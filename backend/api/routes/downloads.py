@@ -297,6 +297,21 @@ def jd_test(reg: ServiceRegistry = Depends(get_registry)):
     return dl.test_jd_connection()
 
 
+@router.get("/jd-state")
+def jd_state(reg: ServiceRegistry = Depends(get_registry)):
+    """Lightweight connectivity + download-queue run-state check.
+
+    Cheap enough to poll frequently (unlike /jd-status, which returns the
+    full linkgrabber/downloads link lists).
+    """
+    dl = reg.download
+    if not dl:
+        raise HTTPException(status_code=503, detail="Download service not available")
+    if not reg.config.get("jd_enabled") or reg.config.get("jd_method") != "api":
+        return {"connected": False, "error": "Enable JDownloader with the MyJDownloader API method in Settings.", "state": "unknown"}
+    return dl.get_jd_state()
+
+
 @router.get("/jd-status")
 def jd_status(reg: ServiceRegistry = Depends(get_registry)):
     """Live JDownloader LinkGrabber + Downloads list (online/offline/broken)."""

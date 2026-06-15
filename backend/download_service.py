@@ -361,13 +361,18 @@ class DownloadService:
             return "stopped"
         return raw.lower() or "unknown"
 
-    def get_download_run_state(self) -> str:
-        """Return JDownloader's current download run state (running/paused/stopped/unknown)."""
+    def get_jd_state(self) -> dict:
+        """Lightweight connectivity + download-queue run-state check.
+
+        A cheap alternative to get_jd_status() for frequent polling: a single
+        downloadcontroller RPC instead of fetching the full linkgrabber/downloads
+        link lists, which can be megabytes on accounts with a large history.
+        """
         try:
             device = self._connect_jd_device()
-        except Exception:
-            return "unknown"
-        return self._normalize_run_state_from(device)
+        except Exception as e:
+            return {"connected": False, "error": str(e), "state": "unknown"}
+        return {"connected": True, "state": self._normalize_run_state_from(device)}
 
     def jd_control(self, action: str) -> dict:
         """Control JDownloader's global download queue.
