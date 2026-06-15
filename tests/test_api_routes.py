@@ -508,6 +508,197 @@ class TestDownloads:
         assert resp.status_code == 422
 
 
+# ── JD Controls & Download Results ──────────────────────────────────────
+
+class TestJdControlsAndResults:
+    """/download/jd-state, /jd-status, /jd-control (POST), /results (GET/DELETE)."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_download_results(self, client):
+        registry.db.clear_download_results()
+        yield
+
+    # -- jd-state --
+
+    def test_jd_state_disabled_by_default(self, client):
+        resp = client.get("/download/jd-state")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["connected"] is False
+        assert data["state"] == "unknown"
+        assert "error" in data
+
+    def test_jd_state_no_service_returns_503(self, client):
+        registry._download_service = None
+        resp = client.get("/download/jd-state")
+        assert resp.status_code == 503
+
+    def test_jd_state_enabled_connected(self, client):
+        registry.config["jd_enabled"] = True
+        registry.config["jd_method"] = "api"
+        mock_dl = MagicMock()
+        mock_dl.get_jd_state.return_value = {"connected": True, "state": "running"}
+        registry._download_service = mock_dl
+        resp = client.get("/download/jd-state")
+        assert resp.status_code == 200
+        assert resp.json() == {"connected": True, "state": "running"}
+
+    def test_jd_state_enabled_disconnected(self, client):
+        registry.config["jd_enabled"] = True
+        registry.config["jd_method"] = "api"
+        mock_dl = MagicMock()
+        mock_dl.get_jd_state.return_value = {"connected": False, "error": "no device", "state": "unknown"}
+        registry._download_service = mock_dl
+        resp = client.get("/download/jd-state")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["connected"] is False
+        assert data["error"] == "no device"
+
+    def test_jd_state_wrong_method_treated_as_disabled(self, client):
+        registry.config["jd_enabled"] = True
+        registry.config["jd_method"] = "folder"
+        resp = client.get("/download/jd-state")
+        assert resp.status_code == 200
+        assert resp.json()["connected"] is False
+
+    # -- jd-status --
+
+    def test_jd_status_disabled_by_default(self, client):
+        resp = client.get("/download/jd-status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["connected"] is False
+        assert data["links"] == []
+        assert data["total"] == 0
+
+    def test_jd_status_no_service_returns_503(self, client):
+        registry._download_service = None
+        resp = client.get("/download/jd-status")
+        assert resp.status_code == 503
+
+    def test_jd_status_enabled_success(self, client):
+        registry.config["jd_enabled"] = True
+        registry.config["jd_method"] = "api"
+        mock_dl = MagicMock()
+        mock_dl.get_jd_status.return_value = {
+            "connected": True, "links": [{"name": "x"}], "online": 1, "offline": 0,
+            "total": 1, "state": "running",
+        }
+        registry._download_service = mock_dl
+        resp = client.get("/download/jd-status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["connected"] is True
+        assert data["total"] == 1
+
+    # -- jd-control (POST) --
+
+    def test_jd_control_no_service_returns_503(self, client):
+        registry._download_service = None
+        resp = client.post("/download/jd-control", json={"action": "start"})
+        assert resp.status_code == 503
+
+    def test_jd_control_disabled_returns_400(self, client):
+        resp = client.post("/download/jd-control", json={"action": "start"})
+        assert resp.status_code == 400
+        assert "settings" in resp.json()["detail"].lower()
+
+    def test_jd_control_wrong_method_returns_400(self, client):
+        registry.config["jd_enabled"] = True
+        registry.config["jd_method"] = "folder"
+        resp = client.post("/download/jd-control", json={"action": "start"})
+        assert resp.status_code == 400
+
+    def test_jd_control_invalid_action_returns_400(self, client):
+        registry.config["jd_enabled"] = True
+        registry.config["jd_method"] = "api"
+        mock_dl = MagicMock()
+        registry._download_service = mock_dl
+        resp = client.post("/download/jd-control", json={"action": "frobnicate"})
+        assert resp.status_code == 400
+        assert "unknown" in resp.json()["detail"].lower()
+        mock_dl.jd_control.assert_not_called()
+
+    @pytest.mark.parametrize("action", ["start", "stop", "pause", "resume"])
+    def test_jd_control_valid_actions_succeed(self, client, action):
+        registry.config["jd_enabled"] = True
+        registry.config["jd_method"] = "api"
+        mock_dl = MagicMock()
+        mock_dl.jd_control.return_value = {"ok": True, "state": "running", "action": action}
+        registry._download_service = mock_dl
+        resp = client.post("/download/jd-control", json={"action": action})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        mock_dl.jd_control.assert_called_once_with(action)
+
+    def test_jd_control_failure_returns_502(self, client):
+        registry.config["jd_enabled"] = True
+        registry.config["jd_method"] = "api"
+        mock_dl = MagicMock()
+        mock_dl.jd_control.return_value = {"ok": False, "error": "device offline"}
+        registry._download_service = mock_dl
+        resp = client.post("/download/jd-control", json={"action": "start"})
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == "device offline"
+
+    def test_jd_control_failure_without_error_message_uses_default(self, client):
+        registry.config["jd_enabled"] = True
+        registry.config["jd_method"] = "api"
+        mock_dl = MagicMock()
+        mock_dl.jd_control.return_value = {"ok": False}
+        registry._download_service = mock_dl
+        resp = client.post("/download/jd-control", json={"action": "stop"})
+        assert resp.status_code == 502
+        assert "failed" in resp.json()["detail"].lower()
+
+    def test_jd_control_requires_action(self, client):
+        resp = client.post("/download/jd-control", json={})
+        assert resp.status_code == 422
+
+    # -- results (GET/DELETE) --
+
+    def test_results_empty_by_default(self, client):
+        resp = client.get("/download/results")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_results_no_db_returns_empty_list(self, client):
+        registry.db = None
+        resp = client.get("/download/results")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_results_returns_tracked_packages(self, client):
+        registry.db.upsert_download_result("Some.Movie.2024.1080p", title="Some Movie", state="downloading")
+        resp = client.get("/download/results")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "Some.Movie.2024.1080p"
+        assert data[0]["title"] == "Some Movie"
+        assert data[0]["state"] == "downloading"
+
+    def test_results_respects_limit(self, client):
+        for i in range(5):
+            registry.db.upsert_download_result(f"pkg-{i}", state="queued")
+        resp = client.get("/download/results?limit=2")
+        assert resp.status_code == 200
+        assert len(resp.json()) == 2
+
+    def test_clear_results(self, client):
+        registry.db.upsert_download_result("pkg-1", state="downloaded")
+        resp = client.delete("/download/results")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "cleared"
+        assert client.get("/download/results").json() == []
+
+    def test_clear_results_no_db_is_noop(self, client):
+        registry.db = None
+        resp = client.delete("/download/results")
+        assert resp.status_code == 200
+
+
 # ── Analytics ─────────────────────────────────────────────────────────
 
 class TestAnalytics:

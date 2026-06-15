@@ -160,6 +160,64 @@ class TestDownloadHistory:
         assert db_manager.get_history_count() == 0
 
 
+class TestDownloadResults:
+
+    def test_empty_results(self, db_manager):
+        assert db_manager.get_download_results() == []
+
+    def test_upsert_and_get(self, db_manager):
+        db_manager.upsert_download_result(
+            name="pkg1", title="Movie 1 [4K]", host="rapidgator.net",
+            bytes_total=1000, bytes_loaded=500, downloaded=0,
+            extraction="na", state="downloading", error=None,
+        )
+        rows = db_manager.get_download_results()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["name"] == "pkg1"
+        assert row["title"] == "Movie 1 [4K]"
+        assert row["host"] == "rapidgator.net"
+        assert row["bytes_total"] == 1000
+        assert row["bytes_loaded"] == 500
+        assert row["downloaded"] == 0
+        assert row["extraction"] == "na"
+        assert row["state"] == "downloading"
+        assert row["error"] is None
+
+    def test_upsert_same_name_updates_in_place(self, db_manager):
+        db_manager.upsert_download_result(name="pkg1", state="downloading", bytes_loaded=500)
+        db_manager.upsert_download_result(name="pkg1", state="downloaded", bytes_loaded=1000, downloaded=1)
+        rows = db_manager.get_download_results()
+        assert len(rows) == 1
+        assert rows[0]["state"] == "downloaded"
+        assert rows[0]["bytes_loaded"] == 1000
+        assert rows[0]["downloaded"] == 1
+
+    def test_get_results_returns_all_tracked_packages(self, db_manager):
+        db_manager.upsert_download_result(name="pkg-old", state="downloaded")
+        db_manager.upsert_download_result(name="pkg-new", state="downloading")
+        names = {r["name"] for r in db_manager.get_download_results()}
+        assert names == {"pkg-old", "pkg-new"}
+
+    def test_get_results_respects_limit(self, db_manager):
+        for i in range(5):
+            db_manager.upsert_download_result(name=f"pkg{i}", state="queued")
+        rows = db_manager.get_download_results(limit=2)
+        assert len(rows) == 2
+
+    def test_clear_results(self, db_manager):
+        db_manager.upsert_download_result(name="pkg1", state="downloaded")
+        db_manager.upsert_download_result(name="pkg2", state="downloaded")
+        assert len(db_manager.get_download_results()) == 2
+        db_manager.clear_download_results()
+        assert db_manager.get_download_results() == []
+
+    def test_upsert_with_error(self, db_manager):
+        db_manager.upsert_download_result(name="pkg1", state="failed", error="Extraction error")
+        rows = db_manager.get_download_results()
+        assert rows[0]["error"] == "Extraction error"
+
+
 class TestLegacyMigration:
 
     def test_migrate_history_json_imports_rows_and_backs_up(self, db_manager, tmp_path):

@@ -1155,3 +1155,368 @@ class TestOpenInPlex:
         assert result is not None
         assert result.endswith("metadata%2Fnew")
         mock_wb.assert_called_once_with(result)
+
+
+# ======================================================================
+# JDownloader run-state / queue control / results polling
+# ======================================================================
+
+class TestNormalizeRunState:
+    def _device(self, state):
+        device = MagicMock()
+        device.downloadcontroller.get_current_state.return_value = state
+        return device
+
+    def test_running(self):
+        assert DownloadService._normalize_run_state_from(self._device("RUNNING")) == "running"
+
+    def test_paused(self):
+        assert DownloadService._normalize_run_state_from(self._device("PAUSED")) == "paused"
+
+    @pytest.mark.parametrize("raw", ["STOPPED_STATE", "IDLE"])
+    def test_stopped_variants(self, raw):
+        assert DownloadService._normalize_run_state_from(self._device(raw)) == "stopped"
+
+    def test_unrecognized_state_is_lowercased(self):
+        assert DownloadService._normalize_run_state_from(self._device("TODO")) == "todo"
+
+    def test_empty_state_returns_unknown(self):
+        assert DownloadService._normalize_run_state_from(self._device("")) == "unknown"
+
+    def test_exception_returns_unknown(self):
+        device = MagicMock()
+        device.downloadcontroller.get_current_state.side_effect = RuntimeError("boom")
+        assert DownloadService._normalize_run_state_from(device) == "unknown"
+
+
+class TestGetJdState:
+    def test_connected(self):
+        svc = _make_service(config={"jd_method": "api"})
+        device = MagicMock()
+        device.downloadcontroller.get_current_state.return_value = "RUNNING"
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            assert svc.get_jd_state() == {"connected": True, "state": "running"}
+
+    def test_not_connected(self):
+        svc = _make_service(config={"jd_method": "api"})
+        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("no creds")):
+            result = svc.get_jd_state()
+        assert result["connected"] is False
+        assert result["state"] == "unknown"
+        assert "no creds" in result["error"]
+
+
+class TestJdControl:
+    def _device(self, state="RUNNING"):
+        device = MagicMock()
+        device.downloadcontroller.get_current_state.return_value = state
+        return device
+
+    def test_start(self):
+        svc = _make_service(config={"jd_method": "api"})
+        device = self._device("RUNNING")
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            result = svc.jd_control("start")
+        device.downloadcontroller.start_downloads.assert_called_once()
+        assert result == {"ok": True, "action": "start", "state": "running"}
+
+    def test_pause(self):
+        svc = _make_service(config={"jd_method": "api"})
+        device = self._device("PAUSED")
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            result = svc.jd_control("pause")
+        device.downloadcontroller.pause_downloads.assert_called_once_with(True)
+        assert result["ok"] is True
+        assert result["state"] == "paused"
+
+    def test_resume(self):
+        svc = _make_service(config={"jd_method": "api"})
+        device = self._device("RUNNING")
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            result = svc.jd_control("resume")
+        device.downloadcontroller.pause_downloads.assert_called_once_with(False)
+        assert result["ok"] is True
+
+    def test_stop(self):
+        svc = _make_service(config={"jd_method": "api"})
+        device = self._device("STOPPED_STATE")
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            result = svc.jd_control("stop")
+        device.downloadcontroller.stop_downloads.assert_called_once()
+        assert result["state"] == "stopped"
+
+    def test_unknown_action(self):
+        svc = _make_service(config={"jd_method": "api"})
+        with patch.object(svc, "_connect_jd_device", return_value=self._device()):
+            result = svc.jd_control("frobnicate")
+        assert result == {"ok": False, "error": "Unknown action: frobnicate"}
+
+    def test_connection_failure(self):
+        svc = _make_service(config={"jd_method": "api"})
+        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("no creds")):
+            result = svc.jd_control("start")
+        assert result["ok"] is False
+        assert "no creds" in result["error"]
+
+    def test_controller_exception(self):
+        svc = _make_service(config={"jd_method": "api"})
+        device = self._device()
+        device.downloadcontroller.start_downloads.side_effect = RuntimeError("jd error")
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            result = svc.jd_control("start")
+        assert result["ok"] is False
+        assert "jd error" in result["error"]
+
+    def test_action_is_case_and_whitespace_insensitive(self):
+        svc = _make_service(config={"jd_method": "api"})
+        device = self._device("RUNNING")
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            result = svc.jd_control("  Start  ")
+        device.downloadcontroller.start_downloads.assert_called_once()
+        assert result["ok"] is True
+
+
+class TestPollResults:
+    def _device(self, packages=None, links=None, raise_on_packages=False, raise_on_links=False):
+        device = MagicMock()
+        if raise_on_packages:
+            device.downloads.query_packages.side_effect = RuntimeError("packages fail")
+        else:
+            device.downloads.query_packages.return_value = packages or []
+        if raise_on_links:
+            device.downloads.query_links.side_effect = RuntimeError("links fail")
+        else:
+            device.downloads.query_links.return_value = links or []
+        return device
+
+    def _svc(self, db=None):
+        if db is None:
+            db = MagicMock()
+            db.get_scraped_link_titles.return_value = {}
+        return _make_service(config={"jd_method": "api"}, db=db), db
+
+    def test_jd_unreachable_returns_empty(self):
+        svc, _db = self._svc()
+        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("no creds")):
+            assert svc.poll_results() == []
+
+    def test_queued_state(self):
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.Queued", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000, "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results == [{
+            "name": "Pkg.Queued", "title": "Pkg.Queued", "host": "",
+            "bytes_total": 1000, "bytes_loaded": 0, "downloaded": 0,
+            "extraction": "na", "state": "queued", "error": None,
+        }]
+
+    def test_downloading_state(self):
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.Dl", "uuid": 1, "bytesLoaded": 500, "bytesTotal": 1000, "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["state"] == "downloading"
+        assert results[0]["downloaded"] == 0
+
+    def test_downloaded_state_via_finished_flag(self):
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.Done", "uuid": 1, "bytesLoaded": 1000, "bytesTotal": 1000, "finished": True, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["state"] == "downloaded"
+        assert results[0]["downloaded"] == 1
+
+    def test_downloaded_state_via_bytes_comparison(self):
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.Done2", "uuid": 1, "bytesLoaded": 1000, "bytesTotal": 1000, "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["state"] == "downloaded"
+        assert results[0]["downloaded"] == 1
+
+    def test_extracting_state(self):
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.Extract", "uuid": 1, "bytesLoaded": 1000, "bytesTotal": 1000, "finished": True, "status": ""}
+        link = {"packageUUID": 1, "host": "rapidgator.net", "url": "http://rg/f1", "name": "f1.rar",
+                "finished": True, "status": "", "extractionStatus": "RUNNING", "bytesTotal": 1000, "bytesLoaded": 1000}
+        device = self._device(packages=[pkg], links=[link])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["extraction"] == "running"
+        assert results[0]["state"] == "extracting"
+        assert results[0]["host"] == "rapidgator.net"
+
+    def test_extracted_state(self):
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.Done3", "uuid": 1, "bytesLoaded": 1000, "bytesTotal": 1000, "finished": True, "status": ""}
+        link = {"packageUUID": 1, "host": "rapidgator.net", "url": "http://rg/f1", "name": "f1.rar",
+                "finished": True, "status": "", "extractionStatus": "SUCCESSFUL", "bytesTotal": 1000, "bytesLoaded": 1000}
+        device = self._device(packages=[pkg], links=[link])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["extraction"] == "success"
+        assert results[0]["state"] == "extracted"
+
+    def test_extraction_error_overrides_downloaded(self):
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.ExErr", "uuid": 1, "bytesLoaded": 1000, "bytesTotal": 1000, "finished": True, "status": ""}
+        link = {"packageUUID": 1, "host": "rapidgator.net", "url": "http://rg/f1", "name": "f1.rar",
+                "finished": True, "status": "", "extractionStatus": "ERROR", "bytesTotal": 1000, "bytesLoaded": 1000}
+        device = self._device(packages=[pkg], links=[link])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["extraction"] == "error"
+        assert results[0]["state"] == "failed"
+
+    def test_download_error_when_not_downloaded(self):
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.Offline", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 0, "finished": False, "status": "OFFLINE"}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["state"] == "failed"
+        assert results[0]["error"] == "OFFLINE"
+
+    def test_title_cross_reference_with_resolution(self):
+        db = MagicMock()
+        db.get_scraped_link_titles.return_value = {"http://rg/f1": {"title": "Real Title", "resolution": "1080p"}}
+        svc, _db = self._svc(db=db)
+        pkg = {"name": "JD.Filename.Pkg", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000, "finished": False, "status": ""}
+        link = {"packageUUID": 1, "host": "rapidgator.net", "url": "http://rg/f1", "name": "f1.rar",
+                "finished": False, "status": "", "extractionStatus": "", "bytesTotal": 1000, "bytesLoaded": 0}
+        device = self._device(packages=[pkg], links=[link])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["title"] == "Real Title [1080p]"
+
+    def test_title_falls_back_to_package_name(self):
+        svc, _db = self._svc()
+        pkg = {"name": "JD.Filename.Pkg", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000, "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["title"] == "JD.Filename.Pkg"
+
+    def test_unnamed_package_fallback(self):
+        svc, _db = self._svc()
+        pkg = {"uuid": 1, "bytesLoaded": 0, "bytesTotal": 0, "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["name"] == "(unnamed package)"
+
+    def test_record_true_upserts_to_db(self):
+        svc, db = self._svc()
+        pkg = {"name": "Pkg1", "uuid": 1, "bytesLoaded": 500, "bytesTotal": 1000, "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            svc.poll_results(record=True)
+        db.upsert_download_result.assert_called_once()
+        kwargs = db.upsert_download_result.call_args.kwargs
+        assert kwargs["name"] == "Pkg1"
+        assert kwargs["state"] == "downloading"
+
+    def test_record_false_skips_db(self):
+        svc, db = self._svc()
+        pkg = {"name": "Pkg1", "uuid": 1, "bytesLoaded": 500, "bytesTotal": 1000, "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            svc.poll_results(record=False)
+        db.upsert_download_result.assert_not_called()
+
+    def test_unchanged_result_not_rewritten(self):
+        svc, db = self._svc()
+        pkg = {"name": "Pkg1", "uuid": 1, "bytesLoaded": 500, "bytesTotal": 1000, "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            svc.poll_results(record=True)
+            svc.poll_results(record=True)
+        db.upsert_download_result.assert_called_once()
+
+    def test_changed_result_rewritten(self):
+        svc, db = self._svc()
+        pkg1 = {"name": "Pkg1", "uuid": 1, "bytesLoaded": 500, "bytesTotal": 1000, "finished": False, "status": ""}
+        pkg2 = {"name": "Pkg1", "uuid": 1, "bytesLoaded": 1000, "bytesTotal": 1000, "finished": True, "status": ""}
+        device1 = self._device(packages=[pkg1], links=[])
+        device2 = self._device(packages=[pkg2], links=[])
+        with patch.object(svc, "_connect_jd_device", side_effect=[device1, device2]):
+            svc.poll_results(record=True)
+            svc.poll_results(record=True)
+        assert db.upsert_download_result.call_count == 2
+
+    def test_packages_query_failure_invalidates_cache_and_returns_empty(self):
+        svc, _db = self._svc()
+        device = self._device(raise_on_packages=True)
+        with patch.object(svc, "_invalidate_jd_cache") as mock_invalidate:
+            with patch.object(svc, "_connect_jd_device", return_value=device):
+                results = svc.poll_results(record=False)
+        assert results == []
+        mock_invalidate.assert_called_once()
+
+    def test_links_query_failure_still_returns_packages(self):
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg1", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000, "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[], raise_on_links=True)
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert len(results) == 1
+        assert results[0]["host"] == ""
+
+    def test_scraped_link_titles_failure_falls_back(self):
+        db = MagicMock()
+        db.get_scraped_link_titles.side_effect = RuntimeError("db down")
+        svc, _db = self._svc(db=db)
+        pkg = {"name": "Pkg1", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000, "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["title"] == "Pkg1"
+
+
+class TestGetJdStatus:
+    def _device(self, lg_packages=None, lg_links=None, dl_packages=None, dl_links=None, state="RUNNING"):
+        device = MagicMock()
+        device.linkgrabber.query_packages.return_value = lg_packages or []
+        device.linkgrabber.query_links.return_value = lg_links or []
+        device.downloads.query_packages.return_value = dl_packages or []
+        device.downloads.query_links.return_value = dl_links or []
+        device.downloadcontroller.get_current_state.return_value = state
+        return device
+
+    def _svc(self):
+        db = MagicMock()
+        db.get_scraped_link_titles.return_value = {}
+        return _make_service(config={"jd_method": "api"}, db=db)
+
+    def test_includes_run_state(self):
+        svc = self._svc()
+        device = self._device(state="RUNNING")
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            result = svc.get_jd_status()
+        assert result["connected"] is True
+        assert result["state"] == "running"
+        assert result["total"] == 0
+
+    def test_connection_failure(self):
+        svc = self._svc()
+        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("no creds")):
+            result = svc.get_jd_status()
+        assert result["connected"] is False
+        assert result["links"] == []
+
+    def test_sorts_offline_links_first(self):
+        svc = self._svc()
+        device = self._device(lg_links=[
+            {"name": "online.rar", "host": "rg", "bytesTotal": 100, "packageUUID": 1, "url": "u1", "availability": "ONLINE"},
+            {"name": "offline.rar", "host": "rg", "bytesTotal": 100, "packageUUID": 2, "url": "u2", "availability": "OFFLINE"},
+        ])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            result = svc.get_jd_status()
+        assert result["links"][0]["name"] == "offline.rar"
+        assert result["online"] == 1
+        assert result["offline"] == 1
