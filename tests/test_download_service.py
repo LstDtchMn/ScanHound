@@ -1267,6 +1267,21 @@ class TestJdControl:
         assert result["ok"] is False
         assert "jd error" in result["error"]
 
+    def test_controller_exception_invalidates_connection_cache(self):
+        """A failed control RPC drops the cached connection so the next call reconnects."""
+        svc = _make_service(config={"jd_method": "api"})
+        device = self._device()
+        device.downloadcontroller.start_downloads.side_effect = RuntimeError("jd error")
+        svc._jd = MagicMock()
+        svc._jd_device = device
+        svc._jd_conn_ts = 12345.0
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            result = svc.jd_control("start")
+        assert result["ok"] is False
+        assert svc._jd is None
+        assert svc._jd_device is None
+        assert svc._jd_conn_ts == 0.0
+
     def test_action_is_case_and_whitespace_insensitive(self):
         svc = _make_service(config={"jd_method": "api"})
         device = self._device("RUNNING")

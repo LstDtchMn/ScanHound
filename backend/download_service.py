@@ -400,6 +400,7 @@ class DownloadService:
             return {"ok": True, "action": action, "state": self._normalize_run_state_from(device)}
         except Exception as e:
             self._log(f"JD control ({action}) failed: {e}", "error")
+            self._invalidate_jd_cache()
             return {"ok": False, "error": str(e)}
 
     def poll_results(self, record: bool = True) -> List[Dict[str, Any]]:
