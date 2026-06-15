@@ -148,6 +148,7 @@ export const api = {
   jdTest: () =>
     request<{ connected: boolean; device?: string; error?: string }>('/download/jd-test'),
   jdStatus: () => request<JdStatus>('/download/jd-status'),
+  jdState: () => request<{ connected: boolean; state: JdRunState; error?: string }>('/download/jd-state'),
   jdControl: (action: 'start' | 'stop' | 'pause' | 'resume') =>
     request<{ ok: boolean; action?: string; state?: JdRunState; error?: string }>('/download/jd-control', {
       method: 'POST',

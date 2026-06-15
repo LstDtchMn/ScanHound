@@ -32,6 +32,15 @@
   // JDownloader global queue controls
   let jdState = $state<JdRunState>('unknown');
   let jdControlBusy = $state(false);
+  async function loadJdState() {
+    try {
+      const r = await api.jdState();
+      jdState = r.state;
+      if (jdInfo) jdInfo.connected = r.connected;
+    } catch {
+      // transient — keep the last known state
+    }
+  }
   async function jdControl(action: 'start' | 'stop' | 'pause' | 'resume') {
     jdControlBusy = true;
     try {
@@ -274,7 +283,9 @@
     loadJdLinks();
     loadResults();
     // Live refresh of JD queue state + download/extraction results while open.
-    const id = setInterval(() => { loadResults(); loadJdLinks(); }, 5000);
+    // Uses the lightweight /jd-state endpoint, not the full link-list /jd-status
+    // (which can be megabytes on accounts with a large JDownloader history).
+    const id = setInterval(() => { loadResults(); loadJdState(); }, 5000);
     return () => clearInterval(id);
   });
 </script>
