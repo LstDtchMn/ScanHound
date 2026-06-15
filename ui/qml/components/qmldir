@@ -1,0 +1,13 @@
+module components
+ResultRow 1.0 ResultRow.qml
+ResultTile 1.0 ResultTile.qml
+PendingRow 1.0 PendingRow.qml
+GroupHeader 1.0 GroupHeader.qml
+RematchDialog 1.0 RematchDialog.qml
+ManualIdDialog 1.0 ManualIdDialog.qml
+ShortcutsDialog 1.0 ShortcutsDialog.qml
+HistoryDialog 1.0 HistoryDialog.qml
+TmdbSearchDialog 1.0 TmdbSearchDialog.qml
+WatchlistDialog 1.0 WatchlistDialog.qml
+AnalyticsDialog 1.0 AnalyticsDialog.qml
+StyledButton 1.0 StyledButton.qml

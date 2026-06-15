@@ -1,0 +1,605 @@
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import { api } from '$lib/api/client';
+  import Badge from '$lib/components/Badge.svelte';
+  import Skeleton from '$lib/components/Skeleton.svelte';
+  import ErrorCard from '$lib/components/ErrorCard.svelte';
+  import { selectedKeys, results } from '$lib/stores/results';
+  import { addToast } from '$lib/stores/notifications';
+  import { downloadQueue, batchProgress, downloadHost, type QueueItem } from '$lib/stores/downloads';
+  import { historyStatusVariant as _historyStatusVariant, historyStatusLabel as _historyStatusLabel, historyBorderColor } from '$lib/constants';
+  import type { JdLink, JdRunState, DownloadResult } from '$lib/api/types';
+
+  // JDownloader live link status
+  let jdLinks = $state<JdLink[]>([]);
+  let jdInfo = $state<{ connected: boolean; online: number; offline: number; total: number; error?: string } | null>(null);
+  let jdLoading = $state(false);
+  async function loadJdLinks() {
+    jdLoading = true;
+    try {
+      const r = await api.jdStatus();
+      jdInfo = { connected: r.connected, online: r.online, offline: r.offline, total: r.total, error: r.error };
+      jdLinks = r.links ?? [];
+      jdState = r.state ?? 'unknown';
+    } catch (e) {
+      jdInfo = { connected: false, online: 0, offline: 0, total: 0, error: e instanceof Error ? e.message : 'Failed to load JDownloader status' };
+      jdLinks = [];
+    } finally {
+      jdLoading = false;
+    }
+  }
+
+  // JDownloader global queue controls
+  let jdState = $state<JdRunState>('unknown');
+  let jdControlBusy = $state(false);
+  async function jdControl(action: 'start' | 'stop' | 'pause' | 'resume') {
+    jdControlBusy = true;
+    try {
+      const r = await api.jdControl(action);
+      if (r.ok) {
+        jdState = r.state ?? jdState;
+        const verb = { start: 'started', stop: 'stopped', pause: 'paused', resume: 'resumed' }[action];
+        addToast('JDownloader', `Downloads ${verb}`);
+      } else {
+        addToast('Error', r.error ?? 'Control failed', 'error');
+      }
+    } catch (e) {
+      addToast('Error', e instanceof Error ? e.message : 'JDownloader control failed', 'error');
+    } finally {
+      jdControlBusy = false;
+      loadJdLinks();
+    }
+  }
+  function jdStateLabel(s: JdRunState): string {
+    return { running: 'Running', paused: 'Paused', stopped: 'Stopped', unknown: 'Unknown' }[s] ?? s;
+  }
+  function jdStateColor(s: JdRunState): string {
+    if (s === 'running') return 'var(--success)';
+    if (s === 'paused') return 'var(--warning)';
+    if (s === 'stopped') return 'var(--error)';
+    return 'var(--text-secondary)';
+  }
+
+  // Download + extraction tracking (polled from JDownloader, persisted server-side)
+  let dlResults = $state<DownloadResult[]>([]);
+  async function loadResults() {
+    try {
+      dlResults = await api.downloadResults();
+    } catch {
+      // transient — keep the last known list
+    }
+  }
+  async function clearResults() {
+    try {
+      await api.clearDownloadResults();
+      dlResults = [];
+    } catch (e) {
+      addToast('Error', e instanceof Error ? e.message : 'Failed to clear results', 'error');
+    }
+  }
+  function resultPct(r: DownloadResult): number {
+    if (r.bytes_total > 0) return Math.min(100, Math.round((r.bytes_loaded / r.bytes_total) * 100));
+    return r.downloaded ? 100 : 0;
+  }
+  function stateLabel(s: string): string {
+    switch (s) {
+      case 'queued': return 'Queued';
+      case 'downloading': return 'Downloading';
+      case 'downloaded': return 'Downloaded';
+      case 'extracting': return 'Extracting';
+      case 'extracted': return 'Extracted';
+      case 'failed': return 'Failed';
+      default: return s;
+    }
+  }
+  function extractionVariant(e: string): 'success' | 'error' | 'warning' | 'default' {
+    if (e === 'success') return 'success';
+    if (e === 'error') return 'error';
+    if (e === 'running') return 'warning';
+    return 'default';
+  }
+  function extractionLabel(e: string): string {
+    if (e === 'success') return 'Extracted ✓';
+    if (e === 'error') return 'Extract ✗';
+    if (e === 'running') return 'Extracting…';
+    return 'No extract';
+  }
+  function jdAvailVariant(a: string): 'success' | 'error' | 'warning' | 'default' {
+    if (a === 'ONLINE') return 'success';
+    if (a === 'OFFLINE') return 'error';
+    return 'warning';
+  }
+  let jdBrokenOnly = $state(false);
+  let jdVisibleLinks = $derived(jdBrokenOnly ? jdLinks.filter((l) => l.availability === 'OFFLINE') : jdLinks);
+
+  interface DownloadEntry {
+    title: string;
+    url?: string;
+    resolution?: string;
+    size?: string;
+    downloaded_at?: string;
+    status?: string;
+    timestamp?: string;
+    path?: string;
+  }
+  let history = $state<DownloadEntry[]>([]);
+  let loading = $state(false);
+  let error = $state('');
+  let searchInput = $state('');
+  let searchFilter = $state('');
+  let statusFilter = $state('all');
+  let searchTimer: ReturnType<typeof setTimeout> | undefined;
+  let refreshing = $state(false);
+  let collapsedGroups = $state(new Set<string>());
+
+  function onSearchInput() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { searchFilter = searchInput; }, 200);
+  }
+
+  async function loadHistory() {
+    loading = true;
+    error = '';
+    try {
+      const data = await api.downloadHistory();
+      history = data as unknown as DownloadEntry[];
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Failed to load download history';
+    } finally {
+      loading = false;
+    }
+  }
+
+  async function refreshHistory() {
+    refreshing = true;
+    try {
+      const data = await api.downloadHistory();
+      history = data as unknown as DownloadEntry[];
+      error = '';
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Failed to load download history';
+    } finally {
+      refreshing = false;
+    }
+  }
+
+  async function downloadSelected() {
+    const keys = [...$selectedKeys];
+    if (keys.length === 0) {
+      addToast('No Selection', 'Select items from the scan results first.', 'warning');
+      return;
+    }
+    const items = keys
+      .map((key) => {
+        const result = $results.find((r) => r.url === key);
+        return result ? { url: result.url ?? '', title: result.title ?? key } : null;
+      })
+      .filter((item): item is { url: string; title: string } => item !== null);
+    if (items.length === 0) {
+      addToast('Error', 'Could not resolve selected items.', 'error');
+      return;
+    }
+
+    // Add items to queue
+    const queueIds = items.map((item) => ({
+      id: downloadQueue.add(item.title),
+      title: item.title
+    }));
+
+    try {
+      await api.downloadBatch(items, $downloadHost);
+      queueIds.forEach((q) => downloadQueue.markSent(q.id));
+      addToast('Downloads Started', `Queued ${items.length} item(s) for download.`);
+    } catch (e) {
+      queueIds.forEach((q) => downloadQueue.markFailed(q.id));
+      addToast('Error', e instanceof Error ? e.message : 'Failed to start downloads.', 'error');
+    }
+  }
+
+  function statusColor(status: QueueItem['status']): string {
+    switch (status) {
+      case 'sending': return 'var(--accent)';
+      case 'sent': return 'var(--accent)';
+      case 'done': return '#22c55e';
+      case 'failed': return '#ef4444';
+    }
+  }
+
+  function statusLabel(status: QueueItem['status']): string {
+    switch (status) {
+      case 'sending': return 'Sending...';
+      case 'sent': return 'Sent to JDownloader';
+      case 'done': return 'Complete';
+      case 'failed': return 'Failed';
+    }
+  }
+
+  const historyStatusVariant = _historyStatusVariant;
+  const historyStatusLabel = _historyStatusLabel;
+  const entryBorderColor = historyBorderColor;
+
+  let historyContainer: HTMLDivElement | undefined = $state();
+
+  // Scroll to top when search filter changes
+  $effect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+    searchFilter;
+    historyContainer?.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+
+  let filteredHistory = $derived.by(() => {
+    let result = history;
+    if (searchFilter) {
+      const q = searchFilter.toLowerCase();
+      result = result.filter(e => e.title.toLowerCase().includes(q));
+    }
+    if (statusFilter !== 'all') {
+      result = result.filter(e => (e.status || 'completed').toLowerCase() === statusFilter);
+    }
+    return result;
+  });
+
+  // Group entries by title
+  interface DownloadGroup {
+    title: string;
+    entries: DownloadEntry[];
+  }
+
+  let groupedHistory = $derived.by(() => {
+    const groups = new Map<string, DownloadEntry[]>();
+    for (const entry of filteredHistory) {
+      const key = entry.title;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(entry);
+    }
+    const result: DownloadGroup[] = [];
+    for (const [title, entries] of groups) {
+      result.push({ title, entries });
+    }
+    return result;
+  });
+
+  function toggleGroup(title: string) {
+    const next = new Set(collapsedGroups);
+    if (next.has(title)) {
+      next.delete(title);
+    } else {
+      next.add(title);
+    }
+    collapsedGroups = next;
+  }
+
+  onMount(() => {
+    loadHistory();
+    loadJdLinks();
+    loadResults();
+    // Live refresh of JD queue state + download/extraction results while open.
+    const id = setInterval(() => { loadResults(); loadJdLinks(); }, 5000);
+    return () => clearInterval(id);
+  });
+</script>
+
+<div class="p-4 border-b border-[var(--border)]">
+  <div class="flex items-center gap-3">
+    <h1 class="text-lg font-semibold">Downloads</h1>
+    <button
+      onclick={downloadSelected}
+      class="px-4 py-2 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded-lg text-sm font-medium transition-colors"
+    >
+      Download Selected ({$selectedKeys.size})
+    </button>
+    <input
+      type="text"
+      bind:value={searchInput}
+      oninput={onSearchInput}
+      placeholder="Search downloads..."
+      class="ml-auto w-48 px-3 py-2 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-sm text-[var(--text-primary)] placeholder:text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)]"
+    />
+    <select
+      bind:value={statusFilter}
+      class="px-2 py-2 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-sm text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] cursor-pointer"
+    >
+      <option value="all">All Status</option>
+      <option value="completed">Completed</option>
+      <option value="clipboard">Clipboard</option>
+      <option value="browser">Browser</option>
+      <option value="failed">Failed</option>
+    </select>
+    <button
+      onclick={() => refreshHistory()}
+      disabled={refreshing}
+      class="px-3 py-2 bg-[var(--bg-tertiary)] hover:bg-[var(--border)] text-[var(--text-primary)] rounded-lg text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+    >
+      {refreshing ? 'Refreshing...' : 'Refresh'}
+    </button>
+  </div>
+</div>
+
+{#if jdInfo}
+  <div class="px-4 py-3 border-b border-[var(--border)]">
+    <div class="flex items-center gap-3 mb-2">
+      <h2 class="text-sm font-semibold">JDownloader Links</h2>
+      {#if jdInfo.connected}
+        <span class="text-xs text-[var(--text-secondary)]">
+          {jdInfo.total} link(s) · <span class="text-[var(--success)]">{jdInfo.online} online</span> · <span class="text-[var(--error)]">{jdInfo.offline} broken</span>
+        </span>
+      {:else}
+        <span class="text-xs text-[var(--warning)]" title={jdInfo.error}>Not connected — {jdInfo.error}</span>
+      {/if}
+      {#if jdInfo.connected && jdInfo.offline > 0}
+        <label class="flex items-center gap-1.5 text-xs text-[var(--text-secondary)] cursor-pointer">
+          <input type="checkbox" bind:checked={jdBrokenOnly} class="accent-[var(--accent)]" />
+          Broken only
+        </label>
+      {/if}
+      <button onclick={loadJdLinks} disabled={jdLoading} class="{jdInfo.connected && jdInfo.offline > 0 ? '' : 'ml-auto'} px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)] disabled:opacity-50">
+        {jdLoading ? 'Loading…' : 'Refresh'}
+      </button>
+    </div>
+    {#if jdInfo.connected}
+      <div class="flex items-center gap-2 mb-2">
+        <span class="text-xs text-[var(--text-secondary)]">Download queue:</span>
+        <span class="text-xs font-medium px-2 py-0.5 rounded-full" style="background: color-mix(in srgb, {jdStateColor(jdState)} 15%, transparent); color: {jdStateColor(jdState)};">{jdStateLabel(jdState)}</span>
+        <button onclick={() => jdControl('start')} disabled={jdControlBusy} class="px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)] disabled:opacity-50" title="Start downloads">▶ Start</button>
+        {#if jdState === 'paused'}
+          <button onclick={() => jdControl('resume')} disabled={jdControlBusy} class="px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)] disabled:opacity-50" title="Resume downloads">⏵ Resume</button>
+        {:else}
+          <button onclick={() => jdControl('pause')} disabled={jdControlBusy} class="px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)] disabled:opacity-50" title="Pause downloads">⏸ Pause</button>
+        {/if}
+        <button onclick={() => jdControl('stop')} disabled={jdControlBusy} class="px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)] disabled:opacity-50" title="Stop downloads">⏹ Stop</button>
+      </div>
+    {/if}
+    {#if jdInfo.connected && jdVisibleLinks.length > 0}
+      <div class="space-y-1 max-h-72 overflow-auto">
+        {#each jdVisibleLinks.slice(0, 500) as link}
+          <div class="flex items-center gap-3 px-3 py-1.5 rounded border {link.availability === 'OFFLINE' ? 'border-[var(--error)]/50 bg-[var(--error)]/5' : 'border-[var(--border)]'} text-xs">
+            <Badge label={link.availability === 'ONLINE' ? 'Online' : link.availability === 'OFFLINE' ? 'Broken' : 'Checking'} variant={jdAvailVariant(link.availability)} />
+            <div class="flex-1 min-w-0">
+              <div class="font-medium truncate" title={link.title}>{link.title || '(unknown title)'}</div>
+              <div class="text-[10px] text-[var(--text-secondary)] truncate" title={link.name}>{link.name || '(unnamed file)'}</div>
+            </div>
+            {#if link.host}<span class="text-[var(--text-secondary)] whitespace-nowrap">{link.host}</span>{/if}
+            <span class="text-[10px] text-[var(--text-secondary)] uppercase whitespace-nowrap">{link.stage}</span>
+          </div>
+        {/each}
+        {#if jdVisibleLinks.length > 500}
+          <p class="text-[10px] text-[var(--text-secondary)] text-center py-1">Showing first 500 of {jdVisibleLinks.length}</p>
+        {/if}
+      </div>
+    {:else if jdInfo.connected && jdBrokenOnly}
+      <p class="text-xs text-[var(--success)]">No broken links 🎉</p>
+    {:else if jdInfo.connected}
+      <p class="text-xs text-[var(--text-secondary)]">No links in JDownloader yet.</p>
+    {/if}
+  </div>
+{/if}
+
+{#if dlResults.length > 0}
+  <div class="px-4 py-3 border-b border-[var(--border)]">
+    <div class="flex items-center gap-3 mb-2">
+      <h2 class="text-sm font-semibold">Download &amp; Extraction Status</h2>
+      <span class="text-xs text-[var(--text-secondary)]">
+        {dlResults.length} item(s) ·
+        <span class="text-[var(--success)]">{dlResults.filter((r) => r.state === 'extracted').length} done</span> ·
+        <span class="text-[var(--error)]">{dlResults.filter((r) => r.state === 'failed').length} failed</span>
+      </span>
+      <button onclick={clearResults} class="ml-auto px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)]">Clear</button>
+    </div>
+    <div class="space-y-1 max-h-80 overflow-auto">
+      {#each dlResults as r (r.name)}
+        <div class="flex items-center gap-3 px-3 py-2 rounded border {r.state === 'failed' ? 'border-[var(--error)]/50 bg-[var(--error)]/5' : 'border-[var(--border)]'} text-xs">
+          <Badge label={r.downloaded ? 'Downloaded ✓' : 'Downloading'} variant={r.downloaded ? 'success' : 'default'} />
+          <Badge label={extractionLabel(r.extraction)} variant={extractionVariant(r.extraction)} />
+          <div class="flex-1 min-w-0">
+            <div class="font-medium truncate" title={r.title}>{r.title || r.name}</div>
+            {#if r.error}
+              <div class="text-[10px] text-[var(--error)] truncate" title={r.error}>{r.error}</div>
+            {:else}
+              <div class="w-full h-1 bg-[var(--bg-tertiary)] rounded-full overflow-hidden mt-1">
+                <div class="h-full rounded-full" style="width: {resultPct(r)}%; background: {r.state === 'failed' ? 'var(--error)' : r.downloaded ? 'var(--success)' : 'var(--accent)'};"></div>
+              </div>
+            {/if}
+          </div>
+          {#if r.host}<span class="text-[var(--text-secondary)] whitespace-nowrap">{r.host}</span>{/if}
+          <span class="text-[10px] text-[var(--text-secondary)] uppercase whitespace-nowrap w-20 text-right">{stateLabel(r.state)}</span>
+        </div>
+      {/each}
+    </div>
+  </div>
+{/if}
+
+{#if $batchProgress}
+  <div class="px-4 py-3 border-b border-[var(--border)] bg-[color-mix(in_srgb,var(--accent)_6%,var(--bg-primary))]">
+    <div class="flex items-center justify-between mb-1.5">
+      <span class="text-sm font-medium">
+        Downloading {$batchProgress.completed} of {$batchProgress.total}
+        {#if $batchProgress.currentTitle}
+          &mdash; {$batchProgress.currentTitle}
+        {/if}
+      </span>
+      {#if $batchProgress.completed >= $batchProgress.total}
+        <span class="text-xs text-[var(--success)]">Complete</span>
+      {/if}
+    </div>
+    <div class="w-full h-1.5 bg-[var(--bg-tertiary)] rounded-full overflow-hidden">
+      <div
+        class="h-full rounded-full transition-all duration-300"
+        style="width: {$batchProgress.total > 0 ? ($batchProgress.completed / $batchProgress.total) * 100 : 0}%; background: {$batchProgress.completed >= $batchProgress.total ? 'var(--success)' : 'var(--accent)'};"
+      ></div>
+    </div>
+  </div>
+{/if}
+
+{#if $downloadQueue.length > 0}
+  <div class="p-4 border-b border-[var(--border)]">
+    <div class="flex items-center justify-between mb-2">
+      <h2 class="text-sm font-semibold text-[var(--text-secondary)]">Active Queue</h2>
+      <button
+        onclick={() => downloadQueue.clearCompleted()}
+        class="text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+      >
+        Clear completed
+      </button>
+    </div>
+    <div class="space-y-2">
+      {#each $downloadQueue as item (item.id)}
+        <div class="flex items-center gap-3 p-3 rounded-lg border border-[var(--border)]"
+          style="background: color-mix(in srgb, {statusColor(item.status)} 8%, var(--bg-secondary));"
+        >
+          <div class="flex-1 min-w-0">
+            <p class="text-sm font-medium truncate">{item.title}</p>
+          </div>
+          <div class="flex items-center gap-2">
+            {#if item.status === 'sending' || item.status === 'sent'}
+              <div class="relative w-24 h-1.5 bg-[var(--bg-tertiary)] rounded-full overflow-hidden">
+                <div
+                  class="absolute inset-y-0 left-0 rounded-full"
+                  style="background: {statusColor(item.status)}; width: {item.status === 'sending' ? '40%' : '80%'}; transition: width 0.5s ease;"
+                ></div>
+                {#if item.status === 'sending'}
+                  <div class="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent animate-shimmer"></div>
+                {/if}
+              </div>
+            {/if}
+            <span class="text-xs whitespace-nowrap" style="color: {statusColor(item.status)};">
+              {statusLabel(item.status)}
+            </span>
+            <button
+              onclick={() => downloadQueue.remove(item.id)}
+              class="text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] ml-1"
+              title="Dismiss"
+            >x</button>
+          </div>
+        </div>
+      {/each}
+    </div>
+  </div>
+{/if}
+
+<div class="flex-1 overflow-auto p-4" bind:this={historyContainer}>
+  {#if error}
+    <ErrorCard message={error} onretry={loadHistory} />
+  {:else if loading}
+    <div class="space-y-2">
+      {#each Array(6) as _}
+        <div class="flex items-center gap-3 p-3 bg-[var(--bg-secondary)] rounded-lg border border-[var(--border)]">
+          <div class="flex-1"><Skeleton width="60%" height="1rem" /></div>
+          <Skeleton width="3rem" height="1.25rem" rounded="rounded-full" />
+          <Skeleton width="6rem" height="0.75rem" />
+          <Skeleton width="8rem" height="0.75rem" />
+        </div>
+      {/each}
+    </div>
+  {:else if filteredHistory.length === 0}
+    <div class="flex flex-col items-center justify-center h-64 gap-4">
+      <svg class="w-12 h-12 text-[var(--text-secondary)] opacity-30" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M14 6h20l6 8v24a4 4 0 01-4 4H12a4 4 0 01-4-4V14l6-8z"/>
+        <path d="M8 14h32"/>
+        <path d="M20 24l4 4 4-4"/>
+        <line x1="24" y1="18" x2="24" y2="28"/>
+      </svg>
+      {#if history.length === 0}
+        <p class="text-sm text-[var(--text-secondary)]">No download history</p>
+        <p class="text-xs text-[var(--text-secondary)] opacity-60">Downloads will appear here after you grab links from scan results.</p>
+      {:else}
+        <p class="text-sm text-[var(--text-secondary)]">No matching downloads</p>
+        <p class="text-xs text-[var(--text-secondary)] opacity-60">Try adjusting your search filter.</p>
+      {/if}
+    </div>
+  {:else}
+    <div class="space-y-1">
+      {#each groupedHistory as group}
+        {#if group.entries.length > 1}
+          <!-- Grouped entries -->
+          <div>
+            <button
+              class="flex items-center gap-2 w-full px-3 py-2 rounded-lg hover:bg-[var(--bg-secondary)] transition-colors text-left"
+              onclick={() => toggleGroup(group.title)}
+            >
+              <svg class="w-3 h-3 text-[var(--text-secondary)] transition-transform {collapsedGroups.has(group.title) ? '' : 'rotate-90'}" viewBox="0 0 16 16" fill="currentColor">
+                <path d="M6 4l4 4-4 4V4z"/>
+              </svg>
+              <span class="text-sm font-medium">{group.title}</span>
+              <span class="text-xs text-[var(--text-secondary)]">({group.entries.length})</span>
+            </button>
+            {#if !collapsedGroups.has(group.title)}
+              <div class="ml-5 space-y-1 mt-1">
+                {#each group.entries as entry, i}
+                  <div
+                    class="flex items-center gap-3 p-3 rounded-lg border border-[var(--border)] {i % 2 === 1 ? 'bg-[var(--bg-secondary)]' : ''}"
+                    style="border-left: 3px solid {entryBorderColor(entry.status)};"
+                  >
+                    <!-- File icon -->
+                    <svg class="w-4 h-4 flex-shrink-0 text-[var(--text-secondary)]" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <path d="M3 2h6l4 4v8a1 1 0 01-1 1H3a1 1 0 01-1-1V3a1 1 0 011-1z"/>
+                      <path d="M9 2v4h4"/>
+                      <path d="M5 10l2 2 2-2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <div class="flex-1 min-w-0">
+                      <p class="text-sm font-medium truncate">{entry.title}</p>
+                      {#if entry.path}
+                        <p class="text-xs text-[var(--text-secondary)] truncate">{entry.path}</p>
+                      {/if}
+                    </div>
+                    {#if entry.resolution}
+                      <Badge label={entry.resolution} />
+                    {/if}
+                    {#if entry.size}
+                      <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap">{entry.size}</span>
+                    {/if}
+                    <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap">{entry.downloaded_at ?? entry.timestamp ?? ''}</span>
+                    <Badge
+                      label={historyStatusLabel(entry.status)}
+                      variant={historyStatusVariant(entry.status)}
+                    />
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {:else}
+          <!-- Single entry (no group) -->
+          {@const entry = group.entries[0]}
+          <div
+            class="flex items-center gap-3 p-3 rounded-lg border border-[var(--border)]"
+            style="border-left: 3px solid {entryBorderColor(entry.status)};"
+          >
+            <!-- File icon -->
+            <svg class="w-4 h-4 flex-shrink-0 text-[var(--text-secondary)]" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M3 2h6l4 4v8a1 1 0 01-1 1H3a1 1 0 01-1-1V3a1 1 0 011-1z"/>
+              <path d="M9 2v4h4"/>
+              <path d="M5 10l2 2 2-2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <div class="flex-1 min-w-0">
+              <p class="text-sm font-medium truncate">{entry.title}</p>
+              {#if entry.path}
+                <p class="text-xs text-[var(--text-secondary)] truncate">{entry.path}</p>
+              {/if}
+            </div>
+            {#if entry.resolution}
+              <Badge label={entry.resolution} />
+            {/if}
+            {#if entry.size}
+              <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap">{entry.size}</span>
+            {/if}
+            <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap">{entry.downloaded_at ?? entry.timestamp ?? ''}</span>
+            <Badge
+              label={historyStatusLabel(entry.status)}
+              variant={historyStatusVariant(entry.status)}
+            />
+          </div>
+        {/if}
+      {/each}
+    </div>
+  {/if}
+</div>
+
+<style>
+  @keyframes shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(200%); }
+  }
+  :global(.animate-shimmer) {
+    animation: shimmer 1.5s infinite;
+  }
+</style>

@@ -1,0 +1,17 @@
+<svg viewBox="0 0 36 16" fill="white" xmlns="http://www.w3.org/2000/svg">
+  <!-- H -->
+  <rect x="0" y="0" width="2.5" height="16"/>
+  <rect x="0" y="7" width="9" height="2.5"/>
+  <rect x="6.5" y="0" width="2.5" height="16"/>
+  <!-- D -->
+  <rect x="12" y="0" width="2.5" height="16"/>
+  <rect x="12" y="0" width="6.5" height="2.5"/>
+  <rect x="12" y="13.5" width="6.5" height="2.5"/>
+  <rect x="16" y="2.5" width="2.5" height="11"/>
+  <!-- R -->
+  <rect x="22" y="0" width="2.5" height="16"/>
+  <rect x="22" y="0" width="9" height="2.5"/>
+  <rect x="22" y="6.5" width="9" height="2.5"/>
+  <rect x="28.5" y="2.5" width="2.5" height="4"/>
+  <polygon points="25,9 27.5,9 33,16 30.5,16"/>
+</svg>

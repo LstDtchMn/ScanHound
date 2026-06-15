@@ -1,0 +1,63 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  schedule:
+    # Run nightly at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    # Allow manual trigger from GitHub Actions UI
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install test-only dependencies (no GUI/browser packages)
+          pip install pytest pytest-cov pytest-asyncio
+          # Install backend dependencies that tests actually need
+          pip install requests aiohttp cloudscraper beautifulsoup4
+          pip install thefuzz rapidfuzz python-dotenv packaging
+          pip install selenium PlexAPI
+          # plyer for desktop notifications (optional, tests mock it)
+          pip install plyer
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ --tb=short -q
+
+      - name: Run tests with coverage
+        if: matrix.python-version == '3.11'
+        run: |
+          python -m pytest tests/ --cov=backend --cov-report=term-missing --cov-report=xml --cov-fail-under=40 -q
+
+      - name: Upload coverage report
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml

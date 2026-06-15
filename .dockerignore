@@ -1,0 +1,37 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.tmp_pytest*/
+
+# Node / frontend (built inside the image)
+node_modules/
+frontend/node_modules/
+frontend/build/
+frontend/.svelte-kit/
+
+# v1 QML desktop UI (not used by the web/API image)
+ui/
+
+# Tests & dev artifacts
+tests/
+.playwright-mcp/
+playwright-*/
+*.png
+*.jpg
+*.csv
+
+# Local data / logs / config (never bake into the image)
+*.db
+*.log
+config.json
+
+# Tooling / VCS
+.git/
+.github/
+docs/
+*.spec
+build/
+dist/

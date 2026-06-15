@@ -1,0 +1,28 @@
+services:
+  scanhound:
+    build: .
+    image: scanhound:latest
+    container_name: scanhound
+    restart: unless-stopped
+    # No host port is published. The app is reached only through Nginx Proxy
+    # Manager over the shared `proxy` network (see networks: below), so it is
+    # never exposed on the host/LAN — NPM + Cloudflare front it.
+    volumes:
+      # Persists config (~/.config/scanhound) + data/DB (~/.local/share/scanhound)
+      # under HOME=/data in one mount.
+      - ./data:/data
+    environment:
+      - TZ=America/New_York
+    extra_hosts:
+      # Lets the container reach Plex running on the Docker host:
+      # set plex_url = http://host.docker.internal:32400 in Settings.
+      - "host.docker.internal:host-gateway"
+    shm_size: "1gb"   # Chromium needs a large /dev/shm
+    networks:
+      # Join the existing shared reverse-proxy network. NPM (also on `proxy`)
+      # forwards to this container as http://scanhound:9721.
+      - proxy
+
+networks:
+  proxy:
+    external: true

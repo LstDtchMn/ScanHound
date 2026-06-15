@@ -1,0 +1,6 @@
+module settings
+LogTab 1.0 LogTab.qml
+NotificationsTab 1.0 NotificationsTab.qml
+AppearanceTab 1.0 AppearanceTab.qml
+LabeledField 1.0 LabeledField.qml
+SettingRow 1.0 SettingRow.qml

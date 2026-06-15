@@ -1,0 +1,258 @@
+import type { ResultsResponse, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult } from './types';
+
+// Dev runs the SvelteKit dev server on :5174 with the API on :9721. In
+// production (Docker/Tauri) the frontend is served by the API itself, so use a
+// relative (same-origin) base — this is what makes it work behind a reverse
+// proxy / Cloudflare tunnel on any hostname.
+function resolveApiBase(): string {
+  if (typeof window === 'undefined') return 'http://localhost:9721';
+  if (window.location.port === '5174') return 'http://localhost:9721';
+  return ''; // same origin
+}
+const API_BASE = resolveApiBase();
+
+const REQUEST_TIMEOUT_MS = 15_000;
+
+/** Auth nonce injected by Tauri sidecar or set via setAuthNonce(). Empty = dev mode (no auth). */
+let authNonce = '';
+
+export function setAuthNonce(nonce: string) {
+  authNonce = nonce;
+}
+
+export function getAuthNonce(): string {
+  return authNonce;
+}
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const headers = new Headers(options?.headers);
+    if (options?.body !== undefined && !headers.has('Content-Type')) {
+      headers.set('Content-Type', 'application/json');
+    }
+    if (authNonce) {
+      headers.set('Authorization', `Bearer ${authNonce}`);
+    }
+
+    const resp = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers,
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      throw new Error(`API error: ${resp.status} ${resp.statusText}`);
+    }
+    const ct = resp.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) {
+      throw new Error(`Unexpected content type: ${ct}`);
+    }
+    const data = await resp.json();
+    // Defensive fallback: catch error payloads that slipped through with 200
+    if (data && typeof data === 'object' && 'success' in data && data.success === false) {
+      throw new Error(data.detail || data.error || data.message || 'Request failed');
+    }
+    return data;
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      throw new Error('Request timed out after 15s');
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export const api = {
+  // System
+  health: () => request<{ status: string; version: string }>('/health'),
+  shutdown: () => request<{ status: string }>('/shutdown', { method: 'POST' }),
+
+  // Scanner
+  scanStart: (type = 'deep', searchQuery = '', pages = 1, source = 'HDEncode', flags?: Record<string, boolean>) =>
+    request('/scan/start', {
+      method: 'POST',
+      body: JSON.stringify({ type, search_query: searchQuery, pages, source, flags: flags ?? null })
+    }),
+  scanStop: () => request('/scan/stop', { method: 'POST' }),
+  scanStatus: () =>
+    request<{ state: string; progress: number; phase: string }>('/scan/status'),
+
+  // Results
+  getResults: (params?: Record<string, string>) => {
+    const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+    return request<ResultsResponse>(`/results${qs}`);
+  },
+  selectItems: (groupKeys: string[], selected: boolean) =>
+    request('/results/select', {
+      method: 'POST',
+      body: JSON.stringify({ group_keys: groupKeys, selected })
+    }),
+  selectAll: () => request('/results/select-all', { method: 'POST' }),
+  deselectAll: () => request('/results/deselect-all', { method: 'POST' }),
+  exportCsv: () =>
+    request<{ filepath: string }>('/results/export', { method: 'POST' }),
+
+  // Plex
+  plexConnect: () => request('/plex/connect', { method: 'POST' }),
+  plexStatus: () => request<PlexStatus>('/plex/status'),
+  plexLibraries: () =>
+    request<{ movie_libraries: string[]; tv_libraries: string[]; known_libraries: string[] }>(
+      '/plex/libraries'
+    ),
+  updatePlexLibraries: (movieLibraries: string[], tvLibraries: string[]) =>
+    request('/plex/libraries', {
+      method: 'PUT',
+      body: JSON.stringify({ movie_libraries: movieLibraries, tv_libraries: tvLibraries })
+    }),
+  plexStats: () => request<Record<string, number>>('/plex/stats'),
+  plexRefresh: () => request('/plex/refresh', { method: 'POST' }),
+
+  // Downloads
+  download: (url: string, title: string, serviceType = 'Rapidgator') =>
+    request('/download', {
+      method: 'POST',
+      body: JSON.stringify({ url, title, service_type: serviceType })
+    }),
+  downloadBatch: (items: { url: string; title: string }[], serviceType = 'Rapidgator') =>
+    request('/download/batch', {
+      method: 'POST',
+      body: JSON.stringify({ items: items.map(i => ({ ...i, service_type: serviceType })) })
+    }),
+  scrapeLinks: (url: string, serviceType = 'Rapidgator', title = '', resolution = '') =>
+    request<{ links: string[]; count: number }>('/download/scrape', {
+      method: 'POST',
+      body: JSON.stringify({ url, service_type: serviceType, title, resolution })
+    }),
+  copyLinksBatch: (items: { url: string; title?: string; resolution?: string }[], serviceType = 'Rapidgator') =>
+    request<{ status: string; count: number }>('/download/copy-links', {
+      method: 'POST',
+      body: JSON.stringify({ items: items.map(i => ({ url: i.url, service_type: serviceType, title: i.title ?? '', resolution: i.resolution ?? '' })) })
+    }),
+  openInPlex: (
+    title: string,
+    imdbId?: string,
+    plexRatingKey?: string
+  ) =>
+    request('/download/open-plex', {
+      method: 'POST',
+      body: JSON.stringify({
+        title,
+        imdb_id: imdbId,
+        plex_rating_key: plexRatingKey
+      })
+    }),
+  downloadHistory: (limit = 100) =>
+    request<Record<string, unknown>[]>(`/download/history?limit=${limit}`),
+  jdTest: () =>
+    request<{ connected: boolean; device?: string; error?: string }>('/download/jd-test'),
+  jdStatus: () => request<JdStatus>('/download/jd-status'),
+  jdControl: (action: 'start' | 'stop' | 'pause' | 'resume') =>
+    request<{ ok: boolean; action?: string; state?: JdRunState; error?: string }>('/download/jd-control', {
+      method: 'POST',
+      body: JSON.stringify({ action })
+    }),
+  downloadResults: (limit = 200) =>
+    request<DownloadResult[]>(`/download/results?limit=${limit}`),
+  clearDownloadResults: () =>
+    request<{ status: string }>('/download/results', { method: 'DELETE' }),
+
+  // Settings
+  getSettings: () => request<Settings>('/settings'),
+  updateSettings: (updates: Settings) =>
+    request('/settings', {
+      method: 'PUT',
+      body: JSON.stringify(updates)
+    }),
+  testNotification: (channel: string) =>
+    request<{ success: boolean; message: string }>(`/settings/test/${channel}`, {
+      method: 'POST'
+    }),
+
+  // Sources
+  getSources: () =>
+    request<{ id: string; name: string; enabled: boolean }[]>('/sources'),
+  toggleSource: (id: string, enabled: boolean) =>
+    request(`/sources/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ enabled })
+    }),
+
+  // Analytics
+  analyticsSummary: () => request<AnalyticsSummary>('/analytics/summary'),
+  analyticsLibrary: (mode = 'Movies') =>
+    request<LibraryStats>(`/analytics/library?mode=${encodeURIComponent(mode)}`),
+  analyticsTrends: (days = 30) =>
+    request<TrendData>(`/analytics/trends?days=${days}`),
+
+  // Watchlist
+  watchlistList: (status?: string, itemType?: string) => {
+    const params = new URLSearchParams();
+    if (status) params.set('status', status);
+    if (itemType) params.set('item_type', itemType);
+    const qs = params.toString();
+    return request<WatchlistItem[]>(`/watchlist${qs ? '?' + qs : ''}`);
+  },
+  watchlistStats: () => request<WatchlistStats>('/watchlist/stats'),
+  watchlistSearch: (q: string) =>
+    request<WatchlistItem[]>(`/watchlist/search?q=${encodeURIComponent(q)}`),
+  watchlistGet: (id: number) => request<WatchlistItem>(`/watchlist/${id}`),
+  watchlistAdd: (item: Partial<WatchlistItem>) =>
+    request<{ id: number; status: string }>('/watchlist', {
+      method: 'POST',
+      body: JSON.stringify(item)
+    }),
+  watchlistUpdate: (id: number, updates: Partial<WatchlistItem>) =>
+    request<{ status: string }>(`/watchlist/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(updates)
+    }),
+  watchlistRemove: (id: number) =>
+    request<{ status: string }>(`/watchlist/${id}`, { method: 'DELETE' }),
+  watchlistExport: () => request<WatchlistExport>('/watchlist/export/json'),
+  watchlistImportJson: (data: string) =>
+    request<{ imported: number }>('/watchlist/import/json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: data
+    }),
+  watchlistImportImdb: (data: string) =>
+    request<{ imported: number }>('/watchlist/import/imdb', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: data
+    }),
+  watchlistImportLetterboxd: (data: string) =>
+    request<{ imported: number }>('/watchlist/import/letterboxd', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: data
+    }),
+
+  // Scan history
+  scanHistory: (limit = 20) =>
+    request<{ id: number; timestamp: string; scan_type: string; items_scanned: number; missing_count: number; upgrade_count: number; duration_seconds: number; sources_scanned: string }[]>(`/analytics/scan-history?limit=${limit}`),
+
+  // Trakt import
+  watchlistImportTrakt: (username: string, listType = 'watchlist') =>
+    request<{ imported: number; total_in_list: number }>('/watchlist/import/trakt', {
+      method: 'POST',
+      body: JSON.stringify({ username, list_type: listType })
+    }),
+
+  // Discovery
+  discover: (category = 'trending', page = 1) =>
+    request<{ items: { id: number; title: string; year: string | null; overview: string; poster_url: string; rating: number; votes: number }[]; total_pages: number }>(`/discover?category=${category}&page=${page}`),
+
+  // Scheduler
+  schedulerStatus: () =>
+    request<{ enabled: boolean; interval_hours: number; idle_only: boolean; last_run: string | null; next_run: string | null; scheduler_active: boolean }>('/scheduler/status'),
+  schedulerUpdate: (config: { enabled?: boolean; interval_hours?: number; idle_only?: boolean }) =>
+    request('/scheduler/config', {
+      method: 'PUT',
+      body: JSON.stringify(config)
+    }),
+  schedulerTrigger: () =>
+    request<{ status: string }>('/scheduler/trigger', { method: 'POST' }),
+};

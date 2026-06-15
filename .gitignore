@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Downloaded/cached files
+*.xml
+
+# Backup files
+*.bak
+*_backup_*.py
+
+# Diff files
+*.diff
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Local Data
+crawler.db
+scanner.log
+config.json
+.coverage
+
+# Runtime data / DBs
+data/
+*.db
+
+# Session & test artifacts (root-level screenshots, CSV exports, scratch)
+/*.png
+/*.jpg
+/*.jpeg
+/*.csv
+/*.crdownload
+/*.html
+ddlbase_sample.html
+.tmp_pytest*/
+.playwright-mcp/
+playwright-deep/
+playwright-gui/
+
+# Frontend test artifacts
+frontend/test-results/
+frontend/playwright-report/
+frontend/qa/
+frontend/e2e/
+
+# Rotated logs
+*.log
+scanner.log.*
