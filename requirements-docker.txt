@@ -18,6 +18,9 @@ thefuzz>=0.20.0,<1.0
 # Browser Automation (HDEncode link scraping)
 selenium>=4.8.0,<5.0
 undetected-chromedriver>=3.5.0
+# Python 3.12 removed stdlib `distutils`, but undetected-chromedriver imports it.
+# setuptools <81 still bundles the distutils shim (81+ dropped it).
+setuptools<81
 
 # Desktop Notifications (lazy-loaded; harmless in a container)
 plyer>=2.1.0,<3.0

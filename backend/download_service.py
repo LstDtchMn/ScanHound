@@ -557,7 +557,12 @@ class DownloadService:
                 options=options,
                 version_main=chrome_ver,
             )
-            self.cached_driver.minimize_window()
+            try:
+                # Cosmetic on the Windows desktop app; unsupported under the
+                # container's headless Xvfb display, so make it best-effort.
+                self.cached_driver.minimize_window()
+            except Exception:
+                pass
             return self.cached_driver
 
     def cleanup_driver(self):
