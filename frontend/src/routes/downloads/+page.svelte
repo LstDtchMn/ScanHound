@@ -36,7 +36,10 @@
     try {
       const r = await api.jdState();
       jdState = r.state;
-      if (jdInfo) jdInfo.connected = r.connected;
+      if (jdInfo) {
+        jdInfo.connected = r.connected;
+        jdInfo.error = r.error;
+      }
     } catch {
       // transient — keep the last known state
     }
