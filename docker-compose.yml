@@ -13,6 +13,10 @@ services:
       - ./data:/data
     environment:
       - TZ=America/New_York
+    labels:
+      # scanhound is a locally-built image (no registry) — tell Whats-Up-Docker
+      # not to try checking Docker Hub for it (was logging 401 UNAUTHORIZED).
+      - "wud.watch=false"
     extra_hosts:
       # Lets the container reach Plex running on the Docker host:
       # set plex_url = http://host.docker.internal:32400 in Settings.
