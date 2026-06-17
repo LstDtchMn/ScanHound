@@ -184,9 +184,9 @@
     const items = keys
       .map((key) => {
         const result = $results.find((r) => r.url === key);
-        return result ? { url: result.url ?? '', title: result.title ?? key } : null;
+        return result ? { url: result.url ?? '', title: result.title ?? key, year: result.year ?? null } : null;
       })
-      .filter((item): item is { url: string; title: string } => item !== null);
+      .filter((item): item is { url: string; title: string; year: number | null } => item !== null);
     if (items.length === 0) {
       addToast('Error', 'Could not resolve selected items.', 'error');
       return;

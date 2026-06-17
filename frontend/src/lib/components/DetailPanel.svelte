@@ -35,10 +35,10 @@
     if (e.key === 'Escape') onclose();
   }
 
-  async function handleDownload(url: string, title: string) {
+  async function handleDownload(url: string, title: string, year?: number | null) {
     const id = downloadQueue.add(title);
     try {
-      await api.download(url, title, $downloadHost);
+      await api.download(url, title, $downloadHost, year);
       downloadQueue.markSent(id);
       addToast('Download', `Sent: ${title} (${$downloadHost})`);
     } catch (e) {
@@ -259,7 +259,7 @@
                 </div>
                 {#if sibling.url}
                   <button
-                    onclick={() => handleDownload(sibling.url, sibling.title)}
+                    onclick={() => handleDownload(sibling.url, sibling.title, sibling.year)}
                     title="Download"
                     aria-label="Download {sibling.resolution || ''} release"
                     class="shrink-0 w-6 h-6 rounded hover:bg-[var(--accent)] flex items-center justify-center text-[var(--text-secondary)] hover:text-white text-xs transition-colors"
@@ -314,7 +314,7 @@
               <option value="1Fichier">1Fichier</option>
             </select>
             <button
-              onclick={() => handleDownload(item.url, item.title)}
+              onclick={() => handleDownload(item.url, item.title, item.year)}
               aria-label="Download"
               class="flex items-center gap-1.5 px-3 py-1.5 rounded-r text-xs font-medium bg-[var(--accent)] text-white hover:opacity-90 transition-opacity"
             >

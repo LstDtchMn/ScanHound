@@ -110,12 +110,12 @@ export const api = {
   plexRefresh: () => request('/plex/refresh', { method: 'POST' }),
 
   // Downloads
-  download: (url: string, title: string, serviceType = 'Rapidgator') =>
+  download: (url: string, title: string, serviceType = 'Rapidgator', year?: number | null) =>
     request('/download', {
       method: 'POST',
-      body: JSON.stringify({ url, title, service_type: serviceType })
+      body: JSON.stringify({ url, title, service_type: serviceType, year: year ?? null })
     }),
-  downloadBatch: (items: { url: string; title: string }[], serviceType = 'Rapidgator') =>
+  downloadBatch: (items: { url: string; title: string; year?: number | null }[], serviceType = 'Rapidgator') =>
     request('/download/batch', {
       method: 'POST',
       body: JSON.stringify({ items: items.map(i => ({ ...i, service_type: serviceType })) })

@@ -50,7 +50,7 @@
   function handleDownload(e: Event) {
     e.stopPropagation();
     if (item.url) {
-      api.download(item.url, item.title, effectiveHost).catch(() => addToast('Error', 'Download failed', 'error'));
+      api.download(item.url, item.title, effectiveHost, item.year).catch(() => addToast('Error', 'Download failed', 'error'));
     }
   }
 

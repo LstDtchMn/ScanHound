@@ -47,7 +47,7 @@
     }
     downloadingAll = true;
     try {
-      await api.downloadBatch(selected.map(i => ({ url: i.url, title: i.title })), $downloadHost);
+      await api.downloadBatch(selected.map(i => ({ url: i.url, title: i.title, year: i.year })), $downloadHost);
       addToast('Download All', `Sending ${selected.length} item(s) to JDownloader…`);
     } catch (e) {
       addToast('Error', e instanceof Error ? e.message : 'Failed to start downloads', 'error');

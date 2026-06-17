@@ -1275,6 +1275,7 @@ class DownloadService:
 
     def download_item(self, url: str, title: str, season: Optional[int],
                       resolution: str, size: str, service_type: str = "Rapidgator",
+                      year: Optional[int] = None,
                       progress_callback: Optional[Callable] = None) -> Dict[str, Any]:
         """Download a single item: scrape links, send to JD or clipboard.
 
@@ -1336,7 +1337,11 @@ class DownloadService:
         # Step 2: Try JDownloader first
         jd_folder = self.config.get("jd_folder", "")
         jd_method = self.config.get("jd_method", "folder")
-        package_name = f"{title} [{resolution}]" if title else "ScanHound Download"
+        if title:
+            name = f"{title} ({year})" if year else title
+            package_name = f"{name} [{resolution}]" if resolution else name
+        else:
+            package_name = "ScanHound Download"
 
         if self.config.get("jd_enabled", False) and (jd_folder or jd_method == "api"):
             if self.send_to_jdownloader(links, package_name, progress_callback=_cb):

@@ -18,6 +18,7 @@ class DownloadRequest(BaseModel):
     url: str
     title: str = "Untitled"
     season: Optional[int] = None
+    year: Optional[int] = None
     resolution: str = ""
     size: str = ""
     service_type: str = "Rapidgator"
@@ -62,7 +63,7 @@ def download_item(
             result = dl.download_item(
                 url=req.url, title=req.title, season=req.season,
                 resolution=req.resolution, size=req.size,
-                service_type=req.service_type,
+                service_type=req.service_type, year=req.year,
                 progress_callback=_on_progress,
             )
             # Surface the *actual* delivery method so a silent clipboard/browser
@@ -118,7 +119,7 @@ def download_batch(
                 dl.download_item(
                     url=item.url, title=item.title, season=item.season,
                     resolution=item.resolution, size=item.size,
-                    service_type=item.service_type,
+                    service_type=item.service_type, year=item.year,
                     progress_callback=_on_progress,
                 )
             ws_manager.broadcast_sync({

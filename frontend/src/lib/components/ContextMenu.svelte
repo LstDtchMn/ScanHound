@@ -65,7 +65,7 @@
 
   function download() {
     if (item.url) {
-      api.download(item.url, item.title).catch(() => addToast('Error', 'Download failed', 'error'));
+      api.download(item.url, item.title, undefined, item.year).catch(() => addToast('Error', 'Download failed', 'error'));
     }
   }
 
