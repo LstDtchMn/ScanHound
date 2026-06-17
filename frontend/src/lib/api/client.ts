@@ -1,4 +1,4 @@
-import type { ResultsResponse, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult } from './types';
+import type { ResultsResponse, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry } from './types';
 
 // Dev runs the SvelteKit dev server on :5174 with the API on :9721. In
 // production (Docker/Tauri) the frontend is served by the API itself, so use a
@@ -144,7 +144,7 @@ export const api = {
       })
     }),
   downloadHistory: (limit = 100) =>
-    request<Record<string, unknown>[]>(`/download/history?limit=${limit}`),
+    request<DownloadHistoryEntry[]>(`/download/history?limit=${limit}`),
   jdTest: () =>
     request<{ connected: boolean; device?: string; error?: string }>('/download/jd-test'),
   jdStatus: () => request<JdStatus>('/download/jd-status'),

@@ -324,6 +324,16 @@ export interface JdStatus {
   state?: JdRunState;
 }
 
+/** One row from the download history table (completed/clipboard/browser/failed). */
+export interface DownloadHistoryEntry {
+  url: string;
+  title: string;
+  resolution: string;
+  size: string;
+  downloaded_at: string;
+  status: string;
+}
+
 /** Persisted per-item download + extraction outcome, polled from JDownloader. */
 export interface DownloadResult {
   name: string; // JDownloader package name

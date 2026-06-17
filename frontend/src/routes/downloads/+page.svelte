@@ -8,7 +8,7 @@
   import { addToast } from '$lib/stores/notifications';
   import { downloadQueue, batchProgress, downloadHost, type QueueItem } from '$lib/stores/downloads';
   import { historyStatusVariant as _historyStatusVariant, historyStatusLabel as _historyStatusLabel, historyBorderColor } from '$lib/constants';
-  import type { JdLink, JdRunState, DownloadResult } from '$lib/api/types';
+  import type { JdLink, JdRunState, DownloadResult, DownloadHistoryEntry } from '$lib/api/types';
 
   // JDownloader live link status
   let jdLinks = $state<JdLink[]>([]);
@@ -116,6 +116,18 @@
     if (e === 'running') return 'Extracting…';
     return 'No extract';
   }
+  function formatBytes(b: number): string {
+    if (!b) return '';
+    if (b >= 1e9) return (b / 1e9).toFixed(1) + ' GB';
+    if (b >= 1e6) return (b / 1e6).toFixed(0) + ' MB';
+    return (b / 1e3).toFixed(0) + ' KB';
+  }
+  function trackerDownloadBadge(r: DownloadResult): { label: string; variant: 'success' | 'warning' | 'default' | 'error' } {
+    if (r.state === 'queued') return { label: 'Queued', variant: 'default' };
+    if (r.state === 'failed' && !r.downloaded) return { label: 'Failed', variant: 'error' };
+    if (r.downloaded) return { label: 'Downloaded ✓', variant: 'success' };
+    return { label: 'Downloading', variant: 'warning' };
+  }
   function jdAvailVariant(a: string): 'success' | 'error' | 'warning' | 'default' {
     if (a === 'ONLINE') return 'success';
     if (a === 'OFFLINE') return 'error';
@@ -124,17 +136,7 @@
   let jdBrokenOnly = $state(false);
   let jdVisibleLinks = $derived(jdBrokenOnly ? jdLinks.filter((l) => l.availability === 'OFFLINE') : jdLinks);
 
-  interface DownloadEntry {
-    title: string;
-    url?: string;
-    resolution?: string;
-    size?: string;
-    downloaded_at?: string;
-    status?: string;
-    timestamp?: string;
-    path?: string;
-  }
-  let history = $state<DownloadEntry[]>([]);
+  let history = $state<DownloadHistoryEntry[]>([]);
   let loading = $state(false);
   let error = $state('');
   let searchInput = $state('');
@@ -153,8 +155,7 @@
     loading = true;
     error = '';
     try {
-      const data = await api.downloadHistory();
-      history = data as unknown as DownloadEntry[];
+      history = await api.downloadHistory();
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to load download history';
     } finally {
@@ -165,8 +166,7 @@
   async function refreshHistory() {
     refreshing = true;
     try {
-      const data = await api.downloadHistory();
-      history = data as unknown as DownloadEntry[];
+      history = await api.downloadHistory();
       error = '';
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to load download history';
@@ -254,11 +254,11 @@
   // Group entries by title
   interface DownloadGroup {
     title: string;
-    entries: DownloadEntry[];
+    entries: DownloadHistoryEntry[];
   }
 
   let groupedHistory = $derived.by(() => {
-    const groups = new Map<string, DownloadEntry[]>();
+    const groups = new Map<string, DownloadHistoryEntry[]>();
     for (const entry of filteredHistory) {
       const key = entry.title;
       if (!groups.has(key)) groups.set(key, []);
@@ -401,9 +401,12 @@
     </div>
     <div class="space-y-1 max-h-80 overflow-auto">
       {#each dlResults as r (r.name)}
+        {@const badge = trackerDownloadBadge(r)}
         <div class="flex items-center gap-3 px-3 py-2 rounded border {r.state === 'failed' ? 'border-[var(--error)]/50 bg-[var(--error)]/5' : 'border-[var(--border)]'} text-xs">
-          <Badge label={r.downloaded ? 'Downloaded ✓' : 'Downloading'} variant={r.downloaded ? 'success' : 'default'} />
-          <Badge label={extractionLabel(r.extraction)} variant={extractionVariant(r.extraction)} />
+          <Badge label={badge.label} variant={badge.variant} />
+          {#if !['queued', 'downloading'].includes(r.state) && r.extraction !== 'na'}
+            <Badge label={extractionLabel(r.extraction)} variant={extractionVariant(r.extraction)} />
+          {/if}
           <div class="flex-1 min-w-0">
             <div class="font-medium truncate" title={r.title}>{r.title || r.name}</div>
             {#if r.error}
@@ -412,6 +415,9 @@
               <div class="w-full h-1 bg-[var(--bg-tertiary)] rounded-full overflow-hidden mt-1">
                 <div class="h-full rounded-full" style="width: {resultPct(r)}%; background: {r.state === 'failed' ? 'var(--error)' : r.downloaded ? 'var(--success)' : 'var(--accent)'};"></div>
               </div>
+              {#if r.bytes_total > 0 || r.bytes_loaded > 0}
+                <div class="text-[10px] text-[var(--text-secondary)] mt-0.5">{formatBytes(r.bytes_loaded)}{r.bytes_total ? ' / ' + formatBytes(r.bytes_total) : ''}</div>
+              {/if}
             {/if}
           </div>
           {#if r.host}<span class="text-[var(--text-secondary)] whitespace-nowrap">{r.host}</span>{/if}
