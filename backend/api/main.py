@@ -1,6 +1,7 @@
 """FastAPI application for ScanHound backend API."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
@@ -218,6 +219,11 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("Starting ScanHound API v%s", __version__)
+        # Capture the running loop BEFORE starting background services so their
+        # early broadcasts (results poller, plex auto-connect) aren't dropped
+        # while no WebSocket client has connected yet.
+        from backend.api.ws import ws_manager
+        ws_manager.set_loop(asyncio.get_running_loop())
         _init_services(registry, config_override=config_override)
         yield
         logger.info("Shutting down ScanHound API")

@@ -22,9 +22,19 @@ class ConnectionManager:
         self._lock = asyncio.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Capture the running loop at app startup so broadcast_sync works even
+        before the first WebSocket client connects.
+
+        Without this, _loop is captured only in connect(), so any background
+        thread (the results poller, plex auto-connect) that broadcasts during
+        startup — before any client has opened /ws — is silently dropped.
+        """
+        self._loop = loop
+
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
-        # Capture the event loop for broadcast_sync (called from background threads)
+        # Refresh the captured loop for broadcast_sync (set at startup too).
         self._loop = asyncio.get_running_loop()
         async with self._lock:
             self._connections.append(ws)

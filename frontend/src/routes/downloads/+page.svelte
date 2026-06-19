@@ -7,6 +7,7 @@
   import { selectedKeys, results } from '$lib/stores/results';
   import { addToast } from '$lib/stores/notifications';
   import { downloadQueue, batchProgress, downloadHost, type QueueItem } from '$lib/stores/downloads';
+  import { connection } from '$lib/stores/connection';
   import { historyStatusVariant as _historyStatusVariant, historyStatusLabel as _historyStatusLabel, historyBorderColor } from '$lib/constants';
   import type { JdPackage, JdRunState, DownloadResult, DownloadHistoryEntry } from '$lib/api/types';
 
@@ -300,11 +301,17 @@
     loadHistory();
     loadJdLinks();
     loadResults();
+    // Live-sync the queue run-state pushed by /jd-control (e.g. start/stop from
+    // another tab) instead of waiting for the next 5s poll.
+    const offState = connection.on('download:state', (d) => {
+      const s = d.state as JdRunState | undefined;
+      if (s) jdState = s;
+    });
     // Live refresh of JD queue state + download/extraction results while open.
     // Uses the lightweight /jd-state endpoint, not the full link-list /jd-status
     // (which can be megabytes on accounts with a large JDownloader history).
     const id = setInterval(() => { loadResults(); loadJdState(); }, 5000);
-    return () => clearInterval(id);
+    return () => { clearInterval(id); offState(); };
   });
 </script>
 
