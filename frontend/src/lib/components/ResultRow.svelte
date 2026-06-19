@@ -111,8 +111,8 @@
       <div class="h-[72px] bg-[var(--bg-tertiary)] rounded" style="width:48px; min-width:48px;"></div>
     {/if}
   </td>
-  <td class="p-2">
-    <div class="text-sm font-medium truncate max-w-xs" title={item.title}>{item.title}</div>
+  <td class="p-2 max-w-[640px] overflow-hidden">
+    <div class="text-sm font-medium truncate" title={item.title}>{item.title}</div>
     <div class="flex items-center gap-1.5 text-[10px] text-[var(--text-secondary)] truncate">
       {#if showGenres && item.genres?.length}<span>{item.genres.slice(0, 3).join(', ')}</span>{/if}
       {#if item.language && item.language !== 'English'}<span class="opacity-60">&middot; {item.language}</span>{/if}
@@ -191,6 +191,4 @@
       {/if}
     </div>
   </td>
-  <!-- Spacer: absorbs remaining width so data columns cluster near the title -->
-  <td class="p-2 w-full"></td>
 </tr>
