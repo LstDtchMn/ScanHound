@@ -1,5 +1,10 @@
 # ScanHound Codebase Audit — Complete Changelog
 
+> ⚠️ **LEGACY / STALE (note added 2026-06-19).** Documents the Mar 2026 audit of
+> the earlier PySide6/QML `ui/` stack; the commit hashes below are absent from
+> current git history (history starts at `02ac8fe`). Useful as a record of what
+> *was* changed, but do not rely on its file:line references against the live tree.
+
 > **Audit period**: 2026-03-08 to 2026-03-09
 > **Commits**: 7 (6 prior + 1 resolve-remaining)
 > **Files modified**: 33 unique production/test files + audit docs

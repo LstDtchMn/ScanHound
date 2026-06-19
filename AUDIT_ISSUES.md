@@ -1,5 +1,12 @@
 # ScanHound Codebase Audit — Issues List
 
+> ⚠️ **LEGACY / STALE (note added 2026-06-19).** This audit (Mar 2026) largely
+> describes the earlier PySide6/QML `ui/` stack and cites commit hashes absent
+> from current git history. Several items are already fixed (e.g. the `.crawljob`
+> format in #6). Treat all file:line references as **stale** — re-verify against
+> the live FastAPI + Svelte code before acting. Use this as a catalog of *areas
+> worth checking*, not an accurate map of the current tree.
+
 > 35-pass sequential audit covering every production file.
 > Reviewed and corrected with fresh-eyes pass (Opus 4.6, 2026-03-08).
 > Codex review applied 2026-03-08: removed false positives, re-tiered dead-code items, consolidated duplicates.

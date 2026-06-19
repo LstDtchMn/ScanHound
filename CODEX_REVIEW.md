@@ -1,5 +1,10 @@
 # ScanHound — Codex Audit Review Request
 
+> ⚠️ **LEGACY / STALE (note added 2026-06-19).** Refers to the Mar 2026 audit of
+> the earlier PySide6/QML `ui/` stack and to commit hashes absent from current
+> git history. Re-verify any file:line reference against the live FastAPI + Svelte
+> code before acting.
+
 > **Date**: 2026-03-08
 > **Context**: Two audits were performed: a 35-pass codebase audit (AUDIT_ISSUES.md) and a SQLite-focused audit (SQLITE_AUDIT.md). 51 code changes were applied across 6 commits. This document is for Codex to verify the changes and assess remaining work.
 
