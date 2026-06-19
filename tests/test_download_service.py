@@ -974,6 +974,35 @@ class TestDownloadItem:
         assert result["method"] == "browser"
         mock_wb.assert_called_once_with("http://page.com")
 
+    @patch("backend.download_service.webbrowser.open")
+    def test_browser_fallback_skipped_in_server_mode(self, mock_wb):
+        """Headless/server mode must not claim a phantom browser delivery."""
+        svc = _make_service(config={})
+        svc.server_mode = True
+        svc.scrape_links = MagicMock(return_value=["http://rg.net/file1"])
+        svc.copy_to_clipboard = MagicMock(return_value=False)
+        svc.save_to_history = MagicMock()
+
+        events = []
+        result = svc.download_item("http://page.com", "Movie", None, "4K", "50 GB",
+                                   progress_callback=lambda e, d: events.append(e))
+        assert result["success"] is False
+        assert result["method"] == ""
+        mock_wb.assert_not_called()
+        assert "download:failed" in events
+
+    @patch("backend.download_service.webbrowser.open", return_value=False)
+    def test_browser_unavailable_is_failure(self, mock_wb):
+        """If no browser actually launches, it's a failure, not a success."""
+        svc = _make_service(config={})
+        svc.scrape_links = MagicMock(return_value=["http://rg.net/file1"])
+        svc.copy_to_clipboard = MagicMock(return_value=False)
+        svc.save_to_history = MagicMock()
+
+        result = svc.download_item("http://page.com", "Movie", None, "4K", "50 GB")
+        assert result["success"] is False
+        assert result["method"] == ""
+
     def test_scrape_exception_no_fallback_for_page_url(self):
         """A source-page URL must NOT be sent on when scraping fails — it would
         just become a Cloudflare-blocked entry in JDownloader."""

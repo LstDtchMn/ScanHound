@@ -210,7 +210,7 @@
 
     // Add items to queue
     const queueIds = items.map((item) => ({
-      id: downloadQueue.add(item.title),
+      id: downloadQueue.add(item.title, item.url),
       title: item.title
     }));
 

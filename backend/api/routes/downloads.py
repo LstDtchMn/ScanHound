@@ -66,16 +66,28 @@ def download_item(
                 service_type=req.service_type, year=req.year,
                 progress_callback=_on_progress,
             )
-            # Surface the *actual* delivery method so a silent clipboard/browser
-            # fallback (e.g. JDownloader disabled or folder unset) is visible.
+            # Report the *honest* outcome: only a JDownloader hand-off counts as
+            # a delivery. A failed scrape or a clipboard/browser fallback must
+            # not look like a successful "Download".
+            success = bool((result or {}).get("success"))
             method = (result or {}).get("method", "")
             message = (result or {}).get("message", "") or f"Sent: {req.title}"
-            if method and method != "jdownloader":
-                message = f"{message} (JDownloader not used — method: {method})"
-            ws_manager.broadcast_sync({
-                "type": "notification",
-                "data": {"title": "Download", "body": message, "priority": "normal"},
-            })
+            if not success:
+                ws_manager.broadcast_sync({
+                    "type": "notification",
+                    "data": {"title": "Download Failed", "body": message, "priority": "high"},
+                })
+            elif method == "jdownloader":
+                ws_manager.broadcast_sync({
+                    "type": "notification",
+                    "data": {"title": "Download", "body": message, "priority": "normal"},
+                })
+            else:
+                # clipboard/browser — succeeded, but nothing reached JDownloader.
+                ws_manager.broadcast_sync({
+                    "type": "notification",
+                    "data": {"title": "Download", "body": f"{message} (not sent to JDownloader — method: {method})", "priority": "normal"},
+                })
         except Exception as e:
             logger.exception("Download failed for %s", req.title)
             try:
@@ -111,24 +123,42 @@ def download_batch(
             # Each item is scraped for its real file-host links before being
             # sent on. Previously the raw page URLs (e.g. hdencode.org posts)
             # were forwarded to JDownloader, which can't resolve them.
+            delivered = diverted = failed = 0
             for i, item in enumerate(req.items):
                 ws_manager.broadcast_sync({
                     "type": "download:batch_progress",
                     "data": {"completed": i, "total": total, "current_title": item.title},
                 })
-                dl.download_item(
+                res = dl.download_item(
                     url=item.url, title=item.title, season=item.season,
                     resolution=item.resolution, size=item.size,
                     service_type=item.service_type, year=item.year,
                     progress_callback=_on_progress,
                 )
+                if not (res or {}).get("success"):
+                    failed += 1
+                elif (res or {}).get("method") == "jdownloader":
+                    delivered += 1
+                else:
+                    diverted += 1
             ws_manager.broadcast_sync({
                 "type": "download:batch_progress",
                 "data": {"completed": total, "total": total, "current_title": ""},
             })
+            # Honest summary: distinguish JD deliveries, clipboard/browser
+            # diversions, and outright failures instead of "Processed N".
+            parts = [f"{delivered} sent to JDownloader"]
+            if diverted:
+                parts.append(f"{diverted} copied/opened")
+            if failed:
+                parts.append(f"{failed} failed")
             ws_manager.broadcast_sync({
                 "type": "notification",
-                "data": {"title": "Batch Download", "body": f"Processed {total} item(s)", "priority": "normal"},
+                "data": {
+                    "title": "Batch Download" if failed == 0 else "Batch Download — some failed",
+                    "body": ", ".join(parts),
+                    "priority": "high" if failed else "normal",
+                },
             })
         except Exception as e:
             logger.exception("Batch download failed")

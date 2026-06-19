@@ -85,7 +85,7 @@ def _init_services(
     reg._scanner_service = scanner_svc
 
     # Downloads
-    download_svc = DownloadService(backend.config, backend.db)
+    download_svc = DownloadService(backend.config, backend.db, server_mode=True)
     reg._download_service = download_svc
     download_svc.driver_preflight()  # log browser version; warn on drift early
 

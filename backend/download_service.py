@@ -101,9 +101,13 @@ def _ensure_selenium():
 class DownloadService:
     """Manages download operations, JDownloader, and WebDriver link scraping."""
 
-    def __init__(self, config: Dict[str, Any], db: DatabaseManager):
+    def __init__(self, config: Dict[str, Any], db: DatabaseManager, server_mode: bool = False):
         self.config = config
         self.db = db
+        # In server/headless mode (the FastAPI/Docker deployment) there is no
+        # user-facing browser, so the browser fallback is meaningless and must
+        # not be reported as a successful delivery.
+        self.server_mode = server_mode
 
         # WebDriver
         self.cached_driver = None
@@ -1440,9 +1444,12 @@ class DownloadService:
     # ── URL helpers ────────────────────────────────────────────────────
 
     @staticmethod
-    def open_url(url: str):
-        """Open URL in default browser."""
-        webbrowser.open(url)
+    def open_url(url: str) -> bool:
+        """Open URL in the default browser. Returns True if a browser launched."""
+        try:
+            return bool(webbrowser.open(url))
+        except Exception:
+            return False
 
     @staticmethod
     def _build_plex_url(plex_url: str, server_id: str, rating_key: Any) -> Optional[str]:
@@ -1555,6 +1562,7 @@ class DownloadService:
                 self._log(f"[Download] {title}: {msg}", "warning")
                 result["message"] = msg
                 self._progress("download:no_links", {"title": title, "url": url}, _cb=_cb)
+                self._progress("download:failed", {"title": title, "url": url, "message": msg}, _cb=_cb)
                 return result
 
         self._progress("download:links_found", {"title": title, "link_count": len(links)}, _cb=_cb)
@@ -1597,15 +1605,30 @@ class DownloadService:
             self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
             return result
 
-        # Step 4: Last resort — open in browser
-        self.open_url(url)
-        result["success"] = True
-        result["method"] = "browser"
-        result["message"] = "Opened URL in browser"
-        result["history_saved"] = self.save_to_history(
-            url, title, season, resolution, size, status="browser"
-        )
-        self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
+        # Step 4: Last resort — open in the user's browser. Only meaningful on
+        # the desktop app; in server/headless mode there is no user browser, so
+        # skip it rather than report a phantom success.
+        if not self.server_mode and self.open_url(url):
+            result["success"] = True
+            result["method"] = "browser"
+            result["message"] = "Opened URL in browser"
+            result["history_saved"] = self.save_to_history(
+                url, title, season, resolution, size, status="browser"
+            )
+            self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
+            return result
+
+        # Nothing delivered the links — report an honest failure.
+        if self.config.get("jd_enabled", False):
+            result["message"] = "JDownloader send failed and no clipboard/browser is available."
+        else:
+            result["message"] = "JDownloader is disabled and no clipboard/browser is available."
+        self._log(f"[Download] {title}: {result['message']}", "warning")
+        try:
+            self.save_to_history(url, title, season, resolution, size, status="failed")
+        except Exception:
+            pass
+        self._progress("download:failed", {"title": title, "url": url, "message": result["message"]}, _cb=_cb)
         return result
 
     def open_in_plex(

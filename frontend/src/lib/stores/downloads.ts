@@ -62,11 +62,18 @@ connection.on('download:links_found', (data) => {
 
 connection.on('download:complete', (data) => {
   activeDownload.update((d) => d ? { ...d, status: 'complete', method: (data.method as string) || '' } : d);
-  // Mark the result row as Downloaded as soon as its links are sent/copied.
+  // Only a real JDownloader hand-off marks the result row Downloaded —
+  // clipboard/browser fallbacks deliver nothing to JD, so they must not.
   const url = (data.url as string) || '';
-  if (url) markDownloaded([url]);
+  if (url && data.method === 'jdownloader') markDownloaded([url]);
   clearTimeout(downloadClearTimer);
   downloadClearTimer = setTimeout(() => activeDownload.set(null), 3000);
+});
+
+connection.on('download:failed', (data) => {
+  activeDownload.update((d) => d ? { ...d, status: 'error' } : d);
+  clearTimeout(downloadClearTimer);
+  downloadClearTimer = setTimeout(() => activeDownload.set(null), 4000);
 });
 
 connection.on('download:batch_progress', (data) => {
@@ -102,6 +109,7 @@ connection.on('download:scrape_progress', (data) => {
 export interface QueueItem {
   id: string;
   title: string;
+  url?: string;
   status: 'sending' | 'sent' | 'done' | 'failed';
   addedAt: number;
 }
@@ -113,10 +121,34 @@ function createDownloadQueue() {
 
   let idCounter = 0;
 
-  function add(title: string): string {
+  function add(title: string, url?: string): string {
     const id = `dq-${++idCounter}-${Date.now()}`;
-    update((q) => [{ id, title, status: 'sending', addedAt: Date.now() }, ...q]);
+    update((q) => [{ id, title, url, status: 'sending', addedAt: Date.now() }, ...q]);
     return id;
+  }
+
+  // Reconcile a queue item by the url it was created with, as the per-item
+  // download:complete / download:failed events arrive.
+  function markDoneByUrl(url: string) {
+    if (!url) return;
+    update((q) => q.map((item) => {
+      if (item.url === url && (item.status === 'sending' || item.status === 'sent')) {
+        scheduleAutoClear(item.id);
+        return { ...item, status: 'done' as const };
+      }
+      return item;
+    }));
+  }
+
+  function markFailedByUrl(url: string) {
+    if (!url) return;
+    update((q) => q.map((item) => {
+      if (item.url === url && (item.status === 'sending' || item.status === 'sent')) {
+        scheduleAutoClear(item.id);
+        return { ...item, status: 'failed' as const };
+      }
+      return item;
+    }));
   }
 
   function markSent(id: string) {
@@ -181,7 +213,11 @@ function createDownloadQueue() {
     }
   });
 
-  return { subscribe, add, markSent, markDone, markFailed, remove, clearCompleted };
+  // Per-item reconciliation from the backend's per-url progress events.
+  connection.on('download:complete', (data) => markDoneByUrl((data.url as string) || ''));
+  connection.on('download:failed', (data) => markFailedByUrl((data.url as string) || ''));
+
+  return { subscribe, add, markSent, markDone, markFailed, markDoneByUrl, markFailedByUrl, remove, clearCompleted };
 }
 
 export const downloadQueue = createDownloadQueue();
