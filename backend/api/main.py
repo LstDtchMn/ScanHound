@@ -86,6 +86,7 @@ def _init_services(
     # Downloads
     download_svc = DownloadService(backend.config, backend.db)
     reg._download_service = download_svc
+    download_svc.driver_preflight()  # log browser version; warn on drift early
 
     # Auto-grab
     auto_grab_svc = AutoGrabService(backend.config, download_svc)

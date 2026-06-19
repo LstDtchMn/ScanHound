@@ -219,18 +219,27 @@ class DownloadService:
                 return False
 
         elif jd_method == "api":
-            try:
-                device = self._connect_jd_device()
-                device.linkgrabber.add_links([{
-                    "autostart": True,
-                    "links": "\n".join(links),
-                    "packageName": package_name[:50],
-                }])
-                self._log("Sent to JDownloader API", "success")
-                return True
-            except Exception as e:
-                self._log(f"JD API error: {e}", "error")
-                return False
+            payload = [{
+                "autostart": True,
+                "links": "\n".join(links),
+                "packageName": package_name[:50],
+            }]
+            # Try the cached connection first; if it fails (e.g. a stale device
+            # handle after JD restarted or the session expired), drop the cache
+            # and retry once with a fresh forced reconnect so a single grab can
+            # self-heal instead of failing for the whole connection TTL.
+            for attempt in (1, 2):
+                try:
+                    device = self._connect_jd_device(force=(attempt == 2))
+                    device.linkgrabber.add_links(payload)
+                    self._log("Sent to JDownloader API", "success")
+                    return True
+                except Exception as e:
+                    self._invalidate_jd_cache()
+                    if attempt == 2:
+                        self._log(f"JD API error: {e}", "error")
+                        return False
+                    self._log(f"JD API send failed ({e}); reconnecting and retrying", "warning")
 
         return False
 
@@ -691,6 +700,25 @@ class DownloadService:
             except Exception:
                 continue
         return None
+
+    def driver_preflight(self) -> None:
+        """Log the detected browser version at startup.
+
+        A Chrome/Chromium <-> ChromeDriver version drift silently breaks ALL
+        scraping (SessionNotCreatedException on every grab). Surfacing the
+        detected version — or a warning when it can't be detected — at boot
+        makes that class of failure visible immediately instead of only when a
+        grab is attempted.
+        """
+        major = self._detect_chrome_major()
+        if major:
+            self._log(f"Scraper preflight: detected browser major version {major}", "info")
+        else:
+            self._log(
+                "Scraper preflight: could NOT detect the browser version — "
+                "undetected-chromedriver may fetch a mismatched driver and break scraping.",
+                "warning",
+            )
 
     def get_driver(self):
         """Get or create a cached WebDriver instance (thread-safe)."""
