@@ -522,6 +522,54 @@ class DownloadService:
 
     # ── WebDriver ─────────────────────────────────────────────────────
 
+    def _detect_chrome_major(self) -> Optional[int]:
+        """Detect the installed Chrome/Chromium major version, cross-platform.
+
+        Returns the major version int (e.g. 149) or None if undetermined.
+        Windows reads the registry; Linux/macOS query the browser binary's
+        ``--version`` output. Passing this to undetected-chromedriver as
+        ``version_main`` keeps it from fetching a newer (mismatched) driver.
+        """
+        if sys.platform.startswith("win"):
+            try:
+                import winreg
+                reg_path = r"SOFTWARE\Google\Chrome\BLBeacon"
+                for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                    try:
+                        with winreg.OpenKey(hive, reg_path) as key:
+                            ver_str, _ = winreg.QueryValueEx(key, "version")
+                            return int(ver_str.split(".")[0])
+                    except OSError:
+                        continue
+            except Exception:
+                pass
+            return None
+        # Linux/macOS: ask the browser binary directly.
+        import re
+        import shutil
+        candidates = [
+            os.environ.get("CHROME_BIN"),
+            "chromium", "chromium-browser",
+            "google-chrome", "google-chrome-stable", "chrome",
+        ]
+        for cand in candidates:
+            if not cand:
+                continue
+            binary = shutil.which(cand) or (cand if os.path.exists(cand) else None)
+            if not binary:
+                continue
+            try:
+                out = subprocess.run(
+                    [binary, "--version"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout
+                match = re.search(r"(\d+)\.\d+\.\d+", out)
+                if match:
+                    return int(match.group(1))
+            except Exception:
+                continue
+        return None
+
     def get_driver(self):
         """Get or create a cached WebDriver instance (thread-safe)."""
         _ensure_selenium()
@@ -543,22 +591,23 @@ class DownloadService:
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--start-minimized")
-            # Detect installed Chrome major version to avoid driver mismatch
-            chrome_ver = None
-            try:
-                import winreg
-                reg_path = r"SOFTWARE\Google\Chrome\BLBeacon"
-                for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-                    try:
-                        with winreg.OpenKey(hive, reg_path) as key:
-                            ver_str, _ = winreg.QueryValueEx(key, "version")
-                            chrome_ver = int(ver_str.split(".")[0])
-                            logger.debug("Detected Chrome version %s", chrome_ver)
-                            break
-                    except OSError:
-                        continue
-            except Exception:
-                pass
+            # Detect the installed Chrome/Chromium major version so
+            # undetected-chromedriver fetches a *matching* driver. Without it,
+            # uc grabs the latest driver, which fails when the installed browser
+            # lags (e.g. the container pins Chromium 149 but uc pulled
+            # ChromeDriver 150 -> SessionNotCreatedException, breaking all scrapes).
+            chrome_ver = self._detect_chrome_major()
+            if chrome_ver:
+                logger.debug("Detected Chrome major version %s", chrome_ver)
+            else:
+                logger.warning(
+                    "Could not detect Chrome version; undetected-chromedriver "
+                    "will guess a driver and may mismatch the browser."
+                )
+            # Target the bundled/pinned browser binary when present (Linux/Docker).
+            chrome_bin = os.environ.get("CHROME_BIN")
+            if chrome_bin and os.path.exists(chrome_bin):
+                options.binary_location = chrome_bin
             self.cached_driver = _uc.Chrome(
                 options=options,
                 version_main=chrome_ver,
