@@ -616,9 +616,11 @@ class AditHDSource(SourceBase):
             found = pattern.findall(html)
             links[host].extend(found)
 
-        # Return preferred host links if available
+        # Return preferred host links if available (order-preserving dedup so
+        # multi-part archives keep their sequence and the host-priority order
+        # below is not discarded by set() randomization).
         if preferred_host and links.get(preferred_host):
-            return list(set(links[preferred_host]))
+            return list(dict.fromkeys(links[preferred_host]))
 
         # Otherwise return all links, prioritized by common preference
         all_links = []
@@ -627,7 +629,7 @@ class AditHDSource(SourceBase):
             if host in links:
                 all_links.extend(links[host])
 
-        return list(set(all_links))
+        return list(dict.fromkeys(all_links))
 
     async def search(
         self,

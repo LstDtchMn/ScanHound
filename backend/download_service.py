@@ -905,8 +905,15 @@ class DownloadService:
                 if "adit-hd.com" in url:
                     return self._scrape_adithd_links(url, service_type)
 
-                # Default: HDEncode
-                keyword = "rapidgator" if service_type == "Rapidgator" else "nitroflare"
+                # Default: HDEncode. Map the requested host to its link keyword.
+                # The old `== "Rapidgator" else "nitroflare"` silently searched
+                # nitroflare for ANY other value (1fichier/ddownload/lowercase).
+                _host_keywords = {"rapidgator": "rapidgator", "nitroflare": "nitroflare",
+                                  "1fichier": "1fichier", "ddownload": "ddownload"}
+                keyword = _host_keywords.get((service_type or "").strip().lower())
+                if keyword is None:
+                    self._log(f"[HDEncode] Unknown host '{service_type}', defaulting to rapidgator", "warning")
+                    keyword = "rapidgator"
                 driver = self.get_driver()
                 try:
                     self._log(f"[HDEncode] Loading page ({service_type}): {url}")
@@ -1023,6 +1030,10 @@ class DownloadService:
             self._log(f"[DDLBase] Scraping links from: {url}")
             driver = self.get_driver()
             driver.get(url)
+            # DDLBase is Cloudflare-protected; wait for any "Just a moment…"
+            # challenge to clear before parsing (the HDEncode path does the
+            # same), then let the page JS render the boolk shortlink tags.
+            self._wait_past_cloudflare(driver)
             time.sleep(3)
 
             soup = BeautifulSoup(driver.page_source, 'html.parser')
@@ -1054,7 +1065,8 @@ class DownloadService:
             direct_links = self._extract_supported_download_links(str(soup.body or soup))
 
             if not shortlinks and not direct_links:
-                self._log("[DDLBase] No shortlinks or download links found")
+                self._log("[DDLBase] No shortlinks or download links found", "warning")
+                self._log_page_diagnostics(driver)
                 return []
 
             self._log(f"[DDLBase] Found {len(shortlinks)} shortlinks, {len(direct_links)} direct links")
@@ -1062,6 +1074,12 @@ class DownloadService:
             # Only resolve Mirror 1 (cuty.io / cuttlinks.com) — others can't be auto-resolved
             resolvable = [s for s in shortlinks if _url_matches_domain(s, _AUTOMATABLE_SHORTLINK_DOMAINS)]
             resolved = list(direct_links)
+            if shortlinks and not resolvable and not direct_links:
+                self._log(
+                    f"[DDLBase] Decoded {len(shortlinks)} shortlink(s) but none are "
+                    "auto-resolvable (only cuty.io / cuttlinks.com are) — no links delivered",
+                    "warning",
+                )
 
             for short_url in dict.fromkeys(resolvable):
                 try:
@@ -1071,8 +1089,14 @@ class DownloadService:
                     if final_url and final_url not in resolved:
                         resolved.append(final_url)
                 except Exception as e:
-                    logger.debug(f"Failed to resolve shortlink {short_url}: {e}")
+                    self._log(f"[DDLBase] Failed to resolve shortlink {short_url}: {e}", "warning")
 
+            if resolvable and not resolved:
+                self._log(
+                    f"[DDLBase] All {len(resolvable)} resolvable shortlink(s) failed "
+                    "(timeout/captcha) — no links delivered",
+                    "warning",
+                )
             return resolved
 
         except Exception as e:
@@ -1335,6 +1359,7 @@ class DownloadService:
 
                     if links:
                         # Filter by service type
+                        raw_count = len(links)
                         keyword = service_type.lower() if service_type else ""
                         if keyword:
                             links = [l for l in links if keyword in l.lower()]
@@ -1343,7 +1368,15 @@ class DownloadService:
                             self._log(f"[Adit-HD] Found {len(links)} {service_type} links")
                             return links
 
-                    self._log("[Adit-HD] Source plugin returned no links, trying fallback scrape")
+                        # Plugin DID return links, just none for the requested host —
+                        # say so accurately instead of "returned no links".
+                        self._log(
+                            f"[Adit-HD] Plugin returned {raw_count} link(s) but none for "
+                            f"{service_type}; trying broad fallback scrape",
+                            "warning",
+                        )
+                    else:
+                        self._log("[Adit-HD] Plugin returned no links, trying fallback scrape")
 
             except ImportError:
                 logger.debug("Adit-HD source registry not available")
