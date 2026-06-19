@@ -300,9 +300,9 @@ export interface Settings {
   smtp_tls?: boolean;
 }
 
+/** One link (file) inside a JDownloader package. */
 export interface JdLink {
   name: string;
-  title: string; // package name = the movie/show this link belongs to
   host: string;
   availability: string; // ONLINE | OFFLINE | UNKNOWN | TEMP_UNKNOWN
   bytes?: number;
@@ -311,16 +311,34 @@ export interface JdLink {
   status?: string;
 }
 
+/** A JDownloader package: the real title plus its child links, grouped so the
+ *  UI can render a collapsible folder (mirroring JDownloader's package view). */
+export interface JdPackage {
+  uuid: string;
+  name: string; // raw JD package name (often the obfuscated archive name)
+  title: string; // resolved movie/show title (falls back to `name`)
+  host: string;
+  total: number;
+  online: number;
+  offline: number;
+  bytes_total: number;
+  bytes_loaded: number;
+  stage: string; // linkgrabber | downloading | finished | mixed
+  links: JdLink[];
+}
+
 /** JDownloader global download-queue run state. */
 export type JdRunState = 'running' | 'paused' | 'stopped' | 'unknown';
 
 export interface JdStatus {
   connected: boolean;
   error?: string;
-  total: number;
+  total: number; // total link count across all packages
   online: number;
   offline: number;
-  links: JdLink[];
+  package_count?: number;
+  truncated?: boolean; // true when more packages exist than were returned
+  packages: JdPackage[];
   state?: JdRunState;
 }
 
@@ -332,6 +350,8 @@ export interface DownloadHistoryEntry {
   size: string;
   downloaded_at: string;
   status: string;
+  path?: string; // optional/legacy — not returned by the current API
+  timestamp?: string; // optional/legacy fallback for downloaded_at
 }
 
 /** Persisted per-item download + extraction outcome, polled from JDownloader. */

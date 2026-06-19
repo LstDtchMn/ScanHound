@@ -8,22 +8,34 @@
   import { addToast } from '$lib/stores/notifications';
   import { downloadQueue, batchProgress, downloadHost, type QueueItem } from '$lib/stores/downloads';
   import { historyStatusVariant as _historyStatusVariant, historyStatusLabel as _historyStatusLabel, historyBorderColor } from '$lib/constants';
-  import type { JdLink, JdRunState, DownloadResult, DownloadHistoryEntry } from '$lib/api/types';
+  import type { JdPackage, JdRunState, DownloadResult, DownloadHistoryEntry } from '$lib/api/types';
 
-  // JDownloader live link status
-  let jdLinks = $state<JdLink[]>([]);
-  let jdInfo = $state<{ connected: boolean; online: number; offline: number; total: number; error?: string } | null>(null);
+  // JDownloader live status — links grouped into collapsible packages.
+  let jdPackages = $state<JdPackage[]>([]);
+  let jdInfo = $state<{ connected: boolean; online: number; offline: number; total: number; packageCount: number; truncated: boolean; error?: string } | null>(null);
   let jdLoading = $state(false);
+  // Packages render collapsed by default (JDownloader-style); this set holds
+  // the UUIDs the user has expanded to reveal their parts.
+  let jdExpanded = $state(new Set<string>());
+  function toggleJdPackage(uuid: string) {
+    const next = new Set(jdExpanded);
+    if (next.has(uuid)) next.delete(uuid); else next.add(uuid);
+    jdExpanded = next;
+  }
   async function loadJdLinks() {
     jdLoading = true;
     try {
       const r = await api.jdStatus();
-      jdInfo = { connected: r.connected, online: r.online, offline: r.offline, total: r.total, error: r.error };
-      jdLinks = r.links ?? [];
+      jdInfo = {
+        connected: r.connected, online: r.online, offline: r.offline, total: r.total,
+        packageCount: r.package_count ?? (r.packages?.length ?? 0),
+        truncated: r.truncated ?? false, error: r.error,
+      };
+      jdPackages = r.packages ?? [];
       jdState = r.state ?? 'unknown';
     } catch (e) {
-      jdInfo = { connected: false, online: 0, offline: 0, total: 0, error: e instanceof Error ? e.message : 'Failed to load JDownloader status' };
-      jdLinks = [];
+      jdInfo = { connected: false, online: 0, offline: 0, total: 0, packageCount: 0, truncated: false, error: e instanceof Error ? e.message : 'Failed to load JDownloader status' };
+      jdPackages = [];
     } finally {
       jdLoading = false;
     }
@@ -134,7 +146,10 @@
     return 'warning';
   }
   let jdBrokenOnly = $state(false);
-  let jdVisibleLinks = $derived(jdBrokenOnly ? jdLinks.filter((l) => l.availability === 'OFFLINE') : jdLinks);
+  let jdVisiblePackages = $derived(jdBrokenOnly ? jdPackages.filter((p) => p.offline > 0) : jdPackages);
+  function availLabel(a: string): string {
+    return a === 'ONLINE' ? 'Online' : a === 'OFFLINE' ? 'Broken' : 'Checking';
+  }
 
   let history = $state<DownloadHistoryEntry[]>([]);
   let loading = $state(false);
@@ -335,7 +350,7 @@
       <h2 class="text-sm font-semibold">JDownloader Links</h2>
       {#if jdInfo.connected}
         <span class="text-xs text-[var(--text-secondary)]">
-          {jdInfo.total} link(s) · <span class="text-[var(--success)]">{jdInfo.online} online</span> · <span class="text-[var(--error)]">{jdInfo.offline} broken</span>
+          {jdInfo.packageCount} package(s) · {jdInfo.total} link(s) · <span class="text-[var(--success)]">{jdInfo.online} online</span> · <span class="text-[var(--error)]">{jdInfo.offline} broken</span>
         </span>
       {:else}
         <span class="text-xs text-[var(--warning)]" title={jdInfo.error}>Not connected — {jdInfo.error}</span>
@@ -363,21 +378,49 @@
         <button onclick={() => jdControl('stop')} disabled={jdControlBusy} class="px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)] disabled:opacity-50" title="Stop downloads">⏹ Stop</button>
       </div>
     {/if}
-    {#if jdInfo.connected && jdVisibleLinks.length > 0}
-      <div class="space-y-1 max-h-72 overflow-auto">
-        {#each jdVisibleLinks.slice(0, 500) as link}
-          <div class="flex items-center gap-3 px-3 py-1.5 rounded border {link.availability === 'OFFLINE' ? 'border-[var(--error)]/50 bg-[var(--error)]/5' : 'border-[var(--border)]'} text-xs">
-            <Badge label={link.availability === 'ONLINE' ? 'Online' : link.availability === 'OFFLINE' ? 'Broken' : 'Checking'} variant={jdAvailVariant(link.availability)} />
-            <div class="flex-1 min-w-0">
-              <div class="font-medium truncate" title={link.title}>{link.title || '(unknown title)'}</div>
-              <div class="text-[10px] text-[var(--text-secondary)] truncate" title={link.name}>{link.name || '(unnamed file)'}</div>
-            </div>
-            {#if link.host}<span class="text-[var(--text-secondary)] whitespace-nowrap">{link.host}</span>{/if}
-            <span class="text-[10px] text-[var(--text-secondary)] uppercase whitespace-nowrap">{link.stage}</span>
+    {#if jdInfo.connected && jdVisiblePackages.length > 0}
+      <div class="space-y-1 max-h-96 overflow-auto">
+        {#each jdVisiblePackages as pkg (pkg.uuid)}
+          <div class="rounded border {pkg.offline > 0 ? 'border-[var(--error)]/50 bg-[var(--error)]/5' : 'border-[var(--border)]'}">
+            <button
+              type="button"
+              class="flex items-center gap-3 w-full px-3 py-1.5 text-left text-xs hover:bg-[var(--bg-tertiary)]/60 transition-colors"
+              onclick={() => toggleJdPackage(pkg.uuid)}
+            >
+              <svg class="w-3 h-3 flex-shrink-0 text-[var(--text-secondary)] transition-transform {jdExpanded.has(pkg.uuid) ? 'rotate-90' : ''}" viewBox="0 0 16 16" fill="currentColor">
+                <path d="M6 4l4 4-4 4V4z" />
+              </svg>
+              <div class="flex-1 min-w-0">
+                <div class="font-medium truncate" title={pkg.title || pkg.name}>{pkg.title || pkg.name || '(unknown title)'}</div>
+                {#if pkg.title && pkg.name && pkg.title !== pkg.name}
+                  <div class="text-[10px] text-[var(--text-secondary)] truncate" title={pkg.name}>{pkg.name}</div>
+                {/if}
+              </div>
+              <span class="text-[10px] whitespace-nowrap">
+                {#if pkg.offline > 0}<span class="text-[var(--error)]">{pkg.offline} broken</span> · {/if}<span class="text-[var(--success)]">{pkg.online}</span><span class="text-[var(--text-secondary)]">/{pkg.total}</span>
+              </span>
+              {#if pkg.bytes_total > 0}<span class="text-[10px] text-[var(--text-secondary)] whitespace-nowrap">{formatBytes(pkg.bytes_total)}</span>{/if}
+              {#if pkg.host}<span class="text-[var(--text-secondary)] whitespace-nowrap hidden sm:inline">{pkg.host}</span>{/if}
+              <span class="text-[10px] text-[var(--text-secondary)] uppercase whitespace-nowrap w-20 text-right">{pkg.stage}</span>
+            </button>
+            {#if jdExpanded.has(pkg.uuid)}
+              <div class="px-3 pb-2 pt-0.5 space-y-1 border-t border-[var(--border)]/60">
+                {#each pkg.links as link, i (link.name + '-' + i)}
+                  <div class="flex items-center gap-3 pl-6 pr-1 py-1 text-xs">
+                    <Badge label={availLabel(link.availability)} variant={jdAvailVariant(link.availability)} />
+                    <div class="flex-1 min-w-0">
+                      <div class="truncate text-[var(--text-secondary)]" title={link.name}>{link.name || '(unnamed file)'}</div>
+                    </div>
+                    {#if link.host}<span class="text-[var(--text-secondary)] whitespace-nowrap">{link.host}</span>{/if}
+                    <span class="text-[10px] text-[var(--text-secondary)] uppercase whitespace-nowrap w-20 text-right">{link.stage}</span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
           </div>
         {/each}
-        {#if jdVisibleLinks.length > 500}
-          <p class="text-[10px] text-[var(--text-secondary)] text-center py-1">Showing first 500 of {jdVisibleLinks.length}</p>
+        {#if jdInfo.truncated}
+          <p class="text-[10px] text-[var(--text-secondary)] text-center py-1">Showing first {jdPackages.length} of {jdInfo.packageCount} packages (broken-first)</p>
         {/if}
       </div>
     {:else if jdInfo.connected && jdBrokenOnly}

@@ -1492,6 +1492,61 @@ class TestPollResults:
             results = svc.poll_results(record=False)
         assert results[0]["title"] == "Pkg1"
 
+    def test_title_url_normalization_matches(self):
+        db = MagicMock()
+        # Map keyed with https + trailing slash; JD link uses http + www, no slash.
+        db.get_scraped_link_titles.return_value = {
+            "https://rapidgator.net/file/abc/": {"title": "Movie", "resolution": "2160p"},
+        }
+        svc, _db = self._svc(db=db)
+        pkg = {"name": "Scrambled.Pkg", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000, "finished": False, "status": ""}
+        link = {"packageUUID": 1, "host": "rapidgator.net", "url": "http://www.rapidgator.net/file/abc",
+                "name": "x.rar", "finished": False, "status": "", "extractionStatus": "",
+                "bytesTotal": 1000, "bytesLoaded": 0}
+        device = self._device(packages=[pkg], links=[link])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["title"] == "Movie [2160p]"
+
+    def test_best_title_not_regressed_on_map_miss(self):
+        db = MagicMock()
+        # First poll resolves a real title; second poll's map is empty.
+        db.get_scraped_link_titles.side_effect = [
+            {"http://rg/f1": {"title": "Real Movie", "resolution": ""}},
+            {},
+        ]
+        svc, _db = self._svc(db=db)
+        pkg = {"name": "Scrambled", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000, "finished": False, "status": ""}
+        link = {"packageUUID": 1, "host": "rg", "url": "http://rg/f1", "name": "x.rar",
+                "finished": False, "status": "", "extractionStatus": "", "bytesTotal": 1000, "bytesLoaded": 0}
+        device = self._device(packages=[pkg], links=[link])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            first = svc.poll_results(record=False)
+            second = svc.poll_results(record=False)
+        assert first[0]["title"] == "Real Movie"
+        # Transient map miss must not regress the display to the raw JD name.
+        assert second[0]["title"] == "Real Movie"
+
+    def test_caches_pruned_to_live_packages(self):
+        db = MagicMock()
+        db.get_scraped_link_titles.return_value = {"http://rg/a": {"title": "Movie A", "resolution": ""}}
+        svc, _db = self._svc(db=db)
+        linkA = {"packageUUID": 1, "host": "rg", "url": "http://rg/a", "name": "a.rar",
+                 "finished": False, "status": "", "extractionStatus": "", "bytesTotal": 1000, "bytesLoaded": 500}
+        pkgA = {"name": "PkgA", "uuid": 1, "bytesLoaded": 500, "bytesTotal": 1000, "finished": False, "status": ""}
+        pkgB = {"name": "PkgB", "uuid": 2, "bytesLoaded": 500, "bytesTotal": 1000, "finished": False, "status": ""}
+        deviceA = self._device(packages=[pkgA], links=[linkA])
+        deviceB = self._device(packages=[pkgB], links=[])
+        with patch.object(svc, "_connect_jd_device", side_effect=[deviceA, deviceB]):
+            svc.poll_results(record=True)
+            assert "PkgA" in svc._results_cache
+            assert "PkgA" in svc._best_titles  # resolved a real title from the map
+            svc.poll_results(record=True)
+        # PkgA dropped out of JD's list -> evicted from BOTH caches; PkgB retained.
+        assert "PkgA" not in svc._results_cache
+        assert "PkgA" not in svc._best_titles
+        assert "PkgB" in svc._results_cache
+
 
 class TestGetJdStatus:
     def _device(self, lg_packages=None, lg_links=None, dl_packages=None, dl_links=None, state="RUNNING"):
@@ -1524,7 +1579,7 @@ class TestGetJdStatus:
         assert result["connected"] is False
         assert result["links"] == []
 
-    def test_sorts_offline_links_first(self):
+    def test_groups_into_packages_offline_first(self):
         svc = self._svc()
         device = self._device(lg_links=[
             {"name": "online.rar", "host": "rg", "bytesTotal": 100, "packageUUID": 1, "url": "u1", "availability": "ONLINE"},
@@ -1532,6 +1587,36 @@ class TestGetJdStatus:
         ])
         with patch.object(svc, "_connect_jd_device", return_value=device):
             result = svc.get_jd_status()
-        assert result["links"][0]["name"] == "offline.rar"
         assert result["online"] == 1
         assert result["offline"] == 1
+        assert result["total"] == 2
+        assert result["package_count"] == 2
+        # The package holding the broken link is surfaced first.
+        assert result["packages"][0]["offline"] == 1
+        assert result["packages"][0]["links"][0]["name"] == "offline.rar"
+
+    def test_groups_links_into_package_with_resolved_title(self):
+        db = MagicMock()
+        # Map stored with https + trailing slash; JD link uses http, no slash.
+        db.get_scraped_link_titles.return_value = {
+            "https://rapidgator.net/file/abc/": {"title": "My Movie", "resolution": "1080p"},
+        }
+        svc = _make_service(config={"jd_method": "api"}, db=db)
+        device = self._device(
+            dl_packages=[{"name": "Scrambled.Pkg", "uuid": 7}],
+            dl_links=[
+                {"name": "p1.rar", "host": "rapidgator.net", "bytesTotal": 100, "bytesLoaded": 100,
+                 "finished": True, "status": "", "packageUUID": 7, "url": "http://rapidgator.net/file/abc"},
+                {"name": "p2.rar", "host": "rapidgator.net", "bytesTotal": 100, "bytesLoaded": 50,
+                 "finished": False, "status": "", "packageUUID": 7, "url": "http://rapidgator.net/file/def"},
+            ],
+        )
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            result = svc.get_jd_status()
+        assert result["package_count"] == 1
+        pkg = result["packages"][0]
+        assert pkg["title"] == "My Movie [1080p]"
+        assert pkg["total"] == 2
+        assert len(pkg["links"]) == 2
+        assert pkg["bytes_total"] == 200
+        assert pkg["online"] == 2

@@ -58,6 +58,32 @@ def _url_matches_domain(url: str, domains: tuple) -> bool:
         return False
 
 
+def _normalize_link_url(url: str) -> str:
+    """Canonicalize a file-host URL so ScanHound's scrape map and JDownloader's
+    stored links match despite cosmetic differences.
+
+    JDownloader frequently stores a link with a different scheme, a ``www.``
+    prefix, a trailing slash, or a stripped query/fragment than the URL
+    ScanHound recorded when it scraped the source page. Matching on the bare
+    ``host/path`` recovers those near-miss cases (the file hash lives in the
+    path for every supported host, so it is the stable identity).
+
+    Returns ``""`` for falsy input.
+    """
+    if not url:
+        return ""
+    try:
+        raw = url.strip()
+        parsed = urlparse(raw if "://" in raw else "http://" + raw)
+        host = (parsed.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        path = (parsed.path or "").rstrip("/")
+        return f"{host}{path}".lower()
+    except Exception:
+        return url.strip().lower()
+
+
 def _ensure_selenium():
     """Lazy-load Selenium and undetected-chromedriver."""
     global _uc, _By, _WebDriverWait, _EC
@@ -101,6 +127,10 @@ class DownloadService:
         # Per-package last-recorded signature so the poller only writes rows
         # that actually changed (avoids re-upserting a large stable queue).
         self._results_cache: Dict[str, tuple] = {}
+        # Best real title ever resolved for a JD package name. Lets a transient
+        # scrape-map miss keep the previously-resolved title instead of
+        # regressing the display back to the raw (often obfuscated) JD name.
+        self._best_titles: Dict[str, str] = {}
 
         # Callbacks
         self._log_fn: Optional[Callable[[str, str], None]] = None
@@ -260,16 +290,57 @@ class DownloadService:
         except Exception as e:
             return {"connected": False, "error": str(e)}
 
-    def get_jd_status(self) -> dict:
-        """Live snapshot of the JDownloader LinkGrabber + Downloads list.
+    # ── Title resolution (shared by status + results poller) ───────────
 
-        Returns per-link availability (ONLINE/OFFLINE/UNKNOWN) and stage so the
-        UI can show which links were added and which are broken/offline.
+    def _scraped_titles_normalized(self) -> Dict[str, dict]:
+        """Return the scrape map keyed by *normalized* URL for robust matching.
+
+        Falls back to an empty map if the DB lookup fails so a transient DB
+        error never blanks out every title.
+        """
+        try:
+            raw = self.db.get_scraped_link_titles() if self.db else {}
+        except Exception as e:
+            logger.warning("scraped_link_map lookup failed: %s", e)
+            return {}
+        out: Dict[str, dict] = {}
+        for link, meta in (raw or {}).items():
+            key = _normalize_link_url(link)
+            if key:
+                out[key] = meta
+        return out
+
+    @staticmethod
+    def _resolve_title(pkg_name: str, child_links: List[dict], norm_titles: Dict[str, dict]) -> str:
+        """Resolve a package's real movie/show title.
+
+        Prefers ScanHound's scrape map (URL → real title, matched on the
+        normalized URL); otherwise falls back to the raw JD package name. JD
+        package names are frequently the obfuscated archive filename, which
+        cannot be reverse-engineered, so the raw name is the honest fallback.
+        """
+        for link in child_links:
+            mapped = norm_titles.get(_normalize_link_url(link.get("url") or ""))
+            if mapped and mapped.get("title"):
+                res = mapped.get("resolution")
+                return f"{mapped['title']} [{res}]" if res else mapped["title"]
+        return pkg_name
+
+    def get_jd_status(self) -> dict:
+        """Live snapshot of the JDownloader LinkGrabber + Downloads list,
+        grouped into packages (mirroring JDownloader's own package view).
+
+        Each package carries its real title, aggregate online/broken/byte
+        counts, and its child links (availability + stage) so the UI can show a
+        collapsible package with its parts inside.
         """
         try:
             device = self._connect_jd_device()
         except Exception as e:
-            return {"connected": False, "error": str(e), "links": [], "online": 0, "offline": 0, "total": 0}
+            return {
+                "connected": False, "error": str(e), "links": [], "packages": [],
+                "online": 0, "offline": 0, "total": 0, "package_count": 0,
+            }
 
         # Map packageUUID -> package name. The app sends links with the package
         # named after the movie/show (e.g. "Magellan [4K]"), so this tells us
@@ -282,68 +353,116 @@ class DownloadService:
             except Exception as e:
                 logger.warning("JD package query failed: %s", e)
 
-        # Cross-reference by URL: our own scrape→link map gives the real title
-        # even for links JD named from the filename (clipboard adds).
-        link_titles = {}
-        try:
-            link_titles = self.db.get_scraped_link_titles() if self.db else {}
-        except Exception as e:
-            logger.warning("scraped_link_map lookup failed: %s", e)
+        norm_titles = self._scraped_titles_normalized()
 
-        def _title_for(url: str, package_uuid) -> str:
-            mapped = link_titles.get(url) if url else None
-            if mapped and mapped.get("title"):
-                res = mapped.get("resolution")
-                return f"{mapped['title']} [{res}]" if res else mapped["title"]
-            return pkg_names.get(package_uuid, "")
+        # Collect raw child links per package UUID, preserving first-seen order.
+        raw_by_pkg: Dict[Any, List[dict]] = {}
+        order: List[Any] = []
 
-        out = []
+        def _bucket(uuid) -> List[dict]:
+            bucket = raw_by_pkg.get(uuid)
+            if bucket is None:
+                bucket = []
+                raw_by_pkg[uuid] = bucket
+                order.append(uuid)
+            return bucket
+
         try:
-            lg = device.linkgrabber.query_links([{
+            for link in (device.linkgrabber.query_links([{
                 "availability": True, "name": True, "host": True,
                 "bytesTotal": True, "packageUUID": True, "url": True,
-            }]) or []
-            for link in lg:
-                out.append({
-                    "name": link.get("name", ""),
-                    "title": _title_for(link.get("url", ""), link.get("packageUUID")),
-                    "host": link.get("host", ""),
-                    "availability": link.get("availability", "UNKNOWN"),
-                    "bytes": link.get("bytesTotal", 0),
-                    "stage": "linkgrabber",
-                })
+            }]) or []):
+                _bucket(link.get("packageUUID")).append({**link, "_origin": "linkgrabber"})
         except Exception as e:
             logger.warning("JD linkgrabber query failed: %s", e)
         try:
-            dls = device.downloads.query_links([{
-                "name": True, "host": True, "bytesTotal": True,
-                "bytesLoaded": True, "finished": True, "status": True, "packageUUID": True, "url": True,
-            }]) or []
-            for link in dls:
-                # A finished download is online; a non-finished one whose status
-                # mentions offline/blocked/error is broken.
-                status = (link.get("status") or "")
-                low = status.lower()
-                broken = any(k in low for k in ("offline", "not found", "blocked", "error", "failed"))
-                out.append({
-                    "name": link.get("name", ""),
-                    "title": pkg_names.get(link.get("packageUUID"), ""),
-                    "host": link.get("host", ""),
-                    "availability": "OFFLINE" if broken else "ONLINE",
-                    "bytes": link.get("bytesTotal", 0),
-                    "bytesLoaded": link.get("bytesLoaded", 0),
-                    "stage": "finished" if link.get("finished") else "downloading",
-                    "status": status,
-                })
+            for link in (device.downloads.query_links([{
+                "name": True, "host": True, "bytesTotal": True, "bytesLoaded": True,
+                "finished": True, "status": True, "packageUUID": True, "url": True,
+            }]) or []):
+                _bucket(link.get("packageUUID")).append({**link, "_origin": "downloads"})
         except Exception as e:
             logger.warning("JD downloads query failed: %s", e)
 
-        online = sum(1 for link in out if link["availability"] == "ONLINE")
-        offline = sum(1 for link in out if link["availability"] == "OFFLINE")
-        # Surface broken/offline links first so problems are immediately visible.
-        out.sort(key=lambda l: 0 if l["availability"] == "OFFLINE" else (1 if l["availability"] != "ONLINE" else 2))
+        packages: List[dict] = []
+        total = online = offline = 0
+        for uuid in order:
+            raw = raw_by_pkg[uuid]
+            disp_links: List[dict] = []
+            p_online = p_offline = 0
+            bytes_total = bytes_loaded = 0
+            host = ""
+            for link in raw:
+                if link["_origin"] == "downloads":
+                    status = link.get("status") or ""
+                    low = status.lower()
+                    broken = any(k in low for k in ("offline", "not found", "blocked", "error", "failed"))
+                    availability = "OFFLINE" if broken else "ONLINE"
+                    stage = "finished" if link.get("finished") else "downloading"
+                else:
+                    status = ""
+                    availability = link.get("availability", "UNKNOWN")
+                    stage = "linkgrabber"
+                bt = link.get("bytesTotal", 0) or 0
+                bl = link.get("bytesLoaded", 0) or 0
+                bytes_total += bt
+                bytes_loaded += bl
+                host = host or link.get("host", "")
+                if availability == "ONLINE":
+                    p_online += 1
+                elif availability == "OFFLINE":
+                    p_offline += 1
+                disp_links.append({
+                    "name": link.get("name", ""),
+                    "host": link.get("host", ""),
+                    "availability": availability,
+                    "bytes": bt,
+                    "bytesLoaded": bl,
+                    "stage": stage,
+                    "status": status,
+                })
+
+            # Broken links first within the package.
+            disp_links.sort(key=lambda l: 0 if l["availability"] == "OFFLINE" else (1 if l["availability"] != "ONLINE" else 2))
+            stages = {l["stage"] for l in disp_links}
+            if stages == {"finished"}:
+                agg_stage = "finished"
+            elif "downloading" in stages:
+                agg_stage = "downloading"
+            elif stages == {"linkgrabber"}:
+                agg_stage = "linkgrabber"
+            else:
+                agg_stage = "mixed"
+
+            packages.append({
+                "uuid": str(uuid),
+                "name": pkg_names.get(uuid, "") or "(unnamed package)",
+                "title": self._resolve_title(pkg_names.get(uuid, ""), raw, norm_titles),
+                "host": host,
+                "total": len(disp_links),
+                "online": p_online,
+                "offline": p_offline,
+                "bytes_total": bytes_total,
+                "bytes_loaded": bytes_loaded,
+                "stage": agg_stage,
+                "links": disp_links,
+            })
+            total += len(disp_links)
+            online += p_online
+            offline += p_offline
+
+        # Surface packages with broken links first, then alphabetically.
+        packages.sort(key=lambda p: (0 if p["offline"] > 0 else 1, (p["title"] or p["name"]).lower()))
+
+        MAX_PACKAGES = 300
+        truncated = len(packages) > MAX_PACKAGES
         state = self._normalize_run_state_from(device)
-        return {"connected": True, "state": state, "total": len(out), "online": online, "offline": offline, "links": out}
+        return {
+            "connected": True, "state": state,
+            "total": total, "online": online, "offline": offline,
+            "package_count": len(packages), "truncated": truncated,
+            "packages": packages[:MAX_PACKAGES],
+        }
 
     @staticmethod
     def _normalize_run_state_from(device) -> str:
@@ -417,10 +536,7 @@ class DownloadService:
 
         # Title cross-reference: clipboard adds get JD's filename-based package
         # name, but our scrape map knows the real movie/show title.
-        try:
-            link_titles = self.db.get_scraped_link_titles() if self.db else {}
-        except Exception:
-            link_titles = {}
+        norm_titles = self._scraped_titles_normalized()
 
         try:
             packages = device.downloads.query_packages([{
@@ -459,14 +575,6 @@ class DownloadService:
                 return "success"
             return "running"
 
-        def _title_for(pkg_name, child_links) -> str:
-            for link in child_links:
-                mapped = link_titles.get(link.get("url") or "")
-                if mapped and mapped.get("title"):
-                    res = mapped.get("resolution")
-                    return f"{mapped['title']} [{res}]" if res else mapped["title"]
-            return pkg_name
-
         results: List[Dict[str, Any]] = []
         for pkg in packages:
             name = pkg.get("name") or "(unnamed package)"
@@ -475,7 +583,13 @@ class DownloadService:
             bytes_loaded = pkg.get("bytesLoaded") or 0
             downloaded = bool(pkg.get("finished")) or (bytes_total > 0 and bytes_loaded >= bytes_total)
             host = next((l.get("host", "") for l in child_links if l.get("host")), "")
-            title = _title_for(name, child_links)
+            title = self._resolve_title(name, child_links, norm_titles)
+            # Keep a once-resolved real title even if the scrape map transiently
+            # misses on a later poll (don't regress to the raw JD package name).
+            if title and title != name:
+                self._best_titles[name] = title
+            elif name in self._best_titles:
+                title = self._best_titles[name]
 
             statuses = [str(l.get("status") or "").lower() for l in child_links]
             all_status = " ".join(statuses + [str(pkg.get("status") or "").lower()])
@@ -510,13 +624,21 @@ class DownloadService:
             results.append(row)
 
             if record and self.db:
-                change_key = (state, bytes_loaded, extraction, row["downloaded"], error)
+                change_key = (state, bytes_loaded, extraction, row["downloaded"], error, title)
                 if self._results_cache.get(name) != change_key:
                     self._results_cache[name] = change_key
                     try:
                         self.db.upsert_download_result(**row)
                     except Exception as e:
                         logger.debug("upsert_download_result failed: %s", e)
+
+        # Bound the per-package caches to packages currently in JD's list so they
+        # don't grow without limit over the long-lived poller's lifetime. Only
+        # prunes after a successful poll (early returns above skip this), so a
+        # transient JD blip never discards resolved titles.
+        live_names = {r["name"] for r in results}
+        self._results_cache = {k: v for k, v in self._results_cache.items() if k in live_names}
+        self._best_titles = {k: v for k, v in self._best_titles.items() if k in live_names}
 
         return results
 
