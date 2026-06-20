@@ -762,10 +762,16 @@ class DownloadService:
             chrome_bin = os.environ.get("CHROME_BIN")
             if chrome_bin and os.path.exists(chrome_bin):
                 options.binary_location = chrome_bin
-            self.cached_driver = _uc.Chrome(
-                options=options,
-                version_main=chrome_ver,
-            )
+            # On Linux/Docker, use the apt-installed chromedriver — always
+            # version-matched to the apt chromium, so uc never downloads a
+            # mismatched driver (belt-and-suspenders behind version_main
+            # detection). Windows desktop keeps uc's auto-managed driver: no
+            # such system path exists there.
+            uc_kwargs: Dict[str, Any] = {"options": options, "version_main": chrome_ver}
+            system_driver = "/usr/bin/chromedriver"
+            if os.path.exists(system_driver):
+                uc_kwargs["driver_executable_path"] = system_driver
+            self.cached_driver = _uc.Chrome(**uc_kwargs)
             try:
                 # Cosmetic on the Windows desktop app; unsupported under the
                 # container's headless Xvfb display, so make it best-effort.
