@@ -63,10 +63,11 @@ def _normalize_link_url(url: str) -> str:
     stored links match despite cosmetic differences.
 
     JDownloader frequently stores a link with a different scheme, a ``www.``
-    prefix, a trailing slash, or a stripped query/fragment than the URL
-    ScanHound recorded when it scraped the source page. Matching on the bare
-    ``host/path`` recovers those near-miss cases (the file hash lives in the
-    path for every supported host, so it is the stable identity).
+    prefix, or a trailing slash than the URL ScanHound recorded when it
+    scraped the source page. Matching on the bare ``host/path`` recovers those
+    near-miss cases — except for hosts that put the file id in the QUERY rather
+    than the path (e.g. ``1fichier.com/?abc123``), where the query is kept so
+    every such link doesn't collapse to the bare host and cross-wire titles.
 
     Returns ``""`` for falsy input.
     """
@@ -79,7 +80,13 @@ def _normalize_link_url(url: str) -> str:
         if host.startswith("www."):
             host = host[4:]
         path = (parsed.path or "").rstrip("/")
-        return f"{host}{path}".lower()
+        if path:
+            ident = f"{host}{path}"
+        else:
+            # No distinguishing path (e.g. 1fichier) — fall back to the query.
+            query = parsed.query or ""
+            ident = f"{host}?{query}" if query else host
+        return ident.lower()
     except Exception:
         return url.strip().lower()
 

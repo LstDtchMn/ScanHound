@@ -1320,6 +1320,31 @@ class TestJdControl:
         assert result["ok"] is True
 
 
+class TestNormalizeLinkUrl:
+    def test_scheme_www_slash_variants_match(self):
+        from backend.download_service import _normalize_link_url as n
+        a = n("https://www.rapidgator.net/file/abc/")
+        b = n("http://rapidgator.net/file/abc")
+        assert a == b == "rapidgator.net/file/abc"
+
+    def test_path_host_drops_query(self):
+        from backend.download_service import _normalize_link_url as n
+        # Rapidgator: id is in the path, so an incidental query is dropped.
+        assert n("https://rapidgator.net/file/abc?ref=x") == "rapidgator.net/file/abc"
+
+    def test_1fichier_query_is_kept_and_distinct(self):
+        from backend.download_service import _normalize_link_url as n
+        # 1fichier puts the id in the query — different files must NOT collide.
+        one = n("https://1fichier.com/?abc123")
+        two = n("https://1fichier.com/?def456")
+        assert one != two
+        assert one == "1fichier.com?abc123"
+
+    def test_empty_returns_empty(self):
+        from backend.download_service import _normalize_link_url as n
+        assert n("") == ""
+
+
 class TestPollResults:
     def _device(self, packages=None, links=None, raise_on_packages=False, raise_on_links=False):
         device = MagicMock()
