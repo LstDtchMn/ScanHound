@@ -143,8 +143,9 @@ class TestEvaluateStatus:
     def test_downloaded_skipped(self):
         svc = _make_service({"auto_grab_statuses": "missing,upgrade,dv_upgrade"})
         item = _make_item(status=ScanStatus.DOWNLOADED)
-        # Downloaded is not in the allowed set
-        assert svc.evaluate_item(item) == "status"
+        # Downloaded is skipped and attributed to "already_downloaded"
+        # (checked before the allowed-status gate).
+        assert svc.evaluate_item(item) == "already_downloaded"
 
     def test_all_statuses(self):
         svc = _make_service({"auto_grab_statuses": "missing,upgrade,dv_upgrade"})
