@@ -146,9 +146,11 @@ class TestEvaluateItem:
         assert svc.evaluate_item(item) == "status"
 
     def test_downloaded_status_skipped(self):
+        # A DOWNLOADED item is skipped and attributed to "already_downloaded"
+        # (checked before the status gate), not lumped into "status".
         svc = make_service()
         item = make_item(status=ScanStatus.DOWNLOADED)
-        assert svc.evaluate_item(item) == "status"
+        assert svc.evaluate_item(item) == "already_downloaded"
 
     def test_rating_below_min_skipped(self):
         svc = make_service({"auto_grab_enabled": True, "auto_grab_min_rating": 8.0})

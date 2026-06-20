@@ -84,14 +84,15 @@ class AutoGrabService:
             Empty string if the item qualifies, otherwise a reason string
             explaining why it was skipped.
         """
+        # Already downloaded — check before the status gate below, otherwise a
+        # DOWNLOADED item is swallowed as "status" and never attributed here.
+        if item.status == ScanStatus.DOWNLOADED:
+            return "already_downloaded"
+
         # Status check
         allowed_statuses = self._get_allowed_statuses()
         if item.status not in allowed_statuses:
             return "status"
-
-        # Already downloaded
-        if item.status == ScanStatus.DOWNLOADED:
-            return "already_downloaded"
 
         # Rating check
         min_rating = float(self.config.get("auto_grab_min_rating", 0.0))
