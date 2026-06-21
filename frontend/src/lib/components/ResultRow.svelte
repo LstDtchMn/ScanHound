@@ -129,7 +129,7 @@
   <td class="{cellPad} max-w-[640px] overflow-hidden">
     <!-- Title with the year folded in -->
     <div class="text-sm truncate" title={item.title}>
-      <span class="font-semibold">{item.title}</span>{#if item.year}<span class="text-[var(--text-secondary)] font-normal"> ({item.year})</span>{/if}
+      <span class="font-semibold">{item.title}</span>{#if item.year}<span class="text-[var(--text-secondary)] font-normal">&nbsp;({item.year})</span>{/if}
     </div>
     <!-- Meta: genres · language · posted date -->
     <div class="flex items-center gap-1.5 text-[11px] text-[var(--text-secondary)] truncate mt-0.5">
