@@ -7,8 +7,8 @@
   {#each $toasts as toast (toast.id)}
     <div
       transition:fly={{ y: 20, duration: 200 }}
-      class="px-4 py-3 rounded-lg shadow-lg max-w-sm border border-[var(--border)]
-        {toast.priority === 'high' ? 'bg-red-900/90' : 'bg-[var(--bg-tertiary)]'}"
+      class="px-4 py-3 rounded-lg shadow-lg max-w-sm border
+        {toast.priority === 'high' ? 'bg-red-900/90 border-red-500/40' : toast.priority === 'warning' ? 'bg-amber-900/80 border-amber-500/40' : 'bg-[var(--bg-tertiary)] border-[var(--border)]'}"
     >
       <div class="flex justify-between items-start gap-3">
         <div>

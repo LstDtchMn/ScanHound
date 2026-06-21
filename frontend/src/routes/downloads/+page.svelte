@@ -514,7 +514,7 @@
     <div class="space-y-2">
       {#each $downloadQueue as item (item.id)}
         <div class="flex items-center gap-3 p-3 rounded-lg border border-[var(--border)]"
-          style="background: color-mix(in srgb, {statusColor(item.status)} 8%, var(--bg-secondary));"
+          style="background: color-mix(in srgb, {statusColor(item.status)} 8%, var(--bg-secondary)); border-left: 3px solid {statusColor(item.status)};"
         >
           <div class="flex-1 min-w-0">
             <p class="text-sm font-medium truncate">{item.title}</p>

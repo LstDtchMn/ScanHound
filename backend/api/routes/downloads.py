@@ -86,7 +86,7 @@ def download_item(
                 # clipboard/browser — succeeded, but nothing reached JDownloader.
                 ws_manager.broadcast_sync({
                     "type": "notification",
-                    "data": {"title": "Download", "body": f"{message} (not sent to JDownloader — method: {method})", "priority": "normal"},
+                    "data": {"title": "Download", "body": f"{message} (not sent to JDownloader — method: {method})", "priority": "warning"},
                 })
         except Exception as e:
             logger.exception("Download failed for %s", req.title)
@@ -152,12 +152,18 @@ def download_batch(
                 parts.append(f"{diverted} copied/opened")
             if failed:
                 parts.append(f"{failed} failed")
+            if failed:
+                batch_priority = "high"
+            elif diverted:
+                batch_priority = "warning"  # nothing failed, but some only diverted
+            else:
+                batch_priority = "normal"
             ws_manager.broadcast_sync({
                 "type": "notification",
                 "data": {
                     "title": "Batch Download" if failed == 0 else "Batch Download — some failed",
                     "body": ", ".join(parts),
-                    "priority": "high" if failed else "normal",
+                    "priority": batch_priority,
                 },
             })
         except Exception as e:
