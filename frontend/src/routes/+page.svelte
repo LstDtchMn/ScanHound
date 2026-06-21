@@ -329,7 +329,6 @@
           <th class="p-2 w-10 hidden sm:table-cell"></th>
           <th class="p-2 max-w-[640px]">Title</th>
           <th class="p-2">Rating</th>
-          <th class="p-2 hidden lg:table-cell">Year</th>
           <th class="p-2 hidden md:table-cell">Res</th>
           <th class="p-2 hidden lg:table-cell">Size</th>
           <th class="p-2">Status</th>
@@ -346,7 +345,7 @@
               tabindex="0"
               role="button"
             >
-              <td colspan="9" class="px-2 py-1.5">
+              <td colspan="8" class="px-2 py-1.5">
                 <div class="flex items-center gap-2">
                   <span class="text-[10px] text-[var(--text-secondary)] transition-transform {collapsedGroups.has(group.title) ? '' : 'rotate-90'}">&triangleright;</span>
                   <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>

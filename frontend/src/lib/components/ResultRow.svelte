@@ -62,6 +62,11 @@
     if (item.imdb_id) window.open(`https://www.imdb.com/title/${item.imdb_id}`, '_blank');
   }
 
+  function openSource(e: Event) {
+    e.stopPropagation();
+    if (item.url) window.open(item.url, '_blank');
+  }
+
   function copyUrl(e: Event) {
     e.stopPropagation();
     if (item.url) {
@@ -112,30 +117,33 @@
     {/if}
   </td>
   <td class="p-2 max-w-[640px] overflow-hidden">
-    <div class="text-sm font-medium truncate" title={item.title}>{item.title}</div>
-    <div class="flex items-center gap-1.5 text-[10px] text-[var(--text-secondary)] truncate">
-      {#if showGenres && item.genres?.length}<span>{item.genres.slice(0, 3).join(', ')}</span>{/if}
-      {#if item.language && item.language !== 'English'}<span class="opacity-60">&middot; {item.language}</span>{/if}
+    <!-- Title with the year folded in -->
+    <div class="text-sm truncate" title={item.title}>
+      <span class="font-semibold">{item.title}</span>{#if item.year}<span class="text-[var(--text-secondary)] font-normal"> ({item.year})</span>{/if}
     </div>
-    <!-- Plex versions + posted date row -->
-    {#if plexVersions.length > 0 || item.posted_date}
-      <div class="flex items-center gap-1.5 mt-0.5 text-[10px] text-[var(--text-secondary)]">
-        {#if plexVersions.length > 0}
-          <span class="font-semibold text-orange-400">Plex</span>
-          {#each plexVersions as pv, i}
-            {#if i > 0}<span class="opacity-40">&middot;</span>{/if}
-            <span class="inline-flex items-center gap-0.5">
-              <span class="font-medium {pv.res === '4K' ? 'text-yellow-500' : 'text-[var(--text-primary)]'}">{pv.res}</span>
-              {#if pv.dovi}<span class="text-purple-400 font-bold">DV</span>{/if}
-              {#if pv.hdr && !pv.dovi}<span class="text-amber-400 font-bold">HDR</span>{/if}
-              {#if pv.size}<span class="opacity-60">{pv.size}GB</span>{/if}
-            </span>
-          {/each}
-        {/if}
-        {#if item.posted_date}
-          {#if plexVersions.length > 0}<span class="opacity-30">|</span>{/if}
-          <span class="opacity-70">{item.posted_date}</span>
-        {/if}
+    <!-- Meta: genres · language · posted date -->
+    <div class="flex items-center gap-1.5 text-[11px] text-[var(--text-secondary)] truncate mt-0.5">
+      {#if showGenres && item.genres?.length}<span class="truncate">{item.genres.slice(0, 3).join(', ')}</span>{/if}
+      {#if item.language && item.language !== 'English'}<span class="opacity-75 whitespace-nowrap">&middot; {item.language}</span>{/if}
+      {#if item.posted_date}
+        <span class="inline-flex items-center gap-1 opacity-85 whitespace-nowrap">
+          <svg class="w-3 h-3 flex-shrink-0" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2.5" y="3.5" width="11" height="10" rx="1.5"/><path d="M2.5 6.5h11M5.5 2v3M10.5 2v3"/></svg>
+          {item.posted_date}
+        </span>
+      {/if}
+    </div>
+    <!-- "In Plex" similar copies, as readable chips -->
+    {#if plexVersions.length > 0}
+      <div class="flex items-center flex-wrap gap-1 mt-1 text-[10px]">
+        <span class="text-[var(--text-secondary)]">In Plex:</span>
+        {#each plexVersions as pv}
+          <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-tertiary)]/50 whitespace-nowrap">
+            <span class="font-semibold {pv.res === '4K' ? 'text-yellow-500' : 'text-[var(--text-primary)]'}">{pv.res}</span>
+            {#if pv.dovi}<span class="text-purple-400 font-bold">DV</span>{/if}
+            {#if pv.hdr && !pv.dovi}<span class="text-amber-400 font-bold">HDR</span>{/if}
+            {#if pv.size}<span class="text-[var(--text-secondary)]">{pv.size}GB</span>{/if}
+          </span>
+        {/each}
       </div>
     {/if}
   </td>
@@ -155,7 +163,6 @@
       </div>
     {/if}
   </td>
-  <td class="p-2 text-sm text-[var(--text-secondary)] hidden lg:table-cell">{item.year ?? ''}</td>
   <td class="p-2 hidden md:table-cell">
     <div class="flex items-center gap-1">
       <Badge label={item.resolution || '?'} />
@@ -184,6 +191,7 @@
         </select>
         <button onclick={handleDownload} disabled={isDownloading} title="Send to JDownloader ({effectiveHost})" aria-label="Send to JDownloader" class="h-6 px-1.5 rounded-r bg-[var(--accent)]/80 hover:bg-[var(--accent)] flex items-center justify-center text-white text-xs transition-colors disabled:opacity-80">{#if isDownloading}<span class="inline-block animate-spin">⟳</span>{:else}&#8595;{/if}</button>
         <button onclick={copyLinks} disabled={copyingLinks} title="Copy {effectiveHost} links (for JDownloader)" aria-label="Copy download links" class="w-6 h-6 rounded hover:bg-[var(--bg-tertiary)] flex items-center justify-center text-[var(--text-secondary)] hover:text-white text-xs transition-colors disabled:opacity-50">{copyingLinks ? '…' : '\u{1F517}'}</button>
+        <button onclick={openSource} title="Open source page" aria-label="Open source page" class="w-6 h-6 rounded hover:bg-[var(--bg-tertiary)] flex items-center justify-center text-[var(--text-secondary)] hover:text-white text-sm transition-colors">&#8599;</button>
         <button onclick={copyUrl} title="Copy page URL" aria-label="Copy URL" class="w-6 h-6 rounded hover:bg-[var(--bg-tertiary)] flex items-center justify-center text-[var(--text-secondary)] hover:text-white text-xs transition-colors">&#128203;</button>
       {/if}
       {#if showLinks && item.imdb_id}
