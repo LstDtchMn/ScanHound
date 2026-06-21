@@ -321,11 +321,16 @@
       const s = d.state as JdRunState | undefined;
       if (s) jdState = s;
     });
-    // Live refresh of JD queue state + download/extraction results while open.
-    // Uses the lightweight /jd-state endpoint, not the full link-list /jd-status
-    // (which can be megabytes on accounts with a large JDownloader history).
+    // Live-update the tracker from the poller's push (instead of only the 5s
+    // poll) — the backend broadcasts download:results whenever a package's
+    // state/bytes/extraction changes.
+    const offResults = connection.on('download:results', (d) => {
+      if (Array.isArray(d.results)) dlResults = d.results as DownloadResult[];
+    });
+    // Periodic fallback refresh (covers any missed push / reconnect) — lightweight
+    // /jd-state, not the full link list (which can be megabytes).
     const id = setInterval(() => { loadResults(); loadJdState(); }, 5000);
-    return () => { clearInterval(id); offState(); };
+    return () => { clearInterval(id); offState(); offResults(); };
   });
 </script>
 

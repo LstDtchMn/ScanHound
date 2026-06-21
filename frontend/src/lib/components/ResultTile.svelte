@@ -59,6 +59,11 @@
     if (item.imdb_id) window.open(`https://www.imdb.com/title/${item.imdb_id}`, '_blank');
   }
 
+  function openSource(e: Event) {
+    e.stopPropagation();
+    if (item.url) window.open(item.url, '_blank');
+  }
+
   function openInPlex(e: Event) {
     e.stopPropagation();
     api.openInPlex(item.title, item.imdb_id ?? undefined, item.plex_rating_key ?? undefined).catch(() => addToast('Error', 'Failed to open in Plex', 'error'));
@@ -146,7 +151,7 @@
   <div class="p-2">
     <!-- Title + year + resolution on one line -->
     <p class="text-sm font-semibold truncate" title={item.title}>
-      {item.title}{#if item.year}<span class="font-normal text-[var(--text-secondary)]"> ({item.year})</span>{/if}
+      {item.title}{#if item.year}<span class="font-normal text-[var(--text-secondary)]">&nbsp;({item.year})</span>{/if}
     </p>
 
     <!-- Metadata row: size, rating, genres -->
@@ -210,6 +215,12 @@
           title="Copy {effectiveHost} links (for JDownloader)"
           class="w-5 h-5 rounded flex items-center justify-center text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] text-[10px] transition-colors disabled:opacity-50"
         >{copyingLinks ? '…' : '\u{1F517}'}</button>
+        <button
+          onclick={openSource}
+          aria-label="Open source page"
+          title="Open source page"
+          class="w-5 h-5 rounded flex items-center justify-center text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] text-xs transition-colors"
+        >&#8599;</button>
         <button
           onclick={copyUrl}
           aria-label="Copy URL"
