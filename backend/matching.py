@@ -644,13 +644,11 @@ class MatchingEngine:
 
         # Max Local Size for comparisons (across ALL matches, not just same_res)
         max_local_size = max([x.get('size', 0) for x in matches]) if matches else 0
-        # Max same-res size for more accurate comparisons
-        max_same_res_size = max([x.get('size', 0) for x in same_res]) if same_res else max_local_size
 
         # Always compare against highest resolution version for upgrade logic
         if exact:
             status, color, info = self.calculate_movie_exact_match_status(
-                web, exact, same_res, all_sorted, max_local_size, max_same_res_size
+                web, exact, same_res, all_sorted, max_local_size
             )
         else:
             status, color, info = self.calculate_movie_fallback_status(web, all_sorted)
@@ -674,8 +672,7 @@ class MatchingEngine:
         exact: PlexItem,
         same_res: List[PlexItem],
         matches: List[PlexItem],
-        max_local_size: float,
-        max_same_res_size: float
+        max_local_size: float
     ) -> Tuple[str, str, str]:
         """Calculate status when exact resolution match exists.
 
@@ -703,60 +700,12 @@ class MatchingEngine:
         status = self.app.STATUS_MISSING
         color = self.app.COLOR_MISSING
 
-        # 0. STRICT RESOLUTION CHECK
-        if is_debug:
-            s_r = self.app.config.get("strict_resolution")
-            self.app.safe_log(f"   > Strict Check: Web={web_res} Local={exact.get('res', '?')} Config={s_r}")
-
-        if self.app.config.get("strict_resolution", False):
-            if (exact.get('res') == '1080p' and web_res == '4K') or \
-               (exact.get('res') == '4K' and web_res == '1080p'):
-                status = self.app.STATUS_MISSING
-                color = self.app.COLOR_MISSING
-
-                # Show all available versions when strict matching finds resolution mismatch
-                def get_version_spec(m):
-                    sz = m.get('size', 0)
-                    r = self.app.EMOJI_4K if m.get('res') == "4K" else m.get('res', '?')
-                    dv = f" {self.app.EMOJI_DV}" if m.get('dovi') else (" HDR" if m.get('hdr') else "")
-                    return f"{r}{dv} ({sz}GB)"
-
-                # Group by resolution to show all versions
-                versions_by_res = {}
-                for m in matches:
-                    res_key = m.get('res', '?')
-                    if res_key not in versions_by_res:
-                        versions_by_res[res_key] = []
-                    versions_by_res[res_key].append(m)
-
-                # Sort resolutions by priority and build info string
-                res_priority = {'4K': 3, '1080p': 2, '720p': 1, '?': 0}
-                sorted_res_keys = sorted(versions_by_res.keys(),
-                                        key=lambda k: res_priority.get(k, 0),
-                                        reverse=True)
-
-                version_specs = []
-                for res_key in sorted_res_keys:
-                    # Get best version of this resolution (highest DV/size)
-                    best = sorted(versions_by_res[res_key],
-                                 key=lambda x: (x.get('dovi', False), x.get('size', 0)),
-                                 reverse=True)[0]
-                    version_specs.append(get_version_spec(best))
-
-                info = "Have " + " + ".join(version_specs)
-                is_upgrade = False
-                if is_debug:
-                    self.app.safe_log("   > Strict Mismatch: Forced MISSING.")
-                logger.debug(
-                    "  strict_res mismatch: web=%s plex=%s → MISSING",
-                    web_res, exact.get('res', '?'),
-                )
-
-        # If strict check passed (didn't force MISSING), proceed to upgrade logic
-        if status == self.app.STATUS_MISSING and not self.app.config.get("strict_resolution", False):
-            status = self.app.STATUS_IN_LIBRARY  # Tentative default if not strict
-        elif status == self.app.STATUS_MISSING and self.app.config.get("strict_resolution", False) and exact.get('res') == web_res:
-            status = self.app.STATUS_IN_LIBRARY  # Strict mode passed (resolutions match)
+        # `exact` is by construction a same-resolution match, so the strict
+        # 1080p<->4K mismatch case can't occur here — that case has no same-res
+        # match and is handled in calculate_movie_fallback_status. So this is an
+        # in-library item; apply the upgrade rules below.
+        if status == self.app.STATUS_MISSING:
+            status = self.app.STATUS_IN_LIBRARY
 
         if status != self.app.STATUS_MISSING:
             # Case 1: Dolby Vision Upgrade
