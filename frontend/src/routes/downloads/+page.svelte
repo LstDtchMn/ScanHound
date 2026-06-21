@@ -152,6 +152,20 @@
     return a === 'ONLINE' ? 'Online' : a === 'OFFLINE' ? 'Broken' : 'Checking';
   }
 
+  // Drag-to-resize a scroll pane (native `resize: vertical`), persisting the
+  // chosen height to localStorage so the JD-links / tracker split stays put.
+  function persistResize(node: HTMLElement, key: string) {
+    try {
+      const saved = localStorage.getItem(key);
+      if (saved) node.style.height = `${saved}px`;
+    } catch { /* ignore */ }
+    const ro = new ResizeObserver(() => {
+      try { localStorage.setItem(key, String(node.offsetHeight)); } catch { /* ignore */ }
+    });
+    ro.observe(node);
+    return { destroy() { ro.disconnect(); } };
+  }
+
   let history = $state<DownloadHistoryEntry[]>([]);
   let loading = $state(false);
   let error = $state('');
@@ -386,7 +400,11 @@
       </div>
     {/if}
     {#if jdInfo.connected && jdVisiblePackages.length > 0}
-      <div class="space-y-1 max-h-96 overflow-auto">
+      <div
+        class="space-y-1 overflow-auto resize-y min-h-24 [max-height:80vh] pb-1"
+        style="height: 24rem"
+        use:persistResize={'sh-jdlinks-h'}
+      >
         {#each jdVisiblePackages as pkg (pkg.uuid)}
           <div class="rounded border {pkg.offline > 0 ? 'border-[var(--error)]/50 bg-[var(--error)]/5' : 'border-[var(--border)]'}">
             <button
@@ -449,7 +467,11 @@
       </span>
       <button onclick={clearResults} class="ml-auto px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)]">Clear</button>
     </div>
-    <div class="space-y-1 max-h-80 overflow-auto">
+    <div
+      class="space-y-1 overflow-auto resize-y min-h-24 [max-height:80vh] pb-1"
+      style="height: 20rem"
+      use:persistResize={'sh-tracker-h'}
+    >
       {#each dlResults as r (r.name)}
         {@const badge = trackerDownloadBadge(r)}
         <div class="flex items-center gap-3 px-3 py-2 rounded border {r.state === 'failed' ? 'border-[var(--error)]/50 bg-[var(--error)]/5' : 'border-[var(--border)]'} text-xs">
@@ -471,7 +493,7 @@
             {/if}
           </div>
           {#if r.host}<span class="text-[var(--text-secondary)] whitespace-nowrap">{r.host}</span>{/if}
-          <span class="text-[10px] text-[var(--text-secondary)] uppercase whitespace-nowrap w-20 text-right">{stateLabel(r.state)}</span>
+          <span class="text-[10px] text-[var(--text-secondary)] uppercase whitespace-nowrap w-20 text-right">{r.state === 'extracted' && r.extraction === 'na' ? 'Complete' : stateLabel(r.state)}</span>
         </div>
       {/each}
     </div>
