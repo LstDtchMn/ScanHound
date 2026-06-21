@@ -6,6 +6,7 @@ Framework-agnostic: communicates via callbacks, no UI dependencies.
 import csv
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -89,6 +90,19 @@ def _normalize_link_url(url: str) -> str:
         return ident.lower()
     except Exception:
         return url.strip().lower()
+
+
+_ARCHIVE_RE = re.compile(r'\.(rar|zip|7z|tar|gz|bz2|tgz|r\d\d|z\d\d|001)$', re.IGNORECASE)
+
+
+def _is_archive_name(name: str) -> bool:
+    """True if a filename looks like an archive JDownloader would extract.
+
+    Direct media files (.mkv/.mp4/...) have nothing to extract, so a package
+    made only of those is *complete* once downloaded — it should not sit at
+    "downloaded" forever waiting for an extraction that never happens.
+    """
+    return bool(_ARCHIVE_RE.search((name or "").strip()))
 
 
 def _ensure_selenium():
@@ -620,6 +634,10 @@ class DownloadService:
                 )
 
             extraction = _agg_extraction(child_links)
+            # A package of only direct media files (no .rar/.zip/...) has nothing
+            # to extract, so once downloaded it is complete — otherwise it sits at
+            # "downloaded" forever waiting for an extraction that never runs.
+            has_archive = any(_is_archive_name(l.get("name") or "") for l in child_links)
             if extraction == "error":
                 state = "failed"
             elif error and not downloaded:
@@ -628,6 +646,8 @@ class DownloadService:
                 state = "extracted"
             elif extraction == "running":
                 state = "extracting"
+            elif downloaded and child_links and not has_archive:
+                state = "extracted"
             elif downloaded:
                 state = "downloaded"
             elif bytes_loaded > 0:

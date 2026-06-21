@@ -1420,6 +1420,36 @@ class TestPollResults:
         assert results[0]["state"] == "extracting"
         assert results[0]["host"] == "rapidgator.net"
 
+    def test_direct_file_download_is_complete(self):
+        # A finished direct media file (no archive) is complete, not stuck at
+        # "downloaded" waiting for an extraction that never runs.
+        svc, _db = self._svc()
+        pkg = {"name": "Movie.2026.2160p.WEB.mkv", "uuid": 1, "bytesLoaded": 1000,
+               "bytesTotal": 1000, "finished": True, "status": ""}
+        link = {"packageUUID": 1, "host": "rapidgator.net", "url": "http://rg/f",
+                "name": "Movie.2026.2160p.WEB.h265-EDITH.mkv", "finished": True,
+                "status": "Finished", "extractionStatus": None,
+                "bytesTotal": 1000, "bytesLoaded": 1000}
+        device = self._device(packages=[pkg], links=[link])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["state"] == "extracted"
+        assert results[0]["extraction"] == "na"
+
+    def test_downloaded_archive_awaits_extraction(self):
+        # An archive that just finished downloading (no extraction status yet)
+        # stays "downloaded" — not prematurely marked complete.
+        svc, _db = self._svc()
+        pkg = {"name": "Movie.Pkg", "uuid": 1, "bytesLoaded": 1000,
+               "bytesTotal": 1000, "finished": True, "status": ""}
+        link = {"packageUUID": 1, "host": "rapidgator.net", "url": "http://rg/f",
+                "name": "movie.part01.rar", "finished": True, "status": "",
+                "extractionStatus": None, "bytesTotal": 1000, "bytesLoaded": 1000}
+        device = self._device(packages=[pkg], links=[link])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["state"] == "downloaded"
+
     def test_extracted_state(self):
         svc, _db = self._svc()
         pkg = {"name": "Pkg.Done3", "uuid": 1, "bytesLoaded": 1000, "bytesTotal": 1000, "finished": True, "status": ""}
