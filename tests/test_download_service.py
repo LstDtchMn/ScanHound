@@ -1380,6 +1380,20 @@ class TestNormalizeLinkUrl:
         assert n("") == ""
 
 
+class TestDownloadHistoryStatusFilter:
+    def test_failed_grabs_excluded_from_history(self, db_manager):
+        """A failed grab must NOT count as a prior download — otherwise the scan
+        list would wrongly mark the item as Downloaded on the next scan."""
+        db_manager.add_to_history("http://ok.com", "Good", status="completed")
+        db_manager.add_to_history("http://bad.com", "Bad", status="failed")
+        db_manager.add_to_history("http://legacy.com", "Legacy")  # default 'completed'
+        svc = _make_service(db=db_manager)
+        hist = svc.load_download_history()
+        assert "http://ok.com" in hist
+        assert "http://legacy.com" in hist
+        assert "http://bad.com" not in hist
+
+
 class TestPollResults:
     def _device(self, packages=None, links=None, raise_on_packages=False, raise_on_links=False):
         device = MagicMock()

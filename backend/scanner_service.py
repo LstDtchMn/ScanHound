@@ -1074,7 +1074,9 @@ class ScannerService:
             with self.db.transaction() as conn:
                 if not conn:
                     return set()
-                rows = conn.execute("SELECT url FROM downloads").fetchall()
+                rows = conn.execute(
+                    "SELECT url FROM downloads WHERE COALESCE(status, 'completed') != 'failed'"
+                ).fetchall()
                 urls = {row[0] for row in rows}
 
                 # Also build title-based lookup for TV show matching
@@ -1083,7 +1085,8 @@ class ScannerService:
                 self._downloaded_titles_lookup.clear()
                 title_rows = conn.execute(
                     "SELECT normalized_title, season, resolution, size, url "
-                    "FROM downloads WHERE normalized_title IS NOT NULL"
+                    "FROM downloads WHERE normalized_title IS NOT NULL "
+                    "AND COALESCE(status, 'completed') != 'failed'"
                 ).fetchall()
 
             for row in title_rows:

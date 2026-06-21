@@ -189,7 +189,9 @@ class DownloadService:
             with self.db.transaction() as conn:
                 if not conn:
                     return set()
-                rows = conn.execute("SELECT url FROM downloads").fetchall()
+                rows = conn.execute(
+                    "SELECT url FROM downloads WHERE COALESCE(status, 'completed') != 'failed'"
+                ).fetchall()
                 return {row[0] for row in rows}
         except Exception:
             return set()
