@@ -46,6 +46,7 @@ class AppConfig(TypedDict, total=False):
     show_rg: bool
     show_nf: bool
     show_links: bool
+    show_genres: bool
 
     # Cache Settings
     cache_duration: int  # hours
@@ -281,6 +282,7 @@ _DEFAULT_CONFIG: AppConfig = {
     "show_rg": True,
     "show_nf": True,
     "show_links": True,
+    "show_genres": True,
     "cache_duration": 4,
     "plex_refresh_mode": "auto",
     "plex_invalidate_on_new_content": True,

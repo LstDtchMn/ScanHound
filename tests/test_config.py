@@ -57,7 +57,7 @@ EXPECTED_DEFAULT_KEYS = {
     # Size / resolution
     "min_size_mb", "pref_res",
     # Display
-    "show_rating", "show_votes", "show_rt", "show_rg", "show_nf", "show_links",
+    "show_rating", "show_votes", "show_rt", "show_rg", "show_nf", "show_links", "show_genres",
     # Cache
     "cache_duration", "plex_refresh_mode", "plex_invalidate_on_new_content",
     # Filtering

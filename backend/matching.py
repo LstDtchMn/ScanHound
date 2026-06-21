@@ -690,7 +690,6 @@ class MatchingEngine:
         w_size = self.app.parse_size(web.get('size', '0'))
         sens = self.app.config.get("upgrade_sensitivity", 2) / 100.0
         is_upgrade = False
-        is_debug = self.app.config.get("debug_mode", False)
 
         # Define display tags early for use in logic
         dv_tag = f" {self.app.EMOJI_DV}" if exact.get('dovi') else (" HDR" if exact.get('hdr') else "")
