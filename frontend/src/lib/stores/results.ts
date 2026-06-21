@@ -17,19 +17,34 @@ export type SortOption =
   | 'posted-desc'
   | 'posted-asc';
 
+/** A writable store backed by localStorage (SSR-safe), so the user's view
+ *  mode and sort choice persist across reloads. */
+function persisted<T>(key: string, fallback: T) {
+  let initial = fallback;
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;
+    if (raw != null) initial = JSON.parse(raw) as T;
+  } catch { /* ignore */ }
+  const store = writable<T>(initial);
+  store.subscribe((v) => {
+    try { if (typeof localStorage !== 'undefined') localStorage.setItem(key, JSON.stringify(v)); } catch { /* ignore */ }
+  });
+  return store;
+}
+
 export const results = writable<ScanResult[]>([]);
 export const statusFilter = writable<StatusFilter>('all');
 export const searchFilter = writable<string>('');
 export const genreFilter = writable<string>('');
 export const languageFilter = writable<string>('');
-export const viewMode = writable<ViewMode>('grid');
+export const viewMode = persisted<ViewMode>('sh-view-mode', 'grid');
 export const stats = writable<ScanStats>({
   total: 0,
   missing: 0,
   upgrade: 0,
   library: 0
 });
-export const sortBy = writable<SortOption>('title-asc');
+export const sortBy = persisted<SortOption>('sh-sort-by', 'posted-desc');
 export const selectedKeys = writable<Set<string>>(new Set());
 let activeScanResultCount = 0;
 
