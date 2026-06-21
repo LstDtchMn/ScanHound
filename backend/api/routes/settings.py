@@ -44,8 +44,8 @@ def _validate_outbound_url(url: str) -> None:
 
 
 SENSITIVE_KEYS = {
-    "plex_token", "tmdb_api_key", "omdb_api_key", "cuty_password",
-    "adithd_password", "discord_webhook", "smtp_password",
+    "plex_token", "plex_password", "tmdb_api_key", "omdb_api_key", "cuty_password",
+    "adithd_password", "jd_password", "discord_webhook", "smtp_password",
     "pushover_token", "slack_webhook", "webhook_url",
 }
 

@@ -75,6 +75,17 @@ class TestSettings:
         data = resp.json()
         assert data["plex_token"] != "secret123"
 
+    def test_get_settings_masks_all_passwords(self, client):
+        # Every password/secret — incl. jd_password & plex_password — must be masked.
+        client.put("/settings", json={
+            "jd_password": "jdsecret", "plex_password": "plexsecret",
+            "adithd_password": "aditsecret", "smtp_password": "smtpsecret",
+        })
+        data = client.get("/settings").json()
+        for k, secret in [("jd_password", "jdsecret"), ("plex_password", "plexsecret"),
+                          ("adithd_password", "aditsecret"), ("smtp_password", "smtpsecret")]:
+            assert data.get(k) != secret, f"{k} was returned in plaintext"
+
     def test_put_settings_partial_update(self, client):
         resp = client.put("/settings", json={"theme_mode": "light"})
         assert resp.status_code == 200
