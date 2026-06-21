@@ -45,6 +45,21 @@ export const stats = writable<ScanStats>({
   library: 0
 });
 export const sortBy = persisted<SortOption>('sh-sort-by', 'posted-desc');
+
+export type Density = 'comfortable' | 'compact';
+export const density = persisted<Density>('sh-density', 'comfortable');
+
+export interface VisibleColumns { rating: boolean; res: boolean; size: boolean; status: boolean; }
+export const visibleColumns = persisted<VisibleColumns>('sh-columns', {
+  rating: true, res: true, size: true, status: true,
+});
+
+/** Active quick-filter chips: any of '4k' | 'hdrdv' | 'inplex'. */
+export const quickFilters = persisted<string[]>('sh-quick-filters', []);
+export function toggleQuickFilter(key: string) {
+  quickFilters.update((q) => (q.includes(key) ? q.filter((k) => k !== key) : [...q, key]));
+}
+
 export const selectedKeys = writable<Set<string>>(new Set());
 let activeScanResultCount = 0;
 
@@ -121,9 +136,14 @@ export const availableLanguages = derived(results, ($results) => {
   return [...set].sort();
 });
 
+/** True if the result has at least one matching copy already in Plex. */
+function hasPlexCopy(i: ScanResult): boolean {
+  try { return JSON.parse(i.plex_versions || '[]').length > 0; } catch { return false; }
+}
+
 export const filteredResults = derived(
-  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy],
-  ([$results, $filter, $search, $genre, $language, $sort]) => {
+  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters],
+  ([$results, $filter, $search, $genre, $language, $sort, $quick]) => {
     let items = $results;
     if ($filter !== 'all') {
       items = items.filter(
@@ -140,6 +160,10 @@ export const filteredResults = derived(
     if ($language) {
       items = items.filter((i) => i.language === $language);
     }
+    // Quick-filter chips (AND-combined with the above)
+    if ($quick.includes('4k')) items = items.filter((i) => i.resolution === '4K');
+    if ($quick.includes('hdrdv')) items = items.filter((i) => i.dovi || (!!i.hdr && i.hdr !== 'SDR'));
+    if ($quick.includes('inplex')) items = items.filter(hasPlexCopy);
     // Sort
     items = [...items].sort((a, b) => {
       switch ($sort) {

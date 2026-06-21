@@ -6,7 +6,7 @@
   import ResultRow from '$lib/components/ResultRow.svelte';
   import ContextMenu from '$lib/components/ContextMenu.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
-  import { filteredResults, viewMode, results, stats, selectedDetail, focusedIndex, toggleSelect } from '$lib/stores/results';
+  import { filteredResults, viewMode, results, stats, selectedDetail, focusedIndex, toggleSelect, visibleColumns } from '$lib/stores/results';
   import { scanState, scanProgress, scanPhase } from '$lib/stores/scanner';
   import { settings, settingsLoaded, loadSettings } from '$lib/stores/settings';
   import { plexConnected, plexMovieCount, plexTvCount, refreshPlexStatus } from '$lib/stores/plex';
@@ -321,17 +321,18 @@
       {/each}
     </div>
   {:else}
+    {@const cols = $visibleColumns}
     <div class="overflow-x-auto">
     <table class="w-full text-left">
-      <thead class="text-xs text-[var(--text-secondary)] border-b border-[var(--border)]">
+      <thead class="text-xs text-[var(--text-secondary)] sticky top-0 z-10 [&_th]:bg-[var(--bg-primary)] [&_th]:border-b [&_th]:border-[var(--border)]">
         <tr>
           <th class="p-2 w-8"></th>
           <th class="p-2 w-10 hidden sm:table-cell"></th>
           <th class="p-2 max-w-[640px]">Title</th>
-          <th class="p-2">Rating</th>
-          <th class="p-2 hidden md:table-cell">Res</th>
-          <th class="p-2 hidden lg:table-cell">Size</th>
-          <th class="p-2">Status</th>
+          {#if cols.rating}<th class="p-2">Rating</th>{/if}
+          {#if cols.res}<th class="p-2 hidden md:table-cell">Res</th>{/if}
+          {#if cols.size}<th class="p-2 hidden lg:table-cell">Size</th>{/if}
+          {#if cols.status}<th class="p-2">Status</th>{/if}
           <th class="p-2">Actions</th>
         </tr>
       </thead>
@@ -345,7 +346,7 @@
               tabindex="0"
               role="button"
             >
-              <td colspan="8" class="px-2 py-1.5">
+              <td colspan="99" class="px-2 py-1.5">
                 <div class="flex items-center gap-2">
                   <span class="text-[10px] text-[var(--text-secondary)] transition-transform {collapsedGroups.has(group.title) ? '' : 'rotate-90'}">&triangleright;</span>
                   <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>
@@ -358,7 +359,7 @@
           {/if}
           {#if !collapsedGroups.has(group.title)}
             {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
-              <ResultRow {item} focused={flatIndexMap().get(item) === $focusedIndex} oncontextmenu={(e) => handleContextMenu(e, item)} />
+              <ResultRow {item} focused={flatIndexMap().get(item) === $focusedIndex} zebra={((flatIndexMap().get(item) ?? 0) % 2) === 1} oncontextmenu={(e) => handleContextMenu(e, item)} />
             {/each}
           {/if}
         {/each}

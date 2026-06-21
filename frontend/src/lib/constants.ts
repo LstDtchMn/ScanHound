@@ -37,6 +37,17 @@ export function statusVariant(status: string | null | undefined): BadgeVariant {
   return 'default';
 }
 
+/** Left-border color for a scan-result row, keyed to its status. */
+export function statusBorderColor(status: string | null | undefined): string {
+  switch (statusVariant(status)) {
+    case 'error': return 'var(--error)';
+    case 'warning': return 'var(--warning)';
+    case 'success': return 'var(--success)';
+    case 'accent': return 'var(--accent)';
+    default: return 'var(--border)';
+  }
+}
+
 /** Map download history status → Badge variant. */
 export function historyStatusVariant(status?: string): BadgeVariant {
   if (!status) return 'default';

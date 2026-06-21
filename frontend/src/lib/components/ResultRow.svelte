@@ -5,7 +5,8 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import { downloadHost, activeDownload } from '$lib/stores/downloads';
-  import { statusVariant, formatStatus, formatCount } from '$lib/constants';
+  import { density, visibleColumns } from '$lib/stores/results';
+  import { statusVariant, statusBorderColor, formatStatus, formatCount } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
 
   let showRating = $derived($settings.show_rating ?? true);
@@ -14,12 +15,20 @@
   let showGenres = $derived($settings.show_genres ?? true);
   let showLinks = $derived($settings.show_links ?? true);
 
+  // Density: compact trims padding + shrinks the poster; comfortable is roomier.
+  let compact = $derived($density === 'compact');
+  let cellPad = $derived(compact ? 'p-1.5' : 'p-2.5');
+  let posterW = $derived(compact ? 44 : 64);
+  let posterH = $derived(compact ? 66 : 96);
+  let cols = $derived($visibleColumns);
+
   interface Props {
     item: ScanResult;
     focused?: boolean;
+    zebra?: boolean;
     oncontextmenu?: (e: MouseEvent) => void;
   }
-  let { item, focused = false, oncontextmenu: ctxHandler }: Props = $props();
+  let { item, focused = false, zebra = false, oncontextmenu: ctxHandler }: Props = $props();
 
   // Select by unique url, not group_key (same-title releases share group_key)
   let selected = $derived($selectedKeys.has(item.url));
@@ -101,22 +110,23 @@
 
 <tr
   class="border-b border-[var(--border)] hover:bg-[var(--bg-tertiary)] transition-colors cursor-pointer
-    {selected ? 'bg-[var(--accent)]/5' : ''}
+    {selected ? 'bg-[var(--accent)]/5' : (zebra ? 'bg-[var(--bg-secondary)]/40' : '')}
     {focused ? 'outline outline-2 outline-[var(--accent)] -outline-offset-2' : ''}"
+  style="border-left: 3px solid {statusBorderColor(item.status)};"
   onclick={() => selectedDetail.set(item)}
   oncontextmenu={ctxHandler}
 >
-  <td class="p-2 w-8">
+  <td class="{cellPad} w-8">
     <input type="checkbox" checked={selected} class="accent-[var(--accent)]" onclick={(e) => { e.stopPropagation(); toggleSelect(item.url); }} />
   </td>
-  <td class="p-2 hidden sm:table-cell" style="width:56px; min-width:56px;">
+  <td class="{cellPad} hidden sm:table-cell" style="width:{posterW + 8}px;">
     {#if item.poster_url}
-      <img src={item.poster_url} alt="" class="h-[72px] object-cover rounded shadow-sm" style="width:48px; min-width:48px;" loading="lazy" />
+      <img src={item.poster_url} alt="" class="object-cover rounded shadow-sm" style="width:{posterW}px; height:{posterH}px;" loading="lazy" />
     {:else}
-      <div class="h-[72px] bg-[var(--bg-tertiary)] rounded" style="width:48px; min-width:48px;"></div>
+      <div class="bg-[var(--bg-tertiary)] rounded" style="width:{posterW}px; height:{posterH}px;"></div>
     {/if}
   </td>
-  <td class="p-2 max-w-[640px] overflow-hidden">
+  <td class="{cellPad} max-w-[640px] overflow-hidden">
     <!-- Title with the year folded in -->
     <div class="text-sm truncate" title={item.title}>
       <span class="font-semibold">{item.title}</span>{#if item.year}<span class="text-[var(--text-secondary)] font-normal"> ({item.year})</span>{/if}
@@ -148,7 +158,8 @@
     {/if}
   </td>
   <!-- Rating (IMDb + Rotten Tomatoes icon) — promoted to second data column -->
-  <td class="p-2 text-sm">
+  {#if cols.rating}
+  <td class="{cellPad} text-sm">
     {#if showRating && item.rating != null}
       <div class="flex items-center gap-1 whitespace-nowrap">
         <span aria-hidden="true">⭐</span>
@@ -163,18 +174,25 @@
       </div>
     {/if}
   </td>
-  <td class="p-2 hidden md:table-cell">
+  {/if}
+  {#if cols.res}
+  <td class="{cellPad} hidden md:table-cell">
     <div class="flex items-center gap-1">
       <Badge label={item.resolution || '?'} />
       {#if item.dovi}<Badge label="DV" variant="accent" />{/if}
       {#if item.hdr && item.hdr !== 'SDR' && !item.dovi}<Badge label="HDR" variant="warning" />{/if}
     </div>
   </td>
-  <td class="p-2 text-sm text-[var(--text-secondary)] hidden lg:table-cell">{item.size}</td>
-  <td class="p-2">
+  {/if}
+  {#if cols.size}
+  <td class="{cellPad} text-sm text-[var(--text-secondary)] hidden lg:table-cell">{item.size}</td>
+  {/if}
+  {#if cols.status}
+  <td class="{cellPad}">
     <Badge label={formatStatus(item.status)} variant={statusVariant(item.status)} />
   </td>
-  <td class="p-2">
+  {/if}
+  <td class="{cellPad}">
     <div class="flex items-center gap-0.5">
       {#if item.url}
         <!-- Per-item host selector -->

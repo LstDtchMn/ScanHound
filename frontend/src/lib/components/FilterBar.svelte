@@ -1,9 +1,24 @@
 <script lang="ts">
-  import { statusFilter, searchFilter, genreFilter, languageFilter, viewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages } from '$lib/stores/results';
+  import { statusFilter, searchFilter, genreFilter, languageFilter, viewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, visibleColumns } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import type { StatusFilter, SortOption } from '$lib/stores/results';
+
+  const quickChips = [
+    { key: '4k', label: '4K' },
+    { key: 'hdrdv', label: 'HDR/DV' },
+    { key: 'inplex', label: 'In Plex' },
+  ];
+  const columnDefs = [
+    { key: 'rating', label: 'Rating' },
+    { key: 'res', label: 'Res' },
+    { key: 'size', label: 'Size' },
+    { key: 'status', label: 'Status' },
+  ] as const;
+  function toggleColumn(key: 'rating' | 'res' | 'size' | 'status') {
+    visibleColumns.update((c) => ({ ...c, [key]: !c[key] }));
+  }
 
   const sortOptions: { value: SortOption; label: string }[] = [
     { value: 'title-asc', label: 'Title (A–Z)' },
@@ -126,6 +141,22 @@
     {/each}
   </div>
 
+  <!-- Quick-filter chips -->
+  <div class="flex gap-0.5">
+    {#each quickChips as chip}
+      <button
+        onclick={() => toggleQuickFilter(chip.key)}
+        class="px-2 py-1 rounded text-[11px] font-medium transition-colors border
+          {$quickFilters.includes(chip.key)
+            ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]'
+            : 'border-transparent text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'}"
+        title="Show only {chip.label}"
+      >
+        {chip.label}
+      </button>
+    {/each}
+  </div>
+
   {#if resultCount > 0}
     <div class="flex items-center gap-0.5">
       <button
@@ -238,6 +269,32 @@
     placeholder="Filter results..."
     class="bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-2 py-1 rounded border border-[var(--border)] text-xs w-36 min-w-0 focus:outline-none focus:border-[var(--accent)]"
   />
+
+  {#if $viewMode === 'list'}
+    <!-- Density toggle (list view) -->
+    <div class="flex gap-0.5 bg-[var(--bg-tertiary)] rounded p-0.5">
+      <button onclick={() => density.set('comfortable')} aria-label="Comfortable rows" title="Comfortable rows"
+        class="p-1 rounded transition-colors {$density === 'comfortable' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 20 20"><path d="M3 5h14M3 10h14M3 15h14"/></svg>
+      </button>
+      <button onclick={() => density.set('compact')} aria-label="Compact rows" title="Compact rows"
+        class="p-1 rounded transition-colors {$density === 'compact' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 20 20"><path d="M3 4h14M3 8h14M3 12h14M3 16h14"/></svg>
+      </button>
+    </div>
+    <!-- Column show/hide (list view) -->
+    <details class="relative">
+      <summary class="list-none cursor-pointer px-2 py-1 rounded text-[11px] text-[var(--text-secondary)] bg-[var(--bg-tertiary)] border border-[var(--border)] hover:border-[var(--accent)] select-none">Columns &#9662;</summary>
+      <div class="absolute right-0 mt-1 z-20 w-32 bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg shadow-lg p-1.5">
+        {#each columnDefs as c}
+          <label class="flex items-center gap-2 px-2 py-1 rounded text-xs cursor-pointer hover:bg-[var(--bg-tertiary)]">
+            <input type="checkbox" checked={$visibleColumns[c.key]} onchange={() => toggleColumn(c.key)} class="accent-[var(--accent)]" />
+            {c.label}
+          </label>
+        {/each}
+      </div>
+    </details>
+  {/if}
 
   <div class="flex gap-0.5 bg-[var(--bg-tertiary)] rounded p-0.5">
     <button
