@@ -841,6 +841,32 @@
               />
             </label>
           {/if}
+
+          <div class="pt-3 mt-1 border-t border-[var(--border)] space-y-3">
+            <p class="text-xs text-[var(--text-secondary)]">
+              Optional per-type download folders. When set, movie grabs go to the Movies path and TV grabs (items with a season) to the TV path — JDownloader extracts there. Leave blank to use JDownloader's default folder.
+            </p>
+            <label class="block">
+              <span class="text-sm text-[var(--text-secondary)]">Movies Download Folder</span>
+              <input
+                type="text"
+                value={$settings.jd_movies_folder as string ?? ''}
+                oninput={(e) => settings.update((s) => ({ ...s, jd_movies_folder: e.currentTarget.value }))}
+                placeholder="e.g. /downloads/Movies"
+                class={inputClass}
+              />
+            </label>
+            <label class="block">
+              <span class="text-sm text-[var(--text-secondary)]">TV Shows Download Folder</span>
+              <input
+                type="text"
+                value={$settings.jd_tv_folder as string ?? ''}
+                oninput={(e) => settings.update((s) => ({ ...s, jd_tv_folder: e.currentTarget.value }))}
+                placeholder="e.g. /downloads/TV"
+                class={inputClass}
+              />
+            </label>
+          </div>
         </div>
       </section>
 

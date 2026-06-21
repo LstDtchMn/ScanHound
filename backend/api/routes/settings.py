@@ -116,6 +116,8 @@ class SettingsUpdate(BaseModel):
     jd_enabled: Optional[bool] = None
     jd_method: Optional[str] = None
     jd_folder: Optional[str] = None
+    jd_movies_folder: Optional[str] = None
+    jd_tv_folder: Optional[str] = None
     jd_email: Optional[str] = None
     jd_password: Optional[str] = None
     jd_device: Optional[str] = None

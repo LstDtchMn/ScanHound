@@ -1068,6 +1068,41 @@ class TestDownloadItem:
         assert result["success"] is True
         assert result["method"] == "jdownloader"
 
+    def test_movie_routes_to_movies_folder(self):
+        svc = _make_service(config={"jd_enabled": True, "jd_method": "api",
+                                    "jd_movies_folder": "/dl/Movies", "jd_tv_folder": "/dl/TV"})
+        svc.scrape_links = MagicMock(return_value=["http://rg.net/f1"])
+        svc.send_to_jdownloader = MagicMock(return_value=True)
+        svc.save_to_history = MagicMock()
+        svc.download_item("http://page.com", "Movie", None, "4K", "50 GB")  # season None -> movie
+        assert svc.send_to_jdownloader.call_args.kwargs["destination"] == "/dl/Movies"
+
+    def test_tv_routes_to_tv_folder(self):
+        svc = _make_service(config={"jd_enabled": True, "jd_method": "api",
+                                    "jd_movies_folder": "/dl/Movies", "jd_tv_folder": "/dl/TV"})
+        svc.scrape_links = MagicMock(return_value=["http://rg.net/f1"])
+        svc.send_to_jdownloader = MagicMock(return_value=True)
+        svc.save_to_history = MagicMock()
+        svc.download_item("http://page.com", "Show", 2, "1080p", "10 GB")  # season 2 -> TV
+        assert svc.send_to_jdownloader.call_args.kwargs["destination"] == "/dl/TV"
+
+    def test_no_per_type_folder_sends_empty_destination(self):
+        svc = _make_service(config={"jd_enabled": True, "jd_method": "api"})
+        svc.scrape_links = MagicMock(return_value=["http://rg.net/f1"])
+        svc.send_to_jdownloader = MagicMock(return_value=True)
+        svc.save_to_history = MagicMock()
+        svc.download_item("http://page.com", "Movie", None, "4K", "50 GB")
+        assert svc.send_to_jdownloader.call_args.kwargs["destination"] == ""
+
+    def test_send_to_jdownloader_api_sets_destination_folder(self):
+        svc = _make_service(config={"jd_method": "api"})
+        device = MagicMock()
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            ok = svc.send_to_jdownloader(["http://rg/f1"], "Pkg", destination="/dl/Movies")
+        assert ok is True
+        payload = device.linkgrabber.add_links.call_args[0][0]
+        assert payload[0]["destinationFolder"] == "/dl/Movies"
+
 
 # ======================================================================
 # open_in_plex

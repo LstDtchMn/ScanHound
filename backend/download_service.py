@@ -219,8 +219,13 @@ class DownloadService:
     # ── JDownloader ───────────────────────────────────────────────────
 
     def send_to_jdownloader(self, links: List[str], package_name: str,
+                              destination: str = "",
                               progress_callback: Optional[Callable] = None) -> bool:
-        """Send links to JDownloader. Returns True on success."""
+        """Send links to JDownloader. Returns True on success.
+
+        ``destination`` optionally pins the download folder (per-type routing,
+        e.g. a movies vs TV path); JDownloader extracts into it.
+        """
         jd_method = self.config.get("jd_method", "folder")
 
         if jd_method == "folder":
@@ -233,6 +238,8 @@ class DownloadService:
                         with open(filepath, 'w', encoding='utf-8') as f:
                             f.write(f"text={link}\n")
                             f.write(f"packageName={package_name[:50]}\n")
+                            if destination:
+                                f.write(f"downloadFolder={destination}\n")
                             f.write("autoStart=TRUE\n\n")
                     self._log(f"Sent {len(links)} links to JDownloader folder", "success")
                     return True
@@ -244,11 +251,14 @@ class DownloadService:
                 return False
 
         elif jd_method == "api":
-            payload = [{
+            pkg = {
                 "autostart": True,
                 "links": "\n".join(links),
                 "packageName": package_name[:50],
-            }]
+            }
+            if destination:
+                pkg["destinationFolder"] = destination
+            payload = [pkg]
             # Try the cached connection first; if it fails (e.g. a stale device
             # handle after JD restarted or the session expired), drop the cache
             # and retry once with a fresh forced reconnect so a single grab can
@@ -1616,8 +1626,14 @@ class DownloadService:
         else:
             package_name = "ScanHound Download"
 
+        # Per-type download folder: TV (has a season) vs movies, when configured.
+        if season is not None:
+            destination = (self.config.get("jd_tv_folder") or "").strip()
+        else:
+            destination = (self.config.get("jd_movies_folder") or "").strip()
+
         if self.config.get("jd_enabled", False) and (jd_folder or jd_method == "api"):
-            if self.send_to_jdownloader(links, package_name, progress_callback=_cb):
+            if self.send_to_jdownloader(links, package_name, destination=destination, progress_callback=_cb):
                 result["success"] = True
                 result["method"] = "jdownloader"
                 result["message"] = f"Sent {len(links)} links to JDownloader"

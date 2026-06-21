@@ -73,6 +73,8 @@ class AppConfig(TypedDict, total=False):
     jd_enabled: bool
     jd_method: Literal["folder", "api"]
     jd_folder: str
+    jd_movies_folder: str
+    jd_tv_folder: str
     jd_email: str
     jd_password: str
     jd_device: str
@@ -290,6 +292,8 @@ _DEFAULT_CONFIG: AppConfig = {
     "jd_enabled": False,
     "jd_method": "folder",
     "jd_folder": "",
+    "jd_movies_folder": "",
+    "jd_tv_folder": "",
     "jd_email": "",
     "jd_password": "",
     "jd_device": "",

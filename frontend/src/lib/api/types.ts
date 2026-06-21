@@ -211,6 +211,8 @@ export interface Settings {
   jd_enabled?: boolean;
   jd_method?: string;
   jd_folder?: string;
+  jd_movies_folder?: string;
+  jd_tv_folder?: string;
   jd_email?: string;
   jd_password?: string;
   jd_device?: string;
