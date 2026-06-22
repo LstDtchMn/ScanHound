@@ -124,7 +124,7 @@
   }
 </script>
 
-<div class="flex flex-col h-full overflow-auto p-6 gap-6">
+<div class="flex flex-col h-full overflow-auto p-4 md:p-6 gap-4 md:gap-6">
   <div class="flex items-center justify-between">
     <h1 class="text-xl font-bold">Analytics</h1>
     {#if data}

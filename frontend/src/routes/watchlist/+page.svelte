@@ -323,7 +323,7 @@
   <div class="fixed inset-0 z-40" role="button" tabindex="-1" onclick={() => (showImportMenu = false)} onkeydown={(e: KeyboardEvent) => { if (e.key === 'Escape') showImportMenu = false; }}></div>
 {/if}
 
-<div class="flex flex-col h-full overflow-auto p-6 gap-4" bind:this={pageContainer}>
+<div class="flex flex-col h-full overflow-auto p-4 md:p-6 gap-4" bind:this={pageContainer}>
   <div class="flex items-center justify-between">
     <h1 class="text-xl font-bold">Watchlist</h1>
     <div class="flex items-center gap-2">
@@ -593,8 +593,8 @@
             <!-- Priority badge -->
             <Badge label={priorityLabels[item.priority] || ''} variant={priorityVariant(item.priority)} />
 
-            <!-- Hover action buttons -->
-            <div class="flex items-center gap-1 opacity-50 group-hover:opacity-100 transition-opacity">
+            <!-- Action buttons (always visible on touch; hover-reveal on desktop) -->
+            <div class="flex items-center gap-1 opacity-100 md:opacity-50 md:group-hover:opacity-100 transition-opacity">
               <!-- Edit (pencil) -->
               <button
                 class="p-1.5 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"

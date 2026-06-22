@@ -196,7 +196,7 @@
     </div>
   </div>
 
-  <div class="p-6 max-w-2xl mx-auto w-full">
+  <div class="p-4 md:p-6 max-w-2xl mx-auto w-full">
     {#if activeTab === 'general'}
       <section class="space-y-4">
         <h2 class="text-lg font-semibold">General Settings</h2>

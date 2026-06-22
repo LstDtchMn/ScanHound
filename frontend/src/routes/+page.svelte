@@ -5,6 +5,7 @@
   import ResultTile from '$lib/components/ResultTile.svelte';
   import ResultRow from '$lib/components/ResultRow.svelte';
   import ContextMenu from '$lib/components/ContextMenu.svelte';
+  import ResultActionSheet from '$lib/components/ResultActionSheet.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
   import SwipeDeck from '$lib/components/SwipeDeck.svelte';
   import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, visibleColumns, hydrateDismissed } from '$lib/stores/results';
@@ -61,6 +62,7 @@
   );
 
   let contextMenu = $state<{ item: ScanResult; x: number; y: number } | null>(null);
+  let mobileActionItem = $state<ScanResult | null>(null);
   let currentPage = $state(1);
   const perPage = 100;
   let collapsedGroups = $state<Set<string>>(new Set());
@@ -235,7 +237,13 @@
 
   function handleContextMenu(e: MouseEvent, item: ScanResult) {
     e.preventDefault();
-    contextMenu = { item, x: e.clientX, y: e.clientY };
+    // On touch, long-press fires `contextmenu` — show a bottom sheet instead of
+    // a cursor-positioned popup.
+    if (get(mobile)) {
+      mobileActionItem = item;
+    } else {
+      contextMenu = { item, x: e.clientX, y: e.clientY };
+    }
   }
 </script>
 
@@ -315,7 +323,7 @@
               <div class="grid gap-4" style={gridStyle} transition:slide={{ duration: 150 }}>
                 {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
                   <div oncontextmenu={(e) => handleContextMenu(e, item)}>
-                    <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} />
+                    <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} onmore={() => (mobileActionItem = item)} />
                   </div>
                 {/each}
               </div>
@@ -324,7 +332,7 @@
         {:else}
           {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
             <div oncontextmenu={(e) => handleContextMenu(e, item)}>
-              <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} />
+              <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} onmore={() => (mobileActionItem = item)} />
             </div>
           {/each}
         {/if}
@@ -558,6 +566,8 @@
     onclose={() => (contextMenu = null)}
   />
 {/if}
+
+<ResultActionSheet item={mobileActionItem} onclose={() => (mobileActionItem = null)} />
 
 {#if $selectedDetail}
   <DetailPanel item={$selectedDetail} onclose={() => selectedDetail.set(null)} />

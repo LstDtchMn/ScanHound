@@ -17,8 +17,9 @@
   interface Props {
     item: ScanResult;
     focused?: boolean;
+    onmore?: () => void;
   }
-  let { item, focused = false }: Props = $props();
+  let { item, focused = false, onmore }: Props = $props();
 
   // Select by unique url, not group_key (same-title releases share group_key)
   let selected = $derived($selectedKeys.has(item.url));
@@ -135,6 +136,15 @@
       {#if item.dovi}<Badge label="DV" variant="accent" />{/if}
       {#if item.hdr && !item.dovi}<Badge label="HDR" variant="warning" />{/if}
     </div>
+
+    <!-- Mobile actions trigger -->
+    {#if onmore}
+      <button
+        onclick={(e) => { e.stopPropagation(); onmore?.(); }}
+        aria-label="Actions"
+        class="md:hidden absolute bottom-1.5 right-1.5 w-8 h-8 rounded-full bg-black/55 text-white flex items-center justify-center text-lg leading-none"
+      >⋯</button>
+    {/if}
 
     <!-- Selection checkbox — top left -->
     <input

@@ -335,7 +335,7 @@
 </script>
 
 <div class="p-4 border-b border-[var(--border)]">
-  <div class="flex items-center gap-3">
+  <div class="flex items-center gap-3 flex-wrap">
     <h1 class="text-lg font-semibold">Downloads</h1>
     <button
       onclick={downloadSelected}
