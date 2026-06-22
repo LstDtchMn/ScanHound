@@ -1,12 +1,13 @@
 <script lang="ts">
   import {
     deckResults, results, selectedKeys, selectedDetail,
-    dismissItem, restoreItem, toggleSelect, deselectAll
+    dismissItem, restoreItem, toggleSelect, deselectAll, markDownloaded
   } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import { statusVariant, formatStatus, formatCount } from '$lib/constants';
+  import { onDestroy } from 'svelte';
   import Badge from './Badge.svelte';
 
   const THRESHOLD = 90;   // px past which a release commits to an action
@@ -33,6 +34,13 @@
   // Selected items (pulled from the full result set — selected cards leave the deck)
   let selectedItems = $derived($results.filter((i) => i.url && $selectedKeys.has(i.url)));
   let downloading = $state(false);
+
+  // Pending fly-off / spring-back timer, so we can cancel it if another action
+  // starts or the component unmounts mid-animation.
+  let actionTimer: ReturnType<typeof setTimeout> | null = null;
+  onDestroy(() => {
+    if (actionTimer) clearTimeout(actionTimer);
+  });
 
   function onPointerDown(e: PointerEvent) {
     if (!top || animating) return;
@@ -69,10 +77,17 @@
     animating = true;
     dx = 0;
     dy = 0;
-    setTimeout(() => (animating = false), 240);
+    if (actionTimer) clearTimeout(actionTimer);
+    actionTimer = setTimeout(() => {
+      animating = false;
+      actionTimer = null;
+    }, 240);
   }
 
   function commit(action: 'select' | 'skip') {
+    // Guard re-entry: an in-flight animation must finish before the next action,
+    // otherwise a rapid double-tap on the buttons commits the same card twice.
+    if (animating) return;
     const item = top;
     if (!item) return;
     animating = true;
@@ -80,13 +95,15 @@
     // Fly off-screen, then mutate the stores so the card leaves the deck.
     dx = dir * (typeof window !== 'undefined' ? window.innerWidth : 800);
     dy = dy * 1.2;
-    setTimeout(() => {
+    if (actionTimer) clearTimeout(actionTimer);
+    actionTimer = setTimeout(() => {
       if (action === 'select') toggleSelect(item.url);
       else dismissItem(item.url, item.title);
       undoStack = [...undoStack.slice(-9), { url: item.url, title: item.title, action }];
       dx = 0;
       dy = 0;
       animating = false;
+      actionTimer = null;
     }, 220);
   }
 
@@ -102,11 +119,16 @@
     if (selectedItems.length === 0 || downloading) return;
     downloading = true;
     try {
+      const urls = selectedItems.map((i) => i.url);
       await api.downloadBatch(
         selectedItems.map((i) => ({ url: i.url, title: i.title, year: i.year })),
         $downloadHost
       );
       addToast('Download', `Sending ${selectedItems.length} item(s) to JDownloader…`);
+      // Mark as downloaded (status → non-actionable) so they leave the deck for
+      // good, then clear the tray. Without this, deselecting would re-surface
+      // the just-downloaded cards.
+      markDownloaded(urls);
       deselectAll();
     } catch (e) {
       addToast('Error', e instanceof Error ? e.message : 'Failed to start downloads', 'error');
@@ -204,7 +226,8 @@
     <div class="flex items-center justify-center gap-6 py-3">
       <button
         onclick={() => commit('skip')}
-        class="w-14 h-14 rounded-full flex items-center justify-center text-2xl bg-[var(--bg-secondary)] border-2 border-[var(--error)] text-[var(--error)] shadow-lg hover:bg-[var(--error)]/10 active:scale-95 transition"
+        disabled={animating}
+        class="w-14 h-14 rounded-full flex items-center justify-center text-2xl bg-[var(--bg-secondary)] border-2 border-[var(--error)] text-[var(--error)] shadow-lg hover:bg-[var(--error)]/10 active:scale-95 transition disabled:opacity-50"
         aria-label="Skip"
         title="Skip (swipe left)"
       >✕</button>
@@ -216,7 +239,8 @@
       >ℹ</button>
       <button
         onclick={() => commit('select')}
-        class="w-14 h-14 rounded-full flex items-center justify-center text-2xl bg-[var(--bg-secondary)] border-2 border-[var(--success)] text-[var(--success)] shadow-lg hover:bg-[var(--success)]/10 active:scale-95 transition"
+        disabled={animating}
+        class="w-14 h-14 rounded-full flex items-center justify-center text-2xl bg-[var(--bg-secondary)] border-2 border-[var(--success)] text-[var(--success)] shadow-lg hover:bg-[var(--success)]/10 active:scale-95 transition disabled:opacity-50"
         aria-label="Add to selection"
         title="Add to selection (swipe right)"
       >✓</button>
