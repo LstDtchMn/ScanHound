@@ -567,8 +567,11 @@ class TestFilePathConstants:
 
     def test_paths_in_base_dir_or_data_dir(self):
         assert os.path.dirname(HISTORY_FILE) == _BASE_DIR
-        assert "ScanHound" in LOG_FILE
-        assert "ScanHound" in CACHE_FILE
+        # App dir is capitalized on Windows (%LOCALAPPDATA%\ScanHound) but
+        # lowercased on Linux/macOS (~/.local/share/scanhound), so match
+        # case-insensitively.
+        assert "scanhound" in LOG_FILE.lower()
+        assert "scanhound" in CACHE_FILE.lower()
 
 
 # ===================================================================
