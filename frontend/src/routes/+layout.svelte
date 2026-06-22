@@ -5,10 +5,12 @@
   import LogPanel from '$lib/components/LogPanel.svelte';
   import ShortcutsHelp from '$lib/components/ShortcutsHelp.svelte';
   import ConnectionBanner from '$lib/components/ConnectionBanner.svelte';
+  import ServerConnection from '$lib/components/ServerConnection.svelte';
   import { connection } from '$lib/stores/connection';
+  import { hasRemoteServer } from '$lib/stores/server';
   import { logPanelOpen } from '$lib/stores/logs';
   import { viewMode, selectAll, deselectAll } from '$lib/stores/results';
-  import { setAuthNonce } from '$lib/api/client';
+  import { setAuthNonce, api } from '$lib/api/client';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   import { fade } from 'svelte/transition';
@@ -17,6 +19,22 @@
   let { children } = $props();
   let showShortcuts = $state(false);
   let mobileMenuOpen = $state(false);
+  let showServerSetup = $state(false);
+
+  // On a packaged app (Android/desktop) with no remote server configured, the
+  // bundled frontend isn't same-origin with any backend. If the initial health
+  // check fails, prompt for a server URL + token. Desktop's Python sidecar
+  // answers health, so the prompt only appears where it's actually needed.
+  async function maybePromptServer() {
+    const isTauri = typeof window !== 'undefined' && '__TAURI__' in window;
+    if (!isTauri || $hasRemoteServer) return;
+    await new Promise((r) => setTimeout(r, 3000)); // give a sidecar time to boot
+    try {
+      await api.health();
+    } catch {
+      showServerSetup = true;
+    }
+  }
   const routeTitles: Record<string, string> = {
     '/': 'Scan',
     '/downloads': 'Downloads',
@@ -68,7 +86,10 @@
   }
 
   onMount(() => {
-    initAuth().then(() => connection.connect());
+    initAuth().then(() => {
+      connection.connect();
+      maybePromptServer();
+    });
     window.addEventListener('keydown', handleKeydown);
     return () => {
       connection.disconnect();
@@ -110,6 +131,19 @@
 
 {#if showShortcuts}
   <ShortcutsHelp onclose={() => showShortcuts = false} />
+{/if}
+
+{#if showServerSetup}
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-[var(--bg-overlay)] p-4">
+    <div class="w-full max-w-md bg-[var(--bg-secondary)] border border-[var(--border)] rounded-2xl shadow-2xl p-5">
+      <div class="flex items-center justify-between mb-1">
+        <h2 class="text-base font-bold text-[var(--text-primary)]">Connect to your ScanHound server</h2>
+        <button onclick={() => (showServerSetup = false)} aria-label="Close" class="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)]">&times;</button>
+      </div>
+      <p class="text-xs text-[var(--text-secondary)] mb-4">Enter the address of your ScanHound backend (the Docker container) and its auth token.</p>
+      <ServerConnection onsaved={() => (showServerSetup = false)} />
+    </div>
+  </div>
 {/if}
 
 <Snackbar />

@@ -5,6 +5,8 @@
   import { scanState } from '$lib/stores/scanner';
   import { jdConnection, refreshJdConnection } from '$lib/stores/jdownloader';
   import { api } from '$lib/api/client';
+  import ServerConnection from '$lib/components/ServerConnection.svelte';
+  import { serverUrl } from '$lib/stores/server';
   import { onMount } from 'svelte';
 
   async function testJd() {
@@ -135,11 +137,12 @@
     }
   }
 
-  type Tab = 'general' | 'plex' | 'sources' | 'notifications' | 'scheduler' | 'matching' | 'autograb';
+  type Tab = 'general' | 'connection' | 'plex' | 'sources' | 'notifications' | 'scheduler' | 'matching' | 'autograb';
   let activeTab = $state<Tab>('general');
 
   const tabs: { value: Tab; label: string }[] = [
     { value: 'general', label: 'General' },
+    { value: 'connection', label: 'Connection' },
     { value: 'plex', label: 'Plex' },
     { value: 'sources', label: 'Sources' },
     { value: 'matching', label: 'Matching' },
@@ -359,6 +362,24 @@
               <span class="text-sm">Clear Logs on Startup</span>
             </label>
           </div>
+        </div>
+      </section>
+
+    {:else if activeTab === 'connection'}
+      <section class="space-y-4">
+        <h2 class="text-lg font-semibold">Server Connection</h2>
+
+        <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">
+          <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Backend</h3>
+          <p class="text-xs text-[var(--text-secondary)]">
+            {#if $serverUrl}
+              Connected to <span class="text-[var(--text-primary)] font-medium">{$serverUrl}</span>.
+            {:else}
+              Using the same origin this page was loaded from. Set an explicit URL
+              for the Android app or to point at a remote server.
+            {/if}
+          </p>
+          <ServerConnection />
         </div>
       </section>
 

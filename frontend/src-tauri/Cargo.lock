@@ -3001,6 +3001,7 @@ dependencies = [
  "tauri-plugin-log",
  "tauri-plugin-process",
  "tauri-plugin-shell",
+ "tokio",
 ]
 
 [[package]]

@@ -40,6 +40,9 @@
       "nsis": {
         "installMode": "currentUser"
       }
+    },
+    "android": {
+      "minSdkVersion": 24
     }
   },
   "plugins": {

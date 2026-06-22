@@ -1,15 +1,8 @@
 import { writable } from 'svelte/store';
 import type { WsMessage } from '$lib/api/types';
 import { getAuthNonce } from '$lib/api/client';
+import { wsBase } from '$lib/api/endpoint';
 
-// Same-origin WebSocket in production (Docker/proxy), explicit in dev.
-function resolveWsBase(): string {
-  if (typeof window === 'undefined') return 'ws://localhost:9721/ws';
-  if (window.location.port === '5174') return 'ws://localhost:9721/ws';
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${window.location.host}/ws`;
-}
-const WS_BASE = resolveWsBase();
 const RECONNECT_DELAY = 2000;
 const MAX_RECONNECT_DELAY = 30000;
 const MAX_RETRIES = 20;
@@ -84,8 +77,9 @@ function createConnection() {
     if (!sidecarAlive) return;
     state.set('connecting');
 
+    const base = wsBase();
     const nonce = getAuthNonce();
-    const wsUrl = nonce ? `${WS_BASE}?token=${encodeURIComponent(nonce)}` : WS_BASE;
+    const wsUrl = nonce ? `${base}?token=${encodeURIComponent(nonce)}` : base;
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {

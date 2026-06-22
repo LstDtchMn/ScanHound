@@ -1,20 +1,11 @@
 import type { ResultsResponse, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry } from './types';
-
-// Dev runs the SvelteKit dev server on :5174 with the API on :9721. In
-// production (Docker/Tauri) the frontend is served by the API itself, so use a
-// relative (same-origin) base — this is what makes it work behind a reverse
-// proxy / Cloudflare tunnel on any hostname.
-function resolveApiBase(): string {
-  if (typeof window === 'undefined') return 'http://localhost:9721';
-  if (window.location.port === '5174') return 'http://localhost:9721';
-  return ''; // same origin
-}
-const API_BASE = resolveApiBase();
+import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
-/** Auth nonce injected by Tauri sidecar or set via setAuthNonce(). Empty = dev mode (no auth). */
-let authNonce = '';
+/** Auth token: a stored token (Android/remote) seeds it; the Tauri sidecar or
+ *  setAuthNonce() can override at runtime. Empty = dev mode (no auth). */
+let authNonce = getStoredToken();
 
 export function setAuthNonce(nonce: string) {
   authNonce = nonce;
@@ -36,7 +27,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       headers.set('Authorization', `Bearer ${authNonce}`);
     }
 
-    const resp = await fetch(`${API_BASE}${path}`, {
+    const resp = await fetch(`${apiBase()}${path}`, {
       ...options,
       headers,
       signal: controller.signal,
