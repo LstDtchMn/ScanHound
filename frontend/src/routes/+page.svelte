@@ -6,7 +6,8 @@
   import ResultRow from '$lib/components/ResultRow.svelte';
   import ContextMenu from '$lib/components/ContextMenu.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
-  import { filteredResults, viewMode, results, stats, selectedDetail, focusedIndex, toggleSelect, visibleColumns } from '$lib/stores/results';
+  import SwipeDeck from '$lib/components/SwipeDeck.svelte';
+  import { filteredResults, viewMode, results, stats, selectedDetail, focusedIndex, toggleSelect, visibleColumns, hydrateDismissed } from '$lib/stores/results';
   import { scanState, scanProgress, scanPhase } from '$lib/stores/scanner';
   import { settings, settingsLoaded, loadSettings } from '$lib/stores/settings';
   import { plexConnected, plexMovieCount, plexTvCount, refreshPlexStatus } from '$lib/stores/plex';
@@ -133,6 +134,8 @@
   });
 
   onMount(async () => {
+    // Pull the persisted swipe-dismissal set so skipped items stay hidden
+    hydrateDismissed();
     // Load all status in parallel so checklist shows accurate data on first render
     await Promise.all([
       refreshPlexStatus().finally(() => { plexChecking = false; }),
@@ -277,6 +280,9 @@
   </div>
 {/if}
 
+{#if $viewMode === 'swipe'}
+  <SwipeDeck />
+{:else}
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <div
@@ -536,6 +542,7 @@
     </div>
   {/if}
 </div>
+{/if}
 
 <StatusBar />
 

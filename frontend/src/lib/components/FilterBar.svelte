@@ -317,5 +317,17 @@
         <path fill-rule="evenodd" d="M3 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clip-rule="evenodd" />
       </svg>
     </button>
+    <button
+      onclick={() => viewMode.set('swipe')}
+      aria-label="Swipe view"
+      title="Swipe deck — triage with swipe right (add) / left (skip)"
+      class="p-1 rounded text-xs transition-colors
+        {$viewMode === 'swipe' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}"
+    >
+      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 20 20">
+        <rect x="5" y="3.5" width="10" height="13" rx="2" transform="rotate(8 10 10)" />
+        <rect x="5" y="3.5" width="10" height="13" rx="2" />
+      </svg>
+    </button>
   </div>
 </div>

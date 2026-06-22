@@ -4,7 +4,7 @@ import { connection } from './connection';
 import type { ScanResult, ScanStats } from '$lib/api/types';
 
 export type StatusFilter = 'all' | 'missing' | 'upgrade' | 'library';
-export type ViewMode = 'grid' | 'list';
+export type ViewMode = 'grid' | 'list' | 'swipe';
 export type SortOption =
   | 'title-asc'
   | 'title-desc'
@@ -61,6 +61,11 @@ export function toggleQuickFilter(key: string) {
 }
 
 export const selectedKeys = writable<Set<string>>(new Set());
+
+/** Release URLs the user swiped away ("skip"); persisted server-side so the
+ *  deck only surfaces fresh items across scans. Hydrated on app load. */
+export const dismissedUrls = writable<Set<string>>(new Set());
+
 let activeScanResultCount = 0;
 
 /** Parse a human-readable size string like "4.5 GB" into bytes for comparison */
@@ -142,9 +147,13 @@ function hasPlexCopy(i: ScanResult): boolean {
 }
 
 export const filteredResults = derived(
-  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters],
-  ([$results, $filter, $search, $genre, $language, $sort, $quick]) => {
+  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls],
+  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed]) => {
     let items = $results;
+    // Hide swiped-away ("skip") items everywhere they'd otherwise appear.
+    if ($dismissed.size > 0) {
+      items = items.filter((i) => !i.url || !$dismissed.has(i.url));
+    }
     if ($filter !== 'all') {
       items = items.filter(
         (i) => i.status === $filter || (i.status && i.status.includes($filter))
@@ -194,6 +203,65 @@ export const filteredResults = derived(
     return items;
   }
 );
+
+/** True for items the swipe deck should present — actionable (missing/upgrade)
+ *  releases that have a source URL and aren't already selected. Selected items
+ *  drop out of the deck so a right-swipe doesn't resurface the same card. */
+function isActionable(status: string | null | undefined): boolean {
+  const s = (status || '').toLowerCase();
+  return s.includes('missing') || s.includes('upgrade');
+}
+
+export const deckResults = derived(
+  [filteredResults, selectedKeys],
+  ([$filtered, $selected]) =>
+    $filtered.filter((i) => !!i.url && isActionable(i.status) && !$selected.has(i.url))
+);
+
+/** Load the persisted dismissal set from the server (call once on app start). */
+export async function hydrateDismissed() {
+  try {
+    const { items } = await api.dismissedList();
+    dismissedUrls.set(new Set(items.map((d) => d.url)));
+  } catch {
+    /* offline / no server — leave empty */
+  }
+}
+
+/** Swipe-left: dismiss an item (optimistic), persisting it server-side. */
+export function dismissItem(url: string, title?: string) {
+  if (!url) return;
+  dismissedUrls.update((s) => {
+    const next = new Set(s);
+    next.add(url);
+    return next;
+  });
+  api.dismissItems([url], title ? { [url]: title } : undefined, true).catch(() => {
+    // Revert on failure so the UI reflects the server's truth.
+    dismissedUrls.update((s) => {
+      const next = new Set(s);
+      next.delete(url);
+      return next;
+    });
+  });
+}
+
+/** Undo a dismissal so the item can reappear. */
+export function restoreItem(url: string) {
+  if (!url) return;
+  dismissedUrls.update((s) => {
+    const next = new Set(s);
+    next.delete(url);
+    return next;
+  });
+  api.dismissItems([url], undefined, false).catch(() => {
+    dismissedUrls.update((s) => {
+      const next = new Set(s);
+      next.add(url);
+      return next;
+    });
+  });
+}
 
 export function clearResults() {
   results.set([]);
