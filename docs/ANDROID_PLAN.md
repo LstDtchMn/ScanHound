@@ -1,6 +1,30 @@
 # ScanHound on Android — Planning Document
 
-Status: **DRAFT for review** · Branch: `claude/review-commit-status-vkxtvi` · Date: 2026-06-22
+Status: **IN PROGRESS** · Branch: `claude/review-commit-status-vkxtvi` · Date: 2026-06-22
+
+## Decisions made
+- **Packaging:** full **APK via Tauri v2 Android** (not PWA). Backend stays in the
+  Docker container; the app is a thin remote front-end.
+- **Swipe deck:** right = add to selection tray, left = skip. Footer "Download N
+  selected" batches to JDownloader. Dismissals are **remembered across sessions**.
+- **List view** is kept; sort/filter remain available.
+
+## Progress (done on this branch)
+- ✅ Backend persistent dismissals: `dismissed_items` table + endpoints; `/results`
+  hides dismissed; tests.
+- ✅ Swipe deck (`SwipeDeck.svelte`): touch-draggable cards, ADD/SKIP overlays,
+  undo, selection-tray footer; new `swipe` view mode; deck/list/grid all respect it.
+- ✅ Remote connection: `api/endpoint.ts` (stored URL+token win over same-origin),
+  WS scheme derivation, `ServerConnection` form, first-run prompt, Settings →
+  Connection tab.
+- ✅ Tauri Android target: `#[cfg(desktop)]`-gated sidecar/tray, `bundle.android`,
+  npm `android:*` scripts, `docs/ANDROID_BUILD.md`.
+
+## Remaining
+- ⏳ Mobile polish of the dense desktop chrome (FilterBar, secondary screens:
+  Downloads / Watchlist / Analytics / Settings) — see §3/§5-B.
+- ⏳ Build the signed APK on a machine with the Android SDK/NDK (can't run here).
+- ⏳ Playwright mobile harness (§5-C) — config/tests still absent.
 
 ## 1. Goal & constraints
 
