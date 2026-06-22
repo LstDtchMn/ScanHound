@@ -1,6 +1,29 @@
 # Mobile UI Polish — Plan
 
-Status: **PLAN for review** · Branch: `claude/review-commit-status-vkxtvi` · Date: 2026-06-22
+Status: **IMPLEMENTED** (Phases 1–4) · Branch: `claude/review-commit-status-vkxtvi` · Date: 2026-06-22
+
+## Implemented
+- **Decisions:** bottom tab bar; phones default to swipe deck; all screens done;
+  Phase 4 (touch context actions) included.
+- **Phase 1:** `BottomSheet`, `media`/`theme` stores, shared nav `icons`,
+  `app.html` viewport-fit/standalone meta.
+- **Phase 2:** `MobileTabBar` (bottom nav), mobile top bar (title + theme), Filter
+  bar → compact bar + filter sheet, Scan controls → compact bar + scan sheet,
+  StatusBar hidden on mobile (redundant), swipe default on phone.
+- **Phase 3:** responsive padding on settings/analytics/watchlist; touch-visible
+  watchlist row actions; downloads header wraps.
+- **Phase 4:** `ResultActionSheet` (long-press on list/grid + ⋯ on grid tiles).
+- **Verification:** `npm run check` + `npm run build` green after each phase.
+
+## Remaining / optional
+- ⏳ Playwright mobile harness (`playwright.config.ts` + smoke tests) — the repo
+  references `test:e2e:mobile` but has no config; deferred.
+- ⏳ On-device pass once the APK is built.
+
+---
+*(Original plan retained below for reference.)*
+
+---
 
 Goal: make the existing SvelteKit UI genuinely usable on a phone for the Android
 app, **without regressing desktop**. The swipe deck is already mobile-first; this

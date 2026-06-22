@@ -6,11 +6,12 @@
   let selectedCount = $derived($selectedKeys.size);
 </script>
 
-<div class="flex items-center gap-3 sm:gap-4 px-3 sm:px-4 py-2 border-t border-[var(--border)] text-[11px] sm:text-xs text-[var(--text-secondary)] whitespace-nowrap overflow-x-auto">
-  <span class="hidden sm:inline">Total: <strong class="text-[var(--text-primary)]">{$stats.total}</strong></span>
+<!-- Desktop status bar; on mobile the filter chips + swipe footer convey this. -->
+<div class="hidden md:flex items-center gap-4 px-4 py-2 border-t border-[var(--border)] text-xs text-[var(--text-secondary)]">
+  <span>Total: <strong class="text-[var(--text-primary)]">{$stats.total}</strong></span>
   <span>Missing: <strong class="text-[var(--error)]">{$stats.missing}</strong></span>
   <span>Upgrades: <strong class="text-[var(--warning)]">{$stats.upgrade}</strong></span>
-  <span class="hidden sm:inline">In Library: <strong class="text-[var(--success)]">{$stats.library}</strong></span>
+  <span>In Library: <strong class="text-[var(--success)]">{$stats.library}</strong></span>
 
   {#if selectedCount > 0}
     <span>Selected: <strong class="text-[var(--accent)]">{selectedCount}</strong></span>
