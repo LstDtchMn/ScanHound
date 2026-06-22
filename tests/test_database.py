@@ -23,6 +23,7 @@ class TestInitDb:
         "plex_cache",
         "scan_history",
         "scanned_urls",
+        "dismissed_items",
     ]
 
     def test_tables_exist(self, db_manager):
@@ -104,6 +105,39 @@ class TestGetConnection:
 # ---------------------------------------------------------------------------
 # 3. Download history CRUD
 # ---------------------------------------------------------------------------
+
+class TestDismissedItems:
+
+    def test_add_and_get(self, db_manager):
+        assert db_manager.get_dismissed_count() == 0
+        db_manager.add_dismissed_item("http://x/a", "Movie A")
+        assert db_manager.get_dismissed_urls() == {"http://x/a"}
+        assert db_manager.get_dismissed_count() == 1
+
+    def test_add_is_idempotent(self, db_manager):
+        db_manager.add_dismissed_item("http://x/a", "A")
+        db_manager.add_dismissed_item("http://x/a", "A again")
+        assert db_manager.get_dismissed_count() == 1
+
+    def test_remove(self, db_manager):
+        db_manager.add_dismissed_item("http://x/a")
+        db_manager.add_dismissed_item("http://x/b")
+        db_manager.remove_dismissed_item("http://x/a")
+        assert db_manager.get_dismissed_urls() == {"http://x/b"}
+
+    def test_get_items_includes_title(self, db_manager):
+        db_manager.add_dismissed_item("http://x/a", "Movie A")
+        items = db_manager.get_dismissed_items()
+        assert len(items) == 1
+        assert items[0]["url"] == "http://x/a"
+        assert items[0]["title"] == "Movie A"
+
+    def test_clear(self, db_manager):
+        db_manager.add_dismissed_item("http://x/a")
+        db_manager.add_dismissed_item("http://x/b")
+        db_manager.clear_dismissed_items()
+        assert db_manager.get_dismissed_count() == 0
+
 
 class TestDownloadHistory:
 

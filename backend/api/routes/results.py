@@ -24,6 +24,14 @@ class SelectRequest(BaseModel):
     selected: bool = True
 
 
+class DismissRequest(BaseModel):
+    urls: List[str]
+    # Optional url -> title map, stored for display in the "dismissed" manager.
+    titles: Optional[Dict[str, str]] = None
+    # True = dismiss (skip), False = un-dismiss (restore).
+    dismissed: bool = True
+
+
 def _compute_status_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
     """Compute status counts from a list of item dicts."""
     return {
@@ -42,10 +50,21 @@ def get_results(
     order: str = Query("asc"),
     page: int = Query(1, ge=1),
     per_page: int = Query(100, ge=1, le=500),
+    include_dismissed: bool = Query(False, description="Include swiped-away items"),
     reg: ServiceRegistry = Depends(get_registry),
 ):
     raw_items = get_last_scan_items()
     items = [_media_item_to_dict(i) for i in raw_items]
+
+    # Hide items the user swiped away on the deck (unless explicitly requested).
+    if not include_dismissed and reg.db is not None:
+        dismissed = reg.db.get_dismissed_urls()
+        if dismissed:
+            items = [i for i in items if i.get("url") not in dismissed]
+
+    # Snapshot of all visible (non-dismissed) items for the overall stats,
+    # before status/search filtering narrows them further.
+    visible_items = list(items)
 
     # Filter by status
     if filter:
@@ -75,9 +94,8 @@ def get_results(
     for item in page_items:
         item["selected"] = item.get("group_key", "") in selected_snapshot
 
-    # Compute stats from all items (unfiltered)
-    all_items = [_media_item_to_dict(i) for i in raw_items]
-    stats = _compute_status_counts(all_items)
+    # Compute stats from all visible items (after dismissal, before filter/search)
+    stats = _compute_status_counts(visible_items)
 
     # Compute filtered stats (from items after filter/search, before pagination)
     filtered_stats = _compute_status_counts(items)
@@ -118,6 +136,44 @@ def deselect_all():
     with _selected_lock:
         _selected.clear()
     return {"status": "ok", "selected_count": 0}
+
+
+@router.post("/dismiss")
+def dismiss_items(req: DismissRequest, reg: ServiceRegistry = Depends(get_registry)):
+    """Dismiss (or restore) swiped-away items so they stay hidden across scans."""
+    db = reg.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    titles = req.titles or {}
+    if req.dismissed:
+        for url in req.urls:
+            if url:
+                db.add_dismissed_item(url, titles.get(url))
+    else:
+        for url in req.urls:
+            if url:
+                db.remove_dismissed_item(url)
+    return {"status": "ok", "dismissed_count": db.get_dismissed_count()}
+
+
+@router.get("/dismissed")
+def list_dismissed(reg: ServiceRegistry = Depends(get_registry)):
+    """List dismissed items (for a 'show skipped' / manage view)."""
+    db = reg.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    items = db.get_dismissed_items()
+    return {"items": items, "count": len(items)}
+
+
+@router.delete("/dismissed")
+def clear_dismissed(reg: ServiceRegistry = Depends(get_registry)):
+    """Clear all dismissals so every item can reappear."""
+    db = reg.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    db.clear_dismissed_items()
+    return {"status": "ok", "dismissed_count": 0}
 
 
 @router.post("/export")

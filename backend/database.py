@@ -273,6 +273,17 @@ class DatabaseManager:
                     )
                 ''')
 
+                # Items the user swiped away ("skip") in the mobile deck. Kept
+                # so dismissed releases stay hidden on future scans. Keyed by
+                # release URL.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS dismissed_items (
+                        url TEXT PRIMARY KEY,
+                        title TEXT,
+                        dismissed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
                 # Durable per-package download + extraction outcome, polled from
                 # JDownloader. Keyed by JD package name so the row survives even
                 # after the package is cleared from JDownloader's list.
@@ -834,6 +845,40 @@ class DatabaseManager:
     def get_scanned_url_count(self):
         """Return the total number of scanned URLs."""
         row = self._query('SELECT COUNT(*) FROM scanned_urls', one=True, default=None)
+        return row[0] if row else 0
+
+    # ── Dismissed items (mobile swipe-to-skip) ───────────────────────────
+
+    def add_dismissed_item(self, url, title=None):
+        """Record a single release URL as dismissed (swiped away)."""
+        return self._mutate('''
+            INSERT OR IGNORE INTO dismissed_items (url, title) VALUES (?, ?)
+        ''', (url, title), label="add_dismissed_item")
+
+    def remove_dismissed_item(self, url):
+        """Un-dismiss a previously dismissed URL so it can reappear."""
+        return self._mutate(
+            'DELETE FROM dismissed_items WHERE url = ?', (url,),
+            label="remove_dismissed_item")
+
+    def get_dismissed_urls(self):
+        """Get all dismissed URLs as a set for fast membership testing."""
+        rows = self._query('SELECT url FROM dismissed_items', default=[])
+        return {row[0] for row in rows}
+
+    def get_dismissed_items(self, limit=1000):
+        """Return dismissed items (url, title, dismissed_at), newest first."""
+        return self._query_dicts(
+            'SELECT url, title, dismissed_at FROM dismissed_items '
+            'ORDER BY dismissed_at DESC LIMIT ?', (limit,), default=[])
+
+    def clear_dismissed_items(self):
+        """Clear all dismissed-item records."""
+        return self._mutate("DELETE FROM dismissed_items", label="clear_dismissed_items")
+
+    def get_dismissed_count(self):
+        """Return the total number of dismissed items."""
+        row = self._query('SELECT COUNT(*) FROM dismissed_items', one=True, default=None)
         return row[0] if row else 0
 
     def record_scraped_links(self, links, title, resolution="", source_url=""):
