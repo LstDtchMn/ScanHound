@@ -4,7 +4,7 @@
   import { addToast } from '$lib/stores/notifications';
   import { downloadQueue, activeDownload, downloadHost } from '$lib/stores/downloads';
   import { results, markDownloaded } from '$lib/stores/results';
-  import { statusVariant, formatStatus } from '$lib/constants';
+  import { statusVariant, formatStatus, DOWNLOAD_HOSTS } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
   import { fly } from 'svelte/transition';
 
@@ -309,9 +309,7 @@
               onchange={(e) => downloadHost.set(e.currentTarget.value)}
               class="px-2 py-1.5 rounded-l text-xs bg-[var(--bg-tertiary)] border border-r-0 border-[var(--border)] text-[var(--text-primary)] focus:outline-none"
             >
-              <option value="Rapidgator">Rapidgator</option>
-              <option value="Nitroflare">Nitroflare</option>
-              <option value="1Fichier">1Fichier</option>
+              {#each DOWNLOAD_HOSTS as h}<option value={h.value}>{h.value}</option>{/each}
             </select>
             <button
               onclick={() => handleDownload(item.url, item.title, item.year)}

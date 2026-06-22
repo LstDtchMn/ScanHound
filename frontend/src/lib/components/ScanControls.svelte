@@ -173,6 +173,7 @@
   {#if $scanState === 'idle'}
     <button
       onclick={() => (scanSheet = true)}
+      aria-label="Scan options"
       class="flex-1 min-w-0 flex items-center gap-2 px-3 py-2 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-sm text-[var(--text-primary)]"
     >
       <span class="truncate">{scanTypeLabel}{#if selectedType !== 'search'} · {selectedSource}{/if}</span>

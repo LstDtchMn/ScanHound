@@ -3,6 +3,7 @@
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
+  import { DOWNLOAD_HOSTS } from '$lib/constants';
   import BottomSheet from './BottomSheet.svelte';
   import type { StatusFilter, SortOption } from '$lib/stores/results';
 
@@ -230,9 +231,7 @@
     class="bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-2 py-1 rounded border border-[var(--border)] text-[11px] focus:outline-none focus:border-[var(--accent)] cursor-pointer"
     title="Download host"
   >
-    <option value="Rapidgator">Rapidgator</option>
-    <option value="Nitroflare">Nitroflare</option>
-    <option value="1Fichier">1Fichier</option>
+    {#each DOWNLOAD_HOSTS as h}<option value={h.value}>{h.value}</option>{/each}
   </select>
 
   {#if $availableGenres.length > 0}
@@ -449,9 +448,7 @@
     <div>
       <label for="fb-host" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Download host</label>
       <select id="fb-host" value={$downloadHost} onchange={(e) => downloadHost.set((e.target as HTMLSelectElement).value)} class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm">
-        <option value="Rapidgator">Rapidgator</option>
-        <option value="Nitroflare">Nitroflare</option>
-        <option value="1Fichier">1Fichier</option>
+        {#each DOWNLOAD_HOSTS as h}<option value={h.value}>{h.value}</option>{/each}
       </select>
     </div>
 

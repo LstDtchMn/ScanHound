@@ -238,8 +238,9 @@ def create_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
-            "https://tauri.localhost", # Tauri production webview
-            "tauri://localhost",       # Tauri custom protocol
+            "https://tauri.localhost", # Tauri production webview (useHttpsScheme)
+            "http://tauri.localhost",  # Tauri >=2.x default scheme on Windows + Android
+            "tauri://localhost",       # Tauri custom protocol (Linux/macOS)
         ],
         # Allow any localhost/127.0.0.1 port — Vite picks a free port at dev time
         allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",

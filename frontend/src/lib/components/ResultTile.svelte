@@ -5,7 +5,7 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import { downloadHost, activeDownload } from '$lib/stores/downloads';
-  import { statusVariant, formatStatus, formatCount } from '$lib/constants';
+  import { statusVariant, formatStatus, formatCount, DOWNLOAD_HOSTS } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
   import { fly } from 'svelte/transition';
 
@@ -207,9 +207,7 @@
           class="h-5 px-0.5 rounded-l text-[9px] bg-[var(--bg-tertiary)] border border-r-0 border-[var(--border)] text-[var(--text-secondary)] focus:outline-none cursor-pointer"
           title="Download host"
         >
-          <option value="Rapidgator">RG</option>
-          <option value="Nitroflare">NF</option>
-          <option value="1Fichier">1F</option>
+          {#each DOWNLOAD_HOSTS as h}<option value={h.value}>{h.short}</option>{/each}
         </select>
         <button
           onclick={handleDownload}

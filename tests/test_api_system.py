@@ -29,3 +29,21 @@ def test_shutdown_returns_accepted(client):
     resp = client.post("/shutdown")
     assert resp.status_code == 202
     assert resp.json()["status"] == "shutting_down"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://tauri.localhost",  # desktop Tauri (useHttpsScheme)
+        "http://tauri.localhost",  # Tauri >=2.x default on Windows + Android
+        "tauri://localhost",  # Linux/macOS custom protocol
+    ],
+)
+def test_cors_allows_tauri_origins(client, origin):
+    resp = client.get("/health", headers={"Origin": origin})
+    assert resp.headers.get("access-control-allow-origin") == origin
+
+
+def test_cors_rejects_unknown_origin(client):
+    resp = client.get("/health", headers={"Origin": "https://evil.example"})
+    assert "access-control-allow-origin" not in resp.headers
