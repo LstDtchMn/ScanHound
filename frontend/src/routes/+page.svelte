@@ -7,7 +7,9 @@
   import ContextMenu from '$lib/components/ContextMenu.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
   import SwipeDeck from '$lib/components/SwipeDeck.svelte';
-  import { filteredResults, viewMode, results, stats, selectedDetail, focusedIndex, toggleSelect, visibleColumns, hydrateDismissed } from '$lib/stores/results';
+  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, visibleColumns, hydrateDismissed } from '$lib/stores/results';
+  import { mobile } from '$lib/stores/media';
+  import { get } from 'svelte/store';
   import { scanState, scanProgress, scanPhase } from '$lib/stores/scanner';
   import { settings, settingsLoaded, loadSettings } from '$lib/stores/settings';
   import { plexConnected, plexMovieCount, plexTvCount, refreshPlexStatus } from '$lib/stores/plex';
@@ -134,6 +136,8 @@
   });
 
   onMount(async () => {
+    // Phones default to the swipe deck unless the user has chosen a view.
+    if (get(mobile) && !get(viewModeExplicit)) viewMode.set('swipe');
     // Pull the persisted swipe-dismissal set so skipped items stay hidden
     hydrateDismissed();
     // Load all status in parallel so checklist shows accurate data on first render

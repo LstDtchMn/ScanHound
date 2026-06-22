@@ -38,6 +38,13 @@ export const searchFilter = writable<string>('');
 export const genreFilter = writable<string>('');
 export const languageFilter = writable<string>('');
 export const viewMode = persisted<ViewMode>('sh-view-mode', 'grid');
+/** Whether the user has explicitly picked a view (vs. the platform default).
+ *  Lets phones default to the swipe deck without overriding a deliberate choice. */
+export const viewModeExplicit = persisted<boolean>('sh-view-mode-explicit', false);
+export function setViewMode(m: ViewMode) {
+  viewMode.set(m);
+  viewModeExplicit.set(true);
+}
 export const stats = writable<ScanStats>({
   total: 0,
   missing: 0,

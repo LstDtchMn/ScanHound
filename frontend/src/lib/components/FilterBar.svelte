@@ -1,9 +1,19 @@
 <script lang="ts">
-  import { statusFilter, searchFilter, genreFilter, languageFilter, viewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, visibleColumns } from '$lib/stores/results';
+  import { statusFilter, searchFilter, genreFilter, languageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, visibleColumns } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
+  import BottomSheet from './BottomSheet.svelte';
   import type { StatusFilter, SortOption } from '$lib/stores/results';
+
+  let filterSheet = $state(false);
+  let activeFilterCount = $derived(
+    ($statusFilter !== 'all' ? 1 : 0) +
+    ($searchFilter ? 1 : 0) +
+    ($genreFilter ? 1 : 0) +
+    ($languageFilter ? 1 : 0) +
+    $quickFilters.length
+  );
 
   const quickChips = [
     { key: '4k', label: '4K' },
@@ -116,7 +126,8 @@
   }
 </script>
 
-<div class="flex items-center gap-2 px-3 py-1 border-b border-[var(--border)]">
+<!-- Desktop toolbar -->
+<div class="hidden md:flex items-center gap-2 px-3 py-1 border-b border-[var(--border)]">
   <!-- Status filter tabs -->
   <div class="flex gap-0.5">
     {#each filters as f}
@@ -298,7 +309,7 @@
 
   <div class="flex gap-0.5 bg-[var(--bg-tertiary)] rounded p-0.5">
     <button
-      onclick={() => viewMode.set('grid')}
+      onclick={() => setViewMode('grid')}
       aria-label="Grid view"
       class="p-1 rounded text-xs transition-colors
         {$viewMode === 'grid' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}"
@@ -308,7 +319,7 @@
       </svg>
     </button>
     <button
-      onclick={() => viewMode.set('list')}
+      onclick={() => setViewMode('list')}
       aria-label="List view"
       class="p-1 rounded text-xs transition-colors
         {$viewMode === 'list' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}"
@@ -318,7 +329,7 @@
       </svg>
     </button>
     <button
-      onclick={() => viewMode.set('swipe')}
+      onclick={() => setViewMode('swipe')}
       aria-label="Swipe view"
       title="Swipe deck — triage with swipe right (add) / left (skip)"
       class="p-1 rounded text-xs transition-colors
@@ -331,3 +342,162 @@
     </button>
   </div>
 </div>
+
+<!-- Mobile toolbar: scrollable status chips + a Filters button → bottom sheet -->
+<div class="flex md:hidden items-center gap-1.5 px-2 py-1.5 border-b border-[var(--border)]">
+  <div class="flex-1 min-w-0 overflow-x-auto flex gap-1">
+    {#each filters as f}
+      <button
+        onclick={() => statusFilter.set(f.value)}
+        class="shrink-0 px-2.5 py-1.5 rounded-full text-xs font-medium transition-colors
+          {$statusFilter === f.value ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)]'}"
+      >
+        {f.label}
+        {#if f.value === 'all' && $stats.total > 0}<span class="ml-0.5 opacity-70">{$stats.total}</span>
+        {:else if f.value === 'missing' && $stats.missing > 0}<span class="ml-0.5 opacity-70">{$stats.missing}</span>
+        {:else if f.value === 'upgrade' && $stats.upgrade > 0}<span class="ml-0.5 opacity-70">{$stats.upgrade}</span>
+        {:else if f.value === 'library' && $stats.library > 0}<span class="ml-0.5 opacity-70">{$stats.library}</span>{/if}
+      </button>
+    {/each}
+  </div>
+  <button
+    onclick={() => (filterSheet = true)}
+    class="relative shrink-0 flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--border)]"
+  >
+    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 4h18M6 12h12M10 20h4" /></svg>
+    Filters
+    {#if activeFilterCount > 0}
+      <span class="absolute -top-1.5 -right-1.5 min-w-[1rem] h-4 px-1 rounded-full bg-[var(--accent)] text-white text-[10px] flex items-center justify-center">{activeFilterCount}</span>
+    {/if}
+  </button>
+</div>
+
+<BottomSheet open={filterSheet} title="View & filters" onclose={() => (filterSheet = false)}>
+  <div class="space-y-4">
+    <!-- View switch -->
+    <div>
+      <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">View</p>
+      <div class="grid grid-cols-3 gap-1 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+        {#each [['swipe', 'Swipe'], ['grid', 'Grid'], ['list', 'List']] as [val, label]}
+          <button
+            onclick={() => setViewMode(val as 'swipe' | 'grid' | 'list')}
+            class="py-2 rounded-md text-sm font-medium transition-colors {$viewMode === val ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}"
+          >{label}</button>
+        {/each}
+      </div>
+    </div>
+
+    <!-- Search -->
+    <div>
+      <label for="fb-search" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Search</label>
+      <input
+        id="fb-search"
+        type="text"
+        bind:value={search}
+        oninput={onSearch}
+        placeholder="Filter by title…"
+        class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm focus:outline-none focus:border-[var(--accent)]"
+      />
+    </div>
+
+    <!-- Sort -->
+    <div>
+      <label for="fb-sort" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Sort</label>
+      <select
+        id="fb-sort"
+        value={$sortBy}
+        onchange={(e) => sortBy.set((e.target as HTMLSelectElement).value as SortOption)}
+        class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm focus:outline-none focus:border-[var(--accent)]"
+      >
+        {#each sortOptions as opt}<option value={opt.value}>{opt.label}</option>{/each}
+      </select>
+    </div>
+
+    <!-- Quick filters -->
+    <div>
+      <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Quick filters</p>
+      <div class="flex flex-wrap gap-2">
+        {#each quickChips as chip}
+          <button
+            onclick={() => toggleQuickFilter(chip.key)}
+            class="px-3 py-1.5 rounded-full text-sm border transition-colors
+              {$quickFilters.includes(chip.key) ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
+          >{chip.label}</button>
+        {/each}
+      </div>
+    </div>
+
+    <!-- Genre / Language / Host -->
+    {#if $availableGenres.length > 0}
+      <div>
+        <label for="fb-genre" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Genre</label>
+        <select id="fb-genre" value={$genreFilter} onchange={(e) => genreFilter.set((e.target as HTMLSelectElement).value)} class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm">
+          <option value="">All genres</option>
+          {#each $availableGenres as g}<option value={g}>{g}</option>{/each}
+        </select>
+      </div>
+    {/if}
+    {#if $availableLanguages.length > 1}
+      <div>
+        <label for="fb-lang" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Language</label>
+        <select id="fb-lang" value={$languageFilter} onchange={(e) => languageFilter.set((e.target as HTMLSelectElement).value)} class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm">
+          <option value="">All languages</option>
+          {#each $availableLanguages as l}<option value={l}>{l}</option>{/each}
+        </select>
+      </div>
+    {/if}
+    <div>
+      <label for="fb-host" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Download host</label>
+      <select id="fb-host" value={$downloadHost} onchange={(e) => downloadHost.set((e.target as HTMLSelectElement).value)} class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm">
+        <option value="Rapidgator">Rapidgator</option>
+        <option value="Nitroflare">Nitroflare</option>
+        <option value="1Fichier">1Fichier</option>
+      </select>
+    </div>
+
+    <!-- List options -->
+    {#if $viewMode === 'list'}
+      <div>
+        <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Columns</p>
+        <div class="flex flex-wrap gap-2">
+          {#each columnDefs as c}
+            <button
+              onclick={() => toggleColumn(c.key)}
+              class="px-3 py-1.5 rounded-full text-sm border transition-colors {$visibleColumns[c.key] ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
+            >{c.label}</button>
+          {/each}
+        </div>
+      </div>
+      <div>
+        <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Density</p>
+        <div class="grid grid-cols-2 gap-1 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+          <button onclick={() => density.set('comfortable')} class="py-2 rounded-md text-sm {$density === 'comfortable' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}">Comfortable</button>
+          <button onclick={() => density.set('compact')} class="py-2 rounded-md text-sm {$density === 'compact' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}">Compact</button>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Selection / batch actions -->
+    {#if resultCount > 0}
+      <div class="pt-2 border-t border-[var(--border)] space-y-2">
+        <div class="flex items-center justify-between text-sm">
+          <span class="text-[var(--text-secondary)]">{resultCount} results{selectedCount > 0 ? ` · ${selectedCount} selected` : ''}</span>
+          <div class="flex gap-3">
+            <button onclick={() => selectAll($filteredResults.map(i => i.url))} class="text-[var(--accent)]">Select all</button>
+            {#if selectedCount > 0}<button onclick={() => deselectAll()} class="text-[var(--text-secondary)]">Clear</button>{/if}
+          </div>
+        </div>
+        {#if selectedCount > 0}
+          <div class="grid grid-cols-2 gap-2">
+            <button onclick={bulkDownloadAll} disabled={downloadingAll} class="py-2.5 rounded-lg text-sm font-semibold text-white bg-[var(--accent)] disabled:opacity-50">{downloadingAll ? '…' : '⬇ Download'}</button>
+            <button onclick={bulkCopyLinks} disabled={copyingLinks} class="py-2.5 rounded-lg text-sm font-medium text-[var(--accent)] border border-[var(--border)] disabled:opacity-50">{copyingLinks ? '…' : '🔗 Copy links'}</button>
+            <button onclick={bulkAddToWatchlist} disabled={addingToWatchlist} class="py-2.5 rounded-lg text-sm font-medium text-[var(--accent)] border border-[var(--border)] disabled:opacity-50">{addingToWatchlist ? '…' : '+ Watchlist'}</button>
+            <button onclick={handleExport} class="py-2.5 rounded-lg text-sm font-medium text-[var(--text-secondary)] border border-[var(--border)]">Export CSV</button>
+          </div>
+        {:else}
+          <button onclick={handleExport} class="w-full py-2.5 rounded-lg text-sm font-medium text-[var(--text-secondary)] border border-[var(--border)]">Export CSV</button>
+        {/if}
+      </div>
+    {/if}
+  </div>
+</BottomSheet>
