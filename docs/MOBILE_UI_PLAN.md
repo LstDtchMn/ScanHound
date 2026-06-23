@@ -1,6 +1,6 @@
 # Mobile UI Polish — Plan
 
-Status: **IMPLEMENTED** (Phases 1–4) · Branch: `claude/review-commit-status-vkxtvi` · Date: 2026-06-22
+Status: **IMPLEMENTED** (Phases 1–4) · Branch: `claude/review-commit-status-vkxtvi` · Date: 2026-06-23
 
 ## Implemented
 - **Decisions:** bottom tab bar; phones default to swipe deck; all screens done;
@@ -16,9 +16,9 @@ Status: **IMPLEMENTED** (Phases 1–4) · Branch: `claude/review-commit-status-v
 - **Verification:** `npm run check` + `npm run build` green after each phase.
 
 ## Remaining / optional
-- ⏳ Playwright mobile harness (`playwright.config.ts` + smoke tests) — the repo
-  references `test:e2e:mobile` but has no config; deferred.
-- ⏳ On-device pass once the APK is built.
+- ✅ Playwright mobile harness (`playwright.config.ts` + smoke tests) — desktop +
+  mobile (Pixel 7) projects, routing/nav/sheets/no-overflow smoke tests.
+- ⏳ On-device pass once the APK is built (needs the user's machine).
 
 ---
 *(Original plan retained below for reference.)*

@@ -1,6 +1,7 @@
 # ScanHound on Android — Planning Document
 
-Status: **IN PROGRESS** · Branch: `claude/review-commit-status-vkxtvi` · Date: 2026-06-22
+Status: **IN PROGRESS** (only hardware-dependent steps remain — see §9/Remaining) ·
+Branch: `claude/review-commit-status-vkxtvi` · Date: 2026-06-23
 
 ## Decisions made
 - **Packaging:** full **APK via Tauri v2 Android** (not PWA). Backend stays in the
@@ -19,12 +20,24 @@ Status: **IN PROGRESS** · Branch: `claude/review-commit-status-vkxtvi` · Date:
   Connection tab.
 - ✅ Tauri Android target: `#[cfg(desktop)]`-gated sidecar/tray, `bundle.android`,
   npm `android:*` scripts, `docs/ANDROID_BUILD.md`.
+- ✅ Mobile polish of the dense desktop chrome (FilterBar, secondary screens) —
+  see `docs/MOBILE_UI_PLAN.md` (Phases 1–4, all implemented).
+- ✅ CORS: the API allows `tauri://localhost` / `https://tauri.localhost` /
+  `http://tauri.localhost` plus a localhost dev-port regex, so a bundled APK
+  (not same-origin) can reach a remote backend.
+- ✅ Playwright mobile harness (§5-C): `frontend/playwright.config.ts` with
+  `desktop` + `mobile` (Pixel 7) projects; smoke tests for routing, bottom-nav,
+  filter/scan sheets, and no-horizontal-overflow at 390px.
+- ✅ Frontend cleanup: deduped `ResultActionSheet`/`ContextMenu` action handlers,
+  centralized download-host options, removed the dead `Sidebar` mobile-drawer
+  branch.
 
 ## Remaining
-- ⏳ Mobile polish of the dense desktop chrome (FilterBar, secondary screens:
-  Downloads / Watchlist / Analytics / Settings) — see §3/§5-B.
-- ⏳ Build the signed APK on a machine with the Android SDK/NDK (can't run here).
-- ⏳ Playwright mobile harness (§5-C) — config/tests still absent.
+- ⏳ Build the signed APK on a machine with the Android SDK/NDK (can't run here;
+  see `docs/ANDROID_BUILD.md`).
+- ⏳ `cargo check` on a desktop with GTK/WebKitGTK libs to confirm the
+  `#[cfg(desktop)]` gating compiles cleanly for both targets.
+- ⏳ On-device smoke test of the installed APK against the real, remote backend.
 
 ## 1. Goal & constraints
 
@@ -182,10 +195,14 @@ For the PWA path this section is **N/A** (same-origin). For a bundled APK:
 - Rewriting the UI in a native toolkit (Kotlin/Compose) — rejected as a second codebase.
 - Offline scanning (backend is required and remote).
 
-## 9. Decisions needed before building
-1. **Packaging target:** PWA only (recommended), or also a wrapped APK later?
-2. **If APK:** what guards the public hostname (Cloudflare Access? the app nonce?), so
-   we design the right login.
-3. **Mobile default view:** card list (recommended) vs. keep the table with hidden
-   columns.
-4. **Scope of first cut:** all five screens, or Scan + Downloads first?
+## 9. Decisions made (resolved during implementation — see §0 / `docs/HANDOFF.md` §2)
+1. **Packaging target:** full APK via Tauri v2 Android (not PWA) — done.
+2. **If APK:** the app prompts for a server URL + token (`SCANHOUND_AUTH_NONCE`)
+   on first launch / Settings → Connection; whatever sits in front of the public
+   hostname (e.g. Cloudflare Access) is the user's deployment concern, called out
+   in `docs/ANDROID_BUILD.md`.
+3. **Mobile default view:** swipe deck (not card list or table) — phones default
+   to `SwipeDeck.svelte`; list/grid stay available and keep the saved desktop
+   preference.
+4. **Scope of first cut:** all five screens adapted (`docs/MOBILE_UI_PLAN.md`
+   Phases 1–4).

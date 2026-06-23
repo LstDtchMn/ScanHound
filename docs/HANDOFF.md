@@ -44,6 +44,10 @@ feat(mobile) x3: bottom nav, filter/scan bottom sheets, responsive secondary
              screens, touch action sheet, StatusBar hidden on mobile
 docs:        MOBILE_UI_PLAN, CODE_REVIEW_PLAN
 fix(ui):     swipe deck correctness (from code review — see §6)
+feat:        dedup result-action handlers, centralize download hosts, fix CORS,
+             add Playwright harness (desktop + mobile projects, 18 tests)
+chore:       drop dead Sidebar mobile-drawer branch, gitignore src-tauri/gen/,
+             refresh docs (this commit)
 ```
 
 ### Key implementation facts
@@ -95,7 +99,13 @@ Frontend:
 cd frontend && npm install        # node 22 present; revert package-lock.json churn after
 npm run check                     # svelte-check — must be 0 errors/0 warnings
 npm run build                     # static build to frontend/build
+npm run test:unit                 # vitest — pure-logic unit tests (stores/api)
+npm run test:e2e                  # Playwright — desktop + mobile projects
 ```
+Playwright's `webServer` starts the backend (`--no-auth`, port 9721) and Vite
+(port 5174) itself — no manual server needed. In a sandbox without the exact
+pinned Chromium revision installed, `npx playwright install chromium` needs
+egress; on a normal dev machine or CI runner this just works.
 
 Run the API live (for endpoint smoke tests):
 ```bash
@@ -107,15 +117,26 @@ curl -s localhost:9721/health
 Already smoke-tested live: dismissals CRUD works; `/health` is open while
 `/results/dismiss[ed]` require `Authorization: Bearer <nonce>` (401 without).
 
-**Cannot do here**: render the frontend (no browser/device), `cargo check`
+**Cannot do here**: render the frontend on a real device, `cargo check`
 (missing GTK libs — gdk-3.0), or build the APK (no Android SDK/NDK/`ANDROID_HOME`).
 
 ## 5. Verification status
 - ✅ Python suite green; backend dismissals verified live (CRUD + auth).
 - ✅ `npm run check` + `npm run build` green.
-- ❌ Frontend never rendered on a device — mobile layout/gestures unverified.
-- ❌ Rust never compiled (`#[cfg(desktop)]` gating unconfirmed by compiler).
-- ❌ APK never built.
+- ✅ `npm run test:unit` green (21 vitest tests: `endpoint.ts` base-URL
+  resolution, `results.ts` dismiss store / `filteredResults` / `deckResults`).
+- ✅ Playwright e2e harness (desktop + mobile projects) written and run green in
+  a sandbox once to confirm it actually works (18/18 passed) — see §6.
+- ✅ `.github/workflows/tests.yml` has a `frontend` job (check/build/vitest/
+  Playwright) alongside the existing Python matrix job — untested by GitHub
+  Actions itself from this sandbox (no way to trigger a real workflow run
+  here); review the YAML before trusting it blindly on the first real push.
+- ❌ Frontend never rendered on a real device — mobile layout/gestures unverified
+  outside the Playwright/Pixel-7-viewport emulation above.
+- ❌ Rust never compiled (`#[cfg(desktop)]` gating unconfirmed by compiler) —
+  needs a machine with GTK/WebKitGTK libs.
+- ❌ APK never built — needs Android SDK/NDK/`ANDROID_HOME` (none of this exists
+  in the sandbox).
 
 ## 6. Code review already done
 Ran `/code-review` (high effort). Three SwipeDeck correctness bugs were **found
@@ -125,25 +146,28 @@ and FIXED** (commit `fix(ui): swipe deck correctness`):
 3. fly-off `setTimeout` not cleared → tracked in `actionTimer`, cleared on next
    action + `onDestroy`.
 
-Two **cleanup findings left UNADDRESSED** (intentionally):
-- `ResultActionSheet.svelte` duplicates `ContextMenu.svelte`'s action handlers →
-  extract a shared module both consume.
-- Download-host options (Rapidgator/Nitroflare/1Fichier) hardcoded in 4 places
-  (ResultTile, ResultRow, FilterBar desktop+sheet) → centralize in a constant.
+Two cleanup findings flagged at the time are now also **FIXED** (commit
+`Dedup result-action handlers, centralize download hosts, fix CORS, add
+Playwright harness`):
+- `ResultActionSheet.svelte` no longer duplicates `ContextMenu.svelte`'s action
+  handlers — both consume a shared module.
+- Download-host options (Rapidgator/Nitroflare/1Fichier) are centralized in a
+  shared constant instead of hardcoded in 4 places.
 
 ## 7. Suggested next steps (pick with the user)
-1. **Cleanup findings** above (quick, safe).
-2. **CORS**: a bundled APK is not same-origin; the FastAPI app needs to allow the
-   app origin. Not done. Check `backend/api/main.py` middleware. Likely needed for
-   the APK to work against the remote server.
-3. **Playwright mobile harness**: repo references `test:e2e:mobile` but there's no
-   `playwright.config.ts` and no tests. Can run headless here IF `npx playwright
-   install chromium` is allowed by egress. Add desktop+mobile(Pixel) projects +
-   smoke tests (nav, sheets open, no horizontal overflow at 390px).
-4. **On-device / APK build** — requires the user's machine (`docs/ANDROID_BUILD.md`).
-5. Frontend unit tests for the dismiss store / endpoint resolution / swipe logic
-   (none exist).
-6. Possible future: per-user dismissals/selection (currently global server state).
+Everything that could be done **without the user's own hardware** is now done:
+cleanup findings, CORS, the Playwright harness, dead-code removal
+(`Sidebar.svelte`'s unused mobile-drawer branch), a frontend CI job, and
+frontend unit tests (vitest) for the dismiss store / `deckResults` derivation
+and `endpoint.ts`'s base-URL resolution. What's left needs the user's machine:
+1. **On-device / APK build** — Rust Android targets, JDK 17, Android SDK/NDK,
+   `npm run android:init/dev/build` (`docs/ANDROID_BUILD.md`).
+2. **`cargo check`** on a desktop with GTK/WebKitGTK libs, to confirm the
+   `#[cfg(desktop)]` gating actually compiles both targets.
+3. **On-device smoke test** of the installed APK against a real backend
+   (CORS, WS upgrade through any reverse proxy, Cloudflare Access if present).
+4. Possible future: per-user dismissals/selection (currently global server
+   state).
 
 ## 8. Gotchas
 - `npm install` rewrites `frontend/package-lock.json` (drops a stale
@@ -159,6 +183,12 @@ Two **cleanup findings left UNADDRESSED** (intentionally):
 - Svelte 5 runes throughout (`$state`/`$derived`/`$props`/snippets). Match it.
 - SSR safety: the static adapter prerenders — guard every
   `window`/`document`/`localStorage`/`matchMedia` access (`typeof … !== 'undefined'`).
+- **vitest config lives in `vite.config.ts`** (`import { defineConfig } from
+  'vitest/config'`, not plain `'vite'`, so the `test` key type-checks), not a
+  separate `vitest.config.ts`. Environment is `jsdom`. Tests that touch
+  `$lib/api/client` must `vi.mock('$lib/api/client', …)` since importing it for
+  real triggers a `fetch` at call time; `results.ts` registers WS handlers via
+  `connection.on(...)` at module load, which is side-effect-free to import.
 
 ## 9. Doc index (all on the branch)
 - `docs/ANDROID_PLAN.md` — overall plan + decisions + progress.

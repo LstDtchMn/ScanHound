@@ -115,16 +115,15 @@ Files: `BottomSheet`, `MobileTabBar`, `ResultActionSheet`, `icons.ts`,
 - [ ] **Theme refactor**: logic moved from `Sidebar` into `stores/theme.ts`; init
   now in `+layout.onMount` via `initTheme()`. Check for FOUC on load and that the
   mobile top-bar toggle + desktop sidebar toggle stay in sync.
-- [ ] **Dead code**: `Sidebar.svelte` still has the `mobile` drawer branch that's
-  no longer rendered (the hamburger was removed). Decide: keep or delete.
+- [x] **Dead code**: `Sidebar.svelte`'s unused `mobile` drawer branch removed —
+  `MobileTabBar` is the only mobile nav now.
 - [ ] **BottomSheet a11y**: backdrop click + Esc close; drag handle. No real focus
   trap — acceptable? Verify `svelte-ignore` comments are justified.
 - [ ] **FilterBar/ScanControls**: the mobile sheets reuse the *same* handlers/state
   as desktop (no logic duplication) — verify. Active-filter badge count correct.
-- [ ] **Touch actions**: `ResultActionSheet` duplicates `ContextMenu`'s actions —
-  confirm parity (and consider whether they should share a handler module).
-  Long-press→`contextmenu`→sheet on mobile; `⋯` on tiles; desktop right-click
-  unchanged.
+- [x] **Touch actions**: `ResultActionSheet` and `ContextMenu` now share a single
+  action-handler module (deduped). Long-press→`contextmenu`→sheet on mobile; `⋯`
+  on tiles; desktop right-click unchanged.
 - [ ] **Stacked chrome**: on the mobile swipe view, confirm the deck still gets
   usable height (StatusBar hidden on mobile; tab bar + scan/filter bars remain).
 
@@ -133,21 +132,27 @@ Files: `BottomSheet`, `MobileTabBar`, `ResultActionSheet`, `icons.ts`,
   endpoints authed.
 - [ ] **SSR safety**: every `window`/`document`/`localStorage`/`matchMedia` access
   guarded (static adapter prerenders).
-- [ ] **Duplication**: download-host options (`Rapidgator/Nitroflare/1Fichier`)
-  hardcoded in ResultTile, ResultRow, FilterBar, ScanControls sheet — candidate to
-  centralize.
+- [x] **Duplication**: download-host options (`Rapidgator/Nitroflare/1Fichier`)
+  centralized in a shared constant, no longer hardcoded per-component.
 - [ ] **a11y**: tab bar `aria-current`, sheet labels, tap-target sizes, the
   several `svelte-ignore` suppressions.
-- [ ] **Tests**: backend covered; **no frontend tests** for the swipe logic /
-  dismiss store / endpoint resolution — note the gap (Playwright harness deferred).
+- [x] **Tests**: backend covered; frontend now has vitest unit tests (dismiss
+  store / `deckResults` derivation, `endpoint.ts` base-URL resolution) and a
+  Playwright e2e harness (desktop + mobile), both wired into CI.
 - [ ] **Docs accuracy**: `ANDROID_PLAN`, `ANDROID_BUILD`, `MOBILE_UI_PLAN` match
   what shipped.
 
 ## Known gaps already flagged
-- Rust not compiled here; mobile not device-tested.
-- No CORS work for a non-same-origin APK client.
-- Playwright mobile harness deferred.
-- `setTimeout`-based swipe commit + uncleared timers (Area 4).
+- Rust not compiled here; mobile not device-tested — still true, needs the
+  user's machine.
+- ~~No CORS work for a non-same-origin APK client.~~ Fixed: the API allows
+  `tauri://localhost` / `https://tauri.localhost` / `http://tauri.localhost`
+  plus a localhost dev-port regex.
+- ~~Playwright mobile harness deferred.~~ Fixed: `frontend/playwright.config.ts`
+  with desktop + mobile (Pixel 7) projects, run green in-sandbox once (18/18).
+- ~~`setTimeout`-based swipe commit + uncleared timers (Area 4).~~ Fixed in the
+  `fix(ui): swipe deck correctness` commit — tracked in `actionTimer`, cleared
+  on next action + `onDestroy`.
 
 ## Sign-off
 - [ ] `npm run check` + `npm run build` green · [ ] `pytest` green ·
