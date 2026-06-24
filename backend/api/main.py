@@ -258,6 +258,13 @@ def create_app(
             # Skip auth for health check (needed for readiness probes)
             if request.url.path == "/health":
                 return await call_next(request)
+            # Let CORS preflight through: browsers send OPTIONS with no
+            # credentials by design, so auth-ing it would 401 the preflight and
+            # strip the CORS headers CORSMiddleware needs to attach — blocking a
+            # non-same-origin client (the Android APK) before its real, authed
+            # request is ever made. OPTIONS returns only CORS metadata, no data.
+            if request.method == "OPTIONS":
+                return await call_next(request)
             auth_header = request.headers.get("authorization", "")
             if auth_header != f"Bearer {nonce}":
                 return JSONResponse(
