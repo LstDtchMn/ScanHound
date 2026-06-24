@@ -11,7 +11,7 @@
   import { connection } from '$lib/stores/connection';
   import { hasRemoteServer } from '$lib/stores/server';
   import { logPanelOpen } from '$lib/stores/logs';
-  import { viewMode, selectAll, deselectAll } from '$lib/stores/results';
+  import { viewMode, setViewMode, selectAll, deselectAll } from '$lib/stores/results';
   import { setAuthNonce, api } from '$lib/api/client';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
@@ -64,8 +64,8 @@
         case '3': goto('/watchlist'); break;
         case '4': goto('/analytics'); break;
         case '5': goto('/settings'); break;
-        case 'g': viewMode.set('grid'); break;
-        case 'l': viewMode.set('list'); break;
+        case 'g': setViewMode('grid'); break;
+        case 'l': setViewMode('list'); break;
         case '?': showShortcuts = !showShortcuts; break;
       }
     }

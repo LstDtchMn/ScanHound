@@ -433,6 +433,24 @@ class TestResults:
         assert "upgrade" in stats
         assert "library" in stats
 
+    def test_export_csv_no_results(self, client):
+        resp = client.post("/results/export")
+        # No scan results to export → 400
+        assert resp.status_code == 400
+        assert "no results" in resp.json()["detail"].lower()
+
+    def test_select_requires_group_keys(self, client):
+        resp = client.post("/results/select", json={"selected": True})
+        assert resp.status_code == 422
+
+    def test_per_page_max_validation(self, client):
+        resp = client.get("/results?per_page=501")
+        assert resp.status_code == 422
+
+    def test_page_min_validation(self, client):
+        resp = client.get("/results?page=0")
+        assert resp.status_code == 422
+
 
 class TestDismiss:
     def test_dismiss_adds_items(self, client):
@@ -468,24 +486,6 @@ class TestDismiss:
         assert resp.status_code == 200
         assert resp.json()["dismissed_count"] == 0
         assert client.get("/results/dismissed").json()["count"] == 0
-
-    def test_export_csv_no_results(self, client):
-        resp = client.post("/results/export")
-        # No scan results to export → 400
-        assert resp.status_code == 400
-        assert "no results" in resp.json()["detail"].lower()
-
-    def test_select_requires_group_keys(self, client):
-        resp = client.post("/results/select", json={"selected": True})
-        assert resp.status_code == 422
-
-    def test_per_page_max_validation(self, client):
-        resp = client.get("/results?per_page=501")
-        assert resp.status_code == 422
-
-    def test_page_min_validation(self, client):
-        resp = client.get("/results?page=0")
-        assert resp.status_code == 422
 
 
 # ── Downloads ─────────────────────────────────────────────────────────

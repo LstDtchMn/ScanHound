@@ -27,6 +27,7 @@ class DatabaseManager:
         self.conn = None
         self._lock = threading.RLock()  # Reentrant lock for thread-safe DB access
         self._init_depth = 0  # Guard against infinite recursion during recovery
+        self._dismissed_cache = None  # lazily-populated set[str], kept in sync by mutators
         self.init_db()
 
     # ── Core helpers ──────────────────────────────────────────────────
@@ -849,22 +850,88 @@ class DatabaseManager:
 
     # ── Dismissed items (mobile swipe-to-skip) ───────────────────────────
 
+    def _dismissed_urls_set(self):
+        """Return the live in-memory cache, lazily loading it from disk once.
+
+        Must be called while holding ``self._lock``. Callers that mutate the
+        table update this same set so it never goes stale without a re-query.
+        """
+        if self._dismissed_cache is None:
+            rows = self._query('SELECT url FROM dismissed_items', default=[])
+            self._dismissed_cache = {row[0] for row in rows}
+        return self._dismissed_cache
+
+    def add_dismissed_items(self, items):
+        """Dismiss multiple URLs in one transaction.
+
+        Args:
+            items: Iterable of (url, title) pairs. Re-dismissing an
+                already-dismissed URL updates its title when a non-null
+                title is supplied, instead of silently keeping the old one.
+        """
+        pairs = [(url, title) for url, title in items if url]
+        if not pairs:
+            return True
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                conn.cursor().executemany('''
+                    INSERT INTO dismissed_items (url, title) VALUES (:url, :title)
+                    ON CONFLICT(url) DO UPDATE SET
+                        title = COALESCE(excluded.title, dismissed_items.title)
+                ''', [{"url": u, "title": t} for u, t in pairs])
+                conn.commit()
+                self._dismissed_urls_set().update(u for u, _ in pairs)
+            return True
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error("DB Error (add_dismissed_items): %s", e)
+            return False
+
     def add_dismissed_item(self, url, title=None):
         """Record a single release URL as dismissed (swiped away)."""
-        return self._mutate('''
-            INSERT OR IGNORE INTO dismissed_items (url, title) VALUES (?, ?)
-        ''', (url, title), label="add_dismissed_item")
+        return self.add_dismissed_items([(url, title)])
+
+    def remove_dismissed_items(self, urls):
+        """Un-dismiss multiple URLs in one transaction so they can reappear."""
+        urls = [u for u in urls if u]
+        if not urls:
+            return True
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                conn.cursor().executemany(
+                    'DELETE FROM dismissed_items WHERE url = ?', [(u,) for u in urls])
+                conn.commit()
+                self._dismissed_urls_set().difference_update(urls)
+            return True
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error("DB Error (remove_dismissed_items): %s", e)
+            return False
 
     def remove_dismissed_item(self, url):
         """Un-dismiss a previously dismissed URL so it can reappear."""
-        return self._mutate(
-            'DELETE FROM dismissed_items WHERE url = ?', (url,),
-            label="remove_dismissed_item")
+        return self.remove_dismissed_items([url])
 
     def get_dismissed_urls(self):
         """Get all dismissed URLs as a set for fast membership testing."""
-        rows = self._query('SELECT url FROM dismissed_items', default=[])
-        return {row[0] for row in rows}
+        with self._lock:
+            return set(self._dismissed_urls_set())
 
     def get_dismissed_items(self, limit=1000):
         """Return dismissed items (url, title, dismissed_at), newest first."""
@@ -874,7 +941,11 @@ class DatabaseManager:
 
     def clear_dismissed_items(self):
         """Clear all dismissed-item records."""
-        return self._mutate("DELETE FROM dismissed_items", label="clear_dismissed_items")
+        ok = self._mutate("DELETE FROM dismissed_items", label="clear_dismissed_items")
+        if ok:
+            with self._lock:
+                self._dismissed_cache = set()
+        return ok
 
     def get_dismissed_count(self):
         """Return the total number of dismissed items."""

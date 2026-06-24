@@ -2,7 +2,7 @@ import { writable } from 'svelte/store';
 import {
   getStoredServerUrl, setStoredServerUrl, setStoredToken, getStoredToken
 } from '$lib/api/endpoint';
-import { setAuthNonce } from '$lib/api/client';
+import { setAuthNonce, fetchWithTimeout } from '$lib/api/client';
 import { connection } from './connection';
 
 /** Reactive mirror of the configured remote server URL ('' = same-origin). */
@@ -45,22 +45,19 @@ export async function testServerConnection(
   const base = url.trim().replace(/\/+$/, '');
   if (!base) return { ok: false, error: 'Enter a server URL' };
   if (!/^https?:\/\//i.test(base)) return { ok: false, error: 'URL must start with http:// or https://' };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10_000);
   try {
-    const resp = await fetch(`${base}/health`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-      signal: controller.signal
-    });
+    const resp = await fetchWithTimeout(
+      `${base}/health`,
+      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
+      10_000
+    );
     if (!resp.ok) {
       return { ok: false, error: resp.status === 401 ? 'Unauthorized — check the token' : `HTTP ${resp.status}` };
     }
     const data = await resp.json().catch(() => ({}));
     return { ok: true, version: (data as { version?: string }).version };
   } catch (e) {
-    if (e instanceof DOMException && e.name === 'AbortError') return { ok: false, error: 'Timed out' };
+    if (e instanceof Error && e.message.startsWith('Request timed out')) return { ok: false, error: 'Timed out' };
     return { ok: false, error: e instanceof Error ? e.message : 'Connection failed' };
-  } finally {
-    clearTimeout(timer);
   }
 }

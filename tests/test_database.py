@@ -138,6 +138,27 @@ class TestDismissedItems:
         db_manager.clear_dismissed_items()
         assert db_manager.get_dismissed_count() == 0
 
+    def test_redismiss_fills_in_missing_title(self, db_manager):
+        db_manager.add_dismissed_item("http://x/a")
+        db_manager.add_dismissed_item("http://x/a", "Movie A")
+        items = db_manager.get_dismissed_items()
+        assert items[0]["title"] == "Movie A"
+
+    def test_redismiss_without_title_keeps_existing_title(self, db_manager):
+        db_manager.add_dismissed_item("http://x/a", "Movie A")
+        db_manager.add_dismissed_item("http://x/a")
+        items = db_manager.get_dismissed_items()
+        assert items[0]["title"] == "Movie A"
+
+    def test_add_dismissed_items_batch(self, db_manager):
+        db_manager.add_dismissed_items([("http://x/a", "A"), ("http://x/b", "B")])
+        assert db_manager.get_dismissed_urls() == {"http://x/a", "http://x/b"}
+
+    def test_remove_dismissed_items_batch(self, db_manager):
+        db_manager.add_dismissed_items([("http://x/a", None), ("http://x/b", None)])
+        db_manager.remove_dismissed_items(["http://x/a", "http://x/b"])
+        assert db_manager.get_dismissed_urls() == set()
+
 
 class TestDownloadHistory:
 

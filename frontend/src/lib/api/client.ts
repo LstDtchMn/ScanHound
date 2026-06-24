@@ -15,44 +15,51 @@ export function getAuthNonce(): string {
   return authNonce;
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+/** fetch() with an abort-based timeout, shared by this client and anything
+ *  else (e.g. the remote-server connection test) that needs to probe a URL
+ *  the way request() does without going through apiBase()/authNonce. */
+export async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const headers = new Headers(options?.headers);
-    if (options?.body !== undefined && !headers.has('Content-Type')) {
-      headers.set('Content-Type', 'application/json');
-    }
-    if (authNonce) {
-      headers.set('Authorization', `Bearer ${authNonce}`);
-    }
-
-    const resp = await fetch(`${apiBase()}${path}`, {
-      ...options,
-      headers,
-      signal: controller.signal,
-    });
-    if (!resp.ok) {
-      throw new Error(`API error: ${resp.status} ${resp.statusText}`);
-    }
-    const ct = resp.headers.get('content-type') || '';
-    if (!ct.includes('application/json')) {
-      throw new Error(`Unexpected content type: ${ct}`);
-    }
-    const data = await resp.json();
-    // Defensive fallback: catch error payloads that slipped through with 200
-    if (data && typeof data === 'object' && 'success' in data && data.success === false) {
-      throw new Error(data.detail || data.error || data.message || 'Request failed');
-    }
-    return data;
+    return await fetch(url, { ...options, signal: controller.signal });
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') {
-      throw new Error('Request timed out after 15s');
+      throw new Error(`Request timed out after ${timeoutMs / 1000}s`);
     }
     throw e;
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const headers = new Headers(options?.headers);
+  if (options?.body !== undefined && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+  if (authNonce) {
+    headers.set('Authorization', `Bearer ${authNonce}`);
+  }
+
+  const resp = await fetchWithTimeout(`${apiBase()}${path}`, { ...options, headers }, REQUEST_TIMEOUT_MS);
+  if (!resp.ok) {
+    throw new Error(`API error: ${resp.status} ${resp.statusText}`);
+  }
+  const ct = resp.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) {
+    throw new Error(`Unexpected content type: ${ct}`);
+  }
+  const data = await resp.json();
+  // Defensive fallback: catch error payloads that slipped through with 200
+  if (data && typeof data === 'object' && 'success' in data && data.success === false) {
+    throw new Error(data.detail || data.error || data.message || 'Request failed');
+  }
+  return data;
 }
 
 export const api = {

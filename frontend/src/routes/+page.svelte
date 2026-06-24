@@ -140,10 +140,12 @@
   onMount(async () => {
     // Phones default to the swipe deck unless the user has chosen a view.
     if (get(mobile) && !get(viewModeExplicit)) viewMode.set('swipe');
-    // Pull the persisted swipe-dismissal set so skipped items stay hidden
-    hydrateDismissed();
     // Load all status in parallel so checklist shows accurate data on first render
     await Promise.all([
+      // Pull the persisted swipe-dismissal set so skipped items stay hidden —
+      // awaited alongside results so the deck never briefly shows cards the
+      // user already swiped away in an earlier session.
+      hydrateDismissed(),
       refreshPlexStatus().finally(() => { plexChecking = false; }),
       loadSettings(),
       (async () => {

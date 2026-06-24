@@ -191,6 +191,24 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
     logger.info("Download results poller started")
 
 
+# Paths reachable without the auth nonce, e.g. readiness probes that run
+# before any client has a token to present. Extend this set rather than
+# bolting another bespoke comparison onto auth_middleware.
+_AUTH_EXEMPT_PATHS = frozenset({"/health"})
+
+
+def _is_auth_exempt(request: Request) -> bool:
+    """Whether this request should pass the auth middleware without a nonce."""
+    if request.method == "OPTIONS":
+        # CORS preflight: browsers send OPTIONS with no credentials by design,
+        # so auth-ing it would 401 the preflight and strip the CORS headers
+        # CORSMiddleware needs to attach — blocking a non-same-origin client
+        # (the Android APK) before its real, authed request is ever made.
+        # OPTIONS returns only CORS metadata, no data.
+        return True
+    return request.url.path in _AUTH_EXEMPT_PATHS
+
+
 def _teardown_services(reg: ServiceRegistry) -> None:
     """Gracefully shut down all services."""
     reg.request_shutdown()  # stop the background results poller
@@ -254,17 +272,7 @@ def create_app(
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
         nonce = registry.auth_nonce
-        if nonce:
-            # Skip auth for health check (needed for readiness probes)
-            if request.url.path == "/health":
-                return await call_next(request)
-            # Let CORS preflight through: browsers send OPTIONS with no
-            # credentials by design, so auth-ing it would 401 the preflight and
-            # strip the CORS headers CORSMiddleware needs to attach — blocking a
-            # non-same-origin client (the Android APK) before its real, authed
-            # request is ever made. OPTIONS returns only CORS metadata, no data.
-            if request.method == "OPTIONS":
-                return await call_next(request)
+        if nonce and not _is_auth_exempt(request):
             auth_header = request.headers.get("authorization", "")
             if auth_header != f"Bearer {nonce}":
                 return JSONResponse(

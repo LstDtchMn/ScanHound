@@ -146,13 +146,9 @@ def dismiss_items(req: DismissRequest, reg: ServiceRegistry = Depends(get_regist
         raise HTTPException(status_code=503, detail="Database not available")
     titles = req.titles or {}
     if req.dismissed:
-        for url in req.urls:
-            if url:
-                db.add_dismissed_item(url, titles.get(url))
+        db.add_dismissed_items((url, titles.get(url)) for url in req.urls if url)
     else:
-        for url in req.urls:
-            if url:
-                db.remove_dismissed_item(url)
+        db.remove_dismissed_items(req.urls)
     return {"status": "ok", "dismissed_count": db.get_dismissed_count()}
 
 

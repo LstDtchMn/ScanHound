@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { fly, fade } from 'svelte/transition';
+  import { fly } from 'svelte/transition';
   import type { Snippet } from 'svelte';
+  import ModalOverlay from './ModalOverlay.svelte';
 
   interface Props {
     open: boolean;
@@ -30,19 +31,10 @@
     if (dragY > 120) onclose();
     dragY = 0;
   }
-
-  function onKey(e: KeyboardEvent) {
-    if (e.key === 'Escape') onclose();
-  }
 </script>
 
-<svelte:window onkeydown={open ? onKey : undefined} />
-
 {#if open}
-  <div class="fixed inset-0 z-50 flex flex-col justify-end">
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="absolute inset-0 bg-[var(--bg-overlay)]" transition:fade={{ duration: 150 }} onclick={onclose}></div>
+  <ModalOverlay {onclose} align="bottom">
     <div
       class="relative bg-[var(--bg-secondary)] border-t border-[var(--border)] rounded-t-2xl shadow-2xl max-h-[85vh] flex flex-col"
       transition:fly={{ y: 400, duration: 220 }}
@@ -70,5 +62,5 @@
         {@render children()}
       </div>
     </div>
-  </div>
+  </ModalOverlay>
 {/if}

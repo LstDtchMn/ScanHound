@@ -235,39 +235,49 @@ export async function hydrateDismissed() {
   }
 }
 
-/** Swipe-left: dismiss an item (optimistic), persisting it server-side. */
-export function dismissItem(url: string, title?: string) {
-  if (!url) return;
+/** Swipe-left: dismiss an item (optimistic), persisting it server-side.
+ *  Resolves false if the server call failed and the optimistic update was
+ *  reverted — callers can use this to drop a now-stale undo entry. */
+export function dismissItem(url: string, title?: string): Promise<boolean> {
+  if (!url) return Promise.resolve(false);
   dismissedUrls.update((s) => {
     const next = new Set(s);
     next.add(url);
     return next;
   });
-  api.dismissItems([url], title ? { [url]: title } : undefined, true).catch(() => {
-    // Revert on failure so the UI reflects the server's truth.
-    dismissedUrls.update((s) => {
-      const next = new Set(s);
-      next.delete(url);
-      return next;
-    });
-  });
+  return api.dismissItems([url], title ? { [url]: title } : undefined, true).then(
+    () => true,
+    () => {
+      // Revert on failure so the UI reflects the server's truth.
+      dismissedUrls.update((s) => {
+        const next = new Set(s);
+        next.delete(url);
+        return next;
+      });
+      return false;
+    }
+  );
 }
 
 /** Undo a dismissal so the item can reappear. */
-export function restoreItem(url: string) {
-  if (!url) return;
+export function restoreItem(url: string): Promise<boolean> {
+  if (!url) return Promise.resolve(false);
   dismissedUrls.update((s) => {
     const next = new Set(s);
     next.delete(url);
     return next;
   });
-  api.dismissItems([url], undefined, false).catch(() => {
-    dismissedUrls.update((s) => {
-      const next = new Set(s);
-      next.add(url);
-      return next;
-    });
-  });
+  return api.dismissItems([url], undefined, false).then(
+    () => true,
+    () => {
+      dismissedUrls.update((s) => {
+        const next = new Set(s);
+        next.add(url);
+        return next;
+      });
+      return false;
+    }
+  );
 }
 
 export function clearResults() {

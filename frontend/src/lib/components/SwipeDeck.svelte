@@ -97,9 +97,18 @@
     dy = dy * 1.2;
     if (actionTimer) clearTimeout(actionTimer);
     actionTimer = setTimeout(() => {
-      if (action === 'select') toggleSelect(item.url);
-      else dismissItem(item.url, item.title);
-      undoStack = [...undoStack.slice(-9), { url: item.url, title: item.title, action }];
+      const entry: Swipe = { url: item.url, title: item.title, action };
+      undoStack = [...undoStack.slice(-9), entry];
+      if (action === 'select') {
+        toggleSelect(item.url);
+      } else {
+        // If the dismiss didn't persist, the store already reverted the card
+        // back into the deck on its own — drop the now-stale undo entry so
+        // "Undo" doesn't sit there as a no-op.
+        dismissItem(item.url, item.title).then((persisted) => {
+          if (!persisted) undoStack = undoStack.filter((s) => s !== entry);
+        });
+      }
       dx = 0;
       dy = 0;
       animating = false;
