@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { statusFilter, searchFilter, genreFilter, languageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, visibleColumns } from '$lib/stores/results';
+  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, visibleColumns } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -11,8 +11,8 @@
   let activeFilterCount = $derived(
     ($statusFilter !== 'all' ? 1 : 0) +
     ($searchFilter ? 1 : 0) +
-    ($genreFilter ? 1 : 0) +
-    ($languageFilter ? 1 : 0) +
+    ($genreFilter.length > 0 ? 1 : 0) +
+    ($languageFilter.length > 0 ? 1 : 0) +
     $quickFilters.length
   );
 
@@ -235,31 +235,49 @@
   </select>
 
   {#if $availableGenres.length > 0}
-    <select
-      value={$genreFilter}
-      onchange={(e) => genreFilter.set((e.target as HTMLSelectElement).value)}
-      class="bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-2 py-1 rounded border border-[var(--border)] text-[11px] focus:outline-none focus:border-[var(--accent)] cursor-pointer"
-      title="Filter by genre"
-    >
-      <option value="">All Genres</option>
-      {#each $availableGenres as genre}
-        <option value={genre}>{genre}</option>
-      {/each}
-    </select>
+    <details class="relative">
+      <summary class="list-none cursor-pointer px-2 py-1 rounded text-[11px] text-[var(--text-secondary)] bg-[var(--bg-tertiary)] border border-[var(--border)] hover:border-[var(--accent)] select-none">
+        Genres{#if $genreFilter.length > 0}<span class="ml-0.5 text-[var(--accent)]">({$genreFilter.length})</span>{/if} &#9662;
+      </summary>
+      <div class="absolute right-0 mt-1 z-20 w-44 max-h-72 overflow-y-auto bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg shadow-lg p-1.5">
+        <button
+          onclick={() => genreFilter.set([])}
+          class="w-full text-left px-2 py-1 rounded text-xs font-medium mb-1
+            {$genreFilter.length === 0 ? 'bg-[var(--accent)]/15 text-[var(--accent)]' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'}"
+        >
+          All genres
+        </button>
+        {#each $availableGenres as genre}
+          <label class="flex items-center gap-2 px-2 py-1 rounded text-xs cursor-pointer hover:bg-[var(--bg-tertiary)]">
+            <input type="checkbox" checked={$genreFilter.includes(genre)} onchange={() => toggleGenreFilter(genre)} class="accent-[var(--accent)]" />
+            {genre}
+          </label>
+        {/each}
+      </div>
+    </details>
   {/if}
 
   {#if $availableLanguages.length > 1}
-    <select
-      value={$languageFilter}
-      onchange={(e) => languageFilter.set((e.target as HTMLSelectElement).value)}
-      class="bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-2 py-1 rounded border border-[var(--border)] text-[11px] focus:outline-none focus:border-[var(--accent)] cursor-pointer"
-      title="Filter by language"
-    >
-      <option value="">All Languages</option>
-      {#each $availableLanguages as lang}
-        <option value={lang}>{lang}</option>
-      {/each}
-    </select>
+    <details class="relative">
+      <summary class="list-none cursor-pointer px-2 py-1 rounded text-[11px] text-[var(--text-secondary)] bg-[var(--bg-tertiary)] border border-[var(--border)] hover:border-[var(--accent)] select-none">
+        Languages{#if $languageFilter.length > 0}<span class="ml-0.5 text-[var(--accent)]">({$languageFilter.length})</span>{/if} &#9662;
+      </summary>
+      <div class="absolute right-0 mt-1 z-20 w-44 max-h-72 overflow-y-auto bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg shadow-lg p-1.5">
+        <button
+          onclick={() => languageFilter.set([])}
+          class="w-full text-left px-2 py-1 rounded text-xs font-medium mb-1
+            {$languageFilter.length === 0 ? 'bg-[var(--accent)]/15 text-[var(--accent)]' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'}"
+        >
+          All languages
+        </button>
+        {#each $availableLanguages as lang}
+          <label class="flex items-center gap-2 px-2 py-1 rounded text-xs cursor-pointer hover:bg-[var(--bg-tertiary)]">
+            <input type="checkbox" checked={$languageFilter.includes(lang)} onchange={() => toggleLanguageFilter(lang)} class="accent-[var(--accent)]" />
+            {lang}
+          </label>
+        {/each}
+      </div>
+    </details>
   {/if}
 
   <select
@@ -429,20 +447,40 @@
     <!-- Genre / Language / Host -->
     {#if $availableGenres.length > 0}
       <div>
-        <label for="fb-genre" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Genre</label>
-        <select id="fb-genre" value={$genreFilter} onchange={(e) => genreFilter.set((e.target as HTMLSelectElement).value)} class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm">
-          <option value="">All genres</option>
-          {#each $availableGenres as g}<option value={g}>{g}</option>{/each}
-        </select>
+        <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Genre</p>
+        <div class="flex flex-wrap gap-2">
+          <button
+            onclick={() => genreFilter.set([])}
+            class="px-3 py-1.5 rounded-full text-sm border transition-colors
+              {$genreFilter.length === 0 ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
+          >All</button>
+          {#each $availableGenres as g}
+            <button
+              onclick={() => toggleGenreFilter(g)}
+              class="px-3 py-1.5 rounded-full text-sm border transition-colors
+                {$genreFilter.includes(g) ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
+            >{g}</button>
+          {/each}
+        </div>
       </div>
     {/if}
     {#if $availableLanguages.length > 1}
       <div>
-        <label for="fb-lang" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Language</label>
-        <select id="fb-lang" value={$languageFilter} onchange={(e) => languageFilter.set((e.target as HTMLSelectElement).value)} class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm">
-          <option value="">All languages</option>
-          {#each $availableLanguages as l}<option value={l}>{l}</option>{/each}
-        </select>
+        <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Language</p>
+        <div class="flex flex-wrap gap-2">
+          <button
+            onclick={() => languageFilter.set([])}
+            class="px-3 py-1.5 rounded-full text-sm border transition-colors
+              {$languageFilter.length === 0 ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
+          >All</button>
+          {#each $availableLanguages as l}
+            <button
+              onclick={() => toggleLanguageFilter(l)}
+              class="px-3 py-1.5 rounded-full text-sm border transition-colors
+                {$languageFilter.includes(l) ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
+            >{l}</button>
+          {/each}
+        </div>
       </div>
     {/if}
     <div>

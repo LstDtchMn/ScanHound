@@ -68,8 +68,8 @@ function resetStores() {
   dismissedUrls.set(new Set());
   statusFilter.set('all');
   searchFilter.set('');
-  genreFilter.set('');
-  languageFilter.set('');
+  genreFilter.set([]);
+  languageFilter.set([]);
   quickFilters.set([]);
 }
 
@@ -105,6 +105,38 @@ describe('filteredResults', () => {
     results.set([item({ url: 'a', title: 'The Matrix' }), item({ url: 'b', title: 'Inception' })]);
     searchFilter.set('matrix');
     expect(get(filteredResults).map((r) => r.url)).toEqual(['a']);
+  });
+
+  it('filters by one or more selected genres (item matches if it has any)', () => {
+    results.set([
+      item({ url: 'a', genres: ['Action', 'Sci-Fi'] }),
+      item({ url: 'b', genres: ['Comedy'] }),
+      item({ url: 'c', genres: ['Drama'] })
+    ]);
+    genreFilter.set(['Sci-Fi', 'Drama']);
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['a', 'c']);
+  });
+
+  it('treats an empty genre selection as "All" (no filter)', () => {
+    results.set([item({ url: 'a', genres: ['Action'] }), item({ url: 'b', genres: ['Comedy'] })]);
+    genreFilter.set([]);
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['a', 'b']);
+  });
+
+  it('filters by one or more selected languages', () => {
+    results.set([
+      item({ url: 'a', language: 'English' }),
+      item({ url: 'b', language: 'French' }),
+      item({ url: 'c', language: 'German' })
+    ]);
+    languageFilter.set(['French', 'German']);
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['b', 'c']);
+  });
+
+  it('treats an empty language selection as "All" (no filter)', () => {
+    results.set([item({ url: 'a', language: 'English' }), item({ url: 'b', language: 'French' })]);
+    languageFilter.set([]);
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['a', 'b']);
   });
 });
 

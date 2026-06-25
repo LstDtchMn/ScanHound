@@ -35,8 +35,15 @@ function persisted<T>(key: string, fallback: T) {
 export const results = writable<ScanResult[]>([]);
 export const statusFilter = writable<StatusFilter>('all');
 export const searchFilter = writable<string>('');
-export const genreFilter = writable<string>('');
-export const languageFilter = writable<string>('');
+/** Selected genres/languages to show; empty array means "All" (no filter). */
+export const genreFilter = writable<string[]>([]);
+export const languageFilter = writable<string[]>([]);
+export function toggleGenreFilter(genre: string) {
+  genreFilter.update((g) => (g.includes(genre) ? g.filter((x) => x !== genre) : [...g, genre]));
+}
+export function toggleLanguageFilter(lang: string) {
+  languageFilter.update((l) => (l.includes(lang) ? l.filter((x) => x !== lang) : [...l, lang]));
+}
 export const viewMode = persisted<ViewMode>('sh-view-mode', 'grid');
 /** Whether the user has explicitly picked a view (vs. the platform default).
  *  Lets phones default to the swipe deck without overriding a deliberate choice. */
@@ -187,11 +194,11 @@ export const filteredResults = derived(
       const q = $search.toLowerCase();
       items = items.filter((i) => i.title.toLowerCase().includes(q));
     }
-    if ($genre) {
-      items = items.filter((i) => i.genres?.includes($genre));
+    if ($genre.length > 0) {
+      items = items.filter((i) => i.genres?.some((g) => $genre.includes(g)));
     }
-    if ($language) {
-      items = items.filter((i) => i.language === $language);
+    if ($language.length > 0) {
+      items = items.filter((i) => $language.includes(i.language));
     }
     // Quick-filter chips (AND-combined with the above)
     if ($quick.includes('4k')) items = items.filter((i) => i.resolution === '4K');
