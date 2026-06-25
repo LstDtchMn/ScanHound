@@ -25,6 +25,21 @@
   let schedulerStatus = $state<{next_run: string | null; scheduler_active: boolean} | null>(null);
   let backgroundStatus = $state<BackgroundStatus | null>(null);
   let bgScanning = $state(false);
+  let ollamaTest = $state<{ ok: boolean; models?: string[]; error?: string } | null>(null);
+  let ollamaTesting = $state(false);
+
+  async function testOllamaConnection() {
+    ollamaTesting = true;
+    ollamaTest = null;
+    if ($isDirty) await saveSettings();  // persist the URL before probing
+    try {
+      ollamaTest = await api.testOllama();
+    } catch {
+      ollamaTest = { ok: false, error: 'Request failed' };
+    } finally {
+      ollamaTesting = false;
+    }
+  }
   let knownLibraries = $state<string[]>([]);
   let movieLibs = $state<string[]>([]);
   let tvLibs = $state<string[]>([]);
@@ -169,7 +184,7 @@
     }
   }
 
-  type Tab = 'general' | 'connection' | 'plex' | 'sources' | 'notifications' | 'scheduler' | 'background' | 'matching' | 'autograb';
+  type Tab = 'general' | 'connection' | 'plex' | 'sources' | 'notifications' | 'scheduler' | 'background' | 'rename' | 'matching' | 'autograb';
   let activeTab = $state<Tab>('general');
 
   const tabs: { value: Tab; label: string }[] = [
@@ -181,6 +196,7 @@
     { value: 'autograb', label: 'Auto-Grab' },
     { value: 'scheduler', label: 'Scheduler' },
     { value: 'background', label: 'Background' },
+    { value: 'rename', label: 'Renaming' },
     { value: 'notifications', label: 'Notifications' }
   ];
 
@@ -1351,6 +1367,125 @@
           {:else}
             <div class="text-sm text-[var(--text-secondary)]">Loading status…</div>
           {/if}
+        </div>
+      </section>
+
+    {:else if activeTab === 'rename'}
+      <section class="space-y-4">
+        <h2 class="text-lg font-semibold">Auto-Rename</h2>
+        <p class="text-sm text-[var(--text-secondary)]">
+          After JDownloader extracts a download, identify it and rename/move it into a
+          Plex-friendly library. Tracked in the
+          <a href="/renames" class="text-[var(--accent)] hover:underline">Renames</a> tab. Off by default.
+        </p>
+
+        <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">
+          <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Behaviour</h3>
+
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.auto_rename_enabled ?? false}
+              onchange={(e) => settings.update((s) => ({ ...s, auto_rename_enabled: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm font-medium">Enable auto-rename</span>
+          </label>
+
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.auto_rename_require_confirmation ?? true}
+              onchange={(e) => settings.update((s) => ({ ...s, auto_rename_require_confirmation: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm">Require confirmation before moving files (recommended)</span>
+          </label>
+
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Low-confidence threshold (flag for review below)</span>
+            <input type="number" min="0" max="100" value={$settings.auto_rename_confidence_threshold ?? 70}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_confidence_threshold: parseInt(e.currentTarget.value) || 70 }))}
+              class={inputSmClass} />
+          </label>
+
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">File placement</span>
+            <select value={$settings.auto_rename_move_method ?? 'hardlink'}
+              onchange={(e) => settings.update((s) => ({ ...s, auto_rename_move_method: e.currentTarget.value }))}
+              class={inputClass}>
+              <option value="hardlink">Hardlink (keeps original)</option>
+              <option value="symlink">Symlink</option>
+              <option value="copy">Copy</option>
+              <option value="move">Move</option>
+            </select>
+          </label>
+
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.auto_rename_plex_sort_titles ?? false}
+              onchange={(e) => settings.update((s) => ({ ...s, auto_rename_plex_sort_titles: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm">Compute Plex sort titles (e.g. “Matrix, The”)</span>
+          </label>
+        </div>
+
+        <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">
+          <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Library destinations</h3>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Movies folder</span>
+            <input type="text" value={$settings.auto_rename_movie_library ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_movie_library: e.currentTarget.value }))}
+              placeholder="/library/Movies" class={inputClass} />
+          </label>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">TV folder</span>
+            <input type="text" value={$settings.auto_rename_tv_library ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_tv_library: e.currentTarget.value }))}
+              placeholder="/library/TV" class={inputClass} />
+          </label>
+          <p class="text-xs text-[var(--text-secondary)]">Leave the templates blank for the Plex default naming.</p>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Movie name template (optional)</span>
+            <input type="text" value={$settings.auto_rename_template_movie ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_template_movie: e.currentTarget.value }))}
+              placeholder={'{{title}} ({{year}}) [{{resolution}}]'} class={inputClass} />
+          </label>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">TV name template (optional)</span>
+            <input type="text" value={$settings.auto_rename_template_tv ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_template_tv: e.currentTarget.value }))}
+              placeholder={'{{title}} - S{{season}}E{{episode}}[ - {{episode_title}}]'} class={inputClass} />
+          </label>
+        </div>
+
+        <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">
+          <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Ollama assist (optional)</h3>
+          <p class="text-xs text-[var(--text-secondary)]">
+            Use a local Ollama model to help identify messy filenames when confidence is low.
+            TMDB still confirms every match.
+          </p>
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.auto_rename_llm_enabled ?? false}
+              onchange={(e) => settings.update((s) => ({ ...s, auto_rename_llm_enabled: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm">Enable Ollama-assisted identification</span>
+          </label>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Ollama URL</span>
+            <input type="text" value={$settings.ollama_base_url ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, ollama_base_url: e.currentTarget.value }))}
+              placeholder="http://host.docker.internal:11434" class={inputClass} />
+          </label>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Model</span>
+            <input type="text" value={$settings.ollama_model ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, ollama_model: e.currentTarget.value }))}
+              placeholder="llama3.1:8b" class={inputClass} />
+          </label>
+          <div class="flex items-center gap-2">
+            <button onclick={testOllamaConnection} disabled={ollamaTesting} class={testBtnClass}>
+              {ollamaTesting ? 'Testing…' : 'Test connection'}
+            </button>
+            {#if ollamaTest}
+              <span class="text-xs {ollamaTest.ok ? 'text-[var(--success)]' : 'text-[var(--error)]'}">
+                {ollamaTest.ok ? `✓ ${ollamaTest.models?.length ?? 0} model(s)` : `✕ ${ollamaTest.error}`}
+              </span>
+            {/if}
+          </div>
         </div>
       </section>
 

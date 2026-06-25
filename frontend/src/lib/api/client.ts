@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -301,4 +301,24 @@ export const api = {
   getBackgroundStatus: () => request<BackgroundStatus>('/background/status'),
   triggerBackgroundScan: () =>
     request<{ status: string }>('/background/scan-now', { method: 'POST' }),
+
+  // Auto-rename
+  getRenameJobs: (status?: string) => {
+    const qs = status ? `?status=${encodeURIComponent(status)}` : '';
+    return request<{ jobs: RenameJob[]; counts: Record<string, number> }>(`/rename/jobs${qs}`);
+  },
+  getRenameStatus: () => request<RenameStatus>('/rename/status'),
+  applyRename: (id: number) =>
+    request<{ ok: boolean }>(`/rename/jobs/${id}/apply`, { method: 'POST' }),
+  undoRename: (id: number) =>
+    request<{ ok: boolean }>(`/rename/jobs/${id}/undo`, { method: 'POST' }),
+  rematchRename: (id: number, tmdbId: number, mediaType?: string) =>
+    request<{ ok: boolean }>(`/rename/jobs/${id}/rematch`, {
+      method: 'POST',
+      body: JSON.stringify({ tmdb_id: tmdbId, media_type: mediaType ?? null })
+    }),
+  deleteRenameJob: (id: number) =>
+    request<{ ok: boolean }>(`/rename/jobs/${id}`, { method: 'DELETE' }),
+  testOllama: () =>
+    request<{ ok: boolean; models?: string[]; error?: string }>('/rename/llm/test'),
 };
