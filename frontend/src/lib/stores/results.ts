@@ -73,6 +73,13 @@ export const selectedKeys = writable<Set<string>>(new Set());
  *  deck only surfaces fresh items across scans. Hydrated on app load. */
 export const dismissedUrls = writable<Set<string>>(new Set());
 
+/** Whether the shown results came from the background pre-cache (no live scan
+ *  this session). Drives a subtle "showing cached results" banner; cleared the
+ *  moment a live scan produces results. */
+export const fromCache = writable<boolean>(false);
+export const cacheUpdatedAt = writable<string | null>(null);
+let fromCacheActive = false;
+
 let activeScanResultCount = 0;
 
 /** Parse a human-readable size string like "4.5 GB" into bytes for comparison */
@@ -101,6 +108,13 @@ function parsePostedDate(s: string | null | undefined): number {
 
 connection.on('scan:result', (data) => {
   const item = data as unknown as ScanResult;
+  // A live scan supersedes any pre-cached results: clear the cache rows on the
+  // first streamed item so live and cached never mix.
+  if (fromCacheActive) {
+    results.set([]);
+    fromCacheActive = false;
+    fromCache.set(false);
+  }
   activeScanResultCount += 1;
   results.update((items) => [...items, item]);
   // Incrementally update stats as items stream in
@@ -117,6 +131,9 @@ connection.on('scan:result', (data) => {
 connection.on('scan:complete', (data) => {
   const s = data.stats as ScanStats;
   if (s) stats.set(s);
+  // A completed live scan always supersedes the cache banner.
+  fromCacheActive = false;
+  fromCache.set(false);
 
   // If a completed scan produced no streamed items, ensure stale results
   // from an earlier run are cleared out of the UI.
@@ -225,6 +242,24 @@ export const deckResults = derived(
     $filtered.filter((i) => !!i.url && isActionable(i.status) && !$selected.has(i.url))
 );
 
+/** Seed the store from pre-cached background-scan results when there are no
+ *  live results yet (fresh session / server restart), so the app opens with
+ *  something to show. Sets fromCache so the UI can flag it. */
+export async function hydrateCache() {
+  try {
+    const data = await api.getCachedResults({ per_page: '500' });
+    if (data.items && data.items.length > 0) {
+      results.set(data.items as ScanResult[]);
+      if (data.stats) stats.set(data.stats);
+      cacheUpdatedAt.set(data.last_updated ?? null);
+      fromCache.set(true);
+      fromCacheActive = true;
+    }
+  } catch {
+    /* no cache / offline — leave empty */
+  }
+}
+
 /** Load the persisted dismissal set from the server (call once on app start). */
 export async function hydrateDismissed() {
   try {
@@ -287,6 +322,8 @@ export function clearResults() {
   selectedDetail.set(null);
   focusedIndex.set(-1);
   activeScanResultCount = 0;
+  fromCacheActive = false;
+  fromCache.set(false);
 }
 
 /** Mark result rows (by url) as Downloaded and adjust the status counters. */

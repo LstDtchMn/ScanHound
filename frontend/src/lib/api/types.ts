@@ -46,6 +46,23 @@ export interface ResultsResponse {
   filtered_stats?: ScanStats;
 }
 
+export interface CachedResultsResponse extends ResultsResponse {
+  source: string;
+  last_updated: string | null;
+}
+
+export interface BackgroundStatus {
+  enabled: boolean;
+  interval_hours: number;
+  pages: number;
+  sources: string[];
+  retain_days: number;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  cached_count: number;
+  running: boolean;
+}
+
 export interface WsMessage {
   type: string;
   data: Record<string, unknown>;
@@ -242,6 +259,14 @@ export interface Settings {
   scheduler_enabled?: boolean;
   scheduler_interval?: number;
   last_scan_time?: number;
+
+  // Background pre-cache scanning
+  background_scan_enabled?: boolean;
+  background_scan_interval_hours?: number;
+  background_scan_pages?: number;
+  background_scan_sources?: string[];
+  background_scan_retain_days?: number;
+  background_scan_last_run?: number;
 
   // Debug & Logging
   debug_mode?: boolean;

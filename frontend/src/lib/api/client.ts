@@ -1,4 +1,4 @@
-import type { ResultsResponse, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -108,6 +108,10 @@ export const api = {
   getResults: (params?: Record<string, string>) => {
     const qs = params ? '?' + new URLSearchParams(params).toString() : '';
     return request<ResultsResponse>(`/results${qs}`);
+  },
+  getCachedResults: (params?: Record<string, string>) => {
+    const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+    return request<CachedResultsResponse>(`/results/cached${qs}`);
   },
   selectItems: (groupKeys: string[], selected: boolean) =>
     request('/results/select', {
@@ -292,4 +296,9 @@ export const api = {
     }),
   schedulerTrigger: () =>
     request<{ status: string }>('/scheduler/trigger', { method: 'POST' }),
+
+  // Background pre-cache scanner
+  getBackgroundStatus: () => request<BackgroundStatus>('/background/status'),
+  triggerBackgroundScan: () =>
+    request<{ status: string }>('/background/scan-now', { method: 'POST' }),
 };
