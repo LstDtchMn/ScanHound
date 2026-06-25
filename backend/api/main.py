@@ -172,6 +172,11 @@ def _init_services(
     reg._background_scanner = BackgroundScanner(reg)
     reg._background_scanner.start()
 
+    # Auto-rename service — created so the JD poller hook and /rename endpoints
+    # work; it self-gates on auto_rename_enabled (off by default).
+    from backend.rename.service import RenameService
+    reg._rename_service = RenameService(reg)
+
 
 def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
     """Background thread that tracks JDownloader download + extraction outcomes.
@@ -187,6 +192,7 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
 
     def _loop():
         last_sig = None
+        handed_to_rename: set = set()  # packages already sent to auto-rename
         while not reg.shutdown_requested:
             try:
                 cfg = reg.config or {}
@@ -203,6 +209,21 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                             "type": "download:results",
                             "data": {"results": results},
                         })
+                    # Auto-rename hook: hand each newly-extracted package's output
+                    # folder to the rename service (it self-gates on the setting
+                    # and dedups by package). Runs off-thread so the poller never
+                    # blocks on filesystem walks / TMDB lookups.
+                    if cfg.get("auto_rename_enabled") and reg._rename_service:
+                        for r in results:
+                            name = r.get("name")
+                            if (r.get("state") == "extracted" and r.get("save_to")
+                                    and name not in handed_to_rename):
+                                handed_to_rename.add(name)
+                                threading.Thread(
+                                    target=reg._rename_service.process_package,
+                                    args=(name, r.get("save_to")),
+                                    name="auto-rename", daemon=True,
+                                ).start()
             except Exception as e:
                 logger.debug("results poller error: %s", e)
             # Sleep in short slices so shutdown stays responsive.
@@ -373,13 +394,14 @@ def create_app(
         return await call_next(request)
 
     # Register route modules
-    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler, auth, background
+    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler, auth, background, rename
     from backend.api import ws
 
     api_routers = [
         system.router, auth.router, ws.router, settings.router, sources.router,
         plex.router, scanner.router, results.router, downloads.router,
         analytics.router, watchlist.router, scheduler.router, background.router,
+        rename.router,
     ]
     for router in api_routers:
         app.include_router(router)

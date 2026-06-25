@@ -107,6 +107,20 @@ class SettingsUpdate(BaseModel):
     background_scan_pages: Optional[int] = None
     background_scan_sources: Optional[List[str]] = None
     background_scan_retain_days: Optional[int] = None
+
+    # Auto-rename + Plex sort + optional Ollama assist
+    auto_rename_enabled: Optional[bool] = None
+    auto_rename_confidence_threshold: Optional[int] = None
+    auto_rename_require_confirmation: Optional[bool] = None
+    auto_rename_move_method: Optional[str] = None
+    auto_rename_movie_library: Optional[str] = None
+    auto_rename_tv_library: Optional[str] = None
+    auto_rename_template_movie: Optional[str] = None
+    auto_rename_template_tv: Optional[str] = None
+    auto_rename_plex_sort_titles: Optional[bool] = None
+    auto_rename_llm_enabled: Optional[bool] = None
+    ollama_base_url: Optional[str] = None
+    ollama_model: Optional[str] = None
     rule_1080_4k: Optional[bool] = None
     rule_1080_4k_size: Optional[bool] = None
     rule_1080_1080: Optional[bool] = None

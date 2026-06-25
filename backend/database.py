@@ -343,6 +343,40 @@ class DatabaseManager:
                     )
                 ''')
 
+                # Auto-rename tracking: one row per extracted media file, with
+                # the identified match, confidence, and rename/move outcome.
+                # Modeled on Nomen's file_manager table. Statuses: pending,
+                # matched, needs_review, applied, failed, reverted.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS rename_jobs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        package_name TEXT,
+                        original_path TEXT NOT NULL,
+                        original_filename TEXT,
+                        new_filename TEXT,
+                        destination_path TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        media_type TEXT,
+                        title TEXT,
+                        year INTEGER,
+                        season INTEGER,
+                        episode INTEGER,
+                        tmdb_id INTEGER,
+                        imdb_id TEXT,
+                        resolution TEXT,
+                        match_confidence REAL,
+                        match_source TEXT,
+                        move_method TEXT,
+                        proposed_match TEXT,
+                        plex_sort_title TEXT,
+                        warning_message TEXT,
+                        error_message TEXT,
+                        detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        processed_at TIMESTAMP,
+                        reverted_at TIMESTAMP
+                    )
+                ''')
+
                 # ── Performance indexes (idempotent) ─────────────────────
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_imdb_id ON plex_cache(imdb_id)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_title ON plex_cache(title)')
@@ -355,6 +389,8 @@ class DatabaseManager:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp DESC)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_bg_cache_last_seen ON background_scan_cache(last_seen_at)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_rename_jobs_status ON rename_jobs(status)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_rename_jobs_detected ON rename_jobs(detected_at DESC)')
 
                 # ── Column migrations (guarded by "duplicate column name") ─
                 _column_migrations = [
@@ -1137,6 +1173,95 @@ class DatabaseManager:
         """Remove all cached background-scan rows."""
         return self._mutate(
             "DELETE FROM background_scan_cache", label="clear_background_cache")
+
+    # ── Auto-rename jobs ──────────────────────────────────────────────
+
+    _RENAME_FIELDS = (
+        "package_name", "original_path", "original_filename", "new_filename",
+        "destination_path", "status", "media_type", "title", "year", "season",
+        "episode", "tmdb_id", "imdb_id", "resolution", "match_confidence",
+        "match_source", "move_method", "proposed_match", "plex_sort_title",
+        "warning_message", "error_message", "processed_at", "reverted_at",
+    )
+
+    def create_rename_job(self, job):
+        """Insert a rename job (dict of column→value); return the new id or None."""
+        cols = [k for k in self._RENAME_FIELDS if k in job]
+        if "original_path" not in cols:
+            return None
+        placeholders = ", ".join(f":{c}" for c in cols)
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return None
+                cur = conn.cursor()
+                cur.execute(
+                    f"INSERT INTO rename_jobs ({', '.join(cols)}) VALUES ({placeholders})",
+                    {c: job.get(c) for c in cols})
+                conn.commit()
+                return cur.lastrowid
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error("DB Error (create_rename_job): %s", e)
+            return None
+
+    def update_rename_job(self, job_id, **fields):
+        """Update arbitrary columns on a rename job."""
+        cols = [k for k in fields if k in self._RENAME_FIELDS]
+        if not cols:
+            return False
+        assignments = ", ".join(f"{c} = :{c}" for c in cols)
+        params = {c: fields[c] for c in cols}
+        params["id"] = job_id
+        return self._mutate(
+            f"UPDATE rename_jobs SET {assignments} WHERE id = :id",
+            params, label="update_rename_job")
+
+    def get_rename_job(self, job_id):
+        """Return a rename job as a dict, or None."""
+        rows = self._query_dicts(
+            "SELECT * FROM rename_jobs WHERE id = ?", (job_id,), default=[])
+        return rows[0] if rows else None
+
+    def list_rename_jobs(self, status=None, limit=200):
+        """Return rename jobs (optionally filtered by status), newest first."""
+        if status:
+            return self._query_dicts(
+                "SELECT * FROM rename_jobs WHERE status = ? "
+                "ORDER BY detected_at DESC LIMIT ?", (status, limit), default=[])
+        return self._query_dicts(
+            "SELECT * FROM rename_jobs ORDER BY detected_at DESC LIMIT ?",
+            (limit,), default=[])
+
+    def count_rename_jobs_by_status(self):
+        """Return a ``{status: count}`` map over all rename jobs."""
+        rows = self._query(
+            "SELECT status, COUNT(*) FROM rename_jobs GROUP BY status", default=[])
+        return {r[0]: r[1] for r in (rows or [])}
+
+    def package_has_rename_job(self, package_name):
+        """Whether any rename job already exists for a JD package (dedup)."""
+        if not package_name:
+            return False
+        row = self._query(
+            "SELECT 1 FROM rename_jobs WHERE package_name = ? LIMIT 1",
+            (package_name,), one=True, default=None)
+        return row is not None
+
+    def delete_rename_job(self, job_id):
+        """Delete a rename job row."""
+        return self._mutate(
+            "DELETE FROM rename_jobs WHERE id = ?", (job_id,), label="delete_rename_job")
+
+    def clear_rename_jobs(self):
+        """Remove all rename jobs (used by tests)."""
+        return self._mutate("DELETE FROM rename_jobs", label="clear_rename_jobs")
 
     def record_scraped_links(self, links, title, resolution="", source_url=""):
         """Map scraped file-host links to the movie/show they belong to.

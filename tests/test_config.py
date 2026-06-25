@@ -86,6 +86,13 @@ EXPECTED_DEFAULT_KEYS = {
     "background_scan_enabled", "background_scan_interval_hours",
     "background_scan_pages", "background_scan_sources",
     "background_scan_retain_days", "background_scan_last_run",
+    # Auto-rename + Plex sort + Ollama
+    "auto_rename_enabled", "auto_rename_confidence_threshold",
+    "auto_rename_require_confirmation", "auto_rename_move_method",
+    "auto_rename_movie_library", "auto_rename_tv_library",
+    "auto_rename_template_movie", "auto_rename_template_tv",
+    "auto_rename_plex_sort_titles", "auto_rename_llm_enabled",
+    "ollama_base_url", "ollama_model",
     # Debug / logging
     "debug_mode", "verbose_logging", "clear_logs_startup", "scan_threads",
     # Matching thresholds

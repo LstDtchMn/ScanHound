@@ -106,6 +106,7 @@ class ServiceRegistry:
     _watchlist_manager: Any = None
     _analytics_dashboard: Any = None
     _background_scanner: Any = None
+    _rename_service: Any = None
     _shutdown_event: threading.Event = field(default_factory=threading.Event)
     # Auth nonce — generated on startup, validated by middleware.
     # If SCANHOUND_AUTH_NONCE env var is set, use that (Tauri passes it).
@@ -143,6 +144,10 @@ class ServiceRegistry:
     @property
     def background_scanner(self):
         return self._background_scanner
+
+    @property
+    def rename_service(self):
+        return self._rename_service
 
     def request_shutdown(self):
         self._shutdown_event.set()
