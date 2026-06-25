@@ -55,13 +55,19 @@ def _reset_dismissed():
 @pytest.fixture(autouse=True)
 def _reset_scan_state():
     """Reset scan state between tests."""
-    from backend.api.routes.scanner import _scan_state, _scan_lock
+    from backend.api.routes.scanner import _scan_state, _scan_lock, _items_lock
+    import backend.api.routes.scanner as _scanner
     with _scan_lock:
         _scan_state["state"] = "idle"
         _scan_state["progress"] = 0.0
         _scan_state["phase"] = ""
         _scan_state["scanned"] = 0
         _scan_state["total"] = 0
+    # The last-scan items are a module global shared across tests; without
+    # clearing them a prior scan test leaks results into e.g.
+    # test_export_csv_no_results (which then gets 200 instead of 400).
+    with _items_lock:
+        _scanner._last_scan_items.clear()
     yield
 
 
