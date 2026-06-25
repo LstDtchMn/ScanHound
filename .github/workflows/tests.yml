@@ -43,6 +43,10 @@ jobs:
           pip install requests aiohttp cloudscraper beautifulsoup4
           pip install thefuzz rapidfuzz python-dotenv packaging
           pip install selenium PlexAPI
+          # FastAPI web stack: the API/WS/auth test modules import
+          # fastapi.testclient (needs httpx) and bcrypt; without these the
+          # whole tests/test_api_*.py set errors out at collection.
+          pip install fastapi "uvicorn[standard]" httpx "bcrypt>=4.0.0,<5.0" websockets
           # plyer for desktop notifications (optional, tests mock it)
           pip install plyer
 
