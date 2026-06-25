@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { toggleSelect, selectedKeys } from '$lib/stores/results';
-  import { api } from '$lib/api/client';
-  import { addToast } from '$lib/stores/notifications';
+  import { selectedKeys } from '$lib/stores/results';
+  import { downloadHost } from '$lib/stores/downloads';
+  import { buildResultActions } from '$lib/resultActions';
   import type { ScanResult } from '$lib/api/types';
   import { onMount } from 'svelte';
 
@@ -31,70 +31,11 @@
     }
   });
 
-  interface MenuItem {
-    label: string;
-    action: () => void;
-    separator?: boolean;
-  }
+  let items = $derived(buildResultActions(item, $downloadHost, selected));
 
-  let items = $derived.by(() => {
-    const list: MenuItem[] = [
-      { label: selected ? 'Deselect' : 'Select', action: () => toggleSelect(item.url) }
-    ];
-    if (item.url) {
-      list.push({ label: 'Download', action: download });
-      list.push({ label: 'Copy URL', action: copyUrl });
-    }
-    if (item.imdb_id) {
-      list.push({ label: 'Open IMDb', action: openImdb, separator: true });
-    }
-    if (item.plex_rating_key) {
-      list.push({ label: 'Open in Plex', action: openInPlex });
-    }
-    if (item.url) {
-      list.push({ label: 'Open Source Page', action: () => window.open(item.url, '_blank'), separator: true });
-    }
-    list.push({ label: 'Add to Watchlist', action: addToWatchlist });
-    return list;
-  });
-
-  function handleAction(action: () => void) {
-    action();
+  function handleAction(run: () => void) {
+    run();
     onclose();
-  }
-
-  function download() {
-    if (item.url) {
-      api.download(item.url, item.title, undefined, item.year).catch(() => addToast('Error', 'Download failed', 'error'));
-    }
-  }
-
-  function copyUrl() {
-    if (item.url) {
-      navigator.clipboard.writeText(item.url).then(
-        () => addToast('Copied', 'URL copied to clipboard'),
-        () => addToast('Error', 'Failed to copy URL', 'error')
-      );
-    }
-  }
-
-  function openImdb() {
-    if (item.imdb_id) window.open(`https://www.imdb.com/title/${item.imdb_id}`, '_blank');
-  }
-
-  function openInPlex() {
-    api.openInPlex(item.title, item.imdb_id ?? undefined, item.plex_rating_key ?? undefined)
-      .catch(() => addToast('Error', 'Failed to open in Plex', 'error'));
-  }
-
-  function addToWatchlist() {
-    api.watchlistAdd({
-      title: item.title,
-      year: item.year,
-      imdb_id: item.imdb_id,
-      item_type: item.season ? 'tv' : 'movie'
-    }).then(() => addToast('Watchlist', `Added: ${item.title}`))
-      .catch((e) => addToast('Error', e instanceof Error ? e.message : 'Failed to add', 'error'));
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -116,7 +57,7 @@
       case 'Enter':
       case ' ':
         e.preventDefault();
-        handleAction(items[focusedIdx].action);
+        handleAction(items[focusedIdx].run);
         break;
     }
   }
@@ -139,14 +80,14 @@
   role="menu"
 >
   {#each items as menuItem, i}
-    {#if menuItem.separator}
+    {#if menuItem.separatorBefore}
       <div class="border-t border-[var(--border)] my-1"></div>
     {/if}
     <button
       data-menu-item
       role="menuitem"
       class="w-full px-3 py-1.5 text-left hover:bg-[var(--bg-tertiary)] transition-colors {focusedIdx === i ? 'bg-[var(--bg-tertiary)]' : ''}"
-      onclick={() => handleAction(menuItem.action)}
+      onclick={() => handleAction(menuItem.run)}
     >
       {menuItem.label}
     </button>

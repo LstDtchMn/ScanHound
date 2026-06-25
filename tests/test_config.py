@@ -82,6 +82,17 @@ EXPECTED_DEFAULT_KEYS = {
     "base_url", "scheduler_only_when_idle",
     # Scheduler
     "scheduler_enabled", "scheduler_interval", "last_scan_time",
+    # Background pre-cache scanning
+    "background_scan_enabled", "background_scan_interval_hours",
+    "background_scan_pages", "background_scan_sources",
+    "background_scan_retain_days", "background_scan_last_run",
+    # Auto-rename + Plex sort + Ollama
+    "auto_rename_enabled", "auto_rename_confidence_threshold",
+    "auto_rename_require_confirmation", "auto_rename_move_method",
+    "auto_rename_movie_library", "auto_rename_tv_library",
+    "auto_rename_template_movie", "auto_rename_template_tv",
+    "auto_rename_plex_sort_titles", "auto_rename_llm_enabled",
+    "ollama_base_url", "ollama_model",
     # Debug / logging
     "debug_mode", "verbose_logging", "clear_logs_startup", "scan_threads",
     # Matching thresholds
@@ -567,8 +578,11 @@ class TestFilePathConstants:
 
     def test_paths_in_base_dir_or_data_dir(self):
         assert os.path.dirname(HISTORY_FILE) == _BASE_DIR
-        assert "ScanHound" in LOG_FILE
-        assert "ScanHound" in CACHE_FILE
+        # App dir is capitalized on Windows (%LOCALAPPDATA%\ScanHound) but
+        # lowercased on Linux/macOS (~/.local/share/scanhound), so match
+        # case-insensitively.
+        assert "scanhound" in LOG_FILE.lower()
+        assert "scanhound" in CACHE_FILE.lower()
 
 
 # ===================================================================

@@ -6,7 +6,7 @@
   import { addToast } from '$lib/stores/notifications';
   import { downloadHost, activeDownload } from '$lib/stores/downloads';
   import { density, visibleColumns } from '$lib/stores/results';
-  import { statusVariant, statusBorderColor, formatStatus, formatCount } from '$lib/constants';
+  import { statusVariant, statusBorderColor, formatStatus, formatCount, DOWNLOAD_HOSTS } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
 
   let showRating = $derived($settings.show_rating ?? true);
@@ -203,9 +203,7 @@
           class="h-6 px-1 rounded-l text-[10px] bg-[var(--bg-tertiary)] border border-r-0 border-[var(--border)] text-[var(--text-secondary)] focus:outline-none cursor-pointer"
           title="Download host"
         >
-          <option value="Rapidgator">RG</option>
-          <option value="Nitroflare">NF</option>
-          <option value="1Fichier">1F</option>
+          {#each DOWNLOAD_HOSTS as h}<option value={h.value}>{h.short}</option>{/each}
         </select>
         <button onclick={handleDownload} disabled={isDownloading} title="Send to JDownloader ({effectiveHost})" aria-label="Send to JDownloader" class="h-6 px-1.5 rounded-r bg-[var(--accent)]/80 hover:bg-[var(--accent)] flex items-center justify-center text-white text-xs transition-colors disabled:opacity-80">{#if isDownloading}<span class="inline-block animate-spin">⟳</span>{:else}&#8595;{/if}</button>
         <button onclick={copyLinks} disabled={copyingLinks} title="Copy {effectiveHost} links (for JDownloader)" aria-label="Copy download links" class="w-6 h-6 rounded hover:bg-[var(--bg-tertiary)] flex items-center justify-center text-[var(--text-secondary)] hover:text-white text-xs transition-colors disabled:opacity-50">{copyingLinks ? '…' : '\u{1F517}'}</button>

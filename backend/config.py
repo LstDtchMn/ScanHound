@@ -105,6 +105,28 @@ class AppConfig(TypedDict, total=False):
     scheduler_interval: int  # hours
     last_scan_time: float  # timestamp
 
+    # Background pre-cache scanning (pre-fetch results so the app opens fast)
+    background_scan_enabled: bool
+    background_scan_interval_hours: int
+    background_scan_pages: int
+    background_scan_sources: List[str]
+    background_scan_retain_days: int
+    background_scan_last_run: float  # timestamp of the last completed run
+
+    # Auto-rename (post-extraction) + Plex sort + optional Ollama assist
+    auto_rename_enabled: bool
+    auto_rename_confidence_threshold: int
+    auto_rename_require_confirmation: bool
+    auto_rename_move_method: str
+    auto_rename_movie_library: str
+    auto_rename_tv_library: str
+    auto_rename_template_movie: str
+    auto_rename_template_tv: str
+    auto_rename_plex_sort_titles: bool
+    auto_rename_llm_enabled: bool
+    ollama_base_url: str
+    ollama_model: str
+
     # Debug & Logging
     debug_mode: bool
     clear_logs_startup: bool
@@ -323,6 +345,24 @@ _DEFAULT_CONFIG: AppConfig = {
     "scheduler_enabled": False,
     "scheduler_interval": 24,
     "last_scan_time": 0,
+    "background_scan_enabled": False,
+    "background_scan_interval_hours": 6,
+    "background_scan_pages": 3,
+    "background_scan_sources": ["HDEncode", "DDLBase", "Adit-HD"],
+    "background_scan_retain_days": 7,
+    "background_scan_last_run": 0,
+    "auto_rename_enabled": False,
+    "auto_rename_confidence_threshold": 70,
+    "auto_rename_require_confirmation": True,
+    "auto_rename_move_method": "hardlink",
+    "auto_rename_movie_library": "",
+    "auto_rename_tv_library": "",
+    "auto_rename_template_movie": "",
+    "auto_rename_template_tv": "",
+    "auto_rename_plex_sort_titles": False,
+    "auto_rename_llm_enabled": False,
+    "ollama_base_url": "http://host.docker.internal:11434",
+    "ollama_model": "",
     "clear_logs_startup": False,
     "scan_threads": 10,
     "tv_match_threshold": 90,

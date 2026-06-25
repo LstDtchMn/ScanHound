@@ -588,6 +588,7 @@ class DownloadService:
             packages = device.downloads.query_packages([{
                 "name": True, "uuid": True, "bytesLoaded": True,
                 "bytesTotal": True, "finished": True, "status": True,
+                "saveTo": True,
             }]) or []
         except Exception as e:
             logger.warning("JD package poll failed: %s", e)
@@ -672,6 +673,9 @@ class DownloadService:
                 "bytes_total": bytes_total, "bytes_loaded": bytes_loaded,
                 "downloaded": 1 if downloaded else 0,
                 "extraction": extraction, "state": state, "error": error,
+                # saveTo (extracted output folder) — consumed by the auto-rename
+                # hook when the package reaches the "extracted" state.
+                "save_to": pkg.get("saveTo") or "",
             }
             results.append(row)
 

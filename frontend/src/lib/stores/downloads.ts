@@ -1,10 +1,11 @@
 import { writable } from 'svelte/store';
 import { connection } from './connection';
 import { markDownloaded } from './results';
+import { DOWNLOAD_HOSTS } from '$lib/constants';
 
-// Download host preference (Rapidgator, Nitroflare, 1Fichier) — persisted to localStorage
+// Download host preference — persisted to localStorage
 const storedHost = typeof localStorage !== 'undefined' ? localStorage.getItem('downloadHost') : null;
-export const downloadHost = writable<string>(storedHost || 'Rapidgator');
+export const downloadHost = writable<string>(storedHost || DOWNLOAD_HOSTS[0].value);
 downloadHost.subscribe(v => {
   if (typeof localStorage !== 'undefined') localStorage.setItem('downloadHost', v);
 });

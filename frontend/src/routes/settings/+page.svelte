@@ -5,7 +5,11 @@
   import { scanState } from '$lib/stores/scanner';
   import { jdConnection, refreshJdConnection } from '$lib/stores/jdownloader';
   import { api } from '$lib/api/client';
+  import ServerConnection from '$lib/components/ServerConnection.svelte';
+  import ChangePassword from '$lib/components/ChangePassword.svelte';
+  import { serverUrl } from '$lib/stores/server';
   import { onMount } from 'svelte';
+  import type { BackgroundStatus } from '$lib/api/types';
 
   async function testJd() {
     if ($isDirty) await saveSettings();
@@ -19,6 +23,23 @@
   let saving = $state(false);
   let testResults = $state<Record<string, 'success' | 'error' | null>>({});
   let schedulerStatus = $state<{next_run: string | null; scheduler_active: boolean} | null>(null);
+  let backgroundStatus = $state<BackgroundStatus | null>(null);
+  let bgScanning = $state(false);
+  let ollamaTest = $state<{ ok: boolean; models?: string[]; error?: string } | null>(null);
+  let ollamaTesting = $state(false);
+
+  async function testOllamaConnection() {
+    ollamaTesting = true;
+    ollamaTest = null;
+    if ($isDirty) await saveSettings();  // persist the URL before probing
+    try {
+      ollamaTest = await api.testOllama();
+    } catch {
+      ollamaTest = { ok: false, error: 'Request failed' };
+    } finally {
+      ollamaTesting = false;
+    }
+  }
   let knownLibraries = $state<string[]>([]);
   let movieLibs = $state<string[]>([]);
   let tvLibs = $state<string[]>([]);
@@ -31,6 +52,7 @@
     refreshPlexStatus();
     loadLibraries();
     loadSchedulerStatus();
+    loadBackgroundStatus();
     return () => { mounted = false; };
   });
 
@@ -39,6 +61,33 @@
       const status = await api.schedulerStatus();
       schedulerStatus = { next_run: status.next_run, scheduler_active: status.scheduler_active };
     } catch { /* ignore */ }
+  }
+
+  async function loadBackgroundStatus() {
+    try {
+      backgroundStatus = await api.getBackgroundStatus();
+    } catch { /* ignore */ }
+  }
+
+  async function runBackgroundScan() {
+    bgScanning = true;
+    try {
+      await api.triggerBackgroundScan();
+      addToast('Background scan', 'Started — this runs in the background');
+      setTimeout(loadBackgroundStatus, 1500);
+    } catch {
+      addToast('Background scan', 'Could not start a scan', 'error');
+    } finally {
+      bgScanning = false;
+    }
+  }
+
+  function toggleBgSource(source: string, on: boolean) {
+    settings.update((s) => {
+      const cur = new Set(s.background_scan_sources ?? []);
+      if (on) cur.add(source); else cur.delete(source);
+      return { ...s, background_scan_sources: [...cur] };
+    });
   }
 
   async function loadLibraries() {
@@ -135,16 +184,19 @@
     }
   }
 
-  type Tab = 'general' | 'plex' | 'sources' | 'notifications' | 'scheduler' | 'matching' | 'autograb';
+  type Tab = 'general' | 'connection' | 'plex' | 'sources' | 'notifications' | 'scheduler' | 'background' | 'rename' | 'matching' | 'autograb';
   let activeTab = $state<Tab>('general');
 
   const tabs: { value: Tab; label: string }[] = [
     { value: 'general', label: 'General' },
+    { value: 'connection', label: 'Connection' },
     { value: 'plex', label: 'Plex' },
     { value: 'sources', label: 'Sources' },
     { value: 'matching', label: 'Matching' },
     { value: 'autograb', label: 'Auto-Grab' },
     { value: 'scheduler', label: 'Scheduler' },
+    { value: 'background', label: 'Background' },
+    { value: 'rename', label: 'Renaming' },
     { value: 'notifications', label: 'Notifications' }
   ];
 
@@ -193,7 +245,7 @@
     </div>
   </div>
 
-  <div class="p-6 max-w-2xl mx-auto w-full">
+  <div class="p-4 md:p-6 max-w-2xl mx-auto w-full">
     {#if activeTab === 'general'}
       <section class="space-y-4">
         <h2 class="text-lg font-semibold">General Settings</h2>
@@ -360,6 +412,27 @@
             </label>
           </div>
         </div>
+      </section>
+
+    {:else if activeTab === 'connection'}
+      <section class="space-y-4">
+        <h2 class="text-lg font-semibold">Server Connection</h2>
+
+        <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">
+          <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Backend</h3>
+          <p class="text-xs text-[var(--text-secondary)]">
+            {#if $serverUrl}
+              Connected to <span class="text-[var(--text-primary)] font-medium">{$serverUrl}</span>.
+            {:else}
+              Using the same origin this page was loaded from. Set an explicit URL
+              for the Android app or to point at a remote server.
+            {/if}
+          </p>
+          <ServerConnection />
+        </div>
+
+        <h2 class="text-lg font-semibold pt-2">Security</h2>
+        <ChangePassword />
       </section>
 
     {:else if activeTab === 'plex'}
@@ -1186,6 +1259,233 @@
           {:else}
             <div class="text-sm text-[var(--text-secondary)]">Loading status...</div>
           {/if}
+        </div>
+      </section>
+
+    {:else if activeTab === 'background'}
+      <section class="space-y-4">
+        <h2 class="text-lg font-semibold">Background Scan</h2>
+        <p class="text-sm text-[var(--text-secondary)]">
+          Pre-fetch results on a schedule so the app opens with results already populated. Off by default.
+        </p>
+
+        <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">
+          <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Schedule</h3>
+
+          <label class="flex items-center gap-3">
+            <input
+              type="checkbox"
+              checked={$settings.background_scan_enabled ?? false}
+              onchange={(e) => settings.update((s) => ({ ...s, background_scan_enabled: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]"
+            />
+            <span class="text-sm font-medium">Enable background scanning</span>
+          </label>
+
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Interval</span>
+            <select
+              value={String($settings.background_scan_interval_hours ?? 6)}
+              onchange={(e) => settings.update((s) => ({ ...s, background_scan_interval_hours: parseInt(e.currentTarget.value) }))}
+              class={inputClass}
+            >
+              <option value="1">Every 1 hour</option>
+              <option value="3">Every 3 hours</option>
+              <option value="6">Every 6 hours</option>
+              <option value="12">Every 12 hours</option>
+              <option value="24">Every 24 hours</option>
+            </select>
+          </label>
+
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Pages per source</span>
+            <input
+              type="number"
+              min="1"
+              max="20"
+              value={$settings.background_scan_pages ?? 3}
+              oninput={(e) => settings.update((s) => ({ ...s, background_scan_pages: parseInt(e.currentTarget.value) || 3 }))}
+              class={inputSmClass}
+            />
+          </label>
+
+          <div>
+            <span class="text-sm text-[var(--text-secondary)]">Sources</span>
+            <div class="mt-2 flex flex-wrap gap-4">
+              {#each ['HDEncode', 'DDLBase', 'Adit-HD'] as src}
+                <label class="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={($settings.background_scan_sources ?? []).includes(src)}
+                    onchange={(e) => toggleBgSource(src, e.currentTarget.checked)}
+                    class="accent-[var(--accent)]"
+                  />
+                  <span class="text-sm">{src}</span>
+                </label>
+              {/each}
+            </div>
+          </div>
+
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Retain results for</span>
+            <select
+              value={String($settings.background_scan_retain_days ?? 7)}
+              onchange={(e) => settings.update((s) => ({ ...s, background_scan_retain_days: parseInt(e.currentTarget.value) }))}
+              class={inputClass}
+            >
+              <option value="1">1 day</option>
+              <option value="3">3 days</option>
+              <option value="7">7 days</option>
+              <option value="14">14 days</option>
+              <option value="30">30 days</option>
+            </select>
+          </label>
+        </div>
+
+        <!-- Status card -->
+        <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-3">
+          <div class="flex items-center justify-between">
+            <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Status</h3>
+            <button
+              onclick={runBackgroundScan}
+              disabled={bgScanning}
+              class="px-3 py-1.5 text-xs rounded-lg bg-[var(--accent)] hover:opacity-90 text-white font-medium transition disabled:opacity-50"
+            >{bgScanning ? 'Starting…' : 'Scan now'}</button>
+          </div>
+          {#if backgroundStatus}
+            <div class="grid grid-cols-2 gap-y-1 text-sm">
+              <span class="text-[var(--text-secondary)]">Cached results</span>
+              <span class="text-right font-medium">{backgroundStatus.cached_count}</span>
+              <span class="text-[var(--text-secondary)]">Last scan</span>
+              <span class="text-right">{backgroundStatus.last_run_at ? new Date(backgroundStatus.last_run_at).toLocaleString() : 'Never'}</span>
+              <span class="text-[var(--text-secondary)]">Next scan</span>
+              <span class="text-right">{backgroundStatus.enabled && backgroundStatus.next_run_at ? new Date(backgroundStatus.next_run_at).toLocaleString() : 'Not scheduled'}</span>
+            </div>
+            {#if backgroundStatus.running}
+              <p class="text-xs text-[var(--accent)]">A scan is running…</p>
+            {/if}
+          {:else}
+            <div class="text-sm text-[var(--text-secondary)]">Loading status…</div>
+          {/if}
+        </div>
+      </section>
+
+    {:else if activeTab === 'rename'}
+      <section class="space-y-4">
+        <h2 class="text-lg font-semibold">Auto-Rename</h2>
+        <p class="text-sm text-[var(--text-secondary)]">
+          After JDownloader extracts a download, identify it and rename/move it into a
+          Plex-friendly library. Tracked in the
+          <a href="/renames" class="text-[var(--accent)] hover:underline">Renames</a> tab. Off by default.
+        </p>
+
+        <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">
+          <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Behaviour</h3>
+
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.auto_rename_enabled ?? false}
+              onchange={(e) => settings.update((s) => ({ ...s, auto_rename_enabled: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm font-medium">Enable auto-rename</span>
+          </label>
+
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.auto_rename_require_confirmation ?? true}
+              onchange={(e) => settings.update((s) => ({ ...s, auto_rename_require_confirmation: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm">Require confirmation before moving files (recommended)</span>
+          </label>
+
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Low-confidence threshold (flag for review below)</span>
+            <input type="number" min="0" max="100" value={$settings.auto_rename_confidence_threshold ?? 70}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_confidence_threshold: parseInt(e.currentTarget.value) || 70 }))}
+              class={inputSmClass} />
+          </label>
+
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">File placement</span>
+            <select value={$settings.auto_rename_move_method ?? 'hardlink'}
+              onchange={(e) => settings.update((s) => ({ ...s, auto_rename_move_method: e.currentTarget.value }))}
+              class={inputClass}>
+              <option value="hardlink">Hardlink (keeps original)</option>
+              <option value="symlink">Symlink</option>
+              <option value="copy">Copy</option>
+              <option value="move">Move</option>
+            </select>
+          </label>
+
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.auto_rename_plex_sort_titles ?? false}
+              onchange={(e) => settings.update((s) => ({ ...s, auto_rename_plex_sort_titles: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm">Compute Plex sort titles (e.g. “Matrix, The”)</span>
+          </label>
+        </div>
+
+        <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">
+          <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Library destinations</h3>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Movies folder</span>
+            <input type="text" value={$settings.auto_rename_movie_library ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_movie_library: e.currentTarget.value }))}
+              placeholder="/library/Movies" class={inputClass} />
+          </label>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">TV folder</span>
+            <input type="text" value={$settings.auto_rename_tv_library ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_tv_library: e.currentTarget.value }))}
+              placeholder="/library/TV" class={inputClass} />
+          </label>
+          <p class="text-xs text-[var(--text-secondary)]">Leave the templates blank for the Plex default naming.</p>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Movie name template (optional)</span>
+            <input type="text" value={$settings.auto_rename_template_movie ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_template_movie: e.currentTarget.value }))}
+              placeholder={'{{title}} ({{year}}) [{{resolution}}]'} class={inputClass} />
+          </label>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">TV name template (optional)</span>
+            <input type="text" value={$settings.auto_rename_template_tv ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_template_tv: e.currentTarget.value }))}
+              placeholder={'{{title}} - S{{season}}E{{episode}}[ - {{episode_title}}]'} class={inputClass} />
+          </label>
+        </div>
+
+        <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">
+          <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Ollama assist (optional)</h3>
+          <p class="text-xs text-[var(--text-secondary)]">
+            Use a local Ollama model to help identify messy filenames when confidence is low.
+            TMDB still confirms every match.
+          </p>
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.auto_rename_llm_enabled ?? false}
+              onchange={(e) => settings.update((s) => ({ ...s, auto_rename_llm_enabled: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm">Enable Ollama-assisted identification</span>
+          </label>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Ollama URL</span>
+            <input type="text" value={$settings.ollama_base_url ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, ollama_base_url: e.currentTarget.value }))}
+              placeholder="http://host.docker.internal:11434" class={inputClass} />
+          </label>
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Model</span>
+            <input type="text" value={$settings.ollama_model ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, ollama_model: e.currentTarget.value }))}
+              placeholder="llama3.1:8b" class={inputClass} />
+          </label>
+          <div class="flex items-center gap-2">
+            <button onclick={testOllamaConnection} disabled={ollamaTesting} class={testBtnClass}>
+              {ollamaTesting ? 'Testing…' : 'Test connection'}
+            </button>
+            {#if ollamaTest}
+              <span class="text-xs {ollamaTest.ok ? 'text-[var(--success)]' : 'text-[var(--error)]'}">
+                {ollamaTest.ok ? `✓ ${ollamaTest.models?.length ?? 0} model(s)` : `✕ ${ollamaTest.error}`}
+              </span>
+            {/if}
+          </div>
         </div>
       </section>
 

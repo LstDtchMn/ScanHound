@@ -27,6 +27,7 @@ class DatabaseManager:
         self.conn = None
         self._lock = threading.RLock()  # Reentrant lock for thread-safe DB access
         self._init_depth = 0  # Guard against infinite recursion during recovery
+        self._dismissed_cache = None  # lazily-populated set[str], kept in sync by mutators
         self.init_db()
 
     # ── Core helpers ──────────────────────────────────────────────────
@@ -273,6 +274,17 @@ class DatabaseManager:
                     )
                 ''')
 
+                # Items the user swiped away ("skip") in the mobile deck. Kept
+                # so dismissed releases stay hidden on future scans. Keyed by
+                # release URL.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS dismissed_items (
+                        url TEXT PRIMARY KEY,
+                        title TEXT,
+                        dismissed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
                 # Durable per-package download + extraction outcome, polled from
                 # JDownloader. Keyed by JD package name so the row survives even
                 # after the package is cleared from JDownloader's list.
@@ -291,6 +303,80 @@ class DatabaseManager:
                     )
                 ''')
 
+                # Admin password (single row) for browser / self-hosted auth.
+                # bcrypt hash only — never the plaintext. Absent row = no
+                # password set, so password auth is off.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS auth_credentials (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        password_hash TEXT NOT NULL,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
+                # Issued login sessions, keyed by the SHA-256 hash of the
+                # bearer token (never the token itself). Rows are purged on
+                # expiry and wiped wholesale when the password changes.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS auth_sessions (
+                        token_hash TEXT PRIMARY KEY,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expires_at TEXT NOT NULL
+                    )
+                ''')
+
+                # Pre-cached scrape results from the background scanner, so the
+                # app can open with results already populated (they survive a
+                # restart, unlike the in-memory live scan). Keyed by release
+                # URL; ``data`` is the full serialized result dict so cached
+                # rows render identically to live ones.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS background_scan_cache (
+                        url TEXT PRIMARY KEY,
+                        title TEXT,
+                        year INTEGER,
+                        status TEXT,
+                        source_category TEXT,
+                        data TEXT,
+                        scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
+                # Auto-rename tracking: one row per extracted media file, with
+                # the identified match, confidence, and rename/move outcome.
+                # Modeled on Nomen's file_manager table. Statuses: pending,
+                # matched, needs_review, applied, failed, reverted.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS rename_jobs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        package_name TEXT,
+                        original_path TEXT NOT NULL,
+                        original_filename TEXT,
+                        new_filename TEXT,
+                        destination_path TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        media_type TEXT,
+                        title TEXT,
+                        year INTEGER,
+                        season INTEGER,
+                        episode INTEGER,
+                        tmdb_id INTEGER,
+                        imdb_id TEXT,
+                        resolution TEXT,
+                        match_confidence REAL,
+                        match_source TEXT,
+                        move_method TEXT,
+                        proposed_match TEXT,
+                        plex_sort_title TEXT,
+                        warning_message TEXT,
+                        error_message TEXT,
+                        detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        processed_at TIMESTAMP,
+                        reverted_at TIMESTAMP
+                    )
+                ''')
+
                 # ── Performance indexes (idempotent) ─────────────────────
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_imdb_id ON plex_cache(imdb_id)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_title ON plex_cache(title)')
@@ -301,6 +387,10 @@ class DatabaseManager:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_date ON downloads(date_added)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_download_results_updated ON download_results(updated_at DESC)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp DESC)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_bg_cache_last_seen ON background_scan_cache(last_seen_at)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_rename_jobs_status ON rename_jobs(status)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_rename_jobs_detected ON rename_jobs(detected_at DESC)')
 
                 # ── Column migrations (guarded by "duplicate column name") ─
                 _column_migrations = [
@@ -835,6 +925,343 @@ class DatabaseManager:
         """Return the total number of scanned URLs."""
         row = self._query('SELECT COUNT(*) FROM scanned_urls', one=True, default=None)
         return row[0] if row else 0
+
+    # ── Dismissed items (mobile swipe-to-skip) ───────────────────────────
+
+    def _dismissed_urls_set(self):
+        """Return the live in-memory cache, lazily loading it from disk once.
+
+        Must be called while holding ``self._lock``. Callers that mutate the
+        table update this same set so it never goes stale without a re-query.
+        """
+        if self._dismissed_cache is None:
+            rows = self._query('SELECT url FROM dismissed_items', default=[])
+            self._dismissed_cache = {row[0] for row in rows}
+        return self._dismissed_cache
+
+    def add_dismissed_items(self, items):
+        """Dismiss multiple URLs in one transaction.
+
+        Args:
+            items: Iterable of (url, title) pairs. Re-dismissing an
+                already-dismissed URL updates its title when a non-null
+                title is supplied, instead of silently keeping the old one.
+        """
+        pairs = [(url, title) for url, title in items if url]
+        if not pairs:
+            return True
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                conn.cursor().executemany('''
+                    INSERT INTO dismissed_items (url, title) VALUES (:url, :title)
+                    ON CONFLICT(url) DO UPDATE SET
+                        title = COALESCE(excluded.title, dismissed_items.title)
+                ''', [{"url": u, "title": t} for u, t in pairs])
+                conn.commit()
+                self._dismissed_urls_set().update(u for u, _ in pairs)
+            return True
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error("DB Error (add_dismissed_items): %s", e)
+            return False
+
+    def add_dismissed_item(self, url, title=None):
+        """Record a single release URL as dismissed (swiped away)."""
+        return self.add_dismissed_items([(url, title)])
+
+    def remove_dismissed_items(self, urls):
+        """Un-dismiss multiple URLs in one transaction so they can reappear."""
+        urls = [u for u in urls if u]
+        if not urls:
+            return True
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                conn.cursor().executemany(
+                    'DELETE FROM dismissed_items WHERE url = ?', [(u,) for u in urls])
+                conn.commit()
+                self._dismissed_urls_set().difference_update(urls)
+            return True
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error("DB Error (remove_dismissed_items): %s", e)
+            return False
+
+    def remove_dismissed_item(self, url):
+        """Un-dismiss a previously dismissed URL so it can reappear."""
+        return self.remove_dismissed_items([url])
+
+    def get_dismissed_urls(self):
+        """Get all dismissed URLs as a set for fast membership testing."""
+        with self._lock:
+            return set(self._dismissed_urls_set())
+
+    def get_dismissed_items(self, limit=1000):
+        """Return dismissed items (url, title, dismissed_at), newest first."""
+        return self._query_dicts(
+            'SELECT url, title, dismissed_at FROM dismissed_items '
+            'ORDER BY dismissed_at DESC LIMIT ?', (limit,), default=[])
+
+    def clear_dismissed_items(self):
+        """Clear all dismissed-item records."""
+        ok = self._mutate("DELETE FROM dismissed_items", label="clear_dismissed_items")
+        if ok:
+            with self._lock:
+                self._dismissed_cache = set()
+        return ok
+
+    def get_dismissed_count(self):
+        """Return the total number of dismissed items."""
+        row = self._query('SELECT COUNT(*) FROM dismissed_items', one=True, default=None)
+        return row[0] if row else 0
+
+    # ── Auth: admin password (single row) ─────────────────────────────
+
+    def get_password_hash(self):
+        """Return the stored bcrypt password hash, or None if unset."""
+        row = self._query(
+            'SELECT password_hash FROM auth_credentials WHERE id = 1',
+            one=True, default=None)
+        return row[0] if row else None
+
+    def has_password(self):
+        """Whether an admin password has been configured."""
+        return self.get_password_hash() is not None
+
+    def set_password_hash(self, password_hash):
+        """Set or replace the admin password hash."""
+        return self._mutate('''
+            INSERT INTO auth_credentials (id, password_hash, updated_at)
+            VALUES (1, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                password_hash = excluded.password_hash,
+                updated_at = excluded.updated_at
+        ''', (password_hash,), label="set_password_hash")
+
+    def clear_password(self):
+        """Remove the admin password (reverts to nonce-only / open auth)."""
+        return self._mutate(
+            "DELETE FROM auth_credentials WHERE id = 1", label="clear_password")
+
+    # ── Auth: login sessions ──────────────────────────────────────────
+
+    def create_session(self, token_hash, expires_at):
+        """Persist a session by its token hash + ISO-8601 expiry."""
+        return self._mutate('''
+            INSERT INTO auth_sessions (token_hash, expires_at)
+            VALUES (?, ?)
+            ON CONFLICT(token_hash) DO UPDATE SET expires_at = excluded.expires_at
+        ''', (token_hash, expires_at), label="create_session")
+
+    def get_session_expiry(self, token_hash):
+        """Return a session's ISO-8601 expiry, or None if it doesn't exist."""
+        row = self._query(
+            'SELECT expires_at FROM auth_sessions WHERE token_hash = ?',
+            (token_hash,), one=True, default=None)
+        return row[0] if row else None
+
+    def delete_session(self, token_hash):
+        """Invalidate a single session (logout)."""
+        return self._mutate(
+            "DELETE FROM auth_sessions WHERE token_hash = ?",
+            (token_hash,), label="delete_session")
+
+    def delete_all_sessions(self):
+        """Invalidate every session (e.g. after a password change)."""
+        return self._mutate("DELETE FROM auth_sessions", label="delete_all_sessions")
+
+    def purge_expired_sessions(self, now_iso):
+        """Delete sessions whose expiry is at or before ``now_iso``."""
+        return self._mutate(
+            "DELETE FROM auth_sessions WHERE expires_at <= ?",
+            (now_iso,), label="purge_expired_sessions")
+
+    def count_sessions(self):
+        """Return the number of stored sessions (expired or not)."""
+        row = self._query('SELECT COUNT(*) FROM auth_sessions', one=True, default=None)
+        return row[0] if row else 0
+
+    # ── Background scan cache ─────────────────────────────────────────
+
+    def upsert_background_cache(self, items):
+        """Insert/update cached background-scan results, keyed by URL.
+
+        Keeps each row's original ``scraped_at`` and refreshes ``last_seen_at``
+        plus any changed fields on re-scrape.
+
+        Args:
+            items: iterable of dicts with keys url, title, year, status,
+                source_category, data (a JSON string of the full result dict).
+        """
+        rows = [it for it in items if it.get("url")]
+        if not rows:
+            return True
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                conn.cursor().executemany('''
+                    INSERT INTO background_scan_cache
+                        (url, title, year, status, source_category, data,
+                         scraped_at, last_seen_at)
+                    VALUES
+                        (:url, :title, :year, :status, :source_category, :data,
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(url) DO UPDATE SET
+                        title = excluded.title,
+                        year = excluded.year,
+                        status = excluded.status,
+                        source_category = excluded.source_category,
+                        data = excluded.data,
+                        last_seen_at = CURRENT_TIMESTAMP
+                ''', [{
+                    "url": it.get("url"),
+                    "title": it.get("title"),
+                    "year": it.get("year"),
+                    "status": it.get("status"),
+                    "source_category": it.get("source_category"),
+                    "data": it.get("data"),
+                } for it in rows])
+                conn.commit()
+            return True
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error("DB Error (upsert_background_cache): %s", e)
+            return False
+
+    def get_background_cache(self, limit=2000):
+        """Return cached background-scan rows, most recently seen first."""
+        return self._query_dicts(
+            'SELECT url, title, year, status, source_category, data, '
+            'scraped_at, last_seen_at FROM background_scan_cache '
+            'ORDER BY last_seen_at DESC LIMIT ?', (limit,), default=[])
+
+    def purge_background_cache(self, retain_days):
+        """Delete cached rows last seen more than ``retain_days`` ago."""
+        return self._mutate(
+            "DELETE FROM background_scan_cache WHERE last_seen_at < datetime('now', ?)",
+            (f"-{int(retain_days)} days",), label="purge_background_cache")
+
+    def count_background_cache(self):
+        """Return the number of cached background-scan rows."""
+        row = self._query(
+            'SELECT COUNT(*) FROM background_scan_cache', one=True, default=None)
+        return row[0] if row else 0
+
+    def clear_background_cache(self):
+        """Remove all cached background-scan rows."""
+        return self._mutate(
+            "DELETE FROM background_scan_cache", label="clear_background_cache")
+
+    # ── Auto-rename jobs ──────────────────────────────────────────────
+
+    _RENAME_FIELDS = (
+        "package_name", "original_path", "original_filename", "new_filename",
+        "destination_path", "status", "media_type", "title", "year", "season",
+        "episode", "tmdb_id", "imdb_id", "resolution", "match_confidence",
+        "match_source", "move_method", "proposed_match", "plex_sort_title",
+        "warning_message", "error_message", "processed_at", "reverted_at",
+    )
+
+    def create_rename_job(self, job):
+        """Insert a rename job (dict of column→value); return the new id or None."""
+        cols = [k for k in self._RENAME_FIELDS if k in job]
+        if "original_path" not in cols:
+            return None
+        placeholders = ", ".join(f":{c}" for c in cols)
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return None
+                cur = conn.cursor()
+                cur.execute(
+                    f"INSERT INTO rename_jobs ({', '.join(cols)}) VALUES ({placeholders})",
+                    {c: job.get(c) for c in cols})
+                conn.commit()
+                return cur.lastrowid
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error("DB Error (create_rename_job): %s", e)
+            return None
+
+    def update_rename_job(self, job_id, **fields):
+        """Update arbitrary columns on a rename job."""
+        cols = [k for k in fields if k in self._RENAME_FIELDS]
+        if not cols:
+            return False
+        assignments = ", ".join(f"{c} = :{c}" for c in cols)
+        params = {c: fields[c] for c in cols}
+        params["id"] = job_id
+        return self._mutate(
+            f"UPDATE rename_jobs SET {assignments} WHERE id = :id",
+            params, label="update_rename_job")
+
+    def get_rename_job(self, job_id):
+        """Return a rename job as a dict, or None."""
+        rows = self._query_dicts(
+            "SELECT * FROM rename_jobs WHERE id = ?", (job_id,), default=[])
+        return rows[0] if rows else None
+
+    def list_rename_jobs(self, status=None, limit=200):
+        """Return rename jobs (optionally filtered by status), newest first."""
+        if status:
+            return self._query_dicts(
+                "SELECT * FROM rename_jobs WHERE status = ? "
+                "ORDER BY detected_at DESC LIMIT ?", (status, limit), default=[])
+        return self._query_dicts(
+            "SELECT * FROM rename_jobs ORDER BY detected_at DESC LIMIT ?",
+            (limit,), default=[])
+
+    def count_rename_jobs_by_status(self):
+        """Return a ``{status: count}`` map over all rename jobs."""
+        rows = self._query(
+            "SELECT status, COUNT(*) FROM rename_jobs GROUP BY status", default=[])
+        return {r[0]: r[1] for r in (rows or [])}
+
+    def package_has_rename_job(self, package_name):
+        """Whether any rename job already exists for a JD package (dedup)."""
+        if not package_name:
+            return False
+        row = self._query(
+            "SELECT 1 FROM rename_jobs WHERE package_name = ? LIMIT 1",
+            (package_name,), one=True, default=None)
+        return row is not None
+
+    def delete_rename_job(self, job_id):
+        """Delete a rename job row."""
+        return self._mutate(
+            "DELETE FROM rename_jobs WHERE id = ?", (job_id,), label="delete_rename_job")
+
+    def clear_rename_jobs(self):
+        """Remove all rename jobs (used by tests)."""
+        return self._mutate("DELETE FROM rename_jobs", label="clear_rename_jobs")
 
     def record_scraped_links(self, links, title, resolution="", source_url=""):
         """Map scraped file-host links to the movie/show they belong to.

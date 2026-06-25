@@ -43,6 +43,10 @@ jobs:
           pip install requests aiohttp cloudscraper beautifulsoup4
           pip install thefuzz rapidfuzz python-dotenv packaging
           pip install selenium PlexAPI
+          # FastAPI web stack: the API/WS/auth test modules import
+          # fastapi.testclient (needs httpx) and bcrypt; without these the
+          # whole tests/test_api_*.py set errors out at collection.
+          pip install fastapi "uvicorn[standard]" httpx "bcrypt>=4.0.0,<5.0" websockets
           # plyer for desktop notifications (optional, tests mock it)
           pip install plyer
 
@@ -61,3 +65,59 @@ jobs:
         with:
           name: coverage-report
           path: coverage.xml
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run check
+
+      - name: Build
+        run: npm run build
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Python (for the Playwright webServer backend)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install backend dependencies (for the Playwright webServer)
+        working-directory: .
+        run: |
+          python -m pip install --upgrade pip
+          pip install "setuptools<81"
+          grep -v undetected-chromedriver requirements.txt > /tmp/requirements-ci.txt
+          pip install -r /tmp/requirements-ci.txt
+          pip install httpx
+
+      - name: Run Playwright e2e tests
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 7

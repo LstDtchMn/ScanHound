@@ -2,6 +2,9 @@
   import { scanState, scanProgress, scanPhase, scanItemCount, startScan, stopScan } from '$lib/stores/scanner';
   import type { ScanType } from '$lib/stores/scanner';
   import { clearResults } from '$lib/stores/results';
+  import BottomSheet from './BottomSheet.svelte';
+
+  let scanSheet = $state(false);
 
   const scanTypes: { value: ScanType; label: string }[] = [
     { value: 'deep', label: 'Deep Scan' },
@@ -47,11 +50,17 @@
 
   let categories = $derived(sourceCategories[selectedSource]);
   let hasInteracted = $state(false);
+  let scanTypeLabel = $derived(scanTypes.find((t) => t.value === selectedType)?.label ?? 'Scan');
 
   function handleStart() {
     hasInteracted = true;
     clearResults();
     startScan(selectedType, query, pages, selectedSource, flags);
+  }
+
+  function mobileStart() {
+    scanSheet = false;
+    handleStart();
   }
 
   // Expose categories and flags for FilterBar
@@ -60,7 +69,8 @@
   }
 </script>
 
-<div class="flex items-center gap-2 px-3 py-1.5 border-b border-[var(--border)]">
+<!-- Desktop scan toolbar -->
+<div class="hidden md:flex items-center gap-2 px-3 py-1.5 border-b border-[var(--border)]">
   <select
     bind:value={selectedType}
     disabled={$scanState !== 'idle'}
@@ -157,6 +167,89 @@
     </div>
   {/if}
 </div>
+
+<!-- Mobile scan bar -->
+<div class="flex md:hidden items-center gap-2 px-3 py-2 border-b border-[var(--border)]">
+  {#if $scanState === 'idle'}
+    <button
+      onclick={() => (scanSheet = true)}
+      aria-label="Scan options"
+      class="flex-1 min-w-0 flex items-center gap-2 px-3 py-2 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-sm text-[var(--text-primary)]"
+    >
+      <span class="truncate">{scanTypeLabel}{#if selectedType !== 'search'} · {selectedSource}{/if}</span>
+      <svg class="w-4 h-4 ml-auto shrink-0 text-[var(--text-secondary)]" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
+    </button>
+    <button
+      onclick={handleStart}
+      class="shrink-0 px-4 py-2 bg-[var(--accent)] text-white rounded-lg text-sm font-semibold"
+    >Scan</button>
+  {:else}
+    <div class="flex-1 min-w-0">
+      <div class="flex justify-between text-[10px] text-[var(--text-secondary)] mb-0.5">
+        <span class="truncate">{$scanPhase}{#if $scanItemCount > 0} · {$scanItemCount}{/if}</span>
+        <span>{Math.round($scanProgress * 100)}%</span>
+      </div>
+      <div class="h-1 bg-[var(--bg-tertiary)] rounded-full overflow-hidden">
+        <div class="h-full bg-[var(--accent)] transition-all duration-300 rounded-full" style="width: {$scanProgress * 100}%"></div>
+      </div>
+    </div>
+    <button
+      onclick={() => { hasInteracted = true; stopScan(); }}
+      disabled={$scanState === 'stopping'}
+      class="shrink-0 px-4 py-2 bg-[var(--error)] text-white rounded-lg text-sm font-semibold disabled:opacity-50"
+    >{$scanState === 'stopping' ? '…' : 'Stop'}</button>
+  {/if}
+</div>
+
+<BottomSheet open={scanSheet} title="Scan options" onclose={() => (scanSheet = false)}>
+  <div class="space-y-4">
+    <div>
+      <label for="sc-type" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Scan type</label>
+      <select id="sc-type" bind:value={selectedType} class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm">
+        {#each scanTypes as t}<option value={t.value}>{t.label}</option>{/each}
+      </select>
+    </div>
+
+    {#if selectedType !== 'search'}
+      <div>
+        <label for="sc-source" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Source</label>
+        <select id="sc-source" value={selectedSource} onchange={(e) => onSourceChange(e.currentTarget.value as Source)} class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm">
+          <option value="HDEncode">HDEncode</option>
+          <option value="DDLBase">DDLBase</option>
+          <option value="Adit-HD">Adit-HD</option>
+        </select>
+      </div>
+
+      <div class="flex items-center justify-between">
+        <span class="text-xs font-medium text-[var(--text-secondary)]">Pages</span>
+        <div class="flex items-center gap-2">
+          <button onclick={() => pages = Math.max(1, pages - 1)} disabled={pages <= 1} aria-label="Decrease pages" class="w-9 h-9 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-lg disabled:opacity-40">-</button>
+          <span class="w-8 text-center text-sm">{pages}</span>
+          <button onclick={() => pages = Math.min(99, pages + 1)} disabled={pages >= 99} aria-label="Increase pages" class="w-9 h-9 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-lg disabled:opacity-40">+</button>
+        </div>
+      </div>
+
+      <div>
+        <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Categories</p>
+        <div class="flex flex-wrap gap-2">
+          {#each categories as cat (cat.key)}
+            <button
+              onclick={() => { flags[cat.key] = !(flags[cat.key] ?? cat.default); }}
+              class="px-3 py-1.5 rounded-full text-sm border transition-colors {(flags[cat.key] ?? cat.default) ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
+            >{cat.label}</button>
+          {/each}
+        </div>
+      </div>
+    {:else}
+      <div>
+        <label for="sc-query" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Search title</label>
+        <input id="sc-query" type="text" bind:value={query} placeholder="e.g. Dune" class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm" />
+      </div>
+    {/if}
+
+    <button onclick={mobileStart} class="w-full py-3 bg-[var(--accent)] text-white rounded-lg text-sm font-semibold">Start Scan</button>
+  </div>
+</BottomSheet>
 
 <style>
   @keyframes pulse-once {

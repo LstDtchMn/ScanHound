@@ -6,7 +6,8 @@
   let selectedCount = $derived($selectedKeys.size);
 </script>
 
-<div class="flex items-center gap-4 px-4 py-2 border-t border-[var(--border)] text-xs text-[var(--text-secondary)]">
+<!-- Desktop status bar; on mobile the filter chips + swipe footer convey this. -->
+<div class="hidden md:flex items-center gap-4 px-4 py-2 border-t border-[var(--border)] text-xs text-[var(--text-secondary)]">
   <span>Total: <strong class="text-[var(--text-primary)]">{$stats.total}</strong></span>
   <span>Missing: <strong class="text-[var(--error)]">{$stats.missing}</strong></span>
   <span>Upgrades: <strong class="text-[var(--warning)]">{$stats.upgrade}</strong></span>

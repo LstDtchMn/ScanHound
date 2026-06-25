@@ -114,3 +114,11 @@ export function formatCount(n: number | null | undefined): string {
   if (n < 1000) return String(n);
   return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(n);
 }
+
+/** Download-host options for the JDownloader hand-off (`value` = backend `service_type`). */
+export interface DownloadHostOption { value: string; short: string }
+export const DOWNLOAD_HOSTS: DownloadHostOption[] = [
+  { value: 'Rapidgator', short: 'RG' },
+  { value: 'Nitroflare', short: 'NF' },
+  { value: '1Fichier', short: '1F' },
+];

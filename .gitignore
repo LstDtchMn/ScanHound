@@ -58,6 +58,9 @@ frontend/playwright-report/
 frontend/qa/
 frontend/e2e/
 
+# Tauri Android (regenerable via `npm run android:init`)
+frontend/src-tauri/gen/
+
 # Rotated logs
 *.log
 scanner.log.*

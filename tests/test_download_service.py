@@ -1428,6 +1428,7 @@ class TestPollResults:
             "name": "Pkg.Queued", "title": "Pkg.Queued", "host": "",
             "bytes_total": 1000, "bytes_loaded": 0, "downloaded": 0,
             "extraction": "na", "state": "queued", "error": None,
+            "save_to": "",
         }]
 
     def test_downloading_state(self):

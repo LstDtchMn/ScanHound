@@ -1,20 +1,11 @@
-import type { ResultsResponse, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry } from './types';
-
-// Dev runs the SvelteKit dev server on :5174 with the API on :9721. In
-// production (Docker/Tauri) the frontend is served by the API itself, so use a
-// relative (same-origin) base — this is what makes it work behind a reverse
-// proxy / Cloudflare tunnel on any hostname.
-function resolveApiBase(): string {
-  if (typeof window === 'undefined') return 'http://localhost:9721';
-  if (window.location.port === '5174') return 'http://localhost:9721';
-  return ''; // same origin
-}
-const API_BASE = resolveApiBase();
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry } from './types';
+import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
-/** Auth nonce injected by Tauri sidecar or set via setAuthNonce(). Empty = dev mode (no auth). */
-let authNonce = '';
+/** Auth token: a stored token (Android/remote) seeds it; the Tauri sidecar or
+ *  setAuthNonce() can override at runtime. Empty = dev mode (no auth). */
+let authNonce = getStoredToken();
 
 export function setAuthNonce(nonce: string) {
   authNonce = nonce;
@@ -24,39 +15,29 @@ export function getAuthNonce(): string {
   return authNonce;
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    const headers = new Headers(options?.headers);
-    if (options?.body !== undefined && !headers.has('Content-Type')) {
-      headers.set('Content-Type', 'application/json');
-    }
-    if (authNonce) {
-      headers.set('Authorization', `Bearer ${authNonce}`);
-    }
+/** Invoked when an API call returns 401 (token missing/expired). The root
+ *  layout registers a handler that redirects to /login. Not fired for the
+ *  /auth/* endpoints, which surface their own errors (e.g. a wrong password). */
+let unauthorizedHandler: (() => void) | null = null;
+export function setUnauthorizedHandler(fn: (() => void) | null) {
+  unauthorizedHandler = fn;
+}
 
-    const resp = await fetch(`${API_BASE}${path}`, {
-      ...options,
-      headers,
-      signal: controller.signal,
-    });
-    if (!resp.ok) {
-      throw new Error(`API error: ${resp.status} ${resp.statusText}`);
-    }
-    const ct = resp.headers.get('content-type') || '';
-    if (!ct.includes('application/json')) {
-      throw new Error(`Unexpected content type: ${ct}`);
-    }
-    const data = await resp.json();
-    // Defensive fallback: catch error payloads that slipped through with 200
-    if (data && typeof data === 'object' && 'success' in data && data.success === false) {
-      throw new Error(data.detail || data.error || data.message || 'Request failed');
-    }
-    return data;
+/** fetch() with an abort-based timeout, shared by this client and anything
+ *  else (e.g. the remote-server connection test) that needs to probe a URL
+ *  the way request() does without going through apiBase()/authNonce. */
+export async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') {
-      throw new Error('Request timed out after 15s');
+      throw new Error(`Request timed out after ${timeoutMs / 1000}s`);
     }
     throw e;
   } finally {
@@ -64,10 +45,54 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   }
 }
 
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const headers = new Headers(options?.headers);
+  if (options?.body !== undefined && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+  if (authNonce) {
+    headers.set('Authorization', `Bearer ${authNonce}`);
+  }
+
+  const resp = await fetchWithTimeout(`${apiBase()}${path}`, { ...options, headers }, REQUEST_TIMEOUT_MS);
+  if (!resp.ok) {
+    if (resp.status === 401 && !path.startsWith('/auth/')) {
+      unauthorizedHandler?.();
+    }
+    throw new Error(`API error: ${resp.status} ${resp.statusText}`);
+  }
+  const ct = resp.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) {
+    throw new Error(`Unexpected content type: ${ct}`);
+  }
+  const data = await resp.json();
+  // Defensive fallback: catch error payloads that slipped through with 200
+  if (data && typeof data === 'object' && 'success' in data && data.success === false) {
+    throw new Error(data.detail || data.error || data.message || 'Request failed');
+  }
+  return data;
+}
+
 export const api = {
   // System
   health: () => request<{ status: string; version: string }>('/health'),
   shutdown: () => request<{ status: string }>('/shutdown', { method: 'POST' }),
+
+  // Auth
+  authStatus: () =>
+    request<{ auth_required: boolean; has_password: boolean; nonce_active: boolean }>('/auth/status'),
+  authLogin: (password: string) =>
+    request<{ token: string; expires_at: string }>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ password })
+    }),
+  authSetPassword: (newPassword: string, currentPassword?: string) =>
+    request<{ ok: boolean }>('/auth/set-password', {
+      method: 'POST',
+      body: JSON.stringify({ new_password: newPassword, current_password: currentPassword ?? null })
+    }),
+  authLogout: () =>
+    request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
 
   // Scanner
   scanStart: (type = 'deep', searchQuery = '', pages = 1, source = 'HDEncode', flags?: Record<string, boolean>) =>
@@ -84,6 +109,10 @@ export const api = {
     const qs = params ? '?' + new URLSearchParams(params).toString() : '';
     return request<ResultsResponse>(`/results${qs}`);
   },
+  getCachedResults: (params?: Record<string, string>) => {
+    const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+    return request<CachedResultsResponse>(`/results/cached${qs}`);
+  },
   selectItems: (groupKeys: string[], selected: boolean) =>
     request('/results/select', {
       method: 'POST',
@@ -93,6 +122,17 @@ export const api = {
   deselectAll: () => request('/results/deselect-all', { method: 'POST' }),
   exportCsv: () =>
     request<{ filepath: string }>('/results/export', { method: 'POST' }),
+  dismissItems: (urls: string[], titles?: Record<string, string>, dismissed = true) =>
+    request<{ status: string; dismissed_count: number }>('/results/dismiss', {
+      method: 'POST',
+      body: JSON.stringify({ urls, titles: titles ?? null, dismissed })
+    }),
+  dismissedList: () =>
+    request<{ items: { url: string; title: string | null; dismissed_at: string }[]; count: number }>(
+      '/results/dismissed'
+    ),
+  clearDismissed: () =>
+    request<{ status: string; dismissed_count: number }>('/results/dismissed', { method: 'DELETE' }),
 
   // Plex
   plexConnect: () => request('/plex/connect', { method: 'POST' }),
@@ -256,4 +296,29 @@ export const api = {
     }),
   schedulerTrigger: () =>
     request<{ status: string }>('/scheduler/trigger', { method: 'POST' }),
+
+  // Background pre-cache scanner
+  getBackgroundStatus: () => request<BackgroundStatus>('/background/status'),
+  triggerBackgroundScan: () =>
+    request<{ status: string }>('/background/scan-now', { method: 'POST' }),
+
+  // Auto-rename
+  getRenameJobs: (status?: string) => {
+    const qs = status ? `?status=${encodeURIComponent(status)}` : '';
+    return request<{ jobs: RenameJob[]; counts: Record<string, number> }>(`/rename/jobs${qs}`);
+  },
+  getRenameStatus: () => request<RenameStatus>('/rename/status'),
+  applyRename: (id: number) =>
+    request<{ ok: boolean }>(`/rename/jobs/${id}/apply`, { method: 'POST' }),
+  undoRename: (id: number) =>
+    request<{ ok: boolean }>(`/rename/jobs/${id}/undo`, { method: 'POST' }),
+  rematchRename: (id: number, tmdbId: number, mediaType?: string) =>
+    request<{ ok: boolean }>(`/rename/jobs/${id}/rematch`, {
+      method: 'POST',
+      body: JSON.stringify({ tmdb_id: tmdbId, media_type: mediaType ?? null })
+    }),
+  deleteRenameJob: (id: number) =>
+    request<{ ok: boolean }>(`/rename/jobs/${id}`, { method: 'DELETE' }),
+  testOllama: () =>
+    request<{ ok: boolean; models?: string[]; error?: string }>('/rename/llm/test'),
 };

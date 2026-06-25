@@ -1,17 +1,30 @@
+// ScanHound Tauri entry point.
+//
+// Desktop bundles the Python backend as a sidecar and runs a system tray.
+// Mobile (Android/iOS) can't run the Python backend on-device, so it skips the
+// sidecar/tray entirely and talks to a remote server the user configures in the
+// app (Settings → Connection). All desktop-only wiring is gated behind
+// `#[cfg(desktop)]`.
+
+#[cfg(desktop)]
 use std::sync::Mutex;
+#[cfg(desktop)]
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager,
 };
 
+#[cfg(desktop)]
 mod sidecar;
 
+#[cfg(desktop)]
 struct SidecarState {
     child: Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
     restart_count: Mutex<u32>,
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn get_auth_nonce(state: tauri::State<'_, sidecar::AuthNonce>) -> String {
     state.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -19,7 +32,11 @@ fn get_auth_nonce(state: tauri::State<'_, sidecar::AuthNonce>) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // ── Desktop: Python sidecar + system tray ────────────────────────────
+    #[cfg(desktop)]
+    let builder = builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
         .manage(SidecarState {
@@ -29,7 +46,6 @@ pub fn run() {
         .manage(sidecar::AuthNonce(Mutex::new(String::new())))
         .invoke_handler(tauri::generate_handler![get_auth_nonce])
         .setup(|app| {
-            // Logging in debug mode
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -81,12 +97,14 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Minimize to tray on close
+            // Minimize to tray on close (desktop only)
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
             }
-        })
+        });
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

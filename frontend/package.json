@@ -10,10 +10,16 @@
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"tauri": "tauri",
+		"android:init": "tauri android init",
+		"android:dev": "tauri android dev",
+		"android:build": "tauri android build --apk",
 		"test:e2e": "playwright test",
 		"test:e2e:desktop": "playwright test --project=desktop",
 		"test:e2e:mobile": "playwright test --project=mobile",
-		"test:e2e:ui": "playwright test --ui"
+		"test:e2e:ui": "playwright test --ui",
+		"test:unit": "vitest run",
+		"test:unit:watch": "vitest"
 	},
 	"devDependencies": {
 		"@playwright/test": "^1.58.2",
@@ -22,12 +28,14 @@
 		"@sveltejs/vite-plugin-svelte": "^6.2.4",
 		"@tailwindcss/vite": "^4.2.1",
 		"@tauri-apps/cli": "^2.10.1",
+		"jsdom": "^29.1.1",
 		"serve": "^14.2.6",
 		"svelte": "^5.51.0",
 		"svelte-check": "^4.4.2",
 		"tailwindcss": "^4.2.1",
 		"typescript": "^5.9.3",
-		"vite": "^7.3.1"
+		"vite": "^7.3.1",
+		"vitest": "^4.1.9"
 	},
 	"dependencies": {
 		"@tauri-apps/api": "^2.10.1",

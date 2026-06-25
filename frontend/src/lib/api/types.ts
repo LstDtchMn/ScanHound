@@ -46,6 +46,60 @@ export interface ResultsResponse {
   filtered_stats?: ScanStats;
 }
 
+export interface CachedResultsResponse extends ResultsResponse {
+  source: string;
+  last_updated: string | null;
+}
+
+export interface BackgroundStatus {
+  enabled: boolean;
+  interval_hours: number;
+  pages: number;
+  sources: string[];
+  retain_days: number;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  cached_count: number;
+  running: boolean;
+}
+
+export interface RenameJob {
+  id: number;
+  package_name: string | null;
+  original_path: string;
+  original_filename: string | null;
+  new_filename: string | null;
+  destination_path: string | null;
+  status: string; // pending | matched | needs_review | applied | failed | reverted
+  media_type: string | null;
+  title: string | null;
+  year: number | null;
+  season: number | null;
+  episode: number | null;
+  tmdb_id: number | null;
+  imdb_id: string | null;
+  resolution: string | null;
+  match_confidence: number | null;
+  match_source: string | null; // deterministic | llm | manual
+  move_method: string | null;
+  warning_message: string | null;
+  error_message: string | null;
+  plex_sort_title: string | null;
+  detected_at: string | null;
+  processed_at: string | null;
+  reverted_at: string | null;
+}
+
+export interface RenameStatus {
+  enabled: boolean;
+  require_confirmation: boolean;
+  confidence_threshold: number;
+  move_method: string;
+  llm_enabled: boolean;
+  counts: Record<string, number>;
+  needs_review: number;
+}
+
 export interface WsMessage {
   type: string;
   data: Record<string, unknown>;
@@ -242,6 +296,28 @@ export interface Settings {
   scheduler_enabled?: boolean;
   scheduler_interval?: number;
   last_scan_time?: number;
+
+  // Background pre-cache scanning
+  background_scan_enabled?: boolean;
+  background_scan_interval_hours?: number;
+  background_scan_pages?: number;
+  background_scan_sources?: string[];
+  background_scan_retain_days?: number;
+  background_scan_last_run?: number;
+
+  // Auto-rename + Plex sort + Ollama assist
+  auto_rename_enabled?: boolean;
+  auto_rename_confidence_threshold?: number;
+  auto_rename_require_confirmation?: boolean;
+  auto_rename_move_method?: string;
+  auto_rename_movie_library?: string;
+  auto_rename_tv_library?: string;
+  auto_rename_template_movie?: string;
+  auto_rename_template_tv?: string;
+  auto_rename_plex_sort_titles?: boolean;
+  auto_rename_llm_enabled?: boolean;
+  ollama_base_url?: string;
+  ollama_model?: string;
 
   // Debug & Logging
   debug_mode?: boolean;

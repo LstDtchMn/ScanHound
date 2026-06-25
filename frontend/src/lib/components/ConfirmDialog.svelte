@@ -1,5 +1,6 @@
 <script lang="ts">
   import { fly } from 'svelte/transition';
+  import ModalOverlay from './ModalOverlay.svelte';
 
   interface Props {
     title: string;
@@ -11,24 +12,15 @@
     oncancel: () => void;
   }
   let { title, message, confirmLabel = 'Confirm', cancelLabel = 'Cancel', variant = 'default', onconfirm, oncancel }: Props = $props();
-
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') oncancel();
-  }
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
-
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<!-- svelte-ignore a11y_click_events_have_key_events -->
-<div class="fixed inset-0 z-50 flex items-center justify-center bg-[var(--bg-overlay)]" onclick={oncancel}>
+<ModalOverlay onclose={oncancel}>
   <div
     transition:fly={{ y: -20, duration: 200 }}
     class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl shadow-2xl p-6 w-full max-w-sm"
     role="alertdialog"
     aria-label={title}
     tabindex="-1"
-    onclick={(e) => e.stopPropagation()}
   >
     <h2 class="text-base font-semibold mb-2">{title}</h2>
     <p class="text-sm text-[var(--text-secondary)] mb-5">{message}</p>
@@ -48,4 +40,4 @@
       </button>
     </div>
   </div>
-</div>
+</ModalOverlay>

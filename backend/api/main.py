@@ -10,11 +10,30 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend.api.dependencies import ServiceRegistry, ScannerAppBridge, registry
+from backend.api.dependencies import (
+    ServiceRegistry, ScannerAppBridge, registry,
+    auth_enabled as _auth_enabled,
+    token_authorized as _token_authorized,
+)
 
 logger = logging.getLogger(__name__)
 
 __version__ = "2.0.0-dev"
+
+
+def _should_auto_connect_plex(config: Dict[str, Any]) -> bool:
+    """Whether startup should auto-connect to Plex given the current config.
+
+    Direct mode needs a server URL + token; account mode (plex.tv) only needs
+    a username + password — the URL and token are discovered after sign-in.
+    Mirror the gate that ``PlexService.connect()`` applies so account mode is
+    not silently skipped at startup.
+    """
+    if not config.get("auto_connect_plex"):
+        return False
+    if config.get("plex_connection_mode", "direct") == "account":
+        return bool(config.get("plex_username") and config.get("plex_password"))
+    return bool(config.get("plex_url") and config.get("plex_token"))
 
 
 def _init_services(
@@ -106,8 +125,8 @@ def _init_services(
     # Background poller: track download + extraction outcomes from JDownloader.
     _start_results_poller(reg)
 
-    # Auto-connect to Plex on startup if configured
-    if reg.config.get("auto_connect_plex") and reg.config.get("plex_url") and reg.config.get("plex_token"):
+    # Auto-connect to Plex on startup if configured (direct or account mode).
+    if _should_auto_connect_plex(reg.config):
         import threading
         def _auto_connect_plex():
             from backend.api.ws import ws_manager
@@ -141,12 +160,27 @@ def _init_services(
                         "data": {"connected": False, "server": "", "movie_count": 0, "tv_count": 0},
                     })
             except Exception as e:
+                # Log the detail server-side, but don't broadcast the raw
+                # exception text to every connected client — it can carry the
+                # Plex URL / token depending on the underlying client.
                 logger.warning("Auto-connect to Plex failed: %s", e)
                 ws_manager.broadcast_sync({
                     "type": "plex:status",
-                    "data": {"connected": False, "server": str(e), "movie_count": 0, "tv_count": 0},
+                    "data": {"connected": False, "server": "", "movie_count": 0, "tv_count": 0},
                 })
         threading.Thread(target=_auto_connect_plex, daemon=True, name="plex-auto-connect").start()
+
+    # Background pre-cache scanner — always created so /background/scan-now and
+    # runtime toggling work; the loop self-gates on background_scan_enabled and
+    # just sleeps while the feature is off (the default).
+    from backend.background_scanner import BackgroundScanner
+    reg._background_scanner = BackgroundScanner(reg)
+    reg._background_scanner.start()
+
+    # Auto-rename service — created so the JD poller hook and /rename endpoints
+    # work; it self-gates on auto_rename_enabled (off by default).
+    from backend.rename.service import RenameService
+    reg._rename_service = RenameService(reg)
 
 
 def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
@@ -163,6 +197,7 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
 
     def _loop():
         last_sig = None
+        handed_to_rename: set = set()  # packages already sent to auto-rename
         while not reg.shutdown_requested:
             try:
                 cfg = reg.config or {}
@@ -179,6 +214,21 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                             "type": "download:results",
                             "data": {"results": results},
                         })
+                    # Auto-rename hook: hand each newly-extracted package's output
+                    # folder to the rename service (it self-gates on the setting
+                    # and dedups by package). Runs off-thread so the poller never
+                    # blocks on filesystem walks / TMDB lookups.
+                    if cfg.get("auto_rename_enabled") and reg._rename_service:
+                        for r in results:
+                            name = r.get("name")
+                            if (r.get("state") == "extracted" and r.get("save_to")
+                                    and name not in handed_to_rename):
+                                handed_to_rename.add(name)
+                                threading.Thread(
+                                    target=reg._rename_service.process_package,
+                                    args=(name, r.get("save_to")),
+                                    name="auto-rename", daemon=True,
+                                ).start()
             except Exception as e:
                 logger.debug("results poller error: %s", e)
             # Sleep in short slices so shutdown stays responsive.
@@ -191,9 +241,75 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
     logger.info("Download results poller started")
 
 
+# Paths reachable without a token, e.g. readiness probes and the login flow
+# itself (you have no token yet when logging in). Extend this set rather than
+# bolting another bespoke comparison onto auth_middleware.
+_AUTH_EXEMPT_PATHS = frozenset({"/health", "/auth/login", "/auth/status"})
+
+
+def _is_auth_exempt(request: Request) -> bool:
+    """Whether this request should pass the auth middleware without a token."""
+    if request.method == "OPTIONS":
+        # CORS preflight: browsers send OPTIONS with no credentials by design,
+        # so auth-ing it would 401 the preflight and strip the CORS headers
+        # CORSMiddleware needs to attach — blocking a non-same-origin client
+        # (the Android APK) before its real, authed request is ever made.
+        # OPTIONS returns only CORS metadata, no data.
+        return True
+    return request.url.path in _AUTH_EXEMPT_PATHS
+
+
+def _bearer_token(request: Request) -> str:
+    """Extract the bearer token from the Authorization header, if any."""
+    header = request.headers.get("authorization", "")
+    return header[7:] if header.startswith("Bearer ") else ""
+
+
+# _auth_enabled / _token_authorized are imported from dependencies (top of file)
+# so the WebSocket handshake in backend.api.ws shares the exact same gate.
+
+
+def _compute_protected_segments(routers) -> frozenset:
+    """Top-level path segments owned by API routers — what the middleware guards.
+
+    Derived from the routers' own prefixes/paths (read directly off the router
+    objects, which is stable; FastAPI wraps included routers opaquely in
+    ``app.routes``), so new routers are covered automatically. The SPA shell and
+    static assets have no API router, so they stay open for the login page.
+    """
+    segments = set()
+    for router in routers:
+        prefix = (getattr(router, "prefix", "") or "").lstrip("/")
+        if prefix:
+            segments.add(prefix.split("/", 1)[0])
+            continue
+        # Prefix-less router (e.g. system: /health, /discover, /shutdown).
+        for route in getattr(router, "routes", []):
+            segment = getattr(route, "path", "").lstrip("/").split("/", 1)[0]
+            if segment and not segment.startswith("{"):
+                segments.add(segment)
+    return frozenset(segments)
+
+
+def _request_requires_auth(request: Request) -> bool:
+    """Whether this request must present a valid token to proceed."""
+    if _is_auth_exempt(request):
+        return False
+    protected = getattr(request.app.state, "protected_segments", frozenset())
+    segment = request.url.path.lstrip("/").split("/", 1)[0]
+    if segment not in protected:
+        return False  # SPA shell / static asset — served openly
+    return _auth_enabled()
+
+
 def _teardown_services(reg: ServiceRegistry) -> None:
     """Gracefully shut down all services."""
     reg.request_shutdown()  # stop the background results poller
+    if reg._background_scanner:
+        try:
+            reg._background_scanner.stop()
+        except Exception:
+            pass
     if reg._notification_bridge:
         try:
             reg._notification_bridge.shutdown()
@@ -238,8 +354,9 @@ def create_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
-            "https://tauri.localhost", # Tauri production webview
-            "tauri://localhost",       # Tauri custom protocol
+            "https://tauri.localhost", # Tauri production webview (useHttpsScheme)
+            "http://tauri.localhost",  # Tauri >=2.x default scheme on Windows + Android
+            "tauri://localhost",       # Tauri custom protocol (Linux/macOS)
         ],
         # Allow any localhost/127.0.0.1 port — Vite picks a free port at dev time
         allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
@@ -248,17 +365,14 @@ def create_app(
         allow_headers=["*"],
     )
 
-    # Auth nonce middleware — protects all HTTP endpoints.
-    # When auth_nonce is empty (dev mode / no env var), auth is disabled.
+    # Bearer-token middleware — guards the API routes. A request is authorized
+    # by either a valid login-session token or the desktop nonce. Auth is off
+    # entirely when no nonce is set and no password is configured (dev / fresh
+    # install); the SPA shell and static assets are always served openly.
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
-        nonce = registry.auth_nonce
-        if nonce:
-            # Skip auth for health check (needed for readiness probes)
-            if request.url.path == "/health":
-                return await call_next(request)
-            auth_header = request.headers.get("authorization", "")
-            if auth_header != f"Bearer {nonce}":
+        if _request_requires_auth(request):
+            if not _token_authorized(_bearer_token(request)):
                 return JSONResponse(
                     status_code=401,
                     content={"detail": "Unauthorized"},
@@ -266,20 +380,22 @@ def create_app(
         return await call_next(request)
 
     # Register route modules
-    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler
+    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler, auth, background, rename
     from backend.api import ws
 
-    app.include_router(system.router)
-    app.include_router(ws.router)
-    app.include_router(settings.router)
-    app.include_router(sources.router)
-    app.include_router(plex.router)
-    app.include_router(scanner.router)
-    app.include_router(results.router)
-    app.include_router(downloads.router)
-    app.include_router(analytics.router)
-    app.include_router(watchlist.router)
-    app.include_router(scheduler.router)
+    api_routers = [
+        system.router, auth.router, ws.router, settings.router, sources.router,
+        plex.router, scanner.router, results.router, downloads.router,
+        analytics.router, watchlist.router, scheduler.router, background.router,
+        rename.router,
+    ]
+    for router in api_routers:
+        app.include_router(router)
+
+    # Snapshot which top-level path segments the bearer middleware guards. The
+    # SPA shell + static assets have no API router and stay open (so the login
+    # page can load before the user holds a token).
+    app.state.protected_segments = _compute_protected_segments(api_routers)
 
     # ── Serve the built frontend (production / Docker) ──────────────────
     # When the SvelteKit static build is present, serve it from the API so the

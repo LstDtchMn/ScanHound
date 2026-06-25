@@ -5,8 +5,13 @@
   import ResultTile from '$lib/components/ResultTile.svelte';
   import ResultRow from '$lib/components/ResultRow.svelte';
   import ContextMenu from '$lib/components/ContextMenu.svelte';
+  import ResultActionSheet from '$lib/components/ResultActionSheet.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
-  import { filteredResults, viewMode, results, stats, selectedDetail, focusedIndex, toggleSelect, visibleColumns } from '$lib/stores/results';
+  import SwipeDeck from '$lib/components/SwipeDeck.svelte';
+  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, visibleColumns, hydrateDismissed, fromCache, cacheUpdatedAt, hydrateCache } from '$lib/stores/results';
+  import { mobile } from '$lib/stores/media';
+  import { addToast } from '$lib/stores/notifications';
+  import { get } from 'svelte/store';
   import { scanState, scanProgress, scanPhase } from '$lib/stores/scanner';
   import { settings, settingsLoaded, loadSettings } from '$lib/stores/settings';
   import { plexConnected, plexMovieCount, plexTvCount, refreshPlexStatus } from '$lib/stores/plex';
@@ -23,6 +28,31 @@
   );
   // Tracks whether initial Plex status check is still pending
   let plexChecking = $state(true);
+
+  /** Short relative time like "5m ago" from a UTC timestamp string. */
+  function relTime(s: string | null): string {
+    if (!s) return '';
+    // SQLite CURRENT_TIMESTAMP is UTC without a zone marker — treat it as UTC.
+    const iso = s.includes('T') ? s : s.replace(' ', 'T') + 'Z';
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return '';
+    const secs = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (secs < 60) return 'just now';
+    const mins = Math.round(secs / 60);
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.round(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.round(hrs / 24)}d ago`;
+  }
+
+  async function scanNow() {
+    try {
+      await api.triggerBackgroundScan();
+      addToast('Background scan', 'Started — cached results will refresh in the background');
+    } catch {
+      addToast('Background scan', 'Could not start a scan', 'error');
+    }
+  }
 
   // Trending movies for empty state discovery
   let trendingMovies = $state<{ id: number; title: string; year: string | null; poster_url: string; rating: number }[]>([]);
@@ -58,6 +88,7 @@
   );
 
   let contextMenu = $state<{ item: ScanResult; x: number; y: number } | null>(null);
+  let mobileActionItem = $state<ScanResult | null>(null);
   let currentPage = $state(1);
   const perPage = 100;
   let collapsedGroups = $state<Set<string>>(new Set());
@@ -133,8 +164,14 @@
   });
 
   onMount(async () => {
+    // Phones default to the swipe deck unless the user has chosen a view.
+    if (get(mobile) && !get(viewModeExplicit)) viewMode.set('swipe');
     // Load all status in parallel so checklist shows accurate data on first render
     await Promise.all([
+      // Pull the persisted swipe-dismissal set so skipped items stay hidden —
+      // awaited alongside results so the deck never briefly shows cards the
+      // user already swiped away in an earlier session.
+      hydrateDismissed(),
       refreshPlexStatus().finally(() => { plexChecking = false; }),
       loadSettings(),
       (async () => {
@@ -147,6 +184,11 @@
         } catch { /* no previous results */ }
       })(),
     ]);
+    // If no live results were available (fresh session / server restart), fall
+    // back to the pre-cached background-scan results so the app opens populated.
+    if (get(results).length === 0) {
+      await hydrateCache();
+    }
     // Settings store is now populated — check metadata keys for banner
     tmdbKeyMissing = !$settings.tmdb_api_key && !$settings.omdb_api_key;
 
@@ -228,7 +270,13 @@
 
   function handleContextMenu(e: MouseEvent, item: ScanResult) {
     e.preventDefault();
-    contextMenu = { item, x: e.clientX, y: e.clientY };
+    // On touch, long-press fires `contextmenu` — show a bottom sheet instead of
+    // a cursor-positioned popup.
+    if (get(mobile)) {
+      mobileActionItem = item;
+    } else {
+      contextMenu = { item, x: e.clientX, y: e.clientY };
+    }
   }
 </script>
 
@@ -249,6 +297,14 @@
 {/if}
 
 <FilterBar />
+
+{#if $fromCache}
+  <div class="px-4 py-1.5 flex items-center gap-2 text-xs text-[var(--text-secondary)] border-b border-[var(--border)] bg-[color-mix(in_srgb,var(--accent)_4%,var(--bg-primary))]">
+    <svg class="w-3.5 h-3.5 flex-shrink-0 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+    <span>Showing cached results{#if $cacheUpdatedAt} · updated {relTime($cacheUpdatedAt)}{/if}</span>
+    <button onclick={scanNow} class="ml-auto text-[var(--accent)] hover:underline font-medium">Scan now</button>
+  </div>
+{/if}
 
 {#if $batchProgress}
   <div class="px-3 py-1.5 border-b border-[var(--border)] bg-[color-mix(in_srgb,var(--accent)_6%,var(--bg-primary))]">
@@ -277,6 +333,9 @@
   </div>
 {/if}
 
+{#if $viewMode === 'swipe'}
+  <SwipeDeck />
+{:else}
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <div
@@ -305,7 +364,7 @@
               <div class="grid gap-4" style={gridStyle} transition:slide={{ duration: 150 }}>
                 {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
                   <div oncontextmenu={(e) => handleContextMenu(e, item)}>
-                    <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} />
+                    <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} onmore={() => (mobileActionItem = item)} />
                   </div>
                 {/each}
               </div>
@@ -314,7 +373,7 @@
         {:else}
           {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
             <div oncontextmenu={(e) => handleContextMenu(e, item)}>
-              <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} />
+              <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} onmore={() => (mobileActionItem = item)} />
             </div>
           {/each}
         {/if}
@@ -536,6 +595,7 @@
     </div>
   {/if}
 </div>
+{/if}
 
 <StatusBar />
 
@@ -547,6 +607,8 @@
     onclose={() => (contextMenu = null)}
   />
 {/if}
+
+<ResultActionSheet item={mobileActionItem} onclose={() => (mobileActionItem = null)} />
 
 {#if $selectedDetail}
   <DetailPanel item={$selectedDetail} onclose={() => selectedDetail.set(null)} />

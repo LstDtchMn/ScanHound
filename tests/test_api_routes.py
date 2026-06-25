@@ -37,15 +37,37 @@ def _reset_results_selection():
 
 
 @pytest.fixture(autouse=True)
+def _reset_dismissed():
+    """Clear persisted dismissals between tests (the DB path is shared)."""
+    def _clear():
+        try:
+            from backend.database import DatabaseManager
+            dm = DatabaseManager()
+            dm.clear_dismissed_items()
+            dm.close()
+        except Exception:
+            pass
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_scan_state():
     """Reset scan state between tests."""
-    from backend.api.routes.scanner import _scan_state, _scan_lock
+    from backend.api.routes.scanner import _scan_state, _scan_lock, _items_lock
+    import backend.api.routes.scanner as _scanner
     with _scan_lock:
         _scan_state["state"] = "idle"
         _scan_state["progress"] = 0.0
         _scan_state["phase"] = ""
         _scan_state["scanned"] = 0
         _scan_state["total"] = 0
+    # The last-scan items are a module global shared across tests; without
+    # clearing them a prior scan test leaks results into e.g.
+    # test_export_csv_no_results (which then gets 200 instead of 400).
+    with _items_lock:
+        _scanner._last_scan_items.clear()
     yield
 
 
@@ -434,6 +456,42 @@ class TestResults:
     def test_page_min_validation(self, client):
         resp = client.get("/results?page=0")
         assert resp.status_code == 422
+
+
+class TestDismiss:
+    def test_dismiss_adds_items(self, client):
+        resp = client.post("/results/dismiss", json={
+            "urls": ["http://x/a", "http://x/b"],
+            "titles": {"http://x/a": "Movie A"},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["dismissed_count"] == 2
+
+    def test_dismiss_is_idempotent(self, client):
+        client.post("/results/dismiss", json={"urls": ["http://x/a"]})
+        resp = client.post("/results/dismiss", json={"urls": ["http://x/a"]})
+        assert resp.json()["dismissed_count"] == 1
+
+    def test_undismiss_removes_item(self, client):
+        client.post("/results/dismiss", json={"urls": ["http://x/a", "http://x/b"]})
+        resp = client.post("/results/dismiss", json={"urls": ["http://x/a"], "dismissed": False})
+        assert resp.json()["dismissed_count"] == 1
+
+    def test_list_dismissed(self, client):
+        client.post("/results/dismiss", json={"urls": ["http://x/a"], "titles": {"http://x/a": "A"}})
+        resp = client.get("/results/dismissed")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 1
+        assert data["items"][0]["url"] == "http://x/a"
+        assert data["items"][0]["title"] == "A"
+
+    def test_clear_dismissed(self, client):
+        client.post("/results/dismiss", json={"urls": ["http://x/a", "http://x/b"]})
+        resp = client.delete("/results/dismissed")
+        assert resp.status_code == 200
+        assert resp.json()["dismissed_count"] == 0
+        assert client.get("/results/dismissed").json()["count"] == 0
 
 
 # ── Downloads ─────────────────────────────────────────────────────────

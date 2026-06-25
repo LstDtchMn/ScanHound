@@ -4,7 +4,7 @@ import { connection } from './connection';
 import type { ScanResult, ScanStats } from '$lib/api/types';
 
 export type StatusFilter = 'all' | 'missing' | 'upgrade' | 'library';
-export type ViewMode = 'grid' | 'list';
+export type ViewMode = 'grid' | 'list' | 'swipe';
 export type SortOption =
   | 'title-asc'
   | 'title-desc'
@@ -35,9 +35,23 @@ function persisted<T>(key: string, fallback: T) {
 export const results = writable<ScanResult[]>([]);
 export const statusFilter = writable<StatusFilter>('all');
 export const searchFilter = writable<string>('');
-export const genreFilter = writable<string>('');
-export const languageFilter = writable<string>('');
+/** Selected genres/languages to show; empty array means "All" (no filter). */
+export const genreFilter = writable<string[]>([]);
+export const languageFilter = writable<string[]>([]);
+export function toggleGenreFilter(genre: string) {
+  genreFilter.update((g) => (g.includes(genre) ? g.filter((x) => x !== genre) : [...g, genre]));
+}
+export function toggleLanguageFilter(lang: string) {
+  languageFilter.update((l) => (l.includes(lang) ? l.filter((x) => x !== lang) : [...l, lang]));
+}
 export const viewMode = persisted<ViewMode>('sh-view-mode', 'grid');
+/** Whether the user has explicitly picked a view (vs. the platform default).
+ *  Lets phones default to the swipe deck without overriding a deliberate choice. */
+export const viewModeExplicit = persisted<boolean>('sh-view-mode-explicit', false);
+export function setViewMode(m: ViewMode) {
+  viewMode.set(m);
+  viewModeExplicit.set(true);
+}
 export const stats = writable<ScanStats>({
   total: 0,
   missing: 0,
@@ -61,6 +75,18 @@ export function toggleQuickFilter(key: string) {
 }
 
 export const selectedKeys = writable<Set<string>>(new Set());
+
+/** Release URLs the user swiped away ("skip"); persisted server-side so the
+ *  deck only surfaces fresh items across scans. Hydrated on app load. */
+export const dismissedUrls = writable<Set<string>>(new Set());
+
+/** Whether the shown results came from the background pre-cache (no live scan
+ *  this session). Drives a subtle "showing cached results" banner; cleared the
+ *  moment a live scan produces results. */
+export const fromCache = writable<boolean>(false);
+export const cacheUpdatedAt = writable<string | null>(null);
+let fromCacheActive = false;
+
 let activeScanResultCount = 0;
 
 /** Parse a human-readable size string like "4.5 GB" into bytes for comparison */
@@ -89,6 +115,13 @@ function parsePostedDate(s: string | null | undefined): number {
 
 connection.on('scan:result', (data) => {
   const item = data as unknown as ScanResult;
+  // A live scan supersedes any pre-cached results: clear the cache rows on the
+  // first streamed item so live and cached never mix.
+  if (fromCacheActive) {
+    results.set([]);
+    fromCacheActive = false;
+    fromCache.set(false);
+  }
   activeScanResultCount += 1;
   results.update((items) => [...items, item]);
   // Incrementally update stats as items stream in
@@ -105,6 +138,9 @@ connection.on('scan:result', (data) => {
 connection.on('scan:complete', (data) => {
   const s = data.stats as ScanStats;
   if (s) stats.set(s);
+  // A completed live scan always supersedes the cache banner.
+  fromCacheActive = false;
+  fromCache.set(false);
 
   // If a completed scan produced no streamed items, ensure stale results
   // from an earlier run are cleared out of the UI.
@@ -142,9 +178,13 @@ function hasPlexCopy(i: ScanResult): boolean {
 }
 
 export const filteredResults = derived(
-  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters],
-  ([$results, $filter, $search, $genre, $language, $sort, $quick]) => {
+  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls],
+  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed]) => {
     let items = $results;
+    // Hide swiped-away ("skip") items everywhere they'd otherwise appear.
+    if ($dismissed.size > 0) {
+      items = items.filter((i) => !i.url || !$dismissed.has(i.url));
+    }
     if ($filter !== 'all') {
       items = items.filter(
         (i) => i.status === $filter || (i.status && i.status.includes($filter))
@@ -154,11 +194,11 @@ export const filteredResults = derived(
       const q = $search.toLowerCase();
       items = items.filter((i) => i.title.toLowerCase().includes(q));
     }
-    if ($genre) {
-      items = items.filter((i) => i.genres?.includes($genre));
+    if ($genre.length > 0) {
+      items = items.filter((i) => i.genres?.some((g) => $genre.includes(g)));
     }
-    if ($language) {
-      items = items.filter((i) => i.language === $language);
+    if ($language.length > 0) {
+      items = items.filter((i) => $language.includes(i.language));
     }
     // Quick-filter chips (AND-combined with the above)
     if ($quick.includes('4k')) items = items.filter((i) => i.resolution === '4K');
@@ -195,6 +235,93 @@ export const filteredResults = derived(
   }
 );
 
+/** True for items the swipe deck should present — actionable (missing/upgrade)
+ *  releases that have a source URL and aren't already selected. Selected items
+ *  drop out of the deck so a right-swipe doesn't resurface the same card. */
+function isActionable(status: string | null | undefined): boolean {
+  const s = (status || '').toLowerCase();
+  return s.includes('missing') || s.includes('upgrade');
+}
+
+export const deckResults = derived(
+  [filteredResults, selectedKeys],
+  ([$filtered, $selected]) =>
+    $filtered.filter((i) => !!i.url && isActionable(i.status) && !$selected.has(i.url))
+);
+
+/** Seed the store from pre-cached background-scan results when there are no
+ *  live results yet (fresh session / server restart), so the app opens with
+ *  something to show. Sets fromCache so the UI can flag it. */
+export async function hydrateCache() {
+  try {
+    const data = await api.getCachedResults({ per_page: '500' });
+    if (data.items && data.items.length > 0) {
+      results.set(data.items as ScanResult[]);
+      if (data.stats) stats.set(data.stats);
+      cacheUpdatedAt.set(data.last_updated ?? null);
+      fromCache.set(true);
+      fromCacheActive = true;
+    }
+  } catch {
+    /* no cache / offline — leave empty */
+  }
+}
+
+/** Load the persisted dismissal set from the server (call once on app start). */
+export async function hydrateDismissed() {
+  try {
+    const { items } = await api.dismissedList();
+    dismissedUrls.set(new Set(items.map((d) => d.url)));
+  } catch {
+    /* offline / no server — leave empty */
+  }
+}
+
+/** Swipe-left: dismiss an item (optimistic), persisting it server-side.
+ *  Resolves false if the server call failed and the optimistic update was
+ *  reverted — callers can use this to drop a now-stale undo entry. */
+export function dismissItem(url: string, title?: string): Promise<boolean> {
+  if (!url) return Promise.resolve(false);
+  dismissedUrls.update((s) => {
+    const next = new Set(s);
+    next.add(url);
+    return next;
+  });
+  return api.dismissItems([url], title ? { [url]: title } : undefined, true).then(
+    () => true,
+    () => {
+      // Revert on failure so the UI reflects the server's truth.
+      dismissedUrls.update((s) => {
+        const next = new Set(s);
+        next.delete(url);
+        return next;
+      });
+      return false;
+    }
+  );
+}
+
+/** Undo a dismissal so the item can reappear. */
+export function restoreItem(url: string): Promise<boolean> {
+  if (!url) return Promise.resolve(false);
+  dismissedUrls.update((s) => {
+    const next = new Set(s);
+    next.delete(url);
+    return next;
+  });
+  return api.dismissItems([url], undefined, false).then(
+    () => true,
+    () => {
+      dismissedUrls.update((s) => {
+        const next = new Set(s);
+        next.add(url);
+        return next;
+      });
+      return false;
+    }
+  );
+}
+
 export function clearResults() {
   results.set([]);
   stats.set({ total: 0, missing: 0, upgrade: 0, library: 0 });
@@ -202,6 +329,8 @@ export function clearResults() {
   selectedDetail.set(null);
   focusedIndex.set(-1);
   activeScanResultCount = 0;
+  fromCacheActive = false;
+  fromCache.set(false);
 }
 
 /** Mark result rows (by url) as Downloaded and adjust the status counters. */

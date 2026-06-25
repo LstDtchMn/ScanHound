@@ -5,7 +5,7 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import { downloadHost, activeDownload } from '$lib/stores/downloads';
-  import { statusVariant, formatStatus, formatCount } from '$lib/constants';
+  import { statusVariant, formatStatus, formatCount, DOWNLOAD_HOSTS } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
   import { fly } from 'svelte/transition';
 
@@ -17,8 +17,9 @@
   interface Props {
     item: ScanResult;
     focused?: boolean;
+    onmore?: () => void;
   }
-  let { item, focused = false }: Props = $props();
+  let { item, focused = false, onmore }: Props = $props();
 
   // Select by unique url, not group_key (same-title releases share group_key)
   let selected = $derived($selectedKeys.has(item.url));
@@ -136,6 +137,15 @@
       {#if item.hdr && !item.dovi}<Badge label="HDR" variant="warning" />{/if}
     </div>
 
+    <!-- Mobile actions trigger -->
+    {#if onmore}
+      <button
+        onclick={(e) => { e.stopPropagation(); onmore?.(); }}
+        aria-label="Actions"
+        class="md:hidden absolute bottom-1.5 right-1.5 w-8 h-8 rounded-full bg-black/55 text-white flex items-center justify-center text-lg leading-none"
+      >⋯</button>
+    {/if}
+
     <!-- Selection checkbox — top left -->
     <input
       type="checkbox"
@@ -197,9 +207,7 @@
           class="h-5 px-0.5 rounded-l text-[9px] bg-[var(--bg-tertiary)] border border-r-0 border-[var(--border)] text-[var(--text-secondary)] focus:outline-none cursor-pointer"
           title="Download host"
         >
-          <option value="Rapidgator">RG</option>
-          <option value="Nitroflare">NF</option>
-          <option value="1Fichier">1F</option>
+          {#each DOWNLOAD_HOSTS as h}<option value={h.value}>{h.short}</option>{/each}
         </select>
         <button
           onclick={handleDownload}
