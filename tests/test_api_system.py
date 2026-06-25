@@ -1,7 +1,7 @@
 """Tests for the system API endpoints (health, shutdown)."""
 import pytest
 from fastapi.testclient import TestClient
-from backend.api.main import create_app
+from backend.api.main import create_app, _should_auto_connect_plex
 from backend.api.dependencies import registry
 
 
@@ -97,3 +97,56 @@ def test_protected_route_requires_token_when_auth_enabled(auth_client):
 def test_protected_route_accepts_valid_token(auth_client):
     resp = auth_client.get("/results", headers={"Authorization": "Bearer test-nonce"})
     assert resp.status_code != 401
+
+
+class TestShouldAutoConnectPlex:
+    """Startup auto-connect gate must fire for both direct and account modes."""
+
+    def test_direct_mode_with_url_and_token(self):
+        assert _should_auto_connect_plex({
+            "auto_connect_plex": True,
+            "plex_connection_mode": "direct",
+            "plex_url": "http://localhost:32400",
+            "plex_token": "tok",
+        })
+
+    def test_direct_mode_is_the_default_when_mode_absent(self):
+        assert _should_auto_connect_plex({
+            "auto_connect_plex": True,
+            "plex_url": "http://localhost:32400",
+            "plex_token": "tok",
+        })
+
+    def test_direct_mode_missing_token_is_skipped(self):
+        assert not _should_auto_connect_plex({
+            "auto_connect_plex": True,
+            "plex_connection_mode": "direct",
+            "plex_url": "http://localhost:32400",
+            "plex_token": "",
+        })
+
+    def test_account_mode_with_username_and_password(self):
+        """Regression: account mode has no URL/token but must still auto-connect."""
+        assert _should_auto_connect_plex({
+            "auto_connect_plex": True,
+            "plex_connection_mode": "account",
+            "plex_username": "user@example.com",
+            "plex_password": "pw",
+            # no plex_url / plex_token — discovered after plex.tv sign-in
+        })
+
+    def test_account_mode_missing_password_is_skipped(self):
+        assert not _should_auto_connect_plex({
+            "auto_connect_plex": True,
+            "plex_connection_mode": "account",
+            "plex_username": "user@example.com",
+            "plex_password": "",
+        })
+
+    def test_disabled_when_auto_connect_off(self):
+        assert not _should_auto_connect_plex({
+            "auto_connect_plex": False,
+            "plex_connection_mode": "account",
+            "plex_username": "user@example.com",
+            "plex_password": "pw",
+        })

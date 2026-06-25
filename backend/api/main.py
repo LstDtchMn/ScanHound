@@ -17,6 +17,21 @@ logger = logging.getLogger(__name__)
 __version__ = "2.0.0-dev"
 
 
+def _should_auto_connect_plex(config: Dict[str, Any]) -> bool:
+    """Whether startup should auto-connect to Plex given the current config.
+
+    Direct mode needs a server URL + token; account mode (plex.tv) only needs
+    a username + password — the URL and token are discovered after sign-in.
+    Mirror the gate that ``PlexService.connect()`` applies so account mode is
+    not silently skipped at startup.
+    """
+    if not config.get("auto_connect_plex"):
+        return False
+    if config.get("plex_connection_mode", "direct") == "account":
+        return bool(config.get("plex_username") and config.get("plex_password"))
+    return bool(config.get("plex_url") and config.get("plex_token"))
+
+
 def _init_services(
     reg: ServiceRegistry,
     config_override: Optional[Dict[str, Any]] = None,
@@ -106,8 +121,8 @@ def _init_services(
     # Background poller: track download + extraction outcomes from JDownloader.
     _start_results_poller(reg)
 
-    # Auto-connect to Plex on startup if configured
-    if reg.config.get("auto_connect_plex") and reg.config.get("plex_url") and reg.config.get("plex_token"):
+    # Auto-connect to Plex on startup if configured (direct or account mode).
+    if _should_auto_connect_plex(reg.config):
         import threading
         def _auto_connect_plex():
             from backend.api.ws import ws_manager
