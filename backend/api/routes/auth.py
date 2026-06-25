@@ -11,7 +11,10 @@ nonce.
 in main) so the login page can reach them before holding any token.
 """
 import logging
-from typing import Optional
+import threading
+import time
+from collections import defaultdict, deque
+from typing import Deque, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -24,6 +27,40 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 _MIN_PASSWORD_LEN = 8
+
+# ── Login rate limiting ──────────────────────────────────────────────────
+# bcrypt's cost slows a single guess, but nothing stopped unlimited parallel
+# attempts. Cap failed attempts per client IP in a sliding window; successful
+# logins clear the counter. In-memory is sufficient for this single-process,
+# self-hosted tool.
+_RATE_WINDOW_S = 300.0   # 5-minute window
+_RATE_MAX_FAILS = 10     # then lock that IP out for the rest of the window
+_login_fails: Dict[str, Deque[float]] = defaultdict(deque)
+_login_fails_lock = threading.Lock()
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limited(ip: str) -> bool:
+    """Whether ``ip`` has exhausted its failed-login budget for the window."""
+    now = time.monotonic()
+    with _login_fails_lock:
+        fails = _login_fails[ip]
+        while fails and now - fails[0] > _RATE_WINDOW_S:
+            fails.popleft()
+        return len(fails) >= _RATE_MAX_FAILS
+
+
+def _record_login_fail(ip: str) -> None:
+    with _login_fails_lock:
+        _login_fails[ip].append(time.monotonic())
+
+
+def _clear_login_fails(ip: str) -> None:
+    with _login_fails_lock:
+        _login_fails.pop(ip, None)
 
 
 class LoginRequest(BaseModel):
@@ -56,14 +93,22 @@ def auth_status(reg: ServiceRegistry = Depends(get_registry)):
 
 
 @router.post("/login")
-def login(body: LoginRequest, reg: ServiceRegistry = Depends(get_registry)):
+def login(body: LoginRequest, request: Request,
+          reg: ServiceRegistry = Depends(get_registry)):
     """Verify the password and issue a long-lived session token."""
     if not reg.db or not reg.db.has_password():
         raise HTTPException(status_code=400, detail="No password is configured")
+    ip = _client_ip(request)
+    if _rate_limited(ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts; try again later")
     stored = reg.db.get_password_hash()
     if not auth_service.verify_password(body.password, stored):
+        _record_login_fail(ip)
         # bcrypt's own cost is the brute-force deterrent; keep the message vague.
         raise HTTPException(status_code=401, detail="Incorrect password")
+    _clear_login_fails(ip)
     token = auth_service.new_session_token()
     expires_at = auth_service.session_expiry()
     reg.db.create_session(auth_service.hash_token(token), expires_at)

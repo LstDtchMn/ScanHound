@@ -130,8 +130,15 @@ class RenameService:
         # Optional Ollama fallback only when the deterministic match is weak.
         if (self._cfg.get("auto_rename_llm_enabled")
                 and (not result or result["confidence"] < self._threshold())):
-            llm = _llm.identify(filename, base_url=self._cfg.get("ollama_base_url", ""),
-                                model=self._cfg.get("ollama_model", ""))
+            base_url = self._cfg.get("ollama_base_url", "")
+            model = self._cfg.get("ollama_model", "")
+            if not model or not base_url:
+                # Enabled but unconfigured — llm.identify() would silently no-op,
+                # so the operator would never learn why no LLM assist happened.
+                logger.warning(
+                    "Ollama assist enabled but %s not set; skipping LLM fallback",
+                    "model" if not model else "base URL")
+            llm = _llm.identify(filename, base_url=base_url, model=model)
             if llm and llm.get("title"):
                 mtype = llm.get("media_type") or media_type
                 alt = self._tmdb_match(llm["title"], llm.get("year"), mtype)
@@ -237,9 +244,28 @@ class RenameService:
             return {"ok": False, "error": str(e)}
         sort_title = (compute_sort_title(job.get("title"))
                       if self._cfg.get("auto_rename_plex_sort_titles") else None)
-        db.update_rename_job(job_id, status="applied", move_method=used,
-                             processed_at=_now(), plex_sort_title=sort_title,
-                             error_message=None)
+        try:
+            db.update_rename_job(job_id, status="applied", move_method=used,
+                                 processed_at=_now(), plex_sort_title=sort_title,
+                                 error_message=None)
+        except Exception as e:
+            # The file is already placed but we couldn't record it. Leaving the
+            # row as-is orphans the file (re-apply sees "source missing", undo
+            # sees "not applied"). Reverse the placement so disk and DB stay
+            # consistent, then surface the failure.
+            try:
+                _fileops.undo_place(src, dst, used)
+            except Exception:
+                logger.exception(
+                    "rename apply: DB write failed AND rollback of %s -> %s "
+                    "failed; file may be orphaned (job %s)", src, dst, job_id)
+            try:
+                db.update_rename_job(job_id, status="failed",
+                                     error_message=f"apply bookkeeping failed: {e}")
+            except Exception:
+                pass
+            self._broadcast(job_id)
+            return {"ok": False, "error": str(e)}
         self._broadcast(job_id)
         return {"ok": True}
 

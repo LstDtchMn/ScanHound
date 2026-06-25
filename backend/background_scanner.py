@@ -78,11 +78,29 @@ class BackgroundScanner:
             hours = 6
         return hours * 3600.0
 
+    def _wait_interval(self) -> bool:
+        """Sleep one interval, re-reading it in short slices so a change to
+        ``background_scan_interval_hours`` is honoured within ~a minute instead
+        of only after the *old* (possibly hours-long) interval elapses.
+
+        Returns True if a stop was requested during the wait.
+        """
+        elapsed = 0.0
+        while not self._stop.is_set():
+            target = self._interval_seconds()
+            if elapsed >= target:
+                return False
+            slice_s = min(60.0, target - elapsed)
+            if self._stop.wait(timeout=slice_s):
+                return True
+            elapsed += slice_s
+        return True
+
     def _loop(self) -> None:
         # Wait one interval before the first run so startup isn't hammered, then
         # run on each interval while still enabled.
         while not self._stop.is_set():
-            if self._stop.wait(timeout=self._interval_seconds()):
+            if self._wait_interval():
                 return  # stop requested
             cfg = self._reg.config or {}
             if cfg.get("background_scan_enabled"):
@@ -113,7 +131,15 @@ class BackgroundScanner:
         except (TypeError, ValueError):
             pages = 3
 
-        self._running.set()
+        # Atomic test-and-set so a manual /background/scan-now can't race the
+        # scheduled loop (or another manual trigger) into two concurrent scans
+        # interleaving writes to the cache. The endpoint's own pre-check is a
+        # friendly 409; this is the actual guarantee.
+        with self._lock:
+            if self._running.is_set():
+                logger.info("Background scan already in progress; skipping")
+                return {"scanned": 0, "cached": 0, "skipped": True}
+            self._running.set()
         total = 0
         try:
             for source in sources:

@@ -85,10 +85,13 @@ ws_manager = ConnectionManager()
 
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, token: str = Query(default="")):
-    # Validate auth nonce if enabled
-    from backend.api.dependencies import registry
-    nonce = registry.auth_nonce
-    if nonce and token != nonce:
+    # Gate the socket with the SAME rule as the HTTP middleware: when auth is
+    # enabled (a nonce or a login password is set), require a valid desktop
+    # nonce or an unexpired session token. Checking only the nonce — as this
+    # endpoint used to — left the socket wide open in password-login mode,
+    # since the nonce is empty there and the early-out skipped validation.
+    from backend.api.dependencies import auth_enabled, token_authorized
+    if auth_enabled() and not token_authorized(token):
         await ws.close(code=1008, reason="Unauthorized")
         return
     await ws_manager.connect(ws)

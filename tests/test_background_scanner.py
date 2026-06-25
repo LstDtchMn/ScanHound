@@ -5,6 +5,7 @@ tests cover the DB upsert/purge logic, that each configured source is scanned
 once with the right page count, and that the full item is persisted as JSON.
 """
 import json
+import threading
 import pytest
 
 from backend.database import DatabaseManager
@@ -153,3 +154,37 @@ class TestBackgroundScannerService:
         bs = BackgroundScanner(
             _FakeRegistry({"background_scan_enabled": False}, _FakeScanner(), db))
         assert bs.next_run_at() is None
+
+    def test_scan_once_is_not_reentrant(self, db):
+        """A second scan_once() while one is mid-flight must skip, not run a
+        concurrent pass that interleaves writes (the /scan-now-vs-scheduled
+        race). The guard is a lock-protected test-and-set, not just the
+        endpoint's pre-check.
+        """
+        started = threading.Event()
+        release = threading.Event()
+
+        class _BlockingScanner:
+            def __init__(self):
+                self.calls = 0
+
+            def run_scan(self, *a, **k):
+                self.calls += 1
+                started.set()
+                release.wait(timeout=5)
+                return []
+
+        scanner = _BlockingScanner()
+        config = {"background_scan_sources": ["HDEncode"], "background_scan_pages": 1}
+        bs = BackgroundScanner(_FakeRegistry(config, scanner, db))
+
+        t = threading.Thread(target=bs.scan_once)
+        t.start()
+        try:
+            assert started.wait(timeout=5)        # first scan is in progress
+            result = bs.scan_once()               # re-entrant call
+            assert result.get("skipped") is True
+        finally:
+            release.set()
+            t.join(timeout=5)
+        assert scanner.calls == 1                  # only the first pass ran

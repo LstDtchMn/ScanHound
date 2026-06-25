@@ -163,3 +163,37 @@ registry = ServiceRegistry()
 
 def get_registry() -> ServiceRegistry:
     return registry
+
+
+def auth_enabled() -> bool:
+    """Auth is active when a nonce is configured or a password has been set.
+
+    Canonical home so both the HTTP middleware (backend.api.main) and the
+    WebSocket endpoint (backend.api.ws) gate on the exact same rule.
+    """
+    if registry.auth_nonce:
+        return True
+    db = registry.db
+    return bool(db and db.has_password())
+
+
+def token_authorized(token: str) -> bool:
+    """Whether a bearer token is the desktop nonce or an unexpired session token.
+
+    Used by both the HTTP middleware and the WebSocket handshake so a
+    password-login session is honoured on the socket too — without this the
+    socket would accept any (or no) token whenever the nonce is unset.
+    """
+    if not token:
+        return False
+    nonce = registry.auth_nonce
+    # Constant-time compare so the nonce can't be recovered by timing.
+    if nonce and secrets.compare_digest(token, nonce):
+        return True
+    db = registry.db
+    if db:
+        from backend import auth_service
+        expires_at = db.get_session_expiry(auth_service.hash_token(token))
+        if expires_at and not auth_service.is_expired(expires_at):
+            return True
+    return False

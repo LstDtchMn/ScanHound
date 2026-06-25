@@ -139,6 +139,35 @@ class TestApplyUndo:
         assert out["ok"] is False
         assert db.get_rename_job(jid)["status"] == "failed"
 
+    def test_apply_rolls_back_file_when_db_write_fails(self, db, tmp_path):
+        """If the 'applied' DB write fails *after* the move, the file must be
+        rolled back — otherwise it's orphaned (re-apply sees 'source missing',
+        undo sees 'not applied') with no way to recover from the UI.
+        """
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+        dst = os.path.join(lib, "The Matrix (1999)",
+                           db.get_rename_job(jid)["new_filename"])
+
+        real_update = db.update_rename_job
+
+        def _boom(job_id, **fields):
+            if fields.get("status") == "applied":
+                raise RuntimeError("simulated DB failure")
+            return real_update(job_id, **fields)
+
+        db.update_rename_job = _boom
+        out = svc.apply(jid)
+
+        assert out["ok"] is False
+        # Disk rolled back: source restored, nothing orphaned in the library.
+        assert os.path.exists(src)
+        assert not os.path.exists(dst)
+        # And the row is recorded as failed, not stuck on its old status.
+        assert db.get_rename_job(jid)["status"] == "failed"
+
 
 # ── Ollama fallback ───────────────────────────────────────────────────
 

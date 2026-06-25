@@ -101,3 +101,38 @@ class TestFileOps:
     def test_missing_source_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             fileops.place_file(str(tmp_path / "nope.mkv"), str(tmp_path / "o.mkv"), "move")
+
+    def test_hardlink_falls_back_to_copy_across_filesystems(self, tmp_path, monkeypatch):
+        """A cross-device hardlink (EXDEV) must degrade to a verified copy.
+
+        Covers the real JD-output-vs-Plex-library-on-different-volumes case,
+        which can't be reproduced with a single tmp_path, by simulating the
+        kernel's EXDEV at os.link.
+        """
+        import errno as _errno
+
+        def _exdev(*_a, **_k):
+            raise OSError(_errno.EXDEV, "Invalid cross-device link")
+
+        monkeypatch.setattr(fileops.os, "link", _exdev)
+        src = tmp_path / "src.mkv"; src.write_bytes(b"payload")
+        dst = tmp_path / "lib" / "out.mkv"
+        # Falls back to copy: returns "copy", keeps the source, verifies content.
+        assert fileops.place_file(str(src), str(dst), "hardlink") == "copy"
+        assert dst.read_bytes() == b"payload" and src.exists()
+        # Undo of the copy-fallback drops the destination, leaves the source.
+        fileops.undo_place(str(src), str(dst), "copy")
+        assert not dst.exists() and src.exists()
+
+    def test_non_exdev_link_error_propagates(self, tmp_path, monkeypatch):
+        """A hardlink failure that ISN'T cross-device must not be swallowed."""
+        import errno as _errno
+
+        def _eperm(*_a, **_k):
+            raise OSError(_errno.EPERM, "Operation not permitted")
+
+        monkeypatch.setattr(fileops.os, "link", _eperm)
+        src = tmp_path / "src.mkv"; src.write_text("x")
+        dst = tmp_path / "out.mkv"
+        with pytest.raises(OSError):
+            fileops.place_file(str(src), str(dst), "hardlink")

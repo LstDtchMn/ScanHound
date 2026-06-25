@@ -29,11 +29,14 @@ def _clear_auth():
 @pytest.fixture(autouse=True)
 def _reset_auth():
     """Clear credentials + sessions and the nonce between tests (shared DB)."""
+    from backend.api.routes import auth as auth_routes
     previous_nonce = registry.auth_nonce
     registry.auth_nonce = ""
     _clear_auth()
+    auth_routes._login_fails.clear()  # reset the login rate-limiter
     yield
     _clear_auth()
+    auth_routes._login_fails.clear()
     registry.auth_nonce = previous_nonce
 
 
@@ -117,6 +120,29 @@ def test_login_issues_usable_token(client):
     token = _login(client)
     assert client.get("/results", headers=_auth(token)).status_code != 401
     assert client.get("/results", headers=_auth("garbage")).status_code == 401
+
+
+def test_login_rate_limited_after_repeated_failures(client):
+    from backend.api.routes import auth as auth_routes
+    _set_first_password(client)
+    # Exhaust the failed-attempt budget for this client.
+    for _ in range(auth_routes._RATE_MAX_FAILS):
+        assert client.post("/auth/login", json={"password": "nope"}).status_code == 401
+    # Further attempts — even with the *correct* password — are now throttled.
+    assert client.post("/auth/login", json={"password": "nope"}).status_code == 429
+    assert client.post("/auth/login", json={"password": PASSWORD}).status_code == 429
+
+
+def test_login_success_clears_failure_counter(client):
+    from backend.api.routes import auth as auth_routes
+    _set_first_password(client)
+    # A few failures, then a success, must reset the budget so the next typo
+    # doesn't immediately lock the user out.
+    for _ in range(3):
+        client.post("/auth/login", json={"password": "nope"})
+    assert client.post("/auth/login", json={"password": PASSWORD}).status_code == 200
+    # Success wiped the counter — no IP retains any recorded failures.
+    assert all(len(d) == 0 for d in auth_routes._login_fails.values())
 
 
 # ── set / change password ─────────────────────────────────────────────

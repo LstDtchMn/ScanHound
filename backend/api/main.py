@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import secrets
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
@@ -11,8 +10,11 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend import auth_service
-from backend.api.dependencies import ServiceRegistry, ScannerAppBridge, registry
+from backend.api.dependencies import (
+    ServiceRegistry, ScannerAppBridge, registry,
+    auth_enabled as _auth_enabled,
+    token_authorized as _token_authorized,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -158,10 +160,13 @@ def _init_services(
                         "data": {"connected": False, "server": "", "movie_count": 0, "tv_count": 0},
                     })
             except Exception as e:
+                # Log the detail server-side, but don't broadcast the raw
+                # exception text to every connected client — it can carry the
+                # Plex URL / token depending on the underlying client.
                 logger.warning("Auto-connect to Plex failed: %s", e)
                 ws_manager.broadcast_sync({
                     "type": "plex:status",
-                    "data": {"connected": False, "server": str(e), "movie_count": 0, "tv_count": 0},
+                    "data": {"connected": False, "server": "", "movie_count": 0, "tv_count": 0},
                 })
         threading.Thread(target=_auto_connect_plex, daemon=True, name="plex-auto-connect").start()
 
@@ -260,27 +265,8 @@ def _bearer_token(request: Request) -> str:
     return header[7:] if header.startswith("Bearer ") else ""
 
 
-def _auth_enabled() -> bool:
-    """Auth is active when a nonce is configured or a password has been set."""
-    if registry.auth_nonce:
-        return True
-    db = registry.db
-    return bool(db and db.has_password())
-
-
-def _token_authorized(token: str) -> bool:
-    """Whether a bearer token is the nonce or an unexpired session token."""
-    if not token:
-        return False
-    nonce = registry.auth_nonce
-    if nonce and secrets.compare_digest(token, nonce):
-        return True
-    db = registry.db
-    if db:
-        expires_at = db.get_session_expiry(auth_service.hash_token(token))
-        if expires_at and not auth_service.is_expired(expires_at):
-            return True
-    return False
+# _auth_enabled / _token_authorized are imported from dependencies (top of file)
+# so the WebSocket handshake in backend.api.ws shares the exact same gate.
 
 
 def _compute_protected_segments(routers) -> frozenset:
