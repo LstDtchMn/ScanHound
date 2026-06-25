@@ -82,6 +82,10 @@ EXPECTED_DEFAULT_KEYS = {
     "base_url", "scheduler_only_when_idle",
     # Scheduler
     "scheduler_enabled", "scheduler_interval", "last_scan_time",
+    # Background pre-cache scanning
+    "background_scan_enabled", "background_scan_interval_hours",
+    "background_scan_pages", "background_scan_sources",
+    "background_scan_retain_days", "background_scan_last_run",
     # Debug / logging
     "debug_mode", "verbose_logging", "clear_logs_startup", "scan_threads",
     # Matching thresholds

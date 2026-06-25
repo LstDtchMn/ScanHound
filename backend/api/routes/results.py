@@ -1,6 +1,7 @@
 """Results endpoints: list, filter, select, export."""
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from typing import Any, Dict, List, Optional
@@ -42,6 +43,69 @@ def _compute_status_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
     }
 
 
+def _shape_results(
+    items: List[Dict[str, Any]],
+    *,
+    filter: Optional[str],
+    search: Optional[str],
+    sort: str,
+    order: str,
+    page: int,
+    per_page: int,
+    include_dismissed: bool,
+    reg: ServiceRegistry,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Filter / search / sort / paginate item dicts into a results response.
+
+    Shared by the live results and the pre-cached results so both behave
+    identically (dismissal hiding, stats, selection annotation).
+    """
+    # Hide items the user swiped away on the deck (unless explicitly requested).
+    if not include_dismissed and reg.db is not None:
+        dismissed = reg.db.get_dismissed_urls()
+        if dismissed:
+            items = [i for i in items if i.get("url") not in dismissed]
+
+    # Snapshot of all visible (non-dismissed) items for the overall stats,
+    # before status/search filtering narrows them further.
+    visible_items = list(items)
+
+    if filter:
+        filter_lower = filter.lower()
+        items = [i for i in items if filter_lower in str(i.get("status", "")).lower()]
+
+    if search:
+        search_lower = search.lower()
+        items = [i for i in items if search_lower in str(i.get("title", "")).lower()]
+
+    items.sort(key=lambda x: str(x.get(sort, "")), reverse=(order == "desc"))
+
+    total = len(items)
+    start = (page - 1) * per_page
+    page_items = items[start:start + per_page]
+
+    # Annotate selection state
+    with _selected_lock:
+        selected_snapshot = set(_selected)
+    for item in page_items:
+        item["selected"] = item.get("group_key", "") in selected_snapshot
+
+    response = {
+        "items": page_items,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        # Stats from all visible items (after dismissal, before filter/search).
+        "stats": _compute_status_counts(visible_items),
+        # Filtered stats (after filter/search, before pagination).
+        "filtered_stats": _compute_status_counts(items),
+    }
+    if extra:
+        response.update(extra)
+    return response
+
+
 @router.get("")
 def get_results(
     filter: Optional[str] = Query(None, description="Status filter: missing, upgrade, library"),
@@ -53,61 +117,49 @@ def get_results(
     include_dismissed: bool = Query(False, description="Include swiped-away items"),
     reg: ServiceRegistry = Depends(get_registry),
 ):
-    raw_items = get_last_scan_items()
-    items = [_media_item_to_dict(i) for i in raw_items]
+    items = [_media_item_to_dict(i) for i in get_last_scan_items()]
+    return _shape_results(
+        items, filter=filter, search=search, sort=sort, order=order,
+        page=page, per_page=per_page, include_dismissed=include_dismissed, reg=reg,
+    )
 
-    # Hide items the user swiped away on the deck (unless explicitly requested).
-    if not include_dismissed and reg.db is not None:
-        dismissed = reg.db.get_dismissed_urls()
-        if dismissed:
-            items = [i for i in items if i.get("url") not in dismissed]
 
-    # Snapshot of all visible (non-dismissed) items for the overall stats,
-    # before status/search filtering narrows them further.
-    visible_items = list(items)
+@router.get("/cached")
+def get_cached_results(
+    filter: Optional[str] = Query(None, description="Status filter: missing, upgrade, library"),
+    search: Optional[str] = Query(None),
+    sort: str = Query("title"),
+    order: str = Query("asc"),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(100, ge=1, le=500),
+    include_dismissed: bool = Query(False, description="Include swiped-away items"),
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    """Pre-cached background-scan results (same shape as GET /results).
 
-    # Filter by status
-    if filter:
-        filter_lower = filter.lower()
-        items = [
-            i for i in items
-            if filter_lower in str(i.get("status", "")).lower()
-        ]
-
-    # Search by title
-    if search:
-        search_lower = search.lower()
-        items = [i for i in items if search_lower in str(i.get("title", "")).lower()]
-
-    # Sort
-    reverse = order == "desc"
-    items.sort(key=lambda x: str(x.get(sort, "")), reverse=reverse)
-
-    total = len(items)
-    start = (page - 1) * per_page
-    end = start + per_page
-    page_items = items[start:end]
-
-    # Annotate selection state
-    with _selected_lock:
-        selected_snapshot = set(_selected)
-    for item in page_items:
-        item["selected"] = item.get("group_key", "") in selected_snapshot
-
-    # Compute stats from all visible items (after dismissal, before filter/search)
-    stats = _compute_status_counts(visible_items)
-
-    # Compute filtered stats (from items after filter/search, before pagination)
-    filtered_stats = _compute_status_counts(items)
-
-    return {
-        "items": page_items,
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-        "stats": stats,
-        "filtered_stats": filtered_stats,
-    }
+    Lets the frontend show something immediately on open, before/without a live
+    scan. ``source`` is ``"cache"`` and ``last_updated`` is the most recent
+    ``last_seen_at`` so the UI can show a "cached as of …" banner.
+    """
+    items: List[Dict[str, Any]] = []
+    last_updated: Optional[str] = None
+    if reg.db is not None:
+        for row in reg.db.get_background_cache():
+            try:
+                data = json.loads(row.get("data") or "{}")
+            except (ValueError, TypeError):
+                data = {}
+            if not data.get("url"):
+                data["url"] = row.get("url")
+            items.append(data)
+            seen = row.get("last_seen_at")
+            if seen and (last_updated is None or seen > last_updated):
+                last_updated = seen
+    return _shape_results(
+        items, filter=filter, search=search, sort=sort, order=order,
+        page=page, per_page=per_page, include_dismissed=include_dismissed, reg=reg,
+        extra={"source": "cache", "last_updated": last_updated},
+    )
 
 
 @router.post("/select")

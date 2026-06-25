@@ -165,6 +165,13 @@ def _init_services(
                 })
         threading.Thread(target=_auto_connect_plex, daemon=True, name="plex-auto-connect").start()
 
+    # Background pre-cache scanner — always created so /background/scan-now and
+    # runtime toggling work; the loop self-gates on background_scan_enabled and
+    # just sleeps while the feature is off (the default).
+    from backend.background_scanner import BackgroundScanner
+    reg._background_scanner = BackgroundScanner(reg)
+    reg._background_scanner.start()
+
 
 def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
     """Background thread that tracks JDownloader download + extraction outcomes.
@@ -291,6 +298,11 @@ def _request_requires_auth(request: Request) -> bool:
 def _teardown_services(reg: ServiceRegistry) -> None:
     """Gracefully shut down all services."""
     reg.request_shutdown()  # stop the background results poller
+    if reg._background_scanner:
+        try:
+            reg._background_scanner.stop()
+        except Exception:
+            pass
     if reg._notification_bridge:
         try:
             reg._notification_bridge.shutdown()
@@ -361,13 +373,13 @@ def create_app(
         return await call_next(request)
 
     # Register route modules
-    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler, auth
+    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler, auth, background
     from backend.api import ws
 
     api_routers = [
         system.router, auth.router, ws.router, settings.router, sources.router,
         plex.router, scanner.router, results.router, downloads.router,
-        analytics.router, watchlist.router, scheduler.router,
+        analytics.router, watchlist.router, scheduler.router, background.router,
     ]
     for router in api_routers:
         app.include_router(router)

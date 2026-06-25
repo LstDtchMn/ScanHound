@@ -325,6 +325,24 @@ class DatabaseManager:
                     )
                 ''')
 
+                # Pre-cached scrape results from the background scanner, so the
+                # app can open with results already populated (they survive a
+                # restart, unlike the in-memory live scan). Keyed by release
+                # URL; ``data`` is the full serialized result dict so cached
+                # rows render identically to live ones.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS background_scan_cache (
+                        url TEXT PRIMARY KEY,
+                        title TEXT,
+                        year INTEGER,
+                        status TEXT,
+                        source_category TEXT,
+                        data TEXT,
+                        scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
                 # ── Performance indexes (idempotent) ─────────────────────
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_imdb_id ON plex_cache(imdb_id)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_title ON plex_cache(title)')
@@ -336,6 +354,7 @@ class DatabaseManager:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_download_results_updated ON download_results(updated_at DESC)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp DESC)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_bg_cache_last_seen ON background_scan_cache(last_seen_at)')
 
                 # ── Column migrations (guarded by "duplicate column name") ─
                 _column_migrations = [
@@ -1040,6 +1059,84 @@ class DatabaseManager:
         """Return the number of stored sessions (expired or not)."""
         row = self._query('SELECT COUNT(*) FROM auth_sessions', one=True, default=None)
         return row[0] if row else 0
+
+    # ── Background scan cache ─────────────────────────────────────────
+
+    def upsert_background_cache(self, items):
+        """Insert/update cached background-scan results, keyed by URL.
+
+        Keeps each row's original ``scraped_at`` and refreshes ``last_seen_at``
+        plus any changed fields on re-scrape.
+
+        Args:
+            items: iterable of dicts with keys url, title, year, status,
+                source_category, data (a JSON string of the full result dict).
+        """
+        rows = [it for it in items if it.get("url")]
+        if not rows:
+            return True
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                conn.cursor().executemany('''
+                    INSERT INTO background_scan_cache
+                        (url, title, year, status, source_category, data,
+                         scraped_at, last_seen_at)
+                    VALUES
+                        (:url, :title, :year, :status, :source_category, :data,
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(url) DO UPDATE SET
+                        title = excluded.title,
+                        year = excluded.year,
+                        status = excluded.status,
+                        source_category = excluded.source_category,
+                        data = excluded.data,
+                        last_seen_at = CURRENT_TIMESTAMP
+                ''', [{
+                    "url": it.get("url"),
+                    "title": it.get("title"),
+                    "year": it.get("year"),
+                    "status": it.get("status"),
+                    "source_category": it.get("source_category"),
+                    "data": it.get("data"),
+                } for it in rows])
+                conn.commit()
+            return True
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error("DB Error (upsert_background_cache): %s", e)
+            return False
+
+    def get_background_cache(self, limit=2000):
+        """Return cached background-scan rows, most recently seen first."""
+        return self._query_dicts(
+            'SELECT url, title, year, status, source_category, data, '
+            'scraped_at, last_seen_at FROM background_scan_cache '
+            'ORDER BY last_seen_at DESC LIMIT ?', (limit,), default=[])
+
+    def purge_background_cache(self, retain_days):
+        """Delete cached rows last seen more than ``retain_days`` ago."""
+        return self._mutate(
+            "DELETE FROM background_scan_cache WHERE last_seen_at < datetime('now', ?)",
+            (f"-{int(retain_days)} days",), label="purge_background_cache")
+
+    def count_background_cache(self):
+        """Return the number of cached background-scan rows."""
+        row = self._query(
+            'SELECT COUNT(*) FROM background_scan_cache', one=True, default=None)
+        return row[0] if row else 0
+
+    def clear_background_cache(self):
+        """Remove all cached background-scan rows."""
+        return self._mutate(
+            "DELETE FROM background_scan_cache", label="clear_background_cache")
 
     def record_scraped_links(self, links, title, resolution="", source_url=""):
         """Map scraped file-host links to the movie/show they belong to.

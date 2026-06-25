@@ -100,6 +100,13 @@ class SettingsUpdate(BaseModel):
 
     # Upgrade Rules
     upgrade_sensitivity: Optional[int] = None
+
+    # Background pre-cache scanning
+    background_scan_enabled: Optional[bool] = None
+    background_scan_interval_hours: Optional[int] = None
+    background_scan_pages: Optional[int] = None
+    background_scan_sources: Optional[List[str]] = None
+    background_scan_retain_days: Optional[int] = None
     rule_1080_4k: Optional[bool] = None
     rule_1080_4k_size: Optional[bool] = None
     rule_1080_1080: Optional[bool] = None

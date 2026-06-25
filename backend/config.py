@@ -105,6 +105,14 @@ class AppConfig(TypedDict, total=False):
     scheduler_interval: int  # hours
     last_scan_time: float  # timestamp
 
+    # Background pre-cache scanning (pre-fetch results so the app opens fast)
+    background_scan_enabled: bool
+    background_scan_interval_hours: int
+    background_scan_pages: int
+    background_scan_sources: List[str]
+    background_scan_retain_days: int
+    background_scan_last_run: float  # timestamp of the last completed run
+
     # Debug & Logging
     debug_mode: bool
     clear_logs_startup: bool
@@ -323,6 +331,12 @@ _DEFAULT_CONFIG: AppConfig = {
     "scheduler_enabled": False,
     "scheduler_interval": 24,
     "last_scan_time": 0,
+    "background_scan_enabled": False,
+    "background_scan_interval_hours": 6,
+    "background_scan_pages": 3,
+    "background_scan_sources": ["HDEncode", "DDLBase", "Adit-HD"],
+    "background_scan_retain_days": 7,
+    "background_scan_last_run": 0,
     "clear_logs_startup": False,
     "scan_threads": 10,
     "tv_match_threshold": 90,
