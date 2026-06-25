@@ -303,6 +303,28 @@ class DatabaseManager:
                     )
                 ''')
 
+                # Admin password (single row) for browser / self-hosted auth.
+                # bcrypt hash only — never the plaintext. Absent row = no
+                # password set, so password auth is off.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS auth_credentials (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        password_hash TEXT NOT NULL,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
+                # Issued login sessions, keyed by the SHA-256 hash of the
+                # bearer token (never the token itself). Rows are purged on
+                # expiry and wiped wholesale when the password changes.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS auth_sessions (
+                        token_hash TEXT PRIMARY KEY,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expires_at TEXT NOT NULL
+                    )
+                ''')
+
                 # ── Performance indexes (idempotent) ─────────────────────
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_imdb_id ON plex_cache(imdb_id)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_title ON plex_cache(title)')
@@ -313,6 +335,7 @@ class DatabaseManager:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_date ON downloads(date_added)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_download_results_updated ON download_results(updated_at DESC)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp DESC)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)')
 
                 # ── Column migrations (guarded by "duplicate column name") ─
                 _column_migrations = [
@@ -950,6 +973,72 @@ class DatabaseManager:
     def get_dismissed_count(self):
         """Return the total number of dismissed items."""
         row = self._query('SELECT COUNT(*) FROM dismissed_items', one=True, default=None)
+        return row[0] if row else 0
+
+    # ── Auth: admin password (single row) ─────────────────────────────
+
+    def get_password_hash(self):
+        """Return the stored bcrypt password hash, or None if unset."""
+        row = self._query(
+            'SELECT password_hash FROM auth_credentials WHERE id = 1',
+            one=True, default=None)
+        return row[0] if row else None
+
+    def has_password(self):
+        """Whether an admin password has been configured."""
+        return self.get_password_hash() is not None
+
+    def set_password_hash(self, password_hash):
+        """Set or replace the admin password hash."""
+        return self._mutate('''
+            INSERT INTO auth_credentials (id, password_hash, updated_at)
+            VALUES (1, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                password_hash = excluded.password_hash,
+                updated_at = excluded.updated_at
+        ''', (password_hash,), label="set_password_hash")
+
+    def clear_password(self):
+        """Remove the admin password (reverts to nonce-only / open auth)."""
+        return self._mutate(
+            "DELETE FROM auth_credentials WHERE id = 1", label="clear_password")
+
+    # ── Auth: login sessions ──────────────────────────────────────────
+
+    def create_session(self, token_hash, expires_at):
+        """Persist a session by its token hash + ISO-8601 expiry."""
+        return self._mutate('''
+            INSERT INTO auth_sessions (token_hash, expires_at)
+            VALUES (?, ?)
+            ON CONFLICT(token_hash) DO UPDATE SET expires_at = excluded.expires_at
+        ''', (token_hash, expires_at), label="create_session")
+
+    def get_session_expiry(self, token_hash):
+        """Return a session's ISO-8601 expiry, or None if it doesn't exist."""
+        row = self._query(
+            'SELECT expires_at FROM auth_sessions WHERE token_hash = ?',
+            (token_hash,), one=True, default=None)
+        return row[0] if row else None
+
+    def delete_session(self, token_hash):
+        """Invalidate a single session (logout)."""
+        return self._mutate(
+            "DELETE FROM auth_sessions WHERE token_hash = ?",
+            (token_hash,), label="delete_session")
+
+    def delete_all_sessions(self):
+        """Invalidate every session (e.g. after a password change)."""
+        return self._mutate("DELETE FROM auth_sessions", label="delete_all_sessions")
+
+    def purge_expired_sessions(self, now_iso):
+        """Delete sessions whose expiry is at or before ``now_iso``."""
+        return self._mutate(
+            "DELETE FROM auth_sessions WHERE expires_at <= ?",
+            (now_iso,), label="purge_expired_sessions")
+
+    def count_sessions(self):
+        """Return the number of stored sessions (expired or not)."""
+        row = self._query('SELECT COUNT(*) FROM auth_sessions', one=True, default=None)
         return row[0] if row else 0
 
     def record_scraped_links(self, links, title, resolution="", source_url=""):

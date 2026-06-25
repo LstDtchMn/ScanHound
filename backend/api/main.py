@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
@@ -10,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from backend import auth_service
 from backend.api.dependencies import ServiceRegistry, ScannerAppBridge, registry
 
 logger = logging.getLogger(__name__)
@@ -206,14 +208,14 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
     logger.info("Download results poller started")
 
 
-# Paths reachable without the auth nonce, e.g. readiness probes that run
-# before any client has a token to present. Extend this set rather than
+# Paths reachable without a token, e.g. readiness probes and the login flow
+# itself (you have no token yet when logging in). Extend this set rather than
 # bolting another bespoke comparison onto auth_middleware.
-_AUTH_EXEMPT_PATHS = frozenset({"/health"})
+_AUTH_EXEMPT_PATHS = frozenset({"/health", "/auth/login", "/auth/status"})
 
 
 def _is_auth_exempt(request: Request) -> bool:
-    """Whether this request should pass the auth middleware without a nonce."""
+    """Whether this request should pass the auth middleware without a token."""
     if request.method == "OPTIONS":
         # CORS preflight: browsers send OPTIONS with no credentials by design,
         # so auth-ing it would 401 the preflight and strip the CORS headers
@@ -222,6 +224,68 @@ def _is_auth_exempt(request: Request) -> bool:
         # OPTIONS returns only CORS metadata, no data.
         return True
     return request.url.path in _AUTH_EXEMPT_PATHS
+
+
+def _bearer_token(request: Request) -> str:
+    """Extract the bearer token from the Authorization header, if any."""
+    header = request.headers.get("authorization", "")
+    return header[7:] if header.startswith("Bearer ") else ""
+
+
+def _auth_enabled() -> bool:
+    """Auth is active when a nonce is configured or a password has been set."""
+    if registry.auth_nonce:
+        return True
+    db = registry.db
+    return bool(db and db.has_password())
+
+
+def _token_authorized(token: str) -> bool:
+    """Whether a bearer token is the nonce or an unexpired session token."""
+    if not token:
+        return False
+    nonce = registry.auth_nonce
+    if nonce and secrets.compare_digest(token, nonce):
+        return True
+    db = registry.db
+    if db:
+        expires_at = db.get_session_expiry(auth_service.hash_token(token))
+        if expires_at and not auth_service.is_expired(expires_at):
+            return True
+    return False
+
+
+def _compute_protected_segments(routers) -> frozenset:
+    """Top-level path segments owned by API routers — what the middleware guards.
+
+    Derived from the routers' own prefixes/paths (read directly off the router
+    objects, which is stable; FastAPI wraps included routers opaquely in
+    ``app.routes``), so new routers are covered automatically. The SPA shell and
+    static assets have no API router, so they stay open for the login page.
+    """
+    segments = set()
+    for router in routers:
+        prefix = (getattr(router, "prefix", "") or "").lstrip("/")
+        if prefix:
+            segments.add(prefix.split("/", 1)[0])
+            continue
+        # Prefix-less router (e.g. system: /health, /discover, /shutdown).
+        for route in getattr(router, "routes", []):
+            segment = getattr(route, "path", "").lstrip("/").split("/", 1)[0]
+            if segment and not segment.startswith("{"):
+                segments.add(segment)
+    return frozenset(segments)
+
+
+def _request_requires_auth(request: Request) -> bool:
+    """Whether this request must present a valid token to proceed."""
+    if _is_auth_exempt(request):
+        return False
+    protected = getattr(request.app.state, "protected_segments", frozenset())
+    segment = request.url.path.lstrip("/").split("/", 1)[0]
+    if segment not in protected:
+        return False  # SPA shell / static asset — served openly
+    return _auth_enabled()
 
 
 def _teardown_services(reg: ServiceRegistry) -> None:
@@ -282,14 +346,14 @@ def create_app(
         allow_headers=["*"],
     )
 
-    # Auth nonce middleware — protects all HTTP endpoints.
-    # When auth_nonce is empty (dev mode / no env var), auth is disabled.
+    # Bearer-token middleware — guards the API routes. A request is authorized
+    # by either a valid login-session token or the desktop nonce. Auth is off
+    # entirely when no nonce is set and no password is configured (dev / fresh
+    # install); the SPA shell and static assets are always served openly.
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
-        nonce = registry.auth_nonce
-        if nonce and not _is_auth_exempt(request):
-            auth_header = request.headers.get("authorization", "")
-            if auth_header != f"Bearer {nonce}":
+        if _request_requires_auth(request):
+            if not _token_authorized(_bearer_token(request)):
                 return JSONResponse(
                     status_code=401,
                     content={"detail": "Unauthorized"},
@@ -297,20 +361,21 @@ def create_app(
         return await call_next(request)
 
     # Register route modules
-    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler
+    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler, auth
     from backend.api import ws
 
-    app.include_router(system.router)
-    app.include_router(ws.router)
-    app.include_router(settings.router)
-    app.include_router(sources.router)
-    app.include_router(plex.router)
-    app.include_router(scanner.router)
-    app.include_router(results.router)
-    app.include_router(downloads.router)
-    app.include_router(analytics.router)
-    app.include_router(watchlist.router)
-    app.include_router(scheduler.router)
+    api_routers = [
+        system.router, auth.router, ws.router, settings.router, sources.router,
+        plex.router, scanner.router, results.router, downloads.router,
+        analytics.router, watchlist.router, scheduler.router,
+    ]
+    for router in api_routers:
+        app.include_router(router)
+
+    # Snapshot which top-level path segments the bearer middleware guards. The
+    # SPA shell + static assets have no API router and stay open (so the login
+    # page can load before the user holds a token).
+    app.state.protected_segments = _compute_protected_segments(api_routers)
 
     # ── Serve the built frontend (production / Docker) ──────────────────
     # When the SvelteKit static build is present, serve it from the API so the
