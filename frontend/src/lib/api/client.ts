@@ -15,6 +15,14 @@ export function getAuthNonce(): string {
   return authNonce;
 }
 
+/** Invoked when an API call returns 401 (token missing/expired). The root
+ *  layout registers a handler that redirects to /login. Not fired for the
+ *  /auth/* endpoints, which surface their own errors (e.g. a wrong password). */
+let unauthorizedHandler: (() => void) | null = null;
+export function setUnauthorizedHandler(fn: (() => void) | null) {
+  unauthorizedHandler = fn;
+}
+
 /** fetch() with an abort-based timeout, shared by this client and anything
  *  else (e.g. the remote-server connection test) that needs to probe a URL
  *  the way request() does without going through apiBase()/authNonce. */
@@ -48,6 +56,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
   const resp = await fetchWithTimeout(`${apiBase()}${path}`, { ...options, headers }, REQUEST_TIMEOUT_MS);
   if (!resp.ok) {
+    if (resp.status === 401 && !path.startsWith('/auth/')) {
+      unauthorizedHandler?.();
+    }
     throw new Error(`API error: ${resp.status} ${resp.statusText}`);
   }
   const ct = resp.headers.get('content-type') || '';
@@ -66,6 +77,22 @@ export const api = {
   // System
   health: () => request<{ status: string; version: string }>('/health'),
   shutdown: () => request<{ status: string }>('/shutdown', { method: 'POST' }),
+
+  // Auth
+  authStatus: () =>
+    request<{ auth_required: boolean; has_password: boolean; nonce_active: boolean }>('/auth/status'),
+  authLogin: (password: string) =>
+    request<{ token: string; expires_at: string }>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ password })
+    }),
+  authSetPassword: (newPassword: string, currentPassword?: string) =>
+    request<{ ok: boolean }>('/auth/set-password', {
+      method: 'POST',
+      body: JSON.stringify({ new_password: newPassword, current_password: currentPassword ?? null })
+    }),
+  authLogout: () =>
+    request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
 
   // Scanner
   scanStart: (type = 'deep', searchQuery = '', pages = 1, source = 'HDEncode', flags?: Record<string, boolean>) =>

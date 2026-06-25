@@ -6,6 +6,7 @@
   import { jdConnection, refreshJdConnection } from '$lib/stores/jdownloader';
   import { api } from '$lib/api/client';
   import ServerConnection from '$lib/components/ServerConnection.svelte';
+  import ChangePassword from '$lib/components/ChangePassword.svelte';
   import { serverUrl } from '$lib/stores/server';
   import { onMount } from 'svelte';
 
@@ -381,6 +382,9 @@
           </p>
           <ServerConnection />
         </div>
+
+        <h2 class="text-lg font-semibold pt-2">Security</h2>
+        <ChangePassword />
       </section>
 
     {:else if activeTab === 'plex'}

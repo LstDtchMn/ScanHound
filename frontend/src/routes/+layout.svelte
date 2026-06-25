@@ -9,10 +9,11 @@
   import ServerConnection from '$lib/components/ServerConnection.svelte';
   import { theme, toggleTheme, initTheme } from '$lib/stores/theme';
   import { connection } from '$lib/stores/connection';
-  import { hasRemoteServer } from '$lib/stores/server';
+  import { hasRemoteServer, currentToken } from '$lib/stores/server';
   import { logPanelOpen } from '$lib/stores/logs';
   import { viewMode, setViewMode, selectAll, deselectAll } from '$lib/stores/results';
-  import { setAuthNonce, api } from '$lib/api/client';
+  import { setAuthNonce, api, setUnauthorizedHandler } from '$lib/api/client';
+  import { refreshAuthStatus, handleUnauthorized } from '$lib/stores/auth';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   import { fade } from 'svelte/transition';
@@ -22,6 +23,8 @@
   let showShortcuts = $state(false);
   let showServerSetup = $state(false);
   let isDark = $derived($theme === 'dark');
+  // The login screen renders bare (no sidebar / chrome around it).
+  let isLoginRoute = $derived($page.url.pathname === '/login');
 
   // On a packaged app (Android/desktop) with no remote server configured, the
   // bundled frontend isn't same-origin with any backend. If the initial health
@@ -89,13 +92,33 @@
 
   onMount(() => {
     initTheme();
-    initAuth().then(() => {
+    const isTauri = typeof window !== 'undefined' && '__TAURI__' in window;
+    // Browser / self-hosted: a 401 means the token is missing or expired —
+    // drop it and send the user to the login screen. The desktop sidecar
+    // authenticates with the nonce, so it never needs this.
+    if (!isTauri) {
+      setUnauthorizedHandler(() => {
+        handleUnauthorized();
+        if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+          goto('/login');
+        }
+      });
+    }
+    initAuth().then(async () => {
+      if (!isTauri) {
+        const status = await refreshAuthStatus();
+        if (status?.auth_required && !currentToken()) {
+          if (window.location.pathname !== '/login') goto('/login');
+          return; // wait for login before opening the socket / fetching data
+        }
+      }
       connection.connect();
       maybePromptServer();
     });
     window.addEventListener('keydown', handleKeydown);
     return () => {
       connection.disconnect();
+      setUnauthorizedHandler(null);
       window.removeEventListener('keydown', handleKeydown);
     };
   });
@@ -105,6 +128,9 @@
   <title>{pageTitle}</title>
 </svelte:head>
 
+{#if isLoginRoute}
+  {@render children()}
+{:else}
 <a href="#main-content" class="sr-only">Skip to content</a>
 <div class="flex h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
   <Sidebar />
@@ -154,6 +180,7 @@
       <ServerConnection onsaved={() => (showServerSetup = false)} />
     </div>
   </div>
+{/if}
 {/if}
 
 <Snackbar />

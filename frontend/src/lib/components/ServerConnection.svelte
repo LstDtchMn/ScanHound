@@ -57,14 +57,14 @@
     />
   </div>
   <div>
-    <label for="sc-token" class="block text-xs font-medium text-[var(--text-secondary)] mb-1">Auth token <span class="opacity-60">(leave blank if the server has no auth)</span></label>
+    <label for="sc-token" class="block text-xs font-medium text-[var(--text-secondary)] mb-1">Auth token <span class="opacity-60">(optional — or leave blank and sign in with a password)</span></label>
     <input
       id="sc-token"
       type="password"
       autocapitalize="none"
       autocorrect="off"
       bind:value={token}
-      placeholder="SCANHOUND_AUTH_NONCE value"
+      placeholder="Auth token (optional)"
       class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm focus:outline-none focus:border-[var(--accent)]"
     />
   </div>
