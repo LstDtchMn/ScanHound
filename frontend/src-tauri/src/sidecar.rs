@@ -94,12 +94,6 @@ pub fn launch(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Reset the restart counter (call after frontend successfully connects).
-pub fn reset_restart_count(app: &tauri::AppHandle) {
-    let state = app.state::<SidecarState>();
-    *state.restart_count.lock().unwrap() = 0;
-}
-
 /// Shut down the sidecar process.
 pub fn shutdown(app: &tauri::AppHandle) {
     let state = app.state::<SidecarState>();
