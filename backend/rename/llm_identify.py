@@ -111,9 +111,14 @@ _VISION_SYSTEM = (
     "title (string or null), year (integer or null), type ('movie' or 'tv'). "
     "If you cannot identify the title from this frame, set title to null."
 )
-# Timestamps (seconds) to sample: title-card window + opening credits zone.
-# End-credits offset is computed dynamically from video duration when available.
-_FRAME_OFFSETS = [30, 60, 120]
+# Phase 1: high-value timestamps likely to contain title cards / opening credits.
+# End-credits offset (~95% of duration) is appended dynamically when duration is known.
+_FRAME_PRIORITY = [30, 60, 120]
+# Phase 2: if priority frames all miss, sample this many evenly-spaced intervals
+# across the video (or fall back to fixed times if duration is unknown).
+_FRAME_GRID_COUNT = 8
+_FRAME_GRID_FIXED = [180, 300, 600, 900, 1200, 1500, 1800, 2400]
+_FRAME_MAX = 12  # hard cap across both phases
 
 
 def identify_from_frames(
@@ -123,27 +128,33 @@ def identify_from_frames(
     """Extract frames from a video file and ask a vision-capable Ollama model
     to identify the title.
 
-    Tries three fixed timestamps (30s, 60s, 120s) plus end-credits (~95% of
-    duration when ffprobe can determine it).  Returns the first non-null result,
-    or ``None`` if ffmpeg is absent, the model is not vision-capable, or all
-    frames yield no title.  Entirely fail-safe — any exception returns ``None``.
+    Two-phase strategy:
+      Phase 1 — priority timestamps (30s, 60s, 120s + end-credits at ~95%)
+                 that are most likely to show a title card or opening credits.
+      Phase 2 — if no hit, expand to an evenly-spaced grid across the full
+                 video (or fixed fallback times when duration is unknown).
+
+    Returns on the first positive identification, or ``None`` after exhausting
+    up to ``_FRAME_MAX`` frames.  Entirely fail-safe — any exception at any
+    step returns ``None``.
     """
     import base64
+    import os as _os
     import subprocess
     import tempfile
 
     if not video_path or not base_url or not model:
         return None
 
-    def _run_ffmpeg(args: list[str]) -> Optional[bytes]:
+    def _run(args: list[str], tout: int = 15) -> Optional[bytes]:
         try:
-            r = subprocess.run(args, capture_output=True, timeout=15)
+            r = subprocess.run(args, capture_output=True, timeout=tout)
             return r.stdout if r.returncode == 0 else None
         except Exception:
             return None
 
     def _duration() -> Optional[float]:
-        out = _run_ffmpeg([
+        out = _run([
             "ffprobe", "-v", "quiet", "-print_format", "json",
             "-show_format", video_path,
         ])
@@ -158,14 +169,13 @@ def identify_from_frames(
     def _extract_frame(offset_sec: int) -> Optional[str]:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             tmp_path = tmp.name
-        data = _run_ffmpeg([
+        _run([
             "ffmpeg", "-y", "-ss", str(offset_sec), "-i", video_path,
             "-vframes", "1", "-q:v", "3", "-f", "image2", tmp_path,
         ])
         try:
             with open(tmp_path, "rb") as f:
                 raw = f.read()
-            import os as _os
             _os.unlink(tmp_path)
             return base64.b64encode(raw).decode() if raw else None
         except Exception:
@@ -178,7 +188,10 @@ def identify_from_frames(
             "options": {"temperature": 0},
             "messages": [{
                 "role": "user",
-                "content": _VISION_SYSTEM + "\n\nIdentify the movie or TV show in this frame.",
+                "content": (
+                    _VISION_SYSTEM
+                    + "\n\nIdentify the movie or TV show in this frame."
+                ),
                 "images": [b64_image],
             }],
         }
@@ -187,28 +200,62 @@ def identify_from_frames(
                                  json=payload, timeout=timeout)
             resp.raise_for_status()
             content = resp.json().get("message", {}).get("content", "")
-            # Strip markdown fences if the model wraps JSON
             content = content.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
             result = _normalize(json.loads(content))
             return result if result and result.get("title") else None
         except Exception as e:
-            logger.debug("Ollama vision failed: %s", e)
+            logger.debug("Ollama vision frame failed: %s", e)
             return None
 
-    offsets = list(_FRAME_OFFSETS)
-    dur = _duration()
-    if dur and dur > 300:
-        offsets.append(int(dur * 0.95))
-
-    for offset in offsets:
+    def _try(offset: int, tried: set) -> Optional[dict[str, Any]]:
+        if offset in tried:
+            return None
+        tried.add(offset)
         b64 = _extract_frame(offset)
         if not b64:
-            continue
+            return None
         result = _ask_vision(b64)
         if result and result.get("title"):
             logger.debug("Vision identified at %ds: %s", offset, result.get("title"))
             return result
+        return None
 
+    dur = _duration()
+    tried: set[int] = set()
+
+    # ── Phase 1: priority timestamps ──────────────────────────────────────
+    phase1 = list(_FRAME_PRIORITY)
+    if dur and dur > 300:
+        phase1.append(int(dur * 0.95))  # end credits
+
+    for offset in phase1:
+        if len(tried) >= _FRAME_MAX:
+            break
+        if dur and offset >= dur:
+            continue
+        result = _try(offset, tried)
+        if result:
+            return result
+
+    # ── Phase 2: grid scan across the video ──────────────────────────────
+    if dur:
+        # Evenly-spaced samples at 10%–90% of duration, avoiding already tried.
+        grid = [int(dur * p / (_FRAME_GRID_COUNT + 1))
+                for p in range(1, _FRAME_GRID_COUNT + 1)]
+    else:
+        grid = list(_FRAME_GRID_FIXED)
+
+    for offset in grid:
+        if len(tried) >= _FRAME_MAX:
+            break
+        if dur and offset >= dur:
+            continue
+        result = _try(offset, tried)
+        if result:
+            return result
+
+    logger.debug("Vision: no identification after %d frames for %s",
+                 len(tried), video_path)
     return None
 
 
