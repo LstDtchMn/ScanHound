@@ -353,5 +353,48 @@ class TestScrapeDetailsResultStructure:
             "display_title", "year", "rating", "search_key", "url",
             "imdb_link", "imdb_id", "size", "res", "hdr", "dovi",
             "tmdb_votes", "is_tv", "season", "episode_number", "episodes",
+            "posted_date", "multi_episode_hint",
         }
         assert expected_keys.issubset(result.keys())
+
+
+# ── Page hint extraction ──────────────────────────────────────────────────
+
+class TestPageHintExtraction:
+
+    def test_extracts_combined_hint_from_page_text(self):
+        html = b"""<html><body>
+<div class="entry-content">
+Filename....: Show.S01E01.1080p.mkv
+File Size: 2 GB
+<p>This is a double episode release.</p>
+</div>
+</body></html>"""
+        scraper = make_scraper()
+        result = scraper.scrape_details(
+            "http://fake-url/post/123",
+            {},
+            scraper=make_mock_scraper(200, html)
+        )
+        assert result is not None
+        hints = result.get("multi_episode_hint")
+        assert hints is not None
+        assert hints["is_combined"] is True
+
+    def test_returns_none_hint_for_normal_page(self):
+        html = b"""<html><body>
+<div class="entry-content">
+Filename....: Show.S01E01.1080p.mkv
+File Size: 2 GB
+<p>Great episode, action-packed.</p>
+</div>
+</body></html>"""
+        scraper = make_scraper()
+        result = scraper.scrape_details(
+            "http://fake-url/post/456",
+            {},
+            scraper=make_mock_scraper(200, html)
+        )
+        assert result is not None
+        hints = result.get("multi_episode_hint")
+        assert hints is None
