@@ -1,5 +1,5 @@
 import pytest
-from backend.rename.confidence import runtime_confidence_delta, filesize_plausibility_delta
+from backend.rename.confidence import runtime_confidence_delta
 
 
 class TestRuntimeThresholdTightening:
