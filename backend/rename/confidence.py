@@ -82,7 +82,7 @@ def runtime_confidence_delta(file_minutes: float, tmdb_minutes: float) -> float:
     Deviation from TMDB runtime → adjustment:
         ≤  3%  → +10  (near-exact: strong confirmation)
         ≤  8%  →  +5  (close: likely correct with encode/credits padding)
-        ≤ 15%  →   0  (neutral: within plausible variance)
+        ≤ 10%  →   0  (neutral: within plausible variance)
         ≤ 30%  → -10  (suspicious mismatch)
         ≤ 50%  → -20  (likely wrong content)
         >  50%  → -30  (almost certainly misidentified)

@@ -97,6 +97,7 @@ def _try_episode_rescan(
     candidates.sort(key=lambda x: x["score_delta"], reverse=True)
 
     best = candidates[0]
+    _used_ollama = False
     if (len(candidates) >= 2
             and candidates[0]["score_delta"] - candidates[1]["score_delta"] < 10
             and llm_cfg.get("base_url") and llm_cfg.get("model")):
@@ -113,6 +114,7 @@ def _try_episode_rescan(
                 None)
             if matched:
                 best = matched
+                _used_ollama = True
 
     return {
         "type": "episode_correction",
@@ -124,7 +126,7 @@ def _try_episode_rescan(
             "runtime": best["runtime"],
         },
         "confidence_gain": round(best["score_delta"] - current_score, 1),
-        "method": "ollama" if len(candidates) >= 2 else "runtime",
+        "method": "ollama" if _used_ollama else "runtime",
     }
 
 
@@ -476,6 +478,7 @@ class RenameService:
                 # ── Episode re-scan (only when runtime is suspicious) ────────
                 if (delta is not None and delta < -10
                         and mtype == "tv"
+                        and file_min
                         and match.get("episode")
                         and not match.get("episode_end")
                         and client):
