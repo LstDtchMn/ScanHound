@@ -271,7 +271,7 @@ class DetailScraper:
             # Extract multi-episode hints from page body (regex only — Ollama is async)
             try:
                 hints = _llm.extract_page_hints(full_text)
-                multi_episode_hint = hints if (hints["is_combined"] or hints["is_split"]) else None
+                multi_episode_hint = hints if hints and (hints.get("is_combined") or hints.get("is_split")) else None
             except Exception:
                 multi_episode_hint = None
 
