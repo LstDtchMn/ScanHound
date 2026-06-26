@@ -300,6 +300,8 @@ class RenameService:
         if result:
             result.update(source="deterministic", resolution=parsed.get("resolution"),
                           season=parsed.get("season"), episode=parsed.get("episode"),
+                          episode_end=parsed.get("episode_end"),
+                          part=parsed.get("part"),
                           episode_title=parsed.get("filename_episode_title"))
 
         # Optional Ollama fallback only when the deterministic match is weak.
@@ -333,6 +335,8 @@ class RenameService:
                     alt.update(source="llm", resolution=parsed.get("resolution"),
                                season=llm.get("season") or parsed.get("season"),
                                episode=llm.get("episode") or parsed.get("episode"),
+                               episode_end=parsed.get("episode_end"),
+                               part=parsed.get("part"),
                                episode_title=parsed.get("filename_episode_title"))
                     result = alt
         return result
@@ -390,6 +394,8 @@ class RenameService:
                             resolution=parsed.get("resolution"),
                             season=vision.get("season") or parsed.get("season"),
                             episode=vision.get("episode") or parsed.get("episode"),
+                            episode_end=parsed.get("episode_end"),
+                            part=parsed.get("part"),
                             episode_title=parsed.get("filename_episode_title"))
                         match = alt
 
@@ -475,28 +481,32 @@ class RenameService:
                     "model": self._cfg.get("ollama_model", ""),
                 }
 
+                # ── Combined episode detection (runs first) ──────────────────
+                # Cheap + high-precision (ratio window + 8% sum match). Must win
+                # over the re-scan for two-part / double-length files, otherwise a
+                # neighbouring long episode could be proposed as a "wrong episode"
+                # correction and suppress the (correct) combined proposal.
+                if (file_min and tmdb_min
+                        and mtype == "tv"
+                        and episodes
+                        and not match.get("episode_end")):
+                    combined = _detect_combined_episode(match, file_min, episodes)
+                    if combined:
+                        match["combined_episode"] = combined
+
                 # ── Episode re-scan (only when runtime is suspicious) ────────
                 if (delta is not None and delta < -10
                         and mtype == "tv"
                         and file_min
                         and match.get("episode")
                         and not match.get("episode_end")
+                        and not match.get("combined_episode")
                         and client):
                     correction = _try_episode_rescan(
                         match, client, file_min, season_cache,
                         int(match["tmdb_id"]), llm_cfg)
                     if correction:
                         match["suggested_correction"] = correction
-
-                # ── Combined episode detection ───────────────────────────────
-                if (file_min and tmdb_min
-                        and mtype == "tv"
-                        and episodes
-                        and not match.get("episode_end")
-                        and not match.get("suggested_correction")):
-                    combined = _detect_combined_episode(match, file_min, episodes)
-                    if combined:
-                        match["combined_episode"] = combined
 
                 # ── Split file detection ─────────────────────────────────────
                 if (mtype == "tv"
@@ -567,6 +577,13 @@ class RenameService:
                 f"Likely split file Part {sf['part']} "
                 f"(sibling: {os.path.basename(sf['sibling_path'])})"
             )
+
+        # Any proposal (wrong-episode / combined / split) needs a human decision —
+        # force needs_review so a flagged file can never silently auto-apply, no
+        # matter how high its confidence scored.
+        if (match.get("suggested_correction") or match.get("combined_episode")
+                or match.get("split_file")):
+            job["status"] = "needs_review"
 
         job_id = self._create(job)
         if (job_id and job["status"] == "matched"

@@ -460,3 +460,69 @@ class TestEpisodeCorrectionCandidates:
         # E5 is 4 away → excluded; E4 is 3 away → included
         assert 5 not in ep_numbers
         assert 4 in ep_numbers
+
+
+# ---------------------------------------------------------------------------
+# Class 7 — End-to-end seam: parse → _identify → build_target
+# ---------------------------------------------------------------------------
+
+class TestMultiEpisodeSeam:
+    """Drives the real _identify → build_target path with a stubbed TMDB search.
+
+    This is the integration guard that unit tests miss: episode_end / part are
+    parsed and rendered correctly in isolation, but the service's .update() calls
+    must actually carry them across the seam, and the phantom-episode-title bug
+    must not reappear. Regression for the C1/C2 holistic-review findings.
+    """
+
+    def _svc(self, candidate):
+        from backend.rename.service import RenameService
+        svc = RenameService.__new__(RenameService)
+        reg = MagicMock()
+        reg.config = {
+            "auto_rename_confidence_threshold": 80,
+            "auto_rename_llm_enabled": False,
+            "auto_rename_tv_library": "/tv",
+            "auto_rename_movie_library": "/movies",
+        }
+        svc._reg = reg
+        svc._tmdb_search_override = lambda title, year, mt: [candidate]
+        svc._client = None
+        return svc
+
+    _CAND = {"id": 100, "name": "Show Name", "first_air_date": "2024-01-01"}
+
+    def test_double_episode_name_carries_through(self):
+        from backend.rename import naming as _naming
+        fn = "Show.Name.S01E01E02.1080p.WEB-DL.mkv"
+        match = self._svc(self._CAND)._identify(fn)
+        assert match is not None
+        assert match.get("episode") == 1
+        assert match.get("episode_end") == 2
+        fname, _ = _naming.build_target(
+            {**match, "original_filename": fn}, tv_root="/tv")
+        assert "S01E01E02" in fname
+        assert " - E02" not in fname  # no phantom episode title (C2)
+
+    def test_part_suffix_carries_through(self):
+        from backend.rename import naming as _naming
+        fn = "Show.Name.S01E05.Part1.1080p.WEB-DL.mkv"
+        match = self._svc(self._CAND)._identify(fn)
+        assert match is not None
+        assert match.get("part") == 1
+        fname, _ = _naming.build_target(
+            {**match, "original_filename": fn}, tv_root="/tv")
+        assert "Part 1" in fname
+        assert fname.count("Part") == 1  # no double-Part rendering
+
+    def test_clean_single_episode_seam_unchanged(self):
+        from backend.rename import naming as _naming
+        fn = "Show.Name.S01E03.1080p.WEB-DL.mkv"
+        match = self._svc(self._CAND)._identify(fn)
+        assert match.get("episode_end") is None
+        assert match.get("part") is None
+        fname, _ = _naming.build_target(
+            {**match, "original_filename": fn}, tv_root="/tv")
+        assert "S01E03" in fname
+        assert "E03E" not in fname
+        assert "Part" not in fname

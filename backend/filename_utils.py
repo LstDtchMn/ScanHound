@@ -40,7 +40,8 @@ UNSAFE_CHARS_RE = re.compile(r'[<>"/\\|?*]')
 
 # Quality/release markers that end an episode title in TV filenames
 EPISODE_BOUNDARY_RE = re.compile(
-    r'[.\s](?:2160p|1080p|720p|480p|4[Kk]|UHD|'
+    r'[.\s](?:Part[.\s\-]?\d|Pt[.\s\-]?\d|'
+    r'2160p|1080p|720p|480p|4[Kk]|UHD|'
     r'BluRay|Blu[\.\-]Ray|BDRip|BDRemux|REMUX|'
     r'WEB[\.\-]?DL|WEBRip|WEBDL|HDTV|DVDRip|HDRip|'
     r'HEVC|[Xx]265|[Xx]264|H[\.\s]?264|H[\.\s]?265|'
@@ -98,6 +99,8 @@ def parse_filename(filename) -> FilenameResult:
         me_match = re.match(r'[.\-]?E(\d{1,3})', after_ep, re.IGNORECASE)
         if me_match:
             result["episode_end"] = int(me_match.group(1))
+            # Skip the second episode code so it isn't mistaken for a title.
+            after_ep = after_ep[me_match.end():]
         ep_boundary = EPISODE_BOUNDARY_RE.search(after_ep)
         ep_raw = after_ep[:ep_boundary.start()] if ep_boundary else after_ep
         ep_clean = re.sub(r'[\.\-_]', ' ', ep_raw).strip()
