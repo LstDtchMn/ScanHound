@@ -98,7 +98,7 @@ def runtime_confidence_delta(file_minutes: float, tmdb_minutes: float) -> float:
         return 10.0
     if pct <= 0.08:
         return 5.0
-    if pct <= 0.15:
+    if pct <= 0.10:
         return 0.0
     if pct <= 0.30:
         return -10.0
