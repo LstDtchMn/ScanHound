@@ -242,6 +242,7 @@ class DetailScraper:
                 if "dovi" in ht or "dolby vision" in ht:
                     dovi = True
 
+            full_text = soup.get_text()
             imdb_link = None
             imdb_id = None
             for a in soup.find_all('a', href=True):
@@ -251,10 +252,14 @@ class DetailScraper:
                     if id_match:
                         imdb_id = id_match.group(1)
                     break
+            if not imdb_id:
+                pt = re.search(r'(?:imdb\.com/title/|imdb[:\s]+)(tt\d{7,})', full_text, re.IGNORECASE)
+                if pt:
+                    imdb_id = pt.group(1)
+                    imdb_link = f"https://www.imdb.com/title/{imdb_id}/"
 
             # Extract posted date (e.g. "Posted on March 1, 2026 at 03:15 PM")
             posted_date = None
-            full_text = soup.get_text()
             date_match = re.search(
                 r'Posted\s+on\s+(\w+\s+\d{1,2},?\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s*[AP]M)',
                 full_text, re.IGNORECASE

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import requests
 
@@ -24,19 +24,40 @@ _SYSTEM = (
     "Respond ONLY with a JSON object with keys: "
     "title (string), year (integer or null), type ('movie' or 'tv'), "
     "season (integer or null), episode (integer or null). "
-    "Do not invent IDs. Use null when a field is unknown."
+    "Do not invent IDs. Use null when a field is unknown. "
+    "When TMDB candidates are provided, pick the one that best matches the "
+    "filename and return its exact title and year."
 )
 
 
 def identify(filename: str, *, base_url: str, model: str,
-             timeout: float = _TIMEOUT) -> Optional[dict[str, Any]]:
+             timeout: float = _TIMEOUT,
+             parsed_year: Optional[int] = None,
+             candidates: Optional[List[dict]] = None) -> Optional[dict[str, Any]]:
     """Ask Ollama to parse a release filename into structured fields.
+
+    ``parsed_year`` anchors disambiguation when the filename year is known.
+    ``candidates`` is a list of ``{title, year, confidence}`` dicts from a
+    prior TMDB search — giving the model concrete options cuts hallucination
+    on ambiguous titles (remakes, foreign films, generic names).
 
     Returns ``{title, year, media_type, season, episode}`` or ``None`` on any
     failure (the caller then keeps its deterministic result).
     """
     if not filename or not base_url or not model:
         return None
+
+    user_content = filename
+    if parsed_year:
+        user_content += f"\nParsed year: {parsed_year}"
+    if candidates:
+        lines = [
+            f"  {i + 1}. \"{c['title']}\" ({c.get('year') or '?'}) "
+            f"— confidence {c.get('confidence', 0):.0f}"
+            for i, c in enumerate(candidates[:5])
+        ]
+        user_content += "\nTMDB candidates:\n" + "\n".join(lines)
+
     payload = {
         "model": model,
         "format": "json",
@@ -44,7 +65,7 @@ def identify(filename: str, *, base_url: str, model: str,
         "options": {"temperature": 0},
         "messages": [
             {"role": "system", "content": _SYSTEM},
-            {"role": "user", "content": filename},
+            {"role": "user", "content": user_content},
         ],
     }
     try:

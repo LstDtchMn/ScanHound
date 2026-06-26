@@ -138,7 +138,19 @@ class RenameService:
                 logger.warning(
                     "Ollama assist enabled but %s not set; skipping LLM fallback",
                     "model" if not model else "base URL")
-            llm = _llm.identify(filename, base_url=base_url, model=model)
+            # Pass parsed year + top TMDB candidates so the model can
+            # disambiguate remakes and generic titles rather than guessing blind.
+            raw = self._search_tmdb(title, year, media_type)[:5]
+            llm_candidates = []
+            for r in raw:
+                c = self._normalize_candidate(r, media_type)
+                if c:
+                    c["confidence"] = _confidence.match_confidence(
+                        title, c["title"], year, c["year"])
+                    llm_candidates.append(c)
+            llm = _llm.identify(filename, base_url=base_url, model=model,
+                                parsed_year=year,
+                                candidates=llm_candidates or None)
             if llm and llm.get("title"):
                 mtype = llm.get("media_type") or media_type
                 alt = self._tmdb_match(llm["title"], llm.get("year"), mtype)
