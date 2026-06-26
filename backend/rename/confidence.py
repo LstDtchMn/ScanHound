@@ -71,33 +71,74 @@ def match_confidence(parsed_title, candidate_title,
     return round(score, 1)
 
 
-def runtime_confidence_delta(file_seconds: float, tmdb_minutes: int) -> float:
+def runtime_confidence_delta(file_minutes: float, tmdb_minutes: float) -> float:
     """Confidence adjustment (positive or negative) from a runtime comparison.
 
-    A large gap between the actual file length and the TMDB-reported runtime
-    is strong evidence of a wrong match — a 2-hour movie cannot be a 45-minute
-    episode.  Returns 0.0 when either value is missing or invalid.
+    Uses percentage deviation rather than flat minute thresholds so that the
+    same absolute gap has a proportional effect — a 5-min variance on a 22-min
+    episode (22% off) is very different from the same gap on a 180-min movie
+    (2.8% off).  Returns 0.0 when either value is missing or invalid.
 
-    Thresholds (difference in minutes):
-        ≤  5 min  → +10  (near-exact, solid confirmation)
-        ≤ 15 min  →   0  (within acceptable encode/credits variance)
-        ≤ 30 min  → -10  (noticeable gap — mild suspicion)
-        ≤ 60 min  → -20  (major gap — likely wrong match)
-        >  60 min → -35  (wildly off — almost certainly wrong)
+    Deviation from TMDB runtime → adjustment:
+        ≤  3%  → +10  (near-exact: strong confirmation)
+        ≤  8%  →  +5  (close: likely correct with encode/credits padding)
+        ≤ 15%  →   0  (neutral: within plausible variance)
+        ≤ 30%  → -10  (suspicious mismatch)
+        ≤ 50%  → -20  (likely wrong content)
+        >  50%  → -30  (almost certainly misidentified)
     """
     try:
-        if not file_seconds or not tmdb_minutes or int(tmdb_minutes) <= 0:
+        if not file_minutes or not tmdb_minutes or float(tmdb_minutes) <= 0:
             return 0.0
-        diff = abs(file_seconds / 60.0 - float(tmdb_minutes))
+        pct = abs(float(file_minutes) - float(tmdb_minutes)) / float(tmdb_minutes)
     except (TypeError, ValueError):
         return 0.0
 
-    if diff <= 5:
+    if pct <= 0.03:
         return 10.0
-    if diff <= 15:
+    if pct <= 0.08:
+        return 5.0
+    if pct <= 0.15:
         return 0.0
-    if diff <= 30:
+    if pct <= 0.30:
         return -10.0
-    if diff <= 60:
+    if pct <= 0.50:
         return -20.0
-    return -35.0
+    return -30.0
+
+
+def filesize_plausibility_delta(file_bytes: int, tmdb_minutes: float,
+                                resolution: str | None = None) -> float:
+    """Confidence adjustment from file-size / runtime plausibility.
+
+    Fallback used when ffprobe is unavailable.  Computes GB/min and checks
+    whether the ratio is in the expected range for the detected resolution.
+    Absurdly small files (stubs, samples) and absurdly large ones are penalised.
+
+    GB/min ranges (from Nomen's calibrated values):
+        2160p  0.08 – 1.30  (4.8 – 78 GB/hr)
+        1080p  0.025 – 0.65  (1.5 – 39 GB/hr)
+        720p   0.012 – 0.30  (0.7 – 18 GB/hr)
+    """
+    try:
+        if not file_bytes or not tmdb_minutes or float(tmdb_minutes) <= 0:
+            return 0.0
+        gb_per_min = (float(file_bytes) / (1024 ** 3)) / float(tmdb_minutes)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+    ranges = {
+        "2160p": (0.08, 1.30),
+        "4k":    (0.08, 1.30),
+        "1080p": (0.025, 0.65),
+        "720p":  (0.012, 0.30),
+    }
+    lo, hi = ranges.get((resolution or "1080p").lower(), (0.025, 0.65))
+
+    if lo <= gb_per_min <= hi:
+        return 5.0
+    if gb_per_min < lo * 0.1 or gb_per_min > hi * 5:
+        return -25.0   # stub / obviously wrong file
+    if gb_per_min < lo * 0.5 or gb_per_min > hi * 2:
+        return -10.0
+    return 0.0

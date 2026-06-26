@@ -103,27 +103,38 @@ def _normalize(data: Any) -> Optional[dict[str, Any]]:
     }
 
 
-def video_duration_seconds(video_path: str) -> float | None:
-    """Return the duration of a video file in seconds via ffprobe.
+def video_duration_minutes(video_path: str, timeout: int = 30) -> float | None:
+    """Return the duration of a video file in minutes via ffprobe.
 
-    Returns ``None`` if ffprobe is unavailable or the file cannot be read.
-    Entirely fail-safe.
+    Returns a rounded integer number of minutes, or ``None`` if ffprobe is
+    unavailable or the file cannot be read.  Entirely fail-safe.
     """
+    import shutil
     import subprocess
 
     if not video_path:
         return None
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
+            [ffprobe, "-v", "quiet", "-print_format", "json",
              "-show_format", video_path],
-            capture_output=True, timeout=15,
+            capture_output=True, text=True, timeout=timeout,
         )
         if r.returncode != 0:
             return None
-        return float(json.loads(r.stdout)["format"]["duration"])
+        duration = float(json.loads(r.stdout)["format"]["duration"])
+        return round(duration / 60) if duration > 0 else None
     except Exception:
         return None
+
+
+# Keep a seconds-based alias used internally by identify_from_frames.
+def _video_duration_seconds(video_path: str) -> float | None:
+    mins = video_duration_minutes(video_path)
+    return mins * 60 if mins is not None else None
 
 
 _VISION_TIMEOUT = 45.0
@@ -177,7 +188,7 @@ def identify_from_frames(
             return None
 
     def _duration() -> Optional[float]:
-        return video_duration_seconds(video_path)
+        return _video_duration_seconds(video_path)
 
     def _extract_frame(offset_sec: int) -> Optional[str]:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:

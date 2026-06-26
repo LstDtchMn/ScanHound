@@ -218,43 +218,76 @@ class RenameService:
                             episode_title=parsed.get("filename_episode_title"))
                         match = alt
 
-        # Runtime confirmation: cross-check actual file length vs TMDB runtime.
-        # A large mismatch (e.g. 45-min file matched to a 2-hour movie) is a
-        # strong signal the title is wrong, even when the name scored well.
-        # Skipped for season packs (episode=None, season set) — pack duration
-        # won't match a single-episode runtime.
+        # Runtime + episode-validity confirmation.
+        # Skipped for season packs (season set, episode=None) — pack duration
+        # != single-episode runtime.
         if match and match.get("tmdb_id"):
+            mtype = match.get("media_type", "movie")
             is_pack = match.get("season") is not None and match.get("episode") is None
             if not is_pack:
-                file_dur = _llm.video_duration_seconds(path)
-                if file_dur:
-                    client = self._tmdb_client()
+                client = self._tmdb_client()
+                file_min = _llm.video_duration_minutes(path)
+                tmdb_min = None
+                try:
                     if client:
-                        try:
-                            mtype = match.get("media_type", "movie")
-                            det = client.details(int(match["tmdb_id"]), media_type=mtype)
-                            if det:
-                                if mtype == "tv":
+                        det = client.details(int(match["tmdb_id"]), media_type=mtype)
+                        if det:
+                            if mtype == "tv":
+                                season_num = match.get("season")
+                                ep_num = match.get("episode")
+                                if season_num and ep_num:
+                                    # Fetch episode-specific runtime + validity
+                                    season_data = client.season(
+                                        int(match["tmdb_id"]), season_num)
+                                    if season_data:
+                                        episodes = season_data.get("episodes") or []
+                                        ep = next(
+                                            (e for e in episodes
+                                             if e.get("episode_number") == ep_num),
+                                            None)
+                                        if ep:
+                                            tmdb_min = ep.get("runtime")
+                                        # Episode validity: penalise if episode
+                                        # number exceeds the season's length.
+                                        max_ep = max(
+                                            (e.get("episode_number", 0) for e in episodes),
+                                            default=0)
+                                        if max_ep and ep_num > max_ep:
+                                            match["confidence"] = round(
+                                                max(0.0, match["confidence"] - 20), 1)
+                                            match["runtime_warning"] = (
+                                                f"E{ep_num:02d} exceeds season "
+                                                f"length ({max_ep} episodes)")
+                                if not tmdb_min:
                                     run_list = det.get("episode_run_time") or []
                                     tmdb_min = run_list[0] if run_list else None
-                                else:
-                                    tmdb_min = det.get("runtime")
-                                if tmdb_min:
-                                    delta = _confidence.runtime_confidence_delta(
-                                        file_dur, tmdb_min)
-                                    match["confidence"] = round(
-                                        max(0.0, min(100.0, match["confidence"] + delta)), 1)
-                                    if delta < -10:
-                                        file_min = round(file_dur / 60, 1)
-                                        match["runtime_warning"] = (
-                                            f"Runtime mismatch: file {file_min}min "
-                                            f"vs TMDB {tmdb_min}min")
-                                        logger.debug(
-                                            "Runtime check penalised '%s' by %.0f "
-                                            "(file %.1fmin, TMDB %dmin)",
-                                            match.get("title"), delta, file_min, tmdb_min)
-                        except Exception:
-                            pass
+                            else:
+                                tmdb_min = det.get("runtime")
+                except Exception:
+                    pass
+
+                resolution = match.get("resolution")
+                if tmdb_min:
+                    if file_min:
+                        delta = _confidence.runtime_confidence_delta(file_min, tmdb_min)
+                    else:
+                        # ffprobe unavailable — fall back to file-size plausibility
+                        try:
+                            file_bytes = os.path.getsize(path)
+                        except OSError:
+                            file_bytes = 0
+                        delta = _confidence.filesize_plausibility_delta(
+                            file_bytes, tmdb_min, resolution)
+                    if delta != 0.0:
+                        match["confidence"] = round(
+                            max(0.0, min(100.0, match["confidence"] + delta)), 1)
+                    if delta < -10 and not match.get("runtime_warning"):
+                        src = f"file {file_min}min" if file_min else "size check"
+                        match["runtime_warning"] = (
+                            f"Runtime mismatch: {src} vs TMDB {tmdb_min}min")
+                        logger.debug(
+                            "Runtime penalised '%s' by %.0f (%s, TMDB %dmin)",
+                            match.get("title"), delta, src, tmdb_min)
 
         job = {"package_name": package_name, "original_path": path,
                "original_filename": filename, "status": "pending"}

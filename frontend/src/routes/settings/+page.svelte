@@ -255,16 +255,6 @@
           <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Download Preferences</h3>
 
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">Download Directory</span>
-            <input
-              type="text"
-              value={$settings.download_dir as string ?? ''}
-              oninput={(e) => settings.update((s) => ({ ...s, download_dir: e.currentTarget.value }))}
-              class={inputClass}
-            />
-          </label>
-
-          <label class="block">
             <span class="text-sm text-[var(--text-secondary)]">Minimum File Size (MB)</span>
             <input
               type="number"
