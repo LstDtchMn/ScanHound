@@ -401,6 +401,9 @@ class RenameService:
                 client = self._tmdb_client()
                 file_min = _llm.video_duration_minutes(path)
                 tmdb_min = None
+                season_data = None
+                episodes: list = []
+                delta: Optional[float] = None
                 try:
                     if client:
                         det = client.details(int(match["tmdb_id"]), media_type=mtype)
@@ -462,6 +465,45 @@ class RenameService:
                             "Runtime penalised '%s' by %.0f (%s, TMDB %dmin)",
                             match.get("title"), delta, src, tmdb_min)
 
+                # Season cache for downstream checks — avoids re-fetching same season
+                season_num = match.get("season")
+                season_cache: dict = {season_num: season_data} if season_data else {}
+                llm_cfg = {
+                    "base_url": self._cfg.get("ollama_base_url", ""),
+                    "model": self._cfg.get("ollama_model", ""),
+                }
+
+                # ── Episode re-scan (only when runtime is suspicious) ────────
+                if (delta is not None and delta < -10
+                        and mtype == "tv"
+                        and match.get("episode")
+                        and not match.get("episode_end")
+                        and client):
+                    correction = _try_episode_rescan(
+                        match, client, file_min, season_cache,
+                        int(match["tmdb_id"]), llm_cfg)
+                    if correction:
+                        match["suggested_correction"] = correction
+
+                # ── Combined episode detection ───────────────────────────────
+                if (file_min and tmdb_min
+                        and mtype == "tv"
+                        and episodes
+                        and not match.get("episode_end")
+                        and not match.get("suggested_correction")):
+                    combined = _detect_combined_episode(match, file_min, episodes)
+                    if combined:
+                        match["combined_episode"] = combined
+
+                # ── Split file detection ─────────────────────────────────────
+                if (mtype == "tv"
+                        and file_min and tmdb_min
+                        and not match.get("combined_episode")
+                        and not match.get("suggested_correction")):
+                    split = _detect_split_file(path, file_min, tmdb_min)
+                    if split:
+                        match["split_file"] = split
+
         job = {"package_name": package_name, "original_path": path,
                "original_filename": filename, "status": "pending"}
 
@@ -481,7 +523,10 @@ class RenameService:
             episode=match.get("episode"), tmdb_id=match.get("tmdb_id"),
             imdb_id=match.get("imdb_id"), resolution=match.get("resolution"),
             match_confidence=conf, match_source=match.get("source"),
-            new_filename=fname, destination_path=dest)
+            new_filename=fname, destination_path=dest,
+            suggested_correction=match.get("suggested_correction"),
+            combined_episode=match.get("combined_episode"),
+            split_file=match.get("split_file"))
 
         runtime_warn = match.get("runtime_warning", "")
         if conf < threshold:
@@ -493,6 +538,32 @@ class RenameService:
             job["status"] = "matched"
             if runtime_warn:
                 job["warning_message"] = runtime_warn
+
+        if match.get("suggested_correction"):
+            corr = match["suggested_correction"]
+            orig = corr["original"]
+            prop = corr["proposed"]
+            job["warning_message"] = (
+                f"Possible wrong episode: "
+                f"S{orig['season']:02d}E{orig['episode']:02d} -> "
+                f"S{prop['season']:02d}E{prop['episode']:02d} "
+                f"\"{prop.get('title', '')}\""
+            )
+
+        if match.get("combined_episode"):
+            comb = match["combined_episode"]
+            job["warning_message"] = (
+                f"Likely combined: "
+                f"E{comb['episode_start']:02d}+E{comb['episode_end']:02d} "
+                f"-> rename as {comb['proposed_code']}"
+            )
+
+        if match.get("split_file"):
+            sf = match["split_file"]
+            job["warning_message"] = (
+                f"Likely split file Part {sf['part']} "
+                f"(sibling: {os.path.basename(sf['sibling_path'])})"
+            )
 
         job_id = self._create(job)
         if (job_id and job["status"] == "matched"
