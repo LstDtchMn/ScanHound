@@ -24,7 +24,7 @@ ENV PYTHONUNBUFFERED=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         chromium chromium-driver xvfb tini \
         fonts-liberation libnss3 libxss1 libasound2 libgbm1 libgtk-3-0 \
-        ca-certificates \
+        ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

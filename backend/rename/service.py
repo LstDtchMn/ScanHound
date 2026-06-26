@@ -193,6 +193,31 @@ class RenameService:
         filename = os.path.basename(path)
         threshold = self._threshold()
         match = self._identify(filename)
+
+        # Vision fallback: if still low-confidence, extract video frames and
+        # ask the vision model to read title cards / credits.
+        if (self._cfg.get("auto_rename_llm_enabled")
+                and (not match or match.get("confidence", 0) < threshold)):
+            base_url = self._cfg.get("ollama_base_url", "")
+            model = self._cfg.get("ollama_model", "")
+            if base_url and model:
+                vision = _llm.identify_from_frames(
+                    path, base_url=base_url, model=model)
+                if vision and vision.get("title"):
+                    mtype = vision.get("media_type") or (
+                        "tv" if vision.get("season") else "movie")
+                    alt = self._tmdb_match(
+                        vision["title"], vision.get("year"), mtype)
+                    if alt and (not match or alt["confidence"] > match.get("confidence", 0)):
+                        parsed = parse_filename(filename)
+                        alt.update(
+                            source="llm_vision",
+                            resolution=parsed.get("resolution"),
+                            season=vision.get("season") or parsed.get("season"),
+                            episode=vision.get("episode") or parsed.get("episode"),
+                            episode_title=parsed.get("filename_episode_title"))
+                        match = alt
+
         job = {"package_name": package_name, "original_path": path,
                "original_filename": filename, "status": "pending"}
 

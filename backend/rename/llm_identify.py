@@ -103,6 +103,115 @@ def _normalize(data: Any) -> Optional[dict[str, Any]]:
     }
 
 
+_VISION_TIMEOUT = 45.0
+_VISION_SYSTEM = (
+    "You identify movies and TV shows from video frames. "
+    "Look for title cards, opening or closing credits, watermarks, and any "
+    "visible on-screen text. Respond ONLY with a JSON object with keys: "
+    "title (string or null), year (integer or null), type ('movie' or 'tv'). "
+    "If you cannot identify the title from this frame, set title to null."
+)
+# Timestamps (seconds) to sample: title-card window + opening credits zone.
+# End-credits offset is computed dynamically from video duration when available.
+_FRAME_OFFSETS = [30, 60, 120]
+
+
+def identify_from_frames(
+    video_path: str, *, base_url: str, model: str,
+    timeout: float = _VISION_TIMEOUT,
+) -> Optional[dict[str, Any]]:
+    """Extract frames from a video file and ask a vision-capable Ollama model
+    to identify the title.
+
+    Tries three fixed timestamps (30s, 60s, 120s) plus end-credits (~95% of
+    duration when ffprobe can determine it).  Returns the first non-null result,
+    or ``None`` if ffmpeg is absent, the model is not vision-capable, or all
+    frames yield no title.  Entirely fail-safe — any exception returns ``None``.
+    """
+    import base64
+    import subprocess
+    import tempfile
+
+    if not video_path or not base_url or not model:
+        return None
+
+    def _run_ffmpeg(args: list[str]) -> Optional[bytes]:
+        try:
+            r = subprocess.run(args, capture_output=True, timeout=15)
+            return r.stdout if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    def _duration() -> Optional[float]:
+        out = _run_ffmpeg([
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", video_path,
+        ])
+        if not out:
+            return None
+        try:
+            import json as _json
+            return float(_json.loads(out)["format"]["duration"])
+        except Exception:
+            return None
+
+    def _extract_frame(offset_sec: int) -> Optional[str]:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+        data = _run_ffmpeg([
+            "ffmpeg", "-y", "-ss", str(offset_sec), "-i", video_path,
+            "-vframes", "1", "-q:v", "3", "-f", "image2", tmp_path,
+        ])
+        try:
+            with open(tmp_path, "rb") as f:
+                raw = f.read()
+            import os as _os
+            _os.unlink(tmp_path)
+            return base64.b64encode(raw).decode() if raw else None
+        except Exception:
+            return None
+
+    def _ask_vision(b64_image: str) -> Optional[dict[str, Any]]:
+        payload = {
+            "model": model,
+            "stream": False,
+            "options": {"temperature": 0},
+            "messages": [{
+                "role": "user",
+                "content": _VISION_SYSTEM + "\n\nIdentify the movie or TV show in this frame.",
+                "images": [b64_image],
+            }],
+        }
+        try:
+            resp = requests.post(base_url.rstrip("/") + "/api/chat",
+                                 json=payload, timeout=timeout)
+            resp.raise_for_status()
+            content = resp.json().get("message", {}).get("content", "")
+            # Strip markdown fences if the model wraps JSON
+            content = content.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+            result = _normalize(json.loads(content))
+            return result if result and result.get("title") else None
+        except Exception as e:
+            logger.debug("Ollama vision failed: %s", e)
+            return None
+
+    offsets = list(_FRAME_OFFSETS)
+    dur = _duration()
+    if dur and dur > 300:
+        offsets.append(int(dur * 0.95))
+
+    for offset in offsets:
+        b64 = _extract_frame(offset)
+        if not b64:
+            continue
+        result = _ask_vision(b64)
+        if result and result.get("title"):
+            logger.debug("Vision identified at %ds: %s", offset, result.get("title"))
+            return result
+
+    return None
+
+
 def test_connection(base_url: str, timeout: float = 5.0) -> dict:
     """Probe Ollama's ``/api/tags``. Returns ``{ok, models?, error?}``."""
     if not base_url:
