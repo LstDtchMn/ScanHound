@@ -65,11 +65,15 @@ def video_extension(filename: str) -> str:
 def _tokens(meta: dict) -> dict:
     season = int(meta.get("season") or 1)
     episode = int(meta.get("episode") or 1)
+    episode_end = meta.get("episode_end")
+    ep_code = f"{episode:02d}"
+    if episode_end:
+        ep_code += f"E{int(episode_end):02d}"
     return {
         "title": sanitize_filename(meta.get("title") or "Unknown"),
         "year": str(meta.get("year") or ""),
         "season": f"{season:02d}",
-        "episode": f"{episode:02d}",
+        "episode": ep_code,
         "episode_title": sanitize_filename(meta.get("episode_title") or ""),
         "resolution": meta.get("resolution") or "",
         "quality": meta.get("resolution") or "",
@@ -110,10 +114,19 @@ def build_target(meta: dict, *, movie_root: str = "", tv_root: str = "",
     elif media_type == "tv":
         season = int(meta.get("season") or 1)
         episode = int(meta.get("episode") or 1)
+        episode_end = meta.get("episode_end")
+        part = meta.get("part")
         ep_title = sanitize_filename(meta.get("episode_title") or "")
         show = f"{title} ({year})" if year else title
         code = f"S{season:02d}E{episode:02d}"
-        fname = f"{show} - {code}" + (f" - {ep_title}" if ep_title else "") + ext
+        if episode_end:
+            code += f"E{int(episode_end):02d}"
+        fname = f"{show} - {code}"
+        if ep_title:
+            fname += f" - {ep_title}"
+        if part:
+            fname += f" - Part {part}"
+        fname += ext
     else:
         folder = f"{title} ({year})" if year else title
         fname = (f"{folder} [{resolution}]" if resolution else folder) + ext

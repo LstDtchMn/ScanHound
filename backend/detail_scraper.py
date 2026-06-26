@@ -14,6 +14,7 @@ import cloudscraper
 from bs4 import BeautifulSoup
 
 from backend.models import ScrapeResult
+from backend.rename import llm_identify as _llm
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +268,13 @@ class DetailScraper:
             if date_match:
                 posted_date = date_match.group(1)
 
+            # Extract multi-episode hints from page body (regex only — Ollama is async)
+            try:
+                hints = _llm.extract_page_hints(full_text)
+                multi_episode_hint = hints if hints and (hints.get("is_combined") or hints.get("is_split")) else None
+            except Exception:
+                multi_episode_hint = None
+
             return {
                 'display_title': clean_title,
                 'year': year,
@@ -285,6 +293,7 @@ class DetailScraper:
                 'episode_number': episode_number,
                 'episodes': episodes_count if is_tv else None,
                 'posted_date': posted_date,
+                'multi_episode_hint': multi_episode_hint,
             }
         except Exception as e:
             if self.app.config.get("debug_mode", False):

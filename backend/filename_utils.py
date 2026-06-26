@@ -40,7 +40,8 @@ UNSAFE_CHARS_RE = re.compile(r'[<>"/\\|?*]')
 
 # Quality/release markers that end an episode title in TV filenames
 EPISODE_BOUNDARY_RE = re.compile(
-    r'[.\s](?:2160p|1080p|720p|480p|4[Kk]|UHD|'
+    r'[.\s](?:Part[.\s\-]?\d|Pt[.\s\-]?\d|'
+    r'2160p|1080p|720p|480p|4[Kk]|UHD|'
     r'BluRay|Blu[\.\-]Ray|BDRip|BDRemux|REMUX|'
     r'WEB[\.\-]?DL|WEBRip|WEBDL|HDTV|DVDRip|HDRip|'
     r'HEVC|[Xx]265|[Xx]264|H[\.\s]?264|H[\.\s]?265|'
@@ -73,13 +74,16 @@ def parse_filename(filename) -> FilenameResult:
             year       (int or None)   — release year
             season     (int or None)   — season number (TV only)
             episode    (int or None)   — episode number (TV only)
+            episode_end (int or None)  — last episode in multi-ep file
             resolution (str or None)   — e.g. "1080p", "2160p"
+            part       (int or None)   — split file part number
             is_tv      (bool)          — True when season/episode found
     """
     name = os.path.splitext(filename)[0]
     result = {
         "title": "", "year": None, "season": None,
-        "episode": None, "resolution": None, "is_tv": False,
+        "episode": None, "episode_end": None, "resolution": None, "is_tv": False,
+        "part": None,
     }
 
     # 1. Season / episode
@@ -91,6 +95,12 @@ def parse_filename(filename) -> FilenameResult:
         title_part = name[:se_match.start()]
         # Extract candidate episode title: text between SxxExx and quality marker
         after_ep = name[se_match.end():]
+        # Multi-episode: SxxExxEyy or SxxExx-Eyy or SxxExx.Eyy
+        me_match = re.match(r'[.\-]?E(\d{1,3})', after_ep, re.IGNORECASE)
+        if me_match:
+            result["episode_end"] = int(me_match.group(1))
+            # Skip the second episode code so it isn't mistaken for a title.
+            after_ep = after_ep[me_match.end():]
         ep_boundary = EPISODE_BOUNDARY_RE.search(after_ep)
         ep_raw = after_ep[:ep_boundary.start()] if ep_boundary else after_ep
         ep_clean = re.sub(r'[\.\-_]', ' ', ep_raw).strip()
@@ -136,6 +146,12 @@ def parse_filename(filename) -> FilenameResult:
     title = re.sub(r'-\w+$', '', title)  # trailing -GROUP tag
     title = re.sub(r'\s+', ' ', title).strip()
     result["title"] = title
+
+    # Part indicator: Part1, Part 2, Pt1, Pt.2
+    part_match = re.search(
+        r'[.\s\-_](?:Part|Pt)[\s.\-]?(\d)', name, re.IGNORECASE)
+    if part_match:
+        result["part"] = int(part_match.group(1))
 
     return result
 

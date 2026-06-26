@@ -82,7 +82,7 @@ def runtime_confidence_delta(file_minutes: float, tmdb_minutes: float) -> float:
     Deviation from TMDB runtime → adjustment:
         ≤  3%  → +10  (near-exact: strong confirmation)
         ≤  8%  →  +5  (close: likely correct with encode/credits padding)
-        ≤ 15%  →   0  (neutral: within plausible variance)
+        ≤ 10%  →   0  (neutral: within plausible variance)
         ≤ 30%  → -10  (suspicious mismatch)
         ≤ 50%  → -20  (likely wrong content)
         >  50%  → -30  (almost certainly misidentified)
@@ -98,7 +98,7 @@ def runtime_confidence_delta(file_minutes: float, tmdb_minutes: float) -> float:
         return 10.0
     if pct <= 0.08:
         return 5.0
-    if pct <= 0.15:
+    if pct <= 0.10:
         return 0.0
     if pct <= 0.30:
         return -10.0
@@ -142,3 +142,35 @@ def filesize_plausibility_delta(file_bytes: int, tmdb_minutes: float,
     if gb_per_min < lo * 0.5 or gb_per_min > hi * 2:
         return -10.0
     return 0.0
+
+
+def episode_correction_candidates(
+    file_minutes: float,
+    episodes: list,
+    current_episode: int,
+    *,
+    search_radius: int = 3,
+    min_gain: float = 15.0,
+) -> list:
+    # Score TMDB episodes near current_episode by runtime fit against file_minutes.
+    current_score: float | None = None
+    candidates: list[tuple[int, float]] = []
+
+    for ep in episodes:
+        ep_num = ep.get("episode_number")
+        ep_rt = ep.get("runtime")
+        if not ep_num or not ep_rt:
+            continue
+        if abs(ep_num - current_episode) > search_radius:
+            continue
+        score = runtime_confidence_delta(float(file_minutes), float(ep_rt))
+        if ep_num == current_episode:
+            current_score = score
+        else:
+            candidates.append((ep_num, score))
+
+    if current_score is None:
+        return []
+
+    better = [(n, s) for n, s in candidates if s - current_score >= min_gain]
+    return sorted(better, key=lambda x: x[1], reverse=True)

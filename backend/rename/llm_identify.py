@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, List, Optional
 
 import requests
@@ -293,3 +294,163 @@ def test_connection(base_url: str, timeout: float = 5.0) -> dict:
         return {"ok": True, "models": [m.get("name") for m in resp.json().get("models", [])]}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ── Episode disambiguator ─────────────────────────────────────────────────
+
+_DISAMBIG_SYSTEM = (
+    "You identify which TV episode a media file most likely corresponds to. "
+    "Given a filename and 2-3 candidate episodes, pick the best match. "
+    "Respond ONLY with JSON: {\"episode\": <number>, \"season\": <number>}"
+)
+
+
+def disambiguate_episode(
+    filename: str,
+    candidates: list,
+    *,
+    base_url: str,
+    model: str,
+    timeout: float = _TIMEOUT,
+) -> Optional[dict]:
+    """Choose between close episode candidates using the Ollama chat API.
+
+    Returns ``{episode: int, season: int}`` or ``None`` on any failure.
+    """
+    if not filename or not base_url or not model or len(candidates) < 2:
+        return None
+    lines = [
+        f"  {i + 1}. S{c['season']:02d}E{c['episode']:02d} "
+        f"\"{c.get('title', '')}\" ({c.get('runtime', '?')}min)"
+        for i, c in enumerate(candidates[:3])
+    ]
+    payload = {
+        "model": model,
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0},
+        "messages": [
+            {"role": "system", "content": _DISAMBIG_SYSTEM},
+            {"role": "user", "content": (
+                f"Filename: {filename}\nCandidates:\n"
+                + "\n".join(lines)
+                + "\nWhich episode does this file most likely contain?"
+            )},
+        ],
+    }
+    try:
+        resp = requests.post(base_url.rstrip("/") + "/api/chat",
+                             json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = json.loads(resp.json().get("message", {}).get("content", "{}"))
+        ep = int(data.get("episode", 0))
+        sn = int(data.get("season", 0))
+        if ep > 0 and sn > 0:
+            return {"episode": ep, "season": sn}
+    except Exception as e:
+        logger.debug("Ollama episode disambiguate failed: %s", e)
+    return None
+
+
+# ── Page hint extraction ──────────────────────────────────────────────────
+
+_HINT_COMBINED_RE = re.compile(
+    r'\b(?:double[\s\-]?episode|2[\s\-]in[\s\-]1|two[\s\-](?:part|episode)s?'
+    r'|episodes?\s+\d+\s*[&+]\s*\d+|multi[\s\-]?episode)\b',
+    re.IGNORECASE,
+)
+_HINT_SPLIT_RE = re.compile(
+    r'\bpart\s*[12]\b|\bpt\.?\s*[12]\b|\b[12]\s+of\s+2\b',
+    re.IGNORECASE,
+)
+_HINT_PART_NUM_RE = re.compile(
+    r'\bpart\s*(\d)\b|\bpt\.?\s*(\d)\b|\b(\d)\s+of\s+\d\b',
+    re.IGNORECASE,
+)
+_HINT_EP_COUNT_RE = re.compile(r'\b(\d+)[\s\-]?(?:episodes?|eps?)\b', re.IGNORECASE)
+
+_HINT_SYSTEM = (
+    "Extract multi-episode metadata from media download page text. "
+    "Respond ONLY with JSON: "
+    "{\"is_combined\": bool, \"is_split\": bool, "
+    "\"part_number\": int_or_null, \"episode_count\": int_or_null}"
+)
+
+
+def extract_page_hints(
+    page_text: str,
+    *,
+    base_url: str = "",
+    model: str = "",
+) -> dict:
+    """Extract combined/split episode hints from download page text.
+
+    Tries Ollama first when configured; falls back to regex when Ollama is
+    unconfigured or fails.  Always returns a dict with all four keys.
+    """
+    empty: dict = {
+        "is_combined": False, "is_split": False,
+        "part_number": None, "episode_count": None,
+    }
+    if not page_text:
+        return empty
+    if base_url and model:
+        ollama_result = _ollama_page_hints(page_text[:3000],
+                                           base_url=base_url, model=model)
+        if ollama_result:
+            return ollama_result
+    return _regex_page_hints(page_text)
+
+
+def _ollama_page_hints(text: str, *, base_url: str, model: str) -> Optional[dict]:
+    payload = {
+        "model": model,
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0},
+        "messages": [
+            {"role": "system", "content": _HINT_SYSTEM},
+            {"role": "user", "content": f"Extract episode info from:\n{text}"},
+        ],
+    }
+    try:
+        resp = requests.post(base_url.rstrip("/") + "/api/chat",
+                             json=payload, timeout=_TIMEOUT)
+        resp.raise_for_status()
+        data = json.loads(resp.json().get("message", {}).get("content", "{}"))
+        ep_count = data.get("episode_count")
+        part_num = data.get("part_number")
+        return {
+            "is_combined": bool(data.get("is_combined", False)),
+            "is_split": bool(data.get("is_split", False)),
+            "part_number": int(part_num) if part_num else None,
+            "episode_count": int(ep_count) if ep_count else None,
+        }
+    except Exception as e:
+        logger.debug("Ollama page hint extraction failed: %s", e)
+        return None
+
+
+def _regex_page_hints(text: str) -> dict:
+    is_combined = bool(_HINT_COMBINED_RE.search(text))
+    is_split = bool(_HINT_SPLIT_RE.search(text))
+    part_number: Optional[int] = None
+    episode_count: Optional[int] = None
+
+    pm = _HINT_PART_NUM_RE.search(text)
+    if pm:
+        part_number = int(next(g for g in pm.groups() if g is not None))
+        is_split = True
+
+    em = _HINT_EP_COUNT_RE.search(text)
+    if em and int(em.group(1)) > 1:
+        episode_count = int(em.group(1))
+        if episode_count == 2:
+            is_combined = True
+
+    return {
+        "is_combined": is_combined,
+        "is_split": is_split,
+        "part_number": part_number,
+        "episode_count": episode_count,
+    }
