@@ -103,6 +103,29 @@ def _normalize(data: Any) -> Optional[dict[str, Any]]:
     }
 
 
+def video_duration_seconds(video_path: str) -> float | None:
+    """Return the duration of a video file in seconds via ffprobe.
+
+    Returns ``None`` if ffprobe is unavailable or the file cannot be read.
+    Entirely fail-safe.
+    """
+    import subprocess
+
+    if not video_path:
+        return None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", video_path],
+            capture_output=True, timeout=15,
+        )
+        if r.returncode != 0:
+            return None
+        return float(json.loads(r.stdout)["format"]["duration"])
+    except Exception:
+        return None
+
+
 _VISION_TIMEOUT = 45.0
 _VISION_SYSTEM = (
     "You identify movies and TV shows from video frames. "
@@ -154,17 +177,7 @@ def identify_from_frames(
             return None
 
     def _duration() -> Optional[float]:
-        out = _run([
-            "ffprobe", "-v", "quiet", "-print_format", "json",
-            "-show_format", video_path,
-        ])
-        if not out:
-            return None
-        try:
-            import json as _json
-            return float(_json.loads(out)["format"]["duration"])
-        except Exception:
-            return None
+        return video_duration_seconds(video_path)
 
     def _extract_frame(offset_sec: int) -> Optional[str]:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:

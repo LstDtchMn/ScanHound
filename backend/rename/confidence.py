@@ -69,3 +69,35 @@ def match_confidence(parsed_title, candidate_title,
     except (TypeError, ValueError):
         pass
     return round(score, 1)
+
+
+def runtime_confidence_delta(file_seconds: float, tmdb_minutes: int) -> float:
+    """Confidence adjustment (positive or negative) from a runtime comparison.
+
+    A large gap between the actual file length and the TMDB-reported runtime
+    is strong evidence of a wrong match — a 2-hour movie cannot be a 45-minute
+    episode.  Returns 0.0 when either value is missing or invalid.
+
+    Thresholds (difference in minutes):
+        ≤  5 min  → +10  (near-exact, solid confirmation)
+        ≤ 15 min  →   0  (within acceptable encode/credits variance)
+        ≤ 30 min  → -10  (noticeable gap — mild suspicion)
+        ≤ 60 min  → -20  (major gap — likely wrong match)
+        >  60 min → -35  (wildly off — almost certainly wrong)
+    """
+    try:
+        if not file_seconds or not tmdb_minutes or int(tmdb_minutes) <= 0:
+            return 0.0
+        diff = abs(file_seconds / 60.0 - float(tmdb_minutes))
+    except (TypeError, ValueError):
+        return 0.0
+
+    if diff <= 5:
+        return 10.0
+    if diff <= 15:
+        return 0.0
+    if diff <= 30:
+        return -10.0
+    if diff <= 60:
+        return -20.0
+    return -35.0
