@@ -7,6 +7,7 @@
   import { api } from '$lib/api/client';
   import ServerConnection from '$lib/components/ServerConnection.svelte';
   import ChangePassword from '$lib/components/ChangePassword.svelte';
+  import Tooltip from '$lib/components/Tooltip.svelte';
   import { serverUrl } from '$lib/stores/server';
   import { onMount } from 'svelte';
   import type { BackgroundStatus } from '$lib/api/types';
@@ -226,10 +227,17 @@
       testResults = { ...testResults, [channel]: null };
     }
   }
+
+  let scrollEl: HTMLDivElement | undefined;
+
+  function switchTab(tab: Tab) {
+    activeTab = tab;
+    scrollEl?.scrollTo({ top: 0 });
+  }
 </script>
 
-<div class="flex-1 overflow-auto">
-  <div class="border-b border-[var(--border)] px-4">
+<div bind:this={scrollEl} class="flex-1 overflow-auto">
+  <div class="sticky top-0 z-10 bg-[var(--bg-primary)] border-b border-[var(--border)] px-4">
     <div class="flex gap-1 overflow-x-auto">
       {#each tabs as tab}
         <button
@@ -237,7 +245,7 @@
             {activeTab === tab.value
               ? 'border-[var(--accent)] text-[var(--accent)]'
               : 'border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)]'}"
-          onclick={() => (activeTab = tab.value)}
+          onclick={() => switchTab(tab.value)}
         >
           {tab.label}
         </button>
@@ -943,7 +951,9 @@
           <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Thresholds</h3>
 
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">Movie Match Threshold (%)</span>
+            <Tooltip text="Minimum title similarity score (0–100) for a scan result to be considered a match against your Plex library. Lower = more matches but more false positives. 85 is a good default.">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Movie Match Threshold (%) ⓘ</span>
+            </Tooltip>
             <input
               type="number"
               min="50"
@@ -955,7 +965,9 @@
           </label>
 
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">TV Match Threshold (%)</span>
+            <Tooltip text="Same as Movie Match Threshold but for TV show episode matching. Episode title fuzziness and regional date differences make TV titles harder to match, so a slightly lower threshold (e.g. 80) is often appropriate.">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">TV Match Threshold (%) ⓘ</span>
+            </Tooltip>
             <input
               type="number"
               min="50"
@@ -967,7 +979,9 @@
           </label>
 
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">Low Match Threshold (%)</span>
+            <Tooltip text="Results that score between this number and the Movie/TV threshold are shown as low-confidence matches — visible in results but not acted on automatically. Below this number = no match. Raise it to be stricter about what counts as a partial match.">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Low Match Threshold (%) ⓘ</span>
+            </Tooltip>
             <input
               type="number"
               min="30"
@@ -979,7 +993,9 @@
           </label>
 
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">Year Tolerance</span>
+            <Tooltip text="How many years off a title's release year can be and still count as a match. Set to 1 to allow for regional release date differences (e.g. a 2023 film sometimes listed as 2024).">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Year Tolerance ⓘ</span>
+            </Tooltip>
             <input
               type="number"
               min="0"
@@ -991,7 +1007,9 @@
           </label>
 
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">Upgrade Sensitivity</span>
+            <Tooltip text="Controls how much larger a new file needs to be to count as a size upgrade. Low = flag any file noticeably bigger. High = only flag files significantly larger (reduces noise for minor encodes).">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Upgrade Sensitivity ⓘ</span>
+            </Tooltip>
             <select
               value={String($settings.upgrade_sensitivity ?? 2)}
               onchange={(e) => settings.update((s) => ({ ...s, upgrade_sensitivity: parseInt(e.currentTarget.value) }))}
@@ -1387,14 +1405,18 @@
           </label>
 
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">Low-confidence threshold (flag for review below)</span>
+            <Tooltip text="Files identified with a confidence score below this number are held for manual review instead of being renamed automatically. 70 is a safe default — lower it to be more permissive, raise it to be stricter.">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Low-confidence threshold ⓘ</span>
+            </Tooltip>
             <input type="number" min="0" max="100" value={$settings.auto_rename_confidence_threshold ?? 70}
               oninput={(e) => settings.update((s) => ({ ...s, auto_rename_confidence_threshold: parseInt(e.currentTarget.value) || 70 }))}
               class={inputSmClass} />
           </label>
 
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">File placement</span>
+            <Tooltip text="Hardlink: creates a second name for the same file — zero extra disk space, original stays in the download folder. Symlink: a shortcut pointer, breaks if the download folder is moved. Copy: duplicates the file (doubles disk usage). Move: relocates the file and deletes the original from the download folder.">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">File placement ⓘ</span>
+            </Tooltip>
             <select value={$settings.auto_rename_move_method ?? 'hardlink'}
               onchange={(e) => settings.update((s) => ({ ...s, auto_rename_move_method: e.currentTarget.value }))}
               class={inputClass}>
@@ -1416,10 +1438,20 @@
         <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">
           <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Library destinations</h3>
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">Movies folder</span>
+            <Tooltip text="Path inside the container where 1080p (and other non-4K) movies are placed. Example: /library/Movies. Must be a volume-mounted path the container can write to.">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Movies folder (1080p) ⓘ</span>
+            </Tooltip>
             <input type="text" value={$settings.auto_rename_movie_library ?? ''}
               oninput={(e) => settings.update((s) => ({ ...s, auto_rename_movie_library: e.currentTarget.value }))}
               placeholder="/library/Movies" class={inputClass} />
+          </label>
+          <label class="block">
+            <Tooltip text="Path for 4K / 2160p movies. When a renamed file is identified as 2160p, it goes here instead of the Movies folder above. Leave blank to put all movies in one folder regardless of resolution.">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Movies folder (4K) ⓘ</span>
+            </Tooltip>
+            <input type="text" value={$settings.auto_rename_movie_library_4k ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_movie_library_4k: e.currentTarget.value }))}
+              placeholder="/library/Movies (4K)" class={inputClass} />
           </label>
           <label class="block">
             <span class="text-sm text-[var(--text-secondary)]">TV folder</span>
@@ -1427,15 +1459,19 @@
               oninput={(e) => settings.update((s) => ({ ...s, auto_rename_tv_library: e.currentTarget.value }))}
               placeholder="/library/TV" class={inputClass} />
           </label>
-          <p class="text-xs text-[var(--text-secondary)]">Leave the templates blank for the Plex default naming.</p>
+          <p class="text-xs text-[var(--text-secondary)]">Leave the templates blank for the Plex default naming convention.</p>
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">Movie name template (optional)</span>
+            <Tooltip text="Tokens: {{title}} {{year}} {{resolution}} {{imdb_id}} {{tmdb_id}}. Sections in [ ] are omitted when the token is empty. Default (blank): Title (Year) [resolution].mkv">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Movie name template (optional) ⓘ</span>
+            </Tooltip>
             <input type="text" value={$settings.auto_rename_template_movie ?? ''}
               oninput={(e) => settings.update((s) => ({ ...s, auto_rename_template_movie: e.currentTarget.value }))}
               placeholder={'{{title}} ({{year}}) [{{resolution}}]'} class={inputClass} />
           </label>
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">TV name template (optional)</span>
+            <Tooltip text="Tokens: {{title}} {{year}} {{season}} {{episode}} {{episode_title}} {{resolution}}. Sections in [ ] are omitted when empty. Default (blank): Show (Year) - S01E01 - Episode Title.mkv">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">TV name template (optional) ⓘ</span>
+            </Tooltip>
             <input type="text" value={$settings.auto_rename_template_tv ?? ''}
               oninput={(e) => settings.update((s) => ({ ...s, auto_rename_template_tv: e.currentTarget.value }))}
               placeholder={'{{title}} - S{{season}}E{{episode}}[ - {{episode_title}}]'} class={inputClass} />
@@ -1455,10 +1491,12 @@
             <span class="text-sm">Enable Ollama-assisted identification</span>
           </label>
           <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">Ollama URL</span>
+            <Tooltip text="URL of your Ollama instance. If Ollama runs as a Docker container on the same proxy network use its container name, e.g. http://ollama:11434. For Ollama installed directly on the host use http://host.docker.internal:11434.">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Ollama URL ⓘ</span>
+            </Tooltip>
             <input type="text" value={$settings.ollama_base_url ?? ''}
               oninput={(e) => settings.update((s) => ({ ...s, ollama_base_url: e.currentTarget.value }))}
-              placeholder="http://host.docker.internal:11434" class={inputClass} />
+              placeholder="http://ollama:11434" class={inputClass} />
           </label>
           <label class="block">
             <span class="text-sm text-[var(--text-secondary)]">Model</span>

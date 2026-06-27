@@ -370,6 +370,9 @@ class DatabaseManager:
                         proposed_match TEXT,
                         plex_sort_title TEXT,
                         warning_message TEXT,
+                        suggested_correction TEXT,
+                        combined_episode TEXT,
+                        split_file TEXT,
                         error_message TEXT,
                         detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         processed_at TIMESTAMP,
@@ -400,6 +403,9 @@ class DatabaseManager:
                     'ALTER TABLE downloads ADD COLUMN size TEXT',
                     "ALTER TABLE downloads ADD COLUMN status TEXT DEFAULT 'completed'",
                     'ALTER TABLE plex_cache ADD COLUMN library_name TEXT',
+                    'ALTER TABLE rename_jobs ADD COLUMN suggested_correction TEXT',
+                    'ALTER TABLE rename_jobs ADD COLUMN combined_episode TEXT',
+                    'ALTER TABLE rename_jobs ADD COLUMN split_file TEXT',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -1182,10 +1188,36 @@ class DatabaseManager:
         "episode", "tmdb_id", "imdb_id", "resolution", "match_confidence",
         "match_source", "move_method", "proposed_match", "plex_sort_title",
         "warning_message", "error_message", "processed_at", "reverted_at",
+        "suggested_correction", "combined_episode", "split_file",
     )
+
+    # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.
+    _JSON_RENAME_FIELDS = frozenset({"suggested_correction", "combined_episode", "split_file"})
+
+    def _serialize_rename_row(self, row: dict) -> dict:
+        """JSON-encode dict/list values for _JSON_RENAME_FIELDS before DB write."""
+        out = {}
+        for k, v in row.items():
+            if k in self._JSON_RENAME_FIELDS:
+                out[k] = json.dumps(v) if isinstance(v, (dict, list)) else v
+            else:
+                out[k] = v
+        return out
+
+    def _deserialize_rename_row(self, row: dict) -> dict:
+        """JSON-decode TEXT values for _JSON_RENAME_FIELDS after DB read."""
+        for field in self._JSON_RENAME_FIELDS:
+            raw = row.get(field)
+            if raw and isinstance(raw, str):
+                try:
+                    row[field] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    row[field] = None
+        return row
 
     def create_rename_job(self, job):
         """Insert a rename job (dict of column→value); return the new id or None."""
+        job = self._serialize_rename_row(job)
         cols = [k for k in self._RENAME_FIELDS if k in job]
         if "original_path" not in cols:
             return None
@@ -1213,6 +1245,7 @@ class DatabaseManager:
 
     def update_rename_job(self, job_id, **fields):
         """Update arbitrary columns on a rename job."""
+        fields = self._serialize_rename_row(fields)
         cols = [k for k in fields if k in self._RENAME_FIELDS]
         if not cols:
             return False
@@ -1227,17 +1260,19 @@ class DatabaseManager:
         """Return a rename job as a dict, or None."""
         rows = self._query_dicts(
             "SELECT * FROM rename_jobs WHERE id = ?", (job_id,), default=[])
-        return rows[0] if rows else None
+        return self._deserialize_rename_row(rows[0]) if rows else None
 
     def list_rename_jobs(self, status=None, limit=200):
         """Return rename jobs (optionally filtered by status), newest first."""
         if status:
-            return self._query_dicts(
+            rows = self._query_dicts(
                 "SELECT * FROM rename_jobs WHERE status = ? "
                 "ORDER BY detected_at DESC LIMIT ?", (status, limit), default=[])
-        return self._query_dicts(
-            "SELECT * FROM rename_jobs ORDER BY detected_at DESC LIMIT ?",
-            (limit,), default=[])
+        else:
+            rows = self._query_dicts(
+                "SELECT * FROM rename_jobs ORDER BY detected_at DESC LIMIT ?",
+                (limit,), default=[])
+        return [self._deserialize_rename_row(r) for r in (rows or [])]
 
     def count_rename_jobs_by_status(self):
         """Return a ``{status: count}`` map over all rename jobs."""

@@ -239,6 +239,13 @@ class RenameService:
         except (TypeError, ValueError):
             return 70
 
+    def _movie_root(self, resolution: Optional[str] = None) -> str:
+        if resolution == "2160p":
+            lib_4k = self._cfg.get("auto_rename_movie_library_4k", "")
+            if lib_4k:
+                return lib_4k
+        return self._cfg.get("auto_rename_movie_library", "")
+
     def _template_for(self, media_type) -> Optional[str]:
         key = "auto_rename_template_tv" if media_type == "tv" else "auto_rename_template_movie"
         return self._cfg.get(key) or None
@@ -493,6 +500,7 @@ class RenameService:
                     combined = _detect_combined_episode(match, file_min, episodes)
                     if combined:
                         match["combined_episode"] = combined
+                        match["episode_end"] = combined["episode_end"]
 
                 # ── Episode re-scan (only when runtime is suspicious) ────────
                 if (delta is not None and delta < -10
@@ -526,7 +534,7 @@ class RenameService:
 
         fname, dest = _naming.build_target(
             {**match, "original_filename": filename},
-            movie_root=self._cfg.get("auto_rename_movie_library", ""),
+            movie_root=self._movie_root(match.get("resolution")),
             tv_root=self._cfg.get("auto_rename_tv_library", ""),
             template=self._template_for(match.get("media_type")))
         conf = match.get("confidence") or 0.0
@@ -684,7 +692,7 @@ class RenameService:
         meta = {**job, "media_type": mtype, "title": title, "year": year,
                 "tmdb_id": int(tmdb_id)}
         fname, dest = _naming.build_target(
-            meta, movie_root=self._cfg.get("auto_rename_movie_library", ""),
+            meta, movie_root=self._movie_root(job.get("resolution")),
             tv_root=self._cfg.get("auto_rename_tv_library", ""),
             template=self._template_for(mtype))
         db.update_rename_job(job_id, title=title, year=year, tmdb_id=int(tmdb_id),
@@ -693,6 +701,62 @@ class RenameService:
                              status="matched", warning_message=None)
         self._broadcast(job_id)
         return {"ok": True}
+
+    def accept_combined(self, job_id: int) -> dict:
+        """Accept a runtime-detected combined-episode proposal.
+
+        The new_filename is already correct (episode_end was set before build_target),
+        so accepting just clears the proposal and promotes the job to matched.
+        """
+        db = self._db
+        job = db.get_rename_job(job_id) if db else None
+        if not job:
+            return {"ok": False, "error": "Job not found"}
+        if not job.get("combined_episode"):
+            return {"ok": False, "error": "No combined episode proposal on this job"}
+        db.update_rename_job(job_id, status="matched", warning_message=None,
+                             combined_episode=None)
+        self._broadcast(job_id)
+        return {"ok": True}
+
+    def accept_correction(self, job_id: int) -> dict:
+        """Accept a runtime-gated wrong-episode correction proposal.
+
+        Re-generates new_filename and destination_path from the proposed S/E,
+        then promotes the job to matched.
+        """
+        db = self._db
+        job = db.get_rename_job(job_id) if db else None
+        if not job:
+            return {"ok": False, "error": "Job not found"}
+        correction = job.get("suggested_correction")
+        if not correction:
+            return {"ok": False, "error": "No episode correction proposal on this job"}
+        proposed = correction.get("proposed", {})
+        meta = {k: job.get(k) for k in (
+            "title", "year", "media_type", "tmdb_id", "imdb_id",
+            "resolution", "original_filename", "plex_sort_title")}
+        meta.update(
+            season=proposed.get("season", job.get("season")),
+            episode=proposed.get("episode", job.get("episode")),
+            # Use the corrected episode's TMDB title — the proposed episode is a
+            # different one, so any filename-parsed title would be the wrong show's.
+            episode_title=proposed.get("title") or None,
+            episode_end=None,
+            part=None)
+        fname, dest = _naming.build_target(
+            meta,
+            movie_root=self._movie_root(meta.get("resolution")),
+            tv_root=self._cfg.get("auto_rename_tv_library", ""),
+            template=self._template_for("tv"))
+        db.update_rename_job(
+            job_id,
+            season=meta["season"], episode=meta["episode"],
+            new_filename=fname, destination_path=dest,
+            suggested_correction=None,
+            status="matched", warning_message=None)
+        self._broadcast(job_id)
+        return {"ok": True, "new_filename": fname}
 
     def _broadcast(self, job_id) -> None:
         if not job_id or self._db is None:

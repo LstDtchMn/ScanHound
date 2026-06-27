@@ -45,6 +45,16 @@ export async function rematchJob(id: number, tmdbId: number, mediaType?: string)
   await refresh();
 }
 
+export async function acceptCombinedJob(id: number) {
+  await api.acceptCombinedRename(id);
+  await refresh();
+}
+
+export async function acceptCorrectionJob(id: number) {
+  await api.acceptCorrectionRename(id);
+  await refresh();
+}
+
 export async function deleteJob(id: number) {
   await api.deleteRenameJob(id);
   renameJobs.update((jobs) => jobs.filter((j) => j.id !== id));

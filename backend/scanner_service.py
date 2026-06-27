@@ -76,7 +76,7 @@ class MediaItem:
     web_data: Dict[str, Any] = field(default_factory=dict)
     group_key: str = ""
     is_duplicate_group: bool = False
-    downloaded_siblings: List[str] = field(default_factory=list)
+    prior_grab: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -98,7 +98,6 @@ class WatchlistItem:
     web_data: Dict[str, Any] = field(default_factory=dict)
     group_key: str = ""
     is_duplicate_group: bool = False
-    downloaded_siblings: List[str] = field(default_factory=list)
 
 
 # ── Status constants ──────────────────────────────────────────────────
@@ -686,16 +685,28 @@ class ScannerService:
 
             normalized = normalize_title(details.get('display_title', ''))
             season = details.get('season')
-            downloaded_siblings = []
+            prior_grab = None
 
             if normalized:
                 lookup_key = f"{normalized}|S{season}" if season is not None else normalized
                 if lookup_key in self._downloaded_titles_lookup:
-                    for entry in self._downloaded_titles_lookup[lookup_key]:
-                        downloaded_siblings.append(f"{entry.get('resolution', '?')} - {entry.get('size', '?')}")
-                    # Mark as downloaded by title+season even if URL changed
-                    if status == ScanStatus.MISSING:
+                    entries = self._downloaded_titles_lookup[lookup_key]
+                    current_res = details.get('res', '')
+                    same_res = [e for e in entries if e.get('resolution', '') == current_res]
+                    diff_res = [e for e in entries if e.get('resolution', '') != current_res]
+
+                    # Same resolution grabbed before (URL may have changed) — mark downloaded
+                    if same_res and status == ScanStatus.MISSING:
                         status = ScanStatus.DOWNLOADED
+
+                    # Different resolution grabbed — surface as prior_grab without hiding item
+                    if diff_res:
+                        best = max(diff_res, key=lambda e: e.get('downloaded_at', ''))
+                        prior_grab = {
+                            'resolution': best.get('resolution', '?'),
+                            'size': best.get('size', '?'),
+                            'downloaded_at': best.get('downloaded_at', ''),
+                        }
 
             # Compute per-episode size for TV packs
             raw_size = details.get('size', '?')
@@ -737,7 +748,7 @@ class ScannerService:
                 language=details.get('language', ''),
                 web_data=details,
                 group_key=f"{normalized}|{details.get('year', 0) or 0}|S{season or 0}",
-                downloaded_siblings=downloaded_siblings,
+                prior_grab=prior_grab,
                 poster_path=details.get('poster_path'),
                 imdb_id=details.get('imdb_id'),
                 description=details.get('description', ''),
@@ -1084,7 +1095,7 @@ class ScannerService:
                 # Done in the same transaction to get a consistent snapshot.
                 self._downloaded_titles_lookup.clear()
                 title_rows = conn.execute(
-                    "SELECT normalized_title, season, resolution, size, url "
+                    "SELECT normalized_title, season, resolution, size, url, date_added "
                     "FROM downloads WHERE normalized_title IS NOT NULL "
                     "AND COALESCE(status, 'completed') != 'failed'"
                 ).fetchall()
@@ -1099,6 +1110,7 @@ class ScannerService:
                     'resolution': resolution,
                     'size': size,
                     'url': row[4] if len(row) > 4 else '',
+                    'downloaded_at': row[5] if len(row) > 5 else '',
                 })
 
             return urls

@@ -28,6 +28,7 @@ export interface ScanResult {
   posted_date: string | null;
   host_pref: string;
   is_duplicate_group: boolean;
+  prior_grab?: { resolution: string; size: string; downloaded_at: string } | null;
 }
 
 export interface ScanStats {
@@ -88,6 +89,20 @@ export interface RenameJob {
   detected_at: string | null;
   processed_at: string | null;
   reverted_at: string | null;
+  suggested_correction?: {
+    original: { season: number; episode: number; title?: string };
+    proposed: { season: number; episode: number; title?: string };
+  } | null;
+  combined_episode?: {
+    episode_start: number;
+    episode_end: number;
+    proposed_code: string;
+    runtime_match_pct: number;
+  } | null;
+  split_file?: {
+    part: number;
+    sibling_path: string;
+  } | null;
 }
 
 export interface RenameStatus {
@@ -311,6 +326,7 @@ export interface Settings {
   auto_rename_require_confirmation?: boolean;
   auto_rename_move_method?: string;
   auto_rename_movie_library?: string;
+  auto_rename_movie_library_4k?: string;
   auto_rename_tv_library?: string;
   auto_rename_template_movie?: string;
   auto_rename_template_tv?: string;

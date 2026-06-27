@@ -198,6 +198,66 @@ class TestLlmFallback:
         assert called["n"] == 0
 
 
+# ── accept proposal endpoints ─────────────────────────────────────────
+
+class TestAcceptProposals:
+    def _correction_job(self, db, tmp_path):
+        save_to, src = _extracted(tmp_path, "The.Show.S01E05.1080p.HDTV.x264.mkv")
+        return db.create_rename_job({
+            "package_name": "corr-pkg",
+            "original_path": src,
+            "original_filename": "The.Show.S01E05.1080p.HDTV.x264.mkv",
+            "media_type": "tv", "title": "The Show", "year": 2020,
+            "season": 1, "episode": 5, "tmdb_id": 1234, "resolution": "1080p",
+            "status": "needs_review",
+            "suggested_correction": {
+                "type": "episode_correction",
+                "original": {"season": 1, "episode": 5},
+                "proposed": {"season": 1, "episode": 7,
+                             "title": "Real Episode Name", "runtime": 42},
+                "confidence_gain": 30.0, "method": "runtime",
+            },
+        })
+
+    def test_accept_correction_uses_proposed_episode_title(self, db, tmp_path):
+        jid = self._correction_job(db, tmp_path)
+        out = _service(db, _matrix_search, tv_lib=str(tmp_path / "tv")).accept_correction(jid)
+        assert out["ok"] is True
+        # The corrected episode's TMDB title must appear in the new filename —
+        # not the original (wrong) episode's, and not be silently dropped.
+        assert out["new_filename"] == "The Show (2020) - S01E07 - Real Episode Name.mkv"
+        job = db.get_rename_job(jid)
+        assert job["status"] == "matched"
+        assert job["season"] == 1 and job["episode"] == 7
+        assert job["suggested_correction"] is None
+
+    def test_accept_correction_requires_a_proposal(self, db, tmp_path):
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        jid = db.create_rename_job({
+            "package_name": "p", "original_path": src,
+            "original_filename": "The.Matrix.1999.1080p.mkv", "status": "matched"})
+        out = _service(db, _matrix_search).accept_correction(jid)
+        assert out["ok"] is False
+
+    def test_accept_combined_promotes_without_renaming(self, db, tmp_path):
+        save_to, src = _extracted(tmp_path, "Show.S01E01E02.1080p.mkv")
+        jid = db.create_rename_job({
+            "package_name": "comb", "original_path": src,
+            "original_filename": "Show.S01E01E02.1080p.mkv",
+            "media_type": "tv", "title": "Show", "season": 1, "episode": 1,
+            "new_filename": "Show - S01E01E02.mkv", "status": "needs_review",
+            "combined_episode": {"episode_start": 1, "episode_end": 2,
+                                 "proposed_code": "E01E02", "runtime_match_pct": 2.0},
+        })
+        out = _service(db, _matrix_search).accept_combined(jid)
+        assert out["ok"] is True
+        job = db.get_rename_job(jid)
+        assert job["status"] == "matched"
+        assert job["combined_episode"] is None
+        # accept_combined trusts the filename built at detection time — unchanged.
+        assert job["new_filename"] == "Show - S01E01E02.mkv"
+
+
 # ── small units ───────────────────────────────────────────────────────
 
 class TestUnits:

@@ -6,6 +6,7 @@
   import { goto } from '$app/navigation';
   import Skeleton from '$lib/components/Skeleton.svelte';
   import ErrorCard from '$lib/components/ErrorCard.svelte';
+  import Tooltip from '$lib/components/Tooltip.svelte';
   import { resolutionLabel } from '$lib/constants';
 
   const TREND_OPTIONS = [7, 14, 30, 90] as const;
@@ -82,7 +83,32 @@
     }
   }
 
-  onMount(() => { loadData(); loadUpcoming(); loadScanHistory(); });
+  // Download stats aggregated from history
+  interface DownloadStats {
+    total: number;
+    completed: number;
+    clipboard: number;
+    browser: number;
+    failed: number;
+  }
+  let downloadStats = $state<DownloadStats | null>(null);
+
+  async function loadDownloadStats() {
+    try {
+      const hist = await api.downloadHistory(2000);
+      const s: DownloadStats = { total: hist.length, completed: 0, clipboard: 0, browser: 0, failed: 0 };
+      for (const h of hist) {
+        const st = (h.status || 'completed').toLowerCase();
+        if (st === 'completed') s.completed++;
+        else if (st === 'clipboard') s.clipboard++;
+        else if (st === 'browser') s.browser++;
+        else if (st === 'failed') s.failed++;
+      }
+      downloadStats = s;
+    } catch { /* ignore */ }
+  }
+
+  onMount(() => { loadData(); loadScanHistory(); loadDownloadStats(); });
 
   function formatSize(gb: number): string {
     if (gb >= 1024) return `${(gb / 1024).toFixed(1)} TB`;
@@ -104,18 +130,8 @@
   }
   let sections = $derived(buildSections(data));
 
-  // Upcoming releases from TMDB
-  let upcomingMovies = $state<{ id: number; title: string; year: string | null; poster_url: string; rating: number; overview: string }[]>([]);
-
   // Individual scan records
   let scanRecords = $state<{ id: number; timestamp: string; scan_type: string; items_scanned: number; missing_count: number; upgrade_count: number; duration_seconds: number; sources_scanned: string }[]>([]);
-
-  async function loadUpcoming() {
-    try {
-      const resp = await api.discover('upcoming');
-      upcomingMovies = resp.items?.slice(0, 12) ?? [];
-    } catch { /* silent */ }
-  }
 
   async function loadScanHistory() {
     try {
@@ -198,21 +214,62 @@
     <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
       <div class="bg-[var(--bg-secondary)] rounded-lg p-4 border border-[var(--border)] border-l-4" style="border-left-color: var(--accent);">
         <div class="text-2xl font-bold text-[var(--accent)]">{data.library.total_items}</div>
-        <div class="text-xs text-[var(--text-secondary)] mt-1">Total Items</div>
+        <Tooltip text="Total movies + TV episodes detected in your Plex library across all configured library sections.">
+          <div class="text-xs text-[var(--text-secondary)] mt-1 cursor-help underline decoration-dotted">Total Items ⓘ</div>
+        </Tooltip>
       </div>
       <div class="bg-[var(--bg-secondary)] rounded-lg p-4 border border-[var(--border)] border-l-4" style="border-left-color: var(--accent);">
         <div class="text-2xl font-bold text-[var(--accent)]">{formatSize(data.library.total_size_gb)}</div>
-        <div class="text-xs text-[var(--text-secondary)] mt-1">Total Size</div>
+        <Tooltip text="Combined disk footprint of all library files reported by Plex. Excludes items Plex hasn't indexed yet.">
+          <div class="text-xs text-[var(--text-secondary)] mt-1 cursor-help underline decoration-dotted">Total Size ⓘ</div>
+        </Tooltip>
       </div>
       <div class="bg-[var(--bg-secondary)] rounded-lg p-4 border border-[var(--border)] border-l-4" style="border-left-color: {qualityBorderColor(data.library.overall_quality_score)};">
         <div class="text-2xl font-bold" style="color: {qualityBorderColor(data.library.overall_quality_score)};">{data.library.overall_quality_score.toFixed(1)}</div>
-        <div class="text-xs text-[var(--text-secondary)] mt-1">Quality Score</div>
+        <Tooltip text="0–100 score weighting resolution (4K=100, 1080p=75, 720p=50), Dolby Vision (+15), HDR (+10), and upgrade potential (−points for items with available upgrades). Higher is better.">
+          <div class="text-xs text-[var(--text-secondary)] mt-1 cursor-help underline decoration-dotted">Quality Score ⓘ</div>
+        </Tooltip>
       </div>
       <div class="bg-[var(--bg-secondary)] rounded-lg p-4 border border-[var(--border)] border-l-4" style="border-left-color: var(--accent);">
         <div class="text-2xl font-bold text-[var(--accent)]">{scanSums.scans}</div>
-        <div class="text-xs text-[var(--text-secondary)] mt-1">Scans ({trendDays}d)</div>
+        <Tooltip text="Number of full or partial scans run during this period. Each scan compares scraped results against your Plex library.">
+          <div class="text-xs text-[var(--text-secondary)] mt-1 cursor-help underline decoration-dotted">Scans ({trendDays}d) ⓘ</div>
+        </Tooltip>
       </div>
     </div>
+
+    <!-- Download stats -->
+    {#if downloadStats}
+    <div class="bg-[var(--bg-secondary)] rounded-lg p-4 border border-[var(--border)]">
+      <h2 class="text-sm font-semibold mb-3">Download History</h2>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
+        <div>
+          <div class="text-lg font-bold text-[var(--accent)]">{downloadStats.total}</div>
+          <Tooltip text="Total entries in the download history, across all methods (JDownloader, clipboard, browser).">
+            <div class="text-[var(--text-secondary)] cursor-help underline decoration-dotted">Total Grabbed ⓘ</div>
+          </Tooltip>
+        </div>
+        <div>
+          <div class="text-lg font-bold text-[var(--success)]">{downloadStats.completed}</div>
+          <Tooltip text="Successfully sent to JDownloader for download.">
+            <div class="text-[var(--text-secondary)] cursor-help underline decoration-dotted">Via JDownloader ⓘ</div>
+          </Tooltip>
+        </div>
+        <div>
+          <div class="text-lg font-bold">{downloadStats.clipboard + downloadStats.browser}</div>
+          <Tooltip text="Links copied to clipboard or opened in browser instead of JDownloader (manual download fallback).">
+            <div class="text-[var(--text-secondary)] cursor-help underline decoration-dotted">Manual ⓘ</div>
+          </Tooltip>
+        </div>
+        <div>
+          <div class="text-lg font-bold text-[var(--error)]">{downloadStats.failed}</div>
+          <Tooltip text="Attempts where ScanHound couldn't extract or deliver download links.">
+            <div class="text-[var(--text-secondary)] cursor-help underline decoration-dotted">Failed ⓘ</div>
+          </Tooltip>
+        </div>
+      </div>
+    </div>
+    {/if}
 
     <!-- Library breakdown -->
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -308,7 +365,9 @@
             <!-- Upgrade Potential bar -->
             <div class="pt-2 border-t border-[var(--border)]">
               <div class="flex justify-between mb-1">
-                <span class="text-[var(--text-secondary)]" title="Percentage of your library that could be upgraded to higher quality">Upgrade Potential</span>
+                <Tooltip text="Percentage of items in this section where ScanHound found a higher-quality version available (e.g. you have 1080p but 4K is indexed). 0% means your library is at peak quality for what's available.">
+                  <span class="text-[var(--text-secondary)] cursor-help underline decoration-dotted">Upgrade Potential ⓘ</span>
+                </Tooltip>
                 <span>{stats.upgrade_potential.toFixed(0)}%</span>
               </div>
               <div class="w-full h-1.5 bg-[var(--bg-tertiary)] rounded-full overflow-hidden">
@@ -409,37 +468,6 @@
               {/each}
             </tbody>
           </table>
-        </div>
-      </div>
-    {/if}
-
-    <!-- Upcoming Releases (Calendar) -->
-    {#if upcomingMovies.length > 0}
-      <div class="bg-[var(--bg-secondary)] rounded-lg p-4 border border-[var(--border)]">
-        <h2 class="text-sm font-semibold mb-3">Upcoming Releases</h2>
-        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
-          {#each upcomingMovies as movie}
-            <a
-              href="https://www.themoviedb.org/movie/{movie.id}"
-              target="_blank"
-              rel="noopener"
-              class="group"
-              title={movie.overview || movie.title}
-            >
-              {#if movie.poster_url}
-                <img
-                  src={movie.poster_url}
-                  alt={movie.title}
-                  class="w-full aspect-[2/3] object-cover rounded-lg border border-[var(--border)] group-hover:border-[var(--accent)] transition-colors"
-                  loading="lazy"
-                />
-              {:else}
-                <div class="w-full aspect-[2/3] bg-[var(--bg-tertiary)] rounded-lg flex items-center justify-center text-[var(--text-secondary)] text-xs">No poster</div>
-              {/if}
-              <p class="text-[10px] font-medium text-[var(--text-primary)] truncate mt-1">{movie.title}</p>
-              <p class="text-[10px] text-[var(--text-secondary)] opacity-60">{movie.year ?? 'TBA'}{movie.rating ? ` · ${movie.rating.toFixed(1)}` : ''}</p>
-            </a>
-          {/each}
         </div>
       </div>
     {/if}

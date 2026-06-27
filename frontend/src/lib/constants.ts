@@ -10,6 +10,7 @@ export const STATUS_VARIANTS: Record<string, BadgeVariant> = {
   dv_upgrade: 'accent',
   in_library: 'success',
   downloaded: 'accent',
+  downloading: 'info',
 };
 
 /** Human-readable label for scan result status. */
@@ -20,6 +21,7 @@ const STATUS_LABELS: Record<string, string> = {
   dv_upgrade: 'DV Upgrade',
   in_library: 'In Library',
   downloaded: 'Downloaded',
+  downloading: 'Downloading',
 };
 
 export function formatStatus(status: string | null | undefined): string {
@@ -44,6 +46,7 @@ export function statusBorderColor(status: string | null | undefined): string {
     case 'warning': return 'var(--warning)';
     case 'success': return 'var(--success)';
     case 'accent': return 'var(--accent)';
+    case 'info': return '#3b82f6';
     default: return 'var(--border)';
   }
 }

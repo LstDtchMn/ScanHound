@@ -76,6 +76,24 @@ def rematch_job(job_id: int, body: RematchRequest,
     return out
 
 
+@router.post("/jobs/{job_id}/accept-combined")
+def accept_combined(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
+    """Accept a combined-episode detection proposal — promotes job to matched."""
+    out = _service(reg).accept_combined(job_id)
+    if not out.get("ok"):
+        raise HTTPException(status_code=400, detail=out.get("error", "Accept failed"))
+    return out
+
+
+@router.post("/jobs/{job_id}/accept-correction")
+def accept_correction(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
+    """Accept an episode correction proposal — updates S/E, promotes job to matched."""
+    out = _service(reg).accept_correction(job_id)
+    if not out.get("ok"):
+        raise HTTPException(status_code=400, detail=out.get("error", "Accept failed"))
+    return out
+
+
 @router.delete("/jobs/{job_id}")
 def delete_job(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
     if reg.db is None:

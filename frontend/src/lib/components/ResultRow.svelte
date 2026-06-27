@@ -4,7 +4,7 @@
   import { settings } from '$lib/stores/settings';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
-  import { downloadHost, activeDownload } from '$lib/stores/downloads';
+  import { downloadHost, activeDownload, downloadingTitles } from '$lib/stores/downloads';
   import { density, visibleColumns } from '$lib/stores/results';
   import { statusVariant, statusBorderColor, formatStatus, formatCount, DOWNLOAD_HOSTS } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
@@ -41,6 +41,22 @@
   let isDownloading = $derived(
     !!item.url && $activeDownload?.url === item.url && $activeDownload?.status !== 'complete'
   );
+
+  let effectiveStatus = $derived($downloadingTitles.has(item.title) ? 'downloading' : item.status);
+
+  // Poster hover-to-enlarge state
+  let posterHovered = $state(false);
+  let enlargedStyle = $state('');
+
+  function onPosterEnter(e: MouseEvent) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const scale = 2.5;
+    const w = r.width * scale;
+    const h = r.height * scale;
+    enlargedStyle = `left:${r.left + r.width / 2 - w / 2}px;top:${r.top + r.height / 2 - h / 2}px;width:${w}px;height:${h}px;`;
+    posterHovered = true;
+  }
+  function onPosterLeave() { posterHovered = false; }
 
   // Parse plex_versions JSON into badge data
   interface PlexVersion { res: string; hdr: string; dovi: boolean; size: string }
@@ -112,7 +128,7 @@
   class="border-b border-[var(--border)] hover:bg-[var(--bg-tertiary)] transition-colors cursor-pointer
     {selected ? 'bg-[var(--accent)]/5' : (zebra ? 'bg-[var(--bg-secondary)]/40' : '')}
     {focused ? 'outline outline-2 outline-[var(--accent)] -outline-offset-2' : ''}"
-  style="border-left: 3px solid {statusBorderColor(item.status)};"
+  style="border-left: 3px solid {statusBorderColor(effectiveStatus)};"
   onclick={() => selectedDetail.set(item)}
   oncontextmenu={ctxHandler}
 >
@@ -121,7 +137,13 @@
   </td>
   <td class="{cellPad} hidden sm:table-cell" style="width:{posterW + 8}px;">
     {#if item.poster_url}
-      <img src={item.poster_url} alt="" class="object-cover rounded shadow-sm" style="width:{posterW}px; height:{posterH}px;" loading="lazy" />
+      <img src={item.poster_url} alt="" class="object-cover rounded shadow-sm cursor-zoom-in" style="width:{posterW}px; height:{posterH}px;" loading="lazy"
+        onmouseenter={onPosterEnter} onmouseleave={onPosterLeave} />
+      {#if posterHovered}
+        <img src={item.poster_url} alt="" aria-hidden="true"
+          style="position:fixed;{enlargedStyle}z-index:9999;pointer-events:none;border-radius:10px;object-fit:cover;box-shadow:0 25px 60px -8px rgba(0,0,0,0.8);"
+          loading="eager" />
+      {/if}
     {:else}
       <div class="bg-[var(--bg-tertiary)] rounded" style="width:{posterW}px; height:{posterH}px;"></div>
     {/if}
@@ -154,6 +176,14 @@
             {#if pv.size}<span class="text-[var(--text-secondary)]">{pv.size}GB</span>{/if}
           </span>
         {/each}
+      </div>
+    {/if}
+    <!-- Previously grabbed (different resolution) -->
+    {#if item.prior_grab}
+      <div class="inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-[10px] text-amber-500 whitespace-nowrap"
+           title="A different version of this title was already sent to JDownloader">
+        <svg class="w-3 h-3 flex-shrink-0" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 3v7m0 0-3-3m3 3 3-3"/><rect x="2" y="11.5" width="12" height="2" rx="1"/></svg>
+        Grabbed: {item.prior_grab.resolution}{#if item.prior_grab.size} · {item.prior_grab.size}{/if}
       </div>
     {/if}
   </td>
@@ -189,7 +219,7 @@
   {/if}
   {#if cols.status}
   <td class="{cellPad}">
-    <Badge label={formatStatus(item.status)} variant={statusVariant(item.status)} />
+    <Badge label={formatStatus(effectiveStatus)} variant={statusVariant(effectiveStatus)} />
   </td>
   {/if}
   <td class="{cellPad}">

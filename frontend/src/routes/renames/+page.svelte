@@ -2,7 +2,8 @@
   import { onMount } from 'svelte';
   import {
     renameJobs, renameStatus, loadRenameJobs, loadRenameStatus,
-    applyJob, undoJob, deleteJob
+    applyJob, undoJob, deleteJob, rematchJob,
+    acceptCombinedJob, acceptCorrectionJob
   } from '$lib/stores/renames';
   import { addToast } from '$lib/stores/notifications';
   import type { RenameJob } from '$lib/api/types';
@@ -46,6 +47,40 @@
     } finally {
       busy = null;
     }
+  }
+
+  // Rematch state — one job can have its form open at a time
+  let rematchOpenId = $state<number | null>(null);
+  let rematchTmdbInput = $state('');
+  let rematchMediaType = $state<'movie' | 'tv'>('movie');
+  let rematchBusy = $state(false);
+
+  function openRematch(job: RenameJob) {
+    rematchOpenId = job.id;
+    rematchTmdbInput = '';
+    rematchMediaType = (job.media_type === 'tv' || job.media_type === 'show') ? 'tv' : 'movie';
+  }
+
+  async function submitRematch(jobId: number) {
+    const id = parseInt(rematchTmdbInput.trim(), 10);
+    if (!id || isNaN(id)) { addToast('Rematch', 'Enter a valid TMDB ID', 'error'); return; }
+    rematchBusy = true;
+    try {
+      await rematchJob(jobId, id, rematchMediaType);
+      addToast('Rematch', 'Re-matched successfully');
+      rematchOpenId = null;
+    } catch {
+      addToast('Rematch', 'Rematch failed', 'error');
+    } finally {
+      rematchBusy = false;
+    }
+  }
+
+  function tmdbSearchUrl(job: RenameJob): string {
+    // Strip extension + quality tags for a cleaner search query
+    const raw = job.original_filename ?? '';
+    const base = raw.replace(/\.[^.]+$/, '').replace(/[._]?(1080p|2160p|4K|BluRay|WEB[-.]DL|HDTV|x264|x265|HEVC|AAC|AC3|DTS|H\.?264|H\.?265).*/i, '').replace(/[._]/g, ' ').trim();
+    return `https://www.themoviedb.org/search?query=${encodeURIComponent(base || raw)}`;
   }
 
   function relTime(s: string | null): string {
@@ -134,6 +169,29 @@
                 <button onclick={() => run(job.id, applyJob, 'Applied')} disabled={busy === job.id}
                   class="px-2.5 py-1 text-xs rounded-lg bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50">Apply</button>
               {/if}
+              {#if job.status === 'needs_review' || job.status === 'failed'}
+                <button
+                  onclick={() => rematchOpenId === job.id ? (rematchOpenId = null) : openRematch(job)}
+                  class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]"
+                  title="Re-match to a different TMDB title"
+                >Rematch</button>
+              {/if}
+              {#if job.status === 'needs_review' && job.combined_episode}
+                <button
+                  onclick={() => run(job.id, acceptCombinedJob, 'Accepted as combined')}
+                  disabled={busy === job.id}
+                  class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
+                  title="Confirm this is a combined double-episode file"
+                >Accept {job.combined_episode.proposed_code}</button>
+              {/if}
+              {#if job.status === 'needs_review' && job.suggested_correction}
+                <button
+                  onclick={() => run(job.id, acceptCorrectionJob, 'Correction applied')}
+                  disabled={busy === job.id}
+                  class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
+                  title="Use the proposed episode correction"
+                >Accept S{String(job.suggested_correction.proposed.season).padStart(2,'0')}E{String(job.suggested_correction.proposed.episode).padStart(2,'0')}</button>
+              {/if}
               {#if job.status === 'applied'}
                 <button onclick={() => run(job.id, undoJob, 'Reverted')} disabled={busy === job.id}
                   class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50">Undo</button>
@@ -142,6 +200,32 @@
                 class="px-2.5 py-1 text-xs rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50">Remove</button>
             </div>
           </div>
+          {#if rematchOpenId === job.id}
+            <div class="mt-2 p-3 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-xs space-y-2">
+              <p class="text-[var(--text-secondary)]">Find the correct entry on TMDB, then paste its numeric ID here.</p>
+              <a href={tmdbSearchUrl(job)} target="_blank" rel="noopener" class="inline-flex items-center gap-1 text-[var(--accent)] hover:underline">
+                Search TMDB ↗
+              </a>
+              <div class="flex items-center gap-2 flex-wrap">
+                <select bind:value={rematchMediaType} class="px-2 py-1 rounded bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]">
+                  <option value="movie">Movie</option>
+                  <option value="tv">TV Show</option>
+                </select>
+                <input
+                  type="number"
+                  bind:value={rematchTmdbInput}
+                  placeholder="TMDB ID (e.g. 550)"
+                  class="flex-1 min-w-0 px-2 py-1 rounded bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-primary)] placeholder:text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)]"
+                  onkeydown={(e) => e.key === 'Enter' && submitRematch(job.id)}
+                />
+                <button onclick={() => submitRematch(job.id)} disabled={rematchBusy}
+                  class="px-2.5 py-1 rounded bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50">
+                  {rematchBusy ? '…' : 'Submit'}
+                </button>
+                <button onclick={() => (rematchOpenId = null)} class="px-2.5 py-1 rounded text-[var(--text-secondary)] hover:bg-[var(--border)]">Cancel</button>
+              </div>
+            </div>
+          {/if}
         </li>
       {/each}
     </ul>

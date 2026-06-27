@@ -411,12 +411,26 @@ def create_app(
     if _os.path.isfile(index_file):
         from fastapi.responses import FileResponse
 
+        _root = _os.path.normpath(frontend_dir)
+        _immutable = _os.path.normpath(_os.path.join(frontend_dir, "_app", "immutable"))
+
+        def _within(path: str, base: str) -> bool:
+            # Real containment check — a bare startswith would let a sibling like
+            # ".../build-evil" or ".../immutable-x" pass the prefix test.
+            return path == base or path.startswith(base + _os.sep)
+
         @app.get("/{full_path:path}")
         async def _serve_spa(full_path: str):
             candidate = _os.path.normpath(_os.path.join(frontend_dir, full_path))
-            if candidate.startswith(_os.path.normpath(frontend_dir)) and _os.path.isfile(candidate):
-                return FileResponse(candidate)
-            return FileResponse(index_file)  # SPA fallback for client-side routes
+            if _within(candidate, _root) and _os.path.isfile(candidate):
+                # Vite hashes immutable assets — safe to cache forever at CDN + browser.
+                if _within(candidate, _immutable):
+                    hdrs = {"Cache-Control": "public, max-age=31536000, immutable"}
+                else:
+                    hdrs = {"Cache-Control": "no-cache"}
+                return FileResponse(candidate, headers=hdrs)
+            # SPA fallback — index.html must never be cached so deploys take effect immediately.
+            return FileResponse(index_file, headers={"Cache-Control": "no-cache"})
 
         logger.info("Serving frontend from %s", frontend_dir)
 

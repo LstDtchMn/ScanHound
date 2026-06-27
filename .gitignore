@@ -64,3 +64,7 @@ frontend/src-tauri/gen/
 # Rotated logs
 *.log
 scanner.log.*
+
+# Build output (regenerated inside Docker at image-build time — never committed)
+frontend/build/
+backend/frontend/

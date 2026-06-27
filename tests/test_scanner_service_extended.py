@@ -735,11 +735,45 @@ class TestCreateMediaItemExtended:
             downloaded_titles_lookup=lookup,
         )
         assert item is not None
+        # Same resolution previously grabbed → still flagged Downloaded even
+        # though the URL changed; no prior_grab note (it's the same version).
         assert item.status == ScanStatus.DOWNLOADED
         assert item.status_text == STATUS_TEXTS[ScanStatus.DOWNLOADED]
         assert item.color == STATUS_COLORS[ScanStatus.DOWNLOADED]
-        assert len(item.downloaded_siblings) == 1
-        assert "1080p" in item.downloaded_siblings[0]
+        assert item.prior_grab is None
+
+    def test_prior_grab_set_for_different_resolution(self):
+        """A different-resolution prior grab surfaces as prior_grab and the
+        item stays visible (not silently marked Downloaded)."""
+        details = {
+            "display_title": "Some Show",
+            "year": 0,
+            "season": 1,
+            "size": "45 GB",
+            "res": "4K",
+            "hdr": "SDR",
+            "dovi": False,
+        }
+        from backend.app_service import normalize_title
+        lookup_key = f"{normalize_title('Some Show')}|S1"
+        lookup = {
+            lookup_key: [
+                {"resolution": "1080p", "size": "20 GB", "downloaded_at": "2026-06-20 10:00:00"},
+                {"resolution": "720p", "size": "8 GB", "downloaded_at": "2026-06-25 12:00:00"},
+            ],
+        }
+        item = self._call(
+            details,
+            url="http://example.com/4k-url",
+            downloaded_titles_lookup=lookup,
+        )
+        assert item is not None
+        # 4K was never grabbed → stays Missing, but shows what WAS grabbed
+        assert item.status == ScanStatus.MISSING
+        assert item.prior_grab is not None
+        # Most-recent different-resolution grab wins (720p @ 06-25 > 1080p @ 06-20)
+        assert item.prior_grab["resolution"] == "720p"
+        assert item.prior_grab["size"] == "8 GB"
 
     def test_invalid_result_returns_none(self):
         """A result dict missing 'details' entirely should return None."""
@@ -898,10 +932,12 @@ class TestDownloadHistoryPersistence:
 
         assert f"{norm}|S2" in svc._downloaded_titles_lookup
         assert item is not None
+        # Same resolution (1080p) persisted across restart → Downloaded, and
+        # since it's the same version there is no prior_grab upgrade note.
         assert item.status == ScanStatus.DOWNLOADED
         assert item.status_text == STATUS_TEXTS[ScanStatus.DOWNLOADED]
         assert item.color == STATUS_COLORS[ScanStatus.DOWNLOADED]
-        assert item.downloaded_siblings
+        assert item.prior_grab is None
         db2.close()
 
 

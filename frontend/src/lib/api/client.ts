@@ -317,6 +317,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ tmdb_id: tmdbId, media_type: mediaType ?? null })
     }),
+  acceptCombinedRename: (id: number) =>
+    request<{ ok: boolean }>(`/rename/jobs/${id}/accept-combined`, { method: 'POST' }),
+  acceptCorrectionRename: (id: number) =>
+    request<{ ok: boolean; new_filename?: string }>(`/rename/jobs/${id}/accept-correction`, { method: 'POST' }),
   deleteRenameJob: (id: number) =>
     request<{ ok: boolean }>(`/rename/jobs/${id}`, { method: 'DELETE' }),
   testOllama: () =>

@@ -1,4 +1,4 @@
-import { writable } from 'svelte/store';
+import { writable, derived } from 'svelte/store';
 import { connection } from './connection';
 import { markDownloaded } from './results';
 import { DOWNLOAD_HOSTS } from '$lib/constants';
@@ -222,3 +222,21 @@ function createDownloadQueue() {
 }
 
 export const downloadQueue = createDownloadQueue();
+
+// Set of titles currently in-flight (resolving/downloading) or queued (sending/sent).
+// Used by result components to overlay a "Downloading" status on the whole title group.
+export const downloadingTitles = derived(
+  [activeDownload, downloadQueue],
+  ([$active, $queue]) => {
+    const titles = new Set<string>();
+    if ($active && $active.status !== 'complete' && $active.status !== 'error' && $active.title) {
+      titles.add($active.title);
+    }
+    for (const item of $queue) {
+      if (item.status === 'sending' || item.status === 'sent') {
+        titles.add(item.title);
+      }
+    }
+    return titles;
+  }
+);

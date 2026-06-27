@@ -16,6 +16,7 @@
   import { settings, settingsLoaded, loadSettings } from '$lib/stores/settings';
   import { plexConnected, plexMovieCount, plexTvCount, refreshPlexStatus } from '$lib/stores/plex';
   import { batchProgress } from '$lib/stores/downloads';
+  import Badge from '$lib/components/Badge.svelte';
   import { jdConnection, refreshJdConnection } from '$lib/stores/jdownloader';
   import { api } from '$lib/api/client';
   import { onMount } from 'svelte';
@@ -91,7 +92,8 @@
   let mobileActionItem = $state<ScanResult | null>(null);
   let currentPage = $state(1);
   const perPage = 100;
-  let collapsedGroups = $state<Set<string>>(new Set());
+  // Track which multi-item groups the user has explicitly expanded; all others start collapsed
+  let expandedGroups = $state<Set<string>>(new Set());
   let resultsContainer: HTMLDivElement | undefined = $state();
 
   let tileColumns = $derived(($settings.tile_columns as number) || 0);
@@ -141,9 +143,74 @@
   }
 
   function toggleGroup(title: string) {
-    collapsedGroups = new Set(collapsedGroups);
-    if (collapsedGroups.has(title)) collapsedGroups.delete(title);
-    else collapsedGroups.add(title);
+    expandedGroups = new Set(expandedGroups);
+    if (expandedGroups.has(title)) expandedGroups.delete(title);
+    else expandedGroups.add(title);
+  }
+
+  function isGroupExpanded(group: ResultGroup): boolean {
+    return !isDuplicateGroup(group) || expandedGroups.has(group.title);
+  }
+
+  function parseSizeGB(size: string | undefined): number {
+    if (!size) return 0;
+    const m = size.match(/([\d.]+)\s*(GB|MB|TB)/i);
+    if (!m) return 0;
+    const v = parseFloat(m[1]);
+    if (m[2].toUpperCase() === 'MB') return v / 1024;
+    if (m[2].toUpperCase() === 'TB') return v * 1024;
+    return v;
+  }
+
+  function groupSizeRange(items: ScanResult[]): string {
+    const sizes = items.map(i => parseSizeGB(i.size)).filter(s => s > 0);
+    if (!sizes.length) return '';
+    const min = Math.min(...sizes);
+    const max = Math.max(...sizes);
+    const fmt = (gb: number) => gb < 1 ? `${Math.round(gb * 1024)} MB` : `${gb.toFixed(1)} GB`;
+    return Math.abs(max - min) < 0.05 ? (items[0].size || '') : `${fmt(min)} – ${fmt(max)}`;
+  }
+
+  function shortDate(d: string): string {
+    if (!d) return '';
+    // "June 25, 2026 at 02:55 PM" → "Jun 25"
+    const m = d.match(/^(\w{3})\w*\s+(\d+)/);
+    if (m) return `${m[1]} ${m[2]}`;
+    return d.split(' at ')[0].replace(/,?\s*\d{4}/, '').trim();
+  }
+
+  function groupDateRange(items: ScanResult[]): string {
+    const dates = items.map(i => i.posted_date).filter(Boolean) as string[];
+    if (!dates.length) return '';
+    // Sort chronologically, not lexically: "July 3" must come after "June 25"
+    // (a plain string sort puts "July" before "June"). Parse to a timestamp,
+    // dropping the " at " so Date can read "June 25, 2026 02:55 PM".
+    const ts = (d: string) => {
+      const t = Date.parse(d.replace(' at ', ' '));
+      return Number.isNaN(t) ? 0 : t;
+    };
+    const unique = [...new Set(dates)].sort((a, b) => ts(a) - ts(b));
+    const first = shortDate(unique[0]);
+    if (unique.length === 1) return first;
+    const last = shortDate(unique[unique.length - 1]);
+    return first === last ? first : `${first} – ${last}`;
+  }
+
+  interface GroupFormats { res: string[]; dv: boolean; hdr: boolean; }
+  function groupFormats(items: ScanResult[]): GroupFormats {
+    const resSet = new Set<string>();
+    let dv = false, hdr = false;
+    for (const it of items) {
+      if (it.resolution) resSet.add(it.resolution === '2160p' ? '4K' : it.resolution);
+      if (it.dovi) dv = true;
+      if (it.hdr && it.hdr !== 'SDR' && !it.dovi) hdr = true;
+    }
+    const order = ['4K', '1080p', '720p', '480p'];
+    const res = [...resSet].sort((a, b) => {
+      const ai = order.indexOf(a), bi = order.indexOf(b);
+      return (ai === -1 ? 9 : ai) - (bi === -1 ? 9 : bi);
+    });
+    return { res, dv, hdr };
   }
 
   // Reset page and keyboard focus when filter changes
@@ -210,7 +277,7 @@
   let flatVisibleItems = $derived(() => {
     const items: ScanResult[] = [];
     for (const group of groupedResults()) {
-      if (!collapsedGroups.has(group.title)) {
+      if (isGroupExpanded(group)) {
         items.push(...group.items);
       }
     }
@@ -222,7 +289,7 @@
     const map = new Map<ScanResult, number>();
     let i = 0;
     for (const group of groupedResults()) {
-      if (!collapsedGroups.has(group.title)) {
+      if (isGroupExpanded(group)) {
         for (const item of group.items) {
           map.set(item, i++);
         }
@@ -351,16 +418,57 @@
           <section class="mb-2" style="grid-column: 1 / -1;">
             <button
               type="button"
-              class="flex w-full items-center gap-2 mb-2 mt-4 first:mt-0 cursor-pointer select-none text-left"
+              class="flex w-full items-center gap-3 mb-2 mt-4 first:mt-0 cursor-pointer select-none text-left rounded-lg border transition-colors
+                {isGroupExpanded(group)
+                  ? 'border-transparent py-0 bg-transparent'
+                  : 'border-[var(--border)] hover:border-[var(--text-secondary)] bg-[var(--bg-secondary)] p-2'}"
               onclick={() => toggleGroup(group.title)}
             >
-              <span class="text-[10px] text-[var(--text-secondary)] transition-transform {collapsedGroups.has(group.title) ? '' : 'rotate-90'}">&triangleright;</span>
-              <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>
-              <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
-                {siblingCounts().get(group.title)} releases
-              </span>
+              {#if !isGroupExpanded(group)}
+                {@const fmts = groupFormats(group.items)}
+                <!-- Collapsed summary — looks like a mini result row -->
+                {#if group.items[0].poster_url}
+                  <img src={group.items[0].poster_url} alt="" class="h-14 w-9 object-cover rounded flex-shrink-0" loading="lazy" />
+                {:else}
+                  <div class="h-14 w-9 bg-[var(--bg-tertiary)] rounded flex-shrink-0"></div>
+                {/if}
+                <div class="flex-1 min-w-0">
+                  <!-- Row 1: title + year + count -->
+                  <div class="flex items-center gap-2 flex-wrap">
+                    <span class="text-sm font-semibold truncate">{group.title}</span>
+                    {#if group.items[0].year}<span class="text-[var(--text-secondary)] text-sm font-normal">({group.items[0].year})</span>{/if}
+                    <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)] flex-shrink-0">
+                      {siblingCounts().get(group.title)} releases
+                    </span>
+                  </div>
+                  <!-- Row 2: rating + format badges -->
+                  <div class="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                    {#if group.items[0].rating != null}
+                      <span class="text-xs text-[var(--text-secondary)]">⭐ {group.items[0].rating.toFixed(1)}</span>
+                    {/if}
+                    {#each fmts.res as r}
+                      <span class="text-[10px] px-1 py-0.5 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-medium">{r}</span>
+                    {/each}
+                    {#if fmts.dv}<span class="text-[10px] px-1 py-0.5 rounded bg-purple-500/20 text-purple-400 font-medium">DV</span>{/if}
+                    {#if fmts.hdr}<span class="text-[10px] px-1 py-0.5 rounded bg-amber-500/20 text-amber-400 font-medium">HDR</span>{/if}
+                  </div>
+                  <!-- Row 3: size range + short date range -->
+                  <div class="flex items-center gap-2 mt-0.5 text-xs text-[var(--text-secondary)]">
+                    {#if groupSizeRange(group.items)}<span>{groupSizeRange(group.items)}</span>{/if}
+                    {#if groupDateRange(group.items)}<span class="opacity-60">&middot; {groupDateRange(group.items)}</span>{/if}
+                  </div>
+                </div>
+                <span class="text-[10px] text-[var(--text-secondary)] flex-shrink-0">&#9654;</span>
+              {:else}
+                <!-- Expanded header — compact text row -->
+                <span class="text-[10px] text-[var(--text-secondary)] transition-transform rotate-90">&triangleright;</span>
+                <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
+                  {siblingCounts().get(group.title)} releases
+                </span>
+              {/if}
             </button>
-            {#if !collapsedGroups.has(group.title)}
+            {#if isGroupExpanded(group)}
               <div class="grid gap-4" style={gridStyle} transition:slide={{ duration: 150 }}>
                 {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
                   <div oncontextmenu={(e) => handleContextMenu(e, item)}>
@@ -398,25 +506,87 @@
       <tbody>
         {#each groupedResults() as group (group.title)}
           {#if isDuplicateGroup(group)}
-            <tr
-              class="cursor-pointer select-none hover:bg-[var(--bg-tertiary)]"
-              onclick={() => toggleGroup(group.title)}
-              onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleGroup(group.title))}
-              tabindex="0"
-              role="button"
-            >
-              <td colspan="99" class="px-2 py-1.5">
-                <div class="flex items-center gap-2">
-                  <span class="text-[10px] text-[var(--text-secondary)] transition-transform {collapsedGroups.has(group.title) ? '' : 'rotate-90'}">&triangleright;</span>
-                  <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>
-                  <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
-                    {siblingCounts().get(group.title)} releases
-                  </span>
-                </div>
-              </td>
-            </tr>
+            {#if !isGroupExpanded(group)}
+              {@const fmtsL = groupFormats(group.items)}
+              <!-- Collapsed: looks like a real result row with range metadata -->
+              <tr
+                class="cursor-pointer select-none border-b border-[var(--border)] hover:bg-[var(--bg-tertiary)] transition-colors"
+                style="border-left: 3px solid var(--border);"
+                onclick={() => toggleGroup(group.title)}
+                onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleGroup(group.title))}
+                tabindex="0"
+                role="button"
+              >
+                <td class="p-2 w-8 text-center">
+                  <span class="text-[10px] text-[var(--text-secondary)]">&#9654;</span>
+                </td>
+                <td class="p-2 hidden sm:table-cell" style="width:72px;">
+                  {#if group.items[0].poster_url}
+                    <img src={group.items[0].poster_url} alt="" class="object-cover rounded shadow-sm"
+                      style="width:64px;height:96px;" loading="lazy" />
+                  {:else}
+                    <div class="bg-[var(--bg-tertiary)] rounded" style="width:64px;height:96px;"></div>
+                  {/if}
+                </td>
+                <td class="p-2 max-w-[640px] overflow-hidden">
+                  <div class="flex items-center gap-2 flex-wrap">
+                    <span class="text-sm font-semibold truncate">{group.title}</span>
+                    {#if group.items[0].year}<span class="text-[var(--text-secondary)] text-sm font-normal">({group.items[0].year})</span>{/if}
+                    <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)] flex-shrink-0">
+                      {siblingCounts().get(group.title)} releases
+                    </span>
+                  </div>
+                  {#if groupDateRange(group.items)}
+                    <div class="text-[11px] text-[var(--text-secondary)] mt-0.5 opacity-60">{groupDateRange(group.items)}</div>
+                  {/if}
+                </td>
+                {#if cols.rating}
+                  <td class="p-2 text-sm">
+                    {#if group.items[0].rating != null}
+                      <div class="flex items-center gap-1 whitespace-nowrap">
+                        <span>⭐</span>
+                        <span class="font-medium">{group.items[0].rating.toFixed(1)}</span>
+                      </div>
+                    {/if}
+                  </td>
+                {/if}
+                {#if cols.res}
+                  <td class="p-2 hidden md:table-cell">
+                    <div class="flex items-center gap-1 flex-wrap">
+                      {#each fmtsL.res as r}
+                        <span class="text-[10px] px-1 py-0.5 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-medium">{r}</span>
+                      {/each}
+                      {#if fmtsL.dv}<span class="text-[10px] px-1 py-0.5 rounded bg-purple-500/20 text-purple-400 font-medium">DV</span>{/if}
+                      {#if fmtsL.hdr}<span class="text-[10px] px-1 py-0.5 rounded bg-amber-500/20 text-amber-400 font-medium">HDR</span>{/if}
+                    </div>
+                  </td>
+                {/if}
+                {#if cols.size}<td class="p-2 text-sm text-[var(--text-secondary)] hidden lg:table-cell">{groupSizeRange(group.items)}</td>{/if}
+                {#if cols.status}<td class="p-2"></td>{/if}
+                <td class="p-2"></td>
+              </tr>
+            {:else}
+              <!-- Expanded header row -->
+              <tr
+                class="cursor-pointer select-none hover:bg-[var(--bg-tertiary)]"
+                onclick={() => toggleGroup(group.title)}
+                onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleGroup(group.title))}
+                tabindex="0"
+                role="button"
+              >
+                <td colspan="99" class="px-2 py-1.5">
+                  <div class="flex items-center gap-2">
+                    <span class="text-[10px] text-[var(--text-secondary)] transition-transform rotate-90">&triangleright;</span>
+                    <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>
+                    <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
+                      {siblingCounts().get(group.title)} releases
+                    </span>
+                  </div>
+                </td>
+              </tr>
+            {/if}
           {/if}
-          {#if !collapsedGroups.has(group.title)}
+          {#if isGroupExpanded(group)}
             {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
               <ResultRow {item} focused={flatIndexMap().get(item) === $focusedIndex} zebra={((flatIndexMap().get(item) ?? 0) % 2) === 1} oncontextmenu={(e) => handleContextMenu(e, item)} />
             {/each}

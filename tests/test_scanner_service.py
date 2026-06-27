@@ -125,9 +125,9 @@ class TestMediaItem:
         item = MediaItem(id="x", title="X", year=2024)
         assert item.is_duplicate_group is False
 
-    def test_downloaded_siblings_defaults_empty(self):
+    def test_prior_grab_defaults_none(self):
         item = MediaItem(id="x", title="X", year=2024)
-        assert item.downloaded_siblings == []
+        assert item.prior_grab is None
 
     def test_plex_info_default(self):
         item = MediaItem(id="x", title="X", year=2024)
@@ -145,7 +145,7 @@ class TestMediaItem:
             "plex_info", "plex_versions", "plex_rating_key", "selected",
             "host_pref", "poster_path", "imdb_id",
             "tile_state", "description", "posted_date", "web_data", "group_key",
-            "is_duplicate_group", "downloaded_siblings",
+            "is_duplicate_group", "prior_grab",
         }
         actual = {f.name for f in fields(MediaItem)}
         assert actual == expected
@@ -181,7 +181,6 @@ class TestScannerWatchlistItem:
         assert item.web_data == {}
         assert item.group_key == ""
         assert item.is_duplicate_group is False
-        assert item.downloaded_siblings == []
 
 
 # ── Helper: build a mocked ScannerService ────────────────────────────

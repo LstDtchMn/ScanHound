@@ -119,6 +119,7 @@ class AppConfig(TypedDict, total=False):
     auto_rename_require_confirmation: bool
     auto_rename_move_method: str
     auto_rename_movie_library: str
+    auto_rename_movie_library_4k: str
     auto_rename_tv_library: str
     auto_rename_template_movie: str
     auto_rename_template_tv: str
@@ -356,12 +357,13 @@ _DEFAULT_CONFIG: AppConfig = {
     "auto_rename_require_confirmation": True,
     "auto_rename_move_method": "hardlink",
     "auto_rename_movie_library": "",
+    "auto_rename_movie_library_4k": "",
     "auto_rename_tv_library": "",
     "auto_rename_template_movie": "",
     "auto_rename_template_tv": "",
     "auto_rename_plex_sort_titles": False,
     "auto_rename_llm_enabled": False,
-    "ollama_base_url": "http://host.docker.internal:11434",
+    "ollama_base_url": "http://ollama:11434",
     "ollama_model": "",
     "clear_logs_startup": False,
     "scan_threads": 10,

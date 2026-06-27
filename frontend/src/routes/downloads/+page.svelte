@@ -166,20 +166,20 @@
     return { destroy() { ro.disconnect(); } };
   }
 
+  // Accordion state for the two live-status sections (JD Links / Tracker).
+  // Expanding one auto-collapses the other to maximise visible area.
+  let activeSection = $state<'jd' | 'tracker' | null>('jd');
+  function toggleSection(s: 'jd' | 'tracker') {
+    activeSection = activeSection === s ? null : s;
+  }
+
   let history = $state<DownloadHistoryEntry[]>([]);
   let loading = $state(false);
   let error = $state('');
   let searchInput = $state('');
-  let searchFilter = $state('');
   let statusFilter = $state('all');
-  let searchTimer: ReturnType<typeof setTimeout> | undefined;
   let refreshing = $state(false);
   let collapsedGroups = $state(new Set<string>());
-
-  function onSearchInput() {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => { searchFilter = searchInput; }, 200);
-  }
 
   async function loadHistory() {
     loading = true;
@@ -262,18 +262,21 @@
 
   let historyContainer: HTMLDivElement | undefined = $state();
 
-  // Scroll to top when search filter changes
+  // Scroll to top when search or status filter changes
   $effect(() => {
     // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-    searchFilter;
+    searchInput; statusFilter;
     historyContainer?.scrollTo({ top: 0, behavior: 'smooth' });
   });
 
   let filteredHistory = $derived.by(() => {
     let result = history;
-    if (searchFilter) {
-      const q = searchFilter.toLowerCase();
-      result = result.filter(e => e.title.toLowerCase().includes(q));
+    const q = searchInput.trim().toLowerCase();
+    if (q) {
+      result = result.filter(e =>
+        (e.title ?? '').toLowerCase().includes(q) ||
+        (e.url ?? '').toLowerCase().includes(q)
+      );
     }
     if (statusFilter !== 'all') {
       result = result.filter(e => (e.status || 'completed').toLowerCase() === statusFilter);
@@ -346,7 +349,6 @@
     <input
       type="text"
       bind:value={searchInput}
-      oninput={onSearchInput}
       placeholder="Search downloads..."
       class="ml-auto w-48 px-3 py-2 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-sm text-[var(--text-primary)] placeholder:text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)]"
     />
@@ -371,26 +373,37 @@
 </div>
 
 {#if jdInfo}
-  <div class="px-4 py-3 border-b border-[var(--border)]">
-    <div class="flex items-center gap-3 mb-2">
+  <div class="border-b border-[var(--border)]">
+    <div
+      role="button"
+      tabindex="0"
+      onclick={() => toggleSection('jd')}
+      onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSection('jd'))}
+      class="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-[var(--bg-tertiary)]/40 transition-colors cursor-pointer select-none"
+    >
+      <svg class="w-3.5 h-3.5 flex-shrink-0 text-[var(--text-secondary)] transition-transform {activeSection === 'jd' ? 'rotate-90' : ''}" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4V4z"/></svg>
       <h2 class="text-sm font-semibold">JDownloader Links</h2>
       {#if jdInfo.connected}
         <span class="text-xs text-[var(--text-secondary)]">
-          {jdInfo.packageCount} package(s) · {jdInfo.total} link(s) · <span class="text-[var(--success)]">{jdInfo.online} online</span> · <span class="text-[var(--error)]">{jdInfo.offline} broken</span>
+          {jdInfo.packageCount} package(s) · {jdInfo.total} link(s) · <span class="text-[var(--success)]">{jdInfo.online} online</span>{#if jdInfo.offline > 0} · <span class="text-[var(--error)]">{jdInfo.offline} broken</span>{/if}
         </span>
       {:else}
-        <span class="text-xs text-[var(--warning)]" title={jdInfo.error}>Not connected — {jdInfo.error}</span>
+        <span class="text-xs text-[var(--warning)]">Not connected</span>
       {/if}
-      {#if jdInfo.connected && jdInfo.offline > 0}
-        <label class="flex items-center gap-1.5 text-xs text-[var(--text-secondary)] cursor-pointer">
-          <input type="checkbox" bind:checked={jdBrokenOnly} class="accent-[var(--accent)]" />
-          Broken only
-        </label>
-      {/if}
-      <button onclick={loadJdLinks} disabled={jdLoading} class="{jdInfo.connected && jdInfo.offline > 0 ? '' : 'ml-auto'} px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)] disabled:opacity-50">
-        {jdLoading ? 'Loading…' : 'Refresh'}
-      </button>
+      <div class="ml-auto flex items-center gap-2" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+        {#if jdInfo.connected && jdInfo.offline > 0}
+          <label class="flex items-center gap-1.5 text-xs text-[var(--text-secondary)] cursor-pointer">
+            <input type="checkbox" bind:checked={jdBrokenOnly} class="accent-[var(--accent)]" />
+            Broken only
+          </label>
+        {/if}
+        <button onclick={loadJdLinks} disabled={jdLoading} class="px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)] disabled:opacity-50">
+          {jdLoading ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
     </div>
+    {#if activeSection === 'jd'}
+    <div class="px-4 pb-3">
     {#if jdInfo.connected}
       <div class="flex items-center gap-2 mb-2">
         <span class="text-xs text-[var(--text-secondary)]">Download queue:</span>
@@ -458,20 +471,33 @@
     {:else if jdInfo.connected}
       <p class="text-xs text-[var(--text-secondary)]">No links in JDownloader yet.</p>
     {/if}
+    </div>
+    {/if}
   </div>
 {/if}
 
 {#if dlResults.length > 0}
-  <div class="px-4 py-3 border-b border-[var(--border)]">
-    <div class="flex items-center gap-3 mb-2">
+  <div class="border-b border-[var(--border)]">
+    <div
+      role="button"
+      tabindex="0"
+      onclick={() => toggleSection('tracker')}
+      onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSection('tracker'))}
+      class="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-[var(--bg-tertiary)]/40 transition-colors cursor-pointer select-none"
+    >
+      <svg class="w-3.5 h-3.5 flex-shrink-0 text-[var(--text-secondary)] transition-transform {activeSection === 'tracker' ? 'rotate-90' : ''}" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4V4z"/></svg>
       <h2 class="text-sm font-semibold">Download &amp; Extraction Status</h2>
       <span class="text-xs text-[var(--text-secondary)]">
         {dlResults.length} item(s) ·
         <span class="text-[var(--success)]">{dlResults.filter((r) => r.state === 'extracted').length} done</span> ·
         <span class="text-[var(--error)]">{dlResults.filter((r) => r.state === 'failed').length} failed</span>
       </span>
-      <button onclick={clearResults} class="ml-auto px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)]">Clear</button>
+      <div class="ml-auto" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+        <button onclick={clearResults} class="px-2.5 py-1 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)]">Clear</button>
+      </div>
     </div>
+    {#if activeSection === 'tracker'}
+    <div class="px-4 pb-3">
     <div
       class="space-y-1 overflow-auto resize-y min-h-24 [max-height:80vh] pb-1"
       style="height: 20rem"
@@ -502,6 +528,8 @@
         </div>
       {/each}
     </div>
+    </div>
+    {/if}
   </div>
 {/if}
 
