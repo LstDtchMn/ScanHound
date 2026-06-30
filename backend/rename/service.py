@@ -1522,6 +1522,30 @@ class RenameService:
         return {"new_filename": fname, "destination_path": dest,
                 "library_configured": lib_set, "warning": warning}
 
+    def search_tmdb_public(self, query: str, media_type: str = "movie") -> list:
+        """Search TMDB for the rematch picker; fail-safe → [] on any problem."""
+        if not query or not query.strip():
+            return []
+        mtype = "tv" if media_type == "tv" else "movie"
+        client = self._tmdb_client()
+        if not client:
+            return []
+        try:
+            raw = client.search(query.strip(), media_type=mtype) or []
+        except Exception:
+            return []
+        out = []
+        for r in raw:
+            cand = self._normalize_candidate(r, mtype)
+            if not cand:
+                continue
+            out.append({"tmdb_id": cand.get("tmdb_id"),
+                        "title": cand.get("title"),
+                        "year": cand.get("year"),
+                        "media_type": mtype,
+                        "poster_path": cand.get("poster_path")})
+        return out
+
     def accept_combined(self, job_id: int) -> dict:
         """Accept a runtime-detected combined-episode proposal.
 

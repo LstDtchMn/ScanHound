@@ -284,3 +284,34 @@ class TestRenameApi:
         assert body["destination_path"] is None
         assert body["new_filename"] is not None  # would-be name still produced
         assert body["warning"]  # "Movie library not configured…"
+
+    # ------------------------------------------------------------------
+    # GET /rename/search-tmdb — Task 6
+    # ------------------------------------------------------------------
+
+    def test_search_tmdb_results_include_poster_url(self, client, monkeypatch):
+        import backend.rename.service as svc_mod
+        monkeypatch.setattr(
+            svc_mod.RenameService, "_tmdb_client",
+            lambda self: type("T", (), {"search": staticmethod(
+                lambda query, media_type="movie", year=None, language="en-US": [
+                    {"id": 603, "title": "The Matrix",
+                     "release_date": "1999-03-31", "poster_path": "/m.jpg"}])})())
+        r = client.get("/rename/search-tmdb?query=matrix&media_type=movie").json()
+        assert len(r["results"]) == 1
+        res = r["results"][0]
+        assert res["tmdb_id"] == 603
+        assert res["title"] == "The Matrix"
+        assert res["year"] == 1999
+        assert res["media_type"] == "movie"
+        assert res["poster_url"].endswith("/m.jpg")
+
+    def test_search_tmdb_empty_query_returns_empty(self, client):
+        r = client.get("/rename/search-tmdb?query=&media_type=movie").json()
+        assert r["results"] == []
+
+    def test_search_tmdb_no_client_returns_empty(self, client, monkeypatch):
+        import backend.rename.service as svc_mod
+        monkeypatch.setattr(svc_mod.RenameService, "_tmdb_client", lambda self: None)
+        r = client.get("/rename/search-tmdb?query=matrix&media_type=movie").json()
+        assert r["results"] == []

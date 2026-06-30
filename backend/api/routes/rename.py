@@ -307,6 +307,16 @@ def dv_scan_folder(req: DvScanRequest, reg: ServiceRegistry = Depends(get_regist
     return {"status": "started", "folder": folder, "force": force}
 
 
+@router.get("/search-tmdb")
+def search_tmdb(query: str = "", media_type: str = "movie",
+                reg: ServiceRegistry = Depends(get_registry)):
+    """TMDB search for the rematch picker; serializes poster_url."""
+    results = _service(reg).search_tmdb_public(query, media_type)
+    for r in results:
+        r["poster_url"] = _poster_url(r.pop("poster_path", None))
+    return {"results": results}
+
+
 @router.get("/dv-scans")
 def dv_scans(layer: Optional[str] = None, limit: int = 500,
              reg: ServiceRegistry = Depends(get_registry)):
