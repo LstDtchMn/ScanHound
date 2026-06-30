@@ -8,25 +8,34 @@
 
   let { job, onClose }: { job: RenameJob; onClose: () => void } = $props();
 
+  // svelte-ignore state_referenced_locally
   let mediaType = $state<'movie' | 'tv'>(
     job.media_type === 'tv' || job.media_type === 'show' ? 'tv' : 'movie'
   );
+  // svelte-ignore state_referenced_locally
   let query = $state(job.title ?? '');
   let results = $state<TmdbSearchResult[]>([]);
   let searchBusy = $state(false);
   let selected = $state<TmdbSearchResult | null>(null);
+  // svelte-ignore state_referenced_locally
   let season = $state<number | null>(job.season);
+  // svelte-ignore state_referenced_locally
   let episode = $state<number | null>(job.episode);
   let preview = $state<RematchPreviewResponse | null>(null);
   let confirmBusy = $state(false);
   let errorMsg = $state<string | null>(null);
 
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let previewDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-  function parsePastedId(q: string): { tmdb_id?: number } {
+  // Monotonic sequence guards to prevent out-of-order async responses
+  let searchSeq = 0;
+  let previewSeq = 0;
+
+  function parsePastedId(q: string): { tmdb_id?: number; isImdb?: boolean } {
     const t = q.trim();
     if (/^\d+$/.test(t)) return { tmdb_id: parseInt(t, 10) };
-    // IMDB ids (tt\d+) can't be used directly with rematch — treat as text search
+    if (/^tt\d+$/i.test(t)) return { isImdb: true };
     return {};
   }
 
@@ -50,16 +59,26 @@
       return;
     }
 
+    // IMDB ids can't be resolved — show feedback instead of text-searching "tt…"
+    if (pasted.isImdb) {
+      errorMsg = "IMDB ids can't be looked up directly — search by title or paste a numeric TMDB id.";
+      results = [];
+      return;
+    }
+
+    const seq = ++searchSeq;
     searchBusy = true;
     errorMsg = null;
     try {
       const r = await api.searchTmdb(q, mediaType);
+      if (seq !== searchSeq) return;
       results = r.results;
     } catch (e) {
+      if (seq !== searchSeq) return;
       errorMsg = `Search failed: ${e instanceof Error ? e.message : String(e)}`;
       results = [];
     } finally {
-      searchBusy = false;
+      if (seq === searchSeq) searchBusy = false;
     }
   }
 
@@ -67,6 +86,7 @@
     query = v;
     selected = null;
     preview = null;
+    errorMsg = null;
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(runSearch, 350);
   }
@@ -80,17 +100,26 @@
   async function loadPreview() {
     if (!selected) return;
     errorMsg = null;
+    const seq = ++previewSeq;
     try {
-      preview = await api.rematchPreview(job.id, {
+      const p = await api.rematchPreview(job.id, {
         tmdb_id: selected.tmdb_id,
         media_type: mediaType,
         season: mediaType === 'tv' ? (season ?? undefined) : undefined,
         episode: mediaType === 'tv' ? (episode ?? undefined) : undefined
       });
+      if (seq !== previewSeq) return;
+      preview = p;
     } catch (e) {
+      if (seq !== previewSeq) return;
       errorMsg = `Preview failed: ${e instanceof Error ? e.message : String(e)}`;
       preview = null;
     }
+  }
+
+  function schedulePreview() {
+    if (previewDebounceTimer) clearTimeout(previewDebounceTimer);
+    previewDebounceTimer = setTimeout(loadPreview, 150);
   }
 
   function setMediaType(mt: 'movie' | 'tv') {
@@ -130,6 +159,7 @@
     }
   }
 
+  // svelte-ignore state_referenced_locally
   let dialogLabel = $derived(
     `Rematch: ${job.title ?? job.original_filename ?? `Job ${job.id}`}`
   );
@@ -201,7 +231,7 @@
             oninput={(e) => {
               const v = (e.target as HTMLInputElement).value;
               season = v === '' ? null : +v;
-              if (selected) loadPreview();
+              if (selected) schedulePreview();
             }}
             class="w-16 px-1.5 py-0.5 rounded bg-[var(--bg-tertiary)] border border-[var(--border)]
                    text-[var(--text)] outline-none focus:border-[var(--accent)]"
@@ -217,7 +247,7 @@
             oninput={(e) => {
               const v = (e.target as HTMLInputElement).value;
               episode = v === '' ? null : +v;
-              if (selected) loadPreview();
+              if (selected) schedulePreview();
             }}
             class="w-16 px-1.5 py-0.5 rounded bg-[var(--bg-tertiary)] border border-[var(--border)]
                    text-[var(--text)] outline-none focus:border-[var(--accent)]"
@@ -231,11 +261,13 @@
     {#if searchBusy}
       <div class="text-xs text-[var(--text-secondary)]">Searching…</div>
     {:else if results.length > 0}
-      <ul class="flex flex-col gap-1 max-h-52 overflow-auto" role="listbox" aria-label="Search results">
+      <ul class="flex flex-col gap-1 max-h-52 overflow-auto" aria-label="Search results">
         {#each results as r (r.tmdb_id)}
-          <li role="option" aria-selected={selected?.tmdb_id === r.tmdb_id}>
+          <li>
             <button
               onclick={() => pick(r)}
+              role="option"
+              aria-selected={selected?.tmdb_id === r.tmdb_id}
               class="w-full flex items-center gap-2 p-1.5 rounded text-left transition-colors
                 {selected?.tmdb_id === r.tmdb_id
                   ? 'bg-[var(--accent)]/15 ring-1 ring-[var(--accent)]/40'
