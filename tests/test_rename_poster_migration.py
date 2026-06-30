@@ -8,10 +8,16 @@ import pytest
 from backend.database import DatabaseManager
 
 
-def _make_dm():
-    """Create a DatabaseManager backed by an isolated temp file."""
-    tmp = tempfile.mktemp(suffix=".db", prefix="scanhound_migration_test_")
-    return DatabaseManager(db_path=tmp), tmp
+@pytest.fixture
+def tmp_db_path():
+    """Yield a path to an isolated temp SQLite file; clean up after the test."""
+    fd, path = tempfile.mkstemp(suffix=".db", prefix="scanhound_migration_test_")
+    os.close(fd)
+    yield path
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _rename_columns(dm):
@@ -20,22 +26,18 @@ def _rename_columns(dm):
     return cols
 
 
-def test_fresh_db_has_poster_path_column():
-    dm, tmp = _make_dm()
+def test_fresh_db_has_poster_path_column(tmp_db_path):
+    dm = DatabaseManager(db_path=tmp_db_path)
     try:
         assert "poster_path" in _rename_columns(dm)
     finally:
         dm.close()
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
 
 
-def test_rerunning_migrations_is_a_noop():
+def test_rerunning_migrations_is_a_noop(tmp_db_path):
     # First init already ran migrations via __init__; re-running init_db()
     # twice more against the same file must not raise on the duplicate ADD COLUMN.
-    dm, tmp = _make_dm()
+    dm = DatabaseManager(db_path=tmp_db_path)
     try:
         dm.init_db()
         dm.init_db()
@@ -43,7 +45,3 @@ def test_rerunning_migrations_is_a_noop():
         assert "poster_path" in cols
     finally:
         dm.close()
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
