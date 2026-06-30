@@ -1475,6 +1475,48 @@ class RenameService:
         return {"ok": True, "status": "matched", "new_filename": fname,
                 "destination_path": dest, "warning": None}
 
+    def rematch_preview(self, job_id: int, tmdb_id: int,
+                        media_type: Optional[str] = None,
+                        season: Optional[int] = None,
+                        episode: Optional[int] = None) -> dict:
+        """Build a would-be target WITHOUT persisting; run the library guard."""
+        db = self._db
+        job = db.get_rename_job(job_id) if db else None
+        if not job:
+            return {"new_filename": None, "destination_path": None,
+                    "library_configured": False, "warning": "Job not found"}
+        mtype = media_type or job.get("media_type") or "movie"
+        client = self._tmdb_client()
+        details = None
+        if client:
+            try:
+                details = client.details(int(tmdb_id), media_type=mtype)
+            except Exception:
+                details = None
+        if not details:
+            return {"new_filename": None, "destination_path": None,
+                    "library_configured": False,
+                    "warning": "Could not fetch TMDB details"}
+        title = details.get("title") or details.get("name") or job.get("title")
+        date = details.get("release_date") or details.get("first_air_date") or ""
+        year = int(date[:4]) if date[:4].isdigit() else job.get("year")
+        sea = season if season is not None else job.get("season")
+        epi = episode if episode is not None else job.get("episode")
+        meta = {**job, "media_type": mtype, "title": title, "year": year,
+                "tmdb_id": int(tmdb_id), "season": sea, "episode": epi}
+        lib_set, lib_label = self._lib_set(mtype, job.get("resolution"))
+        fname, dest = _naming.build_target(
+            meta, movie_root=self._movie_root(job.get("resolution")),
+            tv_root=self._cfg.get("auto_rename_tv_library", ""),
+            template=self._template_for(mtype))
+        warning = None
+        if not lib_set:
+            dest = None
+            warning = (f"{lib_label} library not configured — set it in "
+                       f"Settings → Renaming before applying")
+        return {"new_filename": fname, "destination_path": dest,
+                "library_configured": lib_set, "warning": warning}
+
     def accept_combined(self, job_id: int) -> dict:
         """Accept a runtime-detected combined-episode proposal.
 

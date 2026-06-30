@@ -34,6 +34,13 @@ class RematchRequest(BaseModel):
     episode: Optional[int] = None
 
 
+class RematchPreviewRequest(BaseModel):
+    tmdb_id: int
+    media_type: Optional[str] = None
+    season: Optional[int] = None
+    episode: Optional[int] = None
+
+
 class ProcessFolderRequest(BaseModel):
     folder: str
     dry_run: bool = False
@@ -123,6 +130,14 @@ def rematch_job(job_id: int, body: RematchRequest,
     if not out.get("ok"):
         raise HTTPException(status_code=400, detail=out.get("error", "Rematch failed"))
     return out
+
+
+@router.post("/jobs/{job_id}/rematch-preview")
+def rematch_preview(job_id: int, body: RematchPreviewRequest,
+                    reg: ServiceRegistry = Depends(get_registry)):
+    return _service(reg).rematch_preview(
+        job_id, body.tmdb_id, body.media_type,
+        season=body.season, episode=body.episode)
 
 
 @router.post("/jobs/{job_id}/accept-combined")

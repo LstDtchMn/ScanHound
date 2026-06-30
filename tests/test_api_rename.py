@@ -169,3 +169,57 @@ class TestRenameApi:
         _seed_job(status="matched", title="M", original_path="/x/none.mkv")
         job = client.get("/rename/jobs").json()["jobs"][0]
         assert job["dv_layer"] is None
+
+    def test_rematch_preview_does_not_mutate_db(self, client, monkeypatch):
+        import backend.rename.service as svc_mod
+        jid = _seed_job(status="needs_review", title="Old", media_type="movie",
+                        destination_path="", new_filename="old.mkv")
+        monkeypatch.setattr(
+            svc_mod.RenameService, "_tmdb_client",
+            lambda self: type("T", (), {"details": staticmethod(
+                lambda tmdb_id, media_type="movie", language="en-US": {
+                    "title": "New Title", "release_date": "2021-01-01",
+                    "poster_path": "/n.jpg"})})())
+        before = DatabaseManager(); snap = before.get_rename_job(jid); before.close()
+        r = client.post(f"/rename/jobs/{jid}/rematch-preview",
+                        json={"tmdb_id": 99, "media_type": "movie"}).json()
+        assert "new_filename" in r and "library_configured" in r
+        after = DatabaseManager(); now = after.get_rename_job(jid); after.close()
+        assert now["new_filename"] == snap["new_filename"]
+        assert now["title"] == snap["title"]
+
+    def test_rematch_preview_library_unconfigured_flag(self, client, monkeypatch):
+        import backend.rename.service as svc_mod
+        jid = _seed_job(status="needs_review", title="Old", media_type="movie")
+        monkeypatch.setattr(
+            svc_mod.RenameService, "_tmdb_client",
+            lambda self: type("T", (), {"details": staticmethod(
+                lambda tmdb_id, media_type="movie", language="en-US": {
+                    "title": "New Title", "release_date": "2021-01-01"})})())
+        r = client.post(f"/rename/jobs/{jid}/rematch-preview",
+                        json={"tmdb_id": 99, "media_type": "movie"}).json()
+        assert r["library_configured"] is False
+        assert r["warning"]
+
+    def test_rematch_preview_library_configured(self, client, monkeypatch, tmp_path):
+        import backend.rename.service as svc_mod
+        lib = str(tmp_path / "movies")
+        # Patch the service config to have a movie library set
+        jid = _seed_job(status="needs_review", title="Old", media_type="movie",
+                        resolution="1080p")
+        monkeypatch.setattr(
+            svc_mod.RenameService, "_tmdb_client",
+            lambda self: type("T", (), {"details": staticmethod(
+                lambda tmdb_id, media_type="movie", language="en-US": {
+                    "title": "New Title", "release_date": "2021-01-01",
+                    "poster_path": "/n.jpg"})})())
+        monkeypatch.setattr(
+            svc_mod.RenameService, "_cfg",
+            property(lambda self: {"auto_rename_movie_library": lib}))
+        r = client.post(f"/rename/jobs/{jid}/rematch-preview",
+                        json={"tmdb_id": 99, "media_type": "movie"}).json()
+        assert r["library_configured"] is True
+        assert r["new_filename"] is not None
+        assert r["destination_path"] is not None
+        assert lib in r["destination_path"]
+        assert r["warning"] is None
