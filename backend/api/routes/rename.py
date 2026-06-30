@@ -8,9 +8,20 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
+from backend.api.routes.scanner import TMDB_IMAGE_BASE  # same base+size as Scan posters (w500)
 from backend.api.ws import ws_manager
 from backend.rename import dv_detect, llm_identify
 from backend.rename.service import conflict_annotations
+
+
+def _poster_url(poster_path):
+    """Build a TMDB poster URL from a stored path, fail-safe."""
+    try:
+        if poster_path and str(poster_path).startswith("/"):
+            return f"{TMDB_IMAGE_BASE}{poster_path}"
+    except Exception:
+        pass
+    return None
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/rename", tags=["rename"])
@@ -19,6 +30,11 @@ router = APIRouter(prefix="/rename", tags=["rename"])
 class RematchRequest(BaseModel):
     tmdb_id: int
     media_type: Optional[str] = None
+    season: Optional[int] = None
+    episode: Optional[int] = None
+
+
+RematchPreviewRequest = RematchRequest
 
 
 class ProcessFolderRequest(BaseModel):
@@ -29,6 +45,19 @@ class ProcessFolderRequest(BaseModel):
 class DvScanRequest(BaseModel):
     folder: str
     force: bool = False
+
+
+class BulkIdsRequest(BaseModel):
+    ids: list[int] = []
+
+
+class BulkSetDestRequest(BaseModel):
+    ids: list[int] = []
+    destination_root: str = ""
+
+
+class ApplyConfidentRequest(BaseModel):
+    ids: Optional[list[int]] = None
 
 
 @router.get("/jobs")
@@ -48,11 +77,16 @@ def list_jobs(status: Optional[str] = None, limit: int = 200,
     # so a duplicate is still flagged when the two halves land on different pages
     # or under a status filter.
     annotations = conflict_annotations(reg.db.list_rename_jobs(limit=100000) or [])
+    paths = [j.get("original_path") for j in jobs if j.get("original_path")]
+    dv_map = reg.db.get_dv_scans_by_paths(paths)
     for j in jobs:
         ann = annotations.get(j.get("id")) or {}
         j["destination_conflict"] = ann.get("destination_conflict", False)
         j["keep_recommended"] = ann.get("keep_recommended", False)
         j["keep_reason"] = ann.get("keep_reason")
+        j["poster_url"] = _poster_url(j.get("poster_path"))
+        dv = dv_map.get(j.get("original_path"))
+        j["dv_layer"] = (dv or {}).get("dv_layer")
     return {
         "jobs": jobs,
         "counts": reg.db.count_rename_jobs_by_status(),
@@ -81,6 +115,39 @@ def _service(reg: ServiceRegistry):
     return reg._rename_service
 
 
+# ── Bulk endpoints (must be registered before /{job_id}/… routes so the static
+#    /bulk/… path segment isn't swallowed by the int-typed path parameter) ────
+
+@router.post("/jobs/apply-confident")
+def apply_confident(body: ApplyConfidentRequest,
+                    reg: ServiceRegistry = Depends(get_registry)):
+    return _service(reg).apply_confident(body.ids)
+
+
+@router.post("/jobs/bulk/apply")
+def bulk_apply(body: BulkIdsRequest, reg: ServiceRegistry = Depends(get_registry)):
+    return _service(reg).bulk_apply(body.ids)
+
+
+@router.post("/jobs/bulk/reidentify")
+def bulk_reidentify(body: BulkIdsRequest,
+                    reg: ServiceRegistry = Depends(get_registry)):
+    return _service(reg).bulk_reidentify(body.ids)
+
+
+@router.post("/jobs/bulk/delete")
+def bulk_delete(body: BulkIdsRequest, reg: ServiceRegistry = Depends(get_registry)):
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return _service(reg).bulk_delete(body.ids)
+
+
+@router.post("/jobs/bulk/set-destination")
+def bulk_set_destination(body: BulkSetDestRequest,
+                         reg: ServiceRegistry = Depends(get_registry)):
+    return _service(reg).bulk_set_destination(body.ids, body.destination_root)
+
+
 @router.post("/jobs/{job_id}/apply")
 def apply_job(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
     out = _service(reg).apply(job_id)
@@ -100,10 +167,19 @@ def undo_job(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
 @router.post("/jobs/{job_id}/rematch")
 def rematch_job(job_id: int, body: RematchRequest,
                 reg: ServiceRegistry = Depends(get_registry)):
-    out = _service(reg).rematch(job_id, body.tmdb_id, body.media_type)
+    out = _service(reg).rematch(job_id, body.tmdb_id, body.media_type,
+                                season=body.season, episode=body.episode)
     if not out.get("ok"):
         raise HTTPException(status_code=400, detail=out.get("error", "Rematch failed"))
     return out
+
+
+@router.post("/jobs/{job_id}/rematch-preview")
+def rematch_preview(job_id: int, body: RematchPreviewRequest,
+                    reg: ServiceRegistry = Depends(get_registry)):
+    return _service(reg).rematch_preview(
+        job_id, body.tmdb_id, body.media_type,
+        season=body.season, episode=body.episode)
 
 
 @router.post("/jobs/{job_id}/accept-combined")
@@ -275,6 +351,16 @@ def dv_scan_folder(req: DvScanRequest, reg: ServiceRegistry = Depends(get_regist
 
     threading.Thread(target=_run, name="dv-scan-folder", daemon=True).start()
     return {"status": "started", "folder": folder, "force": force}
+
+
+@router.get("/search-tmdb")
+def search_tmdb(query: str = "", media_type: str = "movie",
+                reg: ServiceRegistry = Depends(get_registry)):
+    """TMDB search for the rematch picker; serializes poster_url."""
+    results = _service(reg).search_tmdb_public(query, media_type)
+    for r in results:
+        r["poster_url"] = _poster_url(r.pop("poster_path", None))
+    return {"results": results}
 
 
 @router.get("/dv-scans")

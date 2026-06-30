@@ -111,6 +111,10 @@ export interface RenameJob {
   // reason like "2160p · Dolby Vision · Remux"). Computed server-side.
   keep_recommended?: boolean;
   keep_reason?: string | null;
+  /** Fully-formed TMDB poster URL built server-side from poster_path. Empty/null = no poster. */
+  poster_url?: string | null;
+  /** Read-only DV layer joined from dv_scan by path at serialize time (FEL/MEL/P8/P5). Null = unknown. */
+  dv_layer?: string | null;
 }
 
 export interface DvScan {
@@ -487,4 +491,65 @@ export interface DownloadResult {
   state: 'queued' | 'downloading' | 'downloaded' | 'extracting' | 'extracted' | 'failed' | string;
   error: string | null;
   updated_at: string;
+}
+
+export interface TmdbSearchResult {
+  tmdb_id: number;
+  title: string;
+  year: number | null;
+  media_type: 'movie' | 'tv';
+  poster_url: string | null;
+}
+
+export interface BulkApplyResult {
+  id: number;
+  ok: boolean;
+  error: string | null;
+}
+export interface BulkApplyResponse {
+  results: BulkApplyResult[];
+  applied: number;
+  failed: number;
+}
+
+export interface BulkReidentifyResponse {
+  ok: boolean;
+  queued: number;
+}
+
+export interface BulkDeleteResponse {
+  deleted: number;
+}
+
+export interface BulkSetDestResult {
+  id: number;
+  ok: boolean;
+  destination_path: string | null;
+  error: string | null;
+}
+export interface BulkSetDestResponse {
+  results: BulkSetDestResult[];
+  updated: number;
+}
+
+export interface ApplyConfidentResponse {
+  results: BulkApplyResult[];
+  applied: number;
+  skipped: number;
+  failed: number;
+}
+
+export interface RematchPreviewResponse {
+  new_filename: string;
+  destination_path: string | null;
+  library_configured: boolean;
+  warning: string | null;
+}
+
+export interface RematchConfirmResponse {
+  ok: boolean;
+  status: string;
+  new_filename: string;
+  destination_path: string | null;
+  warning: string | null;
 }

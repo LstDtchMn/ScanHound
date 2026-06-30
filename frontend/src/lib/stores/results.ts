@@ -19,7 +19,7 @@ export type SortOption =
 
 /** A writable store backed by localStorage (SSR-safe), so the user's view
  *  mode and sort choice persist across reloads. */
-function persisted<T>(key: string, fallback: T) {
+export function persisted<T>(key: string, fallback: T) {
   let initial = fallback;
   try {
     const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;

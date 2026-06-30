@@ -440,6 +440,12 @@ class RenameService:
         key = "auto_rename_template_tv" if media_type == "tv" else "auto_rename_template_movie"
         return self._cfg.get(key) or None
 
+    def _lib_set(self, media_type: Optional[str], resolution: Optional[str] = None) -> tuple:
+        """Return (is_configured, library_label) for the given media type."""
+        if media_type == "tv":
+            return bool(self._cfg.get("auto_rename_tv_library")), "TV"
+        return bool(self._movie_root(resolution)), "Movie"
+
     def _tmdb_client(self):
         if self._client is None:
             with self._client_lock:
@@ -483,7 +489,8 @@ class RenameService:
         if not name:
             return None
         year = int(date[:4]) if date[:4].isdigit() else None
-        return {"title": name, "year": year, "tmdb_id": r.get("id"), "media_type": media_type}
+        return {"title": name, "year": year, "tmdb_id": r.get("id"),
+                "media_type": media_type, "poster_path": r.get("poster_path")}
 
     def _tmdb_match(self, title, year, media_type, *, score_year=None) -> Optional[dict]:
         """Search by ``title``/``year`` and rank by confidence. ``score_year``
@@ -1256,6 +1263,7 @@ class RenameService:
             year=match.get("year"), season=match.get("season"),
             episode=match.get("episode"), tmdb_id=match.get("tmdb_id"),
             imdb_id=match.get("imdb_id"), resolution=match.get("resolution"),
+            poster_path=match.get("poster_path"),
             match_confidence=conf, match_source=match.get("source"),
             new_filename=fname, destination_path=dest,
             suggested_correction=match.get("suggested_correction"),
@@ -1311,12 +1319,7 @@ class RenameService:
         # CWD instead of the library. Hold for review with a clear message rather
         # than move a file to a junk location.
         mtype = match.get("media_type")
-        if mtype == "tv":
-            lib_set = bool(self._cfg.get("auto_rename_tv_library"))
-            lib_label = "TV"
-        else:
-            lib_set = bool(self._movie_root(match.get("resolution")))
-            lib_label = "Movie"
+        lib_set, lib_label = self._lib_set(mtype, match.get("resolution"))
         if not lib_set:
             job["status"] = "needs_review"
             # Don't clobber a more specific reason (low confidence, a proposal);
@@ -1421,7 +1424,8 @@ class RenameService:
         self._broadcast(job_id)
         return {"ok": True}
 
-    def rematch(self, job_id: int, tmdb_id: int, media_type: Optional[str] = None) -> dict:
+    def rematch(self, job_id: int, tmdb_id: int, media_type: Optional[str] = None,
+                season: Optional[int] = None, episode: Optional[int] = None) -> dict:
         db = self._db
         job = db.get_rename_job(job_id) if db else None
         if not job:
@@ -1439,18 +1443,243 @@ class RenameService:
         title = details.get("title") or details.get("name") or job.get("title")
         date = details.get("release_date") or details.get("first_air_date") or ""
         year = int(date[:4]) if date[:4].isdigit() else job.get("year")
+        poster_path = details.get("poster_path") or job.get("poster_path")
+        sea = season if season is not None else job.get("season")
+        epi = episode if episode is not None else job.get("episode")
         meta = {**job, "media_type": mtype, "title": title, "year": year,
-                "tmdb_id": int(tmdb_id)}
+                "tmdb_id": int(tmdb_id), "season": sea, "episode": epi}
+        # Library-not-configured guard (mirrors _process_file_inner).
+        lib_set, lib_label = self._lib_set(mtype, job.get("resolution"))
+        if not lib_set:
+            warning = (f"{lib_label} library not configured — set it in "
+                       f"Settings → Renaming before applying")
+            db.update_rename_job(job_id, title=title, year=year, tmdb_id=int(tmdb_id),
+                                 media_type=mtype, season=sea, episode=epi,
+                                 poster_path=poster_path, destination_path=None,
+                                 match_confidence=100.0, match_source="manual",
+                                 status="needs_review", warning_message=warning)
+            self._broadcast(job_id)
+            return {"ok": True, "status": "needs_review", "new_filename": None,
+                    "destination_path": None, "warning": warning}
         fname, dest = _naming.build_target(
             meta, movie_root=self._movie_root(job.get("resolution")),
             tv_root=self._cfg.get("auto_rename_tv_library", ""),
             template=self._template_for(mtype))
         db.update_rename_job(job_id, title=title, year=year, tmdb_id=int(tmdb_id),
-                             media_type=mtype, new_filename=fname, destination_path=dest,
-                             match_confidence=100.0, match_source="manual",
+                             media_type=mtype, season=sea, episode=epi,
+                             poster_path=poster_path, new_filename=fname,
+                             destination_path=dest, match_confidence=100.0,
+                             match_source="manual", status="matched",
+                             warning_message=None)
+        self._broadcast(job_id)
+        return {"ok": True, "status": "matched", "new_filename": fname,
+                "destination_path": dest, "warning": None}
+
+    def rematch_preview(self, job_id: int, tmdb_id: int,
+                        media_type: Optional[str] = None,
+                        season: Optional[int] = None,
+                        episode: Optional[int] = None) -> dict:
+        """Build a would-be target WITHOUT persisting; run the library guard."""
+        db = self._db
+        job = db.get_rename_job(job_id) if db else None
+        if not job:
+            return {"new_filename": None, "destination_path": None,
+                    "library_configured": False, "warning": "Job not found"}
+        mtype = media_type or job.get("media_type") or "movie"
+        client = self._tmdb_client()
+        details = None
+        if client:
+            try:
+                details = client.details(int(tmdb_id), media_type=mtype)
+            except Exception:
+                details = None
+        if not details:
+            return {"new_filename": None, "destination_path": None,
+                    "library_configured": False,
+                    "warning": "Could not fetch TMDB details"}
+        title = details.get("title") or details.get("name") or job.get("title")
+        date = details.get("release_date") or details.get("first_air_date") or ""
+        year = int(date[:4]) if date[:4].isdigit() else job.get("year")
+        sea = season if season is not None else job.get("season")
+        epi = episode if episode is not None else job.get("episode")
+        meta = {**job, "media_type": mtype, "title": title, "year": year,
+                "tmdb_id": int(tmdb_id), "season": sea, "episode": epi}
+        lib_set, lib_label = self._lib_set(mtype, job.get("resolution"))
+        try:
+            fname, dest = _naming.build_target(
+                meta, movie_root=self._movie_root(job.get("resolution")),
+                tv_root=self._cfg.get("auto_rename_tv_library", ""),
+                template=self._template_for(mtype))
+        except Exception:
+            return {"new_filename": None, "destination_path": None,
+                    "library_configured": False,
+                    "warning": "Could not build target filename"}
+        warning = None
+        if not lib_set:
+            dest = None
+            warning = (f"{lib_label} library not configured — set it in "
+                       f"Settings → Renaming before applying")
+        return {"new_filename": fname, "destination_path": dest,
+                "library_configured": lib_set, "warning": warning}
+
+    def bulk_apply(self, ids: list) -> dict:
+        if not self._bulk_lock.acquire(blocking=False):
+            return {"results": [], "applied": 0, "failed": 0, "busy": True}
+        try:
+            results, applied, failed = [], 0, 0
+            for jid in ids or []:
+                try:
+                    out = self.apply(int(jid))
+                except Exception as e:
+                    out = {"ok": False, "error": str(e)}
+                ok = bool(out.get("ok"))
+                results.append({"id": int(jid), "ok": ok,
+                                "error": out.get("error")})
+                applied += 1 if ok else 0
+                failed += 0 if ok else 1
+            return {"results": results, "applied": applied, "failed": failed}
+        finally:
+            self._bulk_lock.release()
+
+    def apply_confident(self, ids: Optional[list] = None) -> dict:
+        """Apply only matched jobs at confidence >= 95. Server-enforced gate."""
+        db = self._db
+        if db is None:
+            return {"results": [], "applied": 0, "skipped": 0, "failed": 0}
+        if ids is not None:
+            candidates = []
+            for jid in ids:
+                job = db.get_rename_job(int(jid))
+                if job:
+                    candidates.append(job)
+        else:
+            candidates = db.list_rename_jobs(limit=100000) or []
+        if not self._bulk_lock.acquire(blocking=False):
+            return {"results": [], "applied": 0, "skipped": 0, "failed": 0,
+                    "busy": True}
+        try:
+            results, applied, skipped, failed = [], 0, 0, 0
+            for job in candidates:
+                conf = job.get("match_confidence") or 0.0
+                if job.get("status") != "matched" or conf < 95:
+                    skipped += 1
+                    continue
+                jid = job["id"]
+                try:
+                    out = self.apply(int(jid))
+                except Exception as e:
+                    out = {"ok": False, "error": str(e)}
+                ok = bool(out.get("ok"))
+                results.append({"id": int(jid), "ok": ok,
+                                "error": out.get("error")})
+                applied += 1 if ok else 0
+                failed += 0 if ok else 1
+            return {"results": results, "applied": applied,
+                    "skipped": skipped, "failed": failed}
+        finally:
+            self._bulk_lock.release()
+
+    def bulk_reidentify(self, ids: list) -> dict:
+        if not self._bulk_lock.acquire(blocking=False):
+            return {"ok": False, "queued": 0, "busy": True}
+        try:
+            queued = 0
+            for jid in ids or []:
+                try:
+                    result = self.reidentify(int(jid))
+                    if result.get("ok"):
+                        queued += 1
+                except Exception:
+                    logger.exception("bulk_reidentify: job %s failed", jid)
+            return {"ok": True, "queued": queued}
+        finally:
+            self._bulk_lock.release()
+
+    def bulk_delete(self, ids: list) -> dict:
+        db = self._db
+        deleted = 0
+        for jid in ids or []:
+            try:
+                db.delete_rename_job(int(jid))
+                deleted += 1
+            except Exception:
+                logger.exception("bulk_delete: job %s failed", jid)
+        return {"deleted": deleted}
+
+    def set_destination(self, job_id: int, root: str) -> dict:
+        """Rebuild one job's destination_path under ``root``; re-run guard."""
+        db = self._db
+        job = db.get_rename_job(job_id) if db else None
+        if not job:
+            return {"id": int(job_id), "ok": False,
+                    "destination_path": None, "error": "Job not found"}
+        if job.get("status") == "applied":
+            return {"id": int(job_id), "ok": False,
+                    "destination_path": job.get("destination_path"),
+                    "error": "already applied"}
+        if not root or not str(root).strip():
+            db.update_rename_job(job_id, status="needs_review",
+                                 destination_path=None,
+                                 warning_message="Destination library not configured")
+            self._broadcast(job_id)
+            return {"id": int(job_id), "ok": False, "destination_path": None,
+                    "error": "Destination library not configured"}
+        mtype = job.get("media_type") or "movie"
+        meta = {**job, "media_type": mtype}
+        if mtype == "tv":
+            fname, dest = _naming.build_target(
+                meta, tv_root=root, movie_root=self._movie_root(job.get("resolution")),
+                template=self._template_for(mtype))
+        else:
+            fname, dest = _naming.build_target(
+                meta, movie_root=root, tv_root=self._cfg.get("auto_rename_tv_library", ""),
+                template=self._template_for(mtype))
+        db.update_rename_job(job_id, new_filename=fname, destination_path=dest,
                              status="matched", warning_message=None)
         self._broadcast(job_id)
-        return {"ok": True}
+        return {"id": int(job_id), "ok": True, "destination_path": dest,
+                "error": None}
+
+    def bulk_set_destination(self, ids: list, root: str) -> dict:
+        if not self._bulk_lock.acquire(blocking=False):
+            return {"results": [], "updated": 0, "busy": True}
+        try:
+            results, updated = [], 0
+            for jid in ids or []:
+                try:
+                    out = self.set_destination(int(jid), root)
+                except Exception as e:
+                    out = {"id": int(jid), "ok": False,
+                           "destination_path": None, "error": str(e)}
+                results.append(out)
+                updated += 1 if out.get("ok") else 0
+            return {"results": results, "updated": updated}
+        finally:
+            self._bulk_lock.release()
+
+    def search_tmdb_public(self, query: str, media_type: str = "movie") -> list:
+        """Search TMDB for the rematch picker; fail-safe → [] on any problem."""
+        if not query or not query.strip():
+            return []
+        mtype = "tv" if media_type == "tv" else "movie"
+        client = self._tmdb_client()
+        if not client:
+            return []
+        try:
+            raw = client.search(query.strip(), media_type=mtype) or []
+        except Exception:
+            return []
+        out = []
+        for r in raw:
+            cand = self._normalize_candidate(r, mtype)
+            if not cand:
+                continue
+            out.append({"tmdb_id": cand.get("tmdb_id"),
+                        "title": cand.get("title"),
+                        "year": cand.get("year"),
+                        "media_type": mtype,
+                        "poster_path": cand.get("poster_path")})
+        return out
 
     def accept_combined(self, job_id: int) -> dict:
         """Accept a runtime-detected combined-episode proposal.

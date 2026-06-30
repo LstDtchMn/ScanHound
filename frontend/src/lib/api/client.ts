@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -319,10 +319,15 @@ export const api = {
     request<{ ok: boolean }>(`/rename/jobs/${id}/apply`, { method: 'POST' }),
   undoRename: (id: number) =>
     request<{ ok: boolean }>(`/rename/jobs/${id}/undo`, { method: 'POST' }),
-  rematchRename: (id: number, tmdbId: number, mediaType?: string) =>
-    request<{ ok: boolean }>(`/rename/jobs/${id}/rematch`, {
+  rematchRename: (id: number, tmdbId: number, mediaType?: string, season?: number, episode?: number) =>
+    request<RematchConfirmResponse>(`/rename/jobs/${id}/rematch`, {
       method: 'POST',
-      body: JSON.stringify({ tmdb_id: tmdbId, media_type: mediaType ?? null })
+      body: JSON.stringify({
+        tmdb_id: tmdbId,
+        media_type: mediaType ?? null,
+        season: season ?? null,
+        episode: episode ?? null
+      })
     }),
   acceptCombinedRename: (id: number) =>
     request<{ ok: boolean }>(`/rename/jobs/${id}/accept-combined`, { method: 'POST' }),
@@ -330,6 +335,48 @@ export const api = {
     request<{ ok: boolean; new_filename?: string }>(`/rename/jobs/${id}/accept-correction`, { method: 'POST' }),
   deleteRenameJob: (id: number) =>
     request<{ ok: boolean }>(`/rename/jobs/${id}`, { method: 'DELETE' }),
+  bulkApply: (ids: number[]) =>
+    request<BulkApplyResponse>('/rename/jobs/bulk/apply', {
+      method: 'POST',
+      body: JSON.stringify({ ids })
+    }),
+  bulkReidentify: (ids: number[]) =>
+    request<BulkReidentifyResponse>('/rename/jobs/bulk/reidentify', {
+      method: 'POST',
+      body: JSON.stringify({ ids })
+    }),
+  bulkDelete: (ids: number[]) =>
+    request<BulkDeleteResponse>('/rename/jobs/bulk/delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids })
+    }),
+  bulkSetDestination: (ids: number[], destinationRoot: string) =>
+    request<BulkSetDestResponse>('/rename/jobs/bulk/set-destination', {
+      method: 'POST',
+      body: JSON.stringify({ ids, destination_root: destinationRoot })
+    }),
+  applyConfident: (ids?: number[]) =>
+    request<ApplyConfidentResponse>('/rename/jobs/apply-confident', {
+      method: 'POST',
+      body: JSON.stringify(ids ? { ids } : {})
+    }),
+  searchTmdb: (query: string, mediaType: string) => {
+    const qs = '?' + new URLSearchParams({ query, media_type: mediaType }).toString();
+    return request<{ results: TmdbSearchResult[] }>(`/rename/search-tmdb${qs}`);
+  },
+  rematchPreview: (
+    id: number,
+    body: { tmdb_id: number; media_type: string; season?: number; episode?: number }
+  ) =>
+    request<RematchPreviewResponse>(`/rename/jobs/${id}/rematch-preview`, {
+      method: 'POST',
+      body: JSON.stringify({
+        tmdb_id: body.tmdb_id,
+        media_type: body.media_type,
+        season: body.season ?? null,
+        episode: body.episode ?? null
+      })
+    }),
   testOllama: () =>
     request<{ ok: boolean; models?: string[]; error?: string }>('/rename/llm/test'),
   renameProcessFolder: (folder: string, dryRun = false) =>

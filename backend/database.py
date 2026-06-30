@@ -363,6 +363,7 @@ class DatabaseManager:
                         episode INTEGER,
                         tmdb_id INTEGER,
                         imdb_id TEXT,
+                        poster_path TEXT,
                         resolution TEXT,
                         match_confidence REAL,
                         match_source TEXT,
@@ -430,6 +431,7 @@ class DatabaseManager:
                     'ALTER TABLE rename_jobs ADD COLUMN split_file TEXT',
                     'ALTER TABLE downloads ADD COLUMN hdr TEXT',
                     'ALTER TABLE downloads ADD COLUMN dovi INTEGER DEFAULT 0',
+                    'ALTER TABLE rename_jobs ADD COLUMN poster_path TEXT',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -1284,6 +1286,27 @@ class DatabaseManager:
             'FROM dv_scan WHERE path = ?', (path,))
         return rows[0] if rows else None
 
+    def get_dv_scans_by_paths(self, paths):
+        """Return a ``{path: row_dict}`` map for all *paths* found in dv_scan.
+
+        Runs a single parameterised ``IN`` query instead of one call per path.
+        An empty/falsy *paths* input returns ``{}`` without touching the DB.
+        Fail-safe: returns ``{}`` on any error (mirrors the single-row helpers).
+        """
+        if not paths:
+            return {}
+        try:
+            placeholders = ",".join("?" * len(paths))
+            rows = self._query_dicts(
+                f'SELECT path, title, dv_layer, sig_mtime, sig_size, source, '
+                f'rating_key, imdb_id, scanned_at, last_seen_at '
+                f'FROM dv_scan WHERE path IN ({placeholders})',
+                tuple(paths))
+            return {row["path"]: row for row in (rows or [])}
+        except Exception as e:
+            logger.error("get_dv_scans_by_paths error: %s", e)
+            return {}
+
     def get_dv_scans(self, dv_layer=None, limit=100000):
         """Return DV-scan rows, optionally filtered by layer (e.g. 'fel')."""
         if dv_layer:
@@ -1412,7 +1435,7 @@ class DatabaseManager:
         "episode", "tmdb_id", "imdb_id", "resolution", "match_confidence",
         "match_source", "move_method", "proposed_match", "plex_sort_title",
         "warning_message", "error_message", "processed_at", "reverted_at",
-        "suggested_correction", "combined_episode", "split_file",
+        "suggested_correction", "combined_episode", "split_file", "poster_path",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.

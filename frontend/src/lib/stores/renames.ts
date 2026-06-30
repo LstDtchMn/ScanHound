@@ -1,10 +1,41 @@
-import { writable, derived } from 'svelte/store';
+import { writable, derived, get } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { connection } from './connection';
 import type { RenameJob, RenameStatus, DvScan } from '$lib/api/types';
+import { persisted } from '$lib/stores/results';
+import { addToast } from '$lib/stores/notifications';
+import type { RenameCategory } from '$lib/renames/category';
 
 export const renameJobs = writable<RenameJob[]>([]);
 export const renameStatus = writable<RenameStatus | null>(null);
+
+// --- Multi-select ---
+export const selectedJobIds = writable<Set<number>>(new Set());
+export function toggleSelect(id: number) {
+  selectedJobIds.update((s) => {
+    const next = new Set(s);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    return next;
+  });
+}
+export function selectAll(ids: number[]) {
+  selectedJobIds.set(new Set(ids));
+}
+export function clearSelection() {
+  selectedJobIds.set(new Set());
+}
+
+// --- View / sort / category / search prefs ---
+export const viewMode = persisted<'list' | 'grid'>('sh-renames-view', 'list');
+export const renameSort = persisted<
+  'detected_desc' | 'detected_asc' | 'confidence_desc' | 'title_asc'
+>('sh-renames-sort', 'detected_desc');
+export const renameCategory = persisted<RenameCategory>('sh-renames-category', 'all');
+export const renameQuery = writable<string>('');
+
+// --- Bulk in-flight flag (disables BulkBar during a run) ---
+export const bulkBusy = writable<boolean>(false);
 
 export interface FolderPreviewItem {
   path: string;
@@ -51,6 +82,10 @@ async function refresh() {
   await Promise.all([loadRenameJobs(), loadRenameStatus()]);
 }
 
+export async function refreshRenames() {
+  await refresh();
+}
+
 export async function applyJob(id: number) {
   await api.applyRename(id);
   await refresh();
@@ -64,6 +99,77 @@ export async function undoJob(id: number) {
 export async function rematchJob(id: number, tmdbId: number, mediaType?: string) {
   await api.rematchRename(id, tmdbId, mediaType);
   await refresh();
+}
+
+// --- Bulk actions ---
+async function runBulk(label: string, fn: (ids: number[]) => Promise<void>) {
+  const ids = [...get(selectedJobIds)];
+  if (ids.length === 0) return;
+  bulkBusy.set(true);
+  try {
+    await fn(ids);
+  } catch (e) {
+    addToast(`${label} failed`, e instanceof Error ? e.message : String(e), 'error');
+  } finally {
+    await refresh();
+    clearSelection();
+    bulkBusy.set(false);
+  }
+}
+
+export function bulkApply() {
+  return runBulk('Apply', async (ids) => {
+    const r = await api.bulkApply(ids);
+    addToast(
+      `Applied ${r.applied}`,
+      `${r.failed} failed`,
+      r.failed ? 'warning' : 'success'
+    );
+  });
+}
+
+export function bulkReidentify() {
+  return runBulk('Re-identify', async (ids) => {
+    const r = await api.bulkReidentify(ids);
+    addToast('Re-identify queued', `Queued ${r.queued} for re-identify`, 'info');
+  });
+}
+
+export function bulkDelete() {
+  return runBulk('Delete', async (ids) => {
+    const r = await api.bulkDelete(ids);
+    addToast('Deleted', `Deleted ${r.deleted}`, 'success');
+  });
+}
+
+export function bulkSetDestination(root: string) {
+  return runBulk('Set destination', async (ids) => {
+    const r = await api.bulkSetDestination(ids, root);
+    addToast('Destination updated', `Updated destination for ${r.updated}`, 'success');
+  });
+}
+
+/** Apply-confident. ids omitted = all matched jobs (Matched-card shortcut). */
+export async function applyConfident(ids?: number[]) {
+  bulkBusy.set(true);
+  try {
+    const r = await api.applyConfident(ids);
+    addToast(
+      `Applied ${r.applied} confident`,
+      `${r.skipped} skipped, ${r.failed} failed`,
+      r.failed ? 'warning' : 'success'
+    );
+  } catch (e) {
+    addToast(
+      'Apply confident failed',
+      e instanceof Error ? e.message : String(e),
+      'error'
+    );
+  } finally {
+    await refresh();
+    clearSelection();
+    bulkBusy.set(false);
+  }
 }
 
 export async function acceptCombinedJob(id: number) {
