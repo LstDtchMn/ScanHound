@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { get } from 'svelte/store';
   import {
     renameJobs, renameStatus, renameCategory, renameQuery, renameSort,
     viewMode,
@@ -88,7 +87,7 @@
   };
   async function dvScan() {
     const folder = dvPath.trim();
-    if (!folder || get(dvScanRunning)) return;  // guard: one scan at a time
+    if (!folder || $dvScanRunning) return;  // guard: one scan at a time
     try { localStorage.setItem('sh-dv-folder', folder); } catch {}
     // Stay "running" until the backend broadcasts dv:scan_done (the POST itself
     // returns immediately). dv:scan_done always fires — success, error, or busy —
@@ -186,16 +185,6 @@
     renameQuery.set('');
   }
 
-  // Whether a job has any legacy action beyond Apply/Rematch (which live on the
-  // row itself). Drives the "More ▾" affordance.
-  function hasLegacyActions(job: RenameJob): boolean {
-    return job.status === 'applied'
-      || job.status === 'needs_review'
-      || job.status === 'failed'
-      || !!job.combined_episode
-      || !!job.suggested_correction
-      || true; // Remove is always available
-  }
 </script>
 
 <div class="flex-1 overflow-auto p-4 flex flex-col gap-4">
@@ -240,7 +229,7 @@
           <RenameCard {job} {onRematch} />
           <button
             class="absolute top-1.5 right-1.5 z-10 px-1.5 py-0.5 rounded text-[11px] font-medium bg-[var(--bg-secondary)]/90 border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-            aria-label="More actions"
+            aria-label="More actions for {job.original_filename ?? job.title ?? `job ${job.id}`}"
             aria-expanded={actionsOpenId === job.id}
             onclick={(e) => { e.stopPropagation(); actionsOpenId = actionsOpenId === job.id ? null : job.id; }}
           >⋯</button>
@@ -280,10 +269,10 @@
     <ul class="divide-y divide-[var(--border)] rounded-lg border border-[var(--border)] overflow-hidden">
       {#each shown as job (job.id)}
         <RenameRow {job} {onRematch} />
-        {#if hasLegacyActions(job)}
-          <li class="px-3 py-1 bg-[var(--bg-tertiary)]/30">
+        <li class="px-3 py-1 bg-[var(--bg-tertiary)]/30">
             <button
               class="text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+              aria-label="More actions for {job.original_filename ?? job.title ?? `job ${job.id}`}"
               aria-expanded={actionsOpenId === job.id}
               onclick={() => (actionsOpenId = actionsOpenId === job.id ? null : job.id)}
             >{actionsOpenId === job.id ? 'Hide actions ▴' : 'More actions ▾'}</button>
@@ -317,7 +306,6 @@
               </div>
             {/if}
           </li>
-        {/if}
       {/each}
     </ul>
   {/if}
