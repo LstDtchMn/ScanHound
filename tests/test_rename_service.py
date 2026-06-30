@@ -52,6 +52,22 @@ def _show_search(title, year, media_type):
     return [{"id": 100, "name": "Test Show", "first_air_date": "2020-01-01"}]
 
 
+def _matrix_search_poster(title, year, media_type):
+    """Like _matrix_search but the TMDB result carries a poster_path."""
+    return [{
+        "id": 603, "title": "The Matrix", "original_title": "The Matrix",
+        "release_date": "1999-03-31", "poster_path": "/matrix.jpg",
+    }]
+
+
+def _no_poster_search(title, year, media_type):
+    """A movie result with poster_path entirely absent."""
+    return [{
+        "id": 603, "title": "The Matrix", "original_title": "The Matrix",
+        "release_date": "1999-03-31",
+    }]
+
+
 def _service(db, tmdb_search, *, movie_lib="", tv_lib="", **cfg):
     base = {
         "auto_rename_enabled": True,
@@ -152,6 +168,33 @@ class TestProcessPackage:
         assert job["status"] == "applied"
         assert not os.path.exists(src)  # 'move' consumed the source
         assert os.path.isfile(os.path.join(lib, "The Matrix (1999)", "The Matrix (1999) [1080p].mkv"))
+
+    def test_normalize_candidate_retains_poster_path(self):
+        from backend.rename.service import RenameService
+        r = {"id": 603, "title": "The Matrix", "release_date": "1999-03-31",
+             "poster_path": "/matrix.jpg"}
+        cand = RenameService._normalize_candidate(r, "movie")
+        assert cand["poster_path"] == "/matrix.jpg"
+
+    def test_normalize_candidate_poster_path_absent_is_none(self):
+        from backend.rename.service import RenameService
+        r = {"id": 603, "title": "The Matrix", "release_date": "1999-03-31"}
+        cand = RenameService._normalize_candidate(r, "movie")
+        assert cand["poster_path"] is None
+
+    def test_identified_job_persists_poster_path(self, db, tmp_path):
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.BluRay.x264.mkv")
+        ids = _service(db, _matrix_search_poster,
+                       movie_lib=str(tmp_path / "lib")).process_package("pkg1", save_to)
+        job = db.get_rename_job(ids[0])
+        assert job["poster_path"] == "/matrix.jpg"
+
+    def test_job_without_poster_stores_null(self, db, tmp_path):
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.BluRay.x264.mkv")
+        ids = _service(db, _no_poster_search,
+                       movie_lib=str(tmp_path / "lib")).process_package("pkg1", save_to)
+        job = db.get_rename_job(ids[0])
+        assert job["poster_path"] is None
 
 
 # ── DV folder scan accounting ─────────────────────────────────────────

@@ -483,7 +483,8 @@ class RenameService:
         if not name:
             return None
         year = int(date[:4]) if date[:4].isdigit() else None
-        return {"title": name, "year": year, "tmdb_id": r.get("id"), "media_type": media_type}
+        return {"title": name, "year": year, "tmdb_id": r.get("id"),
+                "media_type": media_type, "poster_path": r.get("poster_path")}
 
     def _tmdb_match(self, title, year, media_type, *, score_year=None) -> Optional[dict]:
         """Search by ``title``/``year`` and rank by confidence. ``score_year``
@@ -1256,6 +1257,7 @@ class RenameService:
             year=match.get("year"), season=match.get("season"),
             episode=match.get("episode"), tmdb_id=match.get("tmdb_id"),
             imdb_id=match.get("imdb_id"), resolution=match.get("resolution"),
+            poster_path=match.get("poster_path"),
             match_confidence=conf, match_source=match.get("source"),
             new_filename=fname, destination_path=dest,
             suggested_correction=match.get("suggested_correction"),

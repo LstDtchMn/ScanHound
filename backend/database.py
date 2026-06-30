@@ -1414,7 +1414,7 @@ class DatabaseManager:
         "episode", "tmdb_id", "imdb_id", "resolution", "match_confidence",
         "match_source", "move_method", "proposed_match", "plex_sort_title",
         "warning_message", "error_message", "processed_at", "reverted_at",
-        "suggested_correction", "combined_episode", "split_file",
+        "suggested_correction", "combined_episode", "split_file", "poster_path",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.
