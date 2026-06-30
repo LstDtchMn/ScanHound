@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { confidenceVariant, renameStatusVariant } from './constants';
+import { confidenceVariant, renameStatusVariant, renameStatusBorderColor, dvLayerVariant } from './constants';
 
 describe('confidenceVariant', () => {
   it('is success at and above 95', () => {
@@ -31,5 +31,43 @@ describe('renameStatusVariant', () => {
   it('falls back to default for unknown', () => {
     expect(renameStatusVariant('zzz')).toBe('default');
     expect(renameStatusVariant(null)).toBe('default');
+  });
+  it('covers reverted and pending statuses', () => {
+    expect(renameStatusVariant('reverted')).toBe('default');
+    expect(renameStatusVariant('pending')).toBe('info');
+  });
+});
+
+describe('renameStatusBorderColor', () => {
+  it('returns error color for failed status', () => {
+    const color = renameStatusBorderColor('failed');
+    expect(typeof color).toBe('string');
+    expect(color.length).toBeGreaterThan(0);
+    expect(color).toBe('var(--error)');
+  });
+  it('returns border color for unknown status (default branch)', () => {
+    const color = renameStatusBorderColor('zzz_unknown');
+    expect(color).toBe('var(--border)');
+  });
+  it('returns border color for null (default branch)', () => {
+    expect(renameStatusBorderColor(null)).toBe('var(--border)');
+  });
+});
+
+describe('dvLayerVariant', () => {
+  it('maps fel → error', () => {
+    expect(dvLayerVariant('fel')).toBe('error');
+  });
+  it('maps mel → orange', () => {
+    expect(dvLayerVariant('mel')).toBe('orange');
+  });
+  it('falls back to default for unknown layer', () => {
+    expect(dvLayerVariant('unknown_layer')).toBe('default');
+  });
+  it('falls back to default for null', () => {
+    expect(dvLayerVariant(null)).toBe('default');
+  });
+  it('falls back to default for undefined', () => {
+    expect(dvLayerVariant(undefined)).toBe('default');
   });
 });

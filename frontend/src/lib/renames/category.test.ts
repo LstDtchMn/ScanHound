@@ -25,6 +25,9 @@ describe('categoryOf', () => {
   it('treats media_type "show" as tv', () => {
     expect(categoryOf(job({ media_type: 'show' })).has('tv')).toBe(true);
   });
+  it('treats media_type "tv" as tv', () => {
+    expect(categoryOf(job({ media_type: 'tv' })).has('tv')).toBe(true);
+  });
   it('matches uhd/4k/2160p case-insensitively for 4k', () => {
     expect(categoryOf(job({ resolution: 'UHD' })).has('4k')).toBe(true);
     expect(categoryOf(job({ resolution: '4K' })).has('4k')).toBe(true);
