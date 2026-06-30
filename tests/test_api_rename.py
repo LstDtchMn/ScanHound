@@ -442,3 +442,29 @@ class TestRenameApi:
         r = client.post("/rename/jobs/apply-confident", json={"ids": [a]}).json()
         assert r["applied"] == 1
         assert all(x["id"] == a for x in r["results"])
+
+    def test_apply_confident_empty_ids_applies_nothing(self, client, tmp_path):
+        # An empty ids list is an explicit empty selection: must apply nothing,
+        # even when a confident matched job exists (regression guard for the
+        # if ids: → if ids is not None: fix).
+        dest = tmp_path / "lib"
+        src = tmp_path / "ok.mkv"; src.write_text("x")
+        jid = _seed_job(status="matched", title="Ok", match_confidence=96,
+                        original_path=str(src), destination_path=str(dest),
+                        new_filename="Ok (2020).mkv")
+        r = client.post("/rename/jobs/apply-confident", json={"ids": []}).json()
+        assert r["applied"] == 0 and r["skipped"] == 0 and r["failed"] == 0
+        # The file must NOT have been moved.
+        assert not (dest / "Ok (2020).mkv").exists()
+        assert src.exists()
+
+    def test_apply_confident_boundary_exactly_95(self, client, tmp_path):
+        # A job at match_confidence == 95 must be applied (>= 95 gate is inclusive).
+        dest = tmp_path / "lib"
+        src = tmp_path / "exact.mkv"; src.write_text("x")
+        jid = _seed_job(status="matched", title="Boundary", match_confidence=95,
+                        original_path=str(src), destination_path=str(dest),
+                        new_filename="Boundary (2020).mkv")
+        r = client.post("/rename/jobs/apply-confident", json={}).json()
+        assert r["applied"] == 1 and r["skipped"] == 0
+        assert (dest / "Boundary (2020).mkv").exists()

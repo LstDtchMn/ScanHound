@@ -1546,7 +1546,7 @@ class RenameService:
         db = self._db
         if db is None:
             return {"results": [], "applied": 0, "skipped": 0, "failed": 0}
-        if ids:
+        if ids is not None:
             candidates = []
             for jid in ids:
                 job = db.get_rename_job(int(jid))
