@@ -223,3 +223,64 @@ class TestRenameApi:
         assert r["destination_path"] is not None
         assert lib in r["destination_path"]
         assert r["warning"] is None
+
+    # ------------------------------------------------------------------
+    # Fail-safe no-500 guarantee tests
+    # ------------------------------------------------------------------
+
+    def test_rematch_preview_job_not_found_clean_200(self, client):
+        """POST to a non-existent job must return HTTP 200 clean dict (not 500)."""
+        r = client.post("/rename/jobs/99999/rematch-preview",
+                        json={"tmdb_id": 1, "media_type": "movie"})
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body.keys()) >= {"new_filename", "destination_path",
+                                    "library_configured", "warning"}
+        assert body["library_configured"] is False
+        assert body["destination_path"] is None
+        assert body["warning"] == "Job not found"
+
+    def test_rematch_preview_tmdb_error_clean_200(self, client, monkeypatch):
+        """TMDB fetch raising must return HTTP 200 clean dict with warning (not 500)."""
+        import backend.rename.service as svc_mod
+        jid = _seed_job(status="needs_review", title="Old", media_type="movie")
+
+        def _boom(*a, **kw):
+            raise RuntimeError("TMDB network error")
+
+        monkeypatch.setattr(
+            svc_mod.RenameService, "_tmdb_client",
+            lambda self: type("T", (), {"details": staticmethod(_boom)})())
+        r = client.post(f"/rename/jobs/{jid}/rematch-preview",
+                        json={"tmdb_id": 99, "media_type": "movie"})
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body.keys()) >= {"new_filename", "destination_path",
+                                    "library_configured", "warning"}
+        assert body["library_configured"] is False
+        assert body["destination_path"] is None
+        assert body["warning"]  # warning text is set
+
+    def test_rematch_preview_unconfigured_library_has_new_filename(self, client, monkeypatch):
+        """Unconfigured library path: build_target is called with empty root.
+        Must return HTTP 200, library_configured=False, destination_path=None,
+        and new_filename set (the would-be name) — never 500."""
+        import backend.rename.service as svc_mod
+        jid = _seed_job(status="needs_review", title="Old", media_type="movie",
+                        original_filename="old.mkv")
+        monkeypatch.setattr(
+            svc_mod.RenameService, "_tmdb_client",
+            lambda self: type("T", (), {"details": staticmethod(
+                lambda tmdb_id, media_type="movie", language="en-US": {
+                    "title": "Real Title", "release_date": "2022-05-01"})})())
+        # No library configured (default config has no movie root)
+        r = client.post(f"/rename/jobs/{jid}/rematch-preview",
+                        json={"tmdb_id": 99, "media_type": "movie"})
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body.keys()) >= {"new_filename", "destination_path",
+                                    "library_configured", "warning"}
+        assert body["library_configured"] is False
+        assert body["destination_path"] is None
+        assert body["new_filename"] is not None  # would-be name still produced
+        assert body["warning"]  # "Movie library not configured…"

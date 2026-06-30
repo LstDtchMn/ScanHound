@@ -1505,10 +1505,15 @@ class RenameService:
         meta = {**job, "media_type": mtype, "title": title, "year": year,
                 "tmdb_id": int(tmdb_id), "season": sea, "episode": epi}
         lib_set, lib_label = self._lib_set(mtype, job.get("resolution"))
-        fname, dest = _naming.build_target(
-            meta, movie_root=self._movie_root(job.get("resolution")),
-            tv_root=self._cfg.get("auto_rename_tv_library", ""),
-            template=self._template_for(mtype))
+        try:
+            fname, dest = _naming.build_target(
+                meta, movie_root=self._movie_root(job.get("resolution")),
+                tv_root=self._cfg.get("auto_rename_tv_library", ""),
+                template=self._template_for(mtype))
+        except Exception:
+            return {"new_filename": None, "destination_path": None,
+                    "library_configured": False,
+                    "warning": "Could not build target filename"}
         warning = None
         if not lib_set:
             dest = None

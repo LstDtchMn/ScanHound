@@ -34,11 +34,7 @@ class RematchRequest(BaseModel):
     episode: Optional[int] = None
 
 
-class RematchPreviewRequest(BaseModel):
-    tmdb_id: int
-    media_type: Optional[str] = None
-    season: Optional[int] = None
-    episode: Optional[int] = None
+RematchPreviewRequest = RematchRequest
 
 
 class ProcessFolderRequest(BaseModel):
