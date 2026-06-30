@@ -32,6 +32,14 @@ def _seed_job(**fields):
     return jid
 
 
+def _seed_dv_scan(path, dv_layer):
+    dm = DatabaseManager()
+    dm.upsert_dv_scan(path=path, title="x", dv_layer=dv_layer,
+                      sig_mtime=0.0, sig_size=0, source="test",
+                      rating_key=None, imdb_id=None)
+    dm.close()
+
+
 class _FakeTags:
     def raise_for_status(self): pass
     def json(self): return {"models": [{"name": "llama3.1:8b"}, {"name": "qwen2.5"}]}
@@ -138,3 +146,26 @@ class TestRenameApi:
         body = client.get("/rename/llm/test").json()
         assert body["ok"] is True
         assert "llama3.1:8b" in body["models"]
+
+    def test_poster_url_built_when_poster_path_set(self, client):
+        _seed_job(status="matched", title="M", poster_path="/abc.jpg")
+        job = client.get("/rename/jobs").json()["jobs"][0]
+        assert job["poster_url"] is not None
+        assert job["poster_url"].endswith("/abc.jpg")
+        assert "image.tmdb.org/t/p/" in job["poster_url"]
+
+    def test_poster_url_null_when_no_poster_path(self, client):
+        _seed_job(status="matched", title="M")
+        job = client.get("/rename/jobs").json()["jobs"][0]
+        assert job["poster_url"] is None
+
+    def test_dv_layer_joined_when_dv_scan_exists(self, client):
+        _seed_dv_scan("/x/y.mkv", "fel")
+        _seed_job(status="matched", title="M", original_path="/x/y.mkv")
+        job = client.get("/rename/jobs").json()["jobs"][0]
+        assert job["dv_layer"] == "fel"
+
+    def test_dv_layer_null_when_no_dv_scan(self, client):
+        _seed_job(status="matched", title="M", original_path="/x/none.mkv")
+        job = client.get("/rename/jobs").json()["jobs"][0]
+        assert job["dv_layer"] is None

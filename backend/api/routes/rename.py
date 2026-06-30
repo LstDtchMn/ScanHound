@@ -8,9 +8,20 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
+from backend.api.routes.scanner import TMDB_IMAGE_BASE  # same base+size as Scan posters (w500)
 from backend.api.ws import ws_manager
 from backend.rename import dv_detect, llm_identify
 from backend.rename.service import conflict_annotations
+
+
+def _poster_url(poster_path):
+    """Build a TMDB poster URL from a stored path, fail-safe."""
+    try:
+        if poster_path and str(poster_path).startswith("/"):
+            return f"{TMDB_IMAGE_BASE}{poster_path}"
+    except Exception:
+        pass
+    return None
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/rename", tags=["rename"])
@@ -53,6 +64,12 @@ def list_jobs(status: Optional[str] = None, limit: int = 200,
         j["destination_conflict"] = ann.get("destination_conflict", False)
         j["keep_recommended"] = ann.get("keep_recommended", False)
         j["keep_reason"] = ann.get("keep_reason")
+        j["poster_url"] = _poster_url(j.get("poster_path"))
+        try:
+            dv = reg.db.get_dv_scan(j.get("original_path"))
+        except Exception:
+            dv = None
+        j["dv_layer"] = (dv or {}).get("dv_layer")
     return {
         "jobs": jobs,
         "counts": reg.db.count_rename_jobs_by_status(),
