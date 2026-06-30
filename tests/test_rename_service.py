@@ -583,6 +583,21 @@ class TestRematch:
         assert job["warning_message"]
         assert job["destination_path"] in (None, "")
 
+    def test_rematch_movie_library_unset_needs_review(self, db, monkeypatch):
+        svc = _service(db, _matrix_search, movie_lib="")  # movie library unset
+        jid = db.create_rename_job({
+            "original_path": "/x/film.mkv", "original_filename": "film.mkv",
+            "status": "needs_review", "media_type": "movie"})
+        monkeypatch.setattr(svc, "_tmdb_client",
+            lambda: _FakeTmdb({"title": "The Matrix", "release_date": "1999-03-30",
+                               "poster_path": "/matrix.jpg"}))
+        out = svc.rematch(jid, 603, media_type="movie")
+        job = db.get_rename_job(jid)
+        assert out["ok"] is True
+        assert job["status"] == "needs_review"
+        assert job["warning_message"]
+        assert job["destination_path"] in (None, "")
+
     def test_rematch_tv_library_set_matched_under_root(self, db, monkeypatch, tmp_path):
         tv = str(tmp_path / "tv")
         svc = _service(db, _matrix_search, tv_lib=tv)

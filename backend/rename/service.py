@@ -440,6 +440,12 @@ class RenameService:
         key = "auto_rename_template_tv" if media_type == "tv" else "auto_rename_template_movie"
         return self._cfg.get(key) or None
 
+    def _lib_set(self, media_type: Optional[str], resolution: Optional[str] = None) -> tuple:
+        """Return (is_configured, library_label) for the given media type."""
+        if media_type == "tv":
+            return bool(self._cfg.get("auto_rename_tv_library")), "TV"
+        return bool(self._movie_root(resolution)), "Movie"
+
     def _tmdb_client(self):
         if self._client is None:
             with self._client_lock:
@@ -1313,12 +1319,7 @@ class RenameService:
         # CWD instead of the library. Hold for review with a clear message rather
         # than move a file to a junk location.
         mtype = match.get("media_type")
-        if mtype == "tv":
-            lib_set = bool(self._cfg.get("auto_rename_tv_library"))
-            lib_label = "TV"
-        else:
-            lib_set = bool(self._movie_root(match.get("resolution")))
-            lib_label = "Movie"
+        lib_set, lib_label = self._lib_set(mtype, match.get("resolution"))
         if not lib_set:
             job["status"] = "needs_review"
             # Don't clobber a more specific reason (low confidence, a proposal);
@@ -1448,12 +1449,7 @@ class RenameService:
         meta = {**job, "media_type": mtype, "title": title, "year": year,
                 "tmdb_id": int(tmdb_id), "season": sea, "episode": epi}
         # Library-not-configured guard (mirrors _process_file_inner).
-        if mtype == "tv":
-            lib_set = bool(self._cfg.get("auto_rename_tv_library"))
-            lib_label = "TV"
-        else:
-            lib_set = bool(self._movie_root(job.get("resolution")))
-            lib_label = "Movie"
+        lib_set, lib_label = self._lib_set(mtype, job.get("resolution"))
         if not lib_set:
             warning = (f"{lib_label} library not configured — set it in "
                        f"Settings → Renaming before applying")
