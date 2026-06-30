@@ -1522,6 +1522,100 @@ class RenameService:
         return {"new_filename": fname, "destination_path": dest,
                 "library_configured": lib_set, "warning": warning}
 
+    def bulk_apply(self, ids: list) -> dict:
+        if not self._bulk_lock.acquire(blocking=False):
+            return {"results": [], "applied": 0, "failed": 0, "busy": True}
+        try:
+            results, applied, failed = [], 0, 0
+            for jid in ids or []:
+                try:
+                    out = self.apply(int(jid))
+                except Exception as e:
+                    out = {"ok": False, "error": str(e)}
+                ok = bool(out.get("ok"))
+                results.append({"id": int(jid), "ok": ok,
+                                "error": out.get("error")})
+                applied += 1 if ok else 0
+                failed += 0 if ok else 1
+            return {"results": results, "applied": applied, "failed": failed}
+        finally:
+            self._bulk_lock.release()
+
+    def bulk_reidentify(self, ids: list) -> dict:
+        if not self._bulk_lock.acquire(blocking=False):
+            return {"ok": False, "queued": 0, "busy": True}
+        try:
+            queued = 0
+            for jid in ids or []:
+                try:
+                    self.reidentify(int(jid))
+                    queued += 1
+                except Exception:
+                    logger.exception("bulk_reidentify: job %s failed", jid)
+            return {"ok": True, "queued": queued}
+        finally:
+            self._bulk_lock.release()
+
+    def bulk_delete(self, ids: list) -> dict:
+        db = self._db
+        if db is None:
+            return {"deleted": 0}
+        deleted = 0
+        for jid in ids or []:
+            try:
+                db.delete_rename_job(int(jid))
+                deleted += 1
+            except Exception:
+                logger.exception("bulk_delete: job %s failed", jid)
+        return {"deleted": deleted}
+
+    def set_destination(self, job_id: int, root: str) -> dict:
+        """Rebuild one job's destination_path under ``root``; re-run guard."""
+        db = self._db
+        job = db.get_rename_job(job_id) if db else None
+        if not job:
+            return {"id": int(job_id), "ok": False,
+                    "destination_path": None, "error": "Job not found"}
+        if not root or not str(root).strip():
+            db.update_rename_job(job_id, status="needs_review",
+                                 destination_path=None,
+                                 warning_message="Destination library not configured")
+            self._broadcast(job_id)
+            return {"id": int(job_id), "ok": False, "destination_path": None,
+                    "error": "Destination library not configured"}
+        mtype = job.get("media_type") or "movie"
+        meta = {**job, "media_type": mtype}
+        if mtype == "tv":
+            fname, dest = _naming.build_target(
+                meta, tv_root=root, movie_root=self._movie_root(job.get("resolution")),
+                template=self._template_for(mtype))
+        else:
+            fname, dest = _naming.build_target(
+                meta, movie_root=root, tv_root=self._cfg.get("auto_rename_tv_library", ""),
+                template=self._template_for(mtype))
+        db.update_rename_job(job_id, new_filename=fname, destination_path=dest,
+                             status="matched", warning_message=None)
+        self._broadcast(job_id)
+        return {"id": int(job_id), "ok": True, "destination_path": dest,
+                "error": None}
+
+    def bulk_set_destination(self, ids: list, root: str) -> dict:
+        if not self._bulk_lock.acquire(blocking=False):
+            return {"results": [], "updated": 0, "busy": True}
+        try:
+            results, updated = [], 0
+            for jid in ids or []:
+                try:
+                    out = self.set_destination(int(jid), root)
+                except Exception as e:
+                    out = {"id": int(jid), "ok": False,
+                           "destination_path": None, "error": str(e)}
+                results.append(out)
+                updated += 1 if out.get("ok") else 0
+            return {"results": results, "updated": updated}
+        finally:
+            self._bulk_lock.release()
+
     def search_tmdb_public(self, query: str, media_type: str = "movie") -> list:
         """Search TMDB for the rematch picker; fail-safe → [] on any problem."""
         if not query or not query.strip():

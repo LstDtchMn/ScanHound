@@ -315,3 +315,55 @@ class TestRenameApi:
         monkeypatch.setattr(svc_mod.RenameService, "_tmdb_client", lambda self: None)
         r = client.get("/rename/search-tmdb?query=matrix&media_type=movie").json()
         assert r["results"] == []
+
+    # ------------------------------------------------------------------
+    # Task 7: Bulk endpoints
+    # ------------------------------------------------------------------
+
+    def test_bulk_apply_partial_failure(self, client, tmp_path):
+        dest = tmp_path / "lib"
+        src = tmp_path / "ok.mkv"; src.write_text("x")
+        ok = _seed_job(status="matched", title="Ok", original_path=str(src),
+                       destination_path=str(dest), new_filename="Ok (2020).mkv")
+        bad = _seed_job(status="matched", title="Bad",
+                        original_path=str(tmp_path / "missing.mkv"),
+                        destination_path=str(dest), new_filename="Bad (2020).mkv")
+        r = client.post("/rename/jobs/bulk/apply",
+                        json={"ids": [ok, bad]}).json()
+        by = {x["id"]: x for x in r["results"]}
+        assert by[ok]["ok"] is True
+        assert by[bad]["ok"] is False and by[bad]["error"]
+        assert r["applied"] == 1 and r["failed"] == 1
+
+    def test_bulk_delete_counts(self, client):
+        a = _seed_job(status="needs_review", title="A")
+        b = _seed_job(status="needs_review", title="B")
+        r = client.post("/rename/jobs/bulk/delete", json={"ids": [a, b]}).json()
+        assert r["deleted"] == 2
+        assert client.get("/rename/jobs").json()["jobs"] == []
+
+    def test_bulk_reidentify_queues(self, client):
+        a = _seed_job(status="needs_review", title="A")
+        r = client.post("/rename/jobs/bulk/reidentify", json={"ids": [a]}).json()
+        assert r["ok"] is True and r["queued"] == 1
+
+    def test_bulk_set_destination_guard_enforced(self, client, tmp_path):
+        # Movie job, valid root -> rebuilt destination under root.
+        jid = _seed_job(status="matched", title="The Matrix", year=1999,
+                        media_type="movie", resolution="1080p",
+                        new_filename="The Matrix (1999) [1080p].mkv")
+        root = str(tmp_path / "movies")
+        r = client.post("/rename/jobs/bulk/set-destination",
+                        json={"ids": [jid], "destination_root": root}).json()
+        res = r["results"][0]
+        assert res["ok"] is True
+        assert res["destination_path"].startswith(root)
+        assert r["updated"] == 1
+
+    def test_bulk_set_destination_empty_root_blocks(self, client):
+        jid = _seed_job(status="matched", title="M", media_type="movie")
+        r = client.post("/rename/jobs/bulk/set-destination",
+                        json={"ids": [jid], "destination_root": ""}).json()
+        res = r["results"][0]
+        assert res["ok"] is False
+        assert res["destination_path"] is None

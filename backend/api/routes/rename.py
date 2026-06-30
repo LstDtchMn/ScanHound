@@ -47,6 +47,15 @@ class DvScanRequest(BaseModel):
     force: bool = False
 
 
+class BulkIdsRequest(BaseModel):
+    ids: list[int] = []
+
+
+class BulkSetDestRequest(BaseModel):
+    ids: list[int] = []
+    destination_root: str = ""
+
+
 @router.get("/jobs")
 def list_jobs(status: Optional[str] = None, limit: int = 200,
               reg: ServiceRegistry = Depends(get_registry)):
@@ -100,6 +109,33 @@ def _service(reg: ServiceRegistry):
     if reg._rename_service is None:
         raise HTTPException(status_code=503, detail="Rename service not initialized")
     return reg._rename_service
+
+
+# ── Bulk endpoints (must be registered before /{job_id}/… routes so the static
+#    /bulk/… path segment isn't swallowed by the int-typed path parameter) ────
+
+@router.post("/jobs/bulk/apply")
+def bulk_apply(body: BulkIdsRequest, reg: ServiceRegistry = Depends(get_registry)):
+    return _service(reg).bulk_apply(body.ids)
+
+
+@router.post("/jobs/bulk/reidentify")
+def bulk_reidentify(body: BulkIdsRequest,
+                    reg: ServiceRegistry = Depends(get_registry)):
+    return _service(reg).bulk_reidentify(body.ids)
+
+
+@router.post("/jobs/bulk/delete")
+def bulk_delete(body: BulkIdsRequest, reg: ServiceRegistry = Depends(get_registry)):
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return _service(reg).bulk_delete(body.ids)
+
+
+@router.post("/jobs/bulk/set-destination")
+def bulk_set_destination(body: BulkSetDestRequest,
+                         reg: ServiceRegistry = Depends(get_registry)):
+    return _service(reg).bulk_set_destination(body.ids, body.destination_root)
 
 
 @router.post("/jobs/{job_id}/apply")
