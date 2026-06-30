@@ -168,3 +168,51 @@ export const DOWNLOAD_HOSTS: DownloadHostOption[] = [
   { value: 'Nitroflare', short: 'NF' },
   { value: '1Fichier', short: '1F' },
 ];
+
+/** Rename-pipeline status → Badge variant (distinct from scan STATUS_VARIANTS). */
+export const RENAME_STATUS_VARIANTS: Record<string, BadgeVariant> = {
+  needs_review: 'warning',
+  matched: 'accent',
+  applied: 'success',
+  reverted: 'default',
+  failed: 'error',
+  pending: 'info',
+};
+
+/** Dolby Vision layer → Badge variant. */
+export const DV_LAYER_VARIANTS: Record<string, BadgeVariant> = {
+  fel: 'error',
+  mel: 'orange',
+  p8: 'accent',
+  p5: 'info',
+};
+
+export function renameStatusVariant(status: string | null | undefined): BadgeVariant {
+  if (!status) return 'default';
+  return RENAME_STATUS_VARIANTS[status.toLowerCase()] ?? 'default';
+}
+
+export function dvLayerVariant(layer: string | null | undefined): BadgeVariant {
+  if (!layer) return 'default';
+  return DV_LAYER_VARIANTS[layer.toLowerCase()] ?? 'default';
+}
+
+/** Confidence % → variant: ≥95 success, 70–94 warning, <70 error, null/undefined default. */
+export function confidenceVariant(pct: number | null | undefined): BadgeVariant {
+  if (pct == null || Number.isNaN(pct)) return 'default';
+  if (pct >= 95) return 'success';
+  if (pct >= 70) return 'warning';
+  return 'error';
+}
+
+export function renameStatusBorderColor(status: string | null | undefined): string {
+  switch (renameStatusVariant(status)) {
+    case 'error': return 'var(--error)';
+    case 'warning': return 'var(--warning)';
+    case 'success': return 'var(--success)';
+    case 'accent': return 'var(--accent)';
+    case 'info': return '#3b82f6';
+    case 'orange': return '#f97316';
+    default: return 'var(--border)';
+  }
+}
