@@ -557,6 +557,75 @@ class TestAcceptProposals:
         assert job["new_filename"] == "Show - S01E01E02.mkv"
 
 
+# ── rematch: library guard + poster_path + season/episode overrides ────
+
+class _FakeTmdb:
+    def __init__(self, details):
+        self._details = details
+
+    def details(self, tmdb_id, media_type="movie", language="en-US"):
+        return dict(self._details, id=tmdb_id)
+
+
+class TestRematch:
+    def test_rematch_tv_library_unset_needs_review(self, db, monkeypatch):
+        svc = _service(db, _matrix_search, tv_lib="")  # TV library unset
+        jid = db.create_rename_job({
+            "original_path": "/x/show.mkv", "original_filename": "show.mkv",
+            "status": "needs_review", "media_type": "tv", "season": 1, "episode": 2})
+        monkeypatch.setattr(svc, "_tmdb_client",
+            lambda: _FakeTmdb({"name": "The Show", "first_air_date": "2020-01-01",
+                               "poster_path": "/show.jpg"}))
+        out = svc.rematch(jid, 1234, media_type="tv")
+        job = db.get_rename_job(jid)
+        assert out["ok"] is True
+        assert job["status"] == "needs_review"
+        assert job["warning_message"]
+        assert job["destination_path"] in (None, "")
+
+    def test_rematch_tv_library_set_matched_under_root(self, db, monkeypatch, tmp_path):
+        tv = str(tmp_path / "tv")
+        svc = _service(db, _matrix_search, tv_lib=tv)
+        jid = db.create_rename_job({
+            "original_path": "/x/show.mkv", "original_filename": "show.mkv",
+            "status": "needs_review", "media_type": "tv", "season": 1, "episode": 2})
+        monkeypatch.setattr(svc, "_tmdb_client",
+            lambda: _FakeTmdb({"name": "The Show", "first_air_date": "2020-01-01",
+                               "poster_path": "/show.jpg"}))
+        out = svc.rematch(jid, 1234, media_type="tv")
+        job = db.get_rename_job(jid)
+        assert job["status"] == "matched"
+        assert job["destination_path"].startswith(tv)
+        assert job["poster_path"] == "/show.jpg"
+
+    def test_rematch_season_episode_override_changes_filename(self, db, monkeypatch, tmp_path):
+        tv = str(tmp_path / "tv")
+        svc = _service(db, _matrix_search, tv_lib=tv)
+        jid = db.create_rename_job({
+            "original_path": "/x/show.mkv", "original_filename": "show.mkv",
+            "status": "needs_review", "media_type": "tv", "season": 1, "episode": 2})
+        monkeypatch.setattr(svc, "_tmdb_client",
+            lambda: _FakeTmdb({"name": "The Show", "first_air_date": "2020-01-01",
+                               "poster_path": "/show.jpg"}))
+        svc.rematch(jid, 1234, media_type="tv", season=3, episode=7)
+        fname = db.get_rename_job(jid)["new_filename"]
+        assert "S03E07" in fname
+
+    def test_rematch_poster_path_persisted_from_details(self, db, monkeypatch, tmp_path):
+        movie = str(tmp_path / "movies")
+        svc = _service(db, _matrix_search, movie_lib=movie)
+        jid = db.create_rename_job({
+            "original_path": "/x/film.mkv", "original_filename": "film.mkv",
+            "status": "needs_review", "media_type": "movie"})
+        monkeypatch.setattr(svc, "_tmdb_client",
+            lambda: _FakeTmdb({"title": "The Matrix", "release_date": "1999-03-30",
+                               "poster_path": "/matrix.jpg"}))
+        svc.rematch(jid, 603, media_type="movie")
+        job = db.get_rename_job(jid)
+        assert job["poster_path"] == "/matrix.jpg"
+        assert job["status"] == "matched"
+
+
 # ── small units ───────────────────────────────────────────────────────
 
 class TestUnits:

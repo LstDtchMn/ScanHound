@@ -1423,7 +1423,8 @@ class RenameService:
         self._broadcast(job_id)
         return {"ok": True}
 
-    def rematch(self, job_id: int, tmdb_id: int, media_type: Optional[str] = None) -> dict:
+    def rematch(self, job_id: int, tmdb_id: int, media_type: Optional[str] = None,
+                season: Optional[int] = None, episode: Optional[int] = None) -> dict:
         db = self._db
         job = db.get_rename_job(job_id) if db else None
         if not job:
@@ -1441,18 +1442,42 @@ class RenameService:
         title = details.get("title") or details.get("name") or job.get("title")
         date = details.get("release_date") or details.get("first_air_date") or ""
         year = int(date[:4]) if date[:4].isdigit() else job.get("year")
+        poster_path = details.get("poster_path") or job.get("poster_path")
+        sea = season if season is not None else job.get("season")
+        epi = episode if episode is not None else job.get("episode")
         meta = {**job, "media_type": mtype, "title": title, "year": year,
-                "tmdb_id": int(tmdb_id)}
+                "tmdb_id": int(tmdb_id), "season": sea, "episode": epi}
+        # Library-not-configured guard (mirrors _process_file_inner).
+        if mtype == "tv":
+            lib_set = bool(self._cfg.get("auto_rename_tv_library"))
+            lib_label = "TV"
+        else:
+            lib_set = bool(self._movie_root(job.get("resolution")))
+            lib_label = "Movie"
+        if not lib_set:
+            warning = (f"{lib_label} library not configured — set it in "
+                       f"Settings → Renaming before applying")
+            db.update_rename_job(job_id, title=title, year=year, tmdb_id=int(tmdb_id),
+                                 media_type=mtype, season=sea, episode=epi,
+                                 poster_path=poster_path, destination_path=None,
+                                 match_confidence=100.0, match_source="manual",
+                                 status="needs_review", warning_message=warning)
+            self._broadcast(job_id)
+            return {"ok": True, "status": "needs_review", "new_filename": None,
+                    "destination_path": None, "warning": warning}
         fname, dest = _naming.build_target(
             meta, movie_root=self._movie_root(job.get("resolution")),
             tv_root=self._cfg.get("auto_rename_tv_library", ""),
             template=self._template_for(mtype))
         db.update_rename_job(job_id, title=title, year=year, tmdb_id=int(tmdb_id),
-                             media_type=mtype, new_filename=fname, destination_path=dest,
-                             match_confidence=100.0, match_source="manual",
-                             status="matched", warning_message=None)
+                             media_type=mtype, season=sea, episode=epi,
+                             poster_path=poster_path, new_filename=fname,
+                             destination_path=dest, match_confidence=100.0,
+                             match_source="manual", status="matched",
+                             warning_message=None)
         self._broadcast(job_id)
-        return {"ok": True}
+        return {"ok": True, "status": "matched", "new_filename": fname,
+                "destination_path": dest, "warning": None}
 
     def accept_combined(self, job_id: int) -> dict:
         """Accept a runtime-detected combined-episode proposal.

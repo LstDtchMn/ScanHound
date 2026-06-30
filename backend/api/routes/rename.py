@@ -30,6 +30,8 @@ router = APIRouter(prefix="/rename", tags=["rename"])
 class RematchRequest(BaseModel):
     tmdb_id: int
     media_type: Optional[str] = None
+    season: Optional[int] = None
+    episode: Optional[int] = None
 
 
 class ProcessFolderRequest(BaseModel):
@@ -116,7 +118,8 @@ def undo_job(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
 @router.post("/jobs/{job_id}/rematch")
 def rematch_job(job_id: int, body: RematchRequest,
                 reg: ServiceRegistry = Depends(get_registry)):
-    out = _service(reg).rematch(job_id, body.tmdb_id, body.media_type)
+    out = _service(reg).rematch(job_id, body.tmdb_id, body.media_type,
+                                season=body.season, episode=body.episode)
     if not out.get("ok"):
         raise HTTPException(status_code=400, detail=out.get("error", "Rematch failed"))
     return out
