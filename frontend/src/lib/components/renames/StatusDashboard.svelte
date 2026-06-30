@@ -1,6 +1,8 @@
 <script lang="ts">
   import StatCard from './StatCard.svelte';
   import { renameStatus, dvCounts, applyConfident, loadDvScans } from '$lib/stores/renames';
+  import { dvLayerColor } from '$lib/constants';
+  import { browser } from '$app/environment';
   import { onMount } from 'svelte';
 
   let { statusFilter, onFilter }: { statusFilter: string; onFilter: (status: string) => void } =
@@ -74,12 +76,12 @@
 
   <button
     class="flex-1 min-w-0 text-left rounded-lg border-2 border-[var(--border)] px-3 py-2 hover:bg-[var(--bg-tertiary)]/40"
-    onclick={() => document.getElementById('dv-scan-surface')?.scrollIntoView({ behavior: 'smooth' })}
+    onclick={() => browser && document.getElementById('dv-scan-surface')?.scrollIntoView({ behavior: 'smooth' })}
     title="Dolby Vision inventory (read-only)"
   >
     <div class="text-sm font-bold flex gap-2">
-      <span style="color: var(--error)">FEL {fel}</span>
-      <span style="color: #f97316">MEL {mel}</span>
+      <span style="color: {dvLayerColor('fel')}">FEL {fel}</span>
+      <span style="color: {dvLayerColor('mel')}">MEL {mel}</span>
     </div>
     <div class="text-xs text-[var(--text-secondary)]">Dolby Vision</div>
   </button>

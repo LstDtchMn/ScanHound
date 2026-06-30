@@ -32,6 +32,7 @@
 
 <button
   {onclick}
+  aria-pressed={active}
   class="flex-1 min-w-0 text-left rounded-lg border-2 px-3 py-2 transition-colors hover:bg-[var(--bg-tertiary)]/40"
   style="border-color: {active ? color : 'var(--border)'}"
 >

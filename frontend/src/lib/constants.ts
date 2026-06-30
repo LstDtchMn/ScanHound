@@ -205,6 +205,18 @@ export function confidenceVariant(pct: number | null | undefined): BadgeVariant 
   return 'error';
 }
 
+/** CSS color for a Dolby Vision layer, consistent with DV_LAYER_VARIANTS and Badge colors. */
+export function dvLayerColor(layer: string): string {
+  switch (layer.toLowerCase()) {
+    case 'fel': return 'var(--error)';
+    case 'mel': return '#f97316'; // Badge `orange` variant — keep in sync
+    case 'p8': return 'var(--accent)';
+    case 'p5':
+    case 'info': return '#3b82f6';
+    default: return 'var(--text-secondary)';
+  }
+}
+
 export function renameStatusBorderColor(status: string | null | undefined): string {
   switch (renameStatusVariant(status)) {
     case 'error': return 'var(--error)';
