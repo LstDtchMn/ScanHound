@@ -404,3 +404,41 @@ class TestRenameApi:
         res = r["results"][0]
         assert res["ok"] is False
         assert res["destination_path"] is None
+
+    # ------------------------------------------------------------------
+    # Task 8: POST /rename/jobs/apply-confident
+    # ------------------------------------------------------------------
+
+    def test_apply_confident_applies_matched_96(self, client, tmp_path):
+        dest = tmp_path / "lib"
+        src = tmp_path / "ok.mkv"; src.write_text("x")
+        jid = _seed_job(status="matched", title="Ok", match_confidence=96,
+                        original_path=str(src), destination_path=str(dest),
+                        new_filename="Ok (2020).mkv")
+        r = client.post("/rename/jobs/apply-confident", json={}).json()
+        assert r["applied"] == 1 and r["skipped"] == 0
+        assert (dest / "Ok (2020).mkv").exists()
+
+    def test_apply_confident_skips_matched_94(self, client):
+        jid = _seed_job(status="matched", title="Low", match_confidence=94)
+        r = client.post("/rename/jobs/apply-confident", json={}).json()
+        assert r["applied"] == 0 and r["skipped"] == 1
+
+    def test_apply_confident_skips_needs_review_99(self, client):
+        jid = _seed_job(status="needs_review", title="NR", match_confidence=99)
+        r = client.post("/rename/jobs/apply-confident", json={}).json()
+        assert r["applied"] == 0 and r["skipped"] == 1
+
+    def test_apply_confident_scoped_to_ids(self, client, tmp_path):
+        dest = tmp_path / "lib"
+        s1 = tmp_path / "a.mkv"; s1.write_text("x")
+        a = _seed_job(status="matched", title="A", match_confidence=96,
+                      original_path=str(s1), destination_path=str(dest),
+                      new_filename="A (2020).mkv")
+        b = _seed_job(status="matched", title="B", match_confidence=96,
+                      original_path=str(tmp_path / "b.mkv"),
+                      destination_path=str(dest), new_filename="B (2020).mkv")
+        # Scope to only A; B (also confident) must be untouched.
+        r = client.post("/rename/jobs/apply-confident", json={"ids": [a]}).json()
+        assert r["applied"] == 1
+        assert all(x["id"] == a for x in r["results"])

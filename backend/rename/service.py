@@ -1541,6 +1541,44 @@ class RenameService:
         finally:
             self._bulk_lock.release()
 
+    def apply_confident(self, ids: Optional[list] = None) -> dict:
+        """Apply only matched jobs at confidence >= 95. Server-enforced gate."""
+        db = self._db
+        if db is None:
+            return {"results": [], "applied": 0, "skipped": 0, "failed": 0}
+        if ids:
+            candidates = []
+            for jid in ids:
+                job = db.get_rename_job(int(jid))
+                if job:
+                    candidates.append(job)
+        else:
+            candidates = db.list_rename_jobs(limit=100000) or []
+        if not self._bulk_lock.acquire(blocking=False):
+            return {"results": [], "applied": 0, "skipped": 0, "failed": 0,
+                    "busy": True}
+        try:
+            results, applied, skipped, failed = [], 0, 0, 0
+            for job in candidates:
+                conf = job.get("match_confidence") or 0.0
+                if job.get("status") != "matched" or conf < 95:
+                    skipped += 1
+                    continue
+                jid = job["id"]
+                try:
+                    out = self.apply(int(jid))
+                except Exception as e:
+                    out = {"ok": False, "error": str(e)}
+                ok = bool(out.get("ok"))
+                results.append({"id": int(jid), "ok": ok,
+                                "error": out.get("error")})
+                applied += 1 if ok else 0
+                failed += 0 if ok else 1
+            return {"results": results, "applied": applied,
+                    "skipped": skipped, "failed": failed}
+        finally:
+            self._bulk_lock.release()
+
     def bulk_reidentify(self, ids: list) -> dict:
         if not self._bulk_lock.acquire(blocking=False):
             return {"ok": False, "queued": 0, "busy": True}

@@ -56,6 +56,10 @@ class BulkSetDestRequest(BaseModel):
     destination_root: str = ""
 
 
+class ApplyConfidentRequest(BaseModel):
+    ids: Optional[list[int]] = None
+
+
 @router.get("/jobs")
 def list_jobs(status: Optional[str] = None, limit: int = 200,
               reg: ServiceRegistry = Depends(get_registry)):
@@ -113,6 +117,12 @@ def _service(reg: ServiceRegistry):
 
 # ── Bulk endpoints (must be registered before /{job_id}/… routes so the static
 #    /bulk/… path segment isn't swallowed by the int-typed path parameter) ────
+
+@router.post("/jobs/apply-confident")
+def apply_confident(body: ApplyConfidentRequest,
+                    reg: ServiceRegistry = Depends(get_registry)):
+    return _service(reg).apply_confident(body.ids)
+
 
 @router.post("/jobs/bulk/apply")
 def bulk_apply(body: BulkIdsRequest, reg: ServiceRegistry = Depends(get_registry)):
