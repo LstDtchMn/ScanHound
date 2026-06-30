@@ -21,7 +21,7 @@
   onclick={() => onRematch(job)}
   role="button"
   tabindex="0"
-  onkeydown={(e) => { if (e.key === 'Enter') onRematch(job); }}
+  onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onRematch(job); } }}
 >
   <div class="relative">
     <RenamePoster posterUrl={job.poster_url} alt={job.title ?? ''} />
@@ -30,7 +30,7 @@
       class="absolute top-1.5 left-1.5 accent-[var(--accent)] z-10"
       checked={selected}
       onclick={(e) => e.stopPropagation()}
-      onchange={(e) => { e.stopPropagation(); toggleSelect(job.id); }}
+      onchange={() => toggleSelect(job.id)}
       aria-label="Select {titleLine}"
     />
     <div class="absolute bottom-1.5 left-1.5 right-1.5">
