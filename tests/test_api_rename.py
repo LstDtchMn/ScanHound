@@ -342,10 +342,47 @@ class TestRenameApi:
         assert r["deleted"] == 2
         assert client.get("/rename/jobs").json()["jobs"] == []
 
-    def test_bulk_reidentify_queues(self, client):
-        a = _seed_job(status="needs_review", title="A")
+    def test_bulk_reidentify_applied_not_counted(self, client):
+        # An already-applied job cannot be reidentified; reidentify returns ok:False.
+        # bulk_reidentify must NOT count it — queued must be 0.
+        a = _seed_job(status="applied", title="A")
         r = client.post("/rename/jobs/bulk/reidentify", json={"ids": [a]}).json()
-        assert r["ok"] is True and r["queued"] == 1
+        assert r["ok"] is True
+        assert r["queued"] == 0  # reidentify returned ok:False → not counted
+
+    def test_bulk_reidentify_queues_only_successes(self, client, monkeypatch, tmp_path):
+        # Patch reidentify to simulate one success and one failure; only the
+        # success must be counted.
+        import backend.rename.service as svc_mod
+        call_count = {"n": 0}
+
+        def _fake_reidentify(self, job_id):
+            call_count["n"] += 1
+            return {"ok": True, "job_id": job_id} if call_count["n"] == 1 else {"ok": False, "error": "sim fail"}
+
+        monkeypatch.setattr(svc_mod.RenameService, "reidentify", _fake_reidentify)
+        a = _seed_job(status="needs_review", title="A")
+        b = _seed_job(status="needs_review", title="B")
+        r = client.post("/rename/jobs/bulk/reidentify", json={"ids": [a, b]}).json()
+        assert r["ok"] is True
+        assert r["queued"] == 1  # only the first (ok:True) is counted
+
+    def test_bulk_set_destination_applied_job_not_regressed(self, client, tmp_path):
+        # An already-applied job must not have its status changed back to matched.
+        jid = _seed_job(status="applied", title="Done", media_type="movie",
+                        destination_path="/lib/movies/Done (2020).mkv",
+                        new_filename="Done (2020).mkv")
+        root = str(tmp_path / "movies")
+        r = client.post("/rename/jobs/bulk/set-destination",
+                        json={"ids": [jid], "destination_root": root}).json()
+        res = r["results"][0]
+        assert res["ok"] is False
+        assert "already applied" in res["error"]
+        assert r["updated"] == 0
+        # Status must still be "applied" — no regression to "matched"
+        all_jobs = client.get("/rename/jobs").json()["jobs"]
+        job = next(j for j in all_jobs if j["id"] == jid)
+        assert job["status"] == "applied"
 
     def test_bulk_set_destination_guard_enforced(self, client, tmp_path):
         # Movie job, valid root -> rebuilt destination under root.

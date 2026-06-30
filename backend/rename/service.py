@@ -1548,8 +1548,9 @@ class RenameService:
             queued = 0
             for jid in ids or []:
                 try:
-                    self.reidentify(int(jid))
-                    queued += 1
+                    result = self.reidentify(int(jid))
+                    if result.get("ok"):
+                        queued += 1
                 except Exception:
                     logger.exception("bulk_reidentify: job %s failed", jid)
             return {"ok": True, "queued": queued}
@@ -1558,8 +1559,6 @@ class RenameService:
 
     def bulk_delete(self, ids: list) -> dict:
         db = self._db
-        if db is None:
-            return {"deleted": 0}
         deleted = 0
         for jid in ids or []:
             try:
@@ -1576,6 +1575,10 @@ class RenameService:
         if not job:
             return {"id": int(job_id), "ok": False,
                     "destination_path": None, "error": "Job not found"}
+        if job.get("status") == "applied":
+            return {"id": int(job_id), "ok": False,
+                    "destination_path": job.get("destination_path"),
+                    "error": "already applied"}
         if not root or not str(root).strip():
             db.update_rename_job(job_id, status="needs_review",
                                  destination_path=None,
