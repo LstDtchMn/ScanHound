@@ -59,16 +59,15 @@ def list_jobs(status: Optional[str] = None, limit: int = 200,
     # so a duplicate is still flagged when the two halves land on different pages
     # or under a status filter.
     annotations = conflict_annotations(reg.db.list_rename_jobs(limit=100000) or [])
+    paths = [j.get("original_path") for j in jobs if j.get("original_path")]
+    dv_map = reg.db.get_dv_scans_by_paths(paths)
     for j in jobs:
         ann = annotations.get(j.get("id")) or {}
         j["destination_conflict"] = ann.get("destination_conflict", False)
         j["keep_recommended"] = ann.get("keep_recommended", False)
         j["keep_reason"] = ann.get("keep_reason")
         j["poster_url"] = _poster_url(j.get("poster_path"))
-        try:
-            dv = reg.db.get_dv_scan(j.get("original_path"))
-        except Exception:
-            dv = None
+        dv = dv_map.get(j.get("original_path"))
         j["dv_layer"] = (dv or {}).get("dv_layer")
     return {
         "jobs": jobs,

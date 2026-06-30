@@ -69,3 +69,17 @@ class TestDvScanDB:
         db.upsert_dv_scan("/lib/seed.mkv", "fel", source="seed",
                           sig_mtime=None, sig_size=None)
         assert db.dv_scan_is_current("/lib/seed.mkv", 1.0, 1) is False
+
+    def test_get_dv_scans_by_paths_bulk(self, db):
+        db.upsert_dv_scan("/lib/A.mkv", "fel", title="A", sig_mtime=1.0, sig_size=10)
+        db.upsert_dv_scan("/lib/B.mkv", "mel", title="B", sig_mtime=2.0, sig_size=20)
+        result = db.get_dv_scans_by_paths(["/lib/A.mkv", "/lib/B.mkv", "/lib/missing.mkv"])
+        assert set(result.keys()) == {"/lib/A.mkv", "/lib/B.mkv"}
+        assert result["/lib/A.mkv"].get("dv_layer") == "fel"
+        assert result["/lib/B.mkv"].get("dv_layer") == "mel"
+        assert "/lib/missing.mkv" not in result
+
+    def test_get_dv_scans_by_paths_empty_input(self, db):
+        db.upsert_dv_scan("/lib/A.mkv", "fel", sig_mtime=1.0, sig_size=10)
+        assert db.get_dv_scans_by_paths([]) == {}
+        assert db.get_dv_scans_by_paths(None) == {}

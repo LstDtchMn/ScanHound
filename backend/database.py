@@ -1286,6 +1286,27 @@ class DatabaseManager:
             'FROM dv_scan WHERE path = ?', (path,))
         return rows[0] if rows else None
 
+    def get_dv_scans_by_paths(self, paths):
+        """Return a ``{path: row_dict}`` map for all *paths* found in dv_scan.
+
+        Runs a single parameterised ``IN`` query instead of one call per path.
+        An empty/falsy *paths* input returns ``{}`` without touching the DB.
+        Fail-safe: returns ``{}`` on any error (mirrors the single-row helpers).
+        """
+        if not paths:
+            return {}
+        try:
+            placeholders = ",".join("?" * len(paths))
+            rows = self._query_dicts(
+                f'SELECT path, title, dv_layer, sig_mtime, sig_size, source, '
+                f'rating_key, imdb_id, scanned_at, last_seen_at '
+                f'FROM dv_scan WHERE path IN ({placeholders})',
+                tuple(paths))
+            return {row["path"]: row for row in (rows or [])}
+        except Exception as e:
+            logger.error("get_dv_scans_by_paths error: %s", e)
+            return {}
+
     def get_dv_scans(self, dv_layer=None, limit=100000):
         """Return DV-scan rows, optionally filtered by layer (e.g. 'fel')."""
         if dv_layer:
