@@ -363,6 +363,7 @@ class DatabaseManager:
                         episode INTEGER,
                         tmdb_id INTEGER,
                         imdb_id TEXT,
+                        poster_path TEXT,
                         resolution TEXT,
                         match_confidence REAL,
                         match_source TEXT,
@@ -430,6 +431,7 @@ class DatabaseManager:
                     'ALTER TABLE rename_jobs ADD COLUMN split_file TEXT',
                     'ALTER TABLE downloads ADD COLUMN hdr TEXT',
                     'ALTER TABLE downloads ADD COLUMN dovi INTEGER DEFAULT 0',
+                    'ALTER TABLE rename_jobs ADD COLUMN poster_path TEXT',
                 ]
                 for col_sql in _column_migrations:
                     try:
