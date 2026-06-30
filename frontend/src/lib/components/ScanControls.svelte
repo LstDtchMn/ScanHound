@@ -1,7 +1,8 @@
 <script lang="ts">
   import { scanState, scanProgress, scanPhase, scanItemCount, startScan, stopScan } from '$lib/stores/scanner';
   import type { ScanType } from '$lib/stores/scanner';
-  import { clearResults } from '$lib/stores/results';
+  import { clearResults, categoryFilter } from '$lib/stores/results';
+  import { get } from 'svelte/store';
   import BottomSheet from './BottomSheet.svelte';
 
   let scanSheet = $state(false);
@@ -38,10 +39,27 @@
   let query = $state('');
   let pages = $state(1);
 
-  // Category flags — reset to defaults when source changes
-  let flags = $state<Record<string, boolean>>(
-    Object.fromEntries(sourceCategories['HDEncode'].map((c) => [c.key, c.default]))
-  );
+  // Map a per-source category key to its normalized display category.
+  function normCat(key: string): string {
+    if (key === 'tv') return 'tv';
+    return key.includes('remux') ? 'remux' : '4k';
+  }
+
+  // Derive the toggle flags for a source from the persisted display filter, so
+  // the saved 4K/Remux/TV choice survives a reload. Falls back to source
+  // defaults when nothing is persisted (an empty filter would hide everything).
+  function flagsFor(src: Source, filter: string[]): Record<string, boolean> {
+    const cats = sourceCategories[src];
+    if (!filter || filter.length === 0) {
+      return Object.fromEntries(cats.map((c) => [c.key, c.default]));
+    }
+    return Object.fromEntries(cats.map((c) => [c.key, filter.includes(normCat(c.key))]));
+  }
+
+  // Category flags — seeded from the persisted filter (not blind defaults) so
+  // the $effect below writes back the same value on mount instead of clobbering
+  // the user's saved choice. Reset to defaults when the source changes.
+  let flags = $state<Record<string, boolean>>(flagsFor('HDEncode', get(categoryFilter)));
 
   function onSourceChange(src: Source) {
     selectedSource = src;
@@ -50,6 +68,17 @@
 
   let categories = $derived(sourceCategories[selectedSource]);
   let hasInteracted = $state(false);
+
+  // Drive the instant display filter from the 4K/Remux/TV toggles. The cache is
+  // pre-scanned with every category, so toggling here filters the loaded list
+  // immediately (keeping the others) instead of needing a re-scan.
+  $effect(() => {
+    const cats: string[] = [];
+    if (flags['4k'] || flags['4k_webdl']) cats.push('4k');
+    if (flags['remux'] || flags['4k_remux'] || flags['1080p_remux']) cats.push('remux');
+    if (flags['tv']) cats.push('tv');
+    categoryFilter.set(cats);
+  });
   let scanTypeLabel = $derived(scanTypes.find((t) => t.value === selectedType)?.label ?? 'Scan');
 
   function handleStart() {

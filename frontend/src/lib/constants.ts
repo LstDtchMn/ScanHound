@@ -9,6 +9,9 @@ export const STATUS_VARIANTS: Record<string, BadgeVariant> = {
   upgrade: 'warning',
   dv_upgrade: 'accent',
   in_library: 'success',
+  // Must precede 'downloaded' — statusVariant() does substring matching, and
+  // 'downloaded_similar' contains 'downloaded'.
+  downloaded_similar: 'orange',
   downloaded: 'accent',
   downloading: 'info',
 };
@@ -20,6 +23,7 @@ const STATUS_LABELS: Record<string, string> = {
   upgrade: 'Upgrade',
   dv_upgrade: 'DV Upgrade',
   in_library: 'In Library',
+  downloaded_similar: 'Downloaded Similar',
   downloaded: 'Downloaded',
   downloading: 'Downloading',
 };
@@ -47,8 +51,28 @@ export function statusBorderColor(status: string | null | undefined): string {
     case 'success': return 'var(--success)';
     case 'accent': return 'var(--accent)';
     case 'info': return '#3b82f6';
+    case 'orange': return '#f97316';
     default: return 'var(--border)';
   }
+}
+
+/** Left status bar shared by individual rows AND collapsed group rows so they
+ *  align into one continuous vertical strip. Always a 6px-wide bar painted into
+ *  a transparent left border (reserving the 6px offset). Pass one color for a
+ *  solid bar, or several for a vertical multi-segment bar (mixed-status groups). */
+export function statusBarStyle(colors: string[]): string {
+  const cs = colors.length ? colors : ['var(--border)'];
+  const n = cs.length;
+  const stops = cs.map((c, i) =>
+    `${c} ${((i / n) * 100).toFixed(2)}%, ${c} ${(((i + 1) / n) * 100).toFixed(2)}%`).join(', ');
+  return [
+    'border-left: 6px solid transparent',
+    `background-image: linear-gradient(to bottom, ${stops})`,
+    'background-size: 6px 100%',
+    'background-position: left top',
+    'background-repeat: no-repeat',
+    'background-origin: border-box',
+  ].join('; ') + ';';
 }
 
 /** Map download history status → Badge variant. */
@@ -109,6 +133,25 @@ export const WATCHLIST_STATUS_COLORS: Record<string, string> = {
 export function resolutionLabel(res: string | null | undefined): string {
   if (!res || res === '?') return 'Unknown';
   return res;
+}
+
+/** Rank a resolution for "is this an upgrade?" comparisons (higher = better).
+ *  Shared by the row-level and group-level owned-version comparison so they
+ *  can't drift apart. */
+const RES_RANK: Record<string, number> = { '4k': 3, '2160p': 3, '1080p': 2, '720p': 1, '480p': 0 };
+export function resolutionRank(res: string | null | undefined): number {
+  return RES_RANK[(res ?? '').toLowerCase()] ?? 0;
+}
+
+/** Parse a human size string ("7.6 GB", "900 MB", "1.2 TB") to gigabytes. */
+export function sizeToGB(size: string | null | undefined): number {
+  const m = String(size ?? '').match(/([\d.]+)\s*(TB|GB|MB)?/i);
+  if (!m) return 0;
+  let v = parseFloat(m[1]);
+  const u = (m[2] ?? 'GB').toUpperCase();
+  if (u === 'TB') v *= 1024;
+  else if (u === 'MB') v /= 1024;
+  return v;
 }
 
 /** Compact number formatting for vote/review counts: 1370 → "1.4K", 107813 → "108K", 1.2M. */

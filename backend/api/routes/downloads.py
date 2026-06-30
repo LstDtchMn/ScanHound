@@ -14,6 +14,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/download", tags=["downloads"])
 
 
+def _persist_grab_annotations(reg: ServiceRegistry) -> None:
+    """Re-annotate the cached results after a grab so a just-grabbed release's
+    siblings keep their 'grabbed similar' note across a reload. The live UI is
+    updated optimistically over the WebSocket; this persists it to the cache
+    without waiting for the next (3-hourly) background scan. Cheap (no scraping),
+    best-effort."""
+    try:
+        scanner = getattr(reg, "scanner", None)
+        if scanner is not None:
+            scanner.rematch_cache()
+    except Exception:
+        logger.debug("post-grab cache re-match skipped", exc_info=True)
+
+
 class DownloadRequest(BaseModel):
     url: str
     title: str = "Untitled"
@@ -21,6 +35,8 @@ class DownloadRequest(BaseModel):
     year: Optional[int] = None
     resolution: str = ""
     size: str = ""
+    hdr: str = ""
+    dovi: bool = False
     service_type: str = "Rapidgator"
 
 
@@ -64,6 +80,7 @@ def download_item(
                 url=req.url, title=req.title, season=req.season,
                 resolution=req.resolution, size=req.size,
                 service_type=req.service_type, year=req.year,
+                hdr=req.hdr, dovi=req.dovi,
                 progress_callback=_on_progress,
             )
             # Report the *honest* outcome: only a JDownloader hand-off counts as
@@ -82,6 +99,8 @@ def download_item(
                     "type": "notification",
                     "data": {"title": "Download", "body": message, "priority": "normal"},
                 })
+                # Persist the 'grabbed similar' note onto this title's siblings.
+                _persist_grab_annotations(reg)
             else:
                 # clipboard/browser — succeeded, but nothing reached JDownloader.
                 ws_manager.broadcast_sync({
@@ -91,7 +110,7 @@ def download_item(
         except Exception as e:
             logger.exception("Download failed for %s", req.title)
             try:
-                dl.save_to_history(req.url, req.title, req.season, req.resolution, req.size, status="failed")
+                dl.save_to_history(req.url, req.title, req.season, req.resolution, req.size, status="failed", hdr=req.hdr, dovi=req.dovi)
             except Exception:
                 pass
             ws_manager.broadcast_sync({
@@ -133,6 +152,7 @@ def download_batch(
                     url=item.url, title=item.title, season=item.season,
                     resolution=item.resolution, size=item.size,
                     service_type=item.service_type, year=item.year,
+                    hdr=item.hdr, dovi=item.dovi,
                     progress_callback=_on_progress,
                 )
                 if not (res or {}).get("success"):
@@ -166,11 +186,13 @@ def download_batch(
                     "priority": batch_priority,
                 },
             })
+            if delivered:
+                _persist_grab_annotations(reg)  # once for the whole batch
         except Exception as e:
             logger.exception("Batch download failed")
             for item in req.items:
                 try:
-                    dl.save_to_history(item.url, item.title, item.season, item.resolution, item.size, status="failed")
+                    dl.save_to_history(item.url, item.title, item.season, item.resolution, item.size, status="failed", hdr=item.hdr, dovi=item.dovi)
                 except Exception:
                     pass
             ws_manager.broadcast_sync({

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, visibleColumns } from '$lib/stores/results';
+  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, tileSize, posterAspect, tileShowMeta, gridGap, gridColumns, GRID_COLUMN_CHOICES, type TileSize, type PosterAspect, type GridGap } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -21,15 +21,6 @@
     { key: 'hdrdv', label: 'HDR/DV' },
     { key: 'inplex', label: 'In Plex' },
   ];
-  const columnDefs = [
-    { key: 'rating', label: 'Rating' },
-    { key: 'res', label: 'Res' },
-    { key: 'size', label: 'Size' },
-    { key: 'status', label: 'Status' },
-  ] as const;
-  function toggleColumn(key: 'rating' | 'res' | 'size' | 'status') {
-    visibleColumns.update((c) => ({ ...c, [key]: !c[key] }));
-  }
 
   const sortOptions: { value: SortOption; label: string }[] = [
     { value: 'title-asc', label: 'Title (A–Z)' },
@@ -73,7 +64,7 @@
     }
     downloadingAll = true;
     try {
-      await api.downloadBatch(selected.map(i => ({ url: i.url, title: i.title, year: i.year })), $downloadHost);
+      await api.downloadBatch(selected.map(i => ({ url: i.url, title: i.title, year: i.year, resolution: i.resolution, size: i.size, hdr: i.hdr, dovi: i.dovi })), $downloadHost);
       addToast('Download All', `Sending ${selected.length} item(s) to JDownloader…`);
     } catch (e) {
       addToast('Error', e instanceof Error ? e.message : 'Failed to start downloads', 'error');
@@ -310,16 +301,51 @@
         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 20 20"><path d="M3 4h14M3 8h14M3 12h14M3 16h14"/></svg>
       </button>
     </div>
-    <!-- Column show/hide (list view) -->
+  {/if}
+
+  {#if $viewMode === 'grid'}
+    <!-- Grid display options (grid view) -->
     <details class="relative">
-      <summary class="list-none cursor-pointer px-2 py-1 rounded text-[11px] text-[var(--text-secondary)] bg-[var(--bg-tertiary)] border border-[var(--border)] hover:border-[var(--accent)] select-none">Columns &#9662;</summary>
-      <div class="absolute right-0 mt-1 z-20 w-32 bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg shadow-lg p-1.5">
-        {#each columnDefs as c}
-          <label class="flex items-center gap-2 px-2 py-1 rounded text-xs cursor-pointer hover:bg-[var(--bg-tertiary)]">
-            <input type="checkbox" checked={$visibleColumns[c.key]} onchange={() => toggleColumn(c.key)} class="accent-[var(--accent)]" />
-            {c.label}
-          </label>
-        {/each}
+      <summary class="list-none cursor-pointer px-2 py-1 rounded text-[11px] text-[var(--text-secondary)] bg-[var(--bg-tertiary)] border border-[var(--border)] hover:border-[var(--accent)] select-none">
+        Grid &#9662;
+      </summary>
+      <div class="absolute right-0 z-30 mt-1 w-52 p-3 rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] shadow-xl space-y-3">
+        <div>
+          <p class="text-[10px] uppercase tracking-wide text-[var(--text-secondary)] mb-1">Columns</p>
+          <div class="flex flex-wrap gap-1">
+            {#each GRID_COLUMN_CHOICES as c}
+              <button onclick={() => gridColumns.set(c)} class="px-2 py-1 rounded text-xs transition-colors {$gridColumns === c ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)]'}">{c === 'auto' ? 'Auto' : c}</button>
+            {/each}
+          </div>
+        </div>
+        <div>
+          <p class="text-[10px] uppercase tracking-wide text-[var(--text-secondary)] mb-1">Tile size{#if $gridColumns !== 'auto'}<span class="opacity-50"> (Auto only)</span>{/if}</p>
+          <div class="grid grid-cols-3 gap-1">
+            {#each [['sm', 'S'], ['md', 'M'], ['lg', 'L']] as [val, label]}
+              <button onclick={() => tileSize.set(val as TileSize)} class="py-1 rounded text-xs transition-colors {$tileSize === val ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)]'}">{label}</button>
+            {/each}
+          </div>
+        </div>
+        <div>
+          <p class="text-[10px] uppercase tracking-wide text-[var(--text-secondary)] mb-1">Poster aspect</p>
+          <div class="grid grid-cols-3 gap-1">
+            {#each [['2/3', '2:3'], ['16/9', '16:9'], ['1/1', '1:1']] as [val, label]}
+              <button onclick={() => posterAspect.set(val as PosterAspect)} class="py-1 rounded text-xs transition-colors {$posterAspect === val ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)]'}">{label}</button>
+            {/each}
+          </div>
+        </div>
+        <div>
+          <p class="text-[10px] uppercase tracking-wide text-[var(--text-secondary)] mb-1">Spacing</p>
+          <div class="grid grid-cols-3 gap-1">
+            {#each [['tight', 'Tight'], ['normal', 'Normal'], ['roomy', 'Roomy']] as [val, label]}
+              <button onclick={() => gridGap.set(val as GridGap)} class="py-1 rounded text-xs transition-colors {$gridGap === val ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)]'}">{label}</button>
+            {/each}
+          </div>
+        </div>
+        <label class="flex items-center justify-between text-xs text-[var(--text-secondary)] cursor-pointer select-none">
+          <span>Poster only</span>
+          <input type="checkbox" checked={!$tileShowMeta} onchange={(e) => tileShowMeta.set(!(e.currentTarget as HTMLInputElement).checked)} class="accent-[var(--accent)]" />
+        </label>
       </div>
     </details>
   {/if}
@@ -493,22 +519,53 @@
     <!-- List options -->
     {#if $viewMode === 'list'}
       <div>
-        <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Columns</p>
-        <div class="flex flex-wrap gap-2">
-          {#each columnDefs as c}
-            <button
-              onclick={() => toggleColumn(c.key)}
-              class="px-3 py-1.5 rounded-full text-sm border transition-colors {$visibleColumns[c.key] ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
-            >{c.label}</button>
-          {/each}
-        </div>
-      </div>
-      <div>
         <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Density</p>
         <div class="grid grid-cols-2 gap-1 p-1 rounded-lg bg-[var(--bg-tertiary)]">
           <button onclick={() => density.set('comfortable')} class="py-2 rounded-md text-sm {$density === 'comfortable' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}">Comfortable</button>
           <button onclick={() => density.set('compact')} class="py-2 rounded-md text-sm {$density === 'compact' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}">Compact</button>
         </div>
+      </div>
+    {/if}
+
+    <!-- Grid options -->
+    {#if $viewMode === 'grid'}
+      <div class="space-y-3">
+        <div>
+          <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Columns</p>
+          <div class="flex flex-wrap gap-1">
+            {#each GRID_COLUMN_CHOICES as c}
+              <button onclick={() => gridColumns.set(c)} class="px-3 py-2 rounded-md text-sm {$gridColumns === c ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)]'}">{c === 'auto' ? 'Auto' : c}</button>
+            {/each}
+          </div>
+        </div>
+        <div>
+          <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Tile size</p>
+          <div class="grid grid-cols-3 gap-1 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+            {#each [['sm', 'Small'], ['md', 'Medium'], ['lg', 'Large']] as [val, label]}
+              <button onclick={() => tileSize.set(val as TileSize)} class="py-2 rounded-md text-sm {$tileSize === val ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}">{label}</button>
+            {/each}
+          </div>
+        </div>
+        <div>
+          <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Poster aspect</p>
+          <div class="grid grid-cols-3 gap-1 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+            {#each [['2/3', '2:3'], ['16/9', '16:9'], ['1/1', '1:1']] as [val, label]}
+              <button onclick={() => posterAspect.set(val as PosterAspect)} class="py-2 rounded-md text-sm {$posterAspect === val ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}">{label}</button>
+            {/each}
+          </div>
+        </div>
+        <div>
+          <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Spacing</p>
+          <div class="grid grid-cols-3 gap-1 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+            {#each [['tight', 'Tight'], ['normal', 'Normal'], ['roomy', 'Roomy']] as [val, label]}
+              <button onclick={() => gridGap.set(val as GridGap)} class="py-2 rounded-md text-sm {$gridGap === val ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}">{label}</button>
+            {/each}
+          </div>
+        </div>
+        <label class="flex items-center justify-between text-sm text-[var(--text-secondary)] py-1">
+          <span>Poster only</span>
+          <input type="checkbox" checked={!$tileShowMeta} onchange={(e) => tileShowMeta.set(!(e.currentTarget as HTMLInputElement).checked)} class="accent-[var(--accent)] w-4 h-4" />
+        </label>
       </div>
     {/if}
 

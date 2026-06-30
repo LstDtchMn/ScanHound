@@ -1459,9 +1459,17 @@
               oninput={(e) => settings.update((s) => ({ ...s, auto_rename_tv_library: e.currentTarget.value }))}
               placeholder="/library/TV" class={inputClass} />
           </label>
+          <label class="block">
+            <Tooltip text={'JDownloader runs on the host and reports Windows paths (e.g. F:\\Downloads\\Movie), but ScanHound runs in a container that sees those folders bind-mounted at a different path. Map each host download folder to its container path, one per line, as: host => container. Example: F:\\Downloads => /library/movies. Update this if JDownloader’s download folder changes (and add a matching volume mount in docker-compose).'}>
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Download path mappings (host ⇒ container) ⓘ</span>
+            </Tooltip>
+            <textarea rows="2" value={$settings.auto_rename_path_mappings ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_path_mappings: e.currentTarget.value }))}
+              placeholder={'F:\\Downloads => /library/movies'} class="{inputClass} font-mono text-xs"></textarea>
+          </label>
           <p class="text-xs text-[var(--text-secondary)]">Leave the templates blank for the Plex default naming convention.</p>
           <label class="block">
-            <Tooltip text="Tokens: {{title}} {{year}} {{resolution}} {{imdb_id}} {{tmdb_id}}. Sections in [ ] are omitted when the token is empty. Default (blank): Title (Year) [resolution].mkv">
+            <Tooltip text={'Tokens: {{title}} {{year}} {{resolution}} {{imdb_id}} {{tmdb_id}}. Sections in [ ] are omitted when the token is empty. Default (blank): Title (Year) [resolution].mkv'}>
               <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Movie name template (optional) ⓘ</span>
             </Tooltip>
             <input type="text" value={$settings.auto_rename_template_movie ?? ''}
@@ -1469,7 +1477,7 @@
               placeholder={'{{title}} ({{year}}) [{{resolution}}]'} class={inputClass} />
           </label>
           <label class="block">
-            <Tooltip text="Tokens: {{title}} {{year}} {{season}} {{episode}} {{episode_title}} {{resolution}}. Sections in [ ] are omitted when empty. Default (blank): Show (Year) - S01E01 - Episode Title.mkv">
+            <Tooltip text={'Tokens: {{title}} {{year}} {{season}} {{episode}} {{episode_title}} {{resolution}}. Sections in [ ] are omitted when empty. Default (blank): Show (Year) - S01E01 - Episode Title.mkv'}>
               <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">TV name template (optional) ⓘ</span>
             </Tooltip>
             <input type="text" value={$settings.auto_rename_template_tv ?? ''}

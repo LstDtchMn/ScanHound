@@ -8,7 +8,7 @@
   import ResultActionSheet from '$lib/components/ResultActionSheet.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
   import SwipeDeck from '$lib/components/SwipeDeck.svelte';
-  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, visibleColumns, hydrateDismissed, fromCache, cacheUpdatedAt, hydrateCache } from '$lib/stores/results';
+  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, hydrateCache, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS } from '$lib/stores/results';
   import { mobile } from '$lib/stores/media';
   import { addToast } from '$lib/stores/notifications';
   import { get } from 'svelte/store';
@@ -17,6 +17,7 @@
   import { plexConnected, plexMovieCount, plexTvCount, refreshPlexStatus } from '$lib/stores/plex';
   import { batchProgress } from '$lib/stores/downloads';
   import Badge from '$lib/components/Badge.svelte';
+  import { statusBorderColor, statusVariant, statusBarStyle, formatStatus, resolutionRank, sizeToGB } from '$lib/constants';
   import { jdConnection, refreshJdConnection } from '$lib/stores/jdownloader';
   import { api } from '$lib/api/client';
   import { onMount } from 'svelte';
@@ -96,12 +97,17 @@
   let expandedGroups = $state<Set<string>>(new Set());
   let resultsContainer: HTMLDivElement | undefined = $state();
 
-  let tileColumns = $derived(($settings.tile_columns as number) || 0);
-  let gridStyle = $derived(
-    tileColumns > 0
-      ? `grid-template-columns: repeat(${tileColumns}, 1fr)`
-      : 'grid-template-columns: repeat(auto-fill, minmax(160px, 1fr))'
+  // Column count precedence: an explicit per-device choice wins; otherwise the
+  // server-wide tile_columns setting; otherwise responsive auto-fill by tile size.
+  let effectiveColumns = $derived(
+    $gridColumns !== 'auto' ? $gridColumns : (($settings.tile_columns as number) || 0)
   );
+  let gridStyle = $derived(
+    effectiveColumns > 0
+      ? `grid-template-columns: repeat(${effectiveColumns}, 1fr)`
+      : `grid-template-columns: repeat(auto-fill, minmax(${TILE_MIN_PX[$tileSize]}px, 1fr))`
+  );
+  let gridGapClass = $derived(GRID_GAP_CLASS[$gridGap]);
 
   let totalPages = $derived(Math.max(1, Math.ceil($filteredResults.length / perPage)));
   let paginatedResults = $derived(
@@ -194,6 +200,51 @@
     if (unique.length === 1) return first;
     const last = shortDate(unique[unique.length - 1]);
     return first === last ? first : `${first} – ${last}`;
+  }
+
+  // Severity order for the group status bar/summary (most actionable first).
+  const STATUS_ORDER = ['missing', 'missing_season', 'upgrade', 'dv_upgrade', 'downloaded', 'in_library'];
+
+  /** Per-status counts for a group, ordered by severity, for the header badges. */
+  function groupStatusSummary(items: ScanResult[]): { status: string; count: number }[] {
+    const counts = new Map<string, number>();
+    for (const it of items) {
+      const s = (it.status ?? '').toLowerCase();
+      if (s) counts.set(s, (counts.get(s) ?? 0) + 1);
+    }
+    const ordered = STATUS_ORDER.filter(k => counts.has(k)).map(k => ({ status: k, count: counts.get(k)! }));
+    const extra = [...counts.keys()].filter(k => !STATUS_ORDER.includes(k)).map(k => ({ status: k, count: counts.get(k)! }));
+    return [...ordered, ...extra];
+  }
+
+  /** Left bar for a collapsed group row. One vertical segment per distinct status
+   *  color present (e.g. top-half yellow upgrade, bottom-half green in-library),
+   *  so a mixed group reads at a glance. Uses the same shared statusBarStyle as
+   *  individual rows so every bar lines up into one continuous vertical strip. */
+  function groupBarStyle(items: ScanResult[]): string {
+    const seen = new Set<string>();
+    const colors: string[] = [];
+    for (const { status } of groupStatusSummary(items)) {
+      const c = statusBorderColor(status);
+      if (!seen.has(c)) { seen.add(c); colors.push(c); }
+    }
+    return statusBarStyle(colors);
+  }
+
+  /** The best release in a group the user already has (downloaded or in Plex),
+   *  used to show "upgrade vs what you own" on the still-missing siblings. */
+  function groupOwnedSpec(items: ScanResult[]) {
+    const owned = items.filter(i => {
+      const s = (i.status ?? '').toLowerCase();
+      return s.includes('download') || s.includes('library');
+    });
+    if (owned.length === 0) return null;
+    // Shared ranking/size helpers (constants) keep this in lockstep with the
+    // per-row upgrade comparison in ResultRow.
+    const best = [...owned].sort(
+      (a, b) => resolutionRank(b.resolution) - resolutionRank(a.resolution)
+        || sizeToGB(b.size) - sizeToGB(a.size))[0];
+    return { resolution: best.resolution, size: best.size, hdr: best.hdr, dovi: best.dovi };
   }
 
   interface GroupFormats { res: string[]; dv: boolean; hdr: boolean; }
@@ -412,7 +463,7 @@
   onkeydown={handleResultsKeydown}
 >
   {#if $viewMode === 'grid'}
-    <div class="grid gap-4" style={gridStyle}>
+    <div class="grid {gridGapClass}" style={gridStyle}>
       {#each groupedResults() as group (group.title)}
         {#if isDuplicateGroup(group)}
           <section class="mb-2" style="grid-column: 1 / -1;">
@@ -422,6 +473,7 @@
                 {isGroupExpanded(group)
                   ? 'border-transparent py-0 bg-transparent'
                   : 'border-[var(--border)] hover:border-[var(--text-secondary)] bg-[var(--bg-secondary)] p-2'}"
+              style="{!isGroupExpanded(group) ? groupBarStyle(group.items) : ''}"
               onclick={() => toggleGroup(group.title)}
             >
               {#if !isGroupExpanded(group)}
@@ -469,9 +521,9 @@
               {/if}
             </button>
             {#if isGroupExpanded(group)}
-              <div class="grid gap-4" style={gridStyle} transition:slide={{ duration: 150 }}>
+              <div class="grid {gridGapClass}" style={gridStyle} transition:slide={{ duration: 150 }}>
                 {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
-                  <div oncontextmenu={(e) => handleContextMenu(e, item)}>
+                  <div class="min-w-0" oncontextmenu={(e) => handleContextMenu(e, item)}>
                     <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} onmore={() => (mobileActionItem = item)} />
                   </div>
                 {/each}
@@ -480,7 +532,7 @@
           </section>
         {:else}
           {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
-            <div oncontextmenu={(e) => handleContextMenu(e, item)}>
+            <div class="min-w-0" oncontextmenu={(e) => handleContextMenu(e, item)}>
               <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} onmore={() => (mobileActionItem = item)} />
             </div>
           {/each}
@@ -488,19 +540,14 @@
       {/each}
     </div>
   {:else}
-    {@const cols = $visibleColumns}
     <div class="overflow-x-auto">
     <table class="w-full text-left">
       <thead class="text-xs text-[var(--text-secondary)] sticky top-0 z-10 [&_th]:bg-[var(--bg-primary)] [&_th]:border-b [&_th]:border-[var(--border)]">
         <tr>
           <th class="p-2 w-8"></th>
           <th class="p-2 w-10 hidden sm:table-cell"></th>
-          <th class="p-2 max-w-[640px]">Title</th>
-          {#if cols.rating}<th class="p-2">Rating</th>{/if}
-          {#if cols.res}<th class="p-2 hidden md:table-cell">Res</th>{/if}
-          {#if cols.size}<th class="p-2 hidden lg:table-cell">Size</th>{/if}
-          {#if cols.status}<th class="p-2">Status</th>{/if}
-          <th class="p-2">Actions</th>
+          <th class="p-2">Title</th>
+          <th class="p-2 w-px whitespace-nowrap text-right">Actions</th>
         </tr>
       </thead>
       <tbody>
@@ -508,10 +555,11 @@
           {#if isDuplicateGroup(group)}
             {#if !isGroupExpanded(group)}
               {@const fmtsL = groupFormats(group.items)}
+              {@const statusSummary = groupStatusSummary(group.items)}
               <!-- Collapsed: looks like a real result row with range metadata -->
               <tr
                 class="cursor-pointer select-none border-b border-[var(--border)] hover:bg-[var(--bg-tertiary)] transition-colors"
-                style="border-left: 3px solid var(--border);"
+                style="{groupBarStyle(group.items)}"
                 onclick={() => toggleGroup(group.title)}
                 onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleGroup(group.title))}
                 tabindex="0"
@@ -520,7 +568,7 @@
                 <td class="p-2 w-8 text-center">
                   <span class="text-[10px] text-[var(--text-secondary)]">&#9654;</span>
                 </td>
-                <td class="p-2 hidden sm:table-cell" style="width:72px;">
+                <td class="p-2 hidden sm:table-cell" style="width:72px; min-width:72px;">
                   {#if group.items[0].poster_url}
                     <img src={group.items[0].poster_url} alt="" class="object-cover rounded shadow-sm"
                       style="width:64px;height:96px;" loading="lazy" />
@@ -528,41 +576,47 @@
                     <div class="bg-[var(--bg-tertiary)] rounded" style="width:64px;height:96px;"></div>
                   {/if}
                 </td>
-                <td class="p-2 max-w-[640px] overflow-hidden">
+                <td class="p-2 w-full overflow-hidden">
                   <div class="flex items-center gap-2 flex-wrap">
                     <span class="text-sm font-semibold truncate">{group.title}</span>
                     {#if group.items[0].year}<span class="text-[var(--text-secondary)] text-sm font-normal">({group.items[0].year})</span>{/if}
                     <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)] flex-shrink-0">
                       {siblingCounts().get(group.title)} releases
                     </span>
+                    {#each statusSummary as st}
+                      <Badge label={`${st.count} ${formatStatus(st.status)}`} variant={statusVariant(st.status)} />
+                    {/each}
+                  </div>
+                  <!-- Group decision stat line: rating · RT · resolutions · size range -->
+                  <div class="flex items-center flex-wrap gap-x-2.5 gap-y-1 mt-1 text-[12px]">
+                    {#if group.items[0].rating != null}
+                      <span class="inline-flex items-center gap-1 whitespace-nowrap">
+                        <span aria-hidden="true">⭐</span>
+                        <span class="font-medium text-[var(--text-primary)]">{group.items[0].rating.toFixed(1)}</span>
+                      </span>
+                    {/if}
+                    {#if group.items[0].rt_score != null}
+                      <span class="inline-flex items-center gap-1 whitespace-nowrap text-[var(--text-secondary)]">
+                        <span aria-hidden="true" title={group.items[0].rt_score >= 60 ? 'Fresh' : 'Rotten'}>{group.items[0].rt_score >= 60 ? '🍅' : '🤢'}</span>
+                        <span>{group.items[0].rt_score}%</span>
+                      </span>
+                    {/if}
+                    {#if fmtsL.res.length || fmtsL.dv || fmtsL.hdr}
+                      <span class="inline-flex items-center gap-1 flex-wrap">
+                        {#each fmtsL.res as r}<span class="text-[10px] px-1.5 py-0.5 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-medium">{r}</span>{/each}
+                        {#if fmtsL.dv}<span class="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 font-medium">DV</span>{/if}
+                        {#if fmtsL.hdr}<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 font-medium">HDR</span>{/if}
+                      </span>
+                    {/if}
+                    {#if groupSizeRange(group.items)}<span class="text-[var(--text-secondary)] whitespace-nowrap">{groupSizeRange(group.items)}</span>{/if}
                   </div>
                   {#if groupDateRange(group.items)}
                     <div class="text-[11px] text-[var(--text-secondary)] mt-0.5 opacity-60">{groupDateRange(group.items)}</div>
                   {/if}
+                  {#if group.items[0].description}
+                    <p class="text-[11px] text-[var(--text-secondary)] mt-1 leading-relaxed line-clamp-2 opacity-80">{group.items[0].description}</p>
+                  {/if}
                 </td>
-                {#if cols.rating}
-                  <td class="p-2 text-sm">
-                    {#if group.items[0].rating != null}
-                      <div class="flex items-center gap-1 whitespace-nowrap">
-                        <span>⭐</span>
-                        <span class="font-medium">{group.items[0].rating.toFixed(1)}</span>
-                      </div>
-                    {/if}
-                  </td>
-                {/if}
-                {#if cols.res}
-                  <td class="p-2 hidden md:table-cell">
-                    <div class="flex items-center gap-1 flex-wrap">
-                      {#each fmtsL.res as r}
-                        <span class="text-[10px] px-1 py-0.5 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-medium">{r}</span>
-                      {/each}
-                      {#if fmtsL.dv}<span class="text-[10px] px-1 py-0.5 rounded bg-purple-500/20 text-purple-400 font-medium">DV</span>{/if}
-                      {#if fmtsL.hdr}<span class="text-[10px] px-1 py-0.5 rounded bg-amber-500/20 text-amber-400 font-medium">HDR</span>{/if}
-                    </div>
-                  </td>
-                {/if}
-                {#if cols.size}<td class="p-2 text-sm text-[var(--text-secondary)] hidden lg:table-cell">{groupSizeRange(group.items)}</td>{/if}
-                {#if cols.status}<td class="p-2"></td>{/if}
                 <td class="p-2"></td>
               </tr>
             {:else}
@@ -587,9 +641,18 @@
             {/if}
           {/if}
           {#if isGroupExpanded(group)}
+            {@const ownedSpec = isDuplicateGroup(group) ? groupOwnedSpec(group.items) : null}
             {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
-              <ResultRow {item} focused={flatIndexMap().get(item) === $focusedIndex} zebra={((flatIndexMap().get(item) ?? 0) % 2) === 1} oncontextmenu={(e) => handleContextMenu(e, item)} />
+              <ResultRow {item} nested={isDuplicateGroup(group)} owned={ownedSpec} focused={flatIndexMap().get(item) === $focusedIndex} zebra={((flatIndexMap().get(item) ?? 0) % 2) === 1} oncontextmenu={(e) => handleContextMenu(e, item)} />
             {/each}
+            {#if isDuplicateGroup(group)}
+              <!-- Closes off an expanded version group so its end is unmistakable -->
+              <tr aria-hidden="true" class="pointer-events-none">
+                <td colspan="99" class="p-0">
+                  <div class="h-3 border-b-2 border-[var(--border)]"></div>
+                </td>
+              </tr>
+            {/if}
           {/if}
         {/each}
       </tbody>

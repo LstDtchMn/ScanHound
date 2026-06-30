@@ -47,3 +47,25 @@ class TestMultiEpNaming:
         fname, _ = build_target(meta, movie_root="/movies")
         assert "Part" not in fname
         assert "E0" not in fname
+
+
+# ── Minor review fix: custom template keeps the Part suffix ──────────
+
+from backend.rename.naming import build_target as _bt
+
+
+def test_template_appends_part_when_not_referenced():
+    f1, _ = _bt({"media_type": "tv", "title": "Show", "year": 2024, "season": 1,
+                 "episode": 1, "part": 1, "original_filename": "x.mkv"},
+                tv_root="/tv", template="{{title}} - S{{season}}E{{episode}}")
+    f2, _ = _bt({"media_type": "tv", "title": "Show", "year": 2024, "season": 1,
+                 "episode": 1, "part": 2, "original_filename": "x.mkv"},
+                tv_root="/tv", template="{{title}} - S{{season}}E{{episode}}")
+    assert "Part 1" in f1 and "Part 2" in f2 and f1 != f2  # no collision
+
+
+def test_template_part_token_not_double_appended():
+    f, _ = _bt({"media_type": "tv", "title": "Show", "year": 2024, "season": 1,
+                "episode": 1, "part": 2, "original_filename": "x.mkv"},
+               tv_root="/tv", template="{{title}} Part {{part}}")
+    assert " - Part 2" not in f and "Part 2" in f

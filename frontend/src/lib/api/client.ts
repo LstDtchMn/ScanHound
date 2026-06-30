@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -150,15 +150,21 @@ export const api = {
   plexRefresh: () => request('/plex/refresh', { method: 'POST' }),
 
   // Downloads
-  download: (url: string, title: string, serviceType = 'Rapidgator', year?: number | null) =>
+  download: (url: string, title: string, serviceType = 'Rapidgator', year?: number | null,
+             resolution = '', size = '', hdr = '', dovi = false) =>
     request('/download', {
       method: 'POST',
-      body: JSON.stringify({ url, title, service_type: serviceType, year: year ?? null })
+      body: JSON.stringify({ url, title, service_type: serviceType, year: year ?? null,
+                             resolution, size, hdr, dovi })
     }),
-  downloadBatch: (items: { url: string; title: string; year?: number | null }[], serviceType = 'Rapidgator') =>
+  downloadBatch: (items: { url: string; title: string; year?: number | null; resolution?: string; size?: string; hdr?: string; dovi?: boolean }[], serviceType = 'Rapidgator') =>
     request('/download/batch', {
       method: 'POST',
-      body: JSON.stringify({ items: items.map(i => ({ ...i, service_type: serviceType })) })
+      body: JSON.stringify({ items: items.map(i => ({
+        url: i.url, title: i.title, year: i.year ?? null,
+        resolution: i.resolution ?? '', size: i.size ?? '', hdr: i.hdr ?? '', dovi: i.dovi ?? false,
+        service_type: serviceType,
+      })) })
     }),
   scrapeLinks: (url: string, serviceType = 'Rapidgator', title = '', resolution = '') =>
     request<{ links: string[]; count: number }>('/download/scrape', {
@@ -222,6 +228,7 @@ export const api = {
 
   // Analytics
   analyticsSummary: () => request<AnalyticsSummary>('/analytics/summary'),
+  analyticsRenames: () => request<RenameStats>('/analytics/renames'),
   analyticsLibrary: (mode = 'Movies') =>
     request<LibraryStats>(`/analytics/library?mode=${encodeURIComponent(mode)}`),
   analyticsTrends: (days = 30) =>
@@ -325,4 +332,29 @@ export const api = {
     request<{ ok: boolean }>(`/rename/jobs/${id}`, { method: 'DELETE' }),
   testOllama: () =>
     request<{ ok: boolean; models?: string[]; error?: string }>('/rename/llm/test'),
+  renameProcessFolder: (folder: string, dryRun = false) =>
+    request<{ status: string; folder: string; dry_run: boolean }>('/rename/process-folder', {
+      method: 'POST',
+      body: JSON.stringify({ folder, dry_run: dryRun })
+    }),
+  renameHealth: () =>
+    request<{
+      binaries: Record<string, boolean>;
+      capabilities: Record<string, boolean>;
+      ollama: { ok: boolean; model: string; model_available: boolean; error?: string };
+      llm_enabled: boolean;
+    }>('/rename/health'),
+  reidentifyRename: (id: number) =>
+    request<{ ok: boolean; job_id?: number; error?: string }>(`/rename/jobs/${id}/reidentify`, { method: 'POST' }),
+  reidentifyAllRenames: () =>
+    request<{ status: string }>('/rename/reidentify-all', { method: 'POST' }),
+  dvScanFolder: (folder: string, force = false) =>
+    request<{ status: string; folder: string; force: boolean }>('/rename/dv-scan-folder', {
+      method: 'POST',
+      body: JSON.stringify({ folder, force })
+    }),
+  getDvScans: (layer?: string) => {
+    const qs = layer ? `?layer=${encodeURIComponent(layer)}` : '';
+    return request<{ scans: DvScan[]; counts: Record<string, number> }>(`/rename/dv-scans${qs}`);
+  },
 };

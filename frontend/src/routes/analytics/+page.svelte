@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api } from '$lib/api/client';
-  import type { AnalyticsSummary, LibraryStats, TrendData } from '$lib/api/types';
+  import type { AnalyticsSummary, LibraryStats, TrendData, RenameStats } from '$lib/api/types';
   import { addToast } from '$lib/stores/notifications';
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
@@ -108,7 +108,14 @@
     } catch { /* ignore */ }
   }
 
-  onMount(() => { loadData(); loadScanHistory(); loadDownloadStats(); });
+  let renameStats = $state<RenameStats | null>(null);
+  async function loadRenameStats() {
+    try {
+      renameStats = await api.analyticsRenames();
+    } catch { /* ignore */ }
+  }
+
+  onMount(() => { loadData(); loadScanHistory(); loadDownloadStats(); loadRenameStats(); });
 
   function formatSize(gb: number): string {
     if (gb >= 1024) return `${(gb / 1024).toFixed(1)} TB`;
@@ -269,6 +276,62 @@
         </div>
       </div>
     </div>
+    {/if}
+
+    <!-- Auto-rename stats -->
+    {#if renameStats}
+      {@const moved = renameStats.applied}
+      {@const review = renameStats.by_status['needs_review'] ?? 0}
+      {@const failed = renameStats.by_status['failed'] ?? 0}
+      {@const dirs = Object.entries(renameStats.by_directory).sort((a, b) => b[1] - a[1])}
+      <div class="bg-[var(--bg-secondary)] rounded-lg p-4 border border-[var(--border)]">
+        <h2 class="text-sm font-semibold mb-3">Auto-Rename</h2>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
+          <div>
+            <div class="text-lg font-bold text-[var(--success)]">{moved}</div>
+            <Tooltip text="Files successfully renamed and placed into a Plex library directory.">
+              <div class="text-[var(--text-secondary)] cursor-help underline decoration-dotted">Renamed &amp; Moved ⓘ</div>
+            </Tooltip>
+          </div>
+          <div>
+            <div class="text-lg font-bold">{renameStats.total_jobs}</div>
+            <Tooltip text="Total rename jobs ScanHound has created (applied, awaiting review, or failed).">
+              <div class="text-[var(--text-secondary)] cursor-help underline decoration-dotted">Total Jobs ⓘ</div>
+            </Tooltip>
+          </div>
+          <div>
+            <div class="text-lg font-bold text-[var(--warning)]">{review}</div>
+            <Tooltip text="Matched files held for manual confirmation before moving.">
+              <div class="text-[var(--text-secondary)] cursor-help underline decoration-dotted">Needs Review ⓘ</div>
+            </Tooltip>
+          </div>
+          <div>
+            <div class="text-lg font-bold text-[var(--error)]">{failed}</div>
+            <Tooltip text="Files ScanHound could not identify or move.">
+              <div class="text-[var(--text-secondary)] cursor-help underline decoration-dotted">Failed ⓘ</div>
+            </Tooltip>
+          </div>
+        </div>
+        {#if dirs.length > 0}
+          <div class="mt-4 pt-3 border-t border-[var(--border)]">
+            <div class="text-[11px] uppercase tracking-wide text-[var(--text-secondary)] mb-2">Files moved into each directory</div>
+            <div class="space-y-1.5">
+              {#each dirs as [dir, count]}
+                {@const pct = moved > 0 ? Math.round((count / moved) * 100) : 0}
+                <div class="flex items-center gap-2 text-xs">
+                  <span class="truncate flex-1" title={dir}>{dir}</span>
+                  <div class="w-24 h-1.5 rounded-full bg-[var(--bg-tertiary)] overflow-hidden flex-shrink-0">
+                    <div class="h-full bg-[var(--accent)]" style="width: {pct}%"></div>
+                  </div>
+                  <span class="w-10 text-right font-medium flex-shrink-0">{count}</span>
+                </div>
+              {/each}
+            </div>
+          </div>
+        {:else if moved === 0}
+          <p class="mt-3 text-[11px] text-[var(--text-secondary)] opacity-70">No files renamed yet. Auto-rename acts on downloads as JDownloader finishes extracting them.</p>
+        {/if}
+      </div>
     {/if}
 
     <!-- Library breakdown -->

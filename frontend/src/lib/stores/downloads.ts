@@ -1,6 +1,6 @@
 import { writable, derived } from 'svelte/store';
 import { connection } from './connection';
-import { markDownloaded } from './results';
+import { markDownloaded, markGrabbedSiblings } from './results';
 import { DOWNLOAD_HOSTS } from '$lib/constants';
 
 // Download host preference — persisted to localStorage
@@ -66,7 +66,10 @@ connection.on('download:complete', (data) => {
   // Only a real JDownloader hand-off marks the result row Downloaded —
   // clipboard/browser fallbacks deliver nothing to JD, so they must not.
   const url = (data.url as string) || '';
-  if (url && data.method === 'jdownloader') markDownloaded([url]);
+  if (url && data.method === 'jdownloader') {
+    markDownloaded([url]);
+    markGrabbedSiblings(url);  // tag same-title siblings with a "grabbed" note
+  }
   clearTimeout(downloadClearTimer);
   downloadClearTimer = setTimeout(() => activeDownload.set(null), 3000);
 });

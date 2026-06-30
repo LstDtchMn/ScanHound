@@ -87,6 +87,12 @@ def scheduler_trigger(reg: ServiceRegistry = Depends(get_registry)):
     if not reg._scanner_service:
         raise HTTPException(status_code=503, detail="Scanner not initialized")
 
+    scanner = reg.scanner
+    if scanner and scanner.scan_in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail="A background pre-cache scan is running; please retry in a moment")
+
     # Use the same lock and state as /scan/start to prevent concurrent scans
     req = ScanRequest(type="incremental")
     with _scan_lock:

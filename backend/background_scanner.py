@@ -19,6 +19,14 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SOURCES = ["HDEncode", "DDLBase", "Adit-HD"]
 
+# Pre-cache every category so the UI's 4K/Remux/TV toggles can filter the cached
+# results instantly (no re-scrape). Superset of all per-source flag keys; each
+# source's _build_sources picks the ones it understands.
+_ALL_CATEGORY_FLAGS = {
+    "4k": True, "remux": True, "tv": True,
+    "4k_webdl": True, "4k_remux": True, "1080p_remux": True,
+}
+
 
 class BackgroundScanner:
     """Runs periodic pre-cache scans on a daemon thread."""
@@ -29,6 +37,12 @@ class BackgroundScanner:
         self._stop = threading.Event()
         self._running = threading.Event()  # a scan is currently executing
         self._lock = threading.Lock()
+        # Timestamp the loop is currently sleeping toward — authoritative for
+        # next_run_at so the banner reflects the real wake time even if the last
+        # run failed (and didn't stamp background_scan_last_run).
+        self._next_run_ts: Optional[float] = None
+        # Summary of the most recent run, surfaced via /background/status.
+        self._last_run: Optional[Dict[str, Any]] = None
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
@@ -59,11 +73,20 @@ class BackgroundScanner:
     def is_scanning(self) -> bool:
         return self._running.is_set()
 
+    @property
+    def last_run(self) -> Optional[Dict[str, Any]]:
+        """Summary of the most recent completed run (per-source counts/errors)."""
+        return self._last_run
+
     def next_run_at(self) -> Optional[float]:
         """Epoch timestamp of the next scheduled run, or None if disabled."""
         cfg = self._reg.config or {}
         if not cfg.get("background_scan_enabled"):
             return None
+        # The timestamp the loop is actually sleeping toward is authoritative;
+        # fall back to last_run + interval before the loop has armed it.
+        if self._next_run_ts:
+            return self._next_run_ts
         last = cfg.get("background_scan_last_run") or 0
         base = last or time.time()
         return base + self._interval_seconds()
@@ -86,8 +109,12 @@ class BackgroundScanner:
         Returns True if a stop was requested during the wait.
         """
         elapsed = 0.0
+        start = time.time()
         while not self._stop.is_set():
             target = self._interval_seconds()
+            # Keep the reported next-run ETA in sync with the live interval, so a
+            # mid-wait change doesn't leave a stale wake time on the status page.
+            self._next_run_ts = start + target
             if elapsed >= target:
                 return False
             slice_s = min(60.0, target - elapsed)
@@ -100,7 +127,9 @@ class BackgroundScanner:
         # Wait one interval before the first run so startup isn't hammered, then
         # run on each interval while still enabled.
         while not self._stop.is_set():
+            self._next_run_ts = time.time() + self._interval_seconds()
             if self._wait_interval():
+                self._next_run_ts = None
                 return  # stop requested
             cfg = self._reg.config or {}
             if cfg.get("background_scan_enabled"):
@@ -131,27 +160,72 @@ class BackgroundScanner:
         except (TypeError, ValueError):
             pages = 3
 
-        # Atomic test-and-set so a manual /background/scan-now can't race the
-        # scheduled loop (or another manual trigger) into two concurrent scans
-        # interleaving writes to the cache. The endpoint's own pre-check is a
-        # friendly 409; this is the actual guarantee.
+        # Two-part guard. ``self._running`` stops two background scans
+        # overlapping; ``scanner.try_acquire_scan()`` is the global slot that
+        # also makes the background scan YIELD to any foreground (manual or
+        # scheduled) scan — they share one ScannerService and would corrupt each
+        # other's in-memory state. This is both the race fix and the idle gate.
         with self._lock:
             if self._running.is_set():
                 logger.info("Background scan already in progress; skipping")
                 return {"scanned": 0, "cached": 0, "skipped": True}
+            if not scanner.try_acquire_scan():
+                logger.info("Background scan skipped: a foreground scan is in progress")
+                return {"scanned": 0, "cached": 0, "skipped": True, "reason": "busy"}
             self._running.set()
+
+        # Posts already cached are skipped from re-scraping and the crawl
+        # early-stops once it reaches them; their last_seen is refreshed below so
+        # they aren't purged while still listed.
+        cached_urls = db.get_background_cache_urls()
         total = 0
+        any_early_stopped = False
+        source_results: List[Dict[str, Any]] = []
         try:
             for source in sources:
-                rows = self._to_cache_rows(self._scan_source(source, pages), source)
+                err: Optional[str] = None
+                items: List[Any] = []
+                try:
+                    items = self._scan_source(source, pages, cached_urls)
+                except Exception as e:
+                    err = str(e)
+                    logger.exception("Background scan of source %s failed", source)
+
+                # Refresh last_seen for still-listed items we skipped re-scraping.
+                if not err:
+                    seen = getattr(scanner, "_last_crawl_seen_urls", None)
+                    if seen:
+                        db.touch_background_cache(seen)
+                    if getattr(scanner, "_last_crawl_early_stopped", False):
+                        any_early_stopped = True
+
+                rows = self._to_cache_rows(items, source)
                 if rows:
                     db.upsert_background_cache(rows)
                     total += len(rows)
+                source_results.append({"source": source, "new": len(rows), "error": err})
+
+            # Refresh library/downloaded status across the WHOLE cache (cheap —
+            # no re-scraping) so already-cached items reflect the current Plex
+            # library and recent grabs, not just their state when first scanned.
+            rematched = 0
             try:
-                retain = max(1, int(cfg.get("background_scan_retain_days", 7)))
-            except (TypeError, ValueError):
-                retain = 7
-            db.purge_background_cache(retain)
+                rematched = scanner.rematch_cache()
+            except Exception:
+                logger.exception("Cache re-match failed")
+
+            # Only purge after a FULL crawl. An early-stopped crawl never visited
+            # deeper pages, so its seen-set is partial and last_seen wasn't
+            # refreshed for still-listed items further down — purging now would
+            # age out releases that are still on the site.
+            if any_early_stopped:
+                logger.info("Background scan: a source stopped early, skipping cache purge this run")
+            else:
+                try:
+                    retain = max(1, int(cfg.get("background_scan_retain_days", 7)))
+                except (TypeError, ValueError):
+                    retain = 7
+                db.purge_background_cache(retain)
             try:
                 reg.config["background_scan_last_run"] = time.time()
                 if reg.backend:
@@ -160,29 +234,56 @@ class BackgroundScanner:
                 logger.warning("Failed to stamp background_scan_last_run")
         finally:
             self._running.clear()
+            scanner.release_scan()
 
         cached = db.count_background_cache()
+        self._last_run = {
+            "at": time.time(),
+            "new": total,
+            "cached": cached,
+            "rematched": rematched,
+            "sources": source_results,
+        }
         logger.info(
-            "Background scan complete: %d results from %d source(s), %d cached",
+            "Background scan complete: %d new/updated from %d source(s), %d cached",
             total, len(sources), cached)
         return {"scanned": total, "cached": cached, "sources": list(sources)}
 
-    def _scan_source(self, source: str, pages: int) -> List[Any]:
-        """Run the normal scan for a single source. Returns MediaItems."""
+    def _category_flags(self) -> dict:
+        """Which categories to pre-cache. Defaults to ALL so the UI's instant
+        4K/Remux/TV filters always have every category cached; an operator on a
+        tight scrape/TMDB budget can set ``background_scan_categories`` to a
+        subset (e.g. ``["4k"]``) to cut volume. An empty/all-false set falls
+        back to ALL rather than scanning nothing."""
+        wanted = (self._reg.config or {}).get("background_scan_categories")
+        if not wanted:
+            return dict(_ALL_CATEGORY_FLAGS)
+        keep = {str(w).lower() for w in wanted}
+        flags = {k: (k in keep) for k in _ALL_CATEGORY_FLAGS}
+        return flags if any(flags.values()) else dict(_ALL_CATEGORY_FLAGS)
+
+    def _scan_source(self, source: str, pages: int,
+                     skip_urls: Optional[set] = None) -> List[Any]:
+        """Run a single source's scan and return its MediaItems.
+
+        Raises on hard failure so the caller can record a per-source error.
+        Uses ``track_urls=False`` so it never disturbs the incremental URL
+        history the scheduler relies on, ``skip_urls`` to avoid re-scraping
+        already-cached posts, and ``early_stop`` to stop at the prior endpoint.
+        """
         from backend.api.routes.scanner import _SOURCE_NAME_MAP, _SCAN_TYPE_MAP
         source_type = _SOURCE_NAME_MAP.get(str(source).lower(), source)
-        try:
-            items = self._reg.scanner.run_scan(
-                scan_type=_SCAN_TYPE_MAP.get("deep", "Deep Scan"),
-                source_type=source_type,
-                pages=pages,
-                resolution_flags=None,
-                search_query="",
-            )
-            return list(items) if items else []
-        except Exception:
-            logger.exception("Background scan of source %s failed", source)
-            return []
+        items = self._reg.scanner.run_scan(
+            scan_type=_SCAN_TYPE_MAP.get("deep", "Deep Scan"),
+            source_type=source_type,
+            pages=pages,
+            resolution_flags=self._category_flags(),
+            search_query="",
+            track_urls=False,
+            skip_urls=skip_urls,
+            early_stop=True,
+        )
+        return list(items) if items else []
 
     def _to_cache_rows(self, items, source: str) -> List[Dict[str, Any]]:
         """Serialize MediaItems to cache rows (full dict stored as JSON)."""

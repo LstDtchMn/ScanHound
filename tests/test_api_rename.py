@@ -10,7 +10,7 @@ from backend.database import DatabaseManager
 def _reset_jobs():
     def _clear():
         try:
-            dm = DatabaseManager(); dm.clear_rename_jobs(); dm.close()
+            dm = DatabaseManager(); dm.clear_rename_jobs(); dm.clear_dv_scans(); dm.close()
         except Exception:
             pass
     _clear(); yield; _clear()
@@ -42,6 +42,13 @@ class TestRenameApi:
         body = client.get("/rename/jobs").json()
         assert body["jobs"] == [] and body["counts"] == {}
 
+    def test_health_reports_capabilities(self, client):
+        body = client.get("/rename/health").json()
+        assert set(body["binaries"]) == {"ffmpeg", "ffprobe", "tesseract", "dovi_tool"}
+        assert set(body["capabilities"]) == {
+            "runtime_check", "subtitles", "ocr_credits", "vision", "dv_detection"}
+        assert "ok" in body["ollama"] and "llm_enabled" in body
+
     def test_status_defaults(self, client):
         body = client.get("/rename/status").json()
         assert body["enabled"] is False
@@ -57,6 +64,52 @@ class TestRenameApi:
         assert allj["counts"].get("needs_review") == 1
         nr = client.get("/rename/jobs?status=needs_review").json()
         assert len(nr["jobs"]) == 1 and nr["jobs"][0]["title"] == "A"
+
+    def test_jobs_flags_destination_conflict(self, client):
+        # Two active jobs targeting the same destination file (two releases of one
+        # movie) must both be flagged; an unrelated job must not be.
+        dest, name = "/lib/movies", "Dup (2020) [2160p].mkv"
+        _seed_job(status="matched", title="Dup", destination_path=dest, new_filename=name)
+        _seed_job(status="matched", title="Dup", destination_path=dest, new_filename=name)
+        _seed_job(status="matched", title="Solo", destination_path=dest,
+                  new_filename="Solo (2019).mkv")
+        jobs = client.get("/rename/jobs").json()["jobs"]
+        dups = [j for j in jobs if j["title"] == "Dup"]
+        solos = [j for j in jobs if j["title"] == "Solo"]
+        assert len(dups) == 2 and all(j["destination_conflict"] for j in dups)
+        assert solos and all(not j["destination_conflict"] for j in solos)
+
+    def test_jobs_recommends_keeper_for_duplicate(self, client):
+        dest, name = "/lib/movies", "Dune (2021) [2160p].mkv"
+        _seed_job(status="matched", title="Dune", destination_path=dest, new_filename=name,
+                  original_filename="Dune.2021.2160p.WEB-DL.mkv", resolution="2160p")
+        _seed_job(status="matched", title="Dune", destination_path=dest, new_filename=name,
+                  original_filename="Dune.2021.2160p.BluRay.REMUX.DV.HDR.TrueHD.mkv",
+                  resolution="2160p")
+        jobs = client.get("/rename/jobs").json()["jobs"]
+        dune = [j for j in jobs if j["title"] == "Dune"]
+        keepers = [j for j in dune if j.get("keep_recommended")]
+        assert len(keepers) == 1
+        assert "REMUX" in (keepers[0]["original_filename"] or "")
+        assert keepers[0]["keep_reason"]
+
+    def test_dv_scans_empty_and_shape(self, client):
+        body = client.get("/rename/dv-scans").json()
+        assert body["scans"] == [] and body["counts"] == {}
+
+    def test_dv_scan_folder_requires_folder(self, client):
+        assert client.post("/rename/dv-scan-folder", json={"folder": ""}).status_code == 400
+
+    def test_dv_scan_folder_starts(self, client, monkeypatch):
+        # Don't actually walk the FS / run dovi_tool — just confirm the endpoint
+        # dispatches the background job and returns 'started'.
+        import backend.rename.service as svc_mod
+        monkeypatch.setattr(svc_mod.RenameService, "scan_folder_dv",
+                            lambda self, folder, force=False, progress_cb=None: {
+                                "found": 0, "scanned": 0, "skipped": 0, "by_layer": {}})
+        body = client.post("/rename/dv-scan-folder",
+                           json={"folder": "/library/movies-4k"}).json()
+        assert body["status"] == "started"
 
     def test_apply_unknown_job_is_400(self, client):
         assert client.post("/rename/jobs/99999/apply").status_code == 400

@@ -28,7 +28,8 @@ export interface ScanResult {
   posted_date: string | null;
   host_pref: string;
   is_duplicate_group: boolean;
-  prior_grab?: { resolution: string; size: string; downloaded_at: string } | null;
+  prior_grab?: { resolution: string; size: string; downloaded_at: string; hdr?: string; dovi?: boolean } | null;
+  category?: string; // crawl category: '4k' | 'remux' | 'tv' | '' (unknown)
 }
 
 export interface ScanStats {
@@ -103,6 +104,31 @@ export interface RenameJob {
     part: number;
     sibling_path: string;
   } | null;
+  // True when another active job targets the same destination file (e.g. two
+  // releases of the same movie). Computed server-side on the jobs list.
+  destination_conflict?: boolean;
+  // Within a duplicate group, the best-quality release to keep (with a short
+  // reason like "2160p · Dolby Vision · Remux"). Computed server-side.
+  keep_recommended?: boolean;
+  keep_reason?: string | null;
+}
+
+export interface DvScan {
+  path: string;
+  title: string | null;
+  dv_layer: string; // fel | mel | profile5 | profile8 | none | unknown
+  rating_key?: string | null;
+  imdb_id?: string | null;
+  scanned_at?: string | null;
+  last_seen_at?: string | null;
+}
+
+export interface RenameStats {
+  applied: number;
+  total_jobs: number;
+  by_status: Record<string, number>;
+  by_directory: Record<string, number>;
+  by_method: Record<string, number>;
 }
 
 export interface RenameStatus {
@@ -330,6 +356,7 @@ export interface Settings {
   auto_rename_tv_library?: string;
   auto_rename_template_movie?: string;
   auto_rename_template_tv?: string;
+  auto_rename_path_mappings?: string;
   auto_rename_plex_sort_titles?: boolean;
   auto_rename_llm_enabled?: boolean;
   ollama_base_url?: string;

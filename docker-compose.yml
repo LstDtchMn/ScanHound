@@ -11,6 +11,12 @@ services:
       # Persists config (~/.config/scanhound) + data/DB (~/.local/share/scanhound)
       # under HOME=/data in one mount.
       - ./data:/data
+      # Library/download folders for auto-rename. JDownloader (on the Windows
+      # host) downloads to F:\Downloads; renamed 1080p stays there, 4K goes to
+      # G:\Downloads. The container sees them as /library/movies + /movies-4k;
+      # JD's Windows saveTo paths are translated to these (Settings → Renaming).
+      - "F:/Downloads:/library/movies"
+      - "G:/Downloads:/library/movies-4k"
     environment:
       - TZ=America/New_York
     labels:

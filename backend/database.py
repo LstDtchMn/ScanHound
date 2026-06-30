@@ -380,6 +380,27 @@ class DatabaseManager:
                     )
                 ''')
 
+                # Dolby Vision layer inventory: one row per scanned file with
+                # its detected enhancement-layer type (fel/mel/profile5/...).
+                # Independent of rename_jobs so files that already live in the
+                # library (no rename job) can be recorded and badged. Keyed by
+                # container-view path; (sig_mtime, sig_size) is the change-signal
+                # that lets a re-scan skip unchanged files.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS dv_scan (
+                        path TEXT PRIMARY KEY,
+                        title TEXT,
+                        dv_layer TEXT,
+                        sig_mtime REAL,
+                        sig_size INTEGER,
+                        source TEXT,
+                        rating_key TEXT,
+                        imdb_id TEXT,
+                        scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
                 # ── Performance indexes (idempotent) ─────────────────────
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_imdb_id ON plex_cache(imdb_id)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_title ON plex_cache(title)')
@@ -392,6 +413,7 @@ class DatabaseManager:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp DESC)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_bg_cache_last_seen ON background_scan_cache(last_seen_at)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_dv_scan_layer ON dv_scan(dv_layer)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_rename_jobs_status ON rename_jobs(status)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_rename_jobs_detected ON rename_jobs(detected_at DESC)')
 
@@ -406,6 +428,8 @@ class DatabaseManager:
                     'ALTER TABLE rename_jobs ADD COLUMN suggested_correction TEXT',
                     'ALTER TABLE rename_jobs ADD COLUMN combined_episode TEXT',
                     'ALTER TABLE rename_jobs ADD COLUMN split_file TEXT',
+                    'ALTER TABLE downloads ADD COLUMN hdr TEXT',
+                    'ALTER TABLE downloads ADD COLUMN dovi INTEGER DEFAULT 0',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -677,22 +701,26 @@ class DatabaseManager:
         return self._mutate("DELETE FROM downloads", label="clear_history")
 
     def add_to_history(self, url, title, normalized_title=None, season=None,
-                       resolution=None, size=None, status="completed"):
+                       resolution=None, size=None, status="completed",
+                       hdr=None, dovi=False):
         """Record a downloaded URL with optional metadata for title-based matching.
 
         Uses ON CONFLICT to preserve the original date_added when re-downloading.
         """
         return self._mutate('''
-            INSERT INTO downloads (url, title, normalized_title, season, resolution, size, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO downloads (url, title, normalized_title, season, resolution, size, status, hdr, dovi)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 normalized_title = excluded.normalized_title,
                 season = excluded.season,
                 resolution = excluded.resolution,
                 size = excluded.size,
-                status = excluded.status
-        ''', (url, title, normalized_title, season, resolution, size, status),
+                status = excluded.status,
+                hdr = excluded.hdr,
+                dovi = excluded.dovi
+        ''', (url, title, normalized_title, season, resolution, size, status,
+              hdr or None, 1 if dovi else 0),
             label="add_history")
 
     def get_downloaded_titles(self):
@@ -1134,7 +1162,9 @@ class DatabaseManager:
                         title = excluded.title,
                         year = excluded.year,
                         status = excluded.status,
-                        source_category = excluded.source_category,
+                        source_category = COALESCE(
+                            NULLIF(background_scan_cache.source_category, ''),
+                            excluded.source_category),
                         data = excluded.data,
                         last_seen_at = CURRENT_TIMESTAMP
                 ''', [{
@@ -1162,6 +1192,200 @@ class DatabaseManager:
             'SELECT url, title, year, status, source_category, data, '
             'scraped_at, last_seen_at FROM background_scan_cache '
             'ORDER BY last_seen_at DESC LIMIT ?', (limit,), default=[])
+
+    def enrich_downloads_from_cache(self):
+        """Backfill empty resolution/size/hdr/dovi on download-history rows from
+        the background scan cache, matched by URL.
+
+        Accurate because the URL identifies the exact release that was grabbed.
+        Idempotent — only touches rows that are still missing the data and have a
+        matching cached release. Returns the number of rows updated."""
+        import json as _json
+        # Fetch candidates under the lock, then parse JSON outside it so we
+        # don't hold the lock while doing CPU-bound work on potentially many rows.
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return 0
+                raw_rows = conn.cursor().execute(
+                    "SELECT d.url, c.data FROM downloads d "
+                    "JOIN background_scan_cache c ON c.url = d.url "
+                    "WHERE (d.resolution IS NULL OR d.resolution = '') "
+                    "AND d.url IS NOT NULL"
+                ).fetchall()
+        except Exception as e:
+            logger.error("DB Error (enrich_downloads_from_cache fetch): %s", e)
+            return 0
+
+        to_update = []
+        for url, data in raw_rows:
+            try:
+                rel = _json.loads(data) if data else {}
+            except Exception:
+                continue
+            res = rel.get('resolution') or ''
+            size = rel.get('size') or ''
+            hdr = rel.get('hdr') or None
+            dovi = 1 if rel.get('dovi') else 0
+            if not (res or size or hdr or dovi):
+                continue
+            to_update.append((res, size, hdr, dovi, url))
+
+        if not to_update:
+            return 0
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return 0
+                conn.cursor().executemany(
+                    "UPDATE downloads SET resolution=?, size=?, hdr=?, dovi=? "
+                    "WHERE url=? AND (resolution IS NULL OR resolution = '')",
+                    to_update)
+                conn.commit()
+            updated = len(to_update)
+            logger.info("Enriched %d download-history row(s) from scan cache", updated)
+            return updated
+        except Exception as e:
+            logger.error("DB Error (enrich_downloads_from_cache write): %s", e)
+            return 0
+
+    # ── Dolby Vision layer inventory (dv_scan) ────────────────────────────
+
+    def upsert_dv_scan(self, path, dv_layer, *, title=None, sig_mtime=None,
+                       sig_size=None, source="scan", rating_key=None, imdb_id=None):
+        """Insert/update a DV-layer record for ``path``. Refreshes last_seen_at;
+        preserves scanned_at on update. Returns True on success."""
+        if not path:
+            return False
+        return self._mutate('''
+            INSERT INTO dv_scan
+                (path, title, dv_layer, sig_mtime, sig_size, source,
+                 rating_key, imdb_id, scanned_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(path) DO UPDATE SET
+                title = COALESCE(excluded.title, dv_scan.title),
+                dv_layer = excluded.dv_layer,
+                sig_mtime = excluded.sig_mtime,
+                sig_size = excluded.sig_size,
+                source = excluded.source,
+                rating_key = COALESCE(excluded.rating_key, dv_scan.rating_key),
+                imdb_id = COALESCE(excluded.imdb_id, dv_scan.imdb_id),
+                last_seen_at = CURRENT_TIMESTAMP
+        ''', (path, title, dv_layer, sig_mtime, sig_size, source,
+              rating_key, imdb_id), label="upsert_dv_scan") is not None
+
+    def get_dv_scan(self, path):
+        """Return the DV-scan row for ``path`` (dict) or None."""
+        rows = self._query_dicts(
+            'SELECT path, title, dv_layer, sig_mtime, sig_size, source, '
+            'rating_key, imdb_id, scanned_at, last_seen_at '
+            'FROM dv_scan WHERE path = ?', (path,))
+        return rows[0] if rows else None
+
+    def get_dv_scans(self, dv_layer=None, limit=100000):
+        """Return DV-scan rows, optionally filtered by layer (e.g. 'fel')."""
+        if dv_layer:
+            return self._query_dicts(
+                'SELECT path, title, dv_layer, rating_key, imdb_id, '
+                'scanned_at, last_seen_at FROM dv_scan WHERE dv_layer = ? '
+                'ORDER BY last_seen_at DESC LIMIT ?', (dv_layer, limit), default=[])
+        return self._query_dicts(
+            'SELECT path, title, dv_layer, rating_key, imdb_id, '
+            'scanned_at, last_seen_at FROM dv_scan '
+            'ORDER BY last_seen_at DESC LIMIT ?', (limit,), default=[])
+
+    def count_dv_scans_by_layer(self):
+        """Return ``{layer: count}`` over the dv_scan table."""
+        rows = self._query(
+            'SELECT dv_layer, COUNT(*) FROM dv_scan GROUP BY dv_layer', default=[])
+        return {r[0]: r[1] for r in (rows or [])}
+
+    def dv_scan_is_current(self, path, sig_mtime, sig_size):
+        """Whether ``path`` is already scanned with a matching change-signal, so an
+        expensive RPU re-scan can skip it. A None stored signature never matches
+        (forces a scan).
+
+        Size must match exactly; mtime is matched within 1s to absorb filesystem
+        mtime-granularity differences (FAT 2s, some network mounts 1s) that would
+        otherwise force needless re-scans of unchanged files. Size is the primary
+        guard — an in-place re-rip changes the byte count, so the 1s mtime slack
+        can't mask a real content change."""
+        row = self.get_dv_scan(path)
+        if not row or row.get("sig_mtime") is None or row.get("sig_size") is None:
+            return False
+        try:
+            return (abs(float(row["sig_mtime"]) - float(sig_mtime)) < 1.0
+                    and int(row["sig_size"]) == int(sig_size))
+        except (TypeError, ValueError):
+            return False
+
+    def clear_dv_scans(self):
+        """Remove all DV-scan rows (test/maintenance helper)."""
+        return self._mutate('DELETE FROM dv_scan', label="clear_dv_scans")
+
+    def update_background_status(self, updates):
+        """Update status + data JSON for cached rows WITHOUT touching last_seen,
+        so a status re-match (Plex/download re-check) doesn't reset retention.
+
+        Args:
+            updates: iterable of dicts with keys url, status, data.
+        """
+        rows = [u for u in updates if u.get('url')]
+        if not rows:
+            return True
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                conn.cursor().executemany(
+                    "UPDATE background_scan_cache SET status = :status, data = :data "
+                    "WHERE url = :url",
+                    [{'url': u['url'], 'status': u.get('status', ''), 'data': u.get('data')} for u in rows])
+                conn.commit()
+            return True
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error("DB Error (update_background_status): %s", e)
+            return False
+
+    def get_background_cache_urls(self):
+        """Return the set of URLs currently in the background cache."""
+        rows = self._query('SELECT url FROM background_scan_cache', default=[])
+        return {row[0] for row in rows} if rows else set()
+
+    def touch_background_cache(self, urls):
+        """Refresh ``last_seen_at`` for still-listed cached URLs without
+        re-scraping them — keeps them from being purged while still on the site."""
+        urls = [u for u in (urls or []) if u]
+        if not urls:
+            return True
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                conn.cursor().executemany(
+                    "UPDATE background_scan_cache SET last_seen_at = CURRENT_TIMESTAMP "
+                    "WHERE url = ?", [(u,) for u in urls])
+                conn.commit()
+            return True
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error("DB Error (touch_background_cache): %s", e)
+            return False
 
     def purge_background_cache(self, retain_days):
         """Delete cached rows last seen more than ``retain_days`` ago."""
@@ -1287,6 +1511,16 @@ class DatabaseManager:
         row = self._query(
             "SELECT 1 FROM rename_jobs WHERE package_name = ? LIMIT 1",
             (package_name,), one=True, default=None)
+        return row is not None
+
+    def path_has_rename_job(self, original_path):
+        """Whether a rename job already exists for a given source file — dedup for
+        manual folder processing, which has no JD package name."""
+        if not original_path:
+            return False
+        row = self._query(
+            "SELECT 1 FROM rename_jobs WHERE original_path = ? LIMIT 1",
+            (original_path,), one=True, default=None)
         return row is not None
 
     def delete_rename_job(self, job_id):

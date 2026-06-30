@@ -92,6 +92,22 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
     if not scanner:
         return
 
+    # Claim the global scan slot so we never run concurrently with a background
+    # pre-cache scan (they share one ScannerService and would corrupt each
+    # other's in-memory state). Foreground-vs-foreground is already serialized
+    # by _scan_state; this guards foreground-vs-background.
+    if not scanner.try_acquire_scan():
+        logger.info("Scan aborted: a background pre-cache scan is currently running")
+        ws_manager.broadcast_sync({
+            "type": "scan:error",
+            "data": {"message": "A background pre-cache scan is running; please retry in a moment."},
+        })
+        with _scan_lock:
+            _scan_state["state"] = "idle"
+            _scan_state["progress"] = 0.0
+            _scan_state["phase"] = ""
+        return
+
     with _scan_lock:
         _scan_state["state"] = "running"
         _scan_state["progress"] = 0.0
@@ -190,6 +206,7 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
             "data": {"message": str(e)},
         })
     finally:
+        scanner.release_scan()
         with _scan_lock:
             _scan_state["state"] = "idle"
             _scan_state["progress"] = 0.0
@@ -258,6 +275,12 @@ def scan_start(
     reg: ServiceRegistry = Depends(get_registry),
 ):
     global _scan_thread
+
+    scanner = reg.scanner
+    if scanner and scanner.scan_in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail="A background pre-cache scan is running; please retry in a moment")
 
     with _scan_lock:
         if _scan_state["state"] == "running":

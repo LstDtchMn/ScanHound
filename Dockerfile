@@ -24,7 +24,22 @@ ENV PYTHONUNBUFFERED=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         chromium chromium-driver xvfb tini \
         fonts-liberation libnss3 libxss1 libasound2 libgbm1 libgtk-3-0 \
-        ca-certificates ffmpeg \
+        ca-certificates ffmpeg tesseract-ocr curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# dovi_tool (quietvoid) — Dolby Vision RPU analysis for FEL/MEL detection. Not in
+# apt; install the prebuilt static-musl release binary (no Rust toolchain). The
+# release archive is version-less in its filename, so pin by tag and fetch that
+# tag's asset. mkvtoolnix supplies mkvextract/mkvpropedit for tagging/demux.
+ARG DOVI_TOOL_VERSION=2.3.2
+RUN set -eux; \
+    curl -fsSL -o /tmp/dovi_tool.tar.gz \
+        "https://github.com/quietvoid/dovi_tool/releases/download/${DOVI_TOOL_VERSION}/dovi_tool-${DOVI_TOOL_VERSION}-x86_64-unknown-linux-musl.tar.gz"; \
+    tar -xzf /tmp/dovi_tool.tar.gz -C /usr/local/bin; \
+    rm /tmp/dovi_tool.tar.gz; \
+    chmod +x /usr/local/bin/dovi_tool; \
+    dovi_tool --version; \
+    apt-get update && apt-get install -y --no-install-recommends mkvtoolnix \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

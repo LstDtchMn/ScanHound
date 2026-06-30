@@ -36,6 +36,7 @@ def background_status(reg: ServiceRegistry = Depends(get_registry)):
         "next_run_at": _iso(scanner.next_run_at()) if scanner else None,
         "cached_count": reg.db.count_background_cache() if reg.db else 0,
         "running": bool(scanner and scanner.is_scanning),
+        "last_run": scanner.last_run if scanner else None,
     }
 
 

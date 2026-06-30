@@ -20,6 +20,20 @@ def dashboard_summary(reg: ServiceRegistry = Depends(get_registry)):
     return _get_dashboard(reg).get_dashboard_summary()
 
 
+@router.get("/renames")
+def rename_stats(reg: ServiceRegistry = Depends(get_registry)):
+    """Auto-rename outcomes: total renamed/applied + per-directory breakdown."""
+    cfg = reg.config or {}
+    roots = {}
+    if cfg.get("auto_rename_movie_library"):
+        roots["Movies"] = cfg["auto_rename_movie_library"]
+    if cfg.get("auto_rename_movie_library_4k"):
+        roots["Movies (4K)"] = cfg["auto_rename_movie_library_4k"]
+    if cfg.get("auto_rename_tv_library"):
+        roots["TV"] = cfg["auto_rename_tv_library"]
+    return _get_dashboard(reg).get_rename_stats(roots)
+
+
 @router.get("/library")
 def library_stats(
     mode: str = Query("Movies", pattern="^(Movies|TV Shows)$"),

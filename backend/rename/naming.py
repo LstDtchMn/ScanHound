@@ -80,6 +80,7 @@ def _tokens(meta: dict) -> dict:
         "imdb_id": meta.get("imdb_id") or "",
         "tmdb_id": str(meta.get("tmdb_id") or ""),
         "media_type": meta.get("media_type", "movie"),
+        "part": str(meta.get("part") or ""),
     }
 
 
@@ -110,6 +111,12 @@ def build_target(meta: dict, *, movie_root: str = "", tv_root: str = "",
 
     if template:
         base = sanitize_filename(render_template(template, _tokens(meta)))
+        # Disambiguate split parts even under a custom template: append the part
+        # suffix unless the template already references {part}, so two parts
+        # never render to the same colliding filename.
+        part = meta.get("part")
+        if part and "part" not in template.lower():
+            base = f"{base} - Part {part}"
         fname = (base or title) + ext
     elif media_type == "tv":
         season = int(meta.get("season") or 1)

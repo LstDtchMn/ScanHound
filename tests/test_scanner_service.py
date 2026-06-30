@@ -35,8 +35,9 @@ class TestScanStatus:
     def test_dv_upgrade_value(self):
         assert ScanStatus.DV_UPGRADE.value == "dv_upgrade"
 
-    def test_enum_has_exactly_six_members(self):
-        assert len(ScanStatus) == 6
+    def test_enum_has_expected_members(self):
+        assert len(ScanStatus) == 7
+        assert ScanStatus.DOWNLOADED_SIMILAR.value == "downloaded_similar"
 
     def test_enum_round_trips_from_value(self):
         for member in ScanStatus:
@@ -145,7 +146,7 @@ class TestMediaItem:
             "plex_info", "plex_versions", "plex_rating_key", "selected",
             "host_pref", "poster_path", "imdb_id",
             "tile_state", "description", "posted_date", "web_data", "group_key",
-            "is_duplicate_group", "prior_grab",
+            "is_duplicate_group", "prior_grab", "category",
         }
         actual = {f.name for f in fields(MediaItem)}
         assert actual == expected

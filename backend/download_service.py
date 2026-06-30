@@ -197,14 +197,15 @@ class DownloadService:
             return set()
 
     def save_to_history(self, url: str, title: str, season: Optional[int],
-                        resolution: str, size: str, status: str = "completed"):
+                        resolution: str, size: str, status: str = "completed",
+                        hdr: str = "", dovi: bool = False):
         """Save a downloaded item to history."""
         try:
             normalized = normalize_title(title)
             self.db.add_to_history(
                 url=url, title=title, normalized_title=normalized,
                 season=season, resolution=resolution, size=size,
-                status=status,
+                status=status, hdr=hdr or None, dovi=dovi,
             )
             with self._history_lock:
                 self.download_history.add(url)
@@ -212,6 +213,8 @@ class DownloadService:
                 self._downloaded_titles_lookup.setdefault(key, []).append({
                     'resolution': resolution,
                     'size': size,
+                    'hdr': hdr or '',
+                    'dovi': dovi,
                 })
             return True
         except Exception as e:
@@ -1563,7 +1566,7 @@ class DownloadService:
 
     def download_item(self, url: str, title: str, season: Optional[int],
                       resolution: str, size: str, service_type: str = "Rapidgator",
-                      year: Optional[int] = None,
+                      year: Optional[int] = None, hdr: str = "", dovi: bool = False,
                       progress_callback: Optional[Callable] = None) -> Dict[str, Any]:
         """Download a single item: scrape links, send to JD or clipboard.
 
@@ -1644,7 +1647,7 @@ class DownloadService:
                 result["method"] = "jdownloader"
                 result["message"] = f"Sent {len(links)} links to JDownloader"
                 result["history_saved"] = self.save_to_history(
-                    url, title, season, resolution, size, status="completed"
+                    url, title, season, resolution, size, status="completed", hdr=hdr, dovi=dovi
                 )
                 self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
                 return result
@@ -1655,7 +1658,7 @@ class DownloadService:
             result["method"] = "clipboard"
             result["message"] = f"Copied {len(links)} links to clipboard"
             result["history_saved"] = self.save_to_history(
-                url, title, season, resolution, size, status="clipboard"
+                url, title, season, resolution, size, status="clipboard", hdr=hdr, dovi=dovi
             )
             self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
             return result
@@ -1668,7 +1671,7 @@ class DownloadService:
             result["method"] = "browser"
             result["message"] = "Opened URL in browser"
             result["history_saved"] = self.save_to_history(
-                url, title, season, resolution, size, status="browser"
+                url, title, season, resolution, size, status="browser", hdr=hdr, dovi=dovi
             )
             self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
             return result
@@ -1680,7 +1683,7 @@ class DownloadService:
             result["message"] = "JDownloader is disabled and no clipboard/browser is available."
         self._log(f"[Download] {title}: {result['message']}", "warning")
         try:
-            self.save_to_history(url, title, season, resolution, size, status="failed")
+            self.save_to_history(url, title, season, resolution, size, status="failed", hdr=hdr, dovi=dovi)
         except Exception:
             pass
         self._progress("download:failed", {"title": title, "url": url, "message": result["message"]}, _cb=_cb)

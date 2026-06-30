@@ -105,6 +105,17 @@ class TmdbClient:
         data = self._get(f"/search/{media_type}", params)
         return data.get("results", []) if data else []
 
+    def search_multi(self, query: str, language: str = "en-US") -> list[dict]:
+        """Cross-type search (movies + TV + people in one call). Each result
+        carries its own ``media_type``. Used as a fallback when a typed search
+        finds nothing — e.g. a movie misfiled as TV, or vice versa.
+
+        Returns:
+            List of result dicts (may be empty).
+        """
+        data = self._get("/search/multi", {"query": query, "language": language})
+        return data.get("results", []) if data else []
+
     def details(self, tmdb_id: int, media_type: str = "movie",
                 language: str = "en-US") -> dict | None:
         """Get movie or TV details by TMDB ID.
@@ -121,6 +132,14 @@ class TmdbClient:
             Dict with ``imdb_id``, ``tvdb_id``, etc., or ``None``.
         """
         return self._get(f"/{media_type}/{tmdb_id}/external_ids")
+
+    def credits(self, tmdb_id: int, media_type: str = "movie") -> dict | None:
+        """Get the cast and crew for a movie or TV show.
+
+        Returns:
+            Dict with ``cast`` (billed order) and ``crew`` lists, or ``None``.
+        """
+        return self._get(f"/{media_type}/{tmdb_id}/credits")
 
     def season(self, tv_id: int, season_number: int) -> dict | None:
         """Get season data including all episodes.

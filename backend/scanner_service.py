@@ -36,6 +36,9 @@ class ScanStatus(Enum):
     MISSING = "missing"
     MISSING_SEASON = "missing_season"
     DOWNLOADED = "downloaded"
+    # A sibling release of a title you've already grabbed, that is NOT a quality
+    # upgrade over the grab (same-or-worse) — you effectively have it already.
+    DOWNLOADED_SIMILAR = "downloaded_similar"
     IN_LIBRARY = "in_library"
     UPGRADE = "upgrade"
     DV_UPGRADE = "dv_upgrade"
@@ -77,6 +80,9 @@ class MediaItem:
     group_key: str = ""
     is_duplicate_group: bool = False
     prior_grab: Optional[Dict[str, Any]] = None
+    # Crawl category this item came from: '4k' | 'remux' | 'tv' | '' (unknown).
+    # Drives the instant 4K/Remux/TV display filter in the UI.
+    category: str = ""
 
 
 @dataclass
@@ -106,6 +112,7 @@ STATUS_COLORS = {
     ScanStatus.MISSING: "#e74c3c",
     ScanStatus.MISSING_SEASON: "#d35400",
     ScanStatus.DOWNLOADED: "#17a2b8",
+    ScanStatus.DOWNLOADED_SIMILAR: "#f97316",
     ScanStatus.IN_LIBRARY: "#27ae60",
     ScanStatus.UPGRADE: "#f39c12",
     ScanStatus.DV_UPGRADE: "#9b59b6",
@@ -115,10 +122,19 @@ STATUS_TEXTS = {
     ScanStatus.MISSING: "Missing",
     ScanStatus.MISSING_SEASON: "Missing Season!",
     ScanStatus.DOWNLOADED: "Downloaded",
+    ScanStatus.DOWNLOADED_SIMILAR: "Downloaded Similar",
     ScanStatus.IN_LIBRARY: "\u2713 In Library",
     ScanStatus.UPGRADE: "UPGRADE",
     ScanStatus.DV_UPGRADE: "UPGRADE (DV)",
 }
+
+# Resolution ranking for the "is this sibling an upgrade over what I grabbed?"
+# check used by ``_download_status_for``.
+_RES_RANK = {"2160p": 4, "4k": 4, "uhd": 4, "1080p": 3, "720p": 2, "480p": 1}
+
+
+def _res_rank(res) -> int:
+    return _RES_RANK.get((res or "").strip().lower(), 0)
 
 
 # ── ScannerService ────────────────────────────────────────────────────
@@ -155,6 +171,16 @@ class ScannerService:
         self._stop_event = threading.Event()
         self._scanning_lock = threading.Lock()
         self._is_scanning = False
+        # Single global scan slot. Foreground (manual/scheduled) and background
+        # pre-cache scans share this one ScannerService instance, so they must
+        # never execute concurrently — both paths claim this slot first.
+        self._scan_slot = threading.Lock()
+        # URLs seen in the most recent listing crawl (new + skipped), exposed so
+        # the background scanner can refresh last_seen on still-listed items.
+        self._last_crawl_seen_urls: Set[str] = set()
+        # True when the last crawl stopped early at cached content — the scanner
+        # then never saw deeper pages, so it must NOT purge against this crawl.
+        self._last_crawl_early_stopped: bool = False
 
         # Download history
         self.download_history: Set[str] = set()
@@ -186,6 +212,27 @@ class ScannerService:
     def is_scanning(self, value: bool):
         with self._scanning_lock:
             self._is_scanning = value
+
+    # ── Global scan slot (foreground vs background mutual exclusion) ──
+
+    def try_acquire_scan(self) -> bool:
+        """Atomically claim the single scan slot. Returns False if a scan
+        (foreground or background) is already running. The caller must call
+        ``release_scan()`` in a finally block when its scan completes."""
+        return self._scan_slot.acquire(blocking=False)
+
+    def release_scan(self) -> None:
+        """Release the scan slot. Safe to call even if not held."""
+        try:
+            self._scan_slot.release()
+        except RuntimeError:
+            pass
+
+    @property
+    def scan_in_progress(self) -> bool:
+        """True if any scan currently holds the slot (best-effort, for friendly
+        409s — the authoritative guard is ``try_acquire_scan``)."""
+        return self._scan_slot.locked()
 
     # ── Callbacks ─────────────────────────────────────────────────────
 
@@ -225,6 +272,9 @@ class ScannerService:
         search_query: str = "",
         use_expired_cache: bool = False,
         plex_refresh_mode: str = "auto",
+        track_urls: bool = True,
+        skip_urls: Optional[Set[str]] = None,
+        early_stop: bool = False,
     ) -> List[MediaItem]:
         """Run a full scan synchronously (call from background thread).
 
@@ -236,6 +286,14 @@ class ScannerService:
             search_query: Query string for Site Search mode
             use_expired_cache: If True, skip cache validation and use cached data as-is
             plex_refresh_mode: "auto" (smart), "force_refresh" (always reload), "cache_only" (never reload)
+            track_urls: If False, leave the incremental ``scanned_urls`` table
+                untouched (the background pre-cache uses this so it doesn't reset
+                the baseline the scheduled incremental scans rely on).
+            skip_urls: Extra URLs to skip detail-processing (e.g. URLs the
+                background scanner already has cached), merged with whatever the
+                scan type loads.
+            early_stop: If True, stop crawling a source once a populated listing
+                page yields no new (non-skipped) posts — the "previous endpoint".
 
         Returns:
             List of MediaItem results.
@@ -248,6 +306,7 @@ class ScannerService:
         with self._items_lock:
             self.items.clear()
             self._item_counter = 0
+        self._last_crawl_seen_urls = set()
 
         # Load download history
         self.download_history = self._load_download_history()
@@ -259,7 +318,8 @@ class ScannerService:
             try:
                 loop.run_until_complete(
                     self._run_scan_async(scan_type, source_type, pages, flags,
-                                        search_query, use_expired_cache, plex_refresh_mode)
+                                        search_query, use_expired_cache, plex_refresh_mode,
+                                        track_urls, skip_urls, early_stop)
                 )
             finally:
                 loop.close()
@@ -279,6 +339,9 @@ class ScannerService:
         search_query: str,
         use_expired_cache: bool = False,
         plex_refresh_mode: str = "auto",
+        track_urls: bool = True,
+        skip_urls: Optional[Set[str]] = None,
+        early_stop: bool = False,
     ):
         """Internal async scan implementation."""
 
@@ -366,8 +429,11 @@ class ScannerService:
 
         previously_scanned: Set[str] = set()
         if scan_type == "Deep Scan":
-            self.db.clear_scanned_urls()
-            self._log("Deep Scan: Cleared URL history, scanning all items")
+            if track_urls:
+                self.db.clear_scanned_urls()
+                self._log("Deep Scan: Cleared URL history, scanning all items")
+            else:
+                self._log("Deep Scan: scanning all items (incremental URL history left untouched)")
         elif scan_type == "Site Search":
             # Ad hoc searches should always show current matches and should not
             # contaminate the incremental URL history used by scheduled scans.
@@ -378,7 +444,14 @@ class ScannerService:
             if previously_scanned:
                 self._log(f"Incremental: {len(previously_scanned)} previously scanned URLs loaded")
 
-        all_posts = await self._crawl_pages(sources, pages, base_url, scraper, loop, previously_scanned)
+        # A caller-supplied skip set (e.g. the background pre-cache passes URLs it
+        # already has cached) augments whatever the scan type loaded.
+        if skip_urls:
+            previously_scanned = previously_scanned | set(skip_urls)
+            self._log(f"Skipping {len(skip_urls)} already-cached URL(s)")
+
+        all_posts = await self._crawl_pages(
+            sources, pages, base_url, scraper, loop, previously_scanned, early_stop)
 
         if self.stop_scan_flag:
             return
@@ -394,7 +467,7 @@ class ScannerService:
 
         # Save scanned URLs only after all posts are processed — avoids
         # permanently marking unvisited URLs as "seen" if the scan is stopped.
-        if all_posts and scan_type != "Site Search":
+        if track_urls and all_posts and scan_type != "Site Search":
             urls_to_save = [{'url': p['url'], 'title': None, 'source': p.get('source')} for p in all_posts]
             self.db.add_scanned_urls_batch(urls_to_save)
 
@@ -451,28 +524,31 @@ class ScannerService:
                 "suffix": f"?s={safe_query}",
                 "type": "mixed",
                 "source": "hdencode",
+                # 'search' is not one of the 4K/Remux/TV categories, so the UI's
+                # category toggles never hide explicit search results.
+                "category": "search",
             })
         elif source_type == "HDEncode":
             if flags.get("4k"):
-                sources.append({"name": "4K Movies", "base": f"{base_url}/quality/2160p/", "suffix": "?tag=movies", "type": "movie", "source": "hdencode"})
+                sources.append({"name": "4K Movies", "base": f"{base_url}/quality/2160p/", "suffix": "?tag=movies", "type": "movie", "source": "hdencode", "category": "4k"})
             if flags.get("remux"):
-                sources.append({"name": "Remux Movies", "base": f"{base_url}/quality/remux/", "suffix": "?tag=movies", "type": "movie", "source": "hdencode"})
+                sources.append({"name": "Remux Movies", "base": f"{base_url}/quality/remux/", "suffix": "?tag=movies", "type": "movie", "source": "hdencode", "category": "remux"})
             if flags.get("tv"):
-                sources.append({"name": "TV Packs", "base": f"{base_url}/tag/tv-packs/", "suffix": "", "type": "tv", "source": "hdencode"})
+                sources.append({"name": "TV Packs", "base": f"{base_url}/tag/tv-packs/", "suffix": "", "type": "tv", "source": "hdencode", "category": "tv"})
         elif source_type == "DDLBase":
             if flags.get("4k_webdl"):
-                sources.append({"name": "DDLBase WEB-DL 4K", "base": "https://ddlbase.com/cat/movie-webdl-2160p", "suffix": "", "type": "movie", "source": "ddlbase"})
+                sources.append({"name": "DDLBase WEB-DL 4K", "base": "https://ddlbase.com/cat/movie-webdl-2160p", "suffix": "", "type": "movie", "source": "ddlbase", "category": "4k"})
             if flags.get("4k_remux"):
-                sources.append({"name": "DDLBase Remux 4K", "base": "https://ddlbase.com/cat/movie-remux-2160p", "suffix": "", "type": "movie", "source": "ddlbase"})
+                sources.append({"name": "DDLBase Remux 4K", "base": "https://ddlbase.com/cat/movie-remux-2160p", "suffix": "", "type": "movie", "source": "ddlbase", "category": "remux"})
             if flags.get("1080p_remux"):
-                sources.append({"name": "DDLBase Remux 1080p", "base": "https://ddlbase.com/cat/movie-remux-1080p", "suffix": "", "type": "movie", "source": "ddlbase"})
+                sources.append({"name": "DDLBase Remux 1080p", "base": "https://ddlbase.com/cat/movie-remux-1080p", "suffix": "", "type": "movie", "source": "ddlbase", "category": "remux"})
         elif source_type == "Adit-HD":
             if flags.get("4k"):
-                sources.append({"name": "Adit-HD 4K", "base": "https://adit-hd.com/forums/4k-uhd-movies/", "suffix": "", "type": "movie", "source": "adithd"})
+                sources.append({"name": "Adit-HD 4K", "base": "https://adit-hd.com/forums/4k-uhd-movies/", "suffix": "", "type": "movie", "source": "adithd", "category": "4k"})
             if flags.get("remux"):
-                sources.append({"name": "Adit-HD Remux", "base": "https://adit-hd.com/forums/remux-movies/", "suffix": "", "type": "movie", "source": "adithd"})
+                sources.append({"name": "Adit-HD Remux", "base": "https://adit-hd.com/forums/remux-movies/", "suffix": "", "type": "movie", "source": "adithd", "category": "remux"})
             if flags.get("tv"):
-                sources.append({"name": "Adit-HD TV", "base": "https://adit-hd.com/forums/tv-packs/", "suffix": "", "type": "tv", "source": "adithd"})
+                sources.append({"name": "Adit-HD TV", "base": "https://adit-hd.com/forums/tv-packs/", "suffix": "", "type": "tv", "source": "adithd", "category": "tv"})
 
         return sources
 
@@ -481,6 +557,7 @@ class ScannerService:
     async def _crawl_pages(
         self, sources: List[Dict], pages: int, base_url: str,
         scraper, loop, previously_scanned: Optional[Set[str]] = None,
+        early_stop: bool = False,
     ) -> List[Dict]:
         """Crawl listing pages from all sources and collect post URLs.
 
@@ -508,6 +585,7 @@ class ScannerService:
         skip_urls = previously_scanned or set()
         seen_post_urls: Set[str] = set()  # O(1) dedup instead of O(n) list scan
         skipped_count = 0
+        early_stopped = False
         total_pages = len(sources) * pages
         current_page = 0
 
@@ -520,6 +598,7 @@ class ScannerService:
             source_suffix = source["suffix"]
             source_type_hint = source["type"]
             source_id = source.get("source", "hdencode")
+            source_category = source.get("category", "")
 
             self._log(f"Crawling {source_name}...")
 
@@ -549,6 +628,8 @@ class ScannerService:
                     soup = BeautifulSoup(resp.content, 'html.parser')
                     posts = self._select_posts(soup, source_id)
 
+                    page_posts = 0   # non-empty post URLs found on this page
+                    page_new = 0     # of those, ones not already seen/skipped
                     for post in posts:
                         post_url = post.get('href', '')
                         if post_url.startswith('/'):
@@ -558,12 +639,26 @@ class ScannerService:
                                 post_url = f"https://adit-hd.com{post_url}"
                             else:
                                 post_url = f"{base_url}{post_url}"
-                        if post_url and post_url not in seen_post_urls:
-                            seen_post_urls.add(post_url)
-                            if post_url in skip_urls:
-                                skipped_count += 1
-                                continue
-                            all_posts.append({'url': post_url, 'type': source_type_hint, 'source': source_id})
+                        if not post_url:
+                            continue
+                        page_posts += 1
+                        if post_url in seen_post_urls:
+                            continue
+                        seen_post_urls.add(post_url)
+                        if post_url in skip_urls:
+                            skipped_count += 1
+                            continue
+                        page_new += 1
+                        all_posts.append({'url': post_url, 'type': source_type_hint, 'source': source_id, 'category': source_category})
+
+                    # Early-stop: a populated page that yields no new posts means
+                    # we've reached content already cached/seen — deeper pages are
+                    # older still, so stop crawling this source. Only with a skip
+                    # set in play (otherwise every page looks "all new").
+                    if early_stop and skip_urls and page_posts > 0 and page_new == 0:
+                        self._log(f"{source_name}: reached previously-cached content at page {page_num}, stopping")
+                        early_stopped = True
+                        break
 
                     await asyncio.sleep(0.3)
                 except Exception as e:
@@ -571,6 +666,13 @@ class ScannerService:
 
         if skipped_count:
             self._log(f"Skipped {skipped_count} previously scanned URLs")
+
+        # Expose every listing URL seen this crawl (new + skipped) so callers can
+        # refresh "last seen" on still-listed items without re-scraping them.
+        self._last_crawl_seen_urls = set(seen_post_urls)
+        # A crawl that stopped early never visited deeper pages, so its seen-set
+        # is partial — the caller must not age out items it simply didn't revisit.
+        self._last_crawl_early_stopped = early_stopped
 
         return all_posts
 
@@ -613,6 +715,7 @@ class ScannerService:
                     return None
                 is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'
                 details['source'] = post_source
+                details['category'] = post_info.get('category', '')
                 return {'details': details, 'is_tv': is_tv, 'url': url}
             except Exception as e:
                 logger.debug("Error processing post %s: %s", url, e)
@@ -657,6 +760,42 @@ class ScannerService:
         except (ValueError, TypeError):
             return 0.0
 
+    def _download_status_for(self, url: str, title: str, season: Optional[int],
+                             resolution: str, *, hdr: str = "", dovi: bool = False):
+        """Resolve download-history status + prior_grab for a candidate item.
+
+        Shared by the live scan (``_create_media_item``) and the cache re-match
+        (``rematch_cache``) so both treat 'already grabbed' identically. Returns
+        ``(ScanStatus, prior_grab dict | None)``.
+
+        - The EXACT release you grabbed (matched by URL) → DOWNLOADED.
+        - Another release of the same title that is NOT a quality upgrade over
+          the grab (same-or-worse resolution, no new Dolby Vision) →
+          DOWNLOADED_SIMILAR (you effectively have it), with the grab note.
+        - A genuine upgrade sibling (higher resolution, or gains DV the grab
+          lacked) stays MISSING + note, so it's still surfaced as worth grabbing.
+        """
+        status = ScanStatus.DOWNLOADED if url in self.download_history else ScanStatus.MISSING
+        prior_grab = None
+        normalized = normalize_title(title)
+        if normalized and status == ScanStatus.MISSING:
+            key = f"{normalized}|S{season}" if season is not None else normalized
+            entries = self._downloaded_titles_lookup.get(key)
+            if entries:
+                best = max(entries, key=lambda e: e.get('downloaded_at', ''))
+                prior_grab = {
+                    'resolution': best.get('resolution') or '',
+                    'size': best.get('size') or '',
+                    'downloaded_at': best.get('downloaded_at', ''),
+                    'hdr': best.get('hdr') or '',
+                    'dovi': bool(best.get('dovi')),
+                }
+                ir, gr = _res_rank(resolution), _res_rank(best.get('resolution'))
+                is_upgrade = ir > gr or (ir == gr and bool(dovi) and not bool(best.get('dovi')))
+                if not is_upgrade:
+                    status = ScanStatus.DOWNLOADED_SIMILAR
+        return status, prior_grab
+
     def _create_media_item(self, result: Dict) -> Optional[MediaItem]:
         """Convert a scraped post result into a MediaItem.
 
@@ -679,34 +818,11 @@ class ScannerService:
             details = result['details']
             url = result['url']
 
-            status = ScanStatus.MISSING
-            if url in self.download_history:
-                status = ScanStatus.DOWNLOADED
-
             normalized = normalize_title(details.get('display_title', ''))
             season = details.get('season')
-            prior_grab = None
-
-            if normalized:
-                lookup_key = f"{normalized}|S{season}" if season is not None else normalized
-                if lookup_key in self._downloaded_titles_lookup:
-                    entries = self._downloaded_titles_lookup[lookup_key]
-                    current_res = details.get('res', '')
-                    same_res = [e for e in entries if e.get('resolution', '') == current_res]
-                    diff_res = [e for e in entries if e.get('resolution', '') != current_res]
-
-                    # Same resolution grabbed before (URL may have changed) — mark downloaded
-                    if same_res and status == ScanStatus.MISSING:
-                        status = ScanStatus.DOWNLOADED
-
-                    # Different resolution grabbed — surface as prior_grab without hiding item
-                    if diff_res:
-                        best = max(diff_res, key=lambda e: e.get('downloaded_at', ''))
-                        prior_grab = {
-                            'resolution': best.get('resolution', '?'),
-                            'size': best.get('size', '?'),
-                            'downloaded_at': best.get('downloaded_at', ''),
-                        }
+            status, prior_grab = self._download_status_for(
+                url, details.get('display_title', ''), season, details.get('res', ''),
+                hdr=details.get('hdr', ''), dovi=details.get('dovi', False))
 
             # Compute per-episode size for TV packs
             raw_size = details.get('size', '?')
@@ -753,10 +869,157 @@ class ScannerService:
                 imdb_id=details.get('imdb_id'),
                 description=details.get('description', ''),
                 posted_date=details.get('posted_date'),
+                category=details.get('category', ''),
             )
         except Exception as e:
             self._log(f"Error creating media item: {e}", "warning")
             return None
+
+    # ── Cache re-match (no re-scrape) ─────────────────────────────────
+
+    def _media_item_from_dict(self, d: Dict[str, Any]) -> Optional[MediaItem]:
+        """Reconstruct a MediaItem from a cached result dict (the JSON stored in
+        ``background_scan_cache``) so it can be re-matched without re-scraping."""
+        try:
+            try:
+                status = ScanStatus(d.get('status', 'missing'))
+            except ValueError:
+                status = ScanStatus.MISSING
+            return MediaItem(
+                id=str(d.get('id', '') or ''),
+                title=d.get('title', '') or '',
+                year=d.get('year', 0) or 0,
+                season=d.get('season'),
+                episodes=d.get('episodes'),
+                rating=d.get('rating', 0.0) or 0.0,
+                rt_score=d.get('rt_score'),
+                status=status,
+                status_text=d.get('status_text', '') or '',
+                color=d.get('color', '') or '',
+                resolution=d.get('resolution', '') or '',
+                size=d.get('size', '') or '',
+                hdr=d.get('hdr', '') or '',
+                dovi=bool(d.get('dovi', False)),
+                genres=d.get('genres', []) or [],
+                language=d.get('language', '') or '',
+                url=d.get('url', '') or '',
+                plex_info=d.get('plex_info', '-') or '-',
+                plex_versions=d.get('plex_versions', '[]') or '[]',
+                plex_rating_key=d.get('plex_rating_key'),
+                poster_path=d.get('poster_path'),
+                imdb_id=d.get('imdb_id'),
+                description=d.get('description', '') or '',
+                posted_date=d.get('posted_date'),
+                web_data=d.get('web_data', {}) or {},
+                group_key=d.get('group_key', '') or '',
+                prior_grab=d.get('prior_grab'),
+                category=d.get('category', '') or '',
+            )
+        except Exception:
+            return None
+
+    def rematch_cache(self) -> int:
+        """Re-evaluate every cached item's library/download status against the
+        CURRENT Plex index and download history, WITHOUT re-scraping.
+
+        Cheap and in-memory — the expensive part (scraping detail pages) is
+        skipped; this only re-runs matching. Only rows whose status/info actually
+        changed are written, and ``last_seen`` is left untouched so retention is
+        unaffected. Call while the Plex index is loaded (e.g. right after a
+        background scan). Returns the number of rows updated."""
+        if self.db is None:
+            return 0
+        rows = self.db.get_background_cache(limit=1_000_000)
+        if not rows:
+            return 0
+
+        # Fresh download history so Downloaded/Grabbed reflect recent grabs.
+        self.download_history = self._load_download_history()
+        self.matching.app.download_history = self.download_history
+
+        # When no Plex index is loaded this run (transient outage / empty load),
+        # the matcher can't restore IN_LIBRARY, so we must NOT clear each item's
+        # cached Plex match or downgrade owned titles to Missing. Download history
+        # may still upgrade a row (Missing -> Downloaded); that path is preserved.
+        have_plex = bool(self.plex and self.plex.plex_index.get("all_items"))
+        library_states = (ScanStatus.IN_LIBRARY, ScanStatus.UPGRADE, ScanStatus.DV_UPGRADE)
+
+        items: List[MediaItem] = []
+        data_by_url: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            try:
+                d = json.loads(row.get('data') or '{}')
+            except Exception:
+                continue
+            item = self._media_item_from_dict(d)
+            if item is None or not item.url:
+                continue
+            # Re-apply download-history status + prior_grab.
+            dl_status, item.prior_grab = self._download_status_for(
+                item.url, item.title, item.season, item.resolution,
+                hdr=item.hdr, dovi=item.dovi)
+            if have_plex:
+                # Reset to download status + clear Plex info; the match below
+                # re-applies IN_LIBRARY/UPGRADE for still-owned items.
+                item.status = dl_status
+                item.status_text = STATUS_TEXTS.get(item.status, item.status_text)
+                item.color = STATUS_COLORS.get(item.status, item.color)
+                item.plex_info = "-"
+                item.plex_versions = "[]"
+            elif (dl_status in (ScanStatus.DOWNLOADED, ScanStatus.DOWNLOADED_SIMILAR)
+                  and item.status not in library_states):
+                # No Plex this run: let a real download UPGRADE the row, but never
+                # downgrade a cached IN_LIBRARY/UPGRADE to Missing.
+                item.status = dl_status
+                item.status_text = STATUS_TEXTS.get(item.status, item.status_text)
+                item.color = STATUS_COLORS.get(item.status, item.color)
+            # else (no Plex, no fresh download): keep cached status + Plex info.
+            items.append(item)
+            data_by_url[item.url] = d
+
+        if not items:
+            return 0
+
+        # Run the same Plex matcher over the reconstructed items.
+        with self._items_lock:
+            saved_items = self.items
+            self.items = items
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(self._match_against_plex("Deep Scan"))
+            finally:
+                loop.close()
+        except Exception:
+            logger.exception("Cache re-match: Plex matching failed")
+        finally:
+            with self._items_lock:
+                self.items = saved_items
+
+        # Persist only rows whose status/info changed (preserve last_seen).
+        updates = []
+        for item in items:
+            d = data_by_url.get(item.url)
+            if d is None:
+                continue
+            new_status = item.status.value if isinstance(item.status, ScanStatus) else str(item.status)
+            if (d.get('status') != new_status
+                    or d.get('plex_info', '-') != item.plex_info
+                    or d.get('plex_versions', '[]') != item.plex_versions
+                    or d.get('prior_grab') != item.prior_grab):
+                d['status'] = new_status
+                d['status_text'] = item.status_text
+                d['color'] = item.color
+                d['plex_info'] = item.plex_info
+                d['plex_versions'] = item.plex_versions
+                d['prior_grab'] = item.prior_grab
+                updates.append({'url': item.url, 'status': new_status,
+                                'data': json.dumps(d, default=str)})
+
+        if updates:
+            self.db.update_background_status(updates)
+        logger.info("Cache re-match: %d of %d cached item(s) updated", len(updates), len(items))
+        return len(updates)
 
     # ── Plex matching ─────────────────────────────────────────────────
 
@@ -1095,7 +1358,7 @@ class ScannerService:
                 # Done in the same transaction to get a consistent snapshot.
                 self._downloaded_titles_lookup.clear()
                 title_rows = conn.execute(
-                    "SELECT normalized_title, season, resolution, size, url, date_added "
+                    "SELECT normalized_title, season, resolution, size, url, date_added, hdr, dovi "
                     "FROM downloads WHERE normalized_title IS NOT NULL "
                     "AND COALESCE(status, 'completed') != 'failed'"
                 ).fetchall()
@@ -1103,14 +1366,16 @@ class ScannerService:
             for row in title_rows:
                 norm_title = row[0]
                 season = row[1]
-                resolution = row[2] or '?'
-                size = row[3] or '?'
+                resolution = row[2] or ''
+                size = row[3] or ''
                 key = f"{norm_title}|S{season}" if season is not None else norm_title
                 self._downloaded_titles_lookup.setdefault(key, []).append({
                     'resolution': resolution,
                     'size': size,
                     'url': row[4] if len(row) > 4 else '',
                     'downloaded_at': row[5] if len(row) > 5 else '',
+                    'hdr': row[6] if len(row) > 6 else '',
+                    'dovi': bool(row[7]) if len(row) > 7 else False,
                 })
 
             return urls

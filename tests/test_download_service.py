@@ -183,6 +183,7 @@ class TestSaveToHistory:
             url="http://a.com", title="Test Movie",
             normalized_title="test movie", season=None,
             resolution="4K", size="50 GB", status="completed",
+            hdr=None, dovi=False,
         )
         assert "http://a.com" in svc.download_history
         assert "test movie" in svc._downloaded_titles_lookup

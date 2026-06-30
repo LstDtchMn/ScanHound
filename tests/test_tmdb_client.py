@@ -552,6 +552,40 @@ class TestExternalIds:
         assert result is None
 
 
+class TestCredits:
+    """Tests for TmdbClient.credits method."""
+
+    def _make_client(self):
+        return TmdbClient(api_key="key", rate_limit=0.0, max_retries=0)
+
+    @patch("backend.tmdb_client.time.sleep")
+    @patch("backend.tmdb_client.requests.get")
+    def test_movie_credits(self, mock_get, mock_sleep):
+        client = self._make_client()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "cast": [{"name": "Adam Sandler"}],
+            "crew": [{"name": "Peter Segal", "job": "Director"}]}
+        mock_get.return_value = mock_resp
+
+        result = client.credits(550)
+        assert result["cast"][0]["name"] == "Adam Sandler"
+        assert "/movie/550/credits" in mock_get.call_args[0][0]
+
+    @patch("backend.tmdb_client.time.sleep")
+    @patch("backend.tmdb_client.requests.get")
+    def test_tv_credits_url(self, mock_get, mock_sleep):
+        client = self._make_client()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"cast": [], "crew": []}
+        mock_get.return_value = mock_resp
+
+        client.credits(1399, media_type="tv")
+        assert "/tv/1399/credits" in mock_get.call_args[0][0]
+
+
 # ======================================================================
 # 7. Public API - season
 # ======================================================================

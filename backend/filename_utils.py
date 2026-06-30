@@ -19,18 +19,35 @@ from typing import Optional
 
 from backend.models import FilenameResult
 
-# Common torrent/release tags to strip from parsed titles
+# Common torrent/release tags to strip from parsed titles. Case-insensitive.
+# Internal separators use [\s.\-] so a tag matches whether the filename used a
+# dot, a hyphen, or (after delimiter normalization) a space — e.g. "WEB-DL",
+# "WEB.DL", "WEB DL" all match. Ambiguous short tokens that are also common
+# title words (MA, DC, SE, MAX, CAM, TS, RED, REAL, COMPLETE, LIMITED) are
+# deliberately omitted so we don't clip real titles like "Mad Max" or "Cam".
 TAGS_RE = re.compile(
     r'\b('
-    r'REMUX|BluRay|Blu[\.\-]?Ray|BDRemux|BDRip|BRRip|'
-    r'WEB[\.\-]?DL|WEB[\.\-]?Rip|WEBRip|WEBDL|AMZN|DSNP|HMAX|NF|ATVP|'
-    r'HDTV|DVDRip|HDRip|'
-    r'HEVC|x265|x264|AVC|H[\.\s]?264|H[\.\s]?265|'
-    r'AAC|DTS[\.\-]?HD|DTS[\.\-]?X|DTS|Atmos|TrueHD|FLAC|AC3|EAC3|DD5[\.\s]?1|'
-    r'DV|DoVi|Dolby[\.\s]?Vision|HDR10Plus|HDR10|HDR|SDR|'
-    r'IMAX|REPACK|PROPER|EXTENDED|UNRATED|DIRECTORS[\.\s]?CUT|'
+    # Source / rip
+    r'REMUX|BluRay|Blu[\s.\-]?Ray|BDRemux|BDRip|BRRip|BD(?:25|50|66|100)|'
+    r'WEB[\s.\-]?DL|WEB[\s.\-]?Rip|WEBRip|WEBDL|HDTV|PDTV|DVDRip|DVDSCR|DVD[59]?|'
+    r'HDRip|UHDRip|HDTC|HDCAM|SATRip|WORKPRINT|SCREENER|'
+    # Platforms / services
+    r'AMZN|DSNP|HMAX|NF|ATVP|HULU|PCOK|PMTP|STAN|MUBI|CRAV|ROKU|TUBI|FREEVEE|STARZ|GPLAY|'
+    # Video codec / bit depth
+    r'HEVC|x265|x264|AVC|H[\s.]?264|H[\s.]?265|XviD|DivX|AV1|VP9|MPEG[\s.\-]?2|VC[\s.\-]?1|'
+    r'8bit|10bit|12bit|'
+    # Audio (incl. glued channel suffixes like DDP5.1)
+    r'AAC|DTS[\s.\-]?HD(?:[\s.\-]?MA)?|DTS[\s.\-]?X|DTS|Atmos|TrueHD|FLAC|AC3|EAC3|'
+    r'DDP?[\s.]?\d?(?:[\s.]?\d)?|Opus|LPCM|PCM|'
+    # HDR / color
+    r'DV|DoVi|Dolby[\s.\-]?Vision|HDR10\+?|HDR10Plus|HDR|SDR|HLG|WCG|'
+    # Editions
+    r'IMAX|Hybrid|REMASTERED|RESTORED|EXTENDED|UNRATED|UNCUT|REDUX|THEATRICAL|'
+    r'DIRECTORS?[\s.\-]?CUT|FINAL[\s.\-]?CUT|OPEN[\s.\-]?MATTE|CRITERION|ANNIVERSARY|'
+    r'REPACK|PROPER|RERIP|READNFO|'
+    # Language
     r'MULTI|DL|DUAL|GERMAN|FRENCH|ITALIAN|SPANISH|'
-    r'10bit|UHD'
+    r'UHD'
     r')\b',
     re.IGNORECASE
 )
@@ -48,6 +65,29 @@ EPISODE_BOUNDARY_RE = re.compile(
     r'AMZN|DSNP|HMAX|NF|ATVP|IMAX)',
     re.IGNORECASE
 )
+
+
+def _clean_title(raw: str) -> str:
+    """Turn a raw title fragment into a clean search title: drop bracketed
+    content and a trailing release-group tag, normalize ._- to spaces, strip
+    known release tags, and collapse whitespace."""
+    s = re.sub(r'\[.*?\]', '', raw or '')
+    s = re.sub(r'\(.*?\)', '', s)
+    s = re.sub(r'\{.*?\}', '', s)             # {imdb-tt…}, {edition-…} etc.
+    s = re.sub(r'[-_][A-Za-z0-9]+$', '', s)   # trailing -GROUP / _GROUP
+    s = re.sub(r'[\.\-_]', ' ', s)
+    s = re.sub(r'\btt\d{7,8}\b', ' ', s, flags=re.IGNORECASE)  # bare imdb id
+    s = re.sub(r'\s+', ' ', s).strip()
+    # Strip release tags from everything AFTER the first word, never the first
+    # word itself — a real title's leading word can legitimately equal a tag
+    # (Stan, Opus, Hybrid, Dual, …). Stripping the whole string deletes such
+    # titles outright; protecting the head keeps them while still removing
+    # mid/trailing junk (MULTI, WEB-DL, DDP5.1, …).
+    parts = s.split(' ', 1)
+    if len(parts) == 2:
+        s = (parts[0] + ' ' + TAGS_RE.sub(' ', parts[1])).strip()
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
 
 
 def parse_filename(filename) -> FilenameResult:
@@ -83,8 +123,15 @@ def parse_filename(filename) -> FilenameResult:
     result = {
         "title": "", "year": None, "season": None,
         "episode": None, "episode_end": None, "resolution": None, "is_tv": False,
-        "part": None,
+        "part": None, "imdb_id": None,
     }
+
+    # IMDB id embedded by some renamers/groups: {imdb-tt1234567}, [tt1234567],
+    # or a bare tt-token. When present it's an exact, fuzzy-free resolve, so the
+    # matcher tries it first. \b bounds prevent matching inside longer alnum runs.
+    imdb_match = re.search(r'\b(tt\d{7,8})\b', name, re.IGNORECASE)
+    if imdb_match:
+        result["imdb_id"] = imdb_match.group(1).lower()
 
     # 1. Season / episode
     se_match = re.search(r'[.\s\-_]S(\d{1,2})E(\d{1,3})', name, re.IGNORECASE)
@@ -127,29 +174,36 @@ def parse_filename(filename) -> FilenameResult:
         if rpos > 0:
             title_part = title_part[:rpos]
 
-    # 3. Year
-    year_match = re.search(r'[.\s\(\-]((?:19|20)\d{2})[.\s\)\-]', title_part)
+    # 3. Year — delimiter classes include '_' so underscore-delimited scene
+    #    releases (e.g. Smallfoot_2018_...) extract the year (and the truncation
+    #    below then strips it and any trailing junk out of the title).
+    year_match = re.search(r'[._\s\(\-]((?:19|20)\d{2})[._\s\)\-]', title_part)
     if not year_match:
-        year_match = re.search(r'[.\s\(\-]((?:19|20)\d{2})$', title_part)
+        year_match = re.search(r'[._\s\(\-]((?:19|20)\d{2})$', title_part)
     if year_match:
         result["year"] = int(year_match.group(1))
         ypos = title_part.find(year_match.group(0))
         if ypos > 0:
             title_part = title_part[:ypos]
 
-    # 4. Clean title
-    title = title_part
-    title = re.sub(r'[\.\-_]', ' ', title)
-    title = re.sub(r'\[.*?\]', '', title)
-    title = re.sub(r'\(.*?\)', '', title)
-    title = TAGS_RE.sub('', title)
-    title = re.sub(r'-\w+$', '', title)  # trailing -GROUP tag
-    title = re.sub(r'\s+', ' ', title).strip()
-    result["title"] = title
+    # 3b. a.k.a. / alternate title — split so each side can be searched on its
+    #     own (e.g. "Ohikkoshi a.k.a. Moving" → title "Ohikkoshi", aka "Moving").
+    result["aka"] = None
+    aka_split = re.split(r'[._\s\-]+a\.?k\.?a\.?[._\s\-]+', title_part, maxsplit=1,
+                         flags=re.IGNORECASE)
+    if len(aka_split) == 2:
+        title_part = aka_split[0]
+        aka_clean = _clean_title(aka_split[1])
+        if aka_clean:
+            result["aka"] = aka_clean
 
-    # Part indicator: Part1, Part 2, Pt1, Pt.2
+    # 4. Clean title
+    result["title"] = _clean_title(title_part)
+
+    # Part indicator: Part1, Part 2, Pt1, Pt.2, Part 10, … (1-2 digits so a
+    # double-digit part isn't truncated to its leading digit and collided).
     part_match = re.search(
-        r'[.\s\-_](?:Part|Pt)[\s.\-]?(\d)', name, re.IGNORECASE)
+        r'[.\s\-_](?:Part|Pt)[\s.\-]?(\d{1,2})', name, re.IGNORECASE)
     if part_match:
         result["part"] = int(part_match.group(1))
 

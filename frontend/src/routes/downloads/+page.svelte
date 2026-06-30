@@ -214,9 +214,10 @@
     const items = keys
       .map((key) => {
         const result = $results.find((r) => r.url === key);
-        return result ? { url: result.url ?? '', title: result.title ?? key, year: result.year ?? null } : null;
+        return result ? { url: result.url ?? '', title: result.title ?? key, year: result.year ?? null,
+          resolution: result.resolution ?? '', size: result.size ?? '', hdr: result.hdr ?? '', dovi: result.dovi ?? false } : null;
       })
-      .filter((item): item is { url: string; title: string; year: number | null } => item !== null);
+      .filter((item): item is { url: string; title: string; year: number | null; resolution: string; size: string; hdr: string; dovi: boolean } => item !== null);
     if (items.length === 0) {
       addToast('Error', 'Could not resolve selected items.', 'error');
       return;

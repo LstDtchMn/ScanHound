@@ -1440,6 +1440,7 @@ class TestScheduler:
         """POST /scheduler/trigger returns 409 when scan is already running."""
         from backend.api.routes.scanner import _scan_state, _scan_lock
         mock_scanner = MagicMock()
+        mock_scanner.scan_in_progress = False  # 409 must come from the running-state check
         registry._scanner_service = mock_scanner
         with _scan_lock:
             _scan_state["state"] = "running"
@@ -1451,6 +1452,7 @@ class TestScheduler:
         from backend.api.routes.scanner import _run_scan, ScanRequest
         mock_scanner = MagicMock()
         mock_scanner.is_scanning = False
+        mock_scanner.scan_in_progress = False
         registry._scanner_service = mock_scanner
         with patch("backend.api.routes.scheduler.threading.Thread") as mock_thread:
             mock_thread.return_value.start = MagicMock()

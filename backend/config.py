@@ -373,7 +373,7 @@ _DEFAULT_CONFIG: AppConfig = {
     "year_tolerance": 1,
     "base_url": "https://hdencode.org",
     "scheduler_only_when_idle": False,
-    "tile_columns": 5,
+    "tile_columns": 0,  # 0 = responsive auto-fill (sized by per-device tile size)
     "theme_mode": "dark",
     "enable_system_tray": False,
     "minimize_to_tray": False,

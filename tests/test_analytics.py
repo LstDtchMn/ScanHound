@@ -378,3 +378,83 @@ class TestGetAnalyticsSingleton:
         # The autouse fixture resets _analytics to None, so this should succeed
         instance = get_analytics(db_path=empty_db)
         assert instance is not None
+
+
+# ── Rename stats ─────────────────────────────────────────────────────
+
+@pytest.fixture
+def rename_db(empty_db):
+    """Add a rename_jobs table with sample applied/needs_review/failed rows."""
+    conn = sqlite3.connect(empty_db)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rename_jobs (
+            id INTEGER PRIMARY KEY, package_name TEXT, original_path TEXT,
+            status TEXT, destination_path TEXT, move_method TEXT
+        )
+    """)
+    conn.executemany(
+        "INSERT INTO rename_jobs (package_name, original_path, status, destination_path, move_method) "
+        "VALUES (?,?,?,?,?)",
+        [
+            ("p1", "/dl/a.mkv", "applied", "/lib/Movies/A (2020)/A.mkv", "move"),
+            ("p2", "/dl/b.mkv", "applied", "/lib/Movies/B (2021)/B.mkv", "move"),
+            ("p3", "/dl/c.mkv", "applied", "/lib/TV/Show/Season 01/c.mkv", "hardlink"),
+            ("p4", "/dl/d.mkv", "needs_review", None, "move"),
+            ("p5", "/dl/e.mkv", "failed", None, "move"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    return empty_db
+
+
+class TestRenameStats:
+    def test_counts_and_directory_buckets(self, rename_db):
+        sd = StatsDashboard(db_path=rename_db)
+        stats = sd.get_rename_stats({"Movies": "/lib/Movies", "TV": "/lib/TV"})
+        assert stats["applied"] == 3
+        assert stats["total_jobs"] == 5
+        assert stats["by_status"] == {"applied": 3, "needs_review": 1, "failed": 1}
+        assert stats["by_directory"] == {"Movies": 2, "TV": 1}
+        assert stats["by_method"] == {"move": 2, "hardlink": 1}
+
+    def test_fallback_bucket_without_roots(self, rename_db):
+        sd = StatsDashboard(db_path=rename_db)
+        stats = sd.get_rename_stats()  # no configured roots
+        # Falls back to the parent directory name of each destination.
+        assert stats["applied"] == 3
+        assert sum(stats["by_directory"].values()) == 3
+
+    def test_empty_when_no_jobs(self, empty_db):
+        conn = sqlite3.connect(empty_db)
+        conn.execute("CREATE TABLE rename_jobs (id INTEGER PRIMARY KEY, status TEXT, "
+                     "destination_path TEXT, move_method TEXT)")
+        conn.commit(); conn.close()
+        sd = StatsDashboard(db_path=empty_db)
+        stats = sd.get_rename_stats()
+        assert stats["applied"] == 0 and stats["total_jobs"] == 0
+        assert stats["by_directory"] == {}
+
+
+# ── Rename destination bucketing: 4K prefix collision (review fix #4) ─
+
+class TestBucketDestination:
+    _roots = {"Movies": "/library/movies", "Movies (4K)": "/library/movies-4k",
+              "TV": "/library/tv"}
+
+    def test_4k_not_swallowed_by_movies(self):
+        assert StatsDashboard._bucket_destination(
+            "/library/movies-4k/Film (2024)/f.mkv", self._roots) == "Movies (4K)"
+
+    def test_plain_movies_still_buckets(self):
+        assert StatsDashboard._bucket_destination(
+            "/library/movies/Film (2024)/f.mkv", self._roots) == "Movies"
+
+    def test_order_independent_longest_prefix(self):
+        rev = {"Movies (4K)": "/library/movies-4k", "Movies": "/library/movies"}
+        assert StatsDashboard._bucket_destination(
+            "/library/movies-4k/x.mkv", rev) == "Movies (4K)"
+
+    def test_path_boundary_no_partial_prefix(self):
+        assert StatsDashboard._bucket_destination(
+            "/library/movies2/x.mkv", {"Movies": "/library/movies"}) != "Movies"

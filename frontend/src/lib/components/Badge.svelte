@@ -1,5 +1,5 @@
 <script lang="ts" module>
-  export type BadgeVariant = 'default' | 'success' | 'warning' | 'error' | 'accent' | 'info';
+  export type BadgeVariant = 'default' | 'success' | 'warning' | 'error' | 'accent' | 'info' | 'orange';
 </script>
 
 <script lang="ts">
@@ -15,7 +15,8 @@
     warning: 'bg-[color-mix(in_srgb,var(--warning)_20%,var(--bg-secondary))] text-[var(--warning)]',
     error: 'bg-[color-mix(in_srgb,var(--error)_20%,var(--bg-secondary))] text-[var(--error)]',
     accent: 'bg-[color-mix(in_srgb,var(--accent)_20%,var(--bg-secondary))] text-[var(--accent)]',
-    info: 'bg-blue-500/20 text-blue-400'
+    info: 'bg-blue-500/20 text-blue-400',
+    orange: 'bg-[color-mix(in_srgb,#f97316_20%,var(--bg-secondary))] text-[#f97316]'
   };
 </script>
 

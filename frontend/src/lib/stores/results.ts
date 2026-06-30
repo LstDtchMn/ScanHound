@@ -63,16 +63,48 @@ export const sortBy = persisted<SortOption>('sh-sort-by', 'posted-desc');
 export type Density = 'comfortable' | 'compact';
 export const density = persisted<Density>('sh-density', 'comfortable');
 
-export interface VisibleColumns { rating: boolean; res: boolean; size: boolean; status: boolean; }
-export const visibleColumns = persisted<VisibleColumns>('sh-columns', {
-  rating: true, res: true, size: true, status: true,
-});
+// ── Grid/tile view display options (device-local, instant) ───────────
+export type TileSize = 'sm' | 'md' | 'lg';
+/** Card min-width for the responsive auto-fill grid (ignored when a fixed
+ *  column count is set in Settings). */
+export const tileSize = persisted<TileSize>('sh-tile-size', 'md');
+/** Min-width in px per tile size — fed into grid-template-columns minmax(). */
+export const TILE_MIN_PX: Record<TileSize, number> = { sm: 120, md: 160, lg: 220 };
+
+export type PosterAspect = '2/3' | '16/9' | '1/1';
+export const posterAspect = persisted<PosterAspect>('sh-poster-aspect', '2/3');
+/** Tailwind aspect class for each poster aspect. */
+export const POSTER_ASPECT_CLASS: Record<PosterAspect, string> = {
+  '2/3': 'aspect-[2/3]', '16/9': 'aspect-video', '1/1': 'aspect-square'
+};
+
+/** Show the title/meta block beneath the poster, or render poster-only cards. */
+export const tileShowMeta = persisted<boolean>('sh-tile-show-meta', true);
+
+export type GridGap = 'tight' | 'normal' | 'roomy';
+export const gridGap = persisted<GridGap>('sh-grid-gap', 'normal');
+export const GRID_GAP_CLASS: Record<GridGap, string> = {
+  tight: 'gap-2', normal: 'gap-4', roomy: 'gap-6'
+};
+
+/** Column count for the grid. 'auto' = responsive auto-fill sized by tile size;
+ *  a number = that many fixed equal columns. Device-local + instant; takes
+ *  precedence over the (server-wide) tile_columns setting. */
+export type GridColumns = 'auto' | number;
+export const gridColumns = persisted<GridColumns>('sh-grid-columns', 'auto');
+export const GRID_COLUMN_CHOICES: GridColumns[] = ['auto', 2, 3, 4, 5, 6, 8];
+
 
 /** Active quick-filter chips: any of '4k' | 'hdrdv' | 'inplex'. */
 export const quickFilters = persisted<string[]>('sh-quick-filters', []);
 export function toggleQuickFilter(key: string) {
   quickFilters.update((q) => (q.includes(key) ? q.filter((k) => k !== key) : [...q, key]));
 }
+
+/** Source categories ('4k' | 'remux' | 'tv') currently shown in the list — driven
+ *  by the ScanControls 4K/Remux/TV toggles so they filter the (pre-cached) results
+ *  instantly. Items with an unknown/empty category always show. */
+export const categoryFilter = persisted<string[]>('sh-category-filter', ['4k']);
 
 export const selectedKeys = writable<Set<string>>(new Set());
 
@@ -178,12 +210,28 @@ function hasPlexCopy(i: ScanResult): boolean {
 }
 
 export const filteredResults = derived(
-  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls],
-  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed]) => {
+  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls, categoryFilter],
+  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed, $category]) => {
     let items = $results;
     // Hide swiped-away ("skip") items everywhere they'd otherwise appear.
     if ($dismissed.size > 0) {
       items = items.filter((i) => !i.url || !$dismissed.has(i.url));
+    }
+    // Source-category toggles (4K/Remux/TV). The backend tags each item with its
+    // crawl category; for items predating that (legacy cache, site search) we
+    // infer one — TV packs carry a season, everything else is treated as 4K
+    // (the old cache only held 4K movies). An item shows only when its category
+    // is enabled.
+    {
+      const known = new Set(['4k', 'remux', 'tv']);
+      const enabled = new Set($category);
+      const effCategory = (i: ScanResult) => i.category || (i.season != null ? 'tv' : '4k');
+      // Known categories obey the toggles; anything else (e.g. explicit Site
+      // Search results tagged 'search') always shows.
+      items = items.filter((i) => {
+        const c = effCategory(i);
+        return !known.has(c) || enabled.has(c);
+      });
     }
     if ($filter !== 'all') {
       items = items.filter(
@@ -360,6 +408,32 @@ export function markDownloaded(urls: Array<string | undefined | null>) {
       library: Math.max(0, st.library + libraryDelta)
     }));
   }
+}
+
+/** After a grab, optimistically tag the OTHER releases in the same group with a
+ *  "grabbed similar" note showing the grabbed specs — so siblings update the
+ *  instant the grab lands, before the backend cache re-match persists it. The
+ *  exact release stays Downloaded (markDownloaded handles that). */
+export function markGrabbedSiblings(grabbedUrl: string | undefined | null) {
+  if (!grabbedUrl) return;
+  results.update((items) => {
+    const grabbed = items.find((i) => i.url === grabbedUrl);
+    if (!grabbed || !grabbed.group_key) return items;
+    const note = {
+      resolution: grabbed.resolution || '',
+      size: grabbed.size || '',
+      downloaded_at: new Date().toISOString(),
+      hdr: grabbed.hdr || '',
+      dovi: grabbed.dovi ?? false
+    };
+    return items.map((it) =>
+      it.group_key === grabbed.group_key &&
+      it.url !== grabbedUrl &&
+      (it.status || '').toLowerCase().includes('missing')
+        ? { ...it, prior_grab: note }
+        : it
+    );
+  });
 }
 
 export function toggleSelect(groupKey: string) {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import Badge from './Badge.svelte';
-  import { toggleSelect, selectedKeys, selectedDetail, markDownloaded } from '$lib/stores/results';
+  import { toggleSelect, selectedKeys, selectedDetail, markDownloaded, posterAspect, POSTER_ASPECT_CLASS, tileShowMeta } from '$lib/stores/results';
   import { settings } from '$lib/stores/settings';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -68,7 +68,10 @@
   function handleDownload(e: Event) {
     e.stopPropagation();
     if (item.url) {
-      api.download(item.url, item.title, effectiveHost, item.year).catch(() => addToast('Error', 'Download failed', 'error'));
+      // Include release specs so a later "already grabbed" chip isn't blank.
+      api.download(item.url, item.title, effectiveHost, item.year,
+                   item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false)
+        .catch(() => addToast('Error', 'Download failed', 'error'));
     }
   }
 
@@ -121,7 +124,7 @@
 
 <div
   transition:fly={{ y: 10, duration: 200 }}
-  class="bg-[var(--bg-secondary)] rounded-lg overflow-hidden border transition-colors cursor-pointer group
+  class="min-w-0 bg-[var(--bg-secondary)] rounded-lg overflow-hidden border transition-colors cursor-pointer group
     {selected ? 'border-[var(--accent)]' : 'border-[var(--border)] hover:border-[var(--text-secondary)]'}
     {focused ? 'ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg-primary)]' : ''}"
   onclick={() => selectedDetail.set(item)}
@@ -129,7 +132,7 @@
   tabindex="0"
   onkeydown={(e) => e.key === 'Enter' && selectedDetail.set(item)}
 >
-  <div class="aspect-[2/3] bg-[var(--bg-tertiary)] relative overflow-hidden">
+  <div class="{POSTER_ASPECT_CLASS[$posterAspect]} bg-[var(--bg-tertiary)] relative overflow-hidden">
     {#if item.poster_url}
       <img
         src={item.poster_url}
@@ -185,7 +188,8 @@
     />
   </div>
 
-  <!-- Info section -->
+  <!-- Info section (hidden in poster-only mode; overlays stay on the poster) -->
+  {#if $tileShowMeta}
   <div class="p-2">
     <!-- Title + year + resolution on one line -->
     <p class="text-sm font-semibold truncate" title={item.title}>
@@ -294,4 +298,5 @@
       {/if}
     </div>
   </div>
+  {/if}
 </div>

@@ -233,3 +233,85 @@ class TestMultiEpisodeParsing:
         assert r.get("episode_end") is None
         assert r.get("part") is None
         assert r["is_tv"] is False
+
+
+# ── Regression: underscore-delimited scene releases (real failures) ──
+
+class TestUnderscoreSceneReleases:
+    def test_smallfoot_year_and_junk_stripped(self):
+        p = parse_filename(
+            "Smallfoot_2018_Hybrid_2160p_MA_WEB-DL_DoVi_HDR_H.265_DTS-HD_MA_5.1.mkv")
+        assert p["title"] == "Smallfoot"
+        assert p["year"] == 2018
+        assert p["resolution"] == "2160p"
+
+    def test_kombucha_year_extracted(self):
+        p = parse_filename("Kombucha_2025_2160p_WEB-DL_HDR10__H.265_DTS-HD_MA_5.1.mkv")
+        assert p["title"] == "Kombucha"
+        assert p["year"] == 2025
+
+    def test_ohikkoshi_aka_split(self):
+        p = parse_filename(
+            "Ohikkoshi_a.k.a._Moving_1993_2160p_MUBI_WEB-DL_AAC2.0_H.265-JBD.mkv")
+        assert p["title"] == "Ohikkoshi"
+        assert p["aka"] == "Moving"
+        assert p["year"] == 1993
+
+    def test_dot_delimited_still_works(self):
+        p = parse_filename("The.Matrix.1999.1080p.BluRay.x265-GROUP.mkv")
+        assert p["title"] == "The Matrix"
+        assert p["year"] == 1999
+        assert p.get("aka") is None
+
+
+# ── Embedded IMDB id ─────────────────────────────────────────────────
+
+class TestImdbId:
+    def test_braced_imdb_id_stripped_from_title(self):
+        p = parse_filename("The Matrix (1999) {imdb-tt0133093} 1080p BluRay.mkv")
+        assert p["imdb_id"] == "tt0133093"
+        assert p["title"] == "The Matrix"
+
+    def test_bracketed_imdb_id(self):
+        p = parse_filename("Inception.2010.1080p.[tt1375666].mkv")
+        assert p["imdb_id"] == "tt1375666"
+
+    def test_8digit_imdb_id(self):
+        p = parse_filename("Some.Show.S01E01.{imdb-tt12345678}.mkv")
+        assert p["imdb_id"] == "tt12345678"
+
+    def test_no_imdb_id(self):
+        p = parse_filename("The.Matrix.1999.1080p.BluRay.x265-GROUP.mkv")
+        assert p.get("imdb_id") is None
+
+
+# ── Leading title word must survive tag stripping (review fix #3) ─────
+
+class TestLeadingTitleWordPreserved:
+    def test_platform_word_leading_title(self):
+        assert parse_filename("Stan.And.Ollie.2018.1080p.WEB-DL.mkv")["title"] == "Stan And Ollie"
+
+    def test_single_tag_word_title(self):
+        assert parse_filename("Opus.2025.2160p.WEB-DL.mkv")["title"] == "Opus"
+        assert parse_filename("Hybrid.2007.1080p.BluRay.mkv")["title"] == "Hybrid"
+        assert parse_filename("Dual.2022.1080p.mkv")["title"] == "Dual"
+
+    def test_mid_title_junk_still_stripped(self):
+        assert parse_filename("Some.Movie.MULTI.2020.1080p.mkv")["title"] == "Some Movie"
+
+    def test_trailing_junk_after_year_unaffected(self):
+        assert parse_filename("Smallfoot.2018.Hybrid.2160p.WEB-DL.mkv")["title"] == "Smallfoot"
+
+
+# ── Minor review fixes: multi-digit Part, bare tt-id leak ────────────
+
+class TestMinorParsingFixes:
+    def test_multi_digit_part(self):
+        assert parse_filename("Concert.2020.Part.10.1080p.mkv")["part"] == 10
+        assert parse_filename("Movie.2020.Part.2.1080p.mkv")["part"] == 2
+
+    def test_bare_tt_id_stripped_from_title(self):
+        p = parse_filename("Scott.Pilgrim.tt0446029.2010.1080p.mkv")
+        assert p["imdb_id"] == "tt0446029"
+        assert "tt0446029" not in p["title"]
+        assert p["title"] == "Scott Pilgrim"

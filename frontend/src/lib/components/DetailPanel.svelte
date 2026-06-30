@@ -35,10 +35,17 @@
     if (e.key === 'Escape') onclose();
   }
 
-  async function handleDownload(url: string, title: string, year?: number | null) {
+  async function handleDownload(
+    url: string, title: string, year?: number | null,
+    meta?: { resolution?: string; size?: string; hdr?: string; dovi?: boolean }
+  ) {
     const id = downloadQueue.add(title);
     try {
-      await api.download(url, title, $downloadHost, year);
+      // Pass the release specs so a later scan's "already grabbed" chip shows
+      // resolution / HDR / DV instead of blanks.
+      await api.download(url, title, $downloadHost, year,
+                         meta?.resolution || '', meta?.size || '',
+                         meta?.hdr || '', meta?.dovi ?? false);
       downloadQueue.markSent(id);
       addToast('Download', `Sent: ${title} (${$downloadHost})`);
     } catch (e) {
@@ -127,15 +134,19 @@
     >&times;</button>
 
     <!-- Hero section -->
-    <div class="relative w-full max-h-[300px] overflow-hidden bg-[var(--bg-tertiary)]">
+    <div class="relative w-full h-[300px] overflow-hidden bg-[var(--bg-tertiary)]">
       {#if item.poster_url}
+        <!-- Blurred fill so the wide hero isn't empty around the portrait poster -->
+        <img src={item.poster_url} alt="" aria-hidden="true"
+          class="absolute inset-0 w-full h-full object-cover blur-2xl scale-110 opacity-40" />
+        <!-- Full poster, never cropped (top/bottom no longer cut off) -->
         <img
           src={item.poster_url}
           alt={item.title}
-          class="w-full h-[300px] object-cover"
+          class="relative block h-[300px] mx-auto object-contain"
         />
       {:else}
-        <div class="w-full h-[200px] flex items-center justify-center text-[var(--text-secondary)] text-sm">
+        <div class="w-full h-full flex items-center justify-center text-[var(--text-secondary)] text-sm">
           No poster available
         </div>
       {/if}
@@ -259,7 +270,7 @@
                 </div>
                 {#if sibling.url}
                   <button
-                    onclick={() => handleDownload(sibling.url, sibling.title, sibling.year)}
+                    onclick={() => handleDownload(sibling.url, sibling.title, sibling.year, sibling)}
                     title="Download"
                     aria-label="Download {sibling.resolution || ''} release"
                     class="shrink-0 w-6 h-6 rounded hover:bg-[var(--accent)] flex items-center justify-center text-[var(--text-secondary)] hover:text-white text-xs transition-colors"
@@ -312,7 +323,7 @@
               {#each DOWNLOAD_HOSTS as h}<option value={h.value}>{h.value}</option>{/each}
             </select>
             <button
-              onclick={() => handleDownload(item.url, item.title, item.year)}
+              onclick={() => handleDownload(item.url, item.title, item.year, item)}
               aria-label="Download"
               class="flex items-center gap-1.5 px-3 py-1.5 rounded-r text-xs font-medium bg-[var(--accent)] text-white hover:opacity-90 transition-opacity"
             >

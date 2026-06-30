@@ -18,7 +18,8 @@ class FilenameResult(TypedDict, total=False):
     Core keys (always present): title, year, season, episode, resolution, is_tv.
     Optional key (TV only): filename_episode_title — text extracted from the
     filename between the SxxExx token and the first quality/release tag.
-    Optional keys: episode_end (multi-ep file end), part (split file part number).
+    Optional keys: episode_end (multi-ep file end), part (split file part number),
+    aka (alternate/English title), imdb_id (tt-id embedded in the filename).
     """
     title: str
     year: Optional[int]
@@ -29,6 +30,8 @@ class FilenameResult(TypedDict, total=False):
     is_tv: bool
     filename_episode_title: str
     part: Optional[int]
+    aka: Optional[str]
+    imdb_id: Optional[str]
 
 
 class ScrapeResult(TypedDict):

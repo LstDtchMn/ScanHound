@@ -12,6 +12,7 @@ Extends the basic scan history in database.py with:
 import html as html_lib
 import json
 import logging
+import os
 import sqlite3
 import threading
 from collections import defaultdict
@@ -544,6 +545,64 @@ class StatsDashboard:
                 'resolution': {'labels': [], 'counts': [], 'sizes': []},
                 'hdr': {'labels': [], 'counts': []}
             }
+
+    @staticmethod
+    def _bucket_destination(dest: Optional[str], roots: Dict[str, str]) -> str:
+        """Bucket an applied rename's destination under a configured library root
+        (by path prefix), falling back to its parent directory name."""
+        if not dest:
+            return "Unknown"
+        norm = dest.replace("\\", "/").rstrip("/")
+        # Pick the LONGEST matching root with a path boundary, so /library/movies
+        # does not swallow /library/movies-4k (a prefix of neither the other) —
+        # matching the first prefix would attribute every 4K rename to Movies.
+        best_label, best_len = None, -1
+        for label, root in roots.items():
+            if not root:
+                continue
+            r = str(root).replace("\\", "/").rstrip("/")
+            if r and (norm == r or norm.startswith(r + "/")) and len(r) > best_len:
+                best_label, best_len = label, len(r)
+        if best_label is not None:
+            return best_label
+        parent = os.path.dirname(norm)
+        return os.path.basename(parent) or parent or "Other"
+
+    def get_rename_stats(self, roots: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Auto-rename outcomes for the Stats page.
+
+        Returns how many files were renamed and successfully placed, a per-status
+        breakdown, the move method used, and how many files landed in each
+        library directory (bucketed by the configured roots when provided).
+        """
+        roots = roots or {}
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        by_status: Dict[str, int] = {}
+        by_directory: Dict[str, int] = {}
+        by_method: Dict[str, int] = {}
+        try:
+            for row in cursor.execute(
+                "SELECT status, COUNT(*) AS n FROM rename_jobs GROUP BY status"
+            ):
+                by_status[row["status"] or "unknown"] = row["n"]
+            for row in cursor.execute(
+                "SELECT destination_path, move_method FROM rename_jobs WHERE status = 'applied'"
+            ):
+                method = row["move_method"] or "unknown"
+                by_method[method] = by_method.get(method, 0) + 1
+                bucket = self._bucket_destination(row["destination_path"], roots)
+                by_directory[bucket] = by_directory.get(bucket, 0) + 1
+        except sqlite3.Error as e:
+            logger.warning("rename stats query failed: %s", e)
+
+        return {
+            "applied": by_status.get("applied", 0),
+            "total_jobs": sum(by_status.values()),
+            "by_status": by_status,
+            "by_directory": by_directory,
+            "by_method": by_method,
+        }
 
     def get_dashboard_summary(self) -> Dict[str, Any]:
         """Get complete dashboard summary.

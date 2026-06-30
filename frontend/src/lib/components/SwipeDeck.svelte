@@ -130,7 +130,7 @@
     try {
       const urls = selectedItems.map((i) => i.url);
       await api.downloadBatch(
-        selectedItems.map((i) => ({ url: i.url, title: i.title, year: i.year })),
+        selectedItems.map((i) => ({ url: i.url, title: i.title, year: i.year, resolution: i.resolution, size: i.size, hdr: i.hdr, dovi: i.dovi })),
         $downloadHost
       );
       addToast('Download', `Sending ${selectedItems.length} item(s) to JDownloader…`);

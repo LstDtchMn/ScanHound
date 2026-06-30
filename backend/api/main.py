@@ -170,6 +170,16 @@ def _init_services(
                 })
         threading.Thread(target=_auto_connect_plex, daemon=True, name="plex-auto-connect").start()
 
+    # Backfill resolution/size/HDR/DV onto older download-history rows that
+    # were grabbed before the metadata was captured (e.g. via batch grabs that
+    # only sent url/title). Matched by URL against the scan cache, so it's the
+    # exact release. Idempotent and cheap — runs once per startup, self-healing.
+    if reg.db:
+        try:
+            reg.db.enrich_downloads_from_cache()
+        except Exception:
+            logger.warning("Download-history enrichment skipped")
+
     # Background pre-cache scanner — always created so /background/scan-now and
     # runtime toggling work; the loop self-gates on background_scan_enabled and
     # just sleeps while the feature is off (the default).

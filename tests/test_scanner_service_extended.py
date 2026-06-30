@@ -11,6 +11,7 @@ Covers:
 - detect_duplicate_groups (single, movie dupes, TV multi-season, TV same-season, mixed)
 """
 
+import json
 import logging
 import threading
 import pytest
@@ -347,6 +348,22 @@ class TestBuildSources:
         assert "2160p" in sources[0]["base"]
         assert sources[0]["type"] == "movie"
         assert sources[0]["source"] == "hdencode"
+        assert sources[0]["category"] == "4k"
+
+    def test_sources_tagged_with_category(self):
+        """Each source descriptor carries the category used by the UI's 4K/Remux/
+        TV display filter."""
+        svc = _make_service()
+        flags = {"4k": True, "remux": True, "tv": True}
+        by_name = {s["name"]: s["category"]
+                   for s in svc._build_sources("Deep Scan", "HDEncode", self.BASE_URL, flags, "")}
+        assert by_name == {"4K Movies": "4k", "Remux Movies": "remux", "TV Packs": "tv"}
+        ddl = {s["name"]: s["category"] for s in svc._build_sources(
+            "Deep Scan", "DDLBase", self.BASE_URL,
+            {"4k_webdl": True, "4k_remux": True, "1080p_remux": True}, "")}
+        assert ddl["DDLBase WEB-DL 4K"] == "4k"
+        assert ddl["DDLBase Remux 4K"] == "remux"
+        assert ddl["DDLBase Remux 1080p"] == "remux"
 
     def test_hdencode_remux_only(self):
         svc = _make_service()
@@ -735,12 +752,12 @@ class TestCreateMediaItemExtended:
             downloaded_titles_lookup=lookup,
         )
         assert item is not None
-        # Same resolution previously grabbed → still flagged Downloaded even
-        # though the URL changed; no prior_grab note (it's the same version).
-        assert item.status == ScanStatus.DOWNLOADED
-        assert item.status_text == STATUS_TEXTS[ScanStatus.DOWNLOADED]
-        assert item.color == STATUS_COLORS[ScanStatus.DOWNLOADED]
-        assert item.prior_grab is None
+        # A same-title grab at this resolution but a DIFFERENT url is a sibling
+        # release with no quality gain → Downloaded Similar (orange), with the
+        # grab note. Only the exact url is Downloaded.
+        assert item.status == ScanStatus.DOWNLOADED_SIMILAR
+        assert item.prior_grab is not None
+        assert item.prior_grab["resolution"] == "1080p"
 
     def test_prior_grab_set_for_different_resolution(self):
         """A different-resolution prior grab surfaces as prior_grab and the
@@ -774,6 +791,45 @@ class TestCreateMediaItemExtended:
         # Most-recent different-resolution grab wins (720p @ 06-25 > 1080p @ 06-20)
         assert item.prior_grab["resolution"] == "720p"
         assert item.prior_grab["size"] == "8 GB"
+
+    def test_same_resolution_sibling_keeps_visible_with_grab_note(self):
+        """The reported case: after grabbing one 4K release, another 4K release of
+        the same title (different url) stays visible (Missing) with a 'grabbed
+        similar' note showing the grabbed specs — instead of silently Downloaded."""
+        details = {
+            "display_title": "Finding Emily", "year": 2026,
+            "size": "12.1 GB", "res": "4K", "hdr": "HDR", "dovi": False,
+        }
+        from backend.app_service import normalize_title
+        key = normalize_title("Finding Emily")
+        lookup = {key: [{"resolution": "4K", "size": "19.7 GB", "hdr": "HDR",
+                         "dovi": True, "downloaded_at": "2026-06-30 01:06:47"}]}
+        item = self._call(details, url="http://example.com/amzn-non-dv",
+                          downloaded_titles_lookup=lookup)
+        assert item is not None
+        # Same resolution, and this one LOSES the DV the grab had → same-or-worse,
+        # so it's dimmed as Downloaded Similar (not red Missing) with the note.
+        assert item.status == ScanStatus.DOWNLOADED_SIMILAR
+        assert item.prior_grab is not None
+        assert item.prior_grab["resolution"] == "4K"
+        assert item.prior_grab["size"] == "19.7 GB"
+        assert item.prior_grab["dovi"] is True         # shows you grabbed the DV one
+
+    def test_upgrade_sibling_stays_missing(self):
+        """A sibling that IS a quality upgrade over the grab (higher resolution,
+        or it adds DV the grab lacked) stays Missing — still worth grabbing."""
+        from backend.app_service import normalize_title
+        key = normalize_title("Some Film")
+        # Grabbed a 4K non-DV; this sibling is 4K WITH DV → a DV upgrade.
+        lookup = {key: [{"resolution": "4K", "size": "18 GB", "dovi": False,
+                         "downloaded_at": "2026-06-20 10:00:00"}]}
+        details = {"display_title": "Some Film", "year": 2024, "size": "24 GB",
+                   "res": "4K", "hdr": "HDR", "dovi": True}
+        item = self._call(details, url="http://example.com/4k-dv",
+                          downloaded_titles_lookup=lookup)
+        assert item is not None
+        assert item.status == ScanStatus.MISSING
+        assert item.prior_grab is not None
 
     def test_invalid_result_returns_none(self):
         """A result dict missing 'details' entirely should return None."""
@@ -932,12 +988,11 @@ class TestDownloadHistoryPersistence:
 
         assert f"{norm}|S2" in svc._downloaded_titles_lookup
         assert item is not None
-        # Same resolution (1080p) persisted across restart → Downloaded, and
-        # since it's the same version there is no prior_grab upgrade note.
-        assert item.status == ScanStatus.DOWNLOADED
-        assert item.status_text == STATUS_TEXTS[ScanStatus.DOWNLOADED]
-        assert item.color == STATUS_COLORS[ScanStatus.DOWNLOADED]
-        assert item.prior_grab is None
+        # A different-url sibling at the same resolution persists across restart
+        # as Downloaded Similar with the grab note (only the exact url is Downloaded).
+        assert item.status == ScanStatus.DOWNLOADED_SIMILAR
+        assert item.prior_grab is not None
+        assert item.prior_grab["resolution"] == "1080p"
         db2.close()
 
 
@@ -1087,3 +1142,113 @@ class TestDetectDuplicateGroupsExtended:
         # against self.grouped_items which is from the previous call.
         # Let's just check it works without errors.
         assert key in svc.grouped_items
+
+
+# ===================================================================
+# Cache re-match (rematch_cache, _media_item_from_dict)
+# ===================================================================
+
+class TestCacheRematch:
+    """Re-evaluating cached items against current Plex + downloads, no scrape."""
+
+    @pytest.fixture
+    def db(self):
+        dm = DatabaseManager()
+        dm.clear_background_cache()
+        yield dm
+        dm.clear_background_cache()
+        dm.close()
+
+    def test_media_item_from_dict_roundtrip(self):
+        svc = _make_service()
+        d = {
+            "url": "u1", "title": "Heat", "year": 1995, "status": "in_library",
+            "resolution": "4K", "dovi": True, "season": 2,
+            "web_data": {"imdb_id": "tt1", "size": "50 GB"},
+        }
+        item = svc._media_item_from_dict(d)
+        assert item is not None
+        assert (item.title, item.url, item.year, item.season) == ("Heat", "u1", 1995, 2)
+        assert item.status == ScanStatus.IN_LIBRARY
+        assert item.resolution == "4K" and item.dovi is True
+        assert item.web_data.get("imdb_id") == "tt1"
+
+    def test_media_item_from_dict_bad_status_defaults_missing(self):
+        svc = _make_service()
+        item = svc._media_item_from_dict({"url": "u1", "title": "X", "status": "bogus"})
+        assert item.status == ScanStatus.MISSING
+
+    def test_rematch_marks_downloaded_from_history(self, db):
+        """A cached MISSING item flips to DOWNLOADED once its URL is in history,
+        without any re-scrape."""
+        svc = _make_service(db=db)
+        svc.plex.plex_index = {"all_items": [], "by_imdb": {}, "by_title": {}}
+        db.upsert_background_cache([{
+            "url": "http://x/u1", "title": "Heat", "year": 1995, "status": "missing",
+            "source_category": "HDEncode",
+            "data": json.dumps({"url": "http://x/u1", "title": "Heat", "year": 1995,
+                                "status": "missing", "resolution": "4K"}),
+        }])
+        db.add_to_history(url="http://x/u1", title="Heat", normalized_title="heat",
+                          season=None, resolution="4K", size="50 GB", status="completed")
+        updated = svc.rematch_cache()
+        assert updated == 1
+        row = [r for r in db.get_background_cache() if r["url"] == "http://x/u1"][0]
+        assert row["status"] == "downloaded"
+        assert json.loads(row["data"])["status"] == "downloaded"
+
+    def test_rematch_no_change_returns_zero(self, db):
+        svc = _make_service(db=db)
+        svc.plex.plex_index = {"all_items": [], "by_imdb": {}, "by_title": {}}
+        db.upsert_background_cache([{
+            "url": "http://x/u2", "title": "Solo", "year": 2018, "status": "missing",
+            "source_category": "HDEncode",
+            "data": json.dumps({"url": "http://x/u2", "title": "Solo", "status": "missing",
+                                "resolution": "4K"}),
+        }])
+        assert svc.rematch_cache() == 0  # still missing, nothing to write
+
+    def test_rematch_no_downgrade_when_plex_empty(self, db):
+        """A transient/empty Plex index must NOT downgrade an owned IN_LIBRARY
+        cache row to Missing (review fix #2)."""
+        svc = _make_service(db=db)
+        svc.plex.plex_index = {"all_items": [], "by_imdb": {}, "by_title": {}}
+        db.upsert_background_cache([{
+            "url": "http://x/owned", "title": "Dune", "year": 2021, "status": "in_library",
+            "source_category": "HDEncode",
+            "data": json.dumps({"url": "http://x/owned", "title": "Dune", "year": 2021,
+                                "status": "in_library", "resolution": "4K",
+                                "plex_info": "4K", "plex_versions": "[\"4K\"]"}),
+        }])
+        svc.rematch_cache()
+        row = [r for r in db.get_background_cache() if r["url"] == "http://x/owned"][0]
+        assert row["status"] == "in_library"               # not downgraded
+        assert json.loads(row["data"])["status"] == "in_library"
+
+    def test_rematch_history_upgrade_still_works_when_plex_empty(self, db):
+        """Download-history upgrade (Missing→Downloaded) must still apply with an
+        empty Plex index — only library downgrades are suppressed."""
+        svc = _make_service(db=db)
+        svc.plex.plex_index = {"all_items": [], "by_imdb": {}, "by_title": {}}
+        db.upsert_background_cache([{
+            "url": "http://x/dl", "title": "Heat", "year": 1995, "status": "missing",
+            "source_category": "HDEncode",
+            "data": json.dumps({"url": "http://x/dl", "title": "Heat", "year": 1995,
+                                "status": "missing", "resolution": "4K"}),
+        }])
+        db.add_to_history(url="http://x/dl", title="Heat", normalized_title="heat",
+                          season=None, resolution="4K", size="50 GB", status="completed")
+        assert svc.rematch_cache() == 1
+        row = [r for r in db.get_background_cache() if r["url"] == "http://x/dl"][0]
+        assert row["status"] == "downloaded"
+
+    def test_update_background_status_preserves_last_seen(self, db):
+        """The re-match write must NOT refresh last_seen (retention intact)."""
+        db.upsert_background_cache([{
+            "url": "u1", "title": "A", "year": 2024, "status": "missing",
+            "source_category": "H", "data": "{}"}])
+        db._mutate("UPDATE background_scan_cache SET last_seen_at = "
+                   "datetime('now','-30 days') WHERE url = 'u1'")
+        db.update_background_status([{"url": "u1", "status": "downloaded", "data": "{}"}])
+        db.purge_background_cache(7)
+        assert db.count_background_cache() == 0  # aged row purged → last_seen untouched
