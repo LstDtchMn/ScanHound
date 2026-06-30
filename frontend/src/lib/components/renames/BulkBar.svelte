@@ -80,6 +80,7 @@
         <button
           class="px-2 py-1 rounded text-[11px] font-medium bg-[var(--bg-tertiary)] disabled:opacity-50"
           disabled={$bulkBusy}
+          aria-label="Set destination"
           onclick={() => (destOpen = !destOpen)}
         >Set destination ▾</button>
         {#if destOpen}
@@ -98,6 +99,7 @@
               </select>
               <button
                 class="px-2 py-1 rounded text-[11px] font-medium bg-[var(--accent)] text-white"
+                disabled={$bulkBusy}
                 onclick={applyDest}
               >Apply destination</button>
             {:else}
