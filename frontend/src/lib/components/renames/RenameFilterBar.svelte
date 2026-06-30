@@ -35,6 +35,7 @@
     {#each RENAME_CATEGORIES as cat (cat)}
       <button
         onclick={() => renameCategory.set(cat)}
+        aria-pressed={$renameCategory === cat}
         class="px-2 py-1 rounded text-[11px] font-medium transition-colors border
           {$renameCategory === cat
             ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]'
@@ -47,6 +48,7 @@
 
   <input
     type="search"
+    aria-label="Search rename jobs"
     placeholder="Search title / filename…"
     value={$renameQuery}
     oninput={(e) => renameQuery.set((e.target as HTMLInputElement).value)}
@@ -54,6 +56,7 @@
   />
 
   <select
+    aria-label="Sort rename jobs"
     value={$renameSort}
     onchange={(e) => renameSort.set((e.target as HTMLSelectElement).value as typeof $renameSort)}
     class="px-2 py-1 rounded text-xs bg-[var(--bg-tertiary)] border border-[var(--border)]"
