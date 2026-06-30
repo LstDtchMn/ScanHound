@@ -1,68 +1,75 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import {
-    renameJobs, renameStatus, loadRenameJobs, loadRenameStatus,
-    applyJob, undoJob, deleteJob, rematchJob,
-    acceptCombinedJob, acceptCorrectionJob, folderPreview,
-    dvScanProgress, dvScanResult, dvScans, dvCounts, loadDvScans, dvScanRunning
-  } from '$lib/stores/renames';
   import { get } from 'svelte/store';
-  import { addToast } from '$lib/stores/notifications';
+  import {
+    renameJobs, renameStatus, renameCategory, renameQuery, renameSort,
+    viewMode,
+    loadRenameJobs, loadRenameStatus, loadDvScans,
+    applyJob, undoJob, deleteJob,
+    acceptCombinedJob, acceptCorrectionJob,
+    dvScanProgress, dvScanResult, dvScans, dvCounts, dvScanRunning
+  } from '$lib/stores/renames';
+  import { categoryOf } from '$lib/renames/category';
+  import {
+    tileSize, gridColumns, gridGap, TILE_MIN_PX, GRID_GAP_CLASS
+  } from '$lib/stores/results';
+  import { settings } from '$lib/stores/settings';
   import { api } from '$lib/api/client';
+  import { addToast } from '$lib/stores/notifications';
   import type { RenameJob } from '$lib/api/types';
 
-  type Filter = 'all' | 'needs_review' | 'matched' | 'applied' | 'failed';
-  let filter = $state<Filter>('all');
+  import RenamesHeader from '$lib/components/renames/RenamesHeader.svelte';
+  import StatusDashboard from '$lib/components/renames/StatusDashboard.svelte';
+  import RenameFilterBar from '$lib/components/renames/RenameFilterBar.svelte';
+  import BulkBar from '$lib/components/renames/BulkBar.svelte';
+  import RenameRow from '$lib/components/renames/RenameRow.svelte';
+  import RenameCard from '$lib/components/renames/RenameCard.svelte';
+  import RematchModal from '$lib/components/renames/RematchModal.svelte';
+
+  // Status filter is local orchestrator state (surfaced via the stat cards):
+  // all | needs_review | matched | applied | failed.
+  let statusFilter = $state<string>('all');
+  // Controlled RematchModal — rows/cards call onRematch(job) → set this; modal
+  // renders only while set.
+  let rematchJob = $state<RenameJob | null>(null);
+  // The job whose legacy per-job action menu (Undo / Re-identify / Accept… /
+  // Remove) is open. One at a time.
+  let actionsOpenId = $state<number | null>(null);
   let busy = $state<number | null>(null);
 
-  // Manual "process a folder" — rename an existing backlog with no JDownloader.
-  // Remember the last folder the user processed instead of hardcoding a
-  // host-specific path; empty on first use (the input shows an example).
-  let folderOpen = $state(false);
-  let folderPath = $state(
-    (typeof localStorage !== 'undefined' && localStorage.getItem('sh-process-folder')) || ''
-  );
-  let folderBusy = $state(false);
-  async function processFolder() {
-    const folder = folderPath.trim();
-    if (!folder || folderBusy) return;
-    try { localStorage.setItem('sh-process-folder', folder); } catch {}
-    folderBusy = true;
+  onMount(() => {
+    loadRenameJobs();
+    loadRenameStatus();
+    loadDvScans();
+  });
+
+  // --- Re-identify all (ported verbatim from the old page) ---
+  let reidentifyingAll = $state(false);
+  async function reidentifyAll() {
+    if (reidentifyingAll) return;
+    reidentifyingAll = true;
     try {
-      await api.renameProcessFolder(folder);
-      addToast('Process folder', 'Scanning — rename jobs will appear here as they are identified.');
-      folderOpen = false;
-      // Jobs are created in the background; poll a few times so they show up.
-      for (const d of [2000, 5000, 10000]) setTimeout(loadRenameJobs, d);
+      await api.reidentifyAllRenames();
+      addToast('Re-identify all', 'Re-running the matcher on all reviewable jobs…');
+      for (const d of [2000, 5000, 10000]) setTimeout(() => { loadRenameJobs(); loadRenameStatus(); }, d);
     } catch (e) {
-      addToast('Error', e instanceof Error ? e.message : 'Failed to start folder processing', 'error');
+      addToast('Error', e instanceof Error ? e.message : 'Failed to start re-identify', 'error');
     } finally {
-      folderBusy = false;
+      reidentifyingAll = false;
     }
   }
 
-  // Dry run: identify + propose targets without creating any jobs or moving
-  // files. Result arrives over the WebSocket into the folderPreview store.
-  let previewBusy = $state(false);
-  async function previewFolder() {
-    const folder = folderPath.trim();
-    if (!folder || previewBusy) return;
-    try { localStorage.setItem('sh-process-folder', folder); } catch {}
-    previewBusy = true;
-    folderPreview.set(null);
-    try {
-      await api.renameProcessFolder(folder, true);
-      addToast('Preview', 'Identifying — a preview of what would happen will appear below.');
-    } catch (e) {
-      addToast('Error', e instanceof Error ? e.message : 'Failed to start preview', 'error');
-    } finally {
-      // The preview itself runs in the background; re-enable shortly after.
-      setTimeout(() => (previewBusy = false), 1500);
-    }
-  }
-
-  // Dolby Vision FEL/MEL scan of a folder — populates the DV inventory.
+  // Dolby Vision header button: open the inline DV scan panel + scroll to it.
   let dvOpen = $state(false);
+  function dolbyVision() {
+    dvOpen = true;
+    // Defer until the panel is in the DOM (it lives in #dv-scan-surface).
+    requestAnimationFrame(() =>
+      document.getElementById('dv-scan-surface')?.scrollIntoView({ behavior: 'smooth' })
+    );
+  }
+
+  // --- Dolby Vision FEL/MEL scan (ported verbatim from the old page) ---
   let dvPath = $state(
     (typeof localStorage !== 'undefined' && localStorage.getItem('sh-dv-folder')) || ''
   );
@@ -97,7 +104,7 @@
     }
   }
 
-  // Re-run identification on existing jobs (no need to remove stale ones first).
+  // --- Per-job legacy actions ---
   async function reidentify(id: number) {
     if (busy === id) return;
     busy = id;
@@ -114,52 +121,12 @@
     }
   }
 
-  let reidentifyingAll = $state(false);
-  async function reidentifyAll() {
-    if (reidentifyingAll) return;
-    reidentifyingAll = true;
-    try {
-      await api.reidentifyAllRenames();
-      addToast('Re-identify all', 'Re-running the matcher on all reviewable jobs…');
-      for (const d of [2000, 5000, 10000]) setTimeout(() => { loadRenameJobs(); loadRenameStatus(); }, d);
-    } catch (e) {
-      addToast('Error', e instanceof Error ? e.message : 'Failed to start re-identify', 'error');
-    } finally {
-      reidentifyingAll = false;
-    }
-  }
-
-  const filters: { value: Filter; label: string }[] = [
-    { value: 'all', label: 'All' },
-    { value: 'needs_review', label: 'Needs review' },
-    { value: 'matched', label: 'Matched' },
-    { value: 'applied', label: 'Applied' },
-    { value: 'failed', label: 'Failed' }
-  ];
-
-  onMount(() => {
-    loadRenameJobs();
-    loadRenameStatus();
-    loadDvScans();
-  });
-
-  let shown = $derived(
-    filter === 'all' ? $renameJobs : $renameJobs.filter((j) => j.status === filter)
-  );
-
-  function statusClass(job: RenameJob): string {
-    if (job.status === 'failed') return 'bg-[var(--error)]/15 text-[var(--error)]';
-    if (job.status === 'needs_review') return 'bg-amber-500/15 text-amber-600 dark:text-amber-400';
-    if (job.status === 'applied') return 'bg-[var(--success)]/15 text-[var(--success)]';
-    if (job.status === 'reverted') return 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] line-through';
-    return 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)]';
-  }
-
   async function run(id: number, fn: (id: number) => Promise<void>, ok: string) {
     busy = id;
     try {
       await fn(id);
       addToast('Rename', ok);
+      actionsOpenId = null;
     } catch {
       addToast('Rename', 'Action failed', 'error');
     } finally {
@@ -167,331 +134,264 @@
     }
   }
 
-  // Rematch state — one job can have its form open at a time
-  let rematchOpenId = $state<number | null>(null);
-  let rematchTmdbInput = $state('');
-  let rematchMediaType = $state<'movie' | 'tv'>('movie');
-  let rematchBusy = $state(false);
-
-  function openRematch(job: RenameJob) {
-    rematchOpenId = job.id;
-    rematchTmdbInput = '';
-    rematchMediaType = (job.media_type === 'tv' || job.media_type === 'show') ? 'tv' : 'movie';
+  function onRematch(job: RenameJob) {
+    actionsOpenId = null;
+    rematchJob = job;
   }
 
-  async function submitRematch(jobId: number) {
-    const id = parseInt(rematchTmdbInput.trim(), 10);
-    if (!id || isNaN(id)) { addToast('Rematch', 'Enter a valid TMDB ID', 'error'); return; }
-    rematchBusy = true;
-    try {
-      await rematchJob(jobId, id, rematchMediaType);
-      addToast('Rematch', 'Re-matched successfully');
-      rematchOpenId = null;
-    } catch {
-      addToast('Rematch', 'Rematch failed', 'error');
-    } finally {
-      rematchBusy = false;
+  // --- Derived visible set: status → category → query → sort ---
+  function matchesQuery(j: RenameJob, q: string): boolean {
+    if (!q) return true;
+    const hay = `${j.title ?? ''} ${j.original_filename ?? ''} ${j.new_filename ?? ''}`.toLowerCase();
+    return hay.includes(q.toLowerCase());
+  }
+  function sortJobs(arr: RenameJob[], mode: typeof $renameSort): RenameJob[] {
+    const a = [...arr];
+    switch (mode) {
+      case 'detected_asc': return a.sort((x, y) => (x.detected_at ?? '').localeCompare(y.detected_at ?? ''));
+      case 'confidence_desc': return a.sort((x, y) => (y.match_confidence ?? -1) - (x.match_confidence ?? -1));
+      case 'title_asc': return a.sort((x, y) => (x.title ?? '').localeCompare(y.title ?? ''));
+      default: return a.sort((x, y) => (y.detected_at ?? '').localeCompare(x.detected_at ?? ''));
     }
   }
+  let shown = $derived(
+    sortJobs(
+      $renameJobs
+        .filter((j) => statusFilter === 'all' || j.status === statusFilter)
+        .filter((j) => $renameCategory === 'all' || categoryOf(j).has($renameCategory))
+        .filter((j) => matchesQuery(j, $renameQuery)),
+      $renameSort
+    )
+  );
+  let shownIds = $derived(shown.map((j) => j.id));
+  let hasFilters = $derived(
+    statusFilter !== 'all' || $renameCategory !== 'all' || $renameQuery.trim() !== ''
+  );
 
-  function tmdbSearchUrl(job: RenameJob): string {
-    // Strip extension + quality tags for a cleaner search query
-    const raw = job.original_filename ?? '';
-    const base = raw.replace(/\.[^.]+$/, '').replace(/[._]?(1080p|2160p|4K|BluRay|WEB[-.]DL|HDTV|x264|x265|HEVC|AAC|AC3|DTS|H\.?264|H\.?265).*/i, '').replace(/[._]/g, ' ').trim();
-    return `https://www.themoviedb.org/search?query=${encodeURIComponent(base || raw)}`;
+  // Grid prefs — reuse the Scan page machinery (incl. the tile_columns setting
+  // fallback) so columns/gap stay in lockstep with the Scan grid.
+  let effectiveColumns = $derived(
+    $gridColumns !== 'auto' ? $gridColumns : (($settings.tile_columns as number) || 0)
+  );
+  let gridStyle = $derived(
+    effectiveColumns > 0
+      ? `grid-template-columns: repeat(${effectiveColumns}, 1fr)`
+      : `grid-template-columns: repeat(auto-fill, minmax(${TILE_MIN_PX[$tileSize]}px, 1fr))`
+  );
+  let gridGapClass = $derived(GRID_GAP_CLASS[$gridGap]);
+
+  function clearFilters() {
+    statusFilter = 'all';
+    renameCategory.set('all');
+    renameQuery.set('');
   }
 
-  function relTime(s: string | null): string {
-    if (!s) return '';
-    const iso = s.includes('T') ? s : s.replace(' ', 'T') + 'Z';
-    const t = Date.parse(iso);
-    if (Number.isNaN(t)) return '';
-    const secs = Math.max(0, Math.round((Date.now() - t) / 1000));
-    if (secs < 60) return 'just now';
-    const m = Math.round(secs / 60);
-    if (m < 60) return `${m}m ago`;
-    const h = Math.round(m / 60);
-    if (h < 24) return `${h}h ago`;
-    return `${Math.round(h / 24)}d ago`;
+  // Whether a job has any legacy action beyond Apply/Rematch (which live on the
+  // row itself). Drives the "More ▾" affordance.
+  function hasLegacyActions(job: RenameJob): boolean {
+    return job.status === 'applied'
+      || job.status === 'needs_review'
+      || job.status === 'failed'
+      || !!job.combined_episode
+      || !!job.suggested_correction
+      || true; // Remove is always available
   }
 </script>
 
-<div class="flex-1 overflow-auto">
-  <div class="px-4 py-3 border-b border-[var(--border)]">
-    <div class="flex items-center justify-between">
-      <h1 class="text-lg font-semibold">Renames</h1>
-      <div class="flex items-center gap-3">
-        <button
-          onclick={() => (folderOpen = !folderOpen)}
-          class="text-xs px-2.5 py-1 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text-primary)]"
-        >Process folder…</button>
-        <button
-          onclick={() => (dvOpen = !dvOpen)}
-          title="Scan a folder for Dolby Vision FEL/MEL"
-          class="text-xs px-2.5 py-1 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text-primary)]"
-        >Dolby Vision…</button>
-        <button
-          onclick={reidentifyAll}
-          disabled={reidentifyingAll}
-          title="Re-run identification on all reviewable jobs with the current matcher"
-          class="text-xs px-2.5 py-1 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] disabled:opacity-50"
-        >{reidentifyingAll ? 'Re-identifying…' : 'Re-identify all'}</button>
-        <button
-          onclick={() => { loadRenameJobs(); loadRenameStatus(); }}
-          class="text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-        >Refresh</button>
-      </div>
-    </div>
-    {#if folderOpen}
-      <div class="mt-2 flex items-center gap-2 flex-wrap">
-        <input
-          type="text"
-          bind:value={folderPath}
-          placeholder="F:\Downloads"
-          onkeydown={(e) => e.key === 'Enter' && processFolder()}
-          class="flex-1 min-w-[12rem] bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-1.5 rounded-lg border border-[var(--border)] text-sm font-mono focus:outline-none focus:border-[var(--accent)]"
-        />
-        <button
-          onclick={previewFolder}
-          disabled={previewBusy || !folderPath.trim()}
-          title="Identify without creating jobs or moving files"
-          class="px-3 py-1.5 text-sm rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition disabled:opacity-50"
-        >{previewBusy ? 'Previewing…' : 'Preview'}</button>
-        <button
-          onclick={processFolder}
-          disabled={folderBusy || !folderPath.trim()}
-          class="px-3 py-1.5 text-sm rounded-lg bg-[var(--accent)] hover:opacity-90 text-white font-medium transition disabled:opacity-50"
-        >{folderBusy ? 'Starting…' : 'Process'}</button>
-      </div>
-      <p class="mt-1.5 text-xs text-[var(--text-secondary)]">
-        Scans a folder for video files and creates rename jobs for each — for renaming an existing backlog without JDownloader.
-        <strong>Preview</strong> shows what would happen without creating jobs or moving anything.
-        Host paths (e.g. <code>F:\Downloads</code>) are translated to the container's mounted view; matches still go through review before moving.
-      </p>
-      {#if $folderPreview}
-        <div class="mt-2 rounded-lg border border-[var(--border)] overflow-hidden">
-          <div class="px-3 py-1.5 bg-[var(--bg-tertiary)] text-xs flex items-center justify-between">
-            <span>
-              {#if $folderPreview.error}
-                <span class="text-[var(--error)]">{$folderPreview.error}</span>
-              {:else}
-                Preview: <strong>{$folderPreview.would_match ?? 0}</strong> of {$folderPreview.found} file(s) would match
-              {/if}
-            </span>
-            <button onclick={() => folderPreview.set(null)} class="text-[var(--text-secondary)] hover:text-[var(--text-primary)]">Dismiss</button>
-          </div>
-          {#if $folderPreview.previews?.length}
-            <div class="max-h-72 overflow-auto divide-y divide-[var(--border)]">
-              {#each $folderPreview.previews as p}
-                <div class="px-3 py-1.5 flex items-center gap-2 text-xs">
-                  <span class="shrink-0 px-1.5 py-0.5 rounded {statusClass({ status: p.tracked ? 'matched' : p.status } as RenameJob)}">
-                    {p.tracked ? 'tracked' : p.status === 'matched' ? `${p.confidence}` : 'review'}
-                  </span>
-                  <span class="font-mono truncate text-[var(--text-secondary)] flex-1" title={p.filename}>{p.filename}</span>
-                  <span class="opacity-60 shrink-0">→</span>
-                  <span class="truncate flex-1 {p.new_filename ? '' : 'text-[var(--text-secondary)] italic'}" title={p.new_filename ?? ''}>
-                    {p.new_filename ?? (p.title ? `${p.title}${p.year ? ` (${p.year})` : ''}` : 'no match')}
-                  </span>
-                </div>
-              {/each}
-            </div>
-          {/if}
-          {#if $folderPreview.note}
-            <p class="px-3 py-1.5 text-[11px] text-[var(--text-secondary)] border-t border-[var(--border)]">{$folderPreview.note}</p>
-          {/if}
-        </div>
-      {/if}
-    {/if}
-    {#if dvOpen}
-      <div class="mt-2 flex items-center gap-2 flex-wrap">
-        <input
-          type="text"
-          bind:value={dvPath}
-          placeholder="G:\Downloads"
-          onkeydown={(e) => e.key === 'Enter' && dvScan()}
-          class="flex-1 min-w-[12rem] bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-1.5 rounded-lg border border-[var(--border)] text-sm font-mono focus:outline-none focus:border-[var(--accent)]"
-        />
-        <label class="text-xs text-[var(--text-secondary)] flex items-center gap-1 select-none">
-          <input type="checkbox" bind:checked={dvForce} /> Re-scan all
-        </label>
-        <button
-          onclick={dvScan}
-          disabled={$dvScanRunning || !dvPath.trim()}
-          class="px-3 py-1.5 text-sm rounded-lg bg-[var(--accent)] hover:opacity-90 text-white font-medium transition disabled:opacity-50"
-        >{$dvScanRunning ? 'Scanning…' : 'Scan'}</button>
-      </div>
-      <p class="mt-1.5 text-xs text-[var(--text-secondary)]">
-        Reads each video with <code>dovi_tool</code> to detect Dolby Vision <strong>FEL</strong> vs <strong>MEL</strong>, recording results below.
-        It's a full read per file, so it's slow; unchanged files are skipped unless <em>Re-scan all</em> is set. Detection only — no files are moved or modified.
-      </p>
-      {#if $dvScanProgress}
-        <div class="mt-2 text-xs text-[var(--text-secondary)]">
-          Scanning {$dvScanProgress.done}/{$dvScanProgress.total}:
-          <span class="font-mono">{$dvScanProgress.file}</span>
-          {#if $dvScanProgress.layer}<span class="px-1.5 py-0.5 rounded {dvBadge[$dvScanProgress.layer] ?? dvFallbackBadge}">{dvLabel[$dvScanProgress.layer] ?? $dvScanProgress.layer}</span>{/if}
-        </div>
-      {/if}
-      {#if $dvScanResult && !$dvScanProgress}
-        <div class="mt-2 text-xs">
-          {#if $dvScanResult.error}
-            <span class="text-[var(--error)]">{$dvScanResult.error}</span>
-          {:else}
-            Scanned <strong>{$dvScanResult.scanned}</strong> of {$dvScanResult.found} file(s){#if $dvScanResult.skipped}, {$dvScanResult.skipped} unchanged{/if}.
-          {/if}
-        </div>
-      {/if}
-      {#if Object.keys($dvCounts).length}
-        <div class="mt-2 flex items-center gap-1.5 flex-wrap text-[11px]">
-          <span class="text-[var(--text-secondary)]">Inventory:</span>
-          {#each Object.entries($dvCounts) as [layer, n]}
-            <span class="px-1.5 py-0.5 rounded {dvBadge[layer] ?? dvFallbackBadge}">{dvLabel[layer] ?? layer} {n}</span>
-          {/each}
-        </div>
-        <div class="mt-2 rounded-lg border border-[var(--border)] max-h-72 overflow-auto divide-y divide-[var(--border)]">
-          {#each $dvScans as s}
-            <div class="px-3 py-1.5 flex items-center gap-2 text-xs">
-              <span class="shrink-0 px-1.5 py-0.5 rounded {dvBadge[s.dv_layer] ?? dvFallbackBadge}">{dvLabel[s.dv_layer] ?? s.dv_layer}</span>
-              <span class="truncate flex-1" title={s.path}>{s.title ?? s.path}</span>
-            </div>
-          {/each}
-        </div>
-      {/if}
-    {/if}
-    {#if $renameStatus && !$renameStatus.enabled}
-      <p class="mt-1 text-xs text-[var(--text-secondary)]">
-        Auto-rename is off. Enable it in
-        <a href="/settings" class="text-[var(--accent)] hover:underline">Settings → Renaming</a>
-        to track and organise extracted downloads.
-      </p>
-    {:else if $renameStatus && $renameStatus.needs_review > 0}
-      <p class="mt-1 text-xs text-amber-600 dark:text-amber-400">
-        {$renameStatus.needs_review} item{$renameStatus.needs_review === 1 ? '' : 's'} need review.
-      </p>
-    {/if}
-    <div class="mt-3 flex gap-1 overflow-x-auto">
-      {#each filters as f}
-        <button
-          onclick={() => (filter = f.value)}
-          class="px-3 py-1.5 text-xs rounded-lg whitespace-nowrap transition-colors {filter === f.value ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'}"
-        >
-          {f.label}{#if $renameStatus?.counts[f.value]} ({$renameStatus.counts[f.value]}){/if}
-        </button>
-      {/each}
-    </div>
-  </div>
+<div class="flex-1 overflow-auto p-4 flex flex-col gap-4">
+  <RenamesHeader
+    onDolbyVision={dolbyVision}
+    onReidentifyAll={reidentifyAll}
+    {reidentifyingAll}
+  />
+
+  {#if $renameStatus && !$renameStatus.enabled}
+    <p class="text-xs text-[var(--text-secondary)]">
+      Auto-rename is off. Enable it in
+      <a href="/settings" class="text-[var(--accent)] hover:underline">Settings → Renaming</a>
+      to track and organise extracted downloads.
+    </p>
+  {/if}
+
+  <StatusDashboard {statusFilter} onFilter={(s) => (statusFilter = s)} />
+
+  <RenameFilterBar />
+
+  <BulkBar {shownIds} />
 
   {#if shown.length === 0}
-    <div class="p-8 text-center text-sm text-[var(--text-secondary)]">
-      No rename jobs{filter !== 'all' ? ` (${filter.replace('_', ' ')})` : ''} yet.
+    <div class="text-center py-12 text-[var(--text-secondary)]">
+      {#if $renameJobs.length === 0}
+        <p>No rename jobs yet. Use <strong>Process ▾</strong> to scan a folder.</p>
+      {:else if hasFilters}
+        <p>No jobs match these filters.</p>
+        <button
+          class="mt-2 px-3 py-1.5 rounded text-xs bg-[var(--bg-tertiary)]"
+          onclick={clearFilters}
+        >Clear filters</button>
+      {:else}
+        <p>No rename jobs to show.</p>
+      {/if}
     </div>
-  {:else}
-    <ul class="divide-y divide-[var(--border)]">
+  {:else if $viewMode === 'grid'}
+    <div class="grid {gridGapClass}" style={gridStyle}>
       {#each shown as job (job.id)}
-        <li class="px-4 py-3">
-          <div class="flex items-start gap-3">
-            <div class="flex-1 min-w-0">
-              <div class="flex items-center gap-2 flex-wrap">
-                <span class="text-[10px] px-1.5 py-0.5 rounded uppercase font-medium tracking-wide {statusClass(job)}">{job.status.replace('_', ' ')}</span>
-                {#if job.match_source === 'llm'}
-                  <span class="text-[10px] px-1.5 py-0.5 rounded bg-[var(--accent)]/15 text-[var(--accent)] font-medium">LLM</span>
-                {/if}
-                {#if job.destination_conflict}
-                  <span class="text-[10px] px-1.5 py-0.5 rounded bg-orange-500/15 text-orange-600 dark:text-orange-400 font-medium"
-                        title="Another job targets the same destination file — apply only one">⚠ Duplicate</span>
-                {/if}
-                {#if job.keep_recommended}
-                  <span class="text-[10px] px-1.5 py-0.5 rounded bg-[var(--success)]/15 text-[var(--success)] font-medium"
-                        title={job.keep_reason ? `Best of the duplicates: ${job.keep_reason}` : 'Recommended copy to keep'}>★ Keep{job.keep_reason ? ` · ${job.keep_reason}` : ''}</span>
-                {/if}
-                {#if job.match_confidence != null}
-                  <span class="text-[10px] text-[var(--text-secondary)]">{Math.round(job.match_confidence)}%</span>
-                {/if}
-                {#if job.media_type}
-                  <span class="text-[10px] text-[var(--text-secondary)] uppercase">{job.media_type}</span>
-                {/if}
-                <span class="text-[10px] text-[var(--text-secondary)] ml-auto">{relTime(job.detected_at)}</span>
-              </div>
-              <div class="mt-1 text-sm truncate" title={job.original_filename ?? ''}>{job.original_filename}</div>
-              {#if job.new_filename}
-                <div class="text-xs text-[var(--text-secondary)] truncate" title={job.new_filename}>→ {job.new_filename}</div>
-              {/if}
-              {#if job.warning_message}
-                <div class="text-[11px] text-amber-600 dark:text-amber-400 mt-0.5">{job.warning_message}</div>
-              {/if}
-              {#if job.error_message}
-                <div class="text-[11px] text-[var(--error)] mt-0.5">{job.error_message}</div>
-              {/if}
-            </div>
-            <div class="flex flex-col gap-1 shrink-0">
+        <div class="relative min-w-0">
+          <RenameCard {job} {onRematch} />
+          <button
+            class="absolute top-1.5 right-1.5 z-10 px-1.5 py-0.5 rounded text-[11px] font-medium bg-[var(--bg-secondary)]/90 border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+            aria-label="More actions"
+            aria-expanded={actionsOpenId === job.id}
+            onclick={(e) => { e.stopPropagation(); actionsOpenId = actionsOpenId === job.id ? null : job.id; }}
+          >⋯</button>
+          {#if actionsOpenId === job.id}
+            <div class="absolute top-7 right-1.5 z-20 flex flex-col gap-1 p-2 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] shadow">
               {#if job.status === 'matched' || job.status === 'needs_review'}
                 <button onclick={() => run(job.id, applyJob, 'Applied')} disabled={busy === job.id}
-                  class="px-2.5 py-1 text-xs rounded-lg bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50">Apply</button>
+                  class="px-2.5 py-1 text-xs rounded-lg bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50 text-left">Apply</button>
               {/if}
               {#if job.status === 'needs_review' || job.status === 'failed'}
-                <button
-                  onclick={() => reidentify(job.id)}
-                  disabled={busy === job.id}
-                  class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50"
-                  title="Re-run automatic identification with the current matcher"
-                >Re-identify</button>
-                <button
-                  onclick={() => rematchOpenId === job.id ? (rematchOpenId = null) : openRematch(job)}
-                  class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]"
-                  title="Re-match to a different TMDB title"
-                >Rematch</button>
+                <button onclick={() => reidentify(job.id)} disabled={busy === job.id}
+                  class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50 text-left"
+                  title="Re-run automatic identification with the current matcher">Re-identify</button>
               {/if}
               {#if job.status === 'needs_review' && job.combined_episode}
-                <button
-                  onclick={() => run(job.id, acceptCombinedJob, 'Accepted as combined')}
-                  disabled={busy === job.id}
-                  class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
-                  title="Confirm this is a combined double-episode file"
-                >Accept {job.combined_episode.proposed_code}</button>
+                <button onclick={() => run(job.id, acceptCombinedJob, 'Accepted as combined')} disabled={busy === job.id}
+                  class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50 text-left"
+                  title="Confirm this is a combined double-episode file">Accept {job.combined_episode.proposed_code}</button>
               {/if}
               {#if job.status === 'needs_review' && job.suggested_correction}
-                <button
-                  onclick={() => run(job.id, acceptCorrectionJob, 'Correction applied')}
-                  disabled={busy === job.id}
-                  class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
-                  title="Use the proposed episode correction"
-                >Accept S{String(job.suggested_correction.proposed.season).padStart(2,'0')}E{String(job.suggested_correction.proposed.episode).padStart(2,'0')}</button>
+                <button onclick={() => run(job.id, acceptCorrectionJob, 'Correction applied')} disabled={busy === job.id}
+                  class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50 text-left"
+                  title="Use the proposed episode correction">Accept S{String(job.suggested_correction.proposed.season).padStart(2,'0')}E{String(job.suggested_correction.proposed.episode).padStart(2,'0')}</button>
               {/if}
               {#if job.status === 'applied'}
                 <button onclick={() => run(job.id, undoJob, 'Reverted')} disabled={busy === job.id}
-                  class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50">Undo</button>
+                  class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50 text-left">Undo</button>
               {/if}
               <button onclick={() => run(job.id, deleteJob, 'Removed')} disabled={busy === job.id}
-                class="px-2.5 py-1 text-xs rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50">Remove</button>
-            </div>
-          </div>
-          {#if rematchOpenId === job.id}
-            <div class="mt-2 p-3 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-xs space-y-2">
-              <p class="text-[var(--text-secondary)]">Find the correct entry on TMDB, then paste its numeric ID here.</p>
-              <a href={tmdbSearchUrl(job)} target="_blank" rel="noopener" class="inline-flex items-center gap-1 text-[var(--accent)] hover:underline">
-                Search TMDB ↗
-              </a>
-              <div class="flex items-center gap-2 flex-wrap">
-                <select bind:value={rematchMediaType} class="px-2 py-1 rounded bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]">
-                  <option value="movie">Movie</option>
-                  <option value="tv">TV Show</option>
-                </select>
-                <input
-                  type="number"
-                  bind:value={rematchTmdbInput}
-                  placeholder="TMDB ID (e.g. 550)"
-                  class="flex-1 min-w-0 px-2 py-1 rounded bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-primary)] placeholder:text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)]"
-                  onkeydown={(e) => e.key === 'Enter' && submitRematch(job.id)}
-                />
-                <button onclick={() => submitRematch(job.id)} disabled={rematchBusy}
-                  class="px-2.5 py-1 rounded bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50">
-                  {rematchBusy ? '…' : 'Submit'}
-                </button>
-                <button onclick={() => (rematchOpenId = null)} class="px-2.5 py-1 rounded text-[var(--text-secondary)] hover:bg-[var(--border)]">Cancel</button>
-              </div>
+                class="px-2.5 py-1 text-xs rounded-lg text-[var(--error)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50 text-left">Remove</button>
             </div>
           {/if}
-        </li>
+        </div>
+      {/each}
+    </div>
+  {:else}
+    <ul class="divide-y divide-[var(--border)] rounded-lg border border-[var(--border)] overflow-hidden">
+      {#each shown as job (job.id)}
+        <RenameRow {job} {onRematch} />
+        {#if hasLegacyActions(job)}
+          <li class="px-3 py-1 bg-[var(--bg-tertiary)]/30">
+            <button
+              class="text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+              aria-expanded={actionsOpenId === job.id}
+              onclick={() => (actionsOpenId = actionsOpenId === job.id ? null : job.id)}
+            >{actionsOpenId === job.id ? 'Hide actions ▴' : 'More actions ▾'}</button>
+            {#if actionsOpenId === job.id}
+              <div class="mt-1 flex flex-wrap items-center gap-1">
+                {#if job.status === 'matched' || job.status === 'needs_review'}
+                  <button onclick={() => run(job.id, applyJob, 'Applied')} disabled={busy === job.id}
+                    class="px-2.5 py-1 text-xs rounded-lg bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50">Apply</button>
+                {/if}
+                {#if job.status === 'needs_review' || job.status === 'failed'}
+                  <button onclick={() => reidentify(job.id)} disabled={busy === job.id}
+                    class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50"
+                    title="Re-run automatic identification with the current matcher">Re-identify</button>
+                {/if}
+                {#if job.status === 'needs_review' && job.combined_episode}
+                  <button onclick={() => run(job.id, acceptCombinedJob, 'Accepted as combined')} disabled={busy === job.id}
+                    class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
+                    title="Confirm this is a combined double-episode file">Accept {job.combined_episode.proposed_code}</button>
+                {/if}
+                {#if job.status === 'needs_review' && job.suggested_correction}
+                  <button onclick={() => run(job.id, acceptCorrectionJob, 'Correction applied')} disabled={busy === job.id}
+                    class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
+                    title="Use the proposed episode correction">Accept S{String(job.suggested_correction.proposed.season).padStart(2,'0')}E{String(job.suggested_correction.proposed.episode).padStart(2,'0')}</button>
+                {/if}
+                {#if job.status === 'applied'}
+                  <button onclick={() => run(job.id, undoJob, 'Reverted')} disabled={busy === job.id}
+                    class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50">Undo</button>
+                {/if}
+                <button onclick={() => run(job.id, deleteJob, 'Removed')} disabled={busy === job.id}
+                  class="px-2.5 py-1 text-xs rounded-lg text-[var(--error)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50">Remove</button>
+              </div>
+            {/if}
+          </li>
+        {/if}
       {/each}
     </ul>
   {/if}
+
+  <!-- Dolby Vision scan surface — the StatusDashboard DV card scrolls here. -->
+  <div id="dv-scan-surface" class="rounded-lg border border-[var(--border)]">
+    <button
+      onclick={() => (dvOpen = !dvOpen)}
+      aria-expanded={dvOpen}
+      class="w-full flex items-center justify-between px-3 py-2 text-sm font-medium text-left hover:bg-[var(--bg-tertiary)]/40"
+    >
+      <span>Dolby Vision FEL/MEL scan</span>
+      <span class="text-[var(--text-secondary)] text-xs">{dvOpen ? '▴' : '▾'}</span>
+    </button>
+    {#if dvOpen}
+      <div class="px-3 pb-3">
+        <div class="flex items-center gap-2 flex-wrap">
+          <input
+            type="text"
+            bind:value={dvPath}
+            placeholder="G:\Downloads"
+            onkeydown={(e) => e.key === 'Enter' && dvScan()}
+            class="flex-1 min-w-[12rem] bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-1.5 rounded-lg border border-[var(--border)] text-sm font-mono focus:outline-none focus:border-[var(--accent)]"
+          />
+          <label class="text-xs text-[var(--text-secondary)] flex items-center gap-1 select-none">
+            <input type="checkbox" bind:checked={dvForce} /> Re-scan all
+          </label>
+          <button
+            onclick={dvScan}
+            disabled={$dvScanRunning || !dvPath.trim()}
+            class="px-3 py-1.5 text-sm rounded-lg bg-[var(--accent)] hover:opacity-90 text-white font-medium transition disabled:opacity-50"
+          >{$dvScanRunning ? 'Scanning…' : 'Scan'}</button>
+        </div>
+        <p class="mt-1.5 text-xs text-[var(--text-secondary)]">
+          Reads each video with <code>dovi_tool</code> to detect Dolby Vision <strong>FEL</strong> vs <strong>MEL</strong>, recording results below.
+          It's a full read per file, so it's slow; unchanged files are skipped unless <em>Re-scan all</em> is set. Detection only — no files are moved or modified.
+        </p>
+        {#if $dvScanProgress}
+          <div class="mt-2 text-xs text-[var(--text-secondary)]">
+            Scanning {$dvScanProgress.done}/{$dvScanProgress.total}:
+            <span class="font-mono">{$dvScanProgress.file}</span>
+            {#if $dvScanProgress.layer}<span class="px-1.5 py-0.5 rounded {dvBadge[$dvScanProgress.layer] ?? dvFallbackBadge}">{dvLabel[$dvScanProgress.layer] ?? $dvScanProgress.layer}</span>{/if}
+          </div>
+        {/if}
+        {#if $dvScanResult && !$dvScanProgress}
+          <div class="mt-2 text-xs">
+            {#if $dvScanResult.error}
+              <span class="text-[var(--error)]">{$dvScanResult.error}</span>
+            {:else}
+              Scanned <strong>{$dvScanResult.scanned}</strong> of {$dvScanResult.found} file(s){#if $dvScanResult.skipped}, {$dvScanResult.skipped} unchanged{/if}.
+            {/if}
+          </div>
+        {/if}
+        {#if Object.keys($dvCounts).length}
+          <div class="mt-2 flex items-center gap-1.5 flex-wrap text-[11px]">
+            <span class="text-[var(--text-secondary)]">Inventory:</span>
+            {#each Object.entries($dvCounts) as [layer, n]}
+              <span class="px-1.5 py-0.5 rounded {dvBadge[layer] ?? dvFallbackBadge}">{dvLabel[layer] ?? layer} {n}</span>
+            {/each}
+          </div>
+          <div class="mt-2 rounded-lg border border-[var(--border)] max-h-72 overflow-auto divide-y divide-[var(--border)]">
+            {#each $dvScans as s}
+              <div class="px-3 py-1.5 flex items-center gap-2 text-xs">
+                <span class="shrink-0 px-1.5 py-0.5 rounded {dvBadge[s.dv_layer] ?? dvFallbackBadge}">{dvLabel[s.dv_layer] ?? s.dv_layer}</span>
+                <span class="truncate flex-1" title={s.path}>{s.title ?? s.path}</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
+  </div>
 </div>
+
+{#if rematchJob}
+  <RematchModal job={rematchJob} onClose={() => (rematchJob = null)} />
+{/if}
