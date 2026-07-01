@@ -283,3 +283,96 @@ describe('loadResults / paged mode', () => {
     expect(get(mod.categoryFilter).sort()).toEqual(['4k', 'remux', 'tv']);
   });
 });
+
+describe('debounced refetch on filter change (paged mode)', () => {
+  // NOTE: the module-level _filterKey subscription is primed the moment this
+  // module is first imported, long before these tests run — so we never rely
+  // on "the first fire is skipped" here, only on debounce timing/coalescing/gating.
+  //
+  // Each test also sets an explicit baseline value for the store it's about to
+  // change (while already on fake timers) and then clears timers before the
+  // real assertions start. This guards against a prior suite's resetStores()
+  // (which runs under REAL timers) having left a stray in-flight debounce, and
+  // against a same-value .set() being a no-op (svelte's writable only notifies
+  // subscribers when the new value is actually different).
+
+  it('does not refetch before 250ms, and refetches exactly once after', async () => {
+    vi.useFakeTimers();
+    try {
+      pagedMode.set(true);
+      statusFilter.set('all'); // baseline (may itself schedule a fake timer)
+      vi.clearAllTimers(); // drop anything scheduled by the baseline above
+      (api.getCachedResults as any).mockClear();
+      (api.getCachedResults as any).mockResolvedValue({
+        items: [],
+        total: 0,
+        stats: { total: 0, missing: 0, upgrade: 0, library: 0 },
+        title_counts: {}
+      });
+
+      statusFilter.set('missing');
+
+      vi.advanceTimersByTime(200);
+      expect(api.getCachedResults).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(100); // total 300ms — past the 250ms debounce
+      await vi.runAllTimersAsync();
+      expect(api.getCachedResults).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('coalesces rapid successive filter changes into a single refetch', async () => {
+    vi.useFakeTimers();
+    try {
+      pagedMode.set(true);
+      searchFilter.set(''); // baseline
+      vi.clearAllTimers();
+      (api.getCachedResults as any).mockClear();
+      (api.getCachedResults as any).mockResolvedValue({
+        items: [],
+        total: 0,
+        stats: { total: 0, missing: 0, upgrade: 0, library: 0 },
+        title_counts: {}
+      });
+
+      searchFilter.set('a');
+      vi.advanceTimersByTime(100);
+      searchFilter.set('ab'); // resets the debounce timer before it fires
+      vi.advanceTimersByTime(100); // 200ms since the second change's own start — still short of 250ms
+
+      expect(api.getCachedResults).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(200); // now well past 250ms since the last change
+      await vi.runAllTimersAsync();
+      expect(api.getCachedResults).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never refetches while pagedMode is false, even past the debounce window', async () => {
+    vi.useFakeTimers();
+    try {
+      pagedMode.set(false);
+      statusFilter.set('all'); // baseline
+      vi.clearAllTimers();
+      (api.getCachedResults as any).mockClear();
+      (api.getCachedResults as any).mockResolvedValue({
+        items: [],
+        total: 0,
+        stats: { total: 0, missing: 0, upgrade: 0, library: 0 },
+        title_counts: {}
+      });
+
+      statusFilter.set('upgrade');
+      vi.advanceTimersByTime(300);
+      await vi.runAllTimersAsync();
+
+      expect(api.getCachedResults).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
