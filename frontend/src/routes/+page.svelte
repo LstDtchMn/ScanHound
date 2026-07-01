@@ -8,7 +8,7 @@
   import ResultActionSheet from '$lib/components/ResultActionSheet.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
   import SwipeDeck from '$lib/components/SwipeDeck.svelte';
-  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, hydrateCache, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS } from '$lib/stores/results';
+  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS, loadResults, hasMore, loadingMore, loadError, filteredTotal, titleCounts, pagedMode, statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy } from '$lib/stores/results';
   import { mobile } from '$lib/stores/media';
   import { addToast } from '$lib/stores/notifications';
   import { get } from 'svelte/store';
@@ -91,8 +91,6 @@
 
   let contextMenu = $state<{ item: ScanResult; x: number; y: number } | null>(null);
   let mobileActionItem = $state<ScanResult | null>(null);
-  let currentPage = $state(1);
-  const perPage = 100;
   // Track which multi-item groups the user has explicitly expanded; all others start collapsed
   let expandedGroups = $state<Set<string>>(new Set());
   let resultsContainer: HTMLDivElement | undefined = $state();
@@ -109,10 +107,9 @@
   );
   let gridGapClass = $derived(GRID_GAP_CLASS[$gridGap]);
 
-  let totalPages = $derived(Math.max(1, Math.ceil($filteredResults.length / perPage)));
-  let paginatedResults = $derived(
-    $filteredResults.slice((currentPage - 1) * perPage, currentPage * perPage)
-  );
+  let renderLimit = $state(100);
+  let scrollSentinel: HTMLDivElement | undefined = $state();
+  let renderedResults = $derived($filteredResults.slice(0, renderLimit));
 
   // Group results by title for group headers
   interface ResultGroup {
@@ -122,7 +119,7 @@
   let groupedResults = $derived(() => {
     const groups: ResultGroup[] = [];
     const map = new Map<string, ResultGroup>();
-    for (const item of paginatedResults) {
+    for (const item of renderedResults) {
       const key = item.title;
       let group = map.get(key);
       if (!group) {
@@ -135,12 +132,14 @@
     return groups;
   });
 
-  // Sibling counts across ALL filtered results (not just current page)
+  // Sibling counts across ALL filtered results — server counts in paged mode
+  // (covers rows not yet loaded into the render window), local tally in live mode.
   let siblingCounts = $derived(() => {
-    const counts = new Map<string, number>();
-    for (const item of $filteredResults) {
-      counts.set(item.title, (counts.get(item.title) || 0) + 1);
+    if ($pagedMode && Object.keys($titleCounts).length) {
+      return new Map(Object.entries($titleCounts));
     }
+    const counts = new Map<string, number>();
+    for (const item of $filteredResults) counts.set(item.title, (counts.get(item.title) || 0) + 1);
     return counts;
   });
 
@@ -264,21 +263,28 @@
     return { res, dv, hdr };
   }
 
-  // Reset page and keyboard focus when filter changes
+  // Reset the render window and keyboard focus whenever the active filter set changes.
+  // (The store handles refetching in paged mode — this only resets the client window.)
   $effect(() => {
-    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-    $filteredResults.length;
-    currentPage = 1;
+    $statusFilter; $searchFilter; $genreFilter; $languageFilter; $quickFilters; $categoryFilter; $sortBy;
+    renderLimit = 100;
     focusedIndex.set(-1);
+    resultsContainer?.scrollTo({ top: 0 });
   });
 
-  // Scroll to top when page or filters change
+  // Grow the render window as the bottom sentinel comes into view; in paged mode,
+  // also fetch the next server page once the window nears the end of loaded rows.
   $effect(() => {
-    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-    currentPage;
-    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-    $filteredResults.length;
-    resultsContainer?.scrollTo({ top: 0, behavior: 'smooth' });
+    if (!scrollSentinel) return;
+    const io = new IntersectionObserver((entries) => {
+      if (!entries[0].isIntersecting) return;
+      renderLimit += 100;
+      if ($pagedMode && $hasMore && !$loadingMore && renderLimit >= $filteredResults.length - 100) {
+        loadResults(false);
+      }
+    }, { rootMargin: '600px' });
+    io.observe(scrollSentinel);
+    return () => io.disconnect();
   });
 
   onMount(async () => {
@@ -294,18 +300,21 @@
       loadSettings(),
       (async () => {
         try {
-          const resp = await api.getResults({ per_page: '500' });
+          const resp = await api.getResults({ per_page: '200' });
           if (resp.items && resp.items.length > 0) {
             results.set(resp.items);
             if (resp.stats) stats.set(resp.stats);
+            // A live last-scan set is already fully in memory — use client filtering.
+            pagedMode.set(false);
           }
         } catch { /* no previous results */ }
       })(),
     ]);
     // If no live results were available (fresh session / server restart), fall
-    // back to the pre-cached background-scan results so the app opens populated.
+    // back to server-paginated cached results so the app opens populated.
     if (get(results).length === 0) {
-      await hydrateCache();
+      pagedMode.set(true);
+      await loadResults(true);
     }
     // Settings store is now populated — check metadata keys for banner
     tmdbKeyMissing = !$settings.tmdb_api_key && !$settings.omdb_api_key;
@@ -660,7 +669,7 @@
     </div>
   {/if}
 
-  {#if $filteredResults.length === 0 && $scanState === 'idle'}
+  {#if $filteredTotal === 0 && $filteredResults.length === 0 && $scanState === 'idle'}
     <div class="flex flex-col items-center justify-center min-h-[16rem] py-8 gap-4">
       {#if $results.length > 0}
         <!-- Had results but filter hides them all -->
@@ -806,25 +815,17 @@
     </div>
   {/if}
 
-  {#if totalPages > 1}
-    <div class="flex items-center justify-center gap-2 py-4">
-      <button
-        disabled={currentPage <= 1}
-        onclick={() => currentPage--}
-        class="px-3 py-1.5 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)] disabled:opacity-30 transition-colors"
-      >
-        Prev
-      </button>
-      <span class="text-xs text-[var(--text-secondary)]">
-        Page {currentPage} of {totalPages} ({$filteredResults.length} results)
-      </span>
-      <button
-        disabled={currentPage >= totalPages}
-        onclick={() => currentPage++}
-        class="px-3 py-1.5 rounded text-xs bg-[var(--bg-tertiary)] hover:bg-[var(--border)] disabled:opacity-30 transition-colors"
-      >
-        Next
-      </button>
+  <div bind:this={scrollSentinel} class="h-px"></div>
+  {#if $loadingMore}
+    <div class="py-4 text-center text-sm text-[var(--text-secondary)]">Loading more…</div>
+  {:else if $loadError}
+    <div class="py-4 text-center text-sm">
+      <button class="underline text-[var(--accent)]" onclick={() => loadResults(false)}>Retry loading more</button>
+    </div>
+  {/if}
+  {#if $filteredTotal > 0}
+    <div class="py-3 text-center text-xs text-[var(--text-secondary)] opacity-70">
+      showing {Math.min(renderedResults.length, $filteredTotal)} of {$filteredTotal}
     </div>
   {/if}
 </div>
