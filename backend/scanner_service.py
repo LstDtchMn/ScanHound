@@ -1042,7 +1042,7 @@ class ScannerService:
                 break
             self._progress(idx / total, f"Matching {idx}/{total}")
 
-            if item.status == ScanStatus.DOWNLOADED:
+            if item.status in (ScanStatus.DOWNLOADED, ScanStatus.DOWNLOADED_SIMILAR):
                 continue
 
             web_item = {
