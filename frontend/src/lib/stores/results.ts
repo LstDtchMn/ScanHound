@@ -383,6 +383,12 @@ export const deckResults = derived(
     $filtered.filter((i) => !!i.url && isActionable(i.status) && !$selected.has(i.url))
 );
 
+/** True when the swipe deck's card pool is running low and another server
+ *  page should be fetched to top it up (paged mode only). */
+export function deckNeedsMore(remainingActionable: number): boolean {
+  return get(pagedMode) && get(hasMore) && !get(loadingMore) && remainingActionable < 8;
+}
+
 /** Seed the store from pre-cached background-scan results when there are no
  *  live results yet (fresh session / server restart), so the app opens with
  *  something to show. Sets fromCache so the UI can flag it. */
@@ -422,7 +428,13 @@ export function dismissItem(url: string, title?: string): Promise<boolean> {
     return next;
   });
   if (get(pagedMode)) {
-    results.update((items) => items.filter((i) => i.url !== url));
+    let removed = false;
+    results.update((items) => {
+      const next = items.filter((i) => i.url !== url);
+      removed = next.length !== items.length;
+      return next;
+    });
+    if (removed) filteredTotal.update((n) => Math.max(0, n - 1));
   }
   return api.dismissItems([url], title ? { [url]: title } : undefined, true).then(
     () => true,

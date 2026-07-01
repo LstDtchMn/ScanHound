@@ -1,7 +1,8 @@
 <script lang="ts">
   import {
     deckResults, results, selectedKeys, selectedDetail,
-    dismissItem, restoreItem, toggleSelect, deselectAll, markDownloaded
+    dismissItem, restoreItem, toggleSelect, deselectAll, markDownloaded,
+    deckNeedsMore, loadResults
   } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
@@ -15,6 +16,13 @@
 
   let deck = $derived($deckResults);
   let top = $derived(deck[0] ?? null);
+
+  // Top up the server-paged pool as the deck runs low, so swiping never
+  // outpaces what's loaded. Re-runs as $deckResults.length shrinks (cards
+  // consumed/selected) or grows (a page lands).
+  $effect(() => {
+    if (deckNeedsMore($deckResults.length)) loadResults(false);
+  });
 
   // Top-card drag state
   let dx = $state(0);

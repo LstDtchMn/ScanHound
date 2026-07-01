@@ -277,6 +277,17 @@ describe('loadResults / paged mode', () => {
     expect(get(results).map(r => r.url)).toEqual(['keep']);
   });
 
+  it('dismissItem decrements filteredTotal in paged mode, but only when a row was actually removed', async () => {
+    const { results, dismissItem, pagedMode, filteredTotal } = await import('./results');
+    pagedMode.set(true);
+    results.set([item({ title: 'A', url: 'u1' }), item({ title: 'B', url: 'u2' })]);
+    filteredTotal.set(2);
+    await dismissItem('u1', 'A');
+    expect(get(filteredTotal)).toBe(1);
+    await dismissItem('not-in-results');
+    expect(get(filteredTotal)).toBe(1);
+  });
+
   it('categoryFilter defaults to all three categories', async () => {
     // Fresh module import with no persisted value returns the new default.
     const mod = await import('./results');
@@ -374,5 +385,21 @@ describe('debounced refetch on filter change (paged mode)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('deckNeedsMore', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('deckNeedsMore is true only when paged, has more, and cards run low', async () => {
+    const { deckNeedsMore, pagedMode, hasMore, loadingMore } = await import('./results');
+    pagedMode.set(true); hasMore.set(true); loadingMore.set(false);
+    expect(deckNeedsMore(3)).toBe(true);
+    expect(deckNeedsMore(20)).toBe(false);
+    hasMore.set(false);
+    expect(deckNeedsMore(3)).toBe(false);
   });
 });
