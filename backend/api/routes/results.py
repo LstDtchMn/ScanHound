@@ -165,6 +165,14 @@ class DismissRequest(BaseModel):
     dismissed: bool = True
 
 
+def _csv(param: Optional[str]) -> Optional[List[str]]:
+    """Split a comma-separated query param into a list, or None if empty."""
+    if not param:
+        return None
+    vals = [p.strip() for p in param.split(",") if p.strip()]
+    return vals or None
+
+
 def _compute_status_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
     """Compute status counts from a list of item dicts."""
     return {
@@ -186,6 +194,10 @@ def _shape_results(
     per_page: int,
     include_dismissed: bool,
     reg: ServiceRegistry,
+    category: Optional[List[str]] = None,
+    genre: Optional[List[str]] = None,
+    language: Optional[List[str]] = None,
+    quick: Optional[List[str]] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Filter / search / sort / paginate item dicts into a results response.
@@ -200,18 +212,20 @@ def _shape_results(
             items = [i for i in items if i.get("url") not in dismissed]
 
     # Snapshot of all visible (non-dismissed) items for the overall stats,
-    # before status/search filtering narrows them further.
+    # before status/search/category/genre/language/quick filtering narrows
+    # them further.
     visible_items = list(items)
 
-    if filter:
-        filter_lower = filter.lower()
-        items = [i for i in items if filter_lower in str(i.get("status", "")).lower()]
+    items = _filter_and_sort(
+        items, filter=filter, search=search, category=category, genre=genre,
+        language=language, quick=quick, sort=sort, order=order,
+    )
 
-    if search:
-        search_lower = search.lower()
-        items = [i for i in items if search_lower in str(i.get("title", "")).lower()]
-
-    items.sort(key=lambda x: str(x.get(sort, "")), reverse=(order == "desc"))
+    # Per-title counts over the filtered set (post-filter, pre-pagination).
+    title_counts: Dict[str, int] = {}
+    for i in items:
+        t = str(i.get("title", ""))
+        title_counts[t] = title_counts.get(t, 0) + 1
 
     total = len(items)
     start = (page - 1) * per_page
@@ -228,14 +242,37 @@ def _shape_results(
         "total": total,
         "page": page,
         "per_page": per_page,
-        # Stats from all visible items (after dismissal, before filter/search).
+        # Stats from all visible items (after dismissal, before any filters).
         "stats": _compute_status_counts(visible_items),
-        # Filtered stats (after filter/search, before pagination).
+        # Filtered stats (after all filters, before pagination).
         "filtered_stats": _compute_status_counts(items),
+        "title_counts": title_counts,
     }
     if extra:
         response.update(extra)
     return response
+
+
+def _load_items(source: str, reg: ServiceRegistry):
+    """Return (item_dicts, last_updated) for the live last-scan set or the
+    pre-cached background-scan rows."""
+    if source == "cache":
+        items: List[Dict[str, Any]] = []
+        last_updated: Optional[str] = None
+        if reg.db is not None:
+            for row in reg.db.get_background_cache():
+                try:
+                    data = json.loads(row.get("data") or "{}")
+                except (ValueError, TypeError):
+                    data = {}
+                if not data.get("url"):
+                    data["url"] = row.get("url")
+                items.append(data)
+                seen = row.get("last_seen_at")
+                if seen and (last_updated is None or seen > last_updated):
+                    last_updated = seen
+        return items, last_updated
+    return [_media_item_to_dict(i) for i in get_last_scan_items()], None
 
 
 @router.get("")
@@ -245,14 +282,20 @@ def get_results(
     sort: str = Query("title"),
     order: str = Query("asc"),
     page: int = Query(1, ge=1),
-    per_page: int = Query(100, ge=1, le=500),
+    per_page: int = Query(100, ge=1, le=200),
+    category: Optional[str] = Query(None),
+    genre: Optional[str] = Query(None),
+    language: Optional[str] = Query(None),
+    quick: Optional[str] = Query(None),
     include_dismissed: bool = Query(False, description="Include swiped-away items"),
     reg: ServiceRegistry = Depends(get_registry),
 ):
-    items = [_media_item_to_dict(i) for i in get_last_scan_items()]
+    items, _ = _load_items("live", reg)
     return _shape_results(
         items, filter=filter, search=search, sort=sort, order=order,
         page=page, per_page=per_page, include_dismissed=include_dismissed, reg=reg,
+        category=_csv(category), genre=_csv(genre), language=_csv(language),
+        quick=_csv(quick),
     )
 
 
@@ -263,7 +306,11 @@ def get_cached_results(
     sort: str = Query("title"),
     order: str = Query("asc"),
     page: int = Query(1, ge=1),
-    per_page: int = Query(100, ge=1, le=500),
+    per_page: int = Query(100, ge=1, le=200),
+    category: Optional[str] = Query(None),
+    genre: Optional[str] = Query(None),
+    language: Optional[str] = Query(None),
+    quick: Optional[str] = Query(None),
     include_dismissed: bool = Query(False, description="Include swiped-away items"),
     reg: ServiceRegistry = Depends(get_registry),
 ):
@@ -273,23 +320,12 @@ def get_cached_results(
     scan. ``source`` is ``"cache"`` and ``last_updated`` is the most recent
     ``last_seen_at`` so the UI can show a "cached as of …" banner.
     """
-    items: List[Dict[str, Any]] = []
-    last_updated: Optional[str] = None
-    if reg.db is not None:
-        for row in reg.db.get_background_cache():
-            try:
-                data = json.loads(row.get("data") or "{}")
-            except (ValueError, TypeError):
-                data = {}
-            if not data.get("url"):
-                data["url"] = row.get("url")
-            items.append(data)
-            seen = row.get("last_seen_at")
-            if seen and (last_updated is None or seen > last_updated):
-                last_updated = seen
+    items, last_updated = _load_items("cache", reg)
     return _shape_results(
         items, filter=filter, search=search, sort=sort, order=order,
         page=page, per_page=per_page, include_dismissed=include_dismissed, reg=reg,
+        category=_csv(category), genre=_csv(genre), language=_csv(language),
+        quick=_csv(quick),
         extra={"source": "cache", "last_updated": last_updated},
     )
 
