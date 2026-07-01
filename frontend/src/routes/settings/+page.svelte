@@ -1007,7 +1007,7 @@
           </label>
 
           <label class="block">
-            <Tooltip text="Controls how much larger a new file needs to be to count as a size upgrade. Low = flag any file noticeably bigger. High = only flag files significantly larger (reduces noise for minor encodes).">
+            <Tooltip text="How much larger (as a percentage) a new file must be than your existing copy at the same resolution to count as a size upgrade — e.g. 10 means it must be at least 10% larger. Lower flags more upgrades (even minor re-encodes); higher only flags clearly bigger files. Resolution and Dolby Vision upgrades are always flagged regardless of size.">
               <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Upgrade Sensitivity (%) ⓘ</span>
             </Tooltip>
             <input
