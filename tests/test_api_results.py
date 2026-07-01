@@ -196,3 +196,14 @@ def test_cached_category_query_param_filters():
     c = _client_with_cache(rows)
     r = c.get("/results/cached", params={"category": "4k", "per_page": 100}).json()
     assert {i["title"] for i in r["items"]} == {"K"}
+
+
+def test_select_all_filtered_returns_matching_group_keys():
+    rows = [_row("A", status="missing", category="4k"),
+            _row("B", status="in_library", category="4k"),
+            _row("C", status="missing", category="remux")]
+    c = _client_with_cache(rows)
+    r = c.post("/results/select-all",
+               json={"source": "cache", "filter": "missing", "category": "4k"}).json()
+    assert r["selected_count"] == 1
+    assert r["group_keys"] == ["A-k"]

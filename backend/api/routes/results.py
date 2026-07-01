@@ -157,6 +157,16 @@ class SelectRequest(BaseModel):
     selected: bool = True
 
 
+class SelectAllRequest(BaseModel):
+    source: str = "live"
+    filter: Optional[str] = None
+    search: Optional[str] = None
+    category: Optional[str] = None
+    genre: Optional[str] = None
+    language: Optional[str] = None
+    quick: Optional[str] = None
+
+
 class DismissRequest(BaseModel):
     urls: List[str]
     # Optional url -> title map, stored for display in the "dismissed" manager.
@@ -341,14 +351,28 @@ def select_items(req: SelectRequest):
 
 
 @router.post("/select-all")
-def select_all():
-    raw_items = get_last_scan_items()
+def select_all(req: Optional[SelectAllRequest] = None,
+               reg: ServiceRegistry = Depends(get_registry)):
+    if req is None:
+        raw_items = get_last_scan_items()
+        with _selected_lock:
+            for item in raw_items:
+                gk = getattr(item, "group_key", None) or (
+                    item.get("group_key") if isinstance(item, dict) else None)
+                if gk:
+                    _selected.add(gk)
+            return {"status": "ok", "selected_count": len(_selected),
+                    "group_keys": sorted(_selected)}
+    items, _ = _load_items("cache" if req.source == "cache" else "live", reg)
+    matched = _filter_and_sort(
+        items, filter=req.filter, search=req.search, category=_csv(req.category),
+        genre=_csv(req.genre), language=_csv(req.language), quick=_csv(req.quick),
+    )
+    keys = [str(i.get("group_key")) for i in matched if i.get("group_key")]
     with _selected_lock:
-        for item in raw_items:
-            gk = getattr(item, "group_key", None) or (item.get("group_key") if isinstance(item, dict) else None)
-            if gk:
-                _selected.add(gk)
-        return {"status": "ok", "selected_count": len(_selected)}
+        _selected.clear()
+        _selected.update(keys)
+        return {"status": "ok", "selected_count": len(_selected), "group_keys": keys}
 
 
 @router.post("/deselect-all")
