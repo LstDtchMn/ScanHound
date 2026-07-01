@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -14,6 +16,133 @@ from backend.api.routes.scanner import get_last_scan_items, _media_item_to_dict
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/results", tags=["results"])
+
+# Filter and sort helpers (Task 1: server-side filtering/sorting for pagination)
+_KNOWN_CATEGORIES = {"4k", "remux", "tv"}
+
+
+def _effective_category(item: Dict[str, Any]) -> str:
+    """Determine the effective category for an item.
+
+    If category is set, use it. Otherwise, use 'tv' if season is not None,
+    else '4k'.
+    """
+    cat = item.get("category")
+    if cat:
+        return cat
+    return "tv" if item.get("season") is not None else "4k"
+
+
+def _has_plex_copy(item: Dict[str, Any]) -> bool:
+    """Check if item has at least one Plex version.
+
+    Safely parses plex_versions JSON array; fails gracefully to False.
+    """
+    try:
+        return len(json.loads(item.get("plex_versions") or "[]")) > 0
+    except (ValueError, TypeError):
+        return False
+
+
+def _parse_size_to_bytes(size: str) -> float:
+    """Parse a human-readable size string to bytes.
+
+    Examples: "4.5 GB" -> 4.5e9, "512 MB" -> 5.12e8
+    Returns 0.0 if unparseable.
+    """
+    if not size:
+        return 0.0
+    m = re.search(r"([\d.]+)\s*(TB|GB|MB|KB|B)", size, re.IGNORECASE)
+    if not m:
+        return 0.0
+    mult = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+    return float(m.group(1)) * mult.get(m.group(2).upper(), 0)
+
+
+def _parse_posted_date(s: str) -> float:
+    """Parse posted_date string to Unix timestamp.
+
+    Expected format: "June 8, 2026 at 12:56 AM"
+    Returns 0.0 if unparseable.
+    """
+    if not s:
+        return 0.0
+    txt = s.replace(" at ", " ").strip()
+    for fmt in ("%B %d, %Y %I:%M %p", "%B %d, %Y"):
+        try:
+            return datetime.strptime(txt, fmt).timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
+_SORT_KEYS = {
+    "title": lambda i: str(i.get("title", "")).casefold(),
+    "year": lambda i: float(i.get("year") or 0),
+    "rating": lambda i: float(i.get("rating") or 0),
+    "size": lambda i: _parse_size_to_bytes(i.get("size", "") or ""),
+    "posted_date": lambda i: _parse_posted_date(i.get("posted_date", "") or ""),
+}
+
+
+def _filter_and_sort(items, *, filter=None, search=None, category=None,
+                     genre=None, language=None, quick=None,
+                     sort="title", order="asc"):
+    """Filter and sort items server-side.
+
+    Args:
+        items: list of item dicts
+        filter: status filter (e.g., "missing", "upgrade", "library")
+        search: search in title
+        category: list of enabled categories; shows unknowns + enabled
+        genre: list of genres; item must have at least one
+        language: list of languages; item must match
+        quick: list of quick filters ('4k', 'hdrdv', 'inplex')
+        sort: sort key (default "title")
+        order: "asc" or "desc" (default "asc")
+
+    Returns:
+        Filtered, sorted list of items.
+    """
+    result = list(items)
+
+    if filter:
+        fl = filter.lower()
+        result = [i for i in result if fl in str(i.get("status", "")).lower()]
+
+    if search:
+        sl = search.lower()
+        result = [i for i in result if sl in str(i.get("title", "")).lower()]
+
+    if category:
+        enabled = set(category)
+        result = [i for i in result
+                  if _effective_category(i) not in _KNOWN_CATEGORIES
+                  or _effective_category(i) in enabled]
+
+    if genre:
+        gset = set(genre)
+        result = [i for i in result if any(g in gset for g in (i.get("genres") or []))]
+
+    if language:
+        lset = set(language)
+        result = [i for i in result if i.get("language") in lset]
+
+    if quick:
+        q = set(quick)
+        if "4k" in q:
+            result = [i for i in result if i.get("resolution") == "4K"]
+        if "hdrdv" in q:
+            result = [i for i in result
+                      if i.get("dovi") or (i.get("hdr") and i.get("hdr") != "SDR")]
+        if "inplex" in q:
+            result = [i for i in result if _has_plex_copy(i)]
+
+    keyfn = _SORT_KEYS.get(sort)
+    if keyfn:
+        result = sorted(result, key=keyfn, reverse=(order == "desc"))
+
+    return result
 
 # Selection state
 _selected: set = set()
