@@ -7,7 +7,8 @@ vi.mock('$lib/api/client', () => ({
     dismissItems: vi.fn().mockResolvedValue({ status: 'ok', dismissed_count: 1 }),
     dismissedList: vi.fn().mockResolvedValue({ items: [], count: 0 }),
     selectAll: vi.fn().mockResolvedValue({}),
-    deselectAll: vi.fn().mockResolvedValue({})
+    deselectAll: vi.fn().mockResolvedValue({}),
+    getCachedResults: vi.fn()
   }
 }));
 
@@ -24,7 +25,8 @@ const {
   filteredResults,
   deckResults,
   dismissItem,
-  restoreItem
+  restoreItem,
+  pagedMode
 } = await import('./results');
 
 function item(overrides: Partial<ScanResult>): ScanResult {
@@ -71,6 +73,9 @@ function resetStores() {
   genreFilter.set([]);
   languageFilter.set([]);
   quickFilters.set([]);
+  // These suites exercise the legacy client-side filter+sort pipeline
+  // directly; paged mode (server-side filtering) is covered separately below.
+  pagedMode.set(false);
 }
 
 describe('filteredResults', () => {
@@ -200,5 +205,53 @@ describe('dismissItem / restoreItem', () => {
     dismissItem('');
     expect(get(dismissedUrls).size).toBe(0);
     expect(api.dismissItems).not.toHaveBeenCalled();
+  });
+});
+
+describe('loadResults / paged mode', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('loadResults(true) replaces results and sets paged totals', async () => {
+    const { loadResults, results, filteredTotal, hasMore, pagedMode } =
+      await import('./results');
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'A', url: 'a' }), item({ title: 'B', url: 'b' })],
+      total: 5, stats: { total: 5, missing: 5, upgrade: 0, library: 0 },
+      title_counts: { A: 1, B: 1 }, source: 'cache'
+    });
+    pagedMode.set(true);
+    await loadResults(true);
+    expect(get(results).length).toBe(2);
+    expect(get(filteredTotal)).toBe(5);
+    expect(get(hasMore)).toBe(true);
+  });
+
+  it('loadResults(false) appends the next page and flips hasMore off', async () => {
+    const { loadResults, results, hasMore, pagedMode } = await import('./results');
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'A', url: 'a' })], total: 2,
+      stats: { total: 2, missing: 2, upgrade: 0, library: 0 }, title_counts: { A: 1 }
+    });
+    await loadResults(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'B', url: 'b' })], total: 2,
+      stats: { total: 2, missing: 2, upgrade: 0, library: 0 }, title_counts: { B: 1 }
+    });
+    await loadResults(false);
+    expect(get(results).map(r => r.title)).toEqual(['A', 'B']);
+    expect(get(hasMore)).toBe(false);
+  });
+
+  it('paged filteredResults passes results through untouched', async () => {
+    const { results, filteredResults, pagedMode, statusFilter } = await import('./results');
+    pagedMode.set(true);
+    statusFilter.set('missing');
+    results.set([item({ title: 'Z', status: 'in_library', url: 'z' })]);
+    // paged mode must NOT re-apply the status filter client-side
+    expect(get(filteredResults).map(r => r.title)).toEqual(['Z']);
   });
 });

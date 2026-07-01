@@ -1,4 +1,4 @@
-import { writable, derived } from 'svelte/store';
+import { writable, derived, get } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { connection } from './connection';
 import type { ScanResult, ScanStats } from '$lib/api/types';
@@ -119,6 +119,20 @@ export const fromCache = writable<boolean>(false);
 export const cacheUpdatedAt = writable<string | null>(null);
 let fromCacheActive = false;
 
+// ── Server-side pagination (paged mode) ───────────────────────────────
+/** When true, `results` is loaded page-by-page from the server (which has
+ *  already applied filters/sort/dismissal) and `filteredResults` becomes a
+ *  passthrough. When false, the legacy client-side filter+sort pipeline runs
+ *  over the full (pre-fetched) result set. */
+export const pagedMode = writable<boolean>(true);
+export const hasMore = writable<boolean>(false);
+export const loadingMore = writable<boolean>(false);
+export const loadError = writable<boolean>(false);
+/** Total matching items on the server for the current filter set (paged mode). */
+export const filteredTotal = writable<number>(0);
+/** Per-title counts over the filtered server set (paged mode; for dup-badges etc). */
+export const titleCounts = writable<Record<string, number>>({});
+
 let activeScanResultCount = 0;
 
 /** Parse a human-readable size string like "4.5 GB" into bytes for comparison */
@@ -209,9 +223,81 @@ function hasPlexCopy(i: ScanResult): boolean {
   try { return JSON.parse(i.plex_versions || '[]').length > 0; } catch { return false; }
 }
 
+const SORT_PARAM: Record<SortOption, { sort: string; order: string }> = {
+  'title-asc': { sort: 'title', order: 'asc' },
+  'title-desc': { sort: 'title', order: 'desc' },
+  'year-desc': { sort: 'year', order: 'desc' },
+  'year-asc': { sort: 'year', order: 'asc' },
+  'size-desc': { sort: 'size', order: 'desc' },
+  'size-asc': { sort: 'size', order: 'asc' },
+  'rating-desc': { sort: 'rating', order: 'desc' },
+  'rating-asc': { sort: 'rating', order: 'asc' },
+  'posted-desc': { sort: 'posted_date', order: 'desc' },
+  'posted-asc': { sort: 'posted_date', order: 'asc' }
+};
+
+let currentPage = 0;
+let currentQueryKey = '';
+
+/** Snapshot of every filter/sort input that changes the server query, so a
+ *  page load can detect it's been superseded by a filter change mid-flight. */
+function filterQueryKey(): string {
+  return JSON.stringify([
+    get(statusFilter), get(searchFilter), get(genreFilter), get(languageFilter),
+    get(quickFilters), get(categoryFilter), get(sortBy)
+  ]);
+}
+
+function buildResultParams(page: number): Record<string, string> {
+  const p: Record<string, string> = { page: String(page), per_page: '100' };
+  const s = get(statusFilter); if (s !== 'all') p.filter = s;
+  const q = get(searchFilter); if (q) p.search = q;
+  const cats = get(categoryFilter); if (cats.length) p.category = cats.join(',');
+  const g = get(genreFilter); if (g.length) p.genre = g.join(',');
+  const l = get(languageFilter); if (l.length) p.language = l.join(',');
+  const qf = get(quickFilters); if (qf.length) p.quick = qf.join(',');
+  const so = SORT_PARAM[get(sortBy)]; p.sort = so.sort; p.order = so.order;
+  return p;
+}
+
+/** Load a page of server-filtered/sorted results (paged mode). `reset` starts
+ *  over from page 1 and replaces `results`; otherwise the next page is
+ *  fetched and appended. No-ops outside paged mode or while already loading.
+ *  Discards the response if the filters changed while the request was in
+ *  flight (a fresh load for the new filters will already be underway). */
+export async function loadResults(reset: boolean): Promise<void> {
+  if (!get(pagedMode)) return;
+  if (get(loadingMore)) return;
+  const key = filterQueryKey();
+  if (!reset && key !== currentQueryKey) return; // stale append
+  const page = reset ? 1 : currentPage + 1;
+  loadingMore.set(true);
+  loadError.set(false);
+  try {
+    const data = await api.getCachedResults(buildResultParams(page));
+    if (filterQueryKey() !== key) return; // superseded while awaiting — discard
+    const items = (data.items ?? []) as ScanResult[];
+    if (reset) { results.set(items); currentPage = 1; currentQueryKey = key; }
+    else { results.update((r) => [...r, ...items]); currentPage = page; }
+    filteredTotal.set(data.total ?? items.length);
+    titleCounts.set((data as { title_counts?: Record<string, number> }).title_counts ?? {});
+    if (data.stats) stats.set(data.stats);
+    hasMore.set(get(results).length < (data.total ?? 0));
+    if ((data as { source?: string }).source === 'cache') {
+      cacheUpdatedAt.set((data as { last_updated?: string }).last_updated ?? null);
+      fromCache.set(true);
+    }
+  } catch {
+    loadError.set(true);
+  } finally {
+    loadingMore.set(false);
+  }
+}
+
 export const filteredResults = derived(
-  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls, categoryFilter],
-  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed, $category]) => {
+  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls, categoryFilter, pagedMode],
+  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed, $category, $paged]) => {
+    if ($paged) return $results; // server already filtered + sorted
     let items = $results;
     // Hide swiped-away ("skip") items everywhere they'd otherwise appear.
     if ($dismissed.size > 0) {
