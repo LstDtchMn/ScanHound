@@ -118,7 +118,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ group_keys: groupKeys, selected })
     }),
-  selectAll: () => request('/results/select-all', { method: 'POST' }),
+  selectAll: (payload?: Record<string, string>) =>
+    request('/results/select-all', {
+      method: 'POST',
+      body: payload ? JSON.stringify(payload) : undefined
+    }),
   deselectAll: () => request('/results/deselect-all', { method: 'POST' }),
   exportCsv: () =>
     request<{ filepath: string }>('/results/export', { method: 'POST' }),

@@ -254,4 +254,25 @@ describe('loadResults / paged mode', () => {
     // paged mode must NOT re-apply the status filter client-side
     expect(get(filteredResults).map(r => r.title)).toEqual(['Z']);
   });
+
+  it('selectAll sets selectedKeys from returned group_keys', async () => {
+    const { selectAll, selectedKeys } = await import('./results');
+    (api.selectAll as any).mockResolvedValueOnce({ selected_count: 2, group_keys: ['x-k', 'y-k'] });
+    await selectAll();
+    expect([...get(selectedKeys)].sort()).toEqual(['x-k', 'y-k']);
+  });
+
+  it('dismissItem removes the row from results in paged mode', async () => {
+    const { results, dismissItem, pagedMode } = await import('./results');
+    pagedMode.set(true);
+    results.set([item({ title: 'A', url: 'keep' }), item({ title: 'B', url: 'drop' })]);
+    await dismissItem('drop', 'B');
+    expect(get(results).map(r => r.url)).toEqual(['keep']);
+  });
+
+  it('categoryFilter defaults to all three categories', async () => {
+    // Fresh module import with no persisted value returns the new default.
+    const mod = await import('./results');
+    expect(get(mod.categoryFilter).sort()).toEqual(['4k', 'remux', 'tv']);
+  });
 });

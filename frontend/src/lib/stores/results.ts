@@ -104,7 +104,7 @@ export function toggleQuickFilter(key: string) {
 /** Source categories ('4k' | 'remux' | 'tv') currently shown in the list — driven
  *  by the ScanControls 4K/Remux/TV toggles so they filter the (pre-cached) results
  *  instantly. Items with an unknown/empty category always show. */
-export const categoryFilter = persisted<string[]>('sh-category-filter', ['4k']);
+export const categoryFilter = persisted<string[]>('sh-category-filter', ['4k', 'remux', 'tv']);
 
 export const selectedKeys = writable<Set<string>>(new Set());
 
@@ -421,6 +421,9 @@ export function dismissItem(url: string, title?: string): Promise<boolean> {
     next.add(url);
     return next;
   });
+  if (get(pagedMode)) {
+    results.update((items) => items.filter((i) => i.url !== url));
+  }
   return api.dismissItems([url], title ? { [url]: title } : undefined, true).then(
     () => true,
     () => {
@@ -531,27 +534,22 @@ export function toggleSelect(groupKey: string) {
   });
 }
 
-export async function selectAll(filteredKeys?: string[]) {
-  const applySelection = () => {
-    if (filteredKeys) {
-      selectedKeys.update((s) => {
-        const next = new Set(s);
-        for (const k of filteredKeys) next.add(k);
-        return next;
-      });
-    } else {
-      results.update((items) => {
-        selectedKeys.set(new Set(items.map((i) => i.url)));
-        return items;
-      });
-    }
+export async function selectAll() {
+  const payload: Record<string, string> = {
+    source: get(fromCache) ? 'cache' : 'live'
   };
+  const s = get(statusFilter); if (s !== 'all') payload.filter = s;
+  const q = get(searchFilter); if (q) payload.search = q;
+  const cats = get(categoryFilter); if (cats.length) payload.category = cats.join(',');
+  const g = get(genreFilter); if (g.length) payload.genre = g.join(',');
+  const l = get(languageFilter); if (l.length) payload.language = l.join(',');
+  const qf = get(quickFilters); if (qf.length) payload.quick = qf.join(',');
   try {
-    await api.selectAll();
+    const res = await api.selectAll(payload) as { group_keys?: string[] };
+    if (res?.group_keys) selectedKeys.set(new Set(res.group_keys));
   } catch {
-    // API call failed — select locally anyway
+    selectedKeys.set(new Set(get(results).map((i) => i.url)));
   }
-  applySelection();
 }
 
 export async function deselectAll() {
@@ -565,3 +563,20 @@ export async function deselectAll() {
 
 export const selectedDetail = writable<ScanResult | null>(null);
 export const focusedIndex = writable<number>(-1);
+
+// ── Debounced refetch on filter/sort change (paged mode) ──────────────
+/** Whenever the server-relevant filter/sort inputs change, re-fetch page 1
+ *  after a short debounce — but only in paged mode, and never on the initial
+ *  subscribe (which fires immediately with the current values). */
+const _filterKey = derived(
+  [statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy],
+  (vals) => JSON.stringify(vals)
+);
+let _filterDebounce: ReturnType<typeof setTimeout> | undefined;
+let _filterKeyPrimed = false;
+_filterKey.subscribe(() => {
+  if (!_filterKeyPrimed) { _filterKeyPrimed = true; return; } // skip initial fire
+  if (!get(pagedMode)) return;
+  clearTimeout(_filterDebounce);
+  _filterDebounce = setTimeout(() => loadResults(true), 250);
+});
