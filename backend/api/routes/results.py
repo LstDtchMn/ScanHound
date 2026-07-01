@@ -56,7 +56,10 @@ def _parse_size_to_bytes(size: str) -> float:
     if not m:
         return 0.0
     mult = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
-    return float(m.group(1)) * mult.get(m.group(2).upper(), 0)
+    try:
+        return float(m.group(1)) * mult.get(m.group(2).upper(), 0)
+    except ValueError:
+        return 0.0
 
 
 def _parse_posted_date(s: str) -> float:
