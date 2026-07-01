@@ -1008,17 +1008,16 @@
 
           <label class="block">
             <Tooltip text="Controls how much larger a new file needs to be to count as a size upgrade. Low = flag any file noticeably bigger. High = only flag files significantly larger (reduces noise for minor encodes).">
-              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Upgrade Sensitivity ⓘ</span>
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Upgrade Sensitivity (%) ⓘ</span>
             </Tooltip>
-            <select
-              value={String($settings.upgrade_sensitivity ?? 2)}
-              onchange={(e) => settings.update((s) => ({ ...s, upgrade_sensitivity: parseInt(e.currentTarget.value) }))}
-              class={inputClass}
-            >
-              <option value="1">Low — only major upgrades</option>
-              <option value="2">Medium — standard upgrades</option>
-              <option value="3">High — all potential upgrades</option>
-            </select>
+            <input
+              type="number"
+              min="0"
+              max="100"
+              value={$settings.upgrade_sensitivity as number ?? 10}
+              oninput={(e) => settings.update((s) => ({ ...s, upgrade_sensitivity: parseInt(e.currentTarget.value) || 10 }))}
+              class={inputSmClass}
+            />
           </label>
         </div>
 

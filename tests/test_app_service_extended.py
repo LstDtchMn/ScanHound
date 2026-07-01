@@ -812,7 +812,7 @@ class TestValidateConfigValuesExtended:
         svc = self._make_service({"upgrade_sensitivity": "abc"})
         result = svc.validate_config_values()
         assert any("upgrade_sensitivity" in w for w in result["warnings"])
-        assert svc.config["upgrade_sensitivity"] == 2  # default
+        assert svc.config["upgrade_sensitivity"] == 10  # default
 
     def test_boolean_int_conversion(self):
         """Integer 1 for a boolean field should be converted to True with warning."""

@@ -310,7 +310,7 @@ _DEFAULT_CONFIG: AppConfig = {
     "plex_refresh_mode": "auto",
     "plex_invalidate_on_new_content": True,
     "ignore_keywords": "Cam, TS, HC, KORSUB, TC",
-    "upgrade_sensitivity": 2,
+    "upgrade_sensitivity": 10,
     "movie_libs": ["Movies (1080p)", "Movies (4K HDR)"],
     "tv_libs": ["TV Shows"],
     "known_libraries": [],

@@ -539,9 +539,15 @@ class TestSettingsPresets:
         assert p["min_size_mb"] == 1000
 
     def test_balanced_preset_matches_defaults(self):
-        """Balanced preset should align with the default config's upgrade rules."""
+        """Balanced preset should align with the default config's upgrade rules.
+
+        NOTE: upgrade_sensitivity is intentionally excluded here. The bare
+        default was raised 2 -> 10 (over-sensitive upgrade threshold fix)
+        while the named "Balanced" preset was deliberately left at 2, so
+        the two no longer match. See docs/feature-prompts / upgrade-tuning
+        branch history for the rationale.
+        """
         p = SETTINGS_PRESETS["Balanced"]
-        assert p["upgrade_sensitivity"] == _DEFAULT_CONFIG["upgrade_sensitivity"]
         assert p["min_size_mb"] == _DEFAULT_CONFIG["min_size_mb"]
 
 

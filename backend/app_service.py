@@ -747,7 +747,7 @@ class AppService:
         numeric_validations = {
             'min_size_mb': (0, 100000, 200),
             'cache_duration': (0, 168, 4),
-            'upgrade_sensitivity': (0, 100, 2),
+            'upgrade_sensitivity': (0, 100, 10),
             'scheduler_interval': (1, 168, 24),
             'scan_threads': (1, 50, 10),
             'tv_match_threshold': (0, 100, 90),
