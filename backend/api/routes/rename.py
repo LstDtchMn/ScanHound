@@ -371,6 +371,6 @@ def dv_scans(layer: Optional[str] = None, limit: int = 500,
         return {"scans": [], "counts": {}}
     limit = max(1, min(int(limit), 2000))  # clamp: never let a client OOM the box
     return {
-        "scans": reg.db.get_dv_scans(dv_layer=layer, limit=limit),
-        "counts": reg.db.count_dv_scans_by_layer(),
+        "scans": reg.db.get_dv_scans(dv_layer=layer, limit=limit, source="scan"),
+        "counts": reg.db.count_dv_scans_by_layer(source="scan"),
     }

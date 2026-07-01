@@ -1307,22 +1307,40 @@ class DatabaseManager:
             logger.error("get_dv_scans_by_paths error: %s", e)
             return {}
 
-    def get_dv_scans(self, dv_layer=None, limit=100000):
-        """Return DV-scan rows, optionally filtered by layer (e.g. 'fel')."""
+    def get_dv_scans(self, dv_layer=None, limit=100000, source=None):
+        """Return DV-scan rows, optionally filtered by layer and/or source.
+
+        ``source`` (e.g. 'scan') restricts the list to that origin, so the DV
+        panel can show real detected rows instead of dead seed rows.
+        """
+        clauses = []
+        params = []
         if dv_layer:
-            return self._query_dicts(
-                'SELECT path, title, dv_layer, rating_key, imdb_id, '
-                'scanned_at, last_seen_at FROM dv_scan WHERE dv_layer = ? '
-                'ORDER BY last_seen_at DESC LIMIT ?', (dv_layer, limit), default=[])
+            clauses.append("dv_layer = ?")
+            params.append(dv_layer)
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
         return self._query_dicts(
             'SELECT path, title, dv_layer, rating_key, imdb_id, '
-            'scanned_at, last_seen_at FROM dv_scan '
-            'ORDER BY last_seen_at DESC LIMIT ?', (limit,), default=[])
+            'scanned_at, last_seen_at FROM dv_scan'
+            f'{where} ORDER BY last_seen_at DESC LIMIT ?', tuple(params), default=[])
 
-    def count_dv_scans_by_layer(self):
-        """Return ``{layer: count}`` over the dv_scan table."""
-        rows = self._query(
-            'SELECT dv_layer, COUNT(*) FROM dv_scan GROUP BY dv_layer', default=[])
+    def count_dv_scans_by_layer(self, source=None):
+        """Return ``{layer: count}`` over the dv_scan table.
+
+        ``source`` (e.g. 'scan') restricts the count to that origin, so the DV
+        panel can show real detected counts instead of dead seed rows.
+        """
+        if source is not None:
+            rows = self._query(
+                'SELECT dv_layer, COUNT(*) FROM dv_scan WHERE source = ? '
+                'GROUP BY dv_layer', (source,), default=[])
+        else:
+            rows = self._query(
+                'SELECT dv_layer, COUNT(*) FROM dv_scan GROUP BY dv_layer', default=[])
         return {r[0]: r[1] for r in (rows or [])}
 
     def dv_scan_is_current(self, path, sig_mtime, sig_size):
