@@ -534,22 +534,27 @@ export function toggleSelect(groupKey: string) {
   });
 }
 
-export async function selectAll() {
-  const payload: Record<string, string> = {
-    source: get(fromCache) ? 'cache' : 'live'
+export async function selectAll(filteredKeys?: string[]) {
+  const applySelection = () => {
+    if (filteredKeys) {
+      selectedKeys.update((s) => {
+        const next = new Set(s);
+        for (const k of filteredKeys) next.add(k);
+        return next;
+      });
+    } else {
+      results.update((items) => {
+        selectedKeys.set(new Set(items.map((i) => i.url)));
+        return items;
+      });
+    }
   };
-  const s = get(statusFilter); if (s !== 'all') payload.filter = s;
-  const q = get(searchFilter); if (q) payload.search = q;
-  const cats = get(categoryFilter); if (cats.length) payload.category = cats.join(',');
-  const g = get(genreFilter); if (g.length) payload.genre = g.join(',');
-  const l = get(languageFilter); if (l.length) payload.language = l.join(',');
-  const qf = get(quickFilters); if (qf.length) payload.quick = qf.join(',');
   try {
-    const res = await api.selectAll(payload) as { group_keys?: string[] };
-    if (res?.group_keys) selectedKeys.set(new Set(res.group_keys));
+    await api.selectAll();
   } catch {
-    selectedKeys.set(new Set(get(results).map((i) => i.url)));
+    // API call failed — select locally anyway
   }
+  applySelection();
 }
 
 export async function deselectAll() {

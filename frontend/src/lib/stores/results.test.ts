@@ -255,11 +255,18 @@ describe('loadResults / paged mode', () => {
     expect(get(filteredResults).map(r => r.title)).toEqual(['Z']);
   });
 
-  it('selectAll sets selectedKeys from returned group_keys', async () => {
+  it('selectAll(keys) adds the given keys to selectedKeys, preserving existing selections', async () => {
     const { selectAll, selectedKeys } = await import('./results');
-    (api.selectAll as any).mockResolvedValueOnce({ selected_count: 2, group_keys: ['x-k', 'y-k'] });
+    selectedKeys.set(new Set(['already-selected']));
+    await selectAll(['u1', 'u2']);
+    expect([...get(selectedKeys)].sort()).toEqual(['already-selected', 'u1', 'u2']);
+  });
+
+  it('selectAll() with no args selects every loaded result\'s url', async () => {
+    const { selectAll, selectedKeys, results } = await import('./results');
+    results.set([item({ title: 'A', url: 'a' }), item({ title: 'B', url: 'b' })]);
     await selectAll();
-    expect([...get(selectedKeys)].sort()).toEqual(['x-k', 'y-k']);
+    expect([...get(selectedKeys)].sort()).toEqual(['a', 'b']);
   });
 
   it('dismissItem removes the row from results in paged mode', async () => {
