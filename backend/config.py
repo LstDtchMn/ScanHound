@@ -528,7 +528,7 @@ SETTINGS_PRESETS = {
         "rule_1080_1080": True,
         "rule_4k_4k": True,
         "strict_resolution": False,
-        "upgrade_sensitivity": 2,
+        "upgrade_sensitivity": 10,
         "min_size_mb": 200
     }
 }
