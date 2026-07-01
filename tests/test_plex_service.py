@@ -816,7 +816,9 @@ class TestExtractMovieData:
 
         movie = _make_mock_movie(media_list=[media])
         result = svc._extract_movie_data(movie)
-        assert result[0]["size"] == 0
+        # Media with no parts is skipped entirely (nothing to serve/label) —
+        # no rows are produced, so the extractor returns None.
+        assert result is None
 
     def test_exception_returns_none(self):
         svc = _make_service()
