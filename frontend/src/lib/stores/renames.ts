@@ -248,15 +248,17 @@ connection.on('dv:scan_done', (data) => {
 });
 
 // ── Dolby Vision label sync (mirrors the DV scan stores above) ────────
-export interface DvSyncProgress { done: number; total: number; title: string; }
+export interface DvSyncProgress { done: number; total: number; }
 export interface DvSyncResult {
-  added: number; removed: number; unmatched: number;
-  dry_run?: boolean; error?: string;
+  total: number; added: number; removed: number; matched: number; dry_run: boolean;
+  error?: string;
 }
 /** True from dispatch of a label sync until its dv:sync_done arrives —
  *  drives the "Sync Plex labels" button's disabled state. */
 export const dvSyncRunning = writable<boolean>(false);
-/** Live per-title progress of a running label sync (null when idle). */
+/** Live done/total progress of a running label sync (null when idle) — the
+ *  backend reports counts only, no per-title text (see dv_sync_labels in
+ *  backend/api/routes/rename.py). */
 export const dvSyncProgress = writable<DvSyncProgress | null>(null);
 /** Summary of the last completed label sync. */
 export const dvSyncResult = writable<DvSyncResult | null>(null);

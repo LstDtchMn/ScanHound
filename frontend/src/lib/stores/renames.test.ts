@@ -33,16 +33,25 @@ describe('DV sync stores', () => {
     const mod = await import('./renames');
     const { get } = await import('svelte/store');
     mod.dvSyncRunning.set(true);
-    handlers['dv:sync_done']({ added: 1, removed: 0, unmatched: 2 });
+    handlers['dv:sync_done']({ total: 3, added: 1, removed: 0, matched: 2, dry_run: false });
     expect(get(mod.dvSyncRunning)).toBe(false);
-    expect(get(mod.dvSyncResult)).toEqual({ added: 1, removed: 0, unmatched: 2 });
+    expect(get(mod.dvSyncResult)).toEqual({ total: 3, added: 1, removed: 0, matched: 2, dry_run: false });
     expect(get(mod.dvSyncProgress)).toBeNull();
+  });
+
+  it('dv:sync_done with an error payload stores the error', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.dvSyncRunning.set(true);
+    handlers['dv:sync_done']({ error: 'Plex not initialized' });
+    expect(get(mod.dvSyncRunning)).toBe(false);
+    expect(get(mod.dvSyncResult)).toEqual({ error: 'Plex not initialized' });
   });
 
   it('dv:sync_progress updates dvSyncProgress', async () => {
     const mod = await import('./renames');
     const { get } = await import('svelte/store');
-    handlers['dv:sync_progress']({ done: 3, total: 10, title: 'Dune' });
-    expect(get(mod.dvSyncProgress)).toEqual({ done: 3, total: 10, title: 'Dune' });
+    handlers['dv:sync_progress']({ done: 3, total: 10 });
+    expect(get(mod.dvSyncProgress)).toEqual({ done: 3, total: 10 });
   });
 });
