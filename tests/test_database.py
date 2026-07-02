@@ -427,6 +427,57 @@ class TestPlexCache:
         loaded = db_manager.load_plex_cache("Movies")
         assert len(loaded) == 2
 
+    def test_multi_part_media_rows_both_survive(self, db_manager):
+        """Regression (Task-2 review finding): a single Plex Media with TWO
+        Parts (e.g. a two-file DVD rip / split file) is emitted by
+        _extract_movie_data as two dicts sharing the same rating_key and
+        media_id, distinguished only by a per-part 'key'. Without a per-part
+        key, both rows collide on the fallback f"{rating_key}_{media_id}"
+        primary key and INSERT OR REPLACE silently drops one — only the
+        last part's row survives. This test asserts both rows persist
+        across a save + reload cycle.
+        """
+        items = [
+            {
+                "clean_title": "two part movie",
+                "original_title": "Two Part Movie",
+                "year": 2001,
+                "res": "1080p",
+                "size": 4.5,
+                "imdb_id": "tt9999999",
+                "rating_key": "5001",
+                "media_id": "m5001",
+                "dovi": False,
+                "hdr": False,
+                "file": "Y:/Movies/Two Part Movie/cd1.mkv",
+                "key": "5001_m5001_0",
+            },
+            {
+                "clean_title": "two part movie",
+                "original_title": "Two Part Movie",
+                "year": 2001,
+                "res": "1080p",
+                "size": 4.3,
+                "imdb_id": "tt9999999",
+                "rating_key": "5001",
+                "media_id": "m5001",
+                "dovi": False,
+                "hdr": False,
+                "file": "Y:/Movies/Two Part Movie/cd2.mkv",
+                "key": "5001_m5001_1",
+            },
+        ]
+
+        db_manager.save_plex_cache(items, "Movies")
+        loaded = db_manager.load_plex_cache("Movies")
+
+        matches = [i for i in loaded if i["rating_key"] == "5001"]
+        assert len(matches) == 2, (
+            f"expected both multi-part rows to survive, got {len(matches)}: {matches}"
+        )
+        sizes = {i["size"] for i in matches}
+        assert sizes == {4.5, 4.3}
+
 
 # ---------------------------------------------------------------------------
 # 5. Scan history

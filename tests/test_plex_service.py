@@ -808,7 +808,7 @@ class TestExtractMovieData:
         result = svc._extract_movie_data(movie)
         assert result[0]["imdb_id"] is None
 
-    def test_no_part_size_zero(self):
+    def test_media_with_no_parts_skipped(self):
         svc = _make_service()
         media = MagicMock()
         media.videoResolution = "1080"

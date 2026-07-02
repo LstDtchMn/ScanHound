@@ -432,7 +432,7 @@ class PlexService:
                 parts = media.parts or []
                 if not parts:
                     continue
-                for part in parts:
+                for part_idx, part in enumerate(parts):
                     size_gb = round(part.size / (1024**3), 2) if part and part.size else 0
 
                     res = "?"
@@ -471,9 +471,16 @@ class PlexService:
                         'hdr': hdr,
                         'imdb_id': imdb_id,
                         'rating_key': movie.ratingKey,
-                        'media_id': media.id,  # unique per version — prevents DB key collision
+                        # media_id is unique per version, but NOT per part — a media with
+                        # multiple parts (e.g. a two-file DVD rip) reuses the same media_id
+                        # for each row below. 'key' (below) is what keeps DB rows distinct.
+                        'media_id': media.id,
                         'file': part.file if part else None,  # served path (may be None)
                         'language': getattr(movie, 'originalLanguage', '') or "",
+                        # Per-part cache key so multi-part media don't collide in
+                        # plex_cache's INSERT OR REPLACE (rating_key+media_id alone
+                        # is not unique when one media has multiple parts).
+                        'key': f"{movie.ratingKey}_{media.id}_{part_idx}",
                     })
 
             return results if results else None

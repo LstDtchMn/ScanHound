@@ -66,6 +66,31 @@ def test_extract_captures_file_for_all_parts():
     assert files == ["Y:/A/edition1.mkv", "Y:/A/edition2.mkv", "Z:/B/optimized.mp4"]
 
 
+def test_extract_gives_each_part_a_distinct_cache_key():
+    """Regression (Task-2 review finding): a single Media with multiple Parts
+    (e.g. a two-file DVD rip) must not emit rows that collide on
+    rating_key+media_id in the persisted plex_cache. _extract_movie_data
+    now stamps a per-part 'key' on every row so save_plex_cache's
+    INSERT OR REPLACE doesn't drop all but the last part.
+    """
+    svc = _make_service()
+    # Both media share the same id=42 (see _media()), so rating_key+media_id
+    # alone is NOT unique across these two parts -- only 'key' distinguishes them.
+    movie = _movie([
+        _media([_part("Y:/A/edition1.mkv"), _part("Y:/A/edition2.mkv")]),
+    ])
+    rows = svc._extract_movie_data(movie)
+    assert len(rows) == 2
+
+    keys = [r["key"] for r in rows]
+    assert len(keys) == len(set(keys)), f"expected distinct keys, got {keys}"
+
+    # media_id alone collides (both parts belong to the same media) --
+    # this is exactly why a per-part key is required.
+    assert rows[0]["rating_key"] == rows[1]["rating_key"]
+    assert rows[0]["media_id"] == rows[1]["media_id"]
+
+
 def test_extract_guards_empty_parts_and_none_file():
     svc = _make_service()
     empty_media = _media([])          # no parts
