@@ -47,6 +47,11 @@ def _isolate_config_file(tmp_path, monkeypatch):
     import backend.app_service as _app_service
     monkeypatch.setattr(_app_service, "CONFIG_FILE", str(tmp_path / "config.json"), raising=False)
     monkeypatch.setattr(_app_service, "_LEGACY_CONFIG_FILE", str(tmp_path / "legacy_config.json"), raising=False)
+    # AppService.save_config() also exports the DV host subset to DV_HOST_JSON
+    # (default /data/dv_host.json, which resolves to a drive-root path on
+    # Windows). Without patching this, the full suite would attempt to write
+    # to that uncontrolled path on every save_config() call.
+    monkeypatch.setattr(_app_service, "DV_HOST_JSON", str(tmp_path / "dv_host.json"), raising=False)
     yield
 
 
