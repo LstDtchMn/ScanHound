@@ -11,6 +11,7 @@ from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.routes.scanner import TMDB_IMAGE_BASE  # same base+size as Scan posters (w500)
 from backend.api.ws import ws_manager
 from backend.rename import dv_detect, llm_identify
+from backend.rename.dv_import import import_dv_host_db
 from backend.rename.service import conflict_annotations
 
 
@@ -45,6 +46,10 @@ class ProcessFolderRequest(BaseModel):
 class DvScanRequest(BaseModel):
     folder: str
     force: bool = False
+
+
+class DvImportRequest(BaseModel):
+    host_db_path: Optional[str] = None
 
 
 class BulkIdsRequest(BaseModel):
@@ -351,6 +356,20 @@ def dv_scan_folder(req: DvScanRequest, reg: ServiceRegistry = Depends(get_regist
 
     threading.Thread(target=_run, name="dv-scan-folder", daemon=True).start()
     return {"status": "started", "folder": folder, "force": force}
+
+
+# default host store path inside the container's bind-mounted data dir
+_DEFAULT_DV_HOST_DB = os.environ.get(
+    "SCANHOUND_DV_HOST_DB", "/data/dv_host.db")
+
+
+@router.post("/dv-import")
+def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)):
+    """Ingest the host detector's dv_host.db into dv_scan (source='scan')."""
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="DB not initialized")
+    path = (req.host_db_path or _DEFAULT_DV_HOST_DB)
+    return import_dv_host_db(reg.db, path)
 
 
 @router.get("/search-tmdb")
