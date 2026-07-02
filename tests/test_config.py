@@ -93,6 +93,8 @@ EXPECTED_DEFAULT_KEYS = {
     "auto_rename_template_movie", "auto_rename_template_tv",
     "auto_rename_plex_sort_titles", "auto_rename_llm_enabled",
     "ollama_base_url", "ollama_model",
+    # Dolby Vision host-detector + labeler
+    "dv_library_roots", "dv_detection", "dv_file_tagging", "dv_label_vocab",
     # Debug / logging
     "debug_mode", "verbose_logging", "clear_logs_startup", "scan_threads",
     # Matching thresholds
