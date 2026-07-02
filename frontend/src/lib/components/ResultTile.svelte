@@ -124,8 +124,9 @@
 
 <div
   transition:fly={{ y: 10, duration: 200 }}
-  class="min-w-0 bg-[var(--bg-secondary)] rounded-lg overflow-hidden border transition-colors cursor-pointer group
-    {selected ? 'border-[var(--accent)]' : 'border-[var(--border)] hover:border-[var(--text-secondary)]'}
+  class="relative min-w-0 bg-[var(--bg-secondary)] rounded-lg overflow-hidden border cursor-pointer group
+    transition-[transform,box-shadow,border-color,background-color] duration-200 ease-out hover:shadow-lg hover:scale-[1.02]
+    {selected ? 'border-[var(--accent)] bg-[var(--accent)]/10' : 'border-[var(--border)] hover:border-[var(--text-secondary)]'}
     {focused ? 'ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg-primary)]' : ''}"
   onclick={() => selectedDetail.set(item)}
   role="button"
@@ -137,7 +138,7 @@
       <img
         src={item.poster_url}
         alt={item.title}
-        class="w-full h-full object-cover transition-transform group-hover:scale-105 cursor-zoom-in"
+        class="w-full h-full object-cover cursor-zoom-in"
         loading="lazy"
         onmouseenter={onPosterEnter}
         onmouseleave={onPosterLeave}
@@ -152,8 +153,13 @@
         />
       {/if}
     {:else}
-      <div class="flex items-center justify-center h-full text-[var(--text-secondary)] text-xs">
-        No poster
+      <div class="flex flex-col items-center justify-center gap-2 h-full px-3 text-center bg-gradient-to-b from-[var(--bg-tertiary)] to-[color-mix(in_srgb,var(--bg-tertiary)_60%,black)]">
+        <svg class="w-9 h-9 text-[var(--text-secondary)] opacity-40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="7" width="18" height="14" rx="1.5"/>
+          <path d="M3 7l2.2-3.6a1 1 0 0 1 .85-.4h11.9a1 1 0 0 1 .85.4L21 7"/>
+          <path d="M7.5 3.3L9 7M13 3l1.8 4M3 11h18"/>
+        </svg>
+        <span class="text-[var(--text-secondary)] text-xs opacity-70 line-clamp-2">{item.title}</span>
       </div>
     {/if}
 
@@ -177,15 +183,27 @@
       >⋯</button>
     {/if}
 
-    <!-- Selection checkbox — top left -->
-    <input
-      type="checkbox"
-      checked={selected}
-      aria-label="{selected ? 'Deselect' : 'Select'} {item.title}"
-      class="absolute top-1.5 left-1.5 w-4 h-4 accent-[var(--accent)] cursor-pointer rounded
-        {selected ? 'opacity-100' : 'opacity-40 group-hover:opacity-80 focus-visible:opacity-100'} transition-opacity"
-      onclick={(e) => { e.stopPropagation(); toggleSelect(item.url); }}
-    />
+    <!-- Selection checkbox — top left; custom chip with an accessible native input underneath -->
+    <div
+      class="absolute top-1.5 left-1.5 w-6 h-6 rounded-full flex items-center justify-center transition-all
+        {selected
+          ? 'bg-[var(--accent)] opacity-100 scale-100'
+          : 'bg-black/60 backdrop-blur-sm opacity-0 group-hover:opacity-100 focus-within:opacity-100 scale-90 group-hover:scale-100'}"
+    >
+      <svg
+        class="w-3.5 h-3.5 text-white transition-opacity {selected ? 'opacity-100' : 'opacity-70'}"
+        viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
+      >
+        <path d="M3.5 8.5l3 3 6-7"/>
+      </svg>
+      <input
+        type="checkbox"
+        checked={selected}
+        aria-label="{selected ? 'Deselect' : 'Select'} {item.title}"
+        class="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+        onclick={(e) => { e.stopPropagation(); toggleSelect(item.url); }}
+      />
+    </div>
   </div>
 
   <!-- Info section (hidden in poster-only mode; overlays stay on the poster) -->
@@ -206,13 +224,13 @@
     <!-- Plex library versions -->
     {#if plexVersions.length > 0}
       <div class="flex items-center gap-1 mt-0.5 text-[10px] truncate">
-        <span class="font-semibold text-orange-400">Plex:</span>
+        <span class="font-semibold text-[var(--accent)]">Plex:</span>
         {#each plexVersions as pv, i}
           {#if i > 0}<span class="text-[var(--text-secondary)] opacity-30">&middot;</span>{/if}
           <span class="inline-flex items-center gap-0.5 text-[var(--text-secondary)]">
-            <span class="font-medium {pv.res === '4K' ? 'text-yellow-500' : 'text-[var(--text-primary)]'}">{pv.res}</span>
-            {#if pv.dovi}<span class="text-purple-400 font-bold">DV</span>{/if}
-            {#if pv.hdr && !pv.dovi}<span class="text-amber-400 font-bold">HDR</span>{/if}
+            <Badge label={pv.res} variant={pv.res === '4K' ? 'warning' : 'default'} size="xs" />
+            {#if pv.dovi}<Badge label="DV" variant="accent" size="xs" />{/if}
+            {#if pv.hdr && !pv.dovi}<Badge label="HDR" variant="warning" size="xs" />{/if}
             {#if pv.size}<span class="opacity-60">{pv.size}GB</span>{/if}
           </span>
         {/each}

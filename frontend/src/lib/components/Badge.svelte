@@ -6,8 +6,9 @@
   interface Props {
     label: string;
     variant?: BadgeVariant;
+    size?: 'sm' | 'xs';
   }
-  let { label, variant = 'default' }: Props = $props();
+  let { label, variant = 'default', size = 'sm' }: Props = $props();
 
   const colors: Record<string, string> = {
     default: 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)]',
@@ -18,8 +19,13 @@
     info: 'bg-blue-500/20 text-blue-400',
     orange: 'bg-[color-mix(in_srgb,#f97316_20%,var(--bg-secondary))] text-[#f97316]'
   };
+
+  const sizes: Record<string, string> = {
+    sm: 'px-1.5 py-0.5 text-[10px]',
+    xs: 'px-1 py-px text-[9px]'
+  };
 </script>
 
-<span class="inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium {colors[variant]}">
+<span class="inline-flex items-center rounded font-medium {colors[variant]} {sizes[size]}">
   {label}
 </span>
