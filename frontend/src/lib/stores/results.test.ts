@@ -388,6 +388,91 @@ describe('debounced refetch on filter change (paged mode)', () => {
   });
 });
 
+describe('handleScanResult / handleScanComplete (live stream supersedes paged cache)', () => {
+  // C1/C2 regression coverage: a live scan's streamed results must never mix
+  // with (or be clobbered by) server-paged/cache-loaded rows. The store used
+  // to gate this on a dead `fromCacheActive` flag that nothing set anymore
+  // (hydrateCache, its only setter, had no callers) so the guard could never
+  // fire. handleScanResult/handleScanComplete are exported specifically so
+  // this can be tested by calling them directly, the same way the real
+  // `connection.on('scan:result', ...)` wiring in results.ts invokes them —
+  // this is less invasive than instantiating a real WebSocket in jsdom.
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('first streamed item clears cached rows, flips pagedMode off, and appends; second item just appends', async () => {
+    const { handleScanResult, results, pagedMode, fromCache } = await import('./results');
+    pagedMode.set(true);
+    fromCache.set(true);
+    results.set([item({ title: 'Cached A', url: 'cached-a' }), item({ title: 'Cached B', url: 'cached-b' })]);
+
+    handleScanResult(item({ title: 'Live 1', url: 'live-1' }) as unknown as Record<string, unknown>);
+
+    expect(get(pagedMode)).toBe(false);
+    expect(get(fromCache)).toBe(false);
+    expect(get(results).map((r) => r.title)).toEqual(['Live 1']);
+
+    handleScanResult(item({ title: 'Live 2', url: 'live-2' }) as unknown as Record<string, unknown>);
+
+    expect(get(results).map((r) => r.title)).toEqual(['Live 1', 'Live 2']);
+  });
+
+  it('does not clear results when already in live mode (not paged)', async () => {
+    const { handleScanResult, results, pagedMode } = await import('./results');
+    pagedMode.set(false);
+    results.set([item({ title: 'Existing Live', url: 'existing' })]);
+
+    handleScanResult(item({ title: 'Next', url: 'next' }) as unknown as Record<string, unknown>);
+
+    expect(get(results).map((r) => r.title)).toEqual(['Existing Live', 'Next']);
+  });
+
+  it('handleScanComplete sets stats and clears stale results when the scan produced nothing', async () => {
+    const { handleScanComplete, results, stats } = await import('./results');
+    results.set([item({ title: 'Stale', url: 'stale' })]);
+
+    handleScanComplete({ stats: { total: 0, missing: 0, upgrade: 0, library: 0 } });
+
+    expect(get(results)).toEqual([]);
+    expect(get(stats)).toEqual({ total: 0, missing: 0, upgrade: 0, library: 0 });
+  });
+
+  it('handleScanComplete keeps streamed results when the scan produced items', async () => {
+    const { handleScanResult, handleScanComplete, results, stats } = await import('./results');
+    handleScanResult(item({ title: 'Streamed', url: 'streamed' }) as unknown as Record<string, unknown>);
+
+    handleScanComplete({ stats: { total: 1, missing: 1, upgrade: 0, library: 0 } });
+
+    expect(get(results).map((r) => r.title)).toEqual(['Streamed']);
+    expect(get(stats)).toEqual({ total: 1, missing: 1, upgrade: 0, library: 0 });
+  });
+});
+
+describe('clearResults flips pagedMode off', () => {
+  // clearResults() has exactly one caller today: ScanControls.svelte's
+  // handleStart (the local Start-Scan button), which calls clearResults()
+  // immediately before startScan(...). Since that's the only call site, the
+  // C1 fix's belt-and-braces mode flip lives inside clearResults() itself
+  // rather than in the .svelte component or the scanner store.
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('sets pagedMode to false as part of clearing results for a new scan', async () => {
+    const { clearResults, pagedMode, results } = await import('./results');
+    pagedMode.set(true);
+    results.set([item({ title: 'Old', url: 'old' })]);
+
+    clearResults();
+
+    expect(get(pagedMode)).toBe(false);
+    expect(get(results)).toEqual([]);
+  });
+});
+
 describe('deckNeedsMore', () => {
   beforeEach(() => {
     resetStores();

@@ -300,7 +300,7 @@
       loadSettings(),
       (async () => {
         try {
-          const resp = await api.getResults({ per_page: '200' });
+          const resp = await api.getResults({ per_page: '500' });
           if (resp.items && resp.items.length > 0) {
             results.set(resp.items);
             if (resp.stats) stats.set(resp.stats);

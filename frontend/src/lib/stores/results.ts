@@ -117,7 +117,6 @@ export const dismissedUrls = writable<Set<string>>(new Set());
  *  moment a live scan produces results. */
 export const fromCache = writable<boolean>(false);
 export const cacheUpdatedAt = writable<string | null>(null);
-let fromCacheActive = false;
 
 // ── Server-side pagination (paged mode) ───────────────────────────────
 /** When true, `results` is loaded page-by-page from the server (which has
@@ -159,13 +158,20 @@ function parsePostedDate(s: string | null | undefined): number {
   return Number.isNaN(t) ? 0 : t;
 }
 
-connection.on('scan:result', (data) => {
+/** Handler for the `scan:result` WS event — exported (rather than kept as an
+ *  inline connection.on callback) so tests can invoke it directly without a
+ *  real WebSocket. A live stream always supersedes paged/cache-loaded rows:
+ *  if we're still in paged mode when the first item streams in (whether the
+ *  scan was started via the local Start button, which also flips pagedMode
+ *  in clearResults(), or a scheduled scan streaming into an already-open
+ *  session), clear the cached rows and flip to live mode so the debounced
+ *  filter refetch can never fight the incoming stream. Subsequent items just
+ *  append. */
+export function handleScanResult(data: Record<string, unknown>) {
   const item = data as unknown as ScanResult;
-  // A live scan supersedes any pre-cached results: clear the cache rows on the
-  // first streamed item so live and cached never mix.
-  if (fromCacheActive) {
+  if (get(pagedMode)) {
     results.set([]);
-    fromCacheActive = false;
+    pagedMode.set(false);
     fromCache.set(false);
   }
   activeScanResultCount += 1;
@@ -179,13 +185,14 @@ connection.on('scan:result', (data) => {
     else if (status.includes('library') || status.includes('in_library')) next.library += 1;
     return next;
   });
-});
+}
 
-connection.on('scan:complete', (data) => {
+/** Handler for the `scan:complete` WS event — exported for direct testing;
+ *  see handleScanResult. */
+export function handleScanComplete(data: Record<string, unknown>) {
   const s = data.stats as ScanStats;
   if (s) stats.set(s);
   // A completed live scan always supersedes the cache banner.
-  fromCacheActive = false;
   fromCache.set(false);
 
   // If a completed scan produced no streamed items, ensure stale results
@@ -198,7 +205,10 @@ connection.on('scan:complete', (data) => {
   }
 
   activeScanResultCount = 0;
-});
+}
+
+connection.on('scan:result', handleScanResult);
+connection.on('scan:complete', handleScanComplete);
 
 /** All unique genres from current scan results. */
 export const availableGenres = derived(results, ($results) => {
@@ -389,24 +399,6 @@ export function deckNeedsMore(remainingActionable: number): boolean {
   return get(pagedMode) && get(hasMore) && !get(loadingMore) && remainingActionable < 8;
 }
 
-/** Seed the store from pre-cached background-scan results when there are no
- *  live results yet (fresh session / server restart), so the app opens with
- *  something to show. Sets fromCache so the UI can flag it. */
-export async function hydrateCache() {
-  try {
-    const data = await api.getCachedResults({ per_page: '500' });
-    if (data.items && data.items.length > 0) {
-      results.set(data.items as ScanResult[]);
-      if (data.stats) stats.set(data.stats);
-      cacheUpdatedAt.set(data.last_updated ?? null);
-      fromCache.set(true);
-      fromCacheActive = true;
-    }
-  } catch {
-    /* no cache / offline — leave empty */
-  }
-}
-
 /** Load the persisted dismissal set from the server (call once on app start). */
 export async function hydrateDismissed() {
   try {
@@ -471,6 +463,15 @@ export function restoreItem(url: string): Promise<boolean> {
   );
 }
 
+/** Clears the current result set. Its only caller today is ScanControls'
+ *  handleStart (the local Start-Scan button), so this also flips out of
+ *  paged mode here: belt-and-braces for the pre-first-result window where the
+ *  scan has started but nothing has streamed in yet — without this, a filter
+ *  touch in that window would fire the debounced cache refetch (loadResults)
+ *  and race the incoming live stream. If a future caller needs to clear
+ *  results while staying in browse/paged mode (e.g. a generic "clear" button
+ *  unrelated to starting a scan), move this pagedMode flip to the scan-start
+ *  call path instead (ScanControls.handleStart / scanner.startScan). */
 export function clearResults() {
   results.set([]);
   stats.set({ total: 0, missing: 0, upgrade: 0, library: 0 });
@@ -478,8 +479,8 @@ export function clearResults() {
   selectedDetail.set(null);
   focusedIndex.set(-1);
   activeScanResultCount = 0;
-  fromCacheActive = false;
   fromCache.set(false);
+  pagedMode.set(false);
 }
 
 /** Mark result rows (by url) as Downloaded and adjust the status counters. */

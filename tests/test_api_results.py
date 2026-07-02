@@ -198,6 +198,23 @@ def test_cached_category_query_param_filters():
     assert {i["title"] for i in r["items"]} == {"K"}
 
 
+def test_cached_per_page_500_is_accepted():
+    """Live mode has no client-side pagination, so a reloaded live set needs to
+    fetch up to 500 rows in one request. Guards against the cap regressing to
+    the smaller 200 limit that made items 201+ unreachable on reload."""
+    rows = [_row(f"T{n:03d}") for n in range(10)]
+    c = _client_with_cache(rows)
+    r = c.get("/results/cached", params={"per_page": 500})
+    assert r.status_code == 200
+
+
+def test_cached_per_page_501_is_rejected():
+    rows = [_row("A")]
+    c = _client_with_cache(rows)
+    r = c.get("/results/cached", params={"per_page": 501})
+    assert r.status_code == 422
+
+
 def test_select_all_filtered_returns_matching_group_keys():
     rows = [_row("A", status="missing", category="4k"),
             _row("B", status="in_library", category="4k"),
