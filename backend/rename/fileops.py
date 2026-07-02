@@ -3,15 +3,35 @@
 Ported/adapted from Nomen's ``file_manager_io._move_file``, decoupled from its
 app/logger/progress machinery. Each placement is collision-safe (never
 overwrites) and verifiable, and records enough to be undone.
+
+Deletion safety (owner mandate: no accidental file deletion; deletions must
+go through a user's input first):
+  - Guard 1: automatic (unattended) applies never consume the source — a
+    configured 'move' is forced down to 'hardlink' (falling back to 'copy'
+    if hardlink itself isn't possible, e.g. cross-device).
+  - Guard 2/3: even a user-initiated cross-device 'move' does not hard-delete
+    the source by default — the verified-copied source is sent to a
+    timestamped trash folder instead of ``os.remove``. Only an explicit
+    ``deletions_require_confirmation=False`` opt-out restores the old
+    hard-delete behavior.
 """
 from __future__ import annotations
 
+import datetime
 import errno
 import hashlib
+import logging
 import os
 import shutil
 
+from backend.config import _DATA_DIR
+
+logger = logging.getLogger(__name__)
+
 MOVE_METHODS = ("move", "copy", "hardlink", "symlink")
+
+# Trash root — overridable by tests via monkeypatch.
+_TRASH_ROOT = os.path.join(_DATA_DIR, "trash")
 
 
 def _hash_file(path: str) -> str:
@@ -22,14 +42,61 @@ def _hash_file(path: str) -> str:
     return h.hexdigest()
 
 
-def place_file(src: str, dst: str, method: str = "hardlink") -> str:
+def _trash_bucket_name() -> str:
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _trash(path: str) -> str:
+    """Move ``path`` into ``<data dir>/trash/<YYYYMMDD-HHMMSS>/<name>``.
+
+    Used instead of a hard delete wherever a source file must be disposed of
+    after being safely and verifiably placed elsewhere. Handles filename
+    collisions within the same timestamp bucket with a numeric suffix, and
+    falls back to ``shutil.move`` if a same-volume rename isn't possible
+    (e.g. the trash dir and the source live on different volumes).
+    """
+    bucket = os.path.join(_TRASH_ROOT, _trash_bucket_name())
+    os.makedirs(bucket, exist_ok=True)
+    name = os.path.basename(path)
+    base, ext = os.path.splitext(name)
+    dst = os.path.join(bucket, name)
+    n = 1
+    while os.path.lexists(dst):
+        dst = os.path.join(bucket, f"{base} ({n}){ext}")
+        n += 1
+    try:
+        os.rename(path, dst)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+        shutil.move(path, dst)
+    logger.info("trash  | %s -> %s", path, dst)
+    return dst
+
+
+def place_file(src: str, dst: str, method: str = "hardlink", *,
+               automatic: bool = False,
+               deletions_require_confirmation: bool = True) -> str:
     """Place ``src`` at ``dst`` using ``method``; return the method used.
 
     Collision-safe: refuses to overwrite an existing destination. Verifies
     copies by hash. Raises on failure so the caller can record an error.
+
+    ``automatic`` marks an unattended (no per-item user confirmation)
+    placement — e.g. auto-rename with confirmation disabled. When True and
+    ``method`` is ``move``, the method is forced down to ``hardlink`` (or
+    ``copy`` if hardlinking isn't possible) so the source is never consumed
+    without a human in the loop.
+
+    ``deletions_require_confirmation`` (default True) gates the cross-device
+    'move' fallback: instead of hard-deleting the verified-copied source with
+    ``os.remove``, it is moved to a timestamped trash folder. Pass False to
+    restore the old hard-delete behavior (explicit user opt-out in settings).
     """
     if method not in MOVE_METHODS:
         method = "hardlink"
+    if automatic and method == "move":
+        method = "hardlink"  # Guard 1: unattended applies never consume the source.
     if not os.path.isfile(src):
         raise FileNotFoundError(f"Source file not found: {src}")
     if os.path.lexists(dst):
@@ -56,7 +123,7 @@ def place_file(src: str, dst: str, method: str = "hardlink") -> str:
             raise OSError("Copy verification failed (hash mismatch)")
         return "copy"
 
-    # move: rename first (instant same-fs), else copy + verify + delete source.
+    # move: rename first (instant same-fs), else copy + verify + dispose of source.
     try:
         os.rename(src, dst)
     except OSError as e:
@@ -66,7 +133,10 @@ def place_file(src: str, dst: str, method: str = "hardlink") -> str:
         if _hash_file(src) != _hash_file(dst):
             os.remove(dst)
             raise OSError("Cross-device move verification failed (hash mismatch)")
-        os.remove(src)
+        if deletions_require_confirmation:
+            _trash(src)
+        else:
+            os.remove(src)
     return "move"
 
 

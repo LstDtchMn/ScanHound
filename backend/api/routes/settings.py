@@ -122,6 +122,7 @@ class SettingsUpdate(BaseModel):
     auto_rename_llm_enabled: Optional[bool] = None
     ollama_base_url: Optional[str] = None
     ollama_model: Optional[str] = None
+    deletions_require_confirmation: Optional[bool] = None
     dv_library_roots: Optional[str] = None
     dv_detection: Optional[bool] = None
     dv_file_tagging: Optional[bool] = None

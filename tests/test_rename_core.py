@@ -136,3 +136,127 @@ class TestFileOps:
         dst = tmp_path / "out.mkv"
         with pytest.raises(OSError):
             fileops.place_file(str(src), str(dst), "hardlink")
+
+    # ── Guard 1: automatic applies never consume the source ────────────
+
+    def test_automatic_move_forces_hardlink(self, tmp_path):
+        """automatic=True + method='move' must not consume the source —
+        it degrades to hardlink (never a bare rename/remove)."""
+        src = tmp_path / "src.mkv"; src.write_text("data")
+        dst = tmp_path / "lib" / "out.mkv"
+        used = fileops.place_file(str(src), str(dst), "move", automatic=True)
+        assert used == "hardlink"
+        assert dst.exists() and src.exists()
+
+    def test_automatic_move_falls_back_to_copy_when_hardlink_impossible(
+            self, tmp_path, monkeypatch):
+        """automatic=True forces hardlink; if hardlink itself can't be done
+        (cross-device), it must fall back to a verified copy — never delete
+        the source."""
+        import errno as _errno
+
+        def _exdev(*_a, **_k):
+            raise OSError(_errno.EXDEV, "Invalid cross-device link")
+
+        monkeypatch.setattr(fileops.os, "link", _exdev)
+        src = tmp_path / "src.mkv"; src.write_bytes(b"payload")
+        dst = tmp_path / "lib" / "out.mkv"
+        used = fileops.place_file(str(src), str(dst), "move", automatic=True)
+        assert used == "copy"
+        assert dst.read_bytes() == b"payload" and src.exists()
+
+    def test_user_initiated_move_still_consumes_source(self, tmp_path):
+        """Non-automatic (user-initiated) applies keep the configured
+        'move' behavior — this is the control case for Guard 1."""
+        src = tmp_path / "src.mkv"; src.write_text("data")
+        dst = tmp_path / "lib" / "out.mkv"
+        used = fileops.place_file(str(src), str(dst), "move", automatic=False)
+        assert used == "move"
+        assert dst.exists() and not src.exists()
+
+    # ── Guard 3: trash instead of hard delete ───────────────────────────
+
+    def test_trash_moves_file_into_timestamped_dir(self, tmp_path, monkeypatch):
+        trash_root = tmp_path / "appdata" / "trash"
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        f = tmp_path / "doomed.mkv"; f.write_text("bye")
+        trashed_path = fileops._trash(str(f))
+        assert not f.exists()
+        assert os.path.isfile(trashed_path)
+        assert os.path.basename(trashed_path) == "doomed.mkv"
+        # Landed under trash_root, in a timestamped subdirectory.
+        assert os.path.commonpath([str(trash_root), trashed_path]) == str(trash_root)
+
+    def test_trash_handles_name_collision(self, tmp_path, monkeypatch):
+        trash_root = tmp_path / "appdata" / "trash"
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        f1 = tmp_path / "dupe.mkv"; f1.write_text("one")
+        f2 = tmp_path / "sub" / "dupe.mkv"; f2.parent.mkdir(); f2.write_text("two")
+        # Force both into the *same* timestamp bucket to guarantee collision.
+        monkeypatch.setattr(fileops, "_trash_bucket_name", lambda: "20260101-000000")
+        p1 = fileops._trash(str(f1))
+        p2 = fileops._trash(str(f2))
+        assert p1 != p2
+        assert os.path.isfile(p1) and os.path.isfile(p2)
+        assert open(p1).read() == "one" and open(p2).read() == "two"
+
+    def test_trash_falls_back_to_shutil_move_cross_device(self, tmp_path, monkeypatch):
+        trash_root = tmp_path / "appdata" / "trash"
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        import errno as _errno
+
+        real_rename = fileops.os.rename
+
+        def _exdev_once(src, dst):
+            raise OSError(_errno.EXDEV, "Invalid cross-device link")
+
+        monkeypatch.setattr(fileops.os, "rename", _exdev_once)
+        f = tmp_path / "doomed.mkv"; f.write_text("bye")
+        trashed_path = fileops._trash(str(f))
+        assert not f.exists()
+        assert os.path.isfile(trashed_path)
+
+    def test_cross_device_move_trashes_source_by_default(self, tmp_path, monkeypatch):
+        """place_file's cross-device move branch: with deletions_require_confirmation
+        (the default gate), the source goes to trash, not os.remove."""
+        import errno as _errno
+        trash_root = tmp_path / "appdata" / "trash"
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+
+        def _exdev(*_a, **_k):
+            raise OSError(_errno.EXDEV, "Invalid cross-device link")
+
+        monkeypatch.setattr(fileops.os, "link", _exdev)
+        monkeypatch.setattr(fileops.os, "rename", _exdev)
+        src = tmp_path / "src.mkv"; src.write_bytes(b"payload")
+        dst = tmp_path / "lib" / "out.mkv"
+        used = fileops.place_file(str(src), str(dst), "move",
+                                  deletions_require_confirmation=True)
+        assert used == "move"
+        assert dst.read_bytes() == b"payload"
+        assert not src.exists()
+        # Source ended up in trash, not permanently deleted.
+        trashed = list(trash_root.rglob("src.mkv"))
+        assert len(trashed) == 1
+
+    def test_cross_device_move_hard_deletes_when_confirmation_disabled(
+            self, tmp_path, monkeypatch):
+        """Explicit opt-out (deletions_require_confirmation=False) restores
+        the old hard os.remove behavior."""
+        import errno as _errno
+        trash_root = tmp_path / "appdata" / "trash"
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+
+        def _exdev(*_a, **_k):
+            raise OSError(_errno.EXDEV, "Invalid cross-device link")
+
+        monkeypatch.setattr(fileops.os, "link", _exdev)
+        monkeypatch.setattr(fileops.os, "rename", _exdev)
+        src = tmp_path / "src.mkv"; src.write_bytes(b"payload")
+        dst = tmp_path / "lib" / "out.mkv"
+        used = fileops.place_file(str(src), str(dst), "move",
+                                  deletions_require_confirmation=False)
+        assert used == "move"
+        assert not src.exists()
+        # Nothing in trash — hard-deleted as before.
+        assert not trash_root.exists() or not list(trash_root.rglob("src.mkv"))

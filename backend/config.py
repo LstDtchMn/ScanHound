@@ -127,6 +127,7 @@ class AppConfig(TypedDict, total=False):
     auto_rename_llm_enabled: bool
     ollama_base_url: str
     ollama_model: str
+    deletions_require_confirmation: bool
 
     # Dolby Vision host-detector + labeler
     dv_library_roots: str      # host-native roots, ';' or newline separated
@@ -371,6 +372,7 @@ _DEFAULT_CONFIG: AppConfig = {
     "auto_rename_llm_enabled": False,
     "ollama_base_url": "http://ollama:11434",
     "ollama_model": "",
+    "deletions_require_confirmation": True,
     "dv_library_roots": "",
     "dv_detection": False,
     "dv_file_tagging": False,

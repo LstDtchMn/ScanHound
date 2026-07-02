@@ -160,13 +160,16 @@ class TestProcessPackage:
         assert svc._claim_path(p) is False   # now tracked in DB → blocked
 
     def test_auto_apply_when_confirmation_not_required(self, db, tmp_path):
+        """Guard 1: an automatic apply (no per-item user confirmation) must
+        never consume the source, even when the configured method is
+        'move' — it degrades to hardlink/copy instead."""
         save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
         lib = str(tmp_path / "lib")
         ids = _service(db, _matrix_search, movie_lib=lib,
                        auto_rename_require_confirmation=False).process_package("pa", save_to)
         job = db.get_rename_job(ids[0])
         assert job["status"] == "applied"
-        assert not os.path.exists(src)  # 'move' consumed the source
+        assert os.path.exists(src)  # automatic apply never consumes the source
         assert os.path.isfile(os.path.join(lib, "The Matrix (1999)", "The Matrix (1999) [1080p].mkv"))
 
     def test_normalize_candidate_retains_poster_path(self):
@@ -437,6 +440,21 @@ class TestApplyUndo:
         out = svc.apply(jid)
         assert out["ok"] is False
         assert db.get_rename_job(jid)["status"] == "failed"
+
+    def test_apply_automatic_true_forces_hardlink_not_move(self, db, tmp_path):
+        """Guard 1, exercised directly on RenameService.apply(): passing
+        automatic=True must not consume the source even with
+        auto_rename_move_method='move'."""
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+        out = svc.apply(jid, automatic=True)
+        assert out["ok"] is True
+        job = db.get_rename_job(jid)
+        assert job["status"] == "applied"
+        assert job["move_method"] in ("hardlink", "copy")
+        assert os.path.exists(src)
 
     def test_apply_rolls_back_file_when_db_write_fails(self, db, tmp_path):
         """If the 'applied' DB write fails *after* the move, the file must be
