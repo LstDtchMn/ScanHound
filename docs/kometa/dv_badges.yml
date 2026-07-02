@@ -1,0 +1,85 @@
+# ScanHound — Dolby Vision layer badges for Kometa.
+#
+# Label-gated overlays: each block badges movies carrying exactly one of the four
+# labels ScanHound manages ("DV FEL", "DV MEL", "DV P8", "DV P5"). These label
+# strings MUST match ScanHound's dv_label_vocab values exactly, or nothing badges.
+# (Verified against backend/rename/dv_labeler.py's MANAGED set and
+# backend/config.py's dv_label_vocab default at commit 01431c5 — both are
+# {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}.)
+#
+# Drop this file into your Kometa config and reference it from a Movies library, e.g.:
+#
+#   libraries:
+#     Movies:
+#       overlay_files:
+#         - file: config/dv_badges.yml
+#
+# Kometa applies overlays on its own schedule; run it AFTER ScanHound's
+# host detector walk -> POST /rename/dv-import -> POST /rename/dv-sync-labels.
+# See scripts/host-detector/README.md for the full ordering and the rollout
+# gate that must be cleared before the first real label sync.
+
+overlays:
+  DV FEL:
+    overlay:
+      name: text(DV FEL)
+      horizontal_offset: 15
+      horizontal_align: left
+      vertical_offset: 15
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 200
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: DV FEL
+
+  DV MEL:
+    overlay:
+      name: text(DV MEL)
+      horizontal_offset: 15
+      horizontal_align: left
+      vertical_offset: 15
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 200
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: DV MEL
+
+  DV P8:
+    overlay:
+      name: text(DV P8)
+      horizontal_offset: 15
+      horizontal_align: left
+      vertical_offset: 15
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 200
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: DV P8
+
+  DV P5:
+    overlay:
+      name: text(DV P5)
+      horizontal_offset: 15
+      horizontal_align: left
+      vertical_offset: 15
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 200
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: DV P5
