@@ -206,9 +206,9 @@
       {/if}
       {#if item.resolution || item.dovi || (item.hdr && item.hdr !== 'SDR')}
         <span class="inline-flex items-center gap-1">
-          {#if item.resolution}<span class="text-[10px] px-1.5 py-0.5 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-medium">{item.resolution}</span>{/if}
-          {#if item.dovi}<span class="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 font-medium">DV</span>{/if}
-          {#if item.hdr && item.hdr !== 'SDR' && !item.dovi}<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 font-medium">HDR</span>{/if}
+          {#if item.resolution}<Badge label={item.resolution} />{/if}
+          {#if item.dovi}<Badge label="DV" variant="accent" />{/if}
+          {#if item.hdr && item.hdr !== 'SDR' && !item.dovi}<Badge label="HDR" variant="warning" />{/if}
         </span>
       {/if}
       {#if item.size}<span class="text-[var(--text-secondary)] whitespace-nowrap">{item.size}</span>{/if}
@@ -222,9 +222,9 @@
             <svg class="w-3 h-3 flex-shrink-0 text-amber-500" viewBox="0 0 24 24" fill="currentColor" aria-label="In Plex"><path d="M5 2h6l7 10-7 10H5l7-10L5 2z"/></svg>
             {#each plexVersions as pv, i}
               <span class="inline-flex items-center gap-1 {i > 0 ? 'pl-1 border-l border-amber-500/25' : ''}">
-                <span class="font-semibold {pv.res === '4K' ? 'text-yellow-500' : 'text-[var(--text-primary)]'}">{pv.res}</span>
-                {#if pv.dovi}<span class="text-purple-400 font-bold text-[9px]">DV</span>{/if}
-                {#if pv.hdr && !pv.dovi}<span class="text-amber-400 font-bold text-[9px]">HDR</span>{/if}
+                <Badge label={pv.res} variant={pv.res === '4K' ? 'warning' : 'default'} size="xs" />
+                {#if pv.dovi}<Badge label="DV" variant="accent" size="xs" />{/if}
+                {#if pv.hdr && !pv.dovi}<Badge label="HDR" variant="warning" size="xs" />{/if}
                 {#if pv.size}<span class="text-[var(--text-secondary)] text-[9px]">{pv.size}GB</span>{/if}
               </span>
             {/each}
@@ -283,9 +283,9 @@
           <svg class="w-2.5 h-2.5 flex-shrink-0" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2v8m0 0-2.5-2.5M8 10l2.5-2.5"/><rect x="2.5" y="12" width="11" height="1.5" rx="0.75"/></svg>
           Grabbed
         </span>
-        {#if gRes}<span class="text-[10px] px-1 py-0.5 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-medium whitespace-nowrap">{gRes}</span>{/if}
-        {#if g.dovi}<span class="text-[10px] px-1 py-0.5 rounded bg-purple-500/20 text-purple-400 font-medium">DV</span>{/if}
-        {#if gHdr && !g.dovi}<span class="text-[10px] px-1 py-0.5 rounded bg-amber-500/20 text-amber-400 font-medium">{gHdr}</span>{/if}
+        {#if gRes}<Badge label={gRes} size="xs" />{/if}
+        {#if g.dovi}<Badge label="DV" variant="accent" size="xs" />{/if}
+        {#if gHdr && !g.dovi}<Badge label={gHdr} variant="warning" size="xs" />{/if}
         {#if gSize}<span class="text-[10px] text-[var(--text-secondary)] whitespace-nowrap">{gSize}</span>{/if}
       </div>
     {/if}

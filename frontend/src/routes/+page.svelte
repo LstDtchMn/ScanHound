@@ -498,9 +498,7 @@
                   <div class="flex items-center gap-2 flex-wrap">
                     <span class="text-sm font-semibold truncate">{group.title}</span>
                     {#if group.items[0].year}<span class="text-[var(--text-secondary)] text-sm font-normal">({group.items[0].year})</span>{/if}
-                    <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)] flex-shrink-0">
-                      {siblingCounts().get(group.title)} releases
-                    </span>
+                    <Badge label="{siblingCounts().get(group.title)} releases" />
                   </div>
                   <!-- Row 2: rating + format badges -->
                   <div class="flex items-center gap-1.5 mt-0.5 flex-wrap">
@@ -508,10 +506,10 @@
                       <span class="text-xs text-[var(--text-secondary)]">⭐ {group.items[0].rating.toFixed(1)}</span>
                     {/if}
                     {#each fmts.res as r}
-                      <span class="text-[10px] px-1 py-0.5 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-medium">{r}</span>
+                      <Badge label={r} size="xs" />
                     {/each}
-                    {#if fmts.dv}<span class="text-[10px] px-1 py-0.5 rounded bg-purple-500/20 text-purple-400 font-medium">DV</span>{/if}
-                    {#if fmts.hdr}<span class="text-[10px] px-1 py-0.5 rounded bg-amber-500/20 text-amber-400 font-medium">HDR</span>{/if}
+                    {#if fmts.dv}<Badge label="DV" variant="accent" size="xs" />{/if}
+                    {#if fmts.hdr}<Badge label="HDR" variant="warning" size="xs" />{/if}
                   </div>
                   <!-- Row 3: size range + short date range -->
                   <div class="flex items-center gap-2 mt-0.5 text-xs text-[var(--text-secondary)]">
@@ -524,9 +522,7 @@
                 <!-- Expanded header — compact text row -->
                 <span class="text-[10px] text-[var(--text-secondary)] transition-transform rotate-90">&triangleright;</span>
                 <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>
-                <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
-                  {siblingCounts().get(group.title)} releases
-                </span>
+                <Badge label="{siblingCounts().get(group.title)} releases" />
               {/if}
             </button>
             {#if isGroupExpanded(group)}
@@ -589,9 +585,7 @@
                   <div class="flex items-center gap-2 flex-wrap">
                     <span class="text-sm font-semibold truncate">{group.title}</span>
                     {#if group.items[0].year}<span class="text-[var(--text-secondary)] text-sm font-normal">({group.items[0].year})</span>{/if}
-                    <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)] flex-shrink-0">
-                      {siblingCounts().get(group.title)} releases
-                    </span>
+                    <Badge label="{siblingCounts().get(group.title)} releases" />
                     {#each statusSummary as st}
                       <Badge label={`${st.count} ${formatStatus(st.status)}`} variant={statusVariant(st.status)} />
                     {/each}
@@ -612,9 +606,9 @@
                     {/if}
                     {#if fmtsL.res.length || fmtsL.dv || fmtsL.hdr}
                       <span class="inline-flex items-center gap-1 flex-wrap">
-                        {#each fmtsL.res as r}<span class="text-[10px] px-1.5 py-0.5 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-medium">{r}</span>{/each}
-                        {#if fmtsL.dv}<span class="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 font-medium">DV</span>{/if}
-                        {#if fmtsL.hdr}<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 font-medium">HDR</span>{/if}
+                        {#each fmtsL.res as r}<Badge label={r} size="xs" />{/each}
+                        {#if fmtsL.dv}<Badge label="DV" variant="accent" size="xs" />{/if}
+                        {#if fmtsL.hdr}<Badge label="HDR" variant="warning" size="xs" />{/if}
                       </span>
                     {/if}
                     {#if groupSizeRange(group.items)}<span class="text-[var(--text-secondary)] whitespace-nowrap">{groupSizeRange(group.items)}</span>{/if}
@@ -641,9 +635,7 @@
                   <div class="flex items-center gap-2">
                     <span class="text-[10px] text-[var(--text-secondary)] transition-transform rotate-90">&triangleright;</span>
                     <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>
-                    <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
-                      {siblingCounts().get(group.title)} releases
-                    </span>
+                    <Badge label="{siblingCounts().get(group.title)} releases" />
                   </div>
                 </td>
               </tr>
