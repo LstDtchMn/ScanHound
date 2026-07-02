@@ -1,4 +1,4 @@
-import { writable, derived } from 'svelte/store';
+import { writable, derived, get } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { connection } from './connection';
 import type { ScanResult, ScanStats } from '$lib/api/types';
@@ -104,7 +104,7 @@ export function toggleQuickFilter(key: string) {
 /** Source categories ('4k' | 'remux' | 'tv') currently shown in the list — driven
  *  by the ScanControls 4K/Remux/TV toggles so they filter the (pre-cached) results
  *  instantly. Items with an unknown/empty category always show. */
-export const categoryFilter = persisted<string[]>('sh-category-filter', ['4k']);
+export const categoryFilter = persisted<string[]>('sh-category-filter', ['4k', 'remux', 'tv']);
 
 export const selectedKeys = writable<Set<string>>(new Set());
 
@@ -117,7 +117,20 @@ export const dismissedUrls = writable<Set<string>>(new Set());
  *  moment a live scan produces results. */
 export const fromCache = writable<boolean>(false);
 export const cacheUpdatedAt = writable<string | null>(null);
-let fromCacheActive = false;
+
+// ── Server-side pagination (paged mode) ───────────────────────────────
+/** When true, `results` is loaded page-by-page from the server (which has
+ *  already applied filters/sort/dismissal) and `filteredResults` becomes a
+ *  passthrough. When false, the legacy client-side filter+sort pipeline runs
+ *  over the full (pre-fetched) result set. */
+export const pagedMode = writable<boolean>(true);
+export const hasMore = writable<boolean>(false);
+export const loadingMore = writable<boolean>(false);
+export const loadError = writable<boolean>(false);
+/** Total matching items on the server for the current filter set (paged mode). */
+export const filteredTotal = writable<number>(0);
+/** Per-title counts over the filtered server set (paged mode; for dup-badges etc). */
+export const titleCounts = writable<Record<string, number>>({});
 
 let activeScanResultCount = 0;
 
@@ -145,13 +158,20 @@ function parsePostedDate(s: string | null | undefined): number {
   return Number.isNaN(t) ? 0 : t;
 }
 
-connection.on('scan:result', (data) => {
+/** Handler for the `scan:result` WS event — exported (rather than kept as an
+ *  inline connection.on callback) so tests can invoke it directly without a
+ *  real WebSocket. A live stream always supersedes paged/cache-loaded rows:
+ *  if we're still in paged mode when the first item streams in (whether the
+ *  scan was started via the local Start button, which also flips pagedMode
+ *  in clearResults(), or a scheduled scan streaming into an already-open
+ *  session), clear the cached rows and flip to live mode so the debounced
+ *  filter refetch can never fight the incoming stream. Subsequent items just
+ *  append. */
+export function handleScanResult(data: Record<string, unknown>) {
   const item = data as unknown as ScanResult;
-  // A live scan supersedes any pre-cached results: clear the cache rows on the
-  // first streamed item so live and cached never mix.
-  if (fromCacheActive) {
+  if (get(pagedMode)) {
     results.set([]);
-    fromCacheActive = false;
+    pagedMode.set(false);
     fromCache.set(false);
   }
   activeScanResultCount += 1;
@@ -165,13 +185,14 @@ connection.on('scan:result', (data) => {
     else if (status.includes('library') || status.includes('in_library')) next.library += 1;
     return next;
   });
-});
+}
 
-connection.on('scan:complete', (data) => {
+/** Handler for the `scan:complete` WS event — exported for direct testing;
+ *  see handleScanResult. */
+export function handleScanComplete(data: Record<string, unknown>) {
   const s = data.stats as ScanStats;
   if (s) stats.set(s);
   // A completed live scan always supersedes the cache banner.
-  fromCacheActive = false;
   fromCache.set(false);
 
   // If a completed scan produced no streamed items, ensure stale results
@@ -184,7 +205,10 @@ connection.on('scan:complete', (data) => {
   }
 
   activeScanResultCount = 0;
-});
+}
+
+connection.on('scan:result', handleScanResult);
+connection.on('scan:complete', handleScanComplete);
 
 /** All unique genres from current scan results. */
 export const availableGenres = derived(results, ($results) => {
@@ -209,9 +233,81 @@ function hasPlexCopy(i: ScanResult): boolean {
   try { return JSON.parse(i.plex_versions || '[]').length > 0; } catch { return false; }
 }
 
+const SORT_PARAM: Record<SortOption, { sort: string; order: string }> = {
+  'title-asc': { sort: 'title', order: 'asc' },
+  'title-desc': { sort: 'title', order: 'desc' },
+  'year-desc': { sort: 'year', order: 'desc' },
+  'year-asc': { sort: 'year', order: 'asc' },
+  'size-desc': { sort: 'size', order: 'desc' },
+  'size-asc': { sort: 'size', order: 'asc' },
+  'rating-desc': { sort: 'rating', order: 'desc' },
+  'rating-asc': { sort: 'rating', order: 'asc' },
+  'posted-desc': { sort: 'posted_date', order: 'desc' },
+  'posted-asc': { sort: 'posted_date', order: 'asc' }
+};
+
+let currentPage = 0;
+let currentQueryKey = '';
+
+/** Snapshot of every filter/sort input that changes the server query, so a
+ *  page load can detect it's been superseded by a filter change mid-flight. */
+function filterQueryKey(): string {
+  return JSON.stringify([
+    get(statusFilter), get(searchFilter), get(genreFilter), get(languageFilter),
+    get(quickFilters), get(categoryFilter), get(sortBy)
+  ]);
+}
+
+function buildResultParams(page: number): Record<string, string> {
+  const p: Record<string, string> = { page: String(page), per_page: '100' };
+  const s = get(statusFilter); if (s !== 'all') p.filter = s;
+  const q = get(searchFilter); if (q) p.search = q;
+  const cats = get(categoryFilter); if (cats.length) p.category = cats.join(',');
+  const g = get(genreFilter); if (g.length) p.genre = g.join(',');
+  const l = get(languageFilter); if (l.length) p.language = l.join(',');
+  const qf = get(quickFilters); if (qf.length) p.quick = qf.join(',');
+  const so = SORT_PARAM[get(sortBy)]; p.sort = so.sort; p.order = so.order;
+  return p;
+}
+
+/** Load a page of server-filtered/sorted results (paged mode). `reset` starts
+ *  over from page 1 and replaces `results`; otherwise the next page is
+ *  fetched and appended. No-ops outside paged mode or while already loading.
+ *  Discards the response if the filters changed while the request was in
+ *  flight (a fresh load for the new filters will already be underway). */
+export async function loadResults(reset: boolean): Promise<void> {
+  if (!get(pagedMode)) return;
+  if (get(loadingMore)) return;
+  const key = filterQueryKey();
+  if (!reset && key !== currentQueryKey) return; // stale append
+  const page = reset ? 1 : currentPage + 1;
+  loadingMore.set(true);
+  loadError.set(false);
+  try {
+    const data = await api.getCachedResults(buildResultParams(page));
+    if (filterQueryKey() !== key) return; // superseded while awaiting — discard
+    const items = (data.items ?? []) as ScanResult[];
+    if (reset) { results.set(items); currentPage = 1; currentQueryKey = key; }
+    else { results.update((r) => [...r, ...items]); currentPage = page; }
+    filteredTotal.set(data.total ?? items.length);
+    titleCounts.set((data as { title_counts?: Record<string, number> }).title_counts ?? {});
+    if (data.stats) stats.set(data.stats);
+    hasMore.set(get(results).length < (data.total ?? 0));
+    if ((data as { source?: string }).source === 'cache') {
+      cacheUpdatedAt.set((data as { last_updated?: string }).last_updated ?? null);
+      fromCache.set(true);
+    }
+  } catch {
+    loadError.set(true);
+  } finally {
+    loadingMore.set(false);
+  }
+}
+
 export const filteredResults = derived(
-  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls, categoryFilter],
-  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed, $category]) => {
+  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls, categoryFilter, pagedMode],
+  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed, $category, $paged]) => {
+    if ($paged) return $results; // server already filtered + sorted
     let items = $results;
     // Hide swiped-away ("skip") items everywhere they'd otherwise appear.
     if ($dismissed.size > 0) {
@@ -297,22 +393,10 @@ export const deckResults = derived(
     $filtered.filter((i) => !!i.url && isActionable(i.status) && !$selected.has(i.url))
 );
 
-/** Seed the store from pre-cached background-scan results when there are no
- *  live results yet (fresh session / server restart), so the app opens with
- *  something to show. Sets fromCache so the UI can flag it. */
-export async function hydrateCache() {
-  try {
-    const data = await api.getCachedResults({ per_page: '500' });
-    if (data.items && data.items.length > 0) {
-      results.set(data.items as ScanResult[]);
-      if (data.stats) stats.set(data.stats);
-      cacheUpdatedAt.set(data.last_updated ?? null);
-      fromCache.set(true);
-      fromCacheActive = true;
-    }
-  } catch {
-    /* no cache / offline — leave empty */
-  }
+/** True when the swipe deck's card pool is running low and another server
+ *  page should be fetched to top it up (paged mode only). */
+export function deckNeedsMore(remainingActionable: number): boolean {
+  return get(pagedMode) && get(hasMore) && !get(loadingMore) && remainingActionable < 8;
 }
 
 /** Load the persisted dismissal set from the server (call once on app start). */
@@ -335,6 +419,15 @@ export function dismissItem(url: string, title?: string): Promise<boolean> {
     next.add(url);
     return next;
   });
+  if (get(pagedMode)) {
+    let removed = false;
+    results.update((items) => {
+      const next = items.filter((i) => i.url !== url);
+      removed = next.length !== items.length;
+      return next;
+    });
+    if (removed) filteredTotal.update((n) => Math.max(0, n - 1));
+  }
   return api.dismissItems([url], title ? { [url]: title } : undefined, true).then(
     () => true,
     () => {
@@ -370,6 +463,15 @@ export function restoreItem(url: string): Promise<boolean> {
   );
 }
 
+/** Clears the current result set. Its only caller today is ScanControls'
+ *  handleStart (the local Start-Scan button), so this also flips out of
+ *  paged mode here: belt-and-braces for the pre-first-result window where the
+ *  scan has started but nothing has streamed in yet — without this, a filter
+ *  touch in that window would fire the debounced cache refetch (loadResults)
+ *  and race the incoming live stream. If a future caller needs to clear
+ *  results while staying in browse/paged mode (e.g. a generic "clear" button
+ *  unrelated to starting a scan), move this pagedMode flip to the scan-start
+ *  call path instead (ScanControls.handleStart / scanner.startScan). */
 export function clearResults() {
   results.set([]);
   stats.set({ total: 0, missing: 0, upgrade: 0, library: 0 });
@@ -377,8 +479,8 @@ export function clearResults() {
   selectedDetail.set(null);
   focusedIndex.set(-1);
   activeScanResultCount = 0;
-  fromCacheActive = false;
   fromCache.set(false);
+  pagedMode.set(false);
 }
 
 /** Mark result rows (by url) as Downloaded and adjust the status counters. */
@@ -479,3 +581,20 @@ export async function deselectAll() {
 
 export const selectedDetail = writable<ScanResult | null>(null);
 export const focusedIndex = writable<number>(-1);
+
+// ── Debounced refetch on filter/sort change (paged mode) ──────────────
+/** Whenever the server-relevant filter/sort inputs change, re-fetch page 1
+ *  after a short debounce — but only in paged mode, and never on the initial
+ *  subscribe (which fires immediately with the current values). */
+const _filterKey = derived(
+  [statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy],
+  (vals) => JSON.stringify(vals)
+);
+let _filterDebounce: ReturnType<typeof setTimeout> | undefined;
+let _filterKeyPrimed = false;
+_filterKey.subscribe(() => {
+  if (!_filterKeyPrimed) { _filterKeyPrimed = true; return; } // skip initial fire
+  if (!get(pagedMode)) return;
+  clearTimeout(_filterDebounce);
+  _filterDebounce = setTimeout(() => loadResults(true), 250);
+});

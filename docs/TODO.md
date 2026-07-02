@@ -37,6 +37,10 @@ Full design + locked decisions: [docs/feature-prompts/dv-fel-mel-detection.md](f
 - [ ] **`G:\Downloads` not path-mapped** as a *source* (only `F:\Downloads → /library/movies`). Intentional today (JD saves to F:); add `G:\Downloads => /library/movies-4k` if 4K grabs ever land on G:.
 - [ ] **`/rename/jobs` full-jobs fetch** for conflict/keep annotation is O(all jobs) per call — fine at current scale; revisit (cache / status-filtered query) only if the table grows to many thousands. (Reviewed: intentional, not a defect.)
 
+## Scan pagination — deferred
+- [ ] **`POST /results/select-all` with a body is dormant/unwired.** Implemented and tested (`backend/api/routes/results.py`, `SelectAllRequest` — filters by source/status/search/category/genre/language/quick, returns matched `group_keys`), but the UI's select-all only uses the URL-keyed "select all loaded" path (`selectAll(filteredKeys)` in `frontend/src/lib/stores/results.ts`, which POSTs the no-body `select-all` today). Kept in place for a future "select all N filtered" action (select beyond what's currently loaded/paged in).
+- [ ] **Live mode has no pagination.** `pagedMode=false` (live scan results) holds its full result set in memory with client-side filtering — there's no infinite-scroll/page fetch for it like the paged/cache browse view has. A reloaded live set is capped at whatever `+page.svelte`'s onMount fetches in one shot (`per_page: '500'`); a prior live scan with more than 500 results will have items 501+ unreachable until a fresh scan re-streams them. Tracking note only — no fix planned unless a live scan regularly exceeds 500 results.
+
 ## Notes
 - The duplicate **keep-recommendation** infers quality from the *filename* only (rename jobs don't store size/HDR/DV columns). Good enough for resolution/DV/HDR/source/audio; it can't see actual file size.
 - Heuristic fallbacks (subtitle/OCR/vision/cast) always route to `needs_review`, never auto-apply — preserve this.
