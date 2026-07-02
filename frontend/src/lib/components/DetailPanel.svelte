@@ -230,6 +230,20 @@
         {/if}
       </div>
 
+      <!-- Previously grabbed (different resolution already sent to JDownloader) -->
+      {#if item.prior_grab}
+        <div class="rounded-lg p-3 border border-amber-500/30 bg-amber-500/10 text-amber-500">
+          <h3 class="text-xs font-semibold uppercase tracking-wider mb-1 flex items-center gap-1.5">
+            <svg class="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 3v7m0 0-3-3m3 3 3-3"/><rect x="2" y="11.5" width="12" height="2" rx="1"/></svg>
+            Previously Grabbed
+          </h3>
+          <p class="text-sm">
+            {item.prior_grab.resolution}
+            {#if item.prior_grab.size}<span class="opacity-75"> &middot; {item.prior_grab.size}</span>{/if}
+          </p>
+        </div>
+      {/if}
+
       <!-- Plex library info with version badges -->
       {#if item.plex_info && item.plex_info !== '-'}
         <div>
