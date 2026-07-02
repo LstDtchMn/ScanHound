@@ -1347,7 +1347,7 @@ class RenameService:
                   f" [{job['warning_message']}]" if job.get("warning_message") else "")
         if (job_id and job["status"] == "matched"
                 and not self._cfg.get("auto_rename_require_confirmation", True)):
-            self.apply(job_id)
+            self.apply(job_id, automatic=True)
         return job_id
 
     def _create(self, job) -> Optional[int]:
@@ -1357,7 +1357,14 @@ class RenameService:
 
     # ── UI-driven actions ─────────────────────────────────────────────
 
-    def apply(self, job_id: int) -> dict:
+    def apply(self, job_id: int, automatic: bool = False) -> dict:
+        """Apply a matched job's placement.
+
+        ``automatic`` marks an apply with no per-item human confirmation
+        (e.g. the auto-rename pipeline with confirmation disabled). Such
+        applies never consume the source file — see
+        :func:`backend.rename.fileops.place_file`.
+        """
         db = self._db
         job = db.get_rename_job(job_id) if db else None
         if not job:
@@ -1372,8 +1379,12 @@ class RenameService:
         dst = os.path.join(job.get("destination_path") or "",
                            job.get("new_filename") or os.path.basename(src))
         method = self._cfg.get("auto_rename_move_method", "hardlink")
+        deletions_require_confirmation = self._cfg.get(
+            "deletions_require_confirmation", True)
         try:
-            used = _fileops.place_file(src, dst, method)
+            used = _fileops.place_file(
+                src, dst, method, automatic=automatic,
+                deletions_require_confirmation=deletions_require_confirmation)
         except Exception as e:
             rlog.warning("move   | FAILED %s -> %s (%s): %s", src, dst, method, e)
             db.update_rename_job(job_id, status="failed", error_message=str(e))
