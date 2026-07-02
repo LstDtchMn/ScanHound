@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.routes.scanner import TMDB_IMAGE_BASE  # same base+size as Scan posters (w500)
 from backend.api.ws import ws_manager
-from backend.rename import dv_detect, llm_identify
+from backend.rename import dv_detect, dv_labeler, llm_identify
 from backend.rename.dv_import import import_dv_host_db
 from backend.rename.service import conflict_annotations
 
@@ -50,6 +50,10 @@ class DvScanRequest(BaseModel):
 
 class DvImportRequest(BaseModel):
     host_db_path: Optional[str] = None
+
+
+class DvSyncRequest(BaseModel):
+    dry_run: bool = False
 
 
 class BulkIdsRequest(BaseModel):
@@ -370,6 +374,45 @@ def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)
         raise HTTPException(status_code=503, detail="DB not initialized")
     path = (req.host_db_path or _DEFAULT_DV_HOST_DB)
     return import_dv_host_db(reg.db, path)
+
+
+@router.post("/dv-sync-labels")
+def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_registry)):
+    """Reconcile managed DV labels on every movie against dv_scan (source='scan').
+    Runs in the background; streams dv:sync_progress and ALWAYS emits dv:sync_done."""
+    dry_run = bool(req.dry_run)
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="DB not initialized")
+    plex_manager = getattr(reg._plex_service, "plex_manager", None) if reg._plex_service else None
+    if plex_manager is None:
+        raise HTTPException(status_code=503, detail="Plex not initialized")
+
+    def _run():
+        result = None
+        try:
+            def _progress(done, total):
+                ws_manager.broadcast_sync({"type": "dv:sync_progress", "data": {
+                    "done": done, "total": total}})
+            result = dv_labeler.sync_labels(
+                reg.db, plex_manager, reg.config,
+                dry_run=dry_run, progress_cb=_progress)
+            ws_manager.broadcast_sync({"type": "notification", "data": {
+                "title": "Dolby Vision label sync",
+                "body": (f"{result['matched']} matched, "
+                         f"{result['added']} added, {result['removed']} removed"
+                         f"{' (dry run)' if dry_run else ''}"),
+                "priority": "normal"}})
+        except Exception as e:
+            logger.exception("dv-sync-labels failed")
+            ws_manager.broadcast_sync({"type": "notification", "data": {
+                "title": "Dolby Vision label sync failed",
+                "body": str(e), "priority": "high"}})
+            result = {"error": str(e)}
+        finally:
+            ws_manager.broadcast_sync({"type": "dv:sync_done", "data": result})
+
+    threading.Thread(target=_run, name="dv-sync-labels", daemon=True).start()
+    return {"status": "started", "dry_run": dry_run}
 
 
 @router.get("/search-tmdb")
