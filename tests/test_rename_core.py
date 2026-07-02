@@ -178,7 +178,7 @@ class TestFileOps:
 
     def test_trash_moves_file_into_timestamped_dir(self, tmp_path, monkeypatch):
         trash_root = tmp_path / "appdata" / "trash"
-        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
         f = tmp_path / "doomed.mkv"; f.write_text("bye")
         trashed_path = fileops._trash(str(f))
         assert not f.exists()
@@ -189,7 +189,7 @@ class TestFileOps:
 
     def test_trash_handles_name_collision(self, tmp_path, monkeypatch):
         trash_root = tmp_path / "appdata" / "trash"
-        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
         f1 = tmp_path / "dupe.mkv"; f1.write_text("one")
         f2 = tmp_path / "sub" / "dupe.mkv"; f2.parent.mkdir(); f2.write_text("two")
         # Force both into the *same* timestamp bucket to guarantee collision.
@@ -202,7 +202,7 @@ class TestFileOps:
 
     def test_trash_falls_back_to_shutil_move_cross_device(self, tmp_path, monkeypatch):
         trash_root = tmp_path / "appdata" / "trash"
-        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
         import errno as _errno
 
         real_rename = fileops.os.rename
@@ -221,7 +221,7 @@ class TestFileOps:
         (the default gate), the source goes to trash, not os.remove."""
         import errno as _errno
         trash_root = tmp_path / "appdata" / "trash"
-        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
 
         def _exdev(*_a, **_k):
             raise OSError(_errno.EXDEV, "Invalid cross-device link")
@@ -245,7 +245,7 @@ class TestFileOps:
         the old hard os.remove behavior."""
         import errno as _errno
         trash_root = tmp_path / "appdata" / "trash"
-        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
 
         def _exdev(*_a, **_k):
             raise OSError(_errno.EXDEV, "Invalid cross-device link")
@@ -260,3 +260,60 @@ class TestFileOps:
         assert not src.exists()
         # Nothing in trash — hard-deleted as before.
         assert not trash_root.exists() or not list(trash_root.rglob("src.mkv"))
+
+    # ── M1: trash sited on the source's own volume, not app-data ────────
+
+    def test_trash_root_for_derives_from_source_anchor_not_data_dir(self, tmp_path):
+        """_trash_root_for(path) must be rooted at the SOURCE's own volume
+        anchor (drive letter / UNC share), never under the app's _DATA_DIR —
+        otherwise a cross-device disposal copies media bytes into app-data."""
+        src = tmp_path / "movie.mkv"; src.write_text("x")
+        anchor, _ = os.path.splitdrive(os.path.abspath(str(src)))
+        root = fileops._trash_root_for(str(src))
+        assert root == os.path.join(anchor + os.sep, ".scanhound-trash")
+        assert os.path.commonpath([root, fileops._DATA_DIR]) != \
+            os.path.commonpath([root, root])  # root is not nested under _DATA_DIR
+        assert not root.startswith(fileops._DATA_DIR)
+
+    def test_trash_root_for_falls_back_to_trash_root_when_no_drive(self, monkeypatch):
+        """If splitdrive yields no anchor (relative path with no drive), fall
+        back to the module-level _TRASH_ROOT rather than raising."""
+        monkeypatch.setattr(fileops.os.path, "splitdrive", lambda p: ("", p))
+        assert fileops._trash_root_for("whatever") == fileops._TRASH_ROOT
+
+    def test_trash_moves_into_source_volume_bucket_without_data_dir_copy(self, tmp_path):
+        """End-to-end (no _TRASH_ROOT monkeypatch): trashing a source file
+        lands it under a `.scanhound-trash` bucket on the SOURCE's own
+        volume/tmp_path, and never touches _DATA_DIR at all — proving no
+        media bytes are copied cross-device into app-data."""
+        f = tmp_path / "doomed.mkv"; f.write_text("bye")
+        before = set()
+        if os.path.isdir(fileops._DATA_DIR):
+            before = {os.path.join(dp, fn) for dp, _, fns in os.walk(fileops._DATA_DIR)
+                      for fn in fns}
+
+        trashed_path = fileops._trash(str(f))
+
+        assert not f.exists()
+        assert os.path.isfile(trashed_path)
+        assert os.path.basename(trashed_path) == "doomed.mkv"
+        # Landed under a same-volume .scanhound-trash bucket, not _DATA_DIR.
+        anchor, _ = os.path.splitdrive(os.path.abspath(str(f)))
+        expected_root = os.path.join(anchor + os.sep, ".scanhound-trash")
+        assert os.path.commonpath([expected_root, trashed_path]) == expected_root
+        assert not trashed_path.startswith(fileops._DATA_DIR)
+        # _DATA_DIR's contents are untouched — no bytes copied in.
+        after = set()
+        if os.path.isdir(fileops._DATA_DIR):
+            after = {os.path.join(dp, fn) for dp, _, fns in os.walk(fileops._DATA_DIR)
+                     for fn in fns}
+        assert after == before
+
+        # Cleanup: remove the bucket we created on the real source volume.
+        shutil_bucket = os.path.dirname(trashed_path)
+        if os.path.isdir(shutil_bucket):
+            import shutil as _shutil
+            _shutil.rmtree(shutil_bucket, ignore_errors=True)
+        trash_root_dir = os.path.dirname(shutil_bucket)
+        if os.path.isdir(trash_root_dir) and not os.listdir(trash_root_dir):
+            os.rmdir(trash_root_dir)

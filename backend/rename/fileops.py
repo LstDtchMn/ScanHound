@@ -46,17 +46,45 @@ def _trash_bucket_name() -> str:
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def _trash_root_for(path: str) -> str:
+    """Return the trash root that lives on ``path``'s own volume.
+
+    Disposal must never require a cross-device copy, so the trash bucket is
+    sited on the SOURCE's own drive/UNC share (``<anchor>/.scanhound-trash``)
+    rather than under the app-data dir — otherwise every cross-device 'move'
+    would EXDEV into ``_TRASH_ROOT`` and ``shutil.move`` would silently copy
+    the full media file into (often OneDrive-synced) app-data.
+
+    Falls back to the module-level ``_TRASH_ROOT`` if ``path`` has no drive
+    anchor (e.g. a relative path with no drive component on this platform).
+    """
+    anchor, _ = os.path.splitdrive(os.path.abspath(path))
+    if not anchor:
+        return _TRASH_ROOT
+    return os.path.join(anchor + os.sep, ".scanhound-trash")
+
+
 def _trash(path: str) -> str:
-    """Move ``path`` into ``<data dir>/trash/<YYYYMMDD-HHMMSS>/<name>``.
+    """Move ``path`` into ``<source volume>/.scanhound-trash/<YYYYMMDD-HHMMSS>/<name>``.
 
     Used instead of a hard delete wherever a source file must be disposed of
-    after being safely and verifiably placed elsewhere. Handles filename
-    collisions within the same timestamp bucket with a numeric suffix, and
-    falls back to ``shutil.move`` if a same-volume rename isn't possible
-    (e.g. the trash dir and the source live on different volumes).
+    after being safely and verifiably placed elsewhere. The trash bucket is
+    sited on the source's own volume (see :func:`_trash_root_for`) so
+    disposal is an instant same-volume rename — never a byte copy into
+    app-data. Handles filename collisions within the same timestamp bucket
+    with a numeric suffix, and falls back to the app-data ``_TRASH_ROOT`` +
+    ``shutil.move`` only as a last resort (e.g. the source volume's trash
+    root can't be created), so ``_trash`` never raises in a way that would
+    lose the source.
     """
-    bucket = os.path.join(_TRASH_ROOT, _trash_bucket_name())
-    os.makedirs(bucket, exist_ok=True)
+    root = _trash_root_for(path)
+    bucket = os.path.join(root, _trash_bucket_name())
+    try:
+        os.makedirs(bucket, exist_ok=True)
+    except OSError:
+        root = _TRASH_ROOT
+        bucket = os.path.join(root, _trash_bucket_name())
+        os.makedirs(bucket, exist_ok=True)
     name = os.path.basename(path)
     base, ext = os.path.splitext(name)
     dst = os.path.join(bucket, name)
