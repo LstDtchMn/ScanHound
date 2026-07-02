@@ -512,7 +512,7 @@ class MatchingEngine:
 
         web_res = web.get('res', '?')
         web_size = self.app.parse_size(web.get('size', '0'))
-        sens = self.app.config.get("upgrade_sensitivity", 2) / 100.0
+        sens = self.app.config.get("upgrade_sensitivity", 10) / 100.0
 
         # Build Plex info string
         dv_tag = f" {self.app.EMOJI_DV}" if plex_dovi else (" HDR" if plex_hdr else "")
@@ -688,7 +688,7 @@ class MatchingEngine:
 
         p_size = exact.get('size', 0)
         w_size = self.app.parse_size(web.get('size', '0'))
-        sens = self.app.config.get("upgrade_sensitivity", 2) / 100.0
+        sens = self.app.config.get("upgrade_sensitivity", 10) / 100.0
         is_upgrade = False
 
         # Define display tags early for use in logic
@@ -929,7 +929,7 @@ class MatchingEngine:
                 logger.debug("FALLBACK  NoPreference strict=True web=%s not in plex=%s → MISSING", web_res, res_list)
             else:
                 w_size = self.app.parse_size(web.get('size', '0'))
-                sens = self.app.config.get("upgrade_sensitivity", 2) / 100.0
+                sens = self.app.config.get("upgrade_sensitivity", 10) / 100.0
                 if w_size > (max_local_size * (1 + sens)):
                     status = self.app.STATUS_UPGRADE_SIZE
                     color = self.app.COLOR_UPGRADE

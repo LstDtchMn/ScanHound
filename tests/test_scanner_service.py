@@ -410,6 +410,46 @@ class TestMatchAgainstPlex:
 
         assert svc.items[0].plex_rating_key == "new-plex-key"
 
+    def test_downloaded_similar_sibling_not_reclassified_as_upgrade(self):
+        """Regression test: a DOWNLOADED_SIMILAR sibling of a just-grabbed
+        release must NOT be re-classified to UPGRADE, even when its size
+        would clear the upgrade threshold vs. the (stale, pre-import) Plex
+        copy. See scanner_service.py _match_against_plex skip guard."""
+        svc = _make_service()
+        svc.plex.plex_index = {"all_items": [{"rating_key": "stale-plex-key"}], "by_imdb": {}, "by_title": {}}
+        svc.items = [
+            MediaItem(
+                id="item_0",
+                title="Anaconda",
+                year=2025,
+                resolution="4K",
+                size="40 GB",
+                status=ScanStatus.DOWNLOADED_SIMILAR,
+                status_text=STATUS_TEXTS[ScanStatus.DOWNLOADED_SIMILAR],
+                color=STATUS_COLORS[ScanStatus.DOWNLOADED_SIMILAR],
+                imdb_id="tt1234567",
+                web_data={"imdb_id": "tt1234567", "size": "40 GB"},
+            )
+        ]
+        # Stale Plex copy is much smaller (e.g. 10 GB) — size delta would
+        # clear the upgrade threshold if the matching engine were consulted.
+        svc.matching.find_movie_matches.return_value = (
+            [{"rating_key": "stale-plex-key", "imdb_id": "tt1234567", "res": "4K", "size": 10.0}],
+            False,
+        )
+        svc.matching.calculate_movie_upgrade_status.return_value = (
+            "UPGRADE",
+            "#f39c12",
+            "Have 10GB [4K] -> 40GB [4K]",
+            "stale-plex-key",
+        )
+
+        asyncio.run(svc._match_against_plex())
+
+        assert svc.items[0].status == ScanStatus.DOWNLOADED_SIMILAR
+        # The matching engine must not even be consulted for a skipped item.
+        svc.matching.calculate_movie_upgrade_status.assert_not_called()
+
 
 class TestDetectDuplicateGroups:
     """Test grouping logic for duplicate and multi-season items."""

@@ -539,10 +539,17 @@ class TestSettingsPresets:
         assert p["min_size_mb"] == 1000
 
     def test_balanced_preset_matches_defaults(self):
-        """Balanced preset should align with the default config's upgrade rules."""
-        p = SETTINGS_PRESETS["Balanced"]
-        assert p["upgrade_sensitivity"] == _DEFAULT_CONFIG["upgrade_sensitivity"]
-        assert p["min_size_mb"] == _DEFAULT_CONFIG["min_size_mb"]
+        """The "Balanced" preset is documented as the default configuration,
+        so every key it sets must equal the bare _DEFAULT_CONFIG value
+        (including upgrade_sensitivity, which was raised 2 -> 10 alongside
+        the default in the over-sensitive-upgrade fix)."""
+        preset = SETTINGS_PRESETS["Balanced"]
+        for key, value in preset.items():
+            if key == "description":
+                continue
+            assert _DEFAULT_CONFIG[key] == value, (
+                f"Balanced preset {key}={value} != default {_DEFAULT_CONFIG.get(key)}"
+            )
 
 
 # ===================================================================
