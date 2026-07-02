@@ -429,22 +429,23 @@ class PlexService:
 
             results = []
             for media in movie.media:
-                part = media.parts[0] if media.parts else None
-                size_gb = round(part.size / (1024**3), 2) if part and part.size else 0
+                parts = media.parts or []
+                if not parts:
+                    continue
+                for part_idx, part in enumerate(parts):
+                    size_gb = round(part.size / (1024**3), 2) if part and part.size else 0
 
-                res = "?"
-                if media.videoResolution:
-                    if media.videoResolution in ("4k", "2160"):
-                        res = "4K"
-                    elif media.videoResolution == "1080":
-                        res = "1080p"
-                    elif media.videoResolution == "720":
-                        res = "720p"
+                    res = "?"
+                    if media.videoResolution:
+                        if media.videoResolution in ("4k", "2160"):
+                            res = "4K"
+                        elif media.videoResolution == "1080":
+                            res = "1080p"
+                        elif media.videoResolution == "720":
+                            res = "720p"
 
-                dovi = False
-                hdr = False
-
-                if part:
+                    dovi = False
+                    hdr = False
                     for stream in part.videoStreams():
                         dovi_found = self._check_dovi(stream)
                         if dovi_found:
@@ -454,25 +455,33 @@ class PlexService:
                             if 'bt2020' in stream.colorPrimaries.lower():
                                 hdr = True
 
-                imdb_id = None
-                for guid in movie.guids:
-                    if 'imdb://' in guid.id:
-                        imdb_id = guid.id.replace('imdb://', '')
-                        break
+                    imdb_id = None
+                    for guid in movie.guids:
+                        if 'imdb://' in guid.id:
+                            imdb_id = guid.id.replace('imdb://', '')
+                            break
 
-                results.append({
-                    'clean_title': _clean_string(movie.title),
-                    'original_title': movie.title,
-                    'year': movie.year or 0,
-                    'res': res,
-                    'size': size_gb,
-                    'dovi': dovi,
-                    'hdr': hdr,
-                    'imdb_id': imdb_id,
-                    'rating_key': movie.ratingKey,
-                    'media_id': media.id,  # unique per version — prevents DB key collision
-                    'language': getattr(movie, 'originalLanguage', '') or "",
-                })
+                    results.append({
+                        'clean_title': _clean_string(movie.title),
+                        'original_title': movie.title,
+                        'year': movie.year or 0,
+                        'res': res,
+                        'size': size_gb,
+                        'dovi': dovi,
+                        'hdr': hdr,
+                        'imdb_id': imdb_id,
+                        'rating_key': movie.ratingKey,
+                        # media_id is unique per version, but NOT per part — a media with
+                        # multiple parts (e.g. a two-file DVD rip) reuses the same media_id
+                        # for each row below. 'key' (below) is what keeps DB rows distinct.
+                        'media_id': media.id,
+                        'file': part.file if part else None,  # served path (may be None)
+                        'language': getattr(movie, 'originalLanguage', '') or "",
+                        # Per-part cache key so multi-part media don't collide in
+                        # plex_cache's INSERT OR REPLACE (rating_key+media_id alone
+                        # is not unique when one media has multiple parts).
+                        'key': f"{movie.ratingKey}_{media.id}_{part_idx}",
+                    })
 
             return results if results else None
         except Exception as e:

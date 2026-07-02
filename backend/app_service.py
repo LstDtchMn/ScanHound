@@ -33,6 +33,35 @@ logger = logging.getLogger(__name__)
 APP_NAME = "ScanHound"
 APP_VERSION = "3.0"
 
+# Bind-mounted data dir the host detector reads (design §5/§9). Fixed path so the
+# host script never needs config.py's %APPDATA% resolution.
+_DV_DATA_DIR = os.environ.get("SCANHOUND_DATA_DIR", "/data")
+DV_HOST_JSON = os.path.join(_DV_DATA_DIR, "dv_host.json")
+
+_DV_EXPORT_DEFAULTS = {
+    "dv_library_roots": "",
+    "dv_detection": False,
+    "dv_file_tagging": False,
+    "dv_label_vocab": '{"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}',
+}
+
+
+def export_dv_host_config(config, dest):
+    """Write the DV subset of *config* to *dest* (JSON) for the host detector.
+
+    Only the four DV keys are exported — never secrets. Missing keys fall back to
+    defaults. Returns the dict written. Atomic replace; parent dir auto-created.
+    """
+    payload = {k: config.get(k, default) for k, default in _DV_EXPORT_DEFAULTS.items()}
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = f"{dest}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, dest)
+    return payload
+
 # ── TMDB constants ────────────────────────────────────────────────────
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
@@ -736,6 +765,10 @@ class AppService:
                     os.chmod(CONFIG_FILE, 0o600)
                 except OSError:
                     pass  # Best effort on platforms that don't support chmod
+                try:
+                    export_dv_host_config(self.config, DV_HOST_JSON)
+                except Exception as e:
+                    logger.warning("dv_host.json export failed: %s", e)
             except (IOError, OSError) as e:
                 logger.error(f"Failed to save config: {e}")
 

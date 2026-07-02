@@ -128,6 +128,12 @@ class AppConfig(TypedDict, total=False):
     ollama_base_url: str
     ollama_model: str
 
+    # Dolby Vision host-detector + labeler
+    dv_library_roots: str      # host-native roots, ';' or newline separated
+    dv_detection: bool
+    dv_file_tagging: bool
+    dv_label_vocab: str        # JSON: {layer: label}
+
     # Debug & Logging
     debug_mode: bool
     clear_logs_startup: bool
@@ -365,6 +371,10 @@ _DEFAULT_CONFIG: AppConfig = {
     "auto_rename_llm_enabled": False,
     "ollama_base_url": "http://ollama:11434",
     "ollama_model": "",
+    "dv_library_roots": "",
+    "dv_detection": False,
+    "dv_file_tagging": False,
+    "dv_label_vocab": '{"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}',
     "clear_logs_startup": False,
     "scan_threads": 10,
     "tv_match_threshold": 90,

@@ -1522,6 +1522,43 @@
             {/if}
           </div>
         </div>
+
+        <div class="mt-6 pt-4 border-t border-[var(--border)]">
+          <h3 class="text-sm font-semibold mb-1">Dolby Vision</h3>
+          <p class="text-xs text-[var(--text-secondary)] mb-3">
+            Host-side FEL/MEL detection feeding per-copy Plex labels (DV FEL / DV MEL / DV P8 / DV P5) for Kometa badges.
+          </p>
+
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.dv_detection ?? false}
+              onchange={(e) => settings.update((s) => ({ ...s, dv_detection: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm font-medium">Enable Dolby Vision detection</span>
+          </label>
+
+          <label class="flex items-center gap-3 mt-3">
+            <input type="checkbox" checked={$settings.dv_file_tagging ?? false}
+              onchange={(e) => settings.update((s) => ({ ...s, dv_file_tagging: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm font-medium">Tag MKV track name with the detected layer</span>
+          </label>
+
+          <label class="block mt-3">
+            <span class="text-sm text-[var(--text-secondary)]">Library roots (host-native, one per line)</span>
+            <textarea rows="3" value={$settings.dv_library_roots ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, dv_library_roots: e.currentTarget.value }))}
+              placeholder={'Y:\\Movies\nE:\\4K\n\\\\TURTLELANDSRV2\\Share\\Movies'}
+              class={inputClass + ' font-mono'}></textarea>
+          </label>
+
+          <label class="block mt-3">
+            <span class="text-sm text-[var(--text-secondary)]">Label vocabulary (JSON: layer → label)</span>
+            <input type="text" value={$settings.dv_label_vocab ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, dv_label_vocab: e.currentTarget.value }))}
+              placeholder={'{"fel":"DV FEL","mel":"DV MEL","profile8":"DV P8","profile5":"DV P5"}'}
+              class={inputClass + ' font-mono'} />
+          </label>
+        </div>
       </section>
 
     {:else if activeTab === 'notifications'}

@@ -10,7 +10,8 @@ from pydantic import BaseModel
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.routes.scanner import TMDB_IMAGE_BASE  # same base+size as Scan posters (w500)
 from backend.api.ws import ws_manager
-from backend.rename import dv_detect, llm_identify
+from backend.rename import dv_detect, dv_labeler, llm_identify
+from backend.rename.dv_import import import_dv_host_db
 from backend.rename.service import conflict_annotations
 
 
@@ -45,6 +46,14 @@ class ProcessFolderRequest(BaseModel):
 class DvScanRequest(BaseModel):
     folder: str
     force: bool = False
+
+
+class DvImportRequest(BaseModel):
+    host_db_path: Optional[str] = None
+
+
+class DvSyncRequest(BaseModel):
+    dry_run: bool = False
 
 
 class BulkIdsRequest(BaseModel):
@@ -353,6 +362,59 @@ def dv_scan_folder(req: DvScanRequest, reg: ServiceRegistry = Depends(get_regist
     return {"status": "started", "folder": folder, "force": force}
 
 
+# default host store path inside the container's bind-mounted data dir
+_DEFAULT_DV_HOST_DB = os.environ.get(
+    "SCANHOUND_DV_HOST_DB", "/data/dv_host.db")
+
+
+@router.post("/dv-import")
+def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)):
+    """Ingest the host detector's dv_host.db into dv_scan (source='scan')."""
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="DB not initialized")
+    path = (req.host_db_path or _DEFAULT_DV_HOST_DB)
+    return import_dv_host_db(reg.db, path)
+
+
+@router.post("/dv-sync-labels")
+def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_registry)):
+    """Reconcile managed DV labels on every movie against dv_scan (source='scan').
+    Runs in the background; streams dv:sync_progress and ALWAYS emits dv:sync_done."""
+    dry_run = bool(req.dry_run)
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="DB not initialized")
+    plex_manager = getattr(reg._plex_service, "plex_manager", None) if reg._plex_service else None
+    if plex_manager is None:
+        raise HTTPException(status_code=503, detail="Plex not initialized")
+
+    def _run():
+        result = None
+        try:
+            def _progress(done, total):
+                ws_manager.broadcast_sync({"type": "dv:sync_progress", "data": {
+                    "done": done, "total": total}})
+            result = dv_labeler.sync_labels(
+                reg.db, plex_manager, reg.config,
+                dry_run=dry_run, progress_cb=_progress)
+            ws_manager.broadcast_sync({"type": "notification", "data": {
+                "title": "Dolby Vision label sync",
+                "body": (f"{result['matched']} matched, "
+                         f"{result['added']} added, {result['removed']} removed"
+                         f"{' (dry run)' if dry_run else ''}"),
+                "priority": "normal"}})
+        except Exception as e:
+            logger.exception("dv-sync-labels failed")
+            ws_manager.broadcast_sync({"type": "notification", "data": {
+                "title": "Dolby Vision label sync failed",
+                "body": str(e), "priority": "high"}})
+            result = {"error": str(e)}
+        finally:
+            ws_manager.broadcast_sync({"type": "dv:sync_done", "data": result})
+
+    threading.Thread(target=_run, name="dv-sync-labels", daemon=True).start()
+    return {"status": "started", "dry_run": dry_run}
+
+
 @router.get("/search-tmdb")
 def search_tmdb(query: str = "", media_type: str = "movie",
                 reg: ServiceRegistry = Depends(get_registry)):
@@ -371,6 +433,6 @@ def dv_scans(layer: Optional[str] = None, limit: int = 500,
         return {"scans": [], "counts": {}}
     limit = max(1, min(int(limit), 2000))  # clamp: never let a client OOM the box
     return {
-        "scans": reg.db.get_dv_scans(dv_layer=layer, limit=limit),
-        "counts": reg.db.count_dv_scans_by_layer(),
+        "scans": reg.db.get_dv_scans(dv_layer=layer, limit=limit, source="scan"),
+        "counts": reg.db.count_dv_scans_by_layer(source="scan"),
     }

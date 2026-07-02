@@ -418,6 +418,14 @@ class PlexManager:
             logger.error(f"Failed to get library section '{name}': {e}")
             return None
 
+    def add_label(self, rating_key, label):
+        """Add a Plex label to the item with ``rating_key`` (TEXT-safe)."""
+        self._server.fetchItem(int(rating_key)).addLabel(label)
+
+    def remove_label(self, rating_key, label):
+        """Remove a Plex label from the item with ``rating_key`` (TEXT-safe)."""
+        self._server.fetchItem(int(rating_key)).removeLabel(label)
+
     # Path mapping methods
     def add_path_mapping(self, plex_path: str, local_path: str):
         """Add a path mapping."""

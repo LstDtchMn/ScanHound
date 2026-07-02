@@ -408,4 +408,14 @@ export const api = {
     const qs = layer ? `?layer=${encodeURIComponent(layer)}` : '';
     return request<{ scans: DvScan[]; counts: Record<string, number> }>(`/rename/dv-scans${qs}`);
   },
+  dvImport: () =>
+    request<{ imported: number; updated: number }>('/rename/dv-import', {
+      method: 'POST',
+      body: JSON.stringify({})
+    }),
+  dvSyncLabels: (dryRun = false) =>
+    request<{ status: string }>('/rename/dv-sync-labels', {
+      method: 'POST',
+      body: JSON.stringify({ dry_run: dryRun })
+    }),
 };

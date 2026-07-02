@@ -366,6 +366,12 @@ export interface Settings {
   ollama_base_url?: string;
   ollama_model?: string;
 
+  // Dolby Vision host detector + Plex labeling
+  dv_library_roots?: string;
+  dv_detection?: boolean;
+  dv_file_tagging?: boolean;
+  dv_label_vocab?: string;
+
   // Debug & Logging
   debug_mode?: boolean;
   clear_logs_startup?: boolean;

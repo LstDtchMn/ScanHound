@@ -6,7 +6,8 @@
     loadRenameJobs, loadRenameStatus, loadDvScans,
     applyJob, undoJob, deleteJob,
     acceptCombinedJob, acceptCorrectionJob,
-    dvScanProgress, dvScanResult, dvScans, dvCounts, dvScanRunning
+    dvScanProgress, dvScanResult, dvScans, dvCounts, dvScanRunning,
+    dvSyncRunning, dvSyncProgress, dvSyncResult
   } from '$lib/stores/renames';
   import { categoryOf } from '$lib/renames/category';
   import {
@@ -100,6 +101,22 @@
     } catch (e) {
       dvScanRunning.set(false);
       addToast('Error', e instanceof Error ? e.message : 'Failed to start DV scan', 'error');
+    }
+  }
+
+  // --- Dolby Vision Plex label sync ---
+  // The POST returns immediately; we stay "running" until dv:sync_done arrives
+  // (the store's WS handler flips dvSyncRunning back to false — success or error).
+  async function dvSync() {
+    if ($dvSyncRunning) return; // guard: one sync at a time
+    dvSyncRunning.set(true);
+    dvSyncResult.set(null);
+    try {
+      await api.dvSyncLabels(false);
+      addToast('Dolby Vision', 'Syncing Plex labels — matching detected layers to the copy Plex serves.');
+    } catch (e) {
+      dvSyncRunning.set(false);
+      addToast('Error', e instanceof Error ? e.message : 'Failed to start label sync', 'error');
     }
   }
 
@@ -375,6 +392,33 @@
             {/each}
           </div>
         {/if}
+
+        <div class="mt-3 pt-3 border-t border-[var(--border)]">
+          <div class="flex items-center gap-2 flex-wrap">
+            <button
+              onclick={dvSync}
+              disabled={$dvSyncRunning}
+              class="px-3 py-1.5 text-sm rounded-lg bg-[var(--accent)] hover:opacity-90 text-white font-medium transition disabled:opacity-50"
+            >{$dvSyncRunning ? 'Syncing…' : 'Sync Plex labels'}</button>
+            <span class="text-xs text-[var(--text-secondary)]">
+              Applies <code>DV FEL/MEL/P8/P5</code> to the exact copy Plex serves. Only these four labels are managed — your own labels are never touched.
+            </span>
+          </div>
+          {#if $dvSyncProgress}
+            <div class="mt-2 text-xs text-[var(--text-secondary)]">
+              Matching {$dvSyncProgress.done}/{$dvSyncProgress.total}…
+            </div>
+          {/if}
+          {#if $dvSyncResult && !$dvSyncProgress}
+            <div class="mt-2 text-xs">
+              {#if $dvSyncResult.error}
+                <span class="text-[var(--error)]">{$dvSyncResult.error}</span>
+              {:else}
+                Labeled: <strong>{$dvSyncResult.added}</strong> added, {$dvSyncResult.removed} removed, {$dvSyncResult.matched} matched.
+              {/if}
+            </div>
+          {/if}
+        </div>
       </div>
     {/if}
   </div>
