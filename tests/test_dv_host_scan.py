@@ -88,3 +88,25 @@ def test_script_never_imports_database_manager():
         src = f.read()
     assert "DatabaseManager" not in src
     assert "crawler.db" not in src
+
+
+def test_post_import_default_url_has_no_api_prefix():
+    # The router mounts at bare /rename (no /api prefix) — see
+    # backend/api/routes/rename.py's APIRouter(prefix="/rename", ...) and its
+    # inclusion in backend/api/main.py. _post_import must target that path,
+    # not /api/rename/dv-import (which 404s).
+    m = _load()
+    url = "http://localhost:9721".rstrip("/") + m.DV_IMPORT_PATH
+    assert url.endswith("/rename/dv-import")
+    assert "/api/" not in url
+
+
+def test_default_db_path_resolves_to_shared_data_dir():
+    # backend/rename/dv_import.py's container-side default is /data/dv_host.db,
+    # bind-mounted from <repo-root>/data on the host (see docker-compose.yml's
+    # ./data:/data). The script's own --db default must resolve to the same
+    # file so the automatic post-scan import finds it without an explicit flag.
+    m = _load()
+    repo_root = m.Path(SCRIPT).resolve().parents[2]
+    expected = repo_root / "data" / "dv_host.db"
+    assert m.Path(m.DEFAULT_DB_PATH).resolve() == expected

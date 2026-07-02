@@ -40,31 +40,34 @@ roots are empty, the script logs and exits (exit code `0`).
 | Flag | Default | Notes |
 |---|---|---|
 | `--config` | `data/dv_host.json` | Path to the container-exported config, relative to CWD. |
-| `--db` | `scripts/host-detector/dv_host.db` | The detector's own SQLite store. **See the path-mismatch warning below.** |
+| `--db` | `<repo-root>/data/dv_host.db` (resolved from the script's own location, not CWD) | The detector's own SQLite store. Matches where the container looks for it — see below. |
 | `--api` | `http://localhost:9721` | Base URL the script POSTs the import trigger to after a scan. |
 
-Run it from the repo root (`X:\Docker Apps\ScanHound`) so the relative defaults resolve
-correctly:
+Run it from the repo root (`X:\Docker Apps\ScanHound`) so the `--config` relative default
+resolves correctly (`--db` and `--api` already default to the right place regardless of
+CWD):
 
 ```
-python scripts\host-detector\dv_host_scan.py --config data\dv_host.json --db data\dv_host.db --api http://localhost:9721
+python scripts\host-detector\dv_host_scan.py
 ```
 
-### `--db` path mismatch — pass it explicitly
+### `--db` default — matches the container's mount, override only if needed
 
-The script's own `--db` default (`scripts/host-detector/dv_host.db`, relative to CWD)
-does **not** match where the container looks for it. `POST /rename/dv-import` reads
+`--db` defaults to `<repo-root>/data/dv_host.db`, computed from the script's own file
+location (`scripts/host-detector/dv_host_scan.py` -> `parents[2]` == repo root), not
+CWD. That's the same file the container reads: `POST /rename/dv-import` reads
 `host_db_path` from the request body, defaulting to the `SCANHOUND_DV_HOST_DB`
 environment variable, which itself defaults to `/data/dv_host.db` inside the container
 — i.e. `X:\Docker Apps\ScanHound\data\dv_host.db` on the host, via the same
 `./data:/data` bind mount as the config file. `docker-compose.yml` does not set
-`SCANHOUND_DV_HOST_DB`, so that container-side default is what's actually in effect.
+`SCANHOUND_DV_HOST_DB`, so that container-side default is what's actually in effect, and
+the script's default now matches it out of the box.
 
-**Always pass `--db data\dv_host.db`** (or an equivalent absolute path under
-`X:\Docker Apps\ScanHound\data\`) so the file the script writes is the same file the
-import endpoint reads. If you use the script's bare default instead, `dv_host.db` lands
-in `scripts\host-detector\` and `/rename/dv-import` will find nothing there, silently
-returning `{"imported": 0, "updated": 0}`.
+**Only pass `--db` explicitly** if you need the store somewhere else (e.g. a one-off test
+run) — in that case also pass the matching `host_db_path` to `/rename/dv-import` (or set
+`SCANHOUND_DV_HOST_DB`) so the file the script writes is still the file the import
+endpoint reads. Pointing `--db` at a path the container can't also resolve will make
+`/rename/dv-import` find nothing there, silently returning `{"imported": 0, "updated": 0}`.
 
 ## Ordering (the walk -> import -> sync -> Kometa chain)
 
@@ -74,14 +77,15 @@ The nightly run must happen in this exact order:
    signature is unchanged (mtime within `DV_MTIME_TOL` = 2.0s AND same size), runs
    `dovi_tool` on the rest, upserts `dv_host.db`, and (if `dv_file_tagging`) writes the
    MKV track name then re-stats + re-upserts the post-tag signature.
-2. **Import** — the action then bridges the store into the container by POSTing the
-   import trigger (the container is the sole `crawler.db` owner; this upserts `dv_scan`
-   `source='scan'`). **Known bug:** the script's own `_post_import()` currently builds
-   this request against `/api/rename/dv-import`, but the router only mounts at bare
-   `/rename` (`APIRouter(prefix="/rename", ...)` in `backend/api/routes/rename.py`,
-   included with no additional `/api` prefix in `backend/api/main.py`) — so the script's
-   automatic POST 404s. Until the script is patched, trigger the import manually or via
-   the scheduled task's own action step instead of relying on the script's internal call:
+2. **Import** — the script's own `main()` does this automatically as its last step:
+   after the walk it POSTs the import trigger to `{--api}/rename/dv-import` (bridging the
+   store into the container; the container is the sole `crawler.db` owner, and this
+   upserts `dv_scan` `source='scan'`). The request body is `{}`, so the endpoint falls
+   back to its own default (`SCANHOUND_DV_HOST_DB`, effectively `/data/dv_host.db` in the
+   container == `<repo-root>/data/dv_host.db` on the host) — which matches the script's
+   `--db` default from the same repo root, so no manual trigger is needed in the common
+   case. If you ran the scan with a non-default `--db`, trigger the import manually with
+   a matching `host_db_path` instead of relying on the script's internal call:
    ```
    curl -X POST http://localhost:9721/rename/dv-import -H "Content-Type: application/json" -d "{\"host_db_path\": \"data/dv_host.db\"}"
    ```
@@ -151,13 +155,16 @@ Create a nightly task (Task Scheduler > Create Task):
 - **Triggers:** Daily, e.g. 03:00.
 - **Actions:** Start a program — `powershell.exe` with arguments:
   ```
-  -NoProfile -Command "$env:PATH = 'C:\path\to\host-detector;' + $env:PATH; python 'X:\Docker Apps\ScanHound\scripts\host-detector\dv_host_scan.py' --config 'X:\Docker Apps\ScanHound\data\dv_host.json' --db 'X:\Docker Apps\ScanHound\data\dv_host.db' --api http://localhost:9721; Invoke-WebRequest -Method POST -Uri http://localhost:9721/rename/dv-import -Body '{\"host_db_path\": \"X:\\Docker Apps\\ScanHound\\data\\dv_host.db\"}' -ContentType 'application/json'"
+  -NoProfile -Command "$env:PATH = 'C:\path\to\host-detector;' + $env:PATH; python 'X:\Docker Apps\ScanHound\scripts\host-detector\dv_host_scan.py' --config 'X:\Docker Apps\ScanHound\data\dv_host.json' --api http://localhost:9721"
   ```
   The `$env:PATH` prefix is what makes `dovi_tool.exe` resolvable under the stripped
-  scheduled environment. The explicit `--db`/`host_db_path` absolute paths route around
-  both the `--db` default mismatch and the script's own `/api/rename/dv-import` bug
-  (see "Ordering" above) by having the scheduled task itself make the correct POST,
-  rather than depending on the script's internal `_post_import()` call.
+  scheduled environment. `--db` is omitted here because its default already resolves to
+  `X:\Docker Apps\ScanHound\data\dv_host.db` (relative to the script's own location, not
+  CWD), and the script's internal `_post_import()` call already POSTs to
+  `/rename/dv-import` with no `/api` prefix — so the scan-then-import chain runs entirely
+  inside the script with no separate `Invoke-WebRequest` step required. Pass `--db`
+  explicitly only if you want the store somewhere other than the shared `data\` folder
+  (see the "`--db` default" note above for the caveat that entails).
 
 ## Never touches `crawler.db`
 

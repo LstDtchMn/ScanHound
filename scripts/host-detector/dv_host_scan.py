@@ -7,10 +7,10 @@ database or construct its ORM layer, which runs DDL), reuses
 dv_detect.detect_layer, optionally tags MKVs with mkvpropedit, then POSTs
 /rename/dv-import so the container ingests it.
 
-Usage (Task Scheduler action, with dovi_tool.exe's dir on PATH):
-    python scripts\\host-detector\\dv_host_scan.py \\
-        --config data\\dv_host.json --db scripts\\host-detector\\dv_host.db \\
-        --api http://localhost:9721
+Usage (Task Scheduler action, with dovi_tool.exe's dir on PATH; run from the
+repo root so the --config default resolves — --db and --api already default
+to the shared data/dv_host.db and http://localhost:9721):
+    python scripts\\host-detector\\dv_host_scan.py
 """
 import argparse
 import json
@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import sys
 import urllib.request
+from pathlib import Path
 
 # Make backend.rename.dv_detect importable when run from repo root.
 sys.path.insert(0, os.path.abspath(
@@ -33,6 +34,19 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("dv_host_scan")
 
 DV_MTIME_TOL = 2.0  # >= FAT/exFAT 2s granularity — below this = endless rescans
+
+# The API router mounts at bare /rename (no /api prefix) — see
+# APIRouter(prefix="/rename", ...) in backend/api/routes/rename.py, included
+# with no additional prefix in backend/api/main.py.
+DV_IMPORT_PATH = "/rename/dv-import"
+
+# The container's import endpoint (backend/api/routes/rename.py's
+# _DEFAULT_DV_HOST_DB) reads /data/dv_host.db, bind-mounted from
+# <repo-root>/data on the host (./data:/data in docker-compose.yml). Resolve
+# that same file by walking up from this script's location
+# (scripts/host-detector/dv_host_scan.py -> parents[2] == repo root) so the
+# handoff works without an explicit --db.
+DEFAULT_DB_PATH = str(Path(__file__).resolve().parents[2] / "data" / "dv_host.db")
 
 _TAG_NAMES = {
     "fel": "Dolby Vision Profile 7 FEL",
@@ -152,7 +166,7 @@ def _tag_file(path, layer):
 
 
 def _post_import(api_base):
-    url = api_base.rstrip("/") + "/api/rename/dv-import"
+    url = api_base.rstrip("/") + DV_IMPORT_PATH
     req = urllib.request.Request(url, data=b"{}",
                                  headers={"Content-Type": "application/json"},
                                  method="POST")
@@ -175,7 +189,7 @@ def _iter_files(roots):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="data/dv_host.json")
-    ap.add_argument("--db", default="scripts/host-detector/dv_host.db")
+    ap.add_argument("--db", default=DEFAULT_DB_PATH)
     ap.add_argument("--api", default="http://localhost:9721")
     args = ap.parse_args(argv)
 
