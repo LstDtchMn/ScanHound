@@ -752,6 +752,79 @@ class TestProcessFolder:
         db.close()
 
 
+# ── Surfacing dropped rename jobs (DB failure vs legitimate skip) ────
+
+class TestSurfacedDbFailures:
+    """A genuine create_rename_job DB failure must be counted distinctly from
+    the ordinary 'already has a job for this path' skip — not silently
+    dropped as if nothing happened."""
+
+    def test_process_folder_counts_db_failure_separately_from_skip(self, tmp_path):
+        from backend.database import RenameJobDBError
+
+        db = DatabaseManager()
+        svc = _service(db, _matrix_search, movie_lib=str(tmp_path / "lib"))
+        folder = tmp_path / "dl"
+        folder.mkdir()
+        (folder / "The.Matrix.1999.1080p.BluRay.mkv").write_text("x")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(db, "create_rename_job",
+                       lambda job: (_ for _ in ()).throw(RenameJobDBError("disk full")))
+            result = svc.process_folder(str(folder))
+
+        assert result["created"] == 0
+        assert result["failed_db"] == 1
+        assert result["skipped"] == 0  # not conflated with "already tracked"
+        db.close()
+
+    def test_process_folder_normal_already_tracked_path_only_increments_skipped(self, tmp_path):
+        db = DatabaseManager()
+        svc = _service(db, _matrix_search, movie_lib=str(tmp_path / "lib"))
+        folder = tmp_path / "dl"
+        folder.mkdir()
+        (folder / "The.Matrix.1999.1080p.BluRay.mkv").write_text("x")
+
+        svc.process_folder(str(folder))          # first run: creates the job
+        again = svc.process_folder(str(folder))  # second run: already tracked
+
+        assert again["created"] == 0
+        assert again["skipped"] == 1
+        assert again["failed_db"] == 0
+        db.close()
+
+    def test_process_package_counts_db_failure_without_crashing_the_batch(self, tmp_path):
+        from backend.database import RenameJobDBError
+
+        db = DatabaseManager()
+        svc = _service(db, _matrix_search, movie_lib=str(tmp_path / "lib"))
+        d = tmp_path / "extracted"
+        d.mkdir()
+        (d / "file1.mkv").write_text("x")
+        (d / "file2.mkv").write_text("x")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(db, "create_rename_job",
+                       lambda job: (_ for _ in ()).throw(RenameJobDBError("disk full")))
+            ids = svc.process_package("pkg", str(d))
+
+        assert ids == []  # nothing created
+        assert svc.last_package_failed_db == 2  # both files' DB writes failed, not silently dropped
+        db.close()
+
+    def test_process_package_normal_path_leaves_failed_db_at_zero(self, tmp_path):
+        db = DatabaseManager()
+        svc = _service(db, _matrix_search, movie_lib=str(tmp_path / "lib"))
+        d = tmp_path / "extracted"
+        d.mkdir()
+        (d / "file1.mkv").write_text("x")
+
+        ids = svc.process_package("pkg", str(d))
+        assert len(ids) == 1
+        assert svc.last_package_failed_db == 0
+        db.close()
+
+
 # ── Identify retry ladder (year-strip, a.k.a.) ───────────────────────
 
 class TestRetryLadder:
