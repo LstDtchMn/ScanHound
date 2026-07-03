@@ -3,6 +3,7 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import Tooltip from '$lib/components/Tooltip.svelte';
+  import Badge from '$lib/components/Badge.svelte';
   import type { TrashEntry } from '$lib/api/types';
 
   let open = $state(false);
@@ -89,14 +90,14 @@
     <span class="flex items-center gap-2">
       Trash
       {#if entries.length}
-        <span class="px-1.5 py-0.5 rounded text-[11px] bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">{entries.length}</span>
+        <Badge label={String(entries.length)} />
       {/if}
       {#if dbCorruptionFlag || failedDbLastPackage > 0}
         <Tooltip text={dbCorruptionFlag
           ? 'A database corruption quarantine flag is currently on disk — check the logs.'
           : `${failedDbLastPackage} file(s) were dropped by the most recent folder import due to a database error.`}>
-          <span class="px-1.5 py-0.5 rounded text-[11px] bg-[color-mix(in_srgb,var(--error)_20%,var(--bg-secondary))] text-[var(--error)] cursor-help">
-            {dbCorruptionFlag ? 'DB corruption' : `${failedDbLastPackage} DB failure${failedDbLastPackage === 1 ? '' : 's'}`}
+          <span class="cursor-help">
+            <Badge label={dbCorruptionFlag ? 'DB corruption' : `${failedDbLastPackage} DB failure${failedDbLastPackage === 1 ? '' : 's'}`} variant="error" />
           </span>
         </Tooltip>
       {/if}

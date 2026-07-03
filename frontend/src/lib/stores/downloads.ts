@@ -61,6 +61,17 @@ connection.on('download:links_found', (data) => {
   activeDownload.update((d) => d ? { ...d, status: 'downloading', linkCount: (data.link_count as number) || 0 } : d);
 });
 
+// download:complete / download:failed each drive two independent, decoupled
+// pieces of state from the same event — the single-item `activeDownload`
+// progress bar (below) and the `downloadQueue` list's per-url reconciliation
+// (markDoneByUrl/markFailedByUrl, registered once downloadQueue exists,
+// further down). They're intentionally two separate connection.on(...)
+// registrations per event rather than one combined handler: activeDownload
+// only cares about the single most-recent download, downloadQueue tracks a
+// list of many, and keeping them separate means each concern's tests/reading
+// don't need to know the other exists. This comment plus the corresponding
+// one at the downloadQueue registrations documents the (intentional, single
+// occurrence each) duplication so it doesn't look like a bug at a glance.
 connection.on('download:complete', (data) => {
   activeDownload.update((d) => d ? { ...d, status: 'complete', method: (data.method as string) || '' } : d);
   // Only a real JDownloader hand-off marks the result row Downloaded —
@@ -217,7 +228,9 @@ function createDownloadQueue() {
     }
   });
 
-  // Per-item reconciliation from the backend's per-url progress events.
+  // Per-item queue reconciliation from the backend's per-url progress events
+  // — a second, deliberate registration for download:complete/download:failed
+  // alongside the activeDownload-progress-bar one above; see that comment.
   connection.on('download:complete', (data) => markDoneByUrl((data.url as string) || ''));
   connection.on('download:failed', (data) => markFailedByUrl((data.url as string) || ''));
 

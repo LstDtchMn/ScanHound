@@ -77,6 +77,7 @@
     transition-[transform,box-shadow,border-color,background-color] duration-200 ease-out hover:shadow-lg hover:scale-[1.02]
     {selected ? 'border-[var(--accent)] bg-[var(--accent)]/10' : 'border-[var(--border)] hover:border-[var(--text-secondary)]'}
     {focused ? 'ring-2 ring-[var(--accent)] ring-offset-1 ring-offset-[var(--bg-primary)]' : ''}"
+  data-focused={focused}
   onclick={() => selectedDetail.set(item)}
   role="button"
   tabindex="0"

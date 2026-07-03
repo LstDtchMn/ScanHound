@@ -234,23 +234,84 @@ export function handleScanComplete(data: Record<string, unknown>) {
 connection.on('scan:result', handleScanResult);
 connection.on('scan:complete', handleScanComplete);
 
-/** All unique genres from current scan results. */
-export const availableGenres = derived(results, ($results) => {
-  const set = new Set<string>();
-  for (const r of $results) {
-    for (const g of r.genres || []) set.add(g);
+/** Max rows kept in `results` while in paged/browse mode (server-backed —
+ *  infinite scroll re-fetches whatever falls off, so this just bounds memory).
+ *  Live-scan streaming (handleScanResult while pagedMode is false) is never
+ *  capped: every streamed result must survive so a completed scan's full
+ *  stats/rows stay intact. */
+export const PAGED_RESULTS_CAP = 2000;
+/** Page size for paged/browse-mode `/results/cached` fetches. `hasMore` is
+ *  derived from page*PAGED_PER_PAGE vs the server total (NOT the in-memory
+ *  `results.length`, which the cap above can pin below the total and would
+ *  otherwise leave `hasMore` stuck true → infinite fetch loop). */
+export const PAGED_PER_PAGE = 100;
+
+/** Re-fetch a snapshot of results after the WebSocket reconnects, so any
+ *  scan:result/scan:complete events that streamed in while disconnected
+ *  aren't lost forever. In paged mode this just reloads page 1 of the
+ *  server-filtered set; otherwise (a live/browse snapshot loaded via
+ *  api.getResults on app start) it re-pulls that same snapshot. Never runs
+ *  mid-live-scan-stream — pagedMode is false during a stream, but so is the
+ *  "no scan running, showing a prior snapshot" case, so we distinguish by
+ *  whether a scan is actively producing rows (activeScanResultCount > 0).
+ *  Exported for direct testing. */
+export async function handleReconnectSnapshot(): Promise<void> {
+  if (get(pagedMode)) {
+    await loadResults(true);
+    return;
   }
-  return [...set].sort();
+  if (activeScanResultCount > 0) return; // mid-stream — don't clobber it
+  try {
+    const data = await api.getResults({ per_page: '500' });
+    if (data.items && data.items.length > 0) {
+      results.set(data.items as ScanResult[]);
+      if (data.stats) stats.set(data.stats);
+    }
+  } catch {
+    /* offline — leave whatever is currently shown */
+  }
+}
+
+connection.onReconnect(() => {
+  handleReconnectSnapshot();
 });
 
-/** All unique languages from current scan results. */
-export const availableLanguages = derived(results, ($results) => {
-  const set = new Set<string>();
-  for (const r of $results) {
-    if (r.language) set.add(r.language);
+/** Server-computed facets (D3) — populated from `/results/cached`'s
+ *  `available_genres`/`available_languages`, which are computed over the
+ *  *entire* filtered-set basis server-side (see backend `_compute_facets`),
+ *  not just whatever page(s) happen to be loaded client-side. Only
+ *  meaningful in paged mode; left empty otherwise. */
+export const serverGenres = writable<string[]>([]);
+export const serverLanguages = writable<string[]>([]);
+
+/** Available genre options for the filter UI. In paged mode, the server
+ *  already computed these over the whole matching set (not just loaded
+ *  pages) — see B2/D3 — so use that; otherwise (live mode) derive from the
+ *  in-memory results, same as before. */
+export const availableGenres = derived(
+  [results, pagedMode, serverGenres],
+  ([$results, $paged, $serverGenres]) => {
+    if ($paged) return $serverGenres;
+    const set = new Set<string>();
+    for (const r of $results) {
+      for (const g of r.genres || []) set.add(g);
+    }
+    return [...set].sort();
   }
-  return [...set].sort();
-});
+);
+
+/** Available language options for the filter UI — see availableGenres. */
+export const availableLanguages = derived(
+  [results, pagedMode, serverLanguages],
+  ([$results, $paged, $serverLanguages]) => {
+    if ($paged) return $serverLanguages;
+    const set = new Set<string>();
+    for (const r of $results) {
+      if (r.language) set.add(r.language);
+    }
+    return [...set].sort();
+  }
+);
 
 /** True if the result has at least one matching copy already in Plex. */
 function hasPlexCopy(i: ScanResult): boolean {
@@ -272,6 +333,11 @@ const SORT_PARAM: Record<SortOption, { sort: string; order: string }> = {
 
 let currentPage = 0;
 let currentQueryKey = '';
+/** Bumped on every load call; an in-flight request captures its own value and
+ *  checks it against the live one after awaiting the response, so a reset
+ *  load that starts *after* an append (but resolves first, or even after) is
+ *  never mistaken for the "current" request by that older append. */
+let loadGeneration = 0;
 
 /** Snapshot of every filter/sort input that changes the server query, so a
  *  page load can detect it's been superseded by a filter change mid-flight. */
@@ -283,7 +349,7 @@ function filterQueryKey(): string {
 }
 
 function buildResultParams(page: number): Record<string, string> {
-  const p: Record<string, string> = { page: String(page), per_page: '100' };
+  const p: Record<string, string> = { page: String(page), per_page: String(PAGED_PER_PAGE) };
   const s = get(statusFilter); if (s !== 'all') p.filter = s;
   const q = get(searchFilter); if (q) p.search = q;
   const cats = get(categoryFilter); if (cats.length) p.category = cats.join(',');
@@ -298,35 +364,76 @@ function buildResultParams(page: number): Record<string, string> {
 
 /** Load a page of server-filtered/sorted results (paged mode). `reset` starts
  *  over from page 1 and replaces `results`; otherwise the next page is
- *  fetched and appended. No-ops outside paged mode or while already loading.
- *  Discards the response if the filters changed while the request was in
- *  flight (a fresh load for the new filters will already be underway). */
+ *  fetched and appended. No-ops outside paged mode.
+ *
+ *  A `reset` load always proceeds even if an append is currently in flight —
+ *  a filter/sort change must never be silently swallowed just because the
+ *  user happened to be mid-infinite-scroll. An in-flight *append*, on the
+ *  other hand, still bails if another load (of either kind) is already
+ *  running, and — like before — discards its own response if superseded
+ *  while awaiting (now detected via a generation counter rather than
+ *  `loadingMore`, since `loadingMore` may already reflect a newer request). */
 export async function loadResults(reset: boolean): Promise<void> {
   if (!get(pagedMode)) return;
-  if (get(loadingMore)) return;
+  if (!reset) {
+    if (get(loadingMore)) return; // an append never preempts anything in flight
+    const key = filterQueryKey();
+    if (key !== currentQueryKey) return; // stale append — filters already moved on
+  }
   const key = filterQueryKey();
-  if (!reset && key !== currentQueryKey) return; // stale append
+  const generation = ++loadGeneration;
   const page = reset ? 1 : currentPage + 1;
   loadingMore.set(true);
   loadError.set(false);
   try {
     const data = await api.getCachedResults(buildResultParams(page));
-    if (filterQueryKey() !== key) return; // superseded while awaiting — discard
+    if (generation !== loadGeneration) return; // superseded by a later load — discard
     const items = (data.items ?? []) as ScanResult[];
     if (reset) { results.set(items); currentPage = 1; currentQueryKey = key; }
-    else { results.update((r) => [...r, ...items]); currentPage = page; }
+    else {
+      // Cap accumulated rows so an extended infinite-scroll session doesn't
+      // grow `results` unbounded. Evict from the front (oldest-loaded pages)
+      // since those are what a user actively scrolling forward cares least
+      // about — the server can always re-supply them on a fresh page-1 load.
+      // NEVER evict a currently-selected row: that would desync `selectedKeys`
+      // (url-keyed) and silently shrink a later "Select loaded"/bulk action's
+      // target. Length may thus slightly exceed the cap when many rows are
+      // selected — bounded by the selection size, which is acceptable.
+      results.update((r) => {
+        const next = [...r, ...items];
+        let toDrop = next.length - PAGED_RESULTS_CAP;
+        if (toDrop <= 0) return next;
+        const sel = get(selectedKeys);
+        const kept: ScanResult[] = [];
+        for (const item of next) {
+          if (toDrop > 0 && !sel.has(item.url)) { toDrop--; continue; }
+          kept.push(item);
+        }
+        return kept;
+      });
+      currentPage = page;
+    }
     filteredTotal.set(data.total ?? items.length);
     titleCounts.set((data as { title_counts?: Record<string, number> }).title_counts ?? {});
     if (data.stats) stats.set(data.stats);
-    hasMore.set(get(results).length < (data.total ?? 0));
+    // Derive from page*per_page vs total, NOT results.length (the cap-eviction
+    // above pins results.length at PAGED_RESULTS_CAP while total keeps growing,
+    // which would leave hasMore permanently true → infinite fetch loop).
+    hasMore.set(page * PAGED_PER_PAGE < (data.total ?? 0));
+    // Server facets (B2/D3) — computed over the whole matching set, not just
+    // loaded pages. Always present on /results/cached; default to [] so a
+    // response shape mismatch doesn't leave a stale prior value behind.
+    const facets = data as { available_genres?: string[]; available_languages?: string[] };
+    serverGenres.set(facets.available_genres ?? []);
+    serverLanguages.set(facets.available_languages ?? []);
     if ((data as { source?: string }).source === 'cache') {
       cacheUpdatedAt.set((data as { last_updated?: string }).last_updated ?? null);
       fromCache.set(true);
     }
   } catch {
-    loadError.set(true);
+    if (generation === loadGeneration) loadError.set(true);
   } finally {
-    loadingMore.set(false);
+    if (generation === loadGeneration) loadingMore.set(false);
   }
 }
 

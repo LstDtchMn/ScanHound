@@ -2,17 +2,33 @@ import { get } from 'svelte/store';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ScanResult } from '$lib/api/types';
 
+const reconnectHandlers: Array<() => void> = [];
+vi.mock('$lib/stores/connection', () => ({
+  connection: {
+    on: vi.fn(() => () => {}),
+    onReconnect: (fn: () => void) => { reconnectHandlers.push(fn); return () => {}; }
+  }
+}));
+
 vi.mock('$lib/api/client', () => ({
   api: {
     dismissItems: vi.fn().mockResolvedValue({ status: 'ok', dismissed_count: 1 }),
     dismissedList: vi.fn().mockResolvedValue({ items: [], count: 0 }),
     selectAll: vi.fn().mockResolvedValue({}),
     deselectAll: vi.fn().mockResolvedValue({}),
-    getCachedResults: vi.fn()
+    getCachedResults: vi.fn(),
+    getResults: vi.fn()
   }
 }));
 
 const { api } = await import('$lib/api/client');
+
+/** Fire every reconnect handler registered via connection.onReconnect (the
+ *  store registers its own at import time), the same way connection.ts's
+ *  real ws.onopen-after-a-prior-close path would. */
+function triggerReconnect() {
+  reconnectHandlers.forEach((fn) => fn());
+}
 const {
   results,
   selectedKeys,
@@ -268,15 +284,17 @@ describe('loadResults / paged mode', () => {
   it('loadResults(true) replaces results and sets paged totals', async () => {
     const { loadResults, results, filteredTotal, hasMore, pagedMode } =
       await import('./results');
+    // total > PAGED_PER_PAGE (100) so there genuinely IS a page 2 — hasMore is
+    // derived from page*per_page vs total, not the returned row count.
     (api.getCachedResults as any).mockResolvedValueOnce({
       items: [item({ title: 'A', url: 'a' }), item({ title: 'B', url: 'b' })],
-      total: 5, stats: { total: 5, missing: 5, upgrade: 0, library: 0 },
+      total: 250, stats: { total: 250, missing: 250, upgrade: 0, library: 0 },
       title_counts: { A: 1, B: 1 }, source: 'cache'
     });
     pagedMode.set(true);
     await loadResults(true);
     expect(get(results).length).toBe(2);
-    expect(get(filteredTotal)).toBe(5);
+    expect(get(filteredTotal)).toBe(250);
     expect(get(hasMore)).toBe(true);
   });
 
@@ -367,6 +385,47 @@ describe('loadResults / paged mode', () => {
     expect(params.posted_before).toBe('2026-06-10');
   });
 
+  it('D2: a reset load preempts an in-flight append instead of being swallowed', async () => {
+    const { loadResults, results, pagedMode, statusFilter } = await import('./results');
+    pagedMode.set(true);
+
+    // Seed page 1 so an append (page 2) is a valid next call.
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'Page1', url: 'p1' })],
+      total: 300, stats: { total: 300, missing: 0, upgrade: 0, library: 0 }, title_counts: {}
+    });
+    await loadResults(true);
+
+    // Kick off an append (page 2) but don't resolve it yet.
+    let resolveAppend!: (v: any) => void;
+    const appendPromise = new Promise((resolve) => { resolveAppend = resolve; });
+    (api.getCachedResults as any).mockReturnValueOnce(appendPromise);
+    const appendCall = loadResults(false); // in-flight, unresolved
+
+    // Filter changes mid-flight — simulate what the debounced refetch would do.
+    statusFilter.set('missing');
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'FilteredFresh', url: 'ff' })],
+      total: 1, stats: { total: 1, missing: 1, upgrade: 0, library: 0 }, title_counts: {}
+    });
+    const resetCall = loadResults(true); // must NOT be swallowed by the in-flight append
+
+    await resetCall;
+    // The reset load must have gone through and won: results reflect the
+    // fresh filtered set, not the stale append.
+    expect(get(results).map((r) => r.title)).toEqual(['FilteredFresh']);
+
+    // Now let the stale append resolve — its result must be discarded (the
+    // existing filterQueryKey superseded-check), not appended after the reset.
+    resolveAppend({
+      items: [item({ title: 'StaleAppend', url: 'stale' })],
+      total: 300, stats: { total: 300, missing: 0, upgrade: 0, library: 0 }, title_counts: {}
+    });
+    await appendCall;
+
+    expect(get(results).map((r) => r.title)).toEqual(['FilteredFresh']);
+  });
+
   it('selectAll() payload includes posted_after/posted_before only when set', async () => {
     const { selectAll, postedAfter, postedBefore } = await import('./results');
     postedAfter.set('');
@@ -382,6 +441,240 @@ describe('loadResults / paged mode', () => {
     payload = (api.selectAll as any).mock.calls.at(-1)[0];
     expect(payload.posted_after).toBe('2026-06-01');
     expect(payload.posted_before).toBe('2026-06-10');
+  });
+});
+
+describe('WS reconnect snapshot reload (D1)', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('in paged mode, a reconnect re-runs loadResults(true) (page 1 reload)', async () => {
+    const { handleReconnectSnapshot, pagedMode, results, filteredTotal } = await import('./results');
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'Fresh', url: 'fresh' })],
+      total: 1, stats: { total: 1, missing: 1, upgrade: 0, library: 0 }, title_counts: { Fresh: 1 }
+    });
+
+    await handleReconnectSnapshot();
+
+    expect(api.getCachedResults).toHaveBeenCalled();
+    expect(get(results).map((r) => r.title)).toEqual(['Fresh']);
+    expect(get(filteredTotal)).toBe(1);
+  });
+
+  it('outside paged mode (a live snapshot), a reconnect re-fetches api.getResults', async () => {
+    const { handleReconnectSnapshot, pagedMode, results, stats } = await import('./results');
+    pagedMode.set(false);
+    results.set([item({ title: 'Old snapshot', url: 'old' })]);
+    (api.getResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'Missed while down', url: 'missed' })],
+      total: 1, page: 1, per_page: 500,
+      stats: { total: 1, missing: 1, upgrade: 0, library: 0 }
+    });
+
+    await handleReconnectSnapshot();
+
+    expect(api.getResults).toHaveBeenCalledWith({ per_page: '500' });
+    expect(get(results).map((r) => r.title)).toEqual(['Missed while down']);
+    expect(get(stats)).toEqual({ total: 1, missing: 1, upgrade: 0, library: 0 });
+  });
+
+  it('does not clobber an in-progress live scan stream on reconnect', async () => {
+    const { handleScanResult, handleReconnectSnapshot, pagedMode, results } = await import('./results');
+    pagedMode.set(false);
+    handleScanResult(item({ title: 'Streaming 1', url: 's1' }) as unknown as Record<string, unknown>);
+
+    await handleReconnectSnapshot();
+
+    expect(api.getResults).not.toHaveBeenCalled();
+    expect(get(results).map((r) => r.title)).toEqual(['Streaming 1']);
+  });
+
+  it('the connection.onReconnect wiring at module load invokes handleReconnectSnapshot', async () => {
+    const { pagedMode, results } = await import('./results');
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'Reconnected', url: 'r1' })],
+      total: 1, stats: { total: 1, missing: 1, upgrade: 0, library: 0 }, title_counts: {}
+    });
+
+    triggerReconnect();
+    await vi.waitFor(() => {
+      expect(get(results).map((r) => r.title)).toEqual(['Reconnected']);
+    });
+  });
+});
+
+describe('bounded growth of accumulated pages (D1)', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('appending pages past the cap evicts the oldest rows, keeping the array bounded', async () => {
+    const { loadResults, results, hasMore, pagedMode, PAGED_RESULTS_CAP } = await import('./results');
+    pagedMode.set(true);
+
+    // Seed with a first page.
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'first', url: 'first' })],
+      total: PAGED_RESULTS_CAP + 50,
+      stats: { total: PAGED_RESULTS_CAP + 50, missing: 0, upgrade: 0, library: 0 },
+      title_counts: {}
+    });
+    await loadResults(true);
+
+    // Append pages of 100 until well past the cap.
+    const pagesNeeded = Math.ceil((PAGED_RESULTS_CAP + 50) / 100) + 1;
+    for (let i = 0; i < pagesNeeded; i++) {
+      const pageItems = Array.from({ length: 100 }, (_, j) =>
+        item({ title: `p${i}-${j}`, url: `p${i}-${j}` })
+      );
+      (api.getCachedResults as any).mockResolvedValueOnce({
+        items: pageItems,
+        total: PAGED_RESULTS_CAP + 50,
+        stats: { total: PAGED_RESULTS_CAP + 50, missing: 0, upgrade: 0, library: 0 },
+        title_counts: {}
+      });
+      await loadResults(false);
+    }
+
+    expect(get(results).length).toBeLessThanOrEqual(PAGED_RESULTS_CAP);
+    // The most recently appended page must survive the eviction (it's the
+    // oldest rows — the front of the array — that get dropped).
+    const lastPageFirstUrl = `p${pagesNeeded - 1}-0`;
+    expect(get(results).some((r) => r.url === lastPageFirstUrl)).toBe(true);
+    // Once every server page has been fetched, hasMore MUST be false even
+    // though results.length is pinned at the cap below total — otherwise the
+    // scroll/keyboard top-up loops forever past the true end of the set.
+    expect(get(hasMore)).toBe(false);
+  });
+
+  it('never evicts a currently-selected row when capping (selection stays consistent)', async () => {
+    const { loadResults, results, selectedKeys, pagedMode, PAGED_RESULTS_CAP } =
+      await import('./results');
+    pagedMode.set(true);
+
+    // Page 1 has a row the user then selects.
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'keep-me', url: 'keep-me' })],
+      total: PAGED_RESULTS_CAP + 500,
+      stats: { total: PAGED_RESULTS_CAP + 500, missing: 0, upgrade: 0, library: 0 },
+      title_counts: {}
+    });
+    await loadResults(true);
+    selectedKeys.set(new Set(['keep-me'])); // user selects the oldest row
+
+    // Append enough pages to push well past the cap — 'keep-me' is the very
+    // front of the array and would be the first evicted if selection were ignored.
+    const pagesNeeded = Math.ceil((PAGED_RESULTS_CAP + 500) / 100) + 2;
+    for (let i = 0; i < pagesNeeded; i++) {
+      (api.getCachedResults as any).mockResolvedValueOnce({
+        items: Array.from({ length: 100 }, (_, j) => item({ title: `q${i}-${j}`, url: `q${i}-${j}` })),
+        total: PAGED_RESULTS_CAP + 500,
+        stats: { total: PAGED_RESULTS_CAP + 500, missing: 0, upgrade: 0, library: 0 },
+        title_counts: {}
+      });
+      await loadResults(false);
+    }
+
+    // The selected row survived eviction, so selectedKeys stays backed by a
+    // real loaded row (no phantom selection / over-counted bulk target).
+    expect(get(results).some((r) => r.url === 'keep-me')).toBe(true);
+  });
+
+  it('live-scan streaming (handleScanResult) is never capped', async () => {
+    const { handleScanResult, results, pagedMode } = await import('./results');
+    pagedMode.set(true); // first streamed item flips this off, per existing behavior
+    const count = 50;
+    for (let i = 0; i < count; i++) {
+      handleScanResult(item({ title: `live-${i}`, url: `live-${i}` }) as unknown as Record<string, unknown>);
+    }
+    expect(get(results).length).toBe(count);
+  });
+});
+
+describe('D3: paged-mode facets use server available_genres/available_languages', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('availableGenres/availableLanguages reflect the server facets in paged mode, not just loaded rows', async () => {
+    const { loadResults, pagedMode, availableGenres, availableLanguages } = await import('./results');
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      // Only one item's worth of genres/languages loaded on this page...
+      items: [item({ title: 'A', url: 'a', genres: ['Action'], language: 'English' })],
+      total: 500,
+      stats: { total: 500, missing: 0, upgrade: 0, library: 0 },
+      title_counts: {},
+      // ...but the server facets span the whole matching set (500 items).
+      available_genres: ['Action', 'Comedy', 'Drama', 'Horror'],
+      available_languages: ['English', 'French', 'German']
+    });
+
+    await loadResults(true);
+
+    expect(get(availableGenres)).toEqual(['Action', 'Comedy', 'Drama', 'Horror']);
+    expect(get(availableLanguages)).toEqual(['English', 'French', 'German']);
+  });
+
+  it('in live mode (not paged), facets still derive from loaded results, ignoring any stale server facets', async () => {
+    const { results, pagedMode, availableGenres, availableLanguages } = await import('./results');
+    pagedMode.set(false);
+    results.set([
+      item({ url: 'a', genres: ['Sci-Fi'], language: 'Japanese' }),
+      item({ url: 'b', genres: ['Comedy'], language: 'Japanese' })
+    ]);
+
+    expect(get(availableGenres)).toEqual(['Comedy', 'Sci-Fi']);
+    expect(get(availableLanguages)).toEqual(['Japanese']);
+  });
+
+  it('a fresh page-1 load replaces stale server facets from a previous filter', async () => {
+    const { loadResults, pagedMode, availableGenres } = await import('./results');
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [], total: 0, stats: { total: 0, missing: 0, upgrade: 0, library: 0 },
+      title_counts: {}, available_genres: ['Action'], available_languages: []
+    });
+    await loadResults(true);
+    expect(get(availableGenres)).toEqual(['Action']);
+
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [], total: 0, stats: { total: 0, missing: 0, upgrade: 0, library: 0 },
+      title_counts: {}, available_genres: ['Horror', 'Thriller'], available_languages: []
+    });
+    await loadResults(true);
+    expect(get(availableGenres)).toEqual(['Horror', 'Thriller']);
+  });
+});
+
+describe('D3: select-all in paged mode selects only loaded rows (honest label)', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('selectAll() in paged mode still only selects the urls actually passed/loaded — not the full server match set', async () => {
+    // This documents the D3 decision: rather than silently claiming to select
+    // every server-matched row (which would require plumbing group_key->url
+    // mapping from a backend response, since selectedKeys is url-keyed while
+    // the server's /select-all match set is group_key-keyed), paged mode's
+    // "Select all" button is relabeled "Select loaded (N)" in the UI and the
+    // store keeps exactly its existing (loaded-rows) semantics.
+    const { selectAll, selectedKeys, results, filteredResults, pagedMode, filteredTotal } = await import('./results');
+    pagedMode.set(true);
+    filteredTotal.set(500); // server says 500 total matches
+    results.set([item({ title: 'A', url: 'a' }), item({ title: 'B', url: 'b' })]); // only 2 loaded
+
+    await selectAll(get(filteredResults).map((r) => r.url));
+
+    expect([...get(selectedKeys)].sort()).toEqual(['a', 'b']);
   });
 });
 

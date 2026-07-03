@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, tileSize, posterAspect, tileShowMeta, gridGap, gridColumns, GRID_COLUMN_CHOICES, postedAfter, postedBefore, type TileSize, type PosterAspect, type GridGap } from '$lib/stores/results';
+  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, tileSize, posterAspect, tileShowMeta, gridGap, gridColumns, GRID_COLUMN_CHOICES, postedAfter, postedBefore, pagedMode, filteredTotal, type TileSize, type PosterAspect, type GridGap } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -58,6 +58,15 @@
 
   let resultCount = $derived($filteredResults.length);
   let selectedCount = $derived($selectedKeys.size);
+  // D3: in paged mode, "select all" only selects the rows currently loaded
+  // client-side — the server may have many more matches than that. Rather
+  // than silently under-selecting, say so explicitly.
+  let selectAllLabel = $derived($pagedMode && $filteredTotal > resultCount ? `Select loaded (${resultCount})` : 'All');
+  let selectAllTitle = $derived(
+    $pagedMode && $filteredTotal > resultCount
+      ? `Only the ${resultCount} loaded result(s) will be selected — ${$filteredTotal} match the current filters. Scroll to load more, then select again.`
+      : 'Select visible results'
+  );
   let addingToWatchlist = $state(false);
   let copyingLinks = $state(false);
 
@@ -171,9 +180,9 @@
       <button
         onclick={() => selectAll($filteredResults.map(i => i.url))}
         class="px-1.5 py-0.5 rounded text-[10px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] transition-colors"
-        title="Select visible results"
+        title={selectAllTitle}
       >
-        All
+        {selectAllLabel}
       </button>
       {#if selectedCount > 0}
         <button
@@ -653,7 +662,7 @@
         <div class="flex items-center justify-between text-sm">
           <span class="text-[var(--text-secondary)]">{resultCount} results{selectedCount > 0 ? ` · ${selectedCount} selected` : ''}</span>
           <div class="flex gap-3">
-            <button onclick={() => selectAll($filteredResults.map(i => i.url))} class="text-[var(--accent)]">Select all</button>
+            <button onclick={() => selectAll($filteredResults.map(i => i.url))} class="text-[var(--accent)]" title={selectAllTitle}>{selectAllLabel}</button>
             {#if selectedCount > 0}<button onclick={() => deselectAll()} class="text-[var(--text-secondary)]">Clear</button>{/if}
           </div>
         </div>

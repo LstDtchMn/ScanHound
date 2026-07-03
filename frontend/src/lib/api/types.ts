@@ -51,6 +51,11 @@ export interface ResultsResponse {
 export interface CachedResultsResponse extends ResultsResponse {
   source: string;
   last_updated: string | null;
+  /** Server-side facets (D3) — genres/languages across the whole matching
+   *  set, not just the current page. Present when the backend was asked to
+   *  include_facets (currently always, for /results/cached). */
+  available_genres?: string[];
+  available_languages?: string[];
 }
 
 export interface BackgroundStatus {

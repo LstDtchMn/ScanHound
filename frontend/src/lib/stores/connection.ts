@@ -21,12 +21,27 @@ function createConnection() {
   let sidecarAlive = true;
   let manualDisconnect = false;
   let tauriListenersRegistered = false;
+  /** True once the very first connection of this session has opened — so we
+   *  can tell a genuine reconnect (a later open) apart from the initial one. */
+  let hasConnectedOnce = false;
+  const reconnectHandlers = new Set<() => void>();
 
   function on(type: string, handler: (data: Record<string, unknown>) => void) {
     if (!handlers.has(type)) handlers.set(type, new Set());
     handlers.get(type)!.add(handler);
     return () => {
       handlers.get(type)?.delete(handler);
+    };
+  }
+
+  /** Register a callback fired whenever the socket re-opens after having
+   *  previously been open (i.e. a real reconnect, not the initial connect).
+   *  Consumers use this to re-fetch a snapshot so events missed while
+   *  disconnected aren't lost forever. Returns an unsubscribe function. */
+  function onReconnect(handler: () => void) {
+    reconnectHandlers.add(handler);
+    return () => {
+      reconnectHandlers.delete(handler);
     };
   }
 
@@ -85,6 +100,10 @@ function createConnection() {
     ws.onopen = () => {
       reconnectDelay = RECONNECT_DELAY;
       retryCount = 0;
+      if (hasConnectedOnce) {
+        reconnectHandlers.forEach((fn) => fn());
+      }
+      hasConnectedOnce = true;
     };
 
     ws.onmessage = (event) => {
@@ -129,6 +148,7 @@ function createConnection() {
 
   function disconnect() {
     manualDisconnect = true;
+    hasConnectedOnce = false;
     if (reconnectTimer) clearTimeout(reconnectTimer);
     ws?.close();
     ws = null;
@@ -141,7 +161,7 @@ function createConnection() {
     }
   }
 
-  return { state, version, connect, disconnect, send, on };
+  return { state, version, connect, disconnect, send, on, onReconnect };
 }
 
 export const connection = createConnection();

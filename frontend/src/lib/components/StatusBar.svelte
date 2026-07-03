@@ -5,6 +5,7 @@
   import { jdConnection } from '$lib/stores/jdownloader';
   import { settings, settingsLoaded } from '$lib/stores/settings';
   import ChangelogBadge from './ChangelogBadge.svelte';
+  import Badge from './Badge.svelte';
 
   let errorCount = $derived($logs.filter(l => l.level === 'error' || l.level === 'warning').length);
   let selectedCount = $derived($selectedKeys.size);
@@ -60,7 +61,7 @@
   >
     Logs
     {#if errorCount > 0}
-      <span class="bg-red-500/20 text-red-400 px-1.5 rounded-full text-[10px]">{errorCount}</span>
+      <Badge label={String(errorCount)} variant="error" />
     {/if}
   </button>
 
