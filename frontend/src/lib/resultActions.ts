@@ -3,7 +3,7 @@
 // (mobile long-press / "⋯"). Keeps the two touch/mouse surfaces at parity.
 import { api } from './api/client';
 import { addToast } from './stores/notifications';
-import { toggleSelect } from './stores/results';
+import { toggleSelect, markDownloaded } from './stores/results';
 import type { ScanResult } from './api/types';
 
 export function downloadResult(item: ScanResult, host: string): void {
@@ -20,6 +20,7 @@ export async function copyResultLinks(item: ScanResult, host: string): Promise<v
       return;
     }
     await navigator.clipboard.writeText(links.join('\n'));
+    markDownloaded([item.url]);
     addToast('Copied', `${links.length} ${host} link(s) copied`);
   } catch (e) {
     addToast('Error', e instanceof Error ? e.message : 'Failed to scrape links', 'error');
