@@ -239,7 +239,7 @@
           <h3 class="text-xs font-semibold text-[var(--text-secondary)] uppercase tracking-wider mb-1.5">Genres</h3>
           <div class="flex flex-wrap gap-1.5">
             {#each item.genres as genre}
-              <span class="px-2 py-0.5 rounded-full text-xs bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">{genre}</span>
+              <Badge label={genre} />
             {/each}
           </div>
         </div>
