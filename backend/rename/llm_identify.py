@@ -138,6 +138,41 @@ def _video_duration_seconds(video_path: str) -> float | None:
     return mins * 60 if mins is not None else None
 
 
+def probe_video_width(video_path: str, timeout: int = 30) -> Optional[int]:
+    """Return the pixel width of a video file's primary video stream via
+    ffprobe, or ``None`` if ffprobe is unavailable, the file can't be read,
+    or the call errors/times out. Entirely fail-safe — mirrors
+    :func:`video_duration_minutes`'s invocation pattern (same binary
+    resolution via ``shutil.which``, same subprocess/timeout/error handling).
+
+    Used to disambiguate routing when a filename carries no resolution tag:
+    callers treat a returned width >= 3000 as effectively 4K/2160p.
+    """
+    import shutil
+    import subprocess
+
+    if not video_path:
+        return None
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        r = subprocess.run(
+            [ffprobe, "-v", "quiet", "-select_streams", "v:0",
+             "-show_entries", "stream=width", "-of", "json", video_path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode != 0:
+            return None
+        streams = json.loads(r.stdout).get("streams") or []
+        if not streams:
+            return None
+        width = streams[0].get("width")
+        return int(width) if width else None
+    except Exception:
+        return None
+
+
 _VISION_TIMEOUT = 45.0
 _VISION_SYSTEM = (
     "You identify movies and TV shows from video frames. "

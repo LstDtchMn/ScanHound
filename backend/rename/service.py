@@ -1282,6 +1282,21 @@ class RenameService:
             job.update(status="needs_review", warning_message="No confident match found")
             return self._create(job)
 
+        # Resolution routing fallback: a filename with no resolution tag
+        # (e.g. a 4K release scene-named without "2160p"/"4K") would silently
+        # route to the 1080p/default movie root since _movie_root only keys
+        # off resolution == '2160p'. Probe the actual video width via ffprobe
+        # only when the parse left it unknown — never for already-tagged
+        # files, so this never adds a subprocess call to the common case.
+        if not match.get("resolution"):
+            width = None
+            try:
+                width = _llm.probe_video_width(path)
+            except Exception:
+                width = None  # fail-safe: never let a probe error crash the file
+            if width and width >= 3000:
+                match["resolution"] = "2160p"
+
         fname, dest = _naming.build_target(
             {**match, "original_filename": filename},
             movie_root=self._movie_root(match.get("resolution")),

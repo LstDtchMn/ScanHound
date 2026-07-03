@@ -271,6 +271,64 @@ class TestLibraryGuard:
         assert job["status"] == "matched"  # guard doesn't fire when set
 
 
+# ── resolution=None -> ffprobe width fallback routing ──────────────────
+
+class TestResolutionProbe:
+    def test_unknown_resolution_probed_as_4k_routes_to_4k_library(
+            self, db, tmp_path, monkeypatch):
+        """A plain filename with no resolution tag that's actually a 4K file
+        (ffprobe reports width >= 3000) must route to the 4K library, not
+        silently land in the 1080p one."""
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.mkv")
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.probe_video_width",
+            lambda path, timeout=30: 3840)
+        lib = str(tmp_path / "lib")
+        lib_4k = str(tmp_path / "lib-4k")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_movie_library_4k=lib_4k)
+        job = db.get_rename_job(svc.process_package("pkg", save_to)[0])
+        assert job["destination_path"].startswith(lib_4k)
+        assert job["resolution"] == "2160p"
+
+    def test_ffprobe_failure_falls_back_to_1080p_no_crash(
+            self, db, tmp_path, monkeypatch):
+        """If ffprobe errors/times out/can't read the file, routing must fall
+        back to the CURRENT (non-4K) behavior — never raise."""
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.mkv")
+
+        def _boom(path, timeout=30):
+            raise RuntimeError("ffprobe exploded")
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.probe_video_width", _boom)
+        lib = str(tmp_path / "lib")
+        lib_4k = str(tmp_path / "lib-4k")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_movie_library_4k=lib_4k)
+        job = db.get_rename_job(svc.process_package("pkg", save_to)[0])
+        assert job["destination_path"].startswith(lib)
+        assert not job["destination_path"].startswith(lib_4k)
+
+    def test_already_tagged_resolution_skips_probe(self, db, tmp_path, monkeypatch):
+        """Probing is only for unknown resolution — a file already tagged
+        (e.g. 2160p) must not trigger an extra subprocess call."""
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.2160p.mkv")
+        called = {"n": 0}
+
+        def _spy(path, timeout=30):
+            called["n"] += 1
+            return 3840
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.probe_video_width", _spy)
+        lib = str(tmp_path / "lib")
+        lib_4k = str(tmp_path / "lib-4k")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_movie_library_4k=lib_4k)
+        job = db.get_rename_job(svc.process_package("pkg", save_to)[0])
+        assert called["n"] == 0
+        assert job["destination_path"].startswith(lib_4k)  # already 2160p, routes fine
+
+
 # ── duplicate-destination conflict detection ──────────────────────────
 
 class TestDestinationConflict:
