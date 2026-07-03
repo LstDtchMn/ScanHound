@@ -309,6 +309,11 @@ const SORT_PARAM: Record<SortOption, { sort: string; order: string }> = {
 
 let currentPage = 0;
 let currentQueryKey = '';
+/** Bumped on every load call; an in-flight request captures its own value and
+ *  checks it against the live one after awaiting the response, so a reset
+ *  load that starts *after* an append (but resolves first, or even after) is
+ *  never mistaken for the "current" request by that older append. */
+let loadGeneration = 0;
 
 /** Snapshot of every filter/sort input that changes the server query, so a
  *  page load can detect it's been superseded by a filter change mid-flight. */
@@ -335,20 +340,30 @@ function buildResultParams(page: number): Record<string, string> {
 
 /** Load a page of server-filtered/sorted results (paged mode). `reset` starts
  *  over from page 1 and replaces `results`; otherwise the next page is
- *  fetched and appended. No-ops outside paged mode or while already loading.
- *  Discards the response if the filters changed while the request was in
- *  flight (a fresh load for the new filters will already be underway). */
+ *  fetched and appended. No-ops outside paged mode.
+ *
+ *  A `reset` load always proceeds even if an append is currently in flight —
+ *  a filter/sort change must never be silently swallowed just because the
+ *  user happened to be mid-infinite-scroll. An in-flight *append*, on the
+ *  other hand, still bails if another load (of either kind) is already
+ *  running, and — like before — discards its own response if superseded
+ *  while awaiting (now detected via a generation counter rather than
+ *  `loadingMore`, since `loadingMore` may already reflect a newer request). */
 export async function loadResults(reset: boolean): Promise<void> {
   if (!get(pagedMode)) return;
-  if (get(loadingMore)) return;
+  if (!reset) {
+    if (get(loadingMore)) return; // an append never preempts anything in flight
+    const key = filterQueryKey();
+    if (key !== currentQueryKey) return; // stale append — filters already moved on
+  }
   const key = filterQueryKey();
-  if (!reset && key !== currentQueryKey) return; // stale append
+  const generation = ++loadGeneration;
   const page = reset ? 1 : currentPage + 1;
   loadingMore.set(true);
   loadError.set(false);
   try {
     const data = await api.getCachedResults(buildResultParams(page));
-    if (filterQueryKey() !== key) return; // superseded while awaiting — discard
+    if (generation !== loadGeneration) return; // superseded by a later load — discard
     const items = (data.items ?? []) as ScanResult[];
     if (reset) { results.set(items); currentPage = 1; currentQueryKey = key; }
     else {
@@ -371,9 +386,9 @@ export async function loadResults(reset: boolean): Promise<void> {
       fromCache.set(true);
     }
   } catch {
-    loadError.set(true);
+    if (generation === loadGeneration) loadError.set(true);
   } finally {
-    loadingMore.set(false);
+    if (generation === loadGeneration) loadingMore.set(false);
   }
 }
 

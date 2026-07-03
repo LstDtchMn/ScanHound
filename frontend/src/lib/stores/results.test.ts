@@ -383,6 +383,47 @@ describe('loadResults / paged mode', () => {
     expect(params.posted_before).toBe('2026-06-10');
   });
 
+  it('D2: a reset load preempts an in-flight append instead of being swallowed', async () => {
+    const { loadResults, results, pagedMode, statusFilter } = await import('./results');
+    pagedMode.set(true);
+
+    // Seed page 1 so an append (page 2) is a valid next call.
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'Page1', url: 'p1' })],
+      total: 300, stats: { total: 300, missing: 0, upgrade: 0, library: 0 }, title_counts: {}
+    });
+    await loadResults(true);
+
+    // Kick off an append (page 2) but don't resolve it yet.
+    let resolveAppend!: (v: any) => void;
+    const appendPromise = new Promise((resolve) => { resolveAppend = resolve; });
+    (api.getCachedResults as any).mockReturnValueOnce(appendPromise);
+    const appendCall = loadResults(false); // in-flight, unresolved
+
+    // Filter changes mid-flight — simulate what the debounced refetch would do.
+    statusFilter.set('missing');
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'FilteredFresh', url: 'ff' })],
+      total: 1, stats: { total: 1, missing: 1, upgrade: 0, library: 0 }, title_counts: {}
+    });
+    const resetCall = loadResults(true); // must NOT be swallowed by the in-flight append
+
+    await resetCall;
+    // The reset load must have gone through and won: results reflect the
+    // fresh filtered set, not the stale append.
+    expect(get(results).map((r) => r.title)).toEqual(['FilteredFresh']);
+
+    // Now let the stale append resolve — its result must be discarded (the
+    // existing filterQueryKey superseded-check), not appended after the reset.
+    resolveAppend({
+      items: [item({ title: 'StaleAppend', url: 'stale' })],
+      total: 300, stats: { total: 300, missing: 0, upgrade: 0, library: 0 }, title_counts: {}
+    });
+    await appendCall;
+
+    expect(get(results).map((r) => r.title)).toEqual(['FilteredFresh']);
+  });
+
   it('selectAll() payload includes posted_after/posted_before only when set', async () => {
     const { selectAll, postedAfter, postedBefore } = await import('./results');
     postedAfter.set('');
