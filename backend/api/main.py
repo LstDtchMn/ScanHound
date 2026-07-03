@@ -417,8 +417,15 @@ def create_app(
             "http://tauri.localhost",  # Tauri >=2.x default scheme on Windows + Android
             "tauri://localhost",       # Tauri custom protocol (Linux/macOS)
         ],
-        # Allow any localhost/127.0.0.1 port — Vite picks a free port at dev time
-        allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
+        # A5: was `(:\d+)?` — any port on localhost/127.0.0.1, unbounded. Tightened
+        # to the actual dev surface: tauri.conf.json pins devUrl to :5173, and Vite
+        # increments by one (5174, 5175, …) if that port is already taken locally
+        # (e.g. a second dev instance) rather than picking an arbitrary port — so a
+        # small fixed window covers real usage without leaving every port on the
+        # loopback interface as a trusted, credentialed CORS origin. Widen this
+        # window (not the unbounded regex) if a dev setup needs more concurrent
+        # instances than it covers.
+        allow_origin_regex=r"http://(localhost|127\.0\.0\.1):517[0-9]",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

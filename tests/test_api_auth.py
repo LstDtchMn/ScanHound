@@ -263,3 +263,38 @@ def test_nonce_active_reflected_in_status(client):
     data = client.get("/auth/status").json()
     assert data["nonce_active"] is True
     assert data["auth_required"] is True
+
+
+# ── CORS (A5) ───────────────────────────────────────────────────────────
+# allow_origin_regex was tightened from an unbounded "any localhost/127.0.0.1
+# port" to the small window Vite dev actually uses; allow_origins covers the
+# three Tauri webview origins. Confirm both still work and that an arbitrary
+# origin (any port outside the window, or a non-loopback host) is refused.
+
+def _cors_allowed(client, origin):
+    resp = client.options("/results", headers={
+        "Origin": origin,
+        "Access-Control-Request-Method": "GET",
+    })
+    return resp.headers.get("access-control-allow-origin") == origin
+
+
+def test_cors_allows_vite_dev_port(client):
+    assert _cors_allowed(client, "http://localhost:5173")
+    assert _cors_allowed(client, "http://127.0.0.1:5174")
+
+
+def test_cors_allows_tauri_origins(client):
+    assert _cors_allowed(client, "https://tauri.localhost")
+    assert _cors_allowed(client, "http://tauri.localhost")
+    assert _cors_allowed(client, "tauri://localhost")
+
+
+def test_cors_rejects_port_outside_dev_window(client):
+    # Regression guard for the tightened regex: a port far outside Vite's
+    # actual fallback range must NOT be treated as a trusted origin.
+    assert not _cors_allowed(client, "http://localhost:9999")
+
+
+def test_cors_rejects_non_loopback_origin(client):
+    assert not _cors_allowed(client, "http://evil.example.com")
