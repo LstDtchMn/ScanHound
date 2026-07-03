@@ -19,6 +19,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, List, Optional
 
+from backend.database import RenameJobDBError
 from backend.filename_utils import parse_filename
 from backend.rename import confidence as _confidence
 from backend.rename import dv_detect as _dv
@@ -412,6 +413,12 @@ class RenameService:
         # Per-file TMDB search memo lives here (thread-local so concurrent
         # _process_file calls don't share or race on it).
         self._tl = threading.local()
+        # Count of files dropped by the most recent process_package() run due
+        # to a genuine DB failure (RenameJobDBError) — see process_package's
+        # docstring. Not thread-safe across concurrent process_package calls
+        # (last-writer-wins); process_folder's returned dict is the
+        # thread-safe per-call surface for that case.
+        self.last_package_failed_db = 0
 
     # ── helpers ───────────────────────────────────────────────────────
 
@@ -776,7 +783,16 @@ class RenameService:
         an interrupted batch resumes correctly after a restart and two concurrent
         calls for the same package can't race through the check and double-create
         jobs. No-op unless ``auto_rename_enabled``.
+
+        A genuine DB failure while creating a job (RenameJobDBError) is logged
+        loudly and counted in ``self.last_package_failed_db`` — distinct from a
+        file being skipped because it's already tracked — rather than silently
+        dropping the file with no trace. The return type stays List[int] for
+        backward compatibility with existing callers; the failure count is a
+        best-effort side channel for callers that want it (see process_folder's
+        richer dict summary for the primary user-facing surface).
         """
+        self.last_package_failed_db = 0
         if not self._cfg.get("auto_rename_enabled"):
             return []
         db = self._db
@@ -791,6 +807,11 @@ class RenameService:
                 continue
             try:
                 jid = self._process_file(package_name, path)
+            except RenameJobDBError as e:
+                logger.error("process_package %s: DB failure creating job for %s: %s",
+                             package_name, path, e)
+                self.last_package_failed_db += 1
+                jid = None
             finally:
                 self._release_path(path)
             if jid:
@@ -840,13 +861,20 @@ class RenameService:
                     "found": 0, "created": 0, "skipped": 0, "busy": True}
         try:
             files = self._video_files(resolved)
-            created, skipped = [], 0
+            created, skipped, failed_db = [], 0, 0
             for path in files:
                 if not self._claim_path(path):
                     skipped += 1
                     continue
                 try:
                     jid = self._process_file(None, path)
+                except RenameJobDBError as e:
+                    # Genuine DB failure — distinct from "already tracked"
+                    # (skipped) so it's never silently indistinguishable from
+                    # a legitimate no-op.
+                    logger.error("process_folder: DB failure creating job for %s: %s", path, e)
+                    failed_db += 1
+                    jid = None
                 except Exception:
                     logger.exception("process_folder: failed on %s", path)
                     jid = None
@@ -854,10 +882,12 @@ class RenameService:
                     self._release_path(path)
                 if jid:
                     created.append(jid)
-            logger.info("process_folder %s: %d file(s), %d new job(s), %d already tracked",
-                        resolved, len(files), len(created), skipped)
+            logger.info(
+                "process_folder %s: %d file(s), %d new job(s), %d already tracked, %d DB failure(s)",
+                resolved, len(files), len(created), skipped, failed_db)
             return {"folder": resolved, "found": len(files),
-                    "created": len(created), "skipped": skipped, "ids": created}
+                    "created": len(created), "skipped": skipped,
+                    "failed_db": failed_db, "ids": created}
         finally:
             self._bulk_lock.release()
 
@@ -1351,6 +1381,10 @@ class RenameService:
         return job_id
 
     def _create(self, job) -> Optional[int]:
+        """Persist ``job``. Lets RenameJobDBError propagate (a genuine DB
+        failure) rather than swallowing it to None — callers (process_folder /
+        process_package) count that distinctly from a legitimate no-op so a
+        silently-dropped file is never indistinguishable from "nothing to do"."""
         jid = self._db.create_rename_job(job) if self._db else None
         self._broadcast(jid)
         return jid

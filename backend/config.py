@@ -257,7 +257,90 @@ def _migrate_db(name: str) -> str:
     return new_path
 
 
-DB_PATH = _migrate_db("crawler.db")
+# SQLite database directory — separate from _DATA_DIR so the DB can be
+# relocated onto a Docker named volume (avoids WAL corruption from a
+# bind-mounted filesystem, e.g. Docker Desktop for Windows' gRPC-FUSE/VirtioFS
+# layer). Set SCANHOUND_DB_DIR to opt in; unset it and nothing changes — the
+# DB stays alongside scanner.log under _DATA_DIR exactly as before.
+_DB_DIR = os.environ.get("SCANHOUND_DB_DIR") or _DATA_DIR
+os.makedirs(_DB_DIR, exist_ok=True)
+
+
+def _checkpoint_and_copy(legacy_path: str, new_path: str) -> bool:
+    """Fold the legacy DB's WAL into its main file, then atomically copy it
+    to new_path.
+
+    Returns True on success. Never touches -wal/-shm sidecars at the
+    destination — the copied file is a clean, checkpointed snapshot that
+    SQLite will happily open fresh (WAL/SHM get recreated on first write).
+
+    Atomicity: copy2 goes to a temp sibling (new_path + ".migrating") first,
+    then os.replace() swaps it into place. os.replace is atomic on the same
+    filesystem, and the temp file lives in the same directory as new_path
+    (same volume), so a crash between the copy and the replace never leaves
+    a partial/truncated file at new_path — either the replace happened (full
+    file present) or it didn't (nothing present at new_path, so the
+    idempotency guard in _resolve_db_path correctly retries migration on the
+    next boot instead of mistaking a truncated file for "already migrated").
+    """
+    import shutil
+    import sqlite3
+    conn = sqlite3.connect(legacy_path)
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    temp_path = new_path + ".migrating"
+    if os.path.exists(temp_path):
+        os.remove(temp_path)  # stale leftover from a prior interrupted attempt
+    shutil.copy2(legacy_path, temp_path)
+    os.replace(temp_path, new_path)
+    return True
+
+
+def _resolve_db_path(name: str) -> str:
+    """Return the SQLite DB path under SCANHOUND_DB_DIR (or _DATA_DIR if unset).
+
+    One-time migration: if the DB doesn't exist yet at the resolved location
+    but a legacy copy exists at the old _DATA_DIR/<name> path (the pre-move
+    bind-mount location), checkpoint + copy it into place. Idempotent — never
+    overwrites an existing new-location DB, and any failure just logs and
+    falls back to returning the legacy path so startup never crashes because
+    of a migration hiccup.
+    """
+    new_path = os.path.join(_DB_DIR, name)
+    legacy_path = os.path.join(_DATA_DIR, name)
+
+    if os.path.exists(new_path):
+        return new_path  # already migrated (or DB_DIR == _DATA_DIR) — no-op
+
+    if new_path != legacy_path and os.path.exists(legacy_path):
+        try:
+            _checkpoint_and_copy(legacy_path, new_path)
+            import sys
+            print(f"[ScanHound] Migrated DB {legacy_path} -> {new_path}", file=sys.stderr)
+            import logging
+            logging.getLogger(__name__).info(
+                "Migrated SQLite DB from legacy path %s to %s", legacy_path, new_path)
+        except Exception as e:
+            import sys
+            print(f"[ScanHound] DB dir migration failed ({legacy_path} -> {new_path}): {e}. "
+                  f"Falling back to legacy path.", file=sys.stderr)
+            import logging
+            logging.getLogger(__name__).error(
+                "DB dir migration failed (%s -> %s): %s. Falling back to legacy path.",
+                legacy_path, new_path, e)
+            return legacy_path
+
+    # Either migration succeeded, or there was nothing to migrate (fresh
+    # install) — in both cases the new location is authoritative going
+    # forward, and _migrate_db()/init_db() will create it if absent.
+    return new_path
+
+
+DB_PATH = _migrate_db("crawler.db") if _DB_DIR == _DATA_DIR else _resolve_db_path("crawler.db")
 CACHE_FILE = DB_PATH  # backwards-compat alias
 
 # Config is stored outside the project directory to avoid leaking credentials
