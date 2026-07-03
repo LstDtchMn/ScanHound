@@ -44,6 +44,11 @@ export function toggleGenreFilter(genre: string) {
 export function toggleLanguageFilter(lang: string) {
   languageFilter.update((l) => (l.includes(lang) ? l.filter((x) => x !== lang) : [...l, lang]));
 }
+/** Date-range filter bounds, "YYYY-MM-DD" strings; '' means off. Session-only
+ *  (not persisted), same as genre/language filters. Inclusive on both ends —
+ *  postedBefore covers through the END of that day. */
+export const postedAfter = writable<string>('');
+export const postedBefore = writable<string>('');
 export const viewMode = persisted<ViewMode>('sh-view-mode', 'grid');
 /** Whether the user has explicitly picked a view (vs. the platform default).
  *  Lets phones default to the swipe deck without overriding a deliberate choice. */
@@ -158,6 +163,25 @@ function parsePostedDate(s: string | null | undefined): number {
   return Number.isNaN(t) ? 0 : t;
 }
 
+/** True if an item's posted_date falls within [after, before] (both
+ *  inclusive; before covers through the end of that day). Mirrors the
+ *  backend's _filter_and_sort semantics: when either bound is set, items
+ *  with a missing/unparseable posted_date (parses to 0) are excluded. */
+function inPostedRange(postedDate: string | null | undefined, after: string, before: string): boolean {
+  if (!after && !before) return true;
+  const ts = parsePostedDate(postedDate);
+  if (ts === 0) return false;
+  if (after) {
+    const afterTs = Date.parse(after + 'T00:00:00');
+    if (!Number.isNaN(afterTs) && ts < afterTs) return false;
+  }
+  if (before) {
+    const beforeDayStart = Date.parse(before + 'T00:00:00');
+    if (!Number.isNaN(beforeDayStart) && ts >= beforeDayStart + 24 * 60 * 60 * 1000) return false;
+  }
+  return true;
+}
+
 /** Handler for the `scan:result` WS event — exported (rather than kept as an
  *  inline connection.on callback) so tests can invoke it directly without a
  *  real WebSocket. A live stream always supersedes paged/cache-loaded rows:
@@ -254,7 +278,7 @@ let currentQueryKey = '';
 function filterQueryKey(): string {
   return JSON.stringify([
     get(statusFilter), get(searchFilter), get(genreFilter), get(languageFilter),
-    get(quickFilters), get(categoryFilter), get(sortBy)
+    get(quickFilters), get(categoryFilter), get(sortBy), get(postedAfter), get(postedBefore)
   ]);
 }
 
@@ -266,6 +290,8 @@ function buildResultParams(page: number): Record<string, string> {
   const g = get(genreFilter); if (g.length) p.genre = g.join(',');
   const l = get(languageFilter); if (l.length) p.language = l.join(',');
   const qf = get(quickFilters); if (qf.length) p.quick = qf.join(',');
+  const pa = get(postedAfter); if (pa) p.posted_after = pa;
+  const pb = get(postedBefore); if (pb) p.posted_before = pb;
   const so = SORT_PARAM[get(sortBy)]; p.sort = so.sort; p.order = so.order;
   return p;
 }
@@ -305,8 +331,8 @@ export async function loadResults(reset: boolean): Promise<void> {
 }
 
 export const filteredResults = derived(
-  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls, categoryFilter, pagedMode],
-  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed, $category, $paged]) => {
+  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls, categoryFilter, pagedMode, postedAfter, postedBefore],
+  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed, $category, $paged, $postedAfter, $postedBefore]) => {
     if ($paged) return $results; // server already filtered + sorted
     let items = $results;
     // Hide swiped-away ("skip") items everywhere they'd otherwise appear.
@@ -343,6 +369,9 @@ export const filteredResults = derived(
     }
     if ($language.length > 0) {
       items = items.filter((i) => $language.includes(i.language));
+    }
+    if ($postedAfter || $postedBefore) {
+      items = items.filter((i) => inPostedRange(i.posted_date, $postedAfter, $postedBefore));
     }
     // Quick-filter chips (AND-combined with the above)
     if ($quick.includes('4k')) items = items.filter((i) => i.resolution === '4K');
@@ -563,7 +592,10 @@ export async function selectAll(filteredKeys?: string[]) {
     }
   };
   try {
-    await api.selectAll();
+    const payload: Record<string, string> = {};
+    const pa = get(postedAfter); if (pa) payload.posted_after = pa;
+    const pb = get(postedBefore); if (pb) payload.posted_before = pb;
+    await api.selectAll(Object.keys(payload).length ? payload : undefined);
   } catch {
     // API call failed — select locally anyway
   }
@@ -587,7 +619,7 @@ export const focusedIndex = writable<number>(-1);
  *  after a short debounce — but only in paged mode, and never on the initial
  *  subscribe (which fires immediately with the current values). */
 const _filterKey = derived(
-  [statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy],
+  [statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy, postedAfter, postedBefore],
   (vals) => JSON.stringify(vals)
 );
 let _filterDebounce: ReturnType<typeof setTimeout> | undefined;

@@ -26,7 +26,9 @@ const {
   deckResults,
   dismissItem,
   restoreItem,
-  pagedMode
+  pagedMode,
+  postedAfter,
+  postedBefore
 } = await import('./results');
 
 function item(overrides: Partial<ScanResult>): ScanResult {
@@ -73,6 +75,8 @@ function resetStores() {
   genreFilter.set([]);
   languageFilter.set([]);
   quickFilters.set([]);
+  postedAfter.set('');
+  postedBefore.set('');
   // These suites exercise the legacy client-side filter+sort pipeline
   // directly; paged mode (server-side filtering) is covered separately below.
   pagedMode.set(false);
@@ -142,6 +146,53 @@ describe('filteredResults', () => {
     results.set([item({ url: 'a', language: 'English' }), item({ url: 'b', language: 'French' })]);
     languageFilter.set([]);
     expect(get(filteredResults).map((r) => r.url)).toEqual(['a', 'b']);
+  });
+
+  it('postedAfter excludes items posted before the bound (live/client-side)', () => {
+    results.set([
+      item({ url: 'a', posted_date: 'June 1, 2026 at 12:00 AM' }),
+      item({ url: 'b', posted_date: 'June 20, 2026 at 12:00 AM' })
+    ]);
+    postedAfter.set('2026-06-08');
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['b']);
+  });
+
+  it('postedBefore is inclusive through the end of that day (live/client-side)', () => {
+    results.set([
+      item({ url: 'a', posted_date: 'June 8, 2026 at 11:59 PM' }),
+      item({ url: 'b', posted_date: 'June 9, 2026 at 12:00 AM' })
+    ]);
+    postedBefore.set('2026-06-08');
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['a']);
+  });
+
+  it('postedAfter + postedBefore both bounds inclusive on boundary dates (live/client-side)', () => {
+    results.set([
+      item({ url: 'start', posted_date: 'June 8, 2026 at 12:00 AM' }),
+      item({ url: 'end', posted_date: 'June 10, 2026 at 11:30 PM' }),
+      item({ url: 'early', posted_date: 'June 7, 2026 at 11:59 PM' }),
+      item({ url: 'late', posted_date: 'June 11, 2026 at 12:00 AM' })
+    ]);
+    postedAfter.set('2026-06-08');
+    postedBefore.set('2026-06-10');
+    expect(get(filteredResults).map((r) => r.url).sort()).toEqual(['end', 'start']);
+  });
+
+  it('excludes date-less items when a bound is set (live/client-side)', () => {
+    results.set([
+      item({ url: 'dateless', posted_date: null }),
+      item({ url: 'dated', posted_date: 'June 8, 2026 at 12:00 AM' })
+    ]);
+    postedAfter.set('2026-06-01');
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['dated']);
+  });
+
+  it('includes date-less items when no date bound is set (live/client-side)', () => {
+    results.set([
+      item({ url: 'dateless', posted_date: null }),
+      item({ url: 'dated', posted_date: 'June 8, 2026 at 12:00 AM' })
+    ]);
+    expect(get(filteredResults).map((r) => r.url).sort()).toEqual(['dated', 'dateless']);
   });
 });
 
@@ -293,6 +344,45 @@ describe('loadResults / paged mode', () => {
     const mod = await import('./results');
     expect(get(mod.categoryFilter).sort()).toEqual(['4k', 'remux', 'tv']);
   });
+
+  it('loadResults sends posted_after/posted_before only when set', async () => {
+    const { loadResults, pagedMode, postedAfter, postedBefore } = await import('./results');
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [], total: 0, stats: { total: 0, missing: 0, upgrade: 0, library: 0 }, title_counts: {}
+    });
+    await loadResults(true);
+    let params = (api.getCachedResults as any).mock.calls.at(-1)[0];
+    expect(params.posted_after).toBeUndefined();
+    expect(params.posted_before).toBeUndefined();
+
+    postedAfter.set('2026-06-01');
+    postedBefore.set('2026-06-10');
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [], total: 0, stats: { total: 0, missing: 0, upgrade: 0, library: 0 }, title_counts: {}
+    });
+    await loadResults(true);
+    params = (api.getCachedResults as any).mock.calls.at(-1)[0];
+    expect(params.posted_after).toBe('2026-06-01');
+    expect(params.posted_before).toBe('2026-06-10');
+  });
+
+  it('selectAll() payload includes posted_after/posted_before only when set', async () => {
+    const { selectAll, postedAfter, postedBefore } = await import('./results');
+    postedAfter.set('');
+    postedBefore.set('');
+    await selectAll();
+    let payload = (api.selectAll as any).mock.calls.at(-1)[0];
+    expect(payload?.posted_after).toBeUndefined();
+    expect(payload?.posted_before).toBeUndefined();
+
+    postedAfter.set('2026-06-01');
+    postedBefore.set('2026-06-10');
+    await selectAll();
+    payload = (api.selectAll as any).mock.calls.at(-1)[0];
+    expect(payload.posted_after).toBe('2026-06-01');
+    expect(payload.posted_before).toBe('2026-06-10');
+  });
 });
 
 describe('debounced refetch on filter change (paged mode)', () => {
@@ -356,6 +446,33 @@ describe('debounced refetch on filter change (paged mode)', () => {
       expect(api.getCachedResults).not.toHaveBeenCalled();
 
       vi.advanceTimersByTime(200); // now well past 250ms since the last change
+      await vi.runAllTimersAsync();
+      expect(api.getCachedResults).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('changing postedAfter triggers the debounced refetch', async () => {
+    vi.useFakeTimers();
+    try {
+      pagedMode.set(true);
+      postedAfter.set(''); // baseline
+      vi.clearAllTimers();
+      (api.getCachedResults as any).mockClear();
+      (api.getCachedResults as any).mockResolvedValue({
+        items: [],
+        total: 0,
+        stats: { total: 0, missing: 0, upgrade: 0, library: 0 },
+        title_counts: {}
+      });
+
+      postedAfter.set('2026-06-01');
+
+      vi.advanceTimersByTime(200);
+      expect(api.getCachedResults).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(100);
       await vi.runAllTimersAsync();
       expect(api.getCachedResults).toHaveBeenCalledTimes(1);
     } finally {
