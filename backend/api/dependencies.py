@@ -177,6 +177,29 @@ def auth_enabled() -> bool:
     return bool(db and db.has_password())
 
 
+def has_any_credential() -> bool:
+    """Whether a nonce is configured or a password has been persisted.
+
+    Same predicate as ``auth_enabled`` today, named for its other use: telling
+    the fail-closed bootstrap gate (backend.api.main) whether any credential
+    exists at all, independent of the open-mode escape hatch below.
+    """
+    return auth_enabled()
+
+
+def allow_open() -> bool:
+    """Explicit escape hatch restoring the old fully-open behavior.
+
+    Historically, "no nonce and no password" meant the whole API was served
+    without auth — including after a DB reset/corruption silently wiped the
+    ``auth_credentials`` row. That fail-OPEN posture is now opt-in only: set
+    ``SCANHOUND_ALLOW_OPEN=1`` for intentional headless/dev use. Left unset
+    (the default), a missing credential fails CLOSED instead — see
+    ``backend.api.main._request_requires_auth``.
+    """
+    return os.environ.get("SCANHOUND_ALLOW_OPEN", "") == "1"
+
+
 def token_authorized(token: str) -> bool:
     """Whether a bearer token is the desktop nonce or an unexpired session token.
 

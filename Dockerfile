@@ -51,5 +51,17 @@ COPY --from=frontend /app/frontend/build ./frontend/build
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh && mkdir -p /data
 
+# A2: run as a non-root user. Chromium already launches with --no-sandbox
+# (backend/download_service.py) so it works unchanged as a non-root UID — that
+# flag exists because Chromium's own sandbox needs privileges containers
+# usually restrict anyway, so this was already the container-friendly path.
+#
+# uid/gid 1000 so it lines up with the default first-user account on most
+# Linux hosts (convenient if anyone ever wants to inspect ./data from outside
+# the container); adjust if that collides with your host.
+RUN useradd -m -u 1000 -d /data -s /usr/sbin/nologin scanhound \
+    && chown -R scanhound:scanhound /app /data
+USER scanhound
+
 EXPOSE 9721
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

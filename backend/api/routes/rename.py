@@ -28,6 +28,55 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/rename", tags=["rename"])
 
 
+# ── Path confinement (A3) ────────────────────────────────────────────────
+# process_folder / bulk_set_destination / dv_import all take a caller-supplied
+# filesystem path. Without a check, a client (or a compromised frontend) could
+# point them anywhere the container's filesystem permissions allow — e.g.
+# ``../../etc`` or another mounted drive entirely. Confine each to an
+# allowlist of roots derived from what the app is actually configured to use,
+# reusing main.py's ``_within`` containment rule (real prefix check, not a
+# bare ``startswith`` that a sibling directory name could slip past).
+
+def _library_roots(reg: ServiceRegistry) -> list:
+    """Configured auto-rename library roots (movie/4K-movie/TV), non-empty only."""
+    cfg = reg.config or {}
+    roots = [
+        cfg.get("auto_rename_movie_library"),
+        cfg.get("auto_rename_movie_library_4k"),
+        cfg.get("auto_rename_tv_library"),
+    ]
+    return [os.path.normpath(r) for r in roots if r and str(r).strip()]
+
+
+def _require_within_roots(path: str, roots: list, what: str) -> str:
+    """Return ``path`` normalized if it falls under one of ``roots``, else 422.
+
+    No configured roots at all means nothing has been set up yet — reject
+    rather than silently allow-all, since an empty allowlist is not the same
+    as "anywhere is fine".
+    """
+    # Deferred import: backend.api.main imports this module's router (inside
+    # create_app(), lazily) as part of its own top-to-bottom execution, so a
+    # module-level `from backend.api.main import _within` here would recreate
+    # exactly the circular-import trap that laziness avoids — it only happens
+    # to work when main.py is imported first (pytest/uvicorn's normal order)
+    # and breaks if anything ever imports this module directly, first.
+    from backend.api.main import _within
+    candidate = os.path.normpath((path or "").strip())
+    if not candidate or not roots or not any(_within(candidate, r) for r in roots):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{what} must be inside a configured library root",
+        )
+    return candidate
+
+
+# Directory the DV host-detector handoff file lives in — see _DEFAULT_DV_HOST_DB
+# below (same env var, so this stays in sync with whatever path it resolves to).
+def _dv_host_db_root() -> str:
+    return os.path.normpath(os.path.dirname(_DEFAULT_DV_HOST_DB))
+
+
 class RematchRequest(BaseModel):
     tmdb_id: int
     media_type: Optional[str] = None
@@ -159,7 +208,13 @@ def bulk_delete(body: BulkIdsRequest, reg: ServiceRegistry = Depends(get_registr
 @router.post("/jobs/bulk/set-destination")
 def bulk_set_destination(body: BulkSetDestRequest,
                          reg: ServiceRegistry = Depends(get_registry)):
-    return _service(reg).bulk_set_destination(body.ids, body.destination_root)
+    root = (body.destination_root or "").strip()
+    # An empty root is a legitimate "clear the destination" request the
+    # service already handles (marks jobs needs_review) — only confine
+    # non-empty roots to the configured library allowlist.
+    if root:
+        root = _require_within_roots(root, _library_roots(reg), "destination_root")
+    return _service(reg).bulk_set_destination(body.ids, root)
 
 
 @router.post("/jobs/{job_id}/apply")
@@ -340,6 +395,15 @@ def process_folder(req: ProcessFolderRequest, reg: ServiceRegistry = Depends(get
     dry_run = bool(req.dry_run)
     if not folder:
         raise HTTPException(status_code=400, detail="No folder provided")
+    # The UI accepts host-style paths (e.g. F:\Downloads) and relies on
+    # RenameService._translate_path to map them into the container's mounted
+    # view — confining the *raw* input against container roots would break
+    # that documented flow. Translate first, then confine the resolved,
+    # container-side path to the configured library roots; reject anything
+    # that lands outside them (a mapping miss, `..` escape, or another mount
+    # entirely) with 422 instead of silently walking whatever it resolved to.
+    resolved_folder = svc._translate_path(folder)
+    _require_within_roots(resolved_folder, _library_roots(reg), "folder")
 
     def _run():
         try:
@@ -420,6 +484,11 @@ def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)
     if reg.db is None:
         raise HTTPException(status_code=503, detail="DB not initialized")
     path = (req.host_db_path or _DEFAULT_DV_HOST_DB)
+    # Confine to the expected data/ handoff dir (dirname of _DEFAULT_DV_HOST_DB,
+    # i.e. SCANHOUND_DV_HOST_DB's directory, /data by default) — the only place
+    # the host detector is ever configured to drop dv_host.db. Rejects an
+    # explicit host_db_path pointed anywhere else (`..` escape, another mount).
+    path = _require_within_roots(path, [_dv_host_db_root()], "host_db_path")
     return import_dv_host_db(reg.db, path)
 
 

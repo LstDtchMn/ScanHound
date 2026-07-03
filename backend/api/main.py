@@ -14,6 +14,8 @@ from backend.api.dependencies import (
     ServiceRegistry, ScannerAppBridge, registry,
     auth_enabled as _auth_enabled,
     token_authorized as _token_authorized,
+    has_any_credential as _has_any_credential,
+    allow_open as _allow_open,
 )
 
 logger = logging.getLogger(__name__)
@@ -267,6 +269,13 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
 # bolting another bespoke comparison onto auth_middleware.
 _AUTH_EXEMPT_PATHS = frozenset({"/health", "/auth/login", "/auth/status"})
 
+# Additionally reachable without a token, but ONLY while no credential exists
+# yet (no nonce, no password) — the first-run bootstrap surface. Once a
+# password is set this path is protected again by the normal middleware rule
+# (auth_enabled() is then True), matching the route's own "current password
+# required to change an existing one" check in backend/api/routes/auth.py.
+_BOOTSTRAP_EXEMPT_PATHS = frozenset({"/auth/set-password"})
+
 
 def _is_auth_exempt(request: Request) -> bool:
     """Whether this request should pass the auth middleware without a token."""
@@ -313,14 +322,43 @@ def _compute_protected_segments(routers) -> frozenset:
 
 
 def _request_requires_auth(request: Request) -> bool:
-    """Whether this request must present a valid token to proceed."""
+    """Whether this request must present a valid token to proceed.
+
+    Fail-CLOSED posture: when no credential exists at all (no nonce, no
+    password — e.g. a fresh install, or a corrupted/reset DB that silently
+    dropped the auth_credentials row) protected routes are now DENIED rather
+    than served openly, unless the explicit ``SCANHOUND_ALLOW_OPEN=1`` escape
+    hatch is set. The bootstrap surface (``/auth/set-password`` plus the
+    always-exempt health/login/status/OPTIONS) stays reachable so the first
+    password can be set without a chicken-and-egg lockout.
+    """
     if _is_auth_exempt(request):
         return False
     protected = getattr(request.app.state, "protected_segments", frozenset())
     segment = request.url.path.lstrip("/").split("/", 1)[0]
     if segment not in protected:
         return False  # SPA shell / static asset — served openly
-    return _auth_enabled()
+    if _auth_enabled():
+        return True  # normal case: a credential exists — gate on it
+    if _allow_open():
+        return False  # explicit opt-in to the old fully-open behavior
+    if request.url.path in _BOOTSTRAP_EXEMPT_PATHS:
+        return False  # let the first password be set
+    return True  # fail CLOSED: no credential, no escape hatch — deny
+
+
+def _within(path: str, base: str) -> bool:
+    """Real path-containment check: is ``path`` equal to or inside ``base``?
+
+    A bare ``startswith`` would let a sibling like ``.../build-evil`` or
+    ``.../immutable-x`` pass a prefix test against ``.../build`` /
+    ``.../immutable``. Both callers pass already-``os.path.normpath``-ed
+    inputs. Shared by the SPA static-file guard below and the path-confinement
+    checks in backend/api/routes/rename.py (A3) — one containment rule for
+    every "does this resolved path stay inside its allowed root" check.
+    """
+    import os as _os
+    return path == base or path.startswith(base + _os.sep)
 
 
 def _teardown_services(reg: ServiceRegistry) -> None:
@@ -379,17 +417,26 @@ def create_app(
             "http://tauri.localhost",  # Tauri >=2.x default scheme on Windows + Android
             "tauri://localhost",       # Tauri custom protocol (Linux/macOS)
         ],
-        # Allow any localhost/127.0.0.1 port — Vite picks a free port at dev time
-        allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
+        # A5: was `(:\d+)?` — any port on localhost/127.0.0.1, unbounded. Tightened
+        # to the actual dev surface: tauri.conf.json pins devUrl to :5173, and Vite
+        # increments by one (5174, 5175, …) if that port is already taken locally
+        # (e.g. a second dev instance) rather than picking an arbitrary port — so a
+        # small fixed window covers real usage without leaving every port on the
+        # loopback interface as a trusted, credentialed CORS origin. Widen this
+        # window (not the unbounded regex) if a dev setup needs more concurrent
+        # instances than it covers.
+        allow_origin_regex=r"http://(localhost|127\.0\.0\.1):517[0-9]",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
     # Bearer-token middleware — guards the API routes. A request is authorized
-    # by either a valid login-session token or the desktop nonce. Auth is off
-    # entirely when no nonce is set and no password is configured (dev / fresh
-    # install); the SPA shell and static assets are always served openly.
+    # by either a valid login-session token or the desktop nonce. When neither
+    # is configured (fresh install, or a reset/corrupted DB) protected routes
+    # fail CLOSED — only the bootstrap surface (set-password/login/status/
+    # health) stays reachable — unless SCANHOUND_ALLOW_OPEN=1 is set. The SPA
+    # shell and static assets are always served openly either way.
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
         if _request_requires_auth(request):
@@ -435,10 +482,8 @@ def create_app(
         _root = _os.path.normpath(frontend_dir)
         _immutable = _os.path.normpath(_os.path.join(frontend_dir, "_app", "immutable"))
 
-        def _within(path: str, base: str) -> bool:
-            # Real containment check — a bare startswith would let a sibling like
-            # ".../build-evil" or ".../immutable-x" pass the prefix test.
-            return path == base or path.startswith(base + _os.sep)
+        # _within is now module-level (see above) so rename.py's path-confinement
+        # checks (A3) can share the exact same containment rule.
 
         @app.get("/{full_path:path}")
         async def _serve_spa(full_path: str):

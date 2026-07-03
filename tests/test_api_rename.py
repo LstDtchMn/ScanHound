@@ -26,6 +26,18 @@ def client():
         yield c
 
 
+def _client_with_library(movie_library: str):
+    """A client whose auto_rename_movie_library is configured to
+    ``movie_library`` — needed for the A3 path-confinement tests, which now
+    require a destination_root/folder to fall inside a configured library
+    root rather than accepting any path a caller supplies."""
+    app = create_app(config_override={
+        "plex_url": "", "plex_token": "",
+        "auto_rename_movie_library": movie_library,
+    })
+    return TestClient(app)
+
+
 def _seed_job(**fields):
     dm = DatabaseManager()
     job = {"original_path": "/x/y.mkv", "original_filename": "y.mkv", "status": "pending"}
@@ -395,35 +407,37 @@ class TestRenameApi:
         assert r["ok"] is True
         assert r["queued"] == 1  # only the first (ok:True) is counted
 
-    def test_bulk_set_destination_applied_job_not_regressed(self, client, tmp_path):
+    def test_bulk_set_destination_applied_job_not_regressed(self, tmp_path):
         # An already-applied job must not have its status changed back to matched.
-        jid = _seed_job(status="applied", title="Done", media_type="movie",
-                        destination_path="/lib/movies/Done (2020).mkv",
-                        new_filename="Done (2020).mkv")
         root = str(tmp_path / "movies")
-        r = client.post("/rename/jobs/bulk/set-destination",
-                        json={"ids": [jid], "destination_root": root}).json()
-        res = r["results"][0]
-        assert res["ok"] is False
-        assert "already applied" in res["error"]
-        assert r["updated"] == 0
-        # Status must still be "applied" — no regression to "matched"
-        all_jobs = client.get("/rename/jobs").json()["jobs"]
-        job = next(j for j in all_jobs if j["id"] == jid)
-        assert job["status"] == "applied"
+        with _client_with_library(root) as client:
+            jid = _seed_job(status="applied", title="Done", media_type="movie",
+                            destination_path="/lib/movies/Done (2020).mkv",
+                            new_filename="Done (2020).mkv")
+            r = client.post("/rename/jobs/bulk/set-destination",
+                            json={"ids": [jid], "destination_root": root}).json()
+            res = r["results"][0]
+            assert res["ok"] is False
+            assert "already applied" in res["error"]
+            assert r["updated"] == 0
+            # Status must still be "applied" — no regression to "matched"
+            all_jobs = client.get("/rename/jobs").json()["jobs"]
+            job = next(j for j in all_jobs if j["id"] == jid)
+            assert job["status"] == "applied"
 
-    def test_bulk_set_destination_guard_enforced(self, client, tmp_path):
-        # Movie job, valid root -> rebuilt destination under root.
-        jid = _seed_job(status="matched", title="The Matrix", year=1999,
-                        media_type="movie", resolution="1080p",
-                        new_filename="The Matrix (1999) [1080p].mkv")
+    def test_bulk_set_destination_guard_enforced(self, tmp_path):
+        # Movie job, valid (configured) root -> rebuilt destination under root.
         root = str(tmp_path / "movies")
-        r = client.post("/rename/jobs/bulk/set-destination",
-                        json={"ids": [jid], "destination_root": root}).json()
-        res = r["results"][0]
-        assert res["ok"] is True
-        assert res["destination_path"].startswith(root)
-        assert r["updated"] == 1
+        with _client_with_library(root) as client:
+            jid = _seed_job(status="matched", title="The Matrix", year=1999,
+                            media_type="movie", resolution="1080p",
+                            new_filename="The Matrix (1999) [1080p].mkv")
+            r = client.post("/rename/jobs/bulk/set-destination",
+                            json={"ids": [jid], "destination_root": root}).json()
+            res = r["results"][0]
+            assert res["ok"] is True
+            assert res["destination_path"].startswith(root)
+            assert r["updated"] == 1
 
     def test_bulk_set_destination_empty_root_blocks(self, client):
         jid = _seed_job(status="matched", title="M", media_type="movie")
@@ -432,6 +446,39 @@ class TestRenameApi:
         res = r["results"][0]
         assert res["ok"] is False
         assert res["destination_path"] is None
+
+    # ------------------------------------------------------------------
+    # A3: path confinement — bulk/set-destination must reject roots outside
+    # the configured library allowlist.
+    # ------------------------------------------------------------------
+
+    def test_bulk_set_destination_rejects_unconfigured_root(self, client, tmp_path):
+        # No auto_rename_movie_library configured (the shared `client` fixture
+        # doesn't set one) — any non-empty root must be rejected, not silently
+        # honored.
+        jid = _seed_job(status="matched", title="M", media_type="movie")
+        root = str(tmp_path / "movies")
+        resp = client.post("/rename/jobs/bulk/set-destination",
+                           json={"ids": [jid], "destination_root": root})
+        assert resp.status_code == 422
+
+    def test_bulk_set_destination_rejects_escape_outside_configured_root(self, tmp_path):
+        root = str(tmp_path / "movies")
+        escape = str(tmp_path / "movies-evil")  # sibling dir, not a subpath
+        with _client_with_library(root) as client:
+            jid = _seed_job(status="matched", title="M", media_type="movie")
+            resp = client.post("/rename/jobs/bulk/set-destination",
+                               json={"ids": [jid], "destination_root": escape})
+            assert resp.status_code == 422
+
+    def test_bulk_set_destination_rejects_relative_traversal(self, tmp_path):
+        root = str(tmp_path / "movies")
+        with _client_with_library(root) as client:
+            jid = _seed_job(status="matched", title="M", media_type="movie")
+            escape = os.path.join(root, "..", "..", "etc")
+            resp = client.post("/rename/jobs/bulk/set-destination",
+                               json={"ids": [jid], "destination_root": escape})
+            assert resp.status_code == 422
 
     # ------------------------------------------------------------------
     # Task 8: POST /rename/jobs/apply-confident
@@ -496,6 +543,86 @@ class TestRenameApi:
         r = client.post("/rename/jobs/apply-confident", json={}).json()
         assert r["applied"] == 1 and r["skipped"] == 0
         assert (dest / "Boundary (2020).mkv").exists()
+
+
+class TestPathConfinement:
+    """A3: process-folder / dv-import must confine caller-supplied paths to an
+    allowlist instead of accepting an arbitrary filesystem path."""
+
+    # ── /rename/process-folder ────────────────────────────────────────
+
+    def test_process_folder_in_configured_root_allowed(self, tmp_path):
+        root = tmp_path / "movies"
+        root.mkdir()
+        with _client_with_library(str(root)) as client:
+            resp = client.post("/rename/process-folder", json={"folder": str(root)})
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "started"
+
+    def test_process_folder_rejects_when_no_library_configured(self, client, tmp_path):
+        folder = tmp_path / "movies"
+        folder.mkdir()
+        resp = client.post("/rename/process-folder", json={"folder": str(folder)})
+        assert resp.status_code == 422
+
+    def test_process_folder_rejects_sibling_escape(self, tmp_path):
+        root = tmp_path / "movies"
+        root.mkdir()
+        escape = tmp_path / "movies-evil"
+        escape.mkdir()
+        with _client_with_library(str(root)) as client:
+            resp = client.post("/rename/process-folder", json={"folder": str(escape)})
+            assert resp.status_code == 422
+
+    def test_process_folder_rejects_relative_traversal(self, tmp_path):
+        root = tmp_path / "movies"
+        root.mkdir()
+        with _client_with_library(str(root)) as client:
+            escape = os.path.join(str(root), "..", "..", "etc")
+            resp = client.post("/rename/process-folder", json={"folder": escape})
+            assert resp.status_code == 422
+
+    # ── /rename/dv-import ─────────────────────────────────────────────
+
+    def test_dv_import_default_path_allowed(self, client, monkeypatch):
+        # No host_db_path supplied → falls back to the configured default
+        # data-dir path, which must always be in-allowlist by construction.
+        import backend.api.routes.rename as rename_routes
+        calls = []
+        monkeypatch.setattr(rename_routes, "import_dv_host_db",
+                            lambda db, path: calls.append(path) or {"ok": True})
+        resp = client.post("/rename/dv-import", json={})
+        assert resp.status_code == 200
+        # The route normalizes the path (os.path.normpath) before passing it
+        # on, so compare normalized rather than the raw configured string.
+        assert calls == [os.path.normpath(rename_routes._DEFAULT_DV_HOST_DB)]
+
+    def test_dv_import_rejects_path_outside_data_dir(self, client, tmp_path):
+        outside = str(tmp_path / "elsewhere" / "dv_host.db")
+        resp = client.post("/rename/dv-import", json={"host_db_path": outside})
+        assert resp.status_code == 422
+
+    def test_dv_import_allows_path_inside_data_dir(self, client, monkeypatch, tmp_path):
+        import backend.api.routes.rename as rename_routes
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        db_path = str(data_dir / "dv_host.db")
+        monkeypatch.setattr(rename_routes, "_DEFAULT_DV_HOST_DB", str(data_dir / "default.db"))
+        calls = []
+        monkeypatch.setattr(rename_routes, "import_dv_host_db",
+                            lambda db, path: calls.append(path) or {"ok": True})
+        resp = client.post("/rename/dv-import", json={"host_db_path": db_path})
+        assert resp.status_code == 200
+        assert calls == [db_path]
+
+    def test_dv_import_rejects_traversal_out_of_data_dir(self, monkeypatch, tmp_path, client):
+        import backend.api.routes.rename as rename_routes
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        monkeypatch.setattr(rename_routes, "_DEFAULT_DV_HOST_DB", str(data_dir / "default.db"))
+        escape = os.path.join(str(data_dir), "..", "..", "etc", "passwd")
+        resp = client.post("/rename/dv-import", json={"host_db_path": escape})
+        assert resp.status_code == 422
 
 
 class TestTrashEndpoints:
