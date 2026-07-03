@@ -59,9 +59,14 @@ RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh && mkdir -p /data
 # uid/gid 1000 so it lines up with the default first-user account on most
 # Linux hosts (convenient if anyone ever wants to inspect ./data from outside
 # the container); adjust if that collides with your host.
+# A2 (non-root) REVERTED for Docker-Desktop-on-Windows: the container must
+# read host-created files across the Windows bind mounts (media in F:/G:,
+# the DV host-detector's /data/dv_host.db), which are not reliably readable
+# by a non-root container uid on this platform. The `scanhound` user is still
+# created (harmless) in case this ever runs on a native Linux host, but we do
+# NOT `USER scanhound` here — see the matching note in docker-compose.yml.
 RUN useradd -m -u 1000 -d /data -s /usr/sbin/nologin scanhound \
-    && chown -R scanhound:scanhound /app /data
-USER scanhound
+    && chown -R scanhound:scanhound /app
 
 EXPOSE 9721
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

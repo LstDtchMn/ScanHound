@@ -4,11 +4,16 @@ services:
     image: scanhound:latest
     container_name: scanhound
     restart: unless-stopped
-    # A2: the image already creates+switches to this non-root user (Dockerfile),
-    # but the named volume below (scanhound_db) is Docker-managed and typically
-    # gets created root:root on first `up` — pin the uid/gid here too so compose
-    # and the image agree, and see the one-time chown note on that volume.
-    user: "1000:1000"
+    # A2 (non-root) REVERTED for this Docker-Desktop-on-Windows deployment:
+    # the app's core job is reading/writing HOST-created files across the
+    # Windows bind mounts (JDownloader writes media to F:/G:, the DV
+    # host-detector writes /data/dv_host.db for the container to import).
+    # On Docker Desktop/Windows those host-written files are not reliably
+    # readable by an arbitrary container uid (verified: uid 1000 got EACCES
+    # reading config.json despite 0777), so running as non-root breaks config
+    # load + DV import. Runs as root (root-in-VM, not Windows-admin). The
+    # other Wave A hardenings (fail-closed auth, path confinement, CORS, dep
+    # pins) stand. Revisit if this ever moves to a native Linux host.
     # No host port is published. The app is reached only through Nginx Proxy
     # Manager over the shared `proxy` network (see networks: below), so it is
     # never exposed on the host/LAN — NPM + Cloudflare front it.
