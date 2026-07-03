@@ -180,7 +180,7 @@
              Not lost — this is a relocation; the same data is always available in the detail panel. -->
         <div
           class="max-h-0 opacity-0 overflow-hidden
-            group-hover:max-h-40 group-hover:opacity-100 group-focus-within:max-h-40 group-focus-within:opacity-100
+            group-hover:max-h-48 group-hover:opacity-100 group-focus-within:max-h-48 group-focus-within:opacity-100
             transition-all duration-200 ease-out"
         >
           <div class="flex items-center gap-1.5 text-[10px] text-white/85 flex-wrap mb-1">
@@ -191,6 +191,12 @@
           </div>
           {#if showGenres && item.genres?.length}
             <div class="text-[10px] text-white/70 truncate mb-1">{item.genres.slice(0, 3).join(', ')}</div>
+          {/if}
+          {#if item.posted_date || (item.language && item.language !== 'English')}
+            <div class="flex items-center gap-1.5 text-[10px] text-white/70 truncate mb-1">
+              {#if item.posted_date}<span class="opacity-80">{item.posted_date}</span>{/if}
+              {#if item.language && item.language !== 'English'}<span class="opacity-60">&middot; {item.language}</span>{/if}
+            </div>
           {/if}
           {#if plexVersions.length > 0}
             <div class="flex items-center gap-1 flex-wrap text-[9px] mb-1">
