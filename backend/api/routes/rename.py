@@ -8,7 +8,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
-from backend.api.main import _within
 from backend.api.routes.scanner import TMDB_IMAGE_BASE  # same base+size as Scan posters (w500)
 from backend.api.ws import ws_manager
 from backend.rename import dv_detect, dv_labeler, fileops, llm_identify
@@ -56,6 +55,13 @@ def _require_within_roots(path: str, roots: list, what: str) -> str:
     rather than silently allow-all, since an empty allowlist is not the same
     as "anywhere is fine".
     """
+    # Deferred import: backend.api.main imports this module's router (inside
+    # create_app(), lazily) as part of its own top-to-bottom execution, so a
+    # module-level `from backend.api.main import _within` here would recreate
+    # exactly the circular-import trap that laziness avoids — it only happens
+    # to work when main.py is imported first (pytest/uvicorn's normal order)
+    # and breaks if anything ever imports this module directly, first.
+    from backend.api.main import _within
     candidate = os.path.normpath((path or "").strip())
     if not candidate or not roots or not any(_within(candidate, r) for r in roots):
         raise HTTPException(
