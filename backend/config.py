@@ -129,6 +129,7 @@ class AppConfig(TypedDict, total=False):
     ollama_model: str
     ollama_vision_model: str
     deletions_require_confirmation: bool
+    trash_retention_days: int
 
     # Dolby Vision host-detector + labeler
     dv_library_roots: str      # host-native roots, ';' or newline separated
@@ -458,6 +459,7 @@ _DEFAULT_CONFIG: AppConfig = {
     "ollama_model": "",
     "ollama_vision_model": "minicpm-v:latest",
     "deletions_require_confirmation": True,
+    "trash_retention_days": 30,
     "dv_library_roots": "",
     "dv_detection": False,
     "dv_file_tagging": False,

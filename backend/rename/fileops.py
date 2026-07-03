@@ -274,6 +274,90 @@ def restore_trash_entry(bucket: str, name: str, roots) -> dict:
     return {"ok": False, "error": "Trash entry not found"}
 
 
+def _bucket_age_days(bucket_path: str) -> float:
+    """How many days old a trash bucket is.
+
+    Prefers parsing the ``YYYYMMDD-HHMMSS`` bucket name (the authoritative
+    "trashed at" moment, immune to filesystem mtime drift/preservation on
+    cross-device moves); falls back to the bucket directory's own mtime for
+    any bucket name that doesn't match the expected format.
+    """
+    name = os.path.basename(bucket_path)
+    try:
+        trashed_at = datetime.datetime.strptime(name, "%Y%m%d-%H%M%S")
+        age = datetime.datetime.now() - trashed_at
+        return age.total_seconds() / 86400.0
+    except ValueError:
+        try:
+            mtime = os.path.getmtime(bucket_path)
+        except OSError:
+            return 0.0
+        return (datetime.datetime.now().timestamp() - mtime) / 86400.0
+
+
+def sweep_trash(retention_days: int, roots=None) -> dict:
+    """Delete trash buckets older than ``retention_days``; remove emptied buckets.
+
+    Only ever touches files strictly under the given trash roots (defaults to
+    just ``_TRASH_ROOT`` — callers that also want per-volume
+    ``.scanhound-trash`` roots must pass them explicitly, e.g. via the same
+    root-discovery the /rename/trash endpoints use). Never follows symlinks —
+    a symlink found inside an old bucket is unlinked (removing the link
+    itself), never resolved and deleted at its target. Logs a per-run summary
+    and is fail-safe: per-file/per-bucket errors are logged and skipped
+    rather than aborting the whole sweep.
+
+    Returns ``{"files_deleted": int, "bytes_freed": int, "buckets_removed": int}``.
+    """
+    if roots is None:
+        roots = [_TRASH_ROOT]
+    files_deleted = 0
+    bytes_freed = 0
+    buckets_removed = 0
+
+    for root in roots:
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            continue
+        try:
+            bucket_names = os.listdir(root)
+        except OSError:
+            continue
+        for bucket_name in bucket_names:
+            bucket_path = os.path.join(root, bucket_name)
+            if os.path.islink(bucket_path) or not os.path.isdir(bucket_path):
+                continue  # never descend into a symlinked "bucket"
+            if _bucket_age_days(bucket_path) < retention_days:
+                continue
+            try:
+                for entry in os.listdir(bucket_path):
+                    epath = os.path.join(bucket_path, entry)
+                    try:
+                        if os.path.islink(epath):
+                            os.unlink(epath)  # remove the link, never its target
+                        elif os.path.isfile(epath):
+                            size = os.path.getsize(epath)
+                            os.remove(epath)
+                            if entry != "manifest.json":
+                                files_deleted += 1
+                                bytes_freed += size
+                        elif os.path.isdir(epath):
+                            shutil.rmtree(epath, ignore_errors=True)
+                    except OSError:
+                        logger.warning("sweep_trash: failed to remove %s (skipped)",
+                                       epath, exc_info=True)
+                os.rmdir(bucket_path)
+                buckets_removed += 1
+            except OSError:
+                logger.warning("sweep_trash: failed to remove bucket %s (skipped)",
+                               bucket_path, exc_info=True)
+
+    logger.info("sweep_trash: removed %d file(s), %d bucket(s), freed %d bytes (retention=%dd)",
+               files_deleted, buckets_removed, bytes_freed, retention_days)
+    return {"files_deleted": files_deleted, "bytes_freed": bytes_freed,
+            "buckets_removed": buckets_removed}
+
+
 def place_file(src: str, dst: str, method: str = "hardlink", *,
                automatic: bool = False,
                deletions_require_confirmation: bool = True) -> str:

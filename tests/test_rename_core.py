@@ -490,3 +490,74 @@ class TestTrashListAndRestore:
         entries = fileops.list_trash_entries([str(root1), str(root2)])
         names = {e["name"] for e in entries}
         assert names == {"a.mkv", "b.mkv"}
+
+
+class TestTrashRetentionSweep:
+    """sweep_trash() — deletes only old buckets under the trash roots."""
+
+    @staticmethod
+    def _bucket_name_for_age(age_days: int) -> str:
+        import datetime as _dt
+        return (_dt.datetime.now() - _dt.timedelta(days=age_days)).strftime("%Y%m%d-%H%M%S")
+
+    def _make_bucket(self, root, age_days, filename="movie.mkv"):
+        bucket = root / self._bucket_name_for_age(age_days)
+        bucket.mkdir(parents=True, exist_ok=True)
+        f = bucket / filename
+        f.write_text("x")
+        return bucket, f
+
+    def test_sweeps_bucket_older_than_retention(self, tmp_path):
+        root = tmp_path / "trash"
+        old_bucket, old_file = self._make_bucket(root, age_days=400)
+
+        summary = fileops.sweep_trash(30, roots=[str(root)])
+
+        assert not old_file.exists()
+        assert not old_bucket.exists()
+        assert summary["files_deleted"] == 1
+        assert summary["bytes_freed"] == 1  # "x" is 1 byte
+
+    def test_keeps_fresh_bucket(self, tmp_path):
+        root = tmp_path / "trash"
+        fresh_bucket, fresh_file = self._make_bucket(root, age_days=1)
+
+        summary = fileops.sweep_trash(30, roots=[str(root)])
+
+        assert fresh_file.exists()
+        assert fresh_bucket.exists()
+        assert summary["files_deleted"] == 0
+
+    def test_never_touches_files_outside_trash_root(self, tmp_path):
+        root = tmp_path / "trash"
+        root.mkdir(parents=True)
+        # A file that sits next to (not under) the trash root, deliberately
+        # made to look "old" — sweep_trash must never reach it.
+        sibling = tmp_path / "sibling.mkv"
+        sibling.write_text("keep me")
+        import time as _time
+        old_time = _time.time() - 400 * 86400
+        os.utime(str(sibling), (old_time, old_time))
+
+        fileops.sweep_trash(30, roots=[str(root)])
+
+        assert sibling.exists()
+        assert sibling.read_text() == "keep me"
+
+    def test_does_not_follow_symlinks(self, tmp_path):
+        root = tmp_path / "trash"
+        old_bucket, _ = self._make_bucket(root, age_days=400)
+        # A real file elsewhere, symlinked into the old bucket.
+        target = tmp_path / "outside.mkv"
+        target.write_text("do not delete")
+        link = old_bucket / "linked.mkv"
+        try:
+            os.symlink(str(target), str(link))
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported in this environment")
+
+        fileops.sweep_trash(30, roots=[str(root)])
+
+        # The symlink target must survive even though the bucket was swept.
+        assert target.exists()
+        assert target.read_text() == "do not delete"

@@ -93,6 +93,7 @@ EXPECTED_DEFAULT_KEYS = {
     "auto_rename_template_movie", "auto_rename_template_tv",
     "auto_rename_plex_sort_titles", "auto_rename_llm_enabled",
     "ollama_base_url", "ollama_model", "ollama_vision_model", "deletions_require_confirmation",
+    "trash_retention_days",
     # Dolby Vision host-detector + labeler
     "dv_library_roots", "dv_detection", "dv_file_tagging", "dv_label_vocab",
     # Debug / logging
@@ -157,6 +158,9 @@ class TestDefaultConfig:
 
     def test_default_config_scan_threads(self):
         assert _DEFAULT_CONFIG["scan_threads"] == 10
+
+    def test_default_config_trash_retention_days(self):
+        assert _DEFAULT_CONFIG["trash_retention_days"] == 30
 
     def test_default_config_thresholds(self):
         assert _DEFAULT_CONFIG["tv_match_threshold"] == 90
