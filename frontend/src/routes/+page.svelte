@@ -3,6 +3,7 @@
   import FilterBar from '$lib/components/FilterBar.svelte';
   import StatusBar from '$lib/components/StatusBar.svelte';
   import ResultTile from '$lib/components/ResultTile.svelte';
+  import GroupTile from '$lib/components/GroupTile.svelte';
   import ResultRow from '$lib/components/ResultRow.svelte';
   import ContextMenu from '$lib/components/ContextMenu.svelte';
   import ResultActionSheet from '$lib/components/ResultActionSheet.svelte';
@@ -474,66 +475,40 @@
   {#if $viewMode === 'grid'}
     <div class="grid {gridGapClass}" style={gridStyle}>
       {#each groupedResults() as group (group.title)}
-        {#if isDuplicateGroup(group)}
+        {#if isDuplicateGroup(group) && !isGroupExpanded(group)}
+          <!-- Collapsed duplicate group: a normal grid cell (stacked-poster card),
+               not a full-width row — keeps the poster wall's rhythm intact. -->
+          <div class="min-w-0">
+            <GroupTile
+              title={group.title}
+              items={group.items}
+              count={siblingCounts().get(group.title) ?? group.items.length}
+              formats={groupFormats(group.items)}
+              statusSummary={groupStatusSummary(group.items)}
+              sizeRange={groupSizeRange(group.items)}
+              dateRange={groupDateRange(group.items)}
+              onToggle={() => toggleGroup(group.title)}
+            />
+          </div>
+        {:else if isDuplicateGroup(group)}
+          <!-- Expanded: slim full-width header strip (click/Enter/Space to collapse) + the run of tiles -->
           <section class="mb-2" style="grid-column: 1 / -1;">
             <button
               type="button"
-              class="flex w-full items-center gap-3 mb-2 mt-4 first:mt-0 cursor-pointer select-none text-left rounded-lg border transition-colors
-                {isGroupExpanded(group)
-                  ? 'border-transparent py-0 bg-transparent'
-                  : 'border-[var(--border)] hover:border-[var(--text-secondary)] bg-[var(--bg-secondary)] p-2'}"
-              style="{!isGroupExpanded(group) ? groupBarStyle(group.items) : ''}"
+              class="flex w-full items-center gap-2 mb-2 mt-4 first:mt-0 cursor-pointer select-none text-left rounded-lg border-transparent bg-transparent py-0 transition-colors"
               onclick={() => toggleGroup(group.title)}
             >
-              {#if !isGroupExpanded(group)}
-                {@const fmts = groupFormats(group.items)}
-                <!-- Collapsed summary — looks like a mini result row -->
-                {#if group.items[0].poster_url}
-                  <img src={group.items[0].poster_url} alt="" class="h-14 w-9 object-cover rounded flex-shrink-0" loading="lazy" />
-                {:else}
-                  <div class="h-14 w-9 bg-[var(--bg-tertiary)] rounded flex-shrink-0"></div>
-                {/if}
-                <div class="flex-1 min-w-0">
-                  <!-- Row 1: title + year + count -->
-                  <div class="flex items-center gap-2 flex-wrap">
-                    <span class="text-sm font-semibold truncate">{group.title}</span>
-                    {#if group.items[0].year}<span class="text-[var(--text-secondary)] text-sm font-normal">({group.items[0].year})</span>{/if}
-                    <Badge label="{siblingCounts().get(group.title)} releases" />
-                  </div>
-                  <!-- Row 2: rating + format badges -->
-                  <div class="flex items-center gap-1.5 mt-0.5 flex-wrap">
-                    {#if group.items[0].rating != null}
-                      <span class="text-xs text-[var(--text-secondary)]">⭐ {group.items[0].rating.toFixed(1)}</span>
-                    {/if}
-                    {#each fmts.res as r}
-                      <Badge label={r} size="xs" />
-                    {/each}
-                    {#if fmts.dv}<Badge label="DV" variant="accent" size="xs" />{/if}
-                    {#if fmts.hdr}<Badge label="HDR" variant="warning" size="xs" />{/if}
-                  </div>
-                  <!-- Row 3: size range + short date range -->
-                  <div class="flex items-center gap-2 mt-0.5 text-xs text-[var(--text-secondary)]">
-                    {#if groupSizeRange(group.items)}<span>{groupSizeRange(group.items)}</span>{/if}
-                    {#if groupDateRange(group.items)}<span class="opacity-60">&middot; {groupDateRange(group.items)}</span>{/if}
-                  </div>
-                </div>
-                <span class="text-[10px] text-[var(--text-secondary)] flex-shrink-0">&#9654;</span>
-              {:else}
-                <!-- Expanded header — compact text row -->
-                <span class="text-[10px] text-[var(--text-secondary)] transition-transform rotate-90">&triangleright;</span>
-                <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>
-                <Badge label="{siblingCounts().get(group.title)} releases" />
-              {/if}
+              <span class="text-[10px] text-[var(--text-secondary)] transition-transform rotate-90">&triangleright;</span>
+              <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>
+              <Badge label="{siblingCounts().get(group.title)} releases" />
             </button>
-            {#if isGroupExpanded(group)}
-              <div class="grid {gridGapClass}" style={gridStyle} transition:slide={{ duration: 150 }}>
-                {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
-                  <div class="min-w-0" oncontextmenu={(e) => handleContextMenu(e, item)}>
-                    <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} onmore={() => (mobileActionItem = item)} />
-                  </div>
-                {/each}
-              </div>
-            {/if}
+            <div class="grid {gridGapClass}" style={gridStyle} transition:slide={{ duration: 150 }}>
+              {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
+                <div class="min-w-0" oncontextmenu={(e) => handleContextMenu(e, item)}>
+                  <ResultTile {item} focused={flatIndexMap().get(item) === $focusedIndex} onmore={() => (mobileActionItem = item)} />
+                </div>
+              {/each}
+            </div>
           </section>
         {:else}
           {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
