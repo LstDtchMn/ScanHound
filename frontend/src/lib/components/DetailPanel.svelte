@@ -17,6 +17,13 @@
   let panelEl = $state<HTMLDivElement>();
   let triggerEl: Element | null = null;
 
+  // Mount/unmount only — deliberately reads nothing reactive (not `item`,
+  // not `panelEl` beyond the initial capture below) so switching the
+  // detail shown (selectedDetail.set(anotherItem) while the panel stays
+  // open, which happens without going through onclose — see ResultRow/
+  // ResultTile/SwipeDeck) never re-runs this and never fires the restore-
+  // focus cleanup early. It only actually fires when the panel unmounts,
+  // i.e. a genuine close.
   $effect(() => {
     triggerEl = document.activeElement;
     if (panelEl) {
@@ -31,8 +38,49 @@
     $results.filter((r) => r.group_key === item.group_key && r.url !== item.url)
   );
 
+  /** Focusable elements currently inside the panel, in DOM/tab order. Queried
+   *  live (not cached) since the set of focusable controls changes with
+   *  `item` (siblings list, download buttons, etc.) while the panel stays
+   *  mounted across a same-panel item swap. */
+  function focusableEls(): HTMLElement[] {
+    if (!panelEl) return [];
+    return Array.from(
+      panelEl.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )
+    ).filter((el) => el.offsetParent !== null); // skip hidden elements
+  }
+
+  /** Focus trap: Tab/Shift+Tab cycle within the panel's focusable elements
+   *  instead of escaping into the (dimmed, but still-present) background
+   *  list behind the modal. */
+  function handleTrapTab(e: KeyboardEvent) {
+    if (e.key !== 'Tab') return;
+    const els = focusableEls();
+    if (els.length === 0) {
+      e.preventDefault();
+      panelEl?.focus();
+      return;
+    }
+    const first = els[0];
+    const last = els[els.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey) {
+      if (active === first || !els.includes(active as HTMLElement)) {
+        e.preventDefault();
+        last.focus();
+      }
+    } else {
+      if (active === last || !els.includes(active as HTMLElement)) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  }
+
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') onclose();
+    if (e.key === 'Escape') { onclose(); return; }
+    handleTrapTab(e);
   }
 
   async function handleDownload(
