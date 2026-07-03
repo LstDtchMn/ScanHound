@@ -240,6 +240,11 @@ connection.on('scan:complete', handleScanComplete);
  *  capped: every streamed result must survive so a completed scan's full
  *  stats/rows stay intact. */
 export const PAGED_RESULTS_CAP = 2000;
+/** Page size for paged/browse-mode `/results/cached` fetches. `hasMore` is
+ *  derived from page*PAGED_PER_PAGE vs the server total (NOT the in-memory
+ *  `results.length`, which the cap above can pin below the total and would
+ *  otherwise leave `hasMore` stuck true → infinite fetch loop). */
+export const PAGED_PER_PAGE = 100;
 
 /** Re-fetch a snapshot of results after the WebSocket reconnects, so any
  *  scan:result/scan:complete events that streamed in while disconnected
@@ -344,7 +349,7 @@ function filterQueryKey(): string {
 }
 
 function buildResultParams(page: number): Record<string, string> {
-  const p: Record<string, string> = { page: String(page), per_page: '100' };
+  const p: Record<string, string> = { page: String(page), per_page: String(PAGED_PER_PAGE) };
   const s = get(statusFilter); if (s !== 'all') p.filter = s;
   const q = get(searchFilter); if (q) p.search = q;
   const cats = get(categoryFilter); if (cats.length) p.category = cats.join(',');
@@ -390,16 +395,31 @@ export async function loadResults(reset: boolean): Promise<void> {
       // grow `results` unbounded. Evict from the front (oldest-loaded pages)
       // since those are what a user actively scrolling forward cares least
       // about — the server can always re-supply them on a fresh page-1 load.
+      // NEVER evict a currently-selected row: that would desync `selectedKeys`
+      // (url-keyed) and silently shrink a later "Select loaded"/bulk action's
+      // target. Length may thus slightly exceed the cap when many rows are
+      // selected — bounded by the selection size, which is acceptable.
       results.update((r) => {
         const next = [...r, ...items];
-        return next.length > PAGED_RESULTS_CAP ? next.slice(next.length - PAGED_RESULTS_CAP) : next;
+        let toDrop = next.length - PAGED_RESULTS_CAP;
+        if (toDrop <= 0) return next;
+        const sel = get(selectedKeys);
+        const kept: ScanResult[] = [];
+        for (const item of next) {
+          if (toDrop > 0 && !sel.has(item.url)) { toDrop--; continue; }
+          kept.push(item);
+        }
+        return kept;
       });
       currentPage = page;
     }
     filteredTotal.set(data.total ?? items.length);
     titleCounts.set((data as { title_counts?: Record<string, number> }).title_counts ?? {});
     if (data.stats) stats.set(data.stats);
-    hasMore.set(get(results).length < (data.total ?? 0));
+    // Derive from page*per_page vs total, NOT results.length (the cap-eviction
+    // above pins results.length at PAGED_RESULTS_CAP while total keeps growing,
+    // which would leave hasMore permanently true → infinite fetch loop).
+    hasMore.set(page * PAGED_PER_PAGE < (data.total ?? 0));
     // Server facets (B2/D3) — computed over the whole matching set, not just
     // loaded pages. Always present on /results/cached; default to [] so a
     // response shape mismatch doesn't leave a stale prior value behind.

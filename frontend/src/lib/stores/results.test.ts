@@ -284,15 +284,17 @@ describe('loadResults / paged mode', () => {
   it('loadResults(true) replaces results and sets paged totals', async () => {
     const { loadResults, results, filteredTotal, hasMore, pagedMode } =
       await import('./results');
+    // total > PAGED_PER_PAGE (100) so there genuinely IS a page 2 — hasMore is
+    // derived from page*per_page vs total, not the returned row count.
     (api.getCachedResults as any).mockResolvedValueOnce({
       items: [item({ title: 'A', url: 'a' }), item({ title: 'B', url: 'b' })],
-      total: 5, stats: { total: 5, missing: 5, upgrade: 0, library: 0 },
+      total: 250, stats: { total: 250, missing: 250, upgrade: 0, library: 0 },
       title_counts: { A: 1, B: 1 }, source: 'cache'
     });
     pagedMode.set(true);
     await loadResults(true);
     expect(get(results).length).toBe(2);
-    expect(get(filteredTotal)).toBe(5);
+    expect(get(filteredTotal)).toBe(250);
     expect(get(hasMore)).toBe(true);
   });
 
@@ -513,7 +515,7 @@ describe('bounded growth of accumulated pages (D1)', () => {
   });
 
   it('appending pages past the cap evicts the oldest rows, keeping the array bounded', async () => {
-    const { loadResults, results, pagedMode, PAGED_RESULTS_CAP } = await import('./results');
+    const { loadResults, results, hasMore, pagedMode, PAGED_RESULTS_CAP } = await import('./results');
     pagedMode.set(true);
 
     // Seed with a first page.
@@ -545,6 +547,43 @@ describe('bounded growth of accumulated pages (D1)', () => {
     // oldest rows — the front of the array — that get dropped).
     const lastPageFirstUrl = `p${pagesNeeded - 1}-0`;
     expect(get(results).some((r) => r.url === lastPageFirstUrl)).toBe(true);
+    // Once every server page has been fetched, hasMore MUST be false even
+    // though results.length is pinned at the cap below total — otherwise the
+    // scroll/keyboard top-up loops forever past the true end of the set.
+    expect(get(hasMore)).toBe(false);
+  });
+
+  it('never evicts a currently-selected row when capping (selection stays consistent)', async () => {
+    const { loadResults, results, selectedKeys, pagedMode, PAGED_RESULTS_CAP } =
+      await import('./results');
+    pagedMode.set(true);
+
+    // Page 1 has a row the user then selects.
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'keep-me', url: 'keep-me' })],
+      total: PAGED_RESULTS_CAP + 500,
+      stats: { total: PAGED_RESULTS_CAP + 500, missing: 0, upgrade: 0, library: 0 },
+      title_counts: {}
+    });
+    await loadResults(true);
+    selectedKeys.set(new Set(['keep-me'])); // user selects the oldest row
+
+    // Append enough pages to push well past the cap — 'keep-me' is the very
+    // front of the array and would be the first evicted if selection were ignored.
+    const pagesNeeded = Math.ceil((PAGED_RESULTS_CAP + 500) / 100) + 2;
+    for (let i = 0; i < pagesNeeded; i++) {
+      (api.getCachedResults as any).mockResolvedValueOnce({
+        items: Array.from({ length: 100 }, (_, j) => item({ title: `q${i}-${j}`, url: `q${i}-${j}` })),
+        total: PAGED_RESULTS_CAP + 500,
+        stats: { total: PAGED_RESULTS_CAP + 500, missing: 0, upgrade: 0, library: 0 },
+        title_counts: {}
+      });
+      await loadResults(false);
+    }
+
+    // The selected row survived eviction, so selectedKeys stays backed by a
+    // real loaded row (no phantom selection / over-counted bulk target).
+    expect(get(results).some((r) => r.url === 'keep-me')).toBe(true);
   });
 
   it('live-scan streaming (handleScanResult) is never capped', async () => {
