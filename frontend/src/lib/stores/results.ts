@@ -234,6 +234,43 @@ export function handleScanComplete(data: Record<string, unknown>) {
 connection.on('scan:result', handleScanResult);
 connection.on('scan:complete', handleScanComplete);
 
+/** Max rows kept in `results` while in paged/browse mode (server-backed —
+ *  infinite scroll re-fetches whatever falls off, so this just bounds memory).
+ *  Live-scan streaming (handleScanResult while pagedMode is false) is never
+ *  capped: every streamed result must survive so a completed scan's full
+ *  stats/rows stay intact. */
+export const PAGED_RESULTS_CAP = 2000;
+
+/** Re-fetch a snapshot of results after the WebSocket reconnects, so any
+ *  scan:result/scan:complete events that streamed in while disconnected
+ *  aren't lost forever. In paged mode this just reloads page 1 of the
+ *  server-filtered set; otherwise (a live/browse snapshot loaded via
+ *  api.getResults on app start) it re-pulls that same snapshot. Never runs
+ *  mid-live-scan-stream — pagedMode is false during a stream, but so is the
+ *  "no scan running, showing a prior snapshot" case, so we distinguish by
+ *  whether a scan is actively producing rows (activeScanResultCount > 0).
+ *  Exported for direct testing. */
+export async function handleReconnectSnapshot(): Promise<void> {
+  if (get(pagedMode)) {
+    await loadResults(true);
+    return;
+  }
+  if (activeScanResultCount > 0) return; // mid-stream — don't clobber it
+  try {
+    const data = await api.getResults({ per_page: '500' });
+    if (data.items && data.items.length > 0) {
+      results.set(data.items as ScanResult[]);
+      if (data.stats) stats.set(data.stats);
+    }
+  } catch {
+    /* offline — leave whatever is currently shown */
+  }
+}
+
+connection.onReconnect(() => {
+  handleReconnectSnapshot();
+});
+
 /** All unique genres from current scan results. */
 export const availableGenres = derived(results, ($results) => {
   const set = new Set<string>();
@@ -314,7 +351,17 @@ export async function loadResults(reset: boolean): Promise<void> {
     if (filterQueryKey() !== key) return; // superseded while awaiting — discard
     const items = (data.items ?? []) as ScanResult[];
     if (reset) { results.set(items); currentPage = 1; currentQueryKey = key; }
-    else { results.update((r) => [...r, ...items]); currentPage = page; }
+    else {
+      // Cap accumulated rows so an extended infinite-scroll session doesn't
+      // grow `results` unbounded. Evict from the front (oldest-loaded pages)
+      // since those are what a user actively scrolling forward cares least
+      // about — the server can always re-supply them on a fresh page-1 load.
+      results.update((r) => {
+        const next = [...r, ...items];
+        return next.length > PAGED_RESULTS_CAP ? next.slice(next.length - PAGED_RESULTS_CAP) : next;
+      });
+      currentPage = page;
+    }
     filteredTotal.set(data.total ?? items.length);
     titleCounts.set((data as { title_counts?: Record<string, number> }).title_counts ?? {});
     if (data.stats) stats.set(data.stats);

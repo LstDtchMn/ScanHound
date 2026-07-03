@@ -2,17 +2,33 @@ import { get } from 'svelte/store';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ScanResult } from '$lib/api/types';
 
+const reconnectHandlers: Array<() => void> = [];
+vi.mock('$lib/stores/connection', () => ({
+  connection: {
+    on: vi.fn(() => () => {}),
+    onReconnect: (fn: () => void) => { reconnectHandlers.push(fn); return () => {}; }
+  }
+}));
+
 vi.mock('$lib/api/client', () => ({
   api: {
     dismissItems: vi.fn().mockResolvedValue({ status: 'ok', dismissed_count: 1 }),
     dismissedList: vi.fn().mockResolvedValue({ items: [], count: 0 }),
     selectAll: vi.fn().mockResolvedValue({}),
     deselectAll: vi.fn().mockResolvedValue({}),
-    getCachedResults: vi.fn()
+    getCachedResults: vi.fn(),
+    getResults: vi.fn()
   }
 }));
 
 const { api } = await import('$lib/api/client');
+
+/** Fire every reconnect handler registered via connection.onReconnect (the
+ *  store registers its own at import time), the same way connection.ts's
+ *  real ws.onopen-after-a-prior-close path would. */
+function triggerReconnect() {
+  reconnectHandlers.forEach((fn) => fn());
+}
 const {
   results,
   selectedKeys,
@@ -382,6 +398,122 @@ describe('loadResults / paged mode', () => {
     payload = (api.selectAll as any).mock.calls.at(-1)[0];
     expect(payload.posted_after).toBe('2026-06-01');
     expect(payload.posted_before).toBe('2026-06-10');
+  });
+});
+
+describe('WS reconnect snapshot reload (D1)', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('in paged mode, a reconnect re-runs loadResults(true) (page 1 reload)', async () => {
+    const { handleReconnectSnapshot, pagedMode, results, filteredTotal } = await import('./results');
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'Fresh', url: 'fresh' })],
+      total: 1, stats: { total: 1, missing: 1, upgrade: 0, library: 0 }, title_counts: { Fresh: 1 }
+    });
+
+    await handleReconnectSnapshot();
+
+    expect(api.getCachedResults).toHaveBeenCalled();
+    expect(get(results).map((r) => r.title)).toEqual(['Fresh']);
+    expect(get(filteredTotal)).toBe(1);
+  });
+
+  it('outside paged mode (a live snapshot), a reconnect re-fetches api.getResults', async () => {
+    const { handleReconnectSnapshot, pagedMode, results, stats } = await import('./results');
+    pagedMode.set(false);
+    results.set([item({ title: 'Old snapshot', url: 'old' })]);
+    (api.getResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'Missed while down', url: 'missed' })],
+      total: 1, page: 1, per_page: 500,
+      stats: { total: 1, missing: 1, upgrade: 0, library: 0 }
+    });
+
+    await handleReconnectSnapshot();
+
+    expect(api.getResults).toHaveBeenCalledWith({ per_page: '500' });
+    expect(get(results).map((r) => r.title)).toEqual(['Missed while down']);
+    expect(get(stats)).toEqual({ total: 1, missing: 1, upgrade: 0, library: 0 });
+  });
+
+  it('does not clobber an in-progress live scan stream on reconnect', async () => {
+    const { handleScanResult, handleReconnectSnapshot, pagedMode, results } = await import('./results');
+    pagedMode.set(false);
+    handleScanResult(item({ title: 'Streaming 1', url: 's1' }) as unknown as Record<string, unknown>);
+
+    await handleReconnectSnapshot();
+
+    expect(api.getResults).not.toHaveBeenCalled();
+    expect(get(results).map((r) => r.title)).toEqual(['Streaming 1']);
+  });
+
+  it('the connection.onReconnect wiring at module load invokes handleReconnectSnapshot', async () => {
+    const { pagedMode, results } = await import('./results');
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'Reconnected', url: 'r1' })],
+      total: 1, stats: { total: 1, missing: 1, upgrade: 0, library: 0 }, title_counts: {}
+    });
+
+    triggerReconnect();
+    await vi.waitFor(() => {
+      expect(get(results).map((r) => r.title)).toEqual(['Reconnected']);
+    });
+  });
+});
+
+describe('bounded growth of accumulated pages (D1)', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('appending pages past the cap evicts the oldest rows, keeping the array bounded', async () => {
+    const { loadResults, results, pagedMode, PAGED_RESULTS_CAP } = await import('./results');
+    pagedMode.set(true);
+
+    // Seed with a first page.
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'first', url: 'first' })],
+      total: PAGED_RESULTS_CAP + 50,
+      stats: { total: PAGED_RESULTS_CAP + 50, missing: 0, upgrade: 0, library: 0 },
+      title_counts: {}
+    });
+    await loadResults(true);
+
+    // Append pages of 100 until well past the cap.
+    const pagesNeeded = Math.ceil((PAGED_RESULTS_CAP + 50) / 100) + 1;
+    for (let i = 0; i < pagesNeeded; i++) {
+      const pageItems = Array.from({ length: 100 }, (_, j) =>
+        item({ title: `p${i}-${j}`, url: `p${i}-${j}` })
+      );
+      (api.getCachedResults as any).mockResolvedValueOnce({
+        items: pageItems,
+        total: PAGED_RESULTS_CAP + 50,
+        stats: { total: PAGED_RESULTS_CAP + 50, missing: 0, upgrade: 0, library: 0 },
+        title_counts: {}
+      });
+      await loadResults(false);
+    }
+
+    expect(get(results).length).toBeLessThanOrEqual(PAGED_RESULTS_CAP);
+    // The most recently appended page must survive the eviction (it's the
+    // oldest rows — the front of the array — that get dropped).
+    const lastPageFirstUrl = `p${pagesNeeded - 1}-0`;
+    expect(get(results).some((r) => r.url === lastPageFirstUrl)).toBe(true);
+  });
+
+  it('live-scan streaming (handleScanResult) is never capped', async () => {
+    const { handleScanResult, results, pagedMode } = await import('./results');
+    pagedMode.set(true); // first streamed item flips this off, per existing behavior
+    const count = 50;
+    for (let i = 0; i < count; i++) {
+      handleScanResult(item({ title: `live-${i}`, url: `live-${i}` }) as unknown as Record<string, unknown>);
+    }
+    expect(get(results).length).toBe(count);
   });
 });
 

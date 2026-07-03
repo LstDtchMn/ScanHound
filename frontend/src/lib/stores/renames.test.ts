@@ -5,7 +5,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // keyed by event name so the test can invoke them directly.
 const handlers: Record<string, (data: unknown) => void> = {};
 vi.mock('$lib/stores/connection', () => ({
-  connection: { on: (event: string, cb: (data: unknown) => void) => { handlers[event] = cb; } }
+  connection: {
+    on: (event: string, cb: (data: unknown) => void) => { handlers[event] = cb; return () => {}; },
+    onReconnect: (_cb: () => void) => () => {}
+  }
 }));
 vi.mock('$lib/api/client', () => ({
   api: { getDvScans: vi.fn().mockResolvedValue({ scans: [], counts: {} }) }
