@@ -618,6 +618,44 @@ class TestScannedUrls:
         assert db_manager.is_url_scanned("http://z.com")
 
 
+class TestBackgroundCacheVersion:
+    """B2: get_background_cache_version() is the cheap invalidation signal
+    backend/api/routes/results.py uses to avoid re-parsing every cached
+    row's JSON blob on each request."""
+
+    def test_empty_cache(self, db_manager):
+        assert db_manager.get_background_cache_version() == (0, None)
+
+    def test_changes_on_insert(self, db_manager):
+        before = db_manager.get_background_cache_version()
+        db_manager.upsert_background_cache([
+            {"url": "u/1", "title": "A", "year": 2024, "status": "missing",
+             "source_category": "4k", "data": "{}"},
+        ])
+        after = db_manager.get_background_cache_version()
+        assert after != before
+        assert after[0] == 1
+
+    def test_changes_on_reupsert_same_url(self, db_manager):
+        db_manager.upsert_background_cache([
+            {"url": "u/1", "title": "A", "year": 2024, "status": "missing",
+             "source_category": "4k", "data": "{}"},
+        ])
+        first = db_manager.get_background_cache_version()
+        # Re-upserting the same URL refreshes last_seen_at (CURRENT_TIMESTAMP)
+        # without changing the row count -- the version must still change so
+        # a re-scrape invalidates any cached parsed-items snapshot.
+        import time
+        time.sleep(1.1)  # last_seen_at has second resolution
+        db_manager.upsert_background_cache([
+            {"url": "u/1", "title": "A2", "year": 2024, "status": "missing",
+             "source_category": "4k", "data": "{}"},
+        ])
+        second = db_manager.get_background_cache_version()
+        assert second[0] == first[0] == 1
+        assert second[1] != first[1]
+
+
 # ---------------------------------------------------------------------------
 # 7. Transaction context manager
 # ---------------------------------------------------------------------------

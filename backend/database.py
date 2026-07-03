@@ -1572,6 +1572,22 @@ class DatabaseManager:
             'SELECT COUNT(*) FROM background_scan_cache', one=True, default=None)
         return row[0] if row else 0
 
+    def get_background_cache_version(self):
+        """Return a cheap, monotonic-ish ``(count, max_last_seen_at)`` tuple
+        that changes whenever the background cache's row set or any row's
+        ``last_seen_at`` changes (every upsert refreshes it — see
+        upsert_background_cache). Callers use this as a cache-invalidation
+        key for expensive per-row JSON parsing (see
+        backend/api/routes/results.py) without re-reading and re-parsing
+        every row on each request.
+        """
+        row = self._query(
+            'SELECT COUNT(*), MAX(last_seen_at) FROM background_scan_cache',
+            one=True, default=None)
+        if not row:
+            return (0, None)
+        return (row[0] or 0, row[1])
+
     def clear_background_cache(self):
         """Remove all cached background-scan rows."""
         return self._mutate(
