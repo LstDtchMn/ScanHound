@@ -505,34 +505,36 @@ class DatabaseManager:
 
                 conn.commit()
 
+            except sqlite3.OperationalError as e:
+                # sqlite3.OperationalError is a SUBCLASS of DatabaseError, but
+                # it covers transient conditions ("database is locked" after
+                # busy_timeout expires, "disk I/O error" from a flaky
+                # bind-mounted filesystem) that are NOT corruption. Quarantining
+                # here would nuke a perfectly healthy DB on a transient hiccup
+                # — exactly the failure mode this hardening pass exists to
+                # eliminate, and it's still reachable pre-migration on a
+                # bind-mounted volume. Only treat it as corruption if the
+                # message itself says so; otherwise log loudly and re-raise so
+                # startup fails fast (and can be retried) instead of silently
+                # discarding data.
+                msg = str(e).lower()
+                if any(marker in msg for marker in ("malformed", "not a database", "corrupt")):
+                    self._quarantine_corrupt_db(e)
+                else:
+                    logger.warning(
+                        "Transient DB operational error during init at %s "
+                        "(not corruption — not quarantining): %s", self.db_path, e)
+                    raise
             except sqlite3.DatabaseError as e:
-                # LOUD by design: DB corruption + auto-quarantine is a data-loss
-                # event (every row not yet reflected elsewhere is gone), so this
-                # must never be a quiet log line. ERROR-level log with a
-                # grep-able marker, a best-effort user notification, and a
-                # persisted flag file (survives past the log) that ops/UI code
-                # can check for after the fact.
-                logger.error(
-                    "DATABASE CORRUPTION DETECTED at %s — quarantining and "
-                    "rebuilding a fresh database: %s", self.db_path, e)
-                self._notify_corruption(e)
-                if self.conn:
-                    try:
-                        self.conn.close()
-                    except sqlite3.Error:
-                        pass
-                    self.conn = None
-
-                # Auto-recovery: back up corrupt file and start fresh
-                if os.path.exists(self.db_path):
-                    backup_name = f"{self.db_path}.corrupt.{int(time.time())}"
-                    try:
-                        os.rename(self.db_path, backup_name)
-                        logger.warning("Renamed corrupt DB to %s. Creating fresh DB.", backup_name)
-                        self._write_corruption_flag(backup_name, e)
-                        self.init_db()
-                    except OSError as os_err:
-                        logger.critical("Failed to recover DB: %s", os_err)
+                # Genuine corruption (or an integrity_check failure we raised
+                # ourselves above as a plain DatabaseError). LOUD by design: DB
+                # corruption + auto-quarantine is a data-loss event (every row
+                # not yet reflected elsewhere is gone), so this must never be a
+                # quiet log line. ERROR-level log with a grep-able marker, a
+                # best-effort user notification, and a persisted flag file
+                # (survives past the log) that ops/UI code can check for after
+                # the fact.
+                self._quarantine_corrupt_db(e)
             finally:
                 self._init_depth = 0
 
@@ -545,6 +547,35 @@ class DatabaseManager:
                 self.checkpoint()
             except Exception:
                 logger.exception("Post-init WAL checkpoint failed")
+
+    def _quarantine_corrupt_db(self, e) -> None:
+        """Back up a genuinely corrupt DB file and rebuild fresh in its place.
+
+        Shared by the true-corruption branches of init_db() (plain
+        DatabaseError, and OperationalError whose message indicates real
+        corruption rather than a transient lock/I-O condition).
+        """
+        logger.error(
+            "DATABASE CORRUPTION DETECTED at %s — quarantining and "
+            "rebuilding a fresh database: %s", self.db_path, e)
+        self._notify_corruption(e)
+        if self.conn:
+            try:
+                self.conn.close()
+            except sqlite3.Error:
+                pass
+            self.conn = None
+
+        # Auto-recovery: back up corrupt file and start fresh
+        if os.path.exists(self.db_path):
+            backup_name = f"{self.db_path}.corrupt.{int(time.time())}"
+            try:
+                os.rename(self.db_path, backup_name)
+                logger.warning("Renamed corrupt DB to %s. Creating fresh DB.", backup_name)
+                self._write_corruption_flag(backup_name, e)
+                self.init_db()
+            except OSError as os_err:
+                logger.critical("Failed to recover DB: %s", os_err)
 
     def _notify_corruption(self, error) -> None:
         """Best-effort loud alert for a DB quarantine event.

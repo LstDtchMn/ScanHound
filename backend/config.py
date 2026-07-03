@@ -267,11 +267,21 @@ os.makedirs(_DB_DIR, exist_ok=True)
 
 
 def _checkpoint_and_copy(legacy_path: str, new_path: str) -> bool:
-    """Fold the legacy DB's WAL into its main file, then copy it to new_path.
+    """Fold the legacy DB's WAL into its main file, then atomically copy it
+    to new_path.
 
     Returns True on success. Never touches -wal/-shm sidecars at the
     destination — the copied file is a clean, checkpointed snapshot that
     SQLite will happily open fresh (WAL/SHM get recreated on first write).
+
+    Atomicity: copy2 goes to a temp sibling (new_path + ".migrating") first,
+    then os.replace() swaps it into place. os.replace is atomic on the same
+    filesystem, and the temp file lives in the same directory as new_path
+    (same volume), so a crash between the copy and the replace never leaves
+    a partial/truncated file at new_path — either the replace happened (full
+    file present) or it didn't (nothing present at new_path, so the
+    idempotency guard in _resolve_db_path correctly retries migration on the
+    next boot instead of mistaking a truncated file for "already migrated").
     """
     import shutil
     import sqlite3
@@ -281,7 +291,12 @@ def _checkpoint_and_copy(legacy_path: str, new_path: str) -> bool:
         conn.commit()
     finally:
         conn.close()
-    shutil.copy2(legacy_path, new_path)
+
+    temp_path = new_path + ".migrating"
+    if os.path.exists(temp_path):
+        os.remove(temp_path)  # stale leftover from a prior interrupted attempt
+    shutil.copy2(legacy_path, temp_path)
+    os.replace(temp_path, new_path)
     return True
 
 

@@ -147,6 +147,96 @@ class TestLoudCorruptionQuarantine:
         finally:
             dm2.close()
 
+    class _OperationalErrorCursor:
+        """Wraps a real cursor, raising a given OperationalError on the
+        integrity_check PRAGMA only — everything else passes through to the
+        real cursor untouched."""
+        def __init__(self, real_cursor, boom_message):
+            self._real = real_cursor
+            self._boom_message = boom_message
+
+        def execute(self, sql, *a, **kw):
+            if "integrity_check" in sql:
+                raise sqlite3.OperationalError(self._boom_message)
+            return self._real.execute(sql, *a, **kw)
+
+        def __getattr__(self, item):
+            return getattr(self._real, item)
+
+    class _OperationalErrorConn:
+        def __init__(self, real_conn, boom_message):
+            self._real = real_conn
+            self._boom_message = boom_message
+
+        def cursor(self, *a, **kw):
+            return TestLoudCorruptionQuarantine._OperationalErrorCursor(
+                self._real.cursor(*a, **kw), self._boom_message)
+
+        def __getattr__(self, item):
+            return getattr(self._real, item)
+
+    def _run_operational_error_case(self, db_path, monkeypatch, caplog, boom_message):
+        """Shared body for the 'locked' and 'disk I/O error' cases: an
+        OperationalError raised during PRAGMA integrity_check must NOT be
+        treated as corruption — no quarantine, no backup file, no
+        .corrupt_flag.json, and the error propagates so startup fails loudly
+        / can be retried instead of silently nuking a healthy DB."""
+        # Create a real, healthy DB first so we have a genuine file on disk.
+        dm_probe = DatabaseManager(db_path=db_path)
+        dm_probe.close()
+
+        real_get_connection = DatabaseManager.get_connection
+
+        def _wrapped_get_connection(self):
+            conn = real_get_connection(self)
+            if conn is not None and not isinstance(conn, TestLoudCorruptionQuarantine._OperationalErrorConn):
+                self.conn = TestLoudCorruptionQuarantine._OperationalErrorConn(conn, boom_message)
+                return self.conn
+            return conn
+
+        monkeypatch.setattr(DatabaseManager, "get_connection", _wrapped_get_connection)
+
+        dm = DatabaseManager.__new__(DatabaseManager)
+        dm.db_path = db_path
+        dm.conn = None
+        import threading as _threading
+        dm._lock = _threading.RLock()
+        dm._init_depth = 0
+        dm._dismissed_cache = None
+
+        with caplog.at_level(logging.WARNING, logger="backend.database"):
+            with pytest.raises(sqlite3.OperationalError):
+                dm.init_db()
+
+        # No quarantine: no corrupt backup, no flag file.
+        backups = [f for f in os.listdir(os.path.dirname(db_path))
+                   if ".corrupt." in f]
+        assert not backups, "a transient operational error must never trigger quarantine"
+        flag_path = f"{db_path}.corrupt_flag.json"
+        assert not os.path.exists(flag_path)
+
+        # The original DB file itself is untouched (still present, not renamed).
+        assert os.path.exists(db_path)
+
+        # A WARNING (not a corruption ERROR) was logged instead.
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("transient" in r.message.lower() or "operational error" in r.message.lower()
+                   for r in warning_records)
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not any("CORRUPTION" in r.message.upper() for r in error_records)
+
+        if dm.conn:
+            try:
+                dm.conn.close()
+            except Exception:
+                pass
+
+    def test_operational_error_locked_does_not_quarantine(self, db_path, monkeypatch, caplog):
+        self._run_operational_error_case(db_path, monkeypatch, caplog, "database is locked")
+
+    def test_operational_error_disk_io_does_not_quarantine(self, db_path, monkeypatch, caplog):
+        self._run_operational_error_case(db_path, monkeypatch, caplog, "disk I/O error")
+
     def test_integrity_check_failure_without_exception_also_quarantines(self, db_path, caplog, monkeypatch):
         """A DB that opens fine but fails PRAGMA integrity_check (returns a
         non-'ok' string rather than raising) must still be quarantined loudly,

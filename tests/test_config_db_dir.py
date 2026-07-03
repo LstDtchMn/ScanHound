@@ -196,3 +196,58 @@ class TestMigrationCopy:
         # half-migrated new location.
         assert cfg_mod.CACHE_FILE == os.path.join(_legacy_data_dir(str(data_dir)), "crawler.db")
         assert os.path.exists(cfg_mod.CACHE_FILE)
+
+    def test_crash_between_temp_copy_and_replace_leaves_no_partial_file(self, tmp_path, monkeypatch):
+        """Simulate a crash AFTER the temp file is fully copied but BEFORE
+        os.replace() swaps it into place (e.g. process killed mid-syscall).
+
+        The atomic-copy fix must guarantee that no partial/truncated file is
+        ever visible at the FINAL new_path — either the whole migrated file
+        is there, or nothing is. A half-written file at new_path would trip
+        the `os.path.exists(new_path)` idempotency guard on the next boot and
+        make it look like migration already happened (skipping it forever),
+        even though the file is actually truncated/broken.
+        """
+        data_dir = tmp_path / "appdata"
+        data_dir.mkdir()
+        self._make_legacy_db(data_dir, rows=(("only_legacy.mkv",),))
+
+        db_dir = tmp_path / "db_volume"
+
+        real_replace = os.replace
+
+        def _boom(*a, **kw):
+            raise OSError("simulated crash between temp copy and replace")
+
+        monkeypatch.setattr(os, "replace", _boom)
+
+        cfg_mod = _reload_config(monkeypatch, db_dir=str(db_dir), data_dir=str(data_dir))
+
+        # Migration failed (replace never happened) -> falls back to legacy path.
+        assert cfg_mod.CACHE_FILE == os.path.join(_legacy_data_dir(str(data_dir)), "crawler.db")
+
+        # No partial/truncated file left behind at the FINAL new_path.
+        final_new_path = os.path.join(str(db_dir), "crawler.db")
+        assert not os.path.exists(final_new_path), (
+            "a partial file at new_path would fool the next boot's "
+            "idempotency guard into skipping migration forever")
+
+        # The temp sibling may still exist on disk (replace() raised before
+        # swapping it in) — that's fine, it's never mistaken for the real DB
+        # since _resolve_db_path only ever checks os.path.exists(new_path).
+        # What matters is it's a DIFFERENT filename, not the final new_path.
+        temp_path = final_new_path + ".migrating"
+        if os.path.exists(temp_path):
+            assert temp_path != final_new_path
+
+        # Legacy DB is intact and untouched.
+        legacy_path = os.path.join(_legacy_data_dir(str(data_dir)), "crawler.db")
+        assert os.path.exists(legacy_path)
+        conn = sqlite3.connect(legacy_path)
+        try:
+            rows = conn.execute("SELECT name FROM t").fetchall()
+            assert rows == [("only_legacy.mkv",)]
+        finally:
+            conn.close()
+
+        monkeypatch.setattr(os, "replace", real_replace)
