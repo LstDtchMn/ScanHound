@@ -305,3 +305,13 @@ def test_select_all_respects_posted_range():
     r = c.post("/results/select-all",
                json={"source": "cache", "posted_after": "2026-06-05"}).json()
     assert r["group_keys"] == ["Mid-k"]
+
+def test_cached_posted_calendar_invalid_date_422():
+    """Regex-valid but calendar-invalid dates (2026-02-31) must 422, not 500."""
+    rows = [_row("A")]
+    c = _client_with_cache(rows)
+    r = c.get("/results/cached", params={"posted_after": "2026-02-31"})
+    assert r.status_code == 422
+    assert "calendar" in r.json()["detail"].lower() or "Invalid" in r.json()["detail"]
+    r2 = c.get("/results/cached", params={"posted_before": "2025-13-01"})
+    assert r2.status_code == 422

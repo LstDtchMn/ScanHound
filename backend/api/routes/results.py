@@ -242,6 +242,14 @@ def _validate_date_param(name: str, value: Optional[str]) -> Optional[str]:
             status_code=422,
             detail=f"Invalid {name} format (expected YYYY-MM-DD): {value!r}",
         )
+    try:
+        # Regex alone admits calendar-invalid dates like 2026-02-31.
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid {name} date (not a real calendar date): {value!r}",
+        )
     return value
 
 
