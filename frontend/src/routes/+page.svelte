@@ -359,22 +359,47 @@
     return map;
   });
 
+  /** Scroll the currently-focused row/tile into view (block: 'nearest' so it
+   *  only scrolls when the element isn't already fully visible). Runs after
+   *  a tick so it picks up a renderLimit-driven DOM update when one just
+   *  happened (see handleResultsKeydown's ArrowDown/Up growth below). */
+  function scrollFocusedIntoView() {
+    requestAnimationFrame(() => {
+      resultsContainer?.querySelector('[data-focused="true"]')?.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
   function handleResultsKeydown(e: KeyboardEvent) {
     const tag = (e.target as HTMLElement)?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
 
-    const items = flatVisibleItems();
+    let items = flatVisibleItems();
     if (items.length === 0) return;
 
     switch (e.key) {
       case 'ArrowDown': {
         e.preventDefault();
+        // Keyboard nav used to wall at the ~100-item render window (only the
+        // scroll IntersectionObserver grew it), stranding keyboard-only users
+        // who reached the last rendered row. Grow the window first so moving
+        // past the current edge is always possible while more filtered
+        // results exist (paged mode also tops up from the server, mirroring
+        // the scroll-sentinel observer).
+        if ($focusedIndex >= items.length - 1 && renderLimit < $filteredResults.length) {
+          renderLimit += 100;
+          items = flatVisibleItems();
+          if ($pagedMode && $hasMore && !$loadingMore && renderLimit >= $filteredResults.length - 100) {
+            loadResults(false);
+          }
+        }
         focusedIndex.update(i => Math.min(i + 1, items.length - 1));
+        scrollFocusedIntoView();
         break;
       }
       case 'ArrowUp': {
         e.preventDefault();
         focusedIndex.update(i => Math.max(i - 1, 0));
+        scrollFocusedIntoView();
         break;
       }
       case 'Enter': {

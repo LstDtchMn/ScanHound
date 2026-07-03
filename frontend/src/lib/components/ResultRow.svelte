@@ -162,6 +162,7 @@
     {selected ? 'bg-[var(--accent)]/5' : (zebra ? 'bg-[var(--bg-secondary)]/40' : '')}
     {focused ? 'outline outline-2 outline-[var(--accent)] -outline-offset-2' : ''}"
   style="{statusBarStyle([statusBorderColor(effectiveStatus)])}"
+  data-focused={focused}
   onclick={() => selectedDetail.set(item)}
   oncontextmenu={ctxHandler}
 >
