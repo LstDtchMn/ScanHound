@@ -640,6 +640,13 @@ class TestValidateConfigValues:
         assert len(result["warnings"]) > 0
         assert svc.config["min_size_mb"] == 200  # reset to default
 
+    def test_trash_retention_days_out_of_range_gets_corrected(self):
+        """trash_retention_days must be clamped to its registered (1, 365, 30) bound."""
+        svc = self._make_service({"trash_retention_days": 9999})
+        result = svc.validate_config_values()
+        assert len(result["warnings"]) > 0
+        assert svc.config["trash_retention_days"] == 30  # default
+
     def test_negative_numeric_gets_corrected(self):
         """A negative numeric value should be corrected to default."""
         svc = self._make_service({"cache_duration": -5})
@@ -850,6 +857,84 @@ class TestAppServiceShutdown:
         svc._shutdown_hooks = [MagicMock(side_effect=RuntimeError("hook failed"))]
         svc.shutdown()
         svc.db.close.assert_called_once()
+
+    def test_shutdown_stops_maintenance_thread(self):
+        """shutdown() should signal the maintenance loop to stop."""
+        svc = AppService.__new__(AppService)
+        svc.config = {}
+        svc._shutdown_hooks = []
+        svc._scheduler_stop = threading.Event()
+        svc._maintenance_stop = threading.Event()
+        svc.watchlist_manager = None
+        svc.db = None
+        svc.shutdown()
+        assert svc._maintenance_stop.is_set()
+
+
+# ======================================================================
+# AppService maintenance loop (trash sweep + WAL checkpoint) Tests
+# ======================================================================
+
+class TestMaintenancePass:
+    """Tests for AppService._run_maintenance_pass() / _start_maintenance_loop()."""
+
+    def _make_service(self, config_overrides=None):
+        svc = AppService.__new__(AppService)
+        svc.config = get_default_config()
+        if config_overrides:
+            svc.config.update(config_overrides)
+        svc.db = None
+        return svc
+
+    def test_maintenance_pass_calls_sweep_trash_with_configured_retention(self):
+        from backend.rename import fileops
+        svc = self._make_service({"trash_retention_days": 45})
+        expected_roots = fileops.all_trash_roots()
+        with patch("backend.rename.fileops.sweep_trash") as mock_sweep:
+            mock_sweep.return_value = {"files_deleted": 0, "bytes_freed": 0, "buckets_removed": 0}
+            svc._run_maintenance_pass()
+        mock_sweep.assert_called_once_with(45, roots=expected_roots)
+
+    def test_maintenance_pass_calls_db_checkpoint(self):
+        svc = self._make_service()
+        svc.db = MagicMock()
+        with patch("backend.rename.fileops.sweep_trash",
+                  return_value={"files_deleted": 0, "bytes_freed": 0, "buckets_removed": 0}):
+            svc._run_maintenance_pass()
+        svc.db.checkpoint.assert_called_once()
+
+    def test_maintenance_pass_swallows_checkpoint_exception(self):
+        """A checkpoint failure must be logged, never raised — the loop must
+        survive to run again next interval."""
+        svc = self._make_service()
+        svc.db = MagicMock()
+        svc.db.checkpoint.side_effect = RuntimeError("boom")
+        with patch("backend.rename.fileops.sweep_trash",
+                  return_value={"files_deleted": 0, "bytes_freed": 0, "buckets_removed": 0}):
+            svc._run_maintenance_pass()  # must not raise
+
+    def test_maintenance_pass_swallows_sweep_exception(self):
+        """A sweep_trash failure must be logged, never raised — and must not
+        prevent the checkpoint from still running."""
+        svc = self._make_service()
+        svc.db = MagicMock()
+        with patch("backend.rename.fileops.sweep_trash", side_effect=RuntimeError("boom")):
+            svc._run_maintenance_pass()  # must not raise
+        svc.db.checkpoint.assert_called_once()
+
+    def test_start_maintenance_loop_runs_pass_on_first_tick(self):
+        """The loop thread invokes _run_maintenance_pass once per interval tick."""
+        svc = self._make_service()
+        svc._maintenance_thread = None
+        svc._maintenance_stop = threading.Event()
+        calls = threading.Event()
+        svc._run_maintenance_pass = lambda: calls.set()
+        svc._start_maintenance_loop(interval_seconds=0.05)
+        try:
+            assert calls.wait(timeout=2.0)
+        finally:
+            svc._maintenance_stop.set()
+            svc._maintenance_thread.join(timeout=2.0)
 
 
 # ======================================================================

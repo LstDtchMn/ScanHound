@@ -124,6 +124,7 @@ class SettingsUpdate(BaseModel):
     ollama_model: Optional[str] = None
     ollama_vision_model: Optional[str] = None
     deletions_require_confirmation: Optional[bool] = None
+    trash_retention_days: Optional[int] = None
     dv_library_roots: Optional[str] = None
     dv_detection: Optional[bool] = None
     dv_file_tagging: Optional[bool] = None

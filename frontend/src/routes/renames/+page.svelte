@@ -25,6 +25,7 @@
   import RenameRow from '$lib/components/renames/RenameRow.svelte';
   import RenameCard from '$lib/components/renames/RenameCard.svelte';
   import RematchModal from '$lib/components/renames/RematchModal.svelte';
+  import TrashPanel from '$lib/components/renames/TrashPanel.svelte';
 
   // Status filter is local orchestrator state (surfaced via the stat cards):
   // all | needs_review | matched | applied | failed.
@@ -422,6 +423,8 @@
       </div>
     {/if}
   </div>
+
+  <TrashPanel />
 </div>
 
 {#if rematchJob}

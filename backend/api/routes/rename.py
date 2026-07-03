@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.routes.scanner import TMDB_IMAGE_BASE  # same base+size as Scan posters (w500)
 from backend.api.ws import ws_manager
-from backend.rename import dv_detect, dv_labeler, llm_identify
+from backend.rename import dv_detect, dv_labeler, fileops, llm_identify
 from backend.rename.dv_import import import_dv_host_db
 from backend.rename.service import conflict_annotations
 
@@ -63,6 +63,11 @@ class BulkIdsRequest(BaseModel):
 class BulkSetDestRequest(BaseModel):
     ids: list[int] = []
     destination_root: str = ""
+
+
+class TrashRestoreRequest(BaseModel):
+    bucket: str
+    name: str
 
 
 class ApplyConfidentRequest(BaseModel):
@@ -256,13 +261,25 @@ def rename_health(reg: ServiceRegistry = Depends(get_registry)):
     """Report which rename fallback capabilities are actually available — the
     external binaries (ffmpeg/ffprobe/tesseract) and the Ollama model — so a
     silently-broken dependency (e.g. a rebuild without tesseract, a model that
-    isn't pulled) is visible instead of just degrading quietly."""
+    isn't pulled) is visible instead of just degrading quietly.
+
+    Also surfaces two otherwise-invisible failure signals: how many files were
+    dropped by the most recent process_package() run due to a genuine DB
+    error (failed_db_last_package), and whether an un-acknowledged database
+    corruption quarantine flag is currently on disk (db_corruption_flag)."""
     cfg = reg.config or {}
     bins = {**llm_identify.dependency_status(), **dv_detect.dependency_status()}
     url = cfg.get("ollama_base_url", "")
     model = cfg.get("ollama_model", "")
     ollama = (llm_identify.test_connection(url) if url
               else {"ok": False, "error": "not configured"})
+
+    failed_db_last_package = getattr(reg._rename_service, "last_package_failed_db", 0)
+    db_corruption_flag = False
+    if reg.db is not None:
+        from backend.database import db_corruption_flag_present
+        db_corruption_flag = db_corruption_flag_present(reg.db.db_path)
+
     return {
         "binaries": bins,
         "capabilities": {
@@ -279,7 +296,37 @@ def rename_health(reg: ServiceRegistry = Depends(get_registry)):
             "error": ollama.get("error"),
         },
         "llm_enabled": bool(cfg.get("auto_rename_llm_enabled")),
+        "failed_db_last_package": failed_db_last_package,
+        "db_corruption_flag": db_corruption_flag,
     }
+
+
+@router.get("/trash")
+def list_trash(reg: ServiceRegistry = Depends(get_registry)):
+    """List every trashed file across both trash locations (see
+    fileops.all_trash_roots).
+
+    Each entry reports {bucket, name, size, trashed_at, original_path,
+    restorable}; original_path is null when the bucket has no manifest record
+    for that file (e.g. it predates the manifest feature)."""
+    return {"entries": fileops.list_trash_entries(fileops.all_trash_roots())}
+
+
+@router.post("/trash/restore")
+def restore_trash(body: TrashRestoreRequest, reg: ServiceRegistry = Depends(get_registry)):
+    """Restore a manifest-backed trash entry to its original_path.
+
+    Refuses (409) if the destination is occupied or the entry/manifest can't
+    be found; rejects (400) bucket/name values that look like path traversal."""
+    bucket, name = body.bucket, body.name
+    if not fileops._is_safe_component(bucket) or not fileops._is_safe_component(name):
+        raise HTTPException(status_code=400, detail="Invalid bucket or name")
+    result = fileops.restore_trash_entry(bucket, name, fileops.all_trash_roots())
+    if not result.get("ok"):
+        error = result.get("error", "Restore failed")
+        status = 409 if "already exists" in error.lower() else 404
+        raise HTTPException(status_code=status, detail=error)
+    return result
 
 
 @router.post("/process-folder")

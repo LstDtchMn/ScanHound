@@ -1752,3 +1752,53 @@ class DatabaseManager:
         rows = self._query('SELECT link, title, resolution FROM scraped_link_map', default=[])
         return {row[0]: {"title": row[1], "resolution": row[2]} for row in rows}
 
+
+# ── Startup-time corruption surfacing ─────────────────────────────────────
+
+def corruption_flag_path(db_path: str) -> str:
+    """Path to the persisted corruption marker for ``db_path`` (see
+    DatabaseManager._write_corruption_flag)."""
+    return f"{db_path}.corrupt_flag.json"
+
+
+def db_corruption_flag_present(db_path: str) -> bool:
+    """Whether an un-acknowledged corruption flag exists for ``db_path``.
+
+    True only for the not-yet-notified flag — once notify_db_corruption_once
+    renames it to .notified.json, this returns False again.
+    """
+    return os.path.exists(corruption_flag_path(db_path))
+
+
+def notify_db_corruption_once(db_path: str, bridge) -> bool:
+    """If a corruption flag exists for ``db_path``, notify once and rename it.
+
+    Called at the END of startup (after the notification bridge exists,
+    unlike DatabaseManager._notify_corruption's best-effort attempt during
+    init_db, which usually fires before the bridge is wired up and is a
+    bonus channel, not the primary signal). Renaming the flag to
+    ``.corrupt_flag.notified.json`` after a successful notify means this
+    fires exactly once per corruption event, even across many restarts,
+    while still leaving a permanent on-disk record of the incident.
+
+    Returns True if a (previously un-notified) flag was found and processed
+    (regardless of whether the notification itself succeeded — the rename
+    only happens if we got as far as attempting notification, so the
+    "fire once" behavior holds even when the bridge silently fails).
+    """
+    flag_path = corruption_flag_path(db_path)
+    if not os.path.exists(flag_path):
+        return False
+    try:
+        if bridge is not None:
+            bridge.notify_error(
+                "Database corruption was detected and quarantined — check logs")
+    except Exception:
+        logger.warning("DB corruption notification failed (non-fatal)", exc_info=True)
+    notified_path = f"{db_path}.corrupt_flag.notified.json"
+    try:
+        os.replace(flag_path, notified_path)
+    except OSError:
+        logger.exception("Failed to rename corruption flag to %s", notified_path)
+    return True
+

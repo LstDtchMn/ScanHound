@@ -1,9 +1,12 @@
 """Tests for the auto-rename API: /rename/jobs, status, apply/undo, llm/test."""
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.api.main import create_app
 from backend.database import DatabaseManager
+from backend.rename import fileops
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +59,31 @@ class TestRenameApi:
         assert set(body["capabilities"]) == {
             "runtime_check", "subtitles", "ocr_credits", "vision", "dv_detection"}
         assert "ok" in body["ollama"] and "llm_enabled" in body
+
+    def test_health_reports_failed_db_and_corruption_flag_fields(self, client):
+        body = client.get("/rename/health").json()
+        assert body["failed_db_last_package"] == 0
+        assert body["db_corruption_flag"] is False
+
+    def test_health_reports_nonzero_failed_db_last_package(self, client):
+        from backend.api.dependencies import registry
+        registry._rename_service.last_package_failed_db = 3
+        try:
+            body = client.get("/rename/health").json()
+            assert body["failed_db_last_package"] == 3
+        finally:
+            registry._rename_service.last_package_failed_db = 0
+
+    def test_health_reports_db_corruption_flag_present(self, client, monkeypatch):
+        from backend.api.dependencies import registry
+        flag_path = f"{registry.db.db_path}.corrupt_flag.json"
+        with open(flag_path, "w", encoding="utf-8") as f:
+            f.write("{}")
+        try:
+            body = client.get("/rename/health").json()
+            assert body["db_corruption_flag"] is True
+        finally:
+            os.remove(flag_path)
 
     def test_status_defaults(self, client):
         body = client.get("/rename/status").json()
@@ -468,3 +496,85 @@ class TestRenameApi:
         r = client.post("/rename/jobs/apply-confident", json={}).json()
         assert r["applied"] == 1 and r["skipped"] == 0
         assert (dest / "Boundary (2020).mkv").exists()
+
+
+class TestTrashEndpoints:
+    """/rename/trash (list) and /rename/trash/restore."""
+
+    def _trash_one(self, tmp_path, monkeypatch, filename="movie.mkv", content="x"):
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        monkeypatch.setattr(fileops, "_trash_bucket_name", lambda: "20260101-000000")
+        f = tmp_path / filename
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content)
+        trashed_path = fileops._trash(str(f))
+        return trash_root, trashed_path, f
+
+    def test_list_shows_trashed_file_with_original_path(self, client, tmp_path, monkeypatch):
+        _, _, original = self._trash_one(tmp_path, monkeypatch)
+        body = client.get("/rename/trash").json()
+        entries = [e for e in body["entries"] if e["name"] == "movie.mkv"]
+        assert len(entries) == 1
+        assert entries[0]["original_path"] == os.path.abspath(str(original))
+        assert entries[0]["restorable"] is True
+
+    def test_restore_puts_file_back_and_removes_manifest_record(self, client, tmp_path, monkeypatch):
+        trash_root, trashed_path, original = self._trash_one(tmp_path, monkeypatch)
+        assert not original.exists()
+
+        resp = client.post("/rename/trash/restore",
+                           json={"bucket": "20260101-000000", "name": "movie.mkv"})
+        assert resp.status_code == 200
+        assert original.exists()
+        assert not os.path.exists(trashed_path)
+
+        body = client.get("/rename/trash").json()
+        assert not any(e["name"] == "movie.mkv" for e in body["entries"])
+
+    def test_restore_occupied_destination_errors_and_keeps_file_in_trash(
+            self, client, tmp_path, monkeypatch):
+        trash_root, trashed_path, original = self._trash_one(tmp_path, monkeypatch)
+        original.write_text("occupied")  # something now occupies the original path
+
+        resp = client.post("/rename/trash/restore",
+                           json={"bucket": "20260101-000000", "name": "movie.mkv"})
+        assert resp.status_code == 409
+        assert os.path.isfile(trashed_path)
+        assert original.read_text() == "occupied"
+
+    def test_restore_traversal_attempt_rejected(self, client, tmp_path, monkeypatch):
+        self._trash_one(tmp_path, monkeypatch)
+        resp = client.post("/rename/trash/restore",
+                           json={"bucket": "20260101-000000", "name": "../escape.mkv"})
+        assert resp.status_code == 400
+
+    def test_restore_missing_entry_errors(self, client, tmp_path, monkeypatch):
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        resp = client.post("/rename/trash/restore",
+                           json={"bucket": "20260101-999999", "name": "ghost.mkv"})
+        assert resp.status_code == 404
+
+
+class TestStartupCorruptionNotify:
+    """_init_services() surfaces a pending DB corruption flag exactly once,
+    after the notification bridge exists."""
+
+    def test_corruption_check_runs_at_startup_with_bridge_and_db_path(self, monkeypatch):
+        calls = []
+
+        def _fake_notify(db_path, bridge):
+            calls.append((db_path, bridge))
+            return False
+
+        monkeypatch.setattr("backend.database.notify_db_corruption_once", _fake_notify)
+        app = create_app(config_override={"plex_url": "", "plex_token": ""})
+        with TestClient(app):
+            pass
+
+        assert len(calls) == 1
+        db_path, bridge = calls[0]
+        assert db_path  # a real path was passed, not None
+        assert bridge is not None  # the notification bridge, not a stub

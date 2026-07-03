@@ -395,6 +395,13 @@ class AppService:
         self._scan_trigger: Optional[Callable] = None
         self._config_lock = threading.RLock()
 
+        # Maintenance loop — trash retention sweep + periodic WAL checkpoint.
+        # Always started (unlike the scan scheduler, which is opt-in): both
+        # tasks are self-contained housekeeping with no user-visible side
+        # effects, so they don't need a settings gate.
+        self._maintenance_thread: Optional[threading.Thread] = None
+        self._maintenance_stop = threading.Event()
+
     # ── Lifecycle ─────────────────────────────────────────────────────
 
     def startup(self) -> List[str]:
@@ -553,6 +560,50 @@ class AppService:
         if self.config.get("scheduler_enabled", False):
             self._start_scheduler()
 
+        # Maintenance loop (trash sweep + WAL checkpoint) — always on.
+        self._run_maintenance_pass()  # once immediately at startup
+        self._start_maintenance_loop()
+
+    def _run_maintenance_pass(self):
+        """Run one maintenance pass: trash retention sweep + DB WAL checkpoint.
+
+        Fail-safe by design — either task's exception is logged and
+        swallowed so a single bad pass never crashes the loop (or startup).
+        Reads ``trash_retention_days`` from the live config each call so a
+        settings change takes effect on the next scheduled run.
+        """
+        try:
+            from backend.rename import fileops
+            retention_days = self.config.get("trash_retention_days", 30)
+            summary = fileops.sweep_trash(retention_days, roots=fileops.all_trash_roots())
+            if summary.get("files_deleted"):
+                logger.info(
+                    "Trash sweep: removed %d file(s), freed %d bytes (retention=%dd)",
+                    summary["files_deleted"], summary["bytes_freed"], retention_days)
+        except Exception:
+            logger.exception("Trash retention sweep failed (non-fatal)")
+
+        try:
+            if self.db is not None:
+                self.db.checkpoint()
+        except Exception:
+            logger.exception("Periodic WAL checkpoint failed (non-fatal)")
+
+    def _start_maintenance_loop(self, interval_seconds: float = 3600.0):
+        """Start the hourly trash-sweep + WAL-checkpoint background thread."""
+        if self._maintenance_thread and self._maintenance_thread.is_alive():
+            return
+        self._maintenance_stop.clear()
+
+        def _loop():
+            while not self._maintenance_stop.wait(interval_seconds):
+                self._run_maintenance_pass()
+
+        self._maintenance_thread = threading.Thread(
+            target=_loop, name="maintenance", daemon=True)
+        self._maintenance_thread.start()
+        logger.info("Maintenance loop started (every %.0fs)", interval_seconds)
+
     def set_scan_trigger(self, callback: Optional[Callable]):
         """Register a callback the scheduler invokes to start a scan."""
         self._scan_trigger = callback
@@ -620,6 +671,14 @@ class AppService:
         sched = getattr(self, '_scheduler_thread', None)
         if sched and sched.is_alive():
             sched.join(timeout=3)
+
+        # Stop the maintenance loop (trash sweep + WAL checkpoint) too.
+        maint_stop = getattr(self, '_maintenance_stop', None)
+        if maint_stop is not None:
+            maint_stop.set()
+        maint = getattr(self, '_maintenance_thread', None)
+        if maint and maint.is_alive():
+            maint.join(timeout=3)
 
         # Run controller shutdown hooks (stop workers before DB close)
         for fn in list(self._shutdown_hooks):
@@ -787,6 +846,7 @@ class AppService:
             'low_match_threshold': (0, 100, 80),
             'movie_match_threshold': (0, 100, 85),
             'year_tolerance': (0, 10, 1),
+            'trash_retention_days': (1, 365, 30),
         }
         for key, (min_val, max_val, default_val) in numeric_validations.items():
             if key in self.config:

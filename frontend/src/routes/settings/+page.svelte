@@ -1432,6 +1432,24 @@
               class="accent-[var(--accent)]" />
             <span class="text-sm">Compute Plex sort titles (e.g. “Matrix, The”)</span>
           </label>
+
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.deletions_require_confirmation ?? true}
+              onchange={(e) => settings.update((s) => ({ ...s, deletions_require_confirmation: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <Tooltip text="When on (default), files are never hard-deleted — cross-device moves send the source to a recoverable trash. Turn off to restore permanent deletes.">
+              <span class="text-sm cursor-help underline decoration-dotted">Require confirmation before permanent deletes ⓘ</span>
+            </Tooltip>
+          </label>
+
+          <label class="block">
+            <Tooltip text="How many days a file stays in the recoverable trash before it's permanently swept. Applies to every per-volume trash location, checked hourly. 30 is a safe default.">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Trash retention (days) ⓘ</span>
+            </Tooltip>
+            <input type="number" min="1" max="365" value={$settings.trash_retention_days ?? 30}
+              oninput={(e) => settings.update((s) => ({ ...s, trash_retention_days: parseInt(e.currentTarget.value) || 30 }))}
+              class={inputSmClass} />
+          </label>
         </div>
 
         <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">

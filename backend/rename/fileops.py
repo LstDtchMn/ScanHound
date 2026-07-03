@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime
 import errno
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -44,6 +45,37 @@ def _hash_file(path: str) -> str:
 
 def _trash_bucket_name() -> str:
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _record_trash_manifest(bucket: str, trashed_name: str, original_path: str) -> None:
+    """Append a restore record to ``<bucket>/manifest.json`` (read-modify-write).
+
+    Best-effort: any failure (disk full, permissions, corrupt existing JSON) is
+    logged as a warning and swallowed — losing the ability to restore a file
+    via the manifest is acceptable, but it must never turn a successful trash
+    disposal into a raised exception.
+    """
+    manifest_path = os.path.join(bucket, "manifest.json")
+    try:
+        records = []
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    records = json.load(f)
+                if not isinstance(records, list):
+                    records = []
+            except (OSError, ValueError):
+                records = []
+        records.append({
+            "trashed_name": trashed_name,
+            "original_path": os.path.abspath(original_path),
+            "trashed_at": datetime.datetime.now().isoformat(),
+        })
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2)
+    except OSError:
+        logger.warning("Failed to update trash manifest at %s (non-fatal)", manifest_path,
+                       exc_info=True)
 
 
 def _trash_root_for(path: str) -> str:
@@ -99,7 +131,257 @@ def _trash(path: str) -> str:
             raise
         shutil.move(path, dst)
     logger.info("trash  | %s -> %s", path, dst)
+    _record_trash_manifest(bucket, os.path.basename(dst), path)
     return dst
+
+
+def _is_safe_component(component: str) -> bool:
+    """Whether a single path component is safe to join under a trash root.
+
+    Rejects empty strings, path separators, and any ``..`` traversal segment
+    so a bucket/name supplied over the API can never escape the trash root.
+    """
+    if not component:
+        return False
+    if os.sep in component or (os.altsep and os.altsep in component):
+        return False
+    if component in ("..", "."):
+        return False
+    return True
+
+
+def _load_manifest(bucket_path: str) -> list:
+    """Read a bucket's manifest.json; returns [] if missing/unreadable."""
+    manifest_path = os.path.join(bucket_path, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        return []
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        return records if isinstance(records, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_manifest(bucket_path: str, records: list) -> None:
+    manifest_path = os.path.join(bucket_path, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+
+
+def list_trash_entries(roots) -> list:
+    """List every trashed file across the given trash roots.
+
+    Each entry: ``{bucket, name, size, trashed_at, original_path, restorable}``.
+    ``original_path`` is ``None`` (and ``restorable`` False) when the bucket's
+    manifest has no record for that file (e.g. it predates the manifest
+    feature, or the manifest itself failed to write). Missing/unreadable
+    roots are skipped silently — trash may simply not exist yet.
+    """
+    entries = []
+    seen_roots = set()
+    for root in roots:
+        root = os.path.abspath(root)
+        if root in seen_roots or not os.path.isdir(root):
+            continue
+        seen_roots.add(root)
+        try:
+            bucket_names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for bucket in bucket_names:
+            bucket_path = os.path.join(root, bucket)
+            if not os.path.isdir(bucket_path):
+                continue
+            manifest = _load_manifest(bucket_path)
+            manifest_by_name = {r.get("trashed_name"): r for r in manifest if r.get("trashed_name")}
+            try:
+                names = sorted(os.listdir(bucket_path))
+            except OSError:
+                continue
+            for name in names:
+                if name == "manifest.json":
+                    continue
+                fpath = os.path.join(bucket_path, name)
+                if not os.path.isfile(fpath):
+                    continue
+                rec = manifest_by_name.get(name)
+                try:
+                    size = os.path.getsize(fpath)
+                except OSError:
+                    size = 0
+                entries.append({
+                    "bucket": bucket,
+                    "name": name,
+                    "size": size,
+                    "trashed_at": rec.get("trashed_at") if rec else None,
+                    "original_path": rec.get("original_path") if rec else None,
+                    "restorable": bool(rec),
+                })
+    return entries
+
+
+def restore_trash_entry(bucket: str, name: str, roots) -> dict:
+    """Restore a manifest-backed trash entry to its recorded original_path.
+
+    Safety:
+      - ``bucket``/``name`` are validated as single path components (no
+        separators, no ``..``) so nothing outside the trash roots is ever
+        reachable, regardless of what a caller supplies.
+      - Refuses (never overwrites) if the destination is already occupied.
+      - Refuses if the entry or its manifest record can't be found.
+
+    Returns ``{"ok": True, "restored_path": ...}`` or
+    ``{"ok": False, "error": ...}``. Never raises for expected failure modes.
+    """
+    if not _is_safe_component(bucket) or not _is_safe_component(name):
+        return {"ok": False, "error": "Invalid bucket or name (path traversal rejected)"}
+
+    for root in roots:
+        root = os.path.abspath(root)
+        bucket_path = os.path.join(root, bucket)
+        if not os.path.isdir(bucket_path):
+            continue
+        fpath = os.path.join(bucket_path, name)
+        if not os.path.isfile(fpath):
+            continue
+        manifest = _load_manifest(bucket_path)
+        rec = next((r for r in manifest if r.get("trashed_name") == name), None)
+        if not rec or not rec.get("original_path"):
+            return {"ok": False, "error": "No manifest record for this entry — cannot restore safely"}
+        original_path = rec["original_path"]
+        if os.path.lexists(original_path):
+            return {"ok": False, "error": f"Destination already exists: {original_path}"}
+        try:
+            os.makedirs(os.path.dirname(original_path) or ".", exist_ok=True)
+            os.rename(fpath, original_path)
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                return {"ok": False, "error": f"Restore failed: {e}"}
+            try:
+                shutil.move(fpath, original_path)
+            except OSError as e2:
+                return {"ok": False, "error": f"Restore failed: {e2}"}
+        remaining = [r for r in manifest if r is not rec]
+        try:
+            _save_manifest(bucket_path, remaining)
+        except OSError:
+            logger.warning("Failed to update manifest after restore at %s (non-fatal)",
+                           bucket_path, exc_info=True)
+        logger.info("restore | %s -> %s", fpath, original_path)
+        return {"ok": True, "restored_path": original_path}
+
+    return {"ok": False, "error": "Trash entry not found"}
+
+
+def all_trash_roots() -> list:
+    """All trash roots worth scanning/sweeping: the app-data fallback root
+    (``_TRASH_ROOT``) plus every per-volume ``<volume>/.scanhound-trash`` root
+    implied by ``_trash_root_for`` for each drive letter currently known to
+    Windows (or ``/`` on POSIX).
+
+    Single source of truth shared by the ``/rename/trash`` list/restore
+    endpoints and the maintenance-pass retention sweep — a disposal on any
+    volume must be reachable (and eventually swept) by both. Scanning every
+    drive's candidate root is cheap (a single ``os.path.isdir`` each); a
+    per-volume ``.scanhound-trash`` directory only exists if a disposal
+    actually created it, so this can't return anything a real trash disposal
+    didn't put there.
+    """
+    roots = {os.path.abspath(_TRASH_ROOT)}
+    if os.name == "nt":
+        import string
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.isdir(drive):
+                roots.add(_trash_root_for(drive))
+    else:
+        roots.add(_trash_root_for("/"))
+    return sorted(roots)
+
+
+def _bucket_age_days(bucket_path: str) -> float:
+    """How many days old a trash bucket is.
+
+    Prefers parsing the ``YYYYMMDD-HHMMSS`` bucket name (the authoritative
+    "trashed at" moment, immune to filesystem mtime drift/preservation on
+    cross-device moves); falls back to the bucket directory's own mtime for
+    any bucket name that doesn't match the expected format.
+    """
+    name = os.path.basename(bucket_path)
+    try:
+        trashed_at = datetime.datetime.strptime(name, "%Y%m%d-%H%M%S")
+        age = datetime.datetime.now() - trashed_at
+        return age.total_seconds() / 86400.0
+    except ValueError:
+        try:
+            mtime = os.path.getmtime(bucket_path)
+        except OSError:
+            return 0.0
+        return (datetime.datetime.now().timestamp() - mtime) / 86400.0
+
+
+def sweep_trash(retention_days: int, roots=None) -> dict:
+    """Delete trash buckets older than ``retention_days``; remove emptied buckets.
+
+    Only ever touches files strictly under the given trash roots (defaults to
+    :func:`all_trash_roots` — every per-volume ``.scanhound-trash`` root plus
+    the app-data fallback — so a real disposal on any drive is eventually
+    swept even if the caller doesn't pass ``roots`` explicitly). Never follows symlinks —
+    a symlink found inside an old bucket is unlinked (removing the link
+    itself), never resolved and deleted at its target. Logs a per-run summary
+    and is fail-safe: per-file/per-bucket errors are logged and skipped
+    rather than aborting the whole sweep.
+
+    Returns ``{"files_deleted": int, "bytes_freed": int, "buckets_removed": int}``.
+    """
+    if roots is None:
+        roots = all_trash_roots()
+    files_deleted = 0
+    bytes_freed = 0
+    buckets_removed = 0
+
+    for root in roots:
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            continue
+        try:
+            bucket_names = os.listdir(root)
+        except OSError:
+            continue
+        for bucket_name in bucket_names:
+            bucket_path = os.path.join(root, bucket_name)
+            if os.path.islink(bucket_path) or not os.path.isdir(bucket_path):
+                continue  # never descend into a symlinked "bucket"
+            if _bucket_age_days(bucket_path) < retention_days:
+                continue
+            try:
+                for entry in os.listdir(bucket_path):
+                    epath = os.path.join(bucket_path, entry)
+                    try:
+                        if os.path.islink(epath):
+                            os.unlink(epath)  # remove the link, never its target
+                        elif os.path.isfile(epath):
+                            size = os.path.getsize(epath)
+                            os.remove(epath)
+                            if entry != "manifest.json":
+                                files_deleted += 1
+                                bytes_freed += size
+                        elif os.path.isdir(epath):
+                            shutil.rmtree(epath, ignore_errors=True)
+                    except OSError:
+                        logger.warning("sweep_trash: failed to remove %s (skipped)",
+                                       epath, exc_info=True)
+                os.rmdir(bucket_path)
+                buckets_removed += 1
+            except OSError:
+                logger.warning("sweep_trash: failed to remove bucket %s (skipped)",
+                               bucket_path, exc_info=True)
+
+    logger.info("sweep_trash: removed %d file(s), %d bucket(s), freed %d bytes (retention=%dd)",
+               files_deleted, buckets_removed, bytes_freed, retention_days)
+    return {"files_deleted": files_deleted, "bytes_freed": bytes_freed,
+            "buckets_removed": buckets_removed}
 
 
 def place_file(src: str, dst: str, method: str = "hardlink", *,
