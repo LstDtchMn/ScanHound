@@ -329,6 +329,38 @@ class TestResolutionProbe:
         assert job["destination_path"].startswith(lib_4k)  # already 2160p, routes fine
 
 
+# ── TMDB year mismatch vs. parsed filename year ─────────────────────────
+
+def _carolina_search_2026(title, year, media_type):
+    """TMDB's chosen match has year 2026, one off the filename's 2025 — a
+    gap of 1 isn't penalized by confidence scoring, so this stays 'matched'."""
+    return [{"id": 999, "title": "Carolina Caroline", "release_date": "2026-01-15"}]
+
+
+def _carolina_search_2025(title, year, media_type):
+    return [{"id": 999, "title": "Carolina Caroline", "release_date": "2025-01-15"}]
+
+
+class TestYearMismatchWarning:
+    def test_match_year_differs_from_filename_year_warns(self, db, tmp_path):
+        save_to, _ = _extracted(tmp_path, "Carolina.Caroline.2025.1080p.mkv")
+        svc = _service(db, _carolina_search_2026, movie_lib=str(tmp_path / "lib"))
+        job = db.get_rename_job(svc.process_package("pkg", save_to)[0])
+        assert job["year"] == 2026
+        assert job["status"] == "matched"  # purely additive — must not block
+        assert job["warning_message"], "expected a warning to be attached"
+        assert "2025" in job["warning_message"]
+        assert "2026" in job["warning_message"]
+
+    def test_match_year_equal_to_filename_year_no_warning(self, db, tmp_path):
+        save_to, _ = _extracted(tmp_path, "Carolina.Caroline.2025.1080p.mkv")
+        svc = _service(db, _carolina_search_2025, movie_lib=str(tmp_path / "lib"))
+        job = db.get_rename_job(svc.process_package("pkg", save_to)[0])
+        assert job["year"] == 2025
+        assert job["status"] == "matched"
+        assert not job["warning_message"]
+
+
 # ── duplicate-destination conflict detection ──────────────────────────
 
 class TestDestinationConflict:

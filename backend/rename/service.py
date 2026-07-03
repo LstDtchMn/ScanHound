@@ -1315,16 +1315,36 @@ class RenameService:
             combined_episode=match.get("combined_episode"),
             split_file=match.get("split_file"))
 
+        # TMDB year mismatch: the chosen match's year can legitimately differ
+        # from the filename's parsed year by 1 without being penalised by
+        # confidence scoring (see confidence.match_confidence) — e.g. a
+        # limited theatrical release dated one way in the filename and
+        # another in TMDB. That's silent otherwise: the job stores the
+        # match's year, the destination folder uses it, and confidence stays
+        # high, so the user never sees the substitution. Purely additive/
+        # informational — never blocks apply or changes matching/confidence.
+        filename_year = parse_filename(filename).get("year")
+        match_year = match.get("year")
+        year_warn = ""
+        if filename_year and match_year and int(filename_year) != int(match_year):
+            year_warn = f"Year adjusted {filename_year} -> {match_year} from TMDB match"
+
         runtime_warn = match.get("runtime_warning", "")
         if conf < threshold:
             msg = f"Low confidence ({conf:.0f} < {threshold})"
             if runtime_warn:
                 msg += f"; {runtime_warn}"
+            if year_warn:
+                msg += f"; {year_warn}"
             job.update(status="needs_review", warning_message=msg)
         else:
             job["status"] = "matched"
             if runtime_warn:
                 job["warning_message"] = runtime_warn
+            if year_warn:
+                job["warning_message"] = (
+                    f"{job['warning_message']}; {year_warn}"
+                    if job.get("warning_message") else year_warn)
 
         if match.get("suggested_correction"):
             corr = match["suggested_correction"]
