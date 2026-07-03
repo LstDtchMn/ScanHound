@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, RenameHealthResponse } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -59,7 +59,17 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     if (resp.status === 401 && !path.startsWith('/auth/')) {
       unauthorizedHandler?.();
     }
-    throw new Error(`API error: ${resp.status} ${resp.statusText}`);
+    // FastAPI's HTTPException(detail=...) responses are JSON — surface that
+    // message (e.g. "Destination already exists: ...") when present, so a
+    // caller-shown error is actionable instead of a bare status code.
+    let detail: string | undefined;
+    try {
+      const body = await resp.clone().json();
+      detail = body?.detail;
+    } catch {
+      // non-JSON error body — fall through to the generic message
+    }
+    throw new Error(detail || `API error: ${resp.status} ${resp.statusText}`);
   }
   const ct = resp.headers.get('content-type') || '';
   if (!ct.includes('application/json')) {
@@ -388,13 +398,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ folder, dry_run: dryRun })
     }),
-  renameHealth: () =>
-    request<{
-      binaries: Record<string, boolean>;
-      capabilities: Record<string, boolean>;
-      ollama: { ok: boolean; model: string; model_available: boolean; error?: string };
-      llm_enabled: boolean;
-    }>('/rename/health'),
+  renameHealth: () => request<RenameHealthResponse>('/rename/health'),
   reidentifyRename: (id: number) =>
     request<{ ok: boolean; job_id?: number; error?: string }>(`/rename/jobs/${id}/reidentify`, { method: 'POST' }),
   reidentifyAllRenames: () =>
@@ -417,5 +421,13 @@ export const api = {
     request<{ status: string }>('/rename/dv-sync-labels', {
       method: 'POST',
       body: JSON.stringify({ dry_run: dryRun })
+    }),
+
+  // Trash (recoverable deletes)
+  trashList: () => request<TrashListResponse>('/rename/trash'),
+  trashRestore: (bucket: string, name: string) =>
+    request<TrashRestoreResponse>('/rename/trash/restore', {
+      method: 'POST',
+      body: JSON.stringify({ bucket, name })
     }),
 };

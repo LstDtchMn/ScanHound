@@ -362,6 +362,8 @@ export interface Settings {
   auto_rename_template_tv?: string;
   auto_rename_path_mappings?: string;
   auto_rename_plex_sort_titles?: boolean;
+  deletions_require_confirmation?: boolean;
+  trash_retention_days?: number;
   auto_rename_llm_enabled?: boolean;
   ollama_base_url?: string;
   ollama_model?: string;
@@ -559,4 +561,32 @@ export interface RematchConfirmResponse {
   new_filename: string;
   destination_path: string | null;
   warning: string | null;
+}
+
+export interface TrashEntry {
+  bucket: string;
+  name: string;
+  size: number;
+  trashed_at: string | null;
+  original_path: string | null;
+  restorable: boolean;
+}
+
+export interface TrashListResponse {
+  entries: TrashEntry[];
+}
+
+export interface TrashRestoreResponse {
+  ok: boolean;
+  restored_path?: string;
+  error?: string;
+}
+
+export interface RenameHealthResponse {
+  binaries: Record<string, boolean>;
+  capabilities: Record<string, boolean>;
+  ollama: { ok: boolean; model: string; model_available: boolean; error?: string };
+  llm_enabled: boolean;
+  failed_db_last_package: number;
+  db_corruption_flag: boolean;
 }
