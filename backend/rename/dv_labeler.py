@@ -47,6 +47,23 @@ def build_index(rows, mappings=None):
     return idx
 
 
+def build_index_and_paths(rows, mappings=None):
+    """Single pass over rows: ({norm -> dv_layer}, {norm -> original_path}).
+
+    Same normalization semantics as build_index, but also captures the
+    original (un-normalized) row path so callers can recover it in O(1)
+    instead of re-scanning all rows per lookup.
+    """
+    idx = {}
+    norm_to_path = {}
+    for r in rows:
+        p = normalize_path(r.get("path"), mappings)
+        if p:
+            idx[p] = r.get("dv_layer")
+            norm_to_path[p] = r.get("path")
+    return idx, norm_to_path
+
+
 def _movie_norm_paths(movie, mappings):
     paths = []
     for media in (movie.media or []):
@@ -115,7 +132,7 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     """Reconcile every movie against dv_scan (source='scan'). Returns a summary."""
     vocab = _vocab_from_config(config)
     rows = db.get_dv_scans(source="scan", limit=1000000)
-    index = build_index(rows, mappings)
+    index, norm_to_path = build_index_and_paths(rows, mappings)
 
     movie_libs = (config.get("movie_libs")
                   or config.get("known_movie_libraries") or [])
@@ -149,7 +166,7 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
                     for p in _movie_norm_paths(mv, mappings):
                         if p in index:
                             db.upsert_dv_scan(
-                                _row_path_for(rows, p, mappings) or p,
+                                norm_to_path.get(p, p),
                                 index[p], rating_key=str(mv.ratingKey),
                                 source="scan")
                             break
@@ -161,11 +178,3 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
 
     return {"total": total, "added": added_n, "removed": removed_n,
             "matched": matched_n, "dry_run": dry_run}
-
-
-def _row_path_for(rows, norm, mappings):
-    """Recover the original dv_scan path whose normalize == *norm* (back-write key)."""
-    for r in rows:
-        if normalize_path(r.get("path"), mappings) == norm:
-            return r.get("path")
-    return None

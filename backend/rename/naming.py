@@ -20,6 +20,22 @@ VIDEO_EXTENSIONS = frozenset({
 
 _TOKEN_RE = re.compile(r"\{\{(\w+)(?:\|([^}]*))?\}\}")
 _SECTION_RE = re.compile(r"\[([^\[\]]*)\]")
+# Implicit optional segment: a *literal* "( ... )" wrapper in the template
+# text (not the explicit "[...]" section syntax) whose entire contents are
+# token placeholders (plus whitespace). Common author idiom, e.g.
+# "{{title}} ({{year}})". Only these template-authored parens are eligible
+# for empty-collapse — parens that are part of a token's *substituted value*
+# (e.g. a title literally containing "()") never match this, because by the
+# time this runs the "{{...}}" placeholders are still intact.
+_PAREN_SECTION_RE = re.compile(r"\(([^()]*)\)")
+# A one-shot sentinel that stands in for "a token substitution that resolved
+# to empty". It's inserted instead of "" so that empty-collapse cleanup can
+# target exactly the separators/whitespace that were written by the template
+# author around that placeholder, without ever touching literal characters
+# that came from a non-empty substituted value (e.g. a title ending in "-").
+# Chosen to be something that can never appear in real input: it's stripped
+# from any incoming token value up front.
+_EMPTY_MARK = "\0"
 
 
 def render_template(template: str, tokens: dict[str, Any]) -> str:
@@ -27,32 +43,77 @@ def render_template(template: str, tokens: dict[str, Any]) -> str:
 
     Token values are stripped of path separators to prevent directory
     traversal via a malicious/badly-parsed title. (Ported from Nomen.)
+
+    Optional segments can be marked either with explicit ``[...]`` bracket
+    syntax, or with a bare ``(...)`` wrapper around token placeholders (e.g.
+    ``{{title}} ({{year}})``); both collapse to nothing when every token
+    inside resolves empty. Bare (non-bracket, non-paren) empty-token
+    placeholders also clean up their own adjacent template-authored
+    separator (e.g. ``{{title}} - {{episode_title}}`` with an empty
+    ``episode_title``). This collapse only ever targets whitespace/separator
+    characters that sit in the *template source* next to a placeholder that
+    resolved empty — literal parentheses, brackets, or trailing hyphens that
+    are part of a token's substituted value (e.g. a title like
+    ``"Rush () 2013"`` or ``"Under-"``) are never touched.
     """
     str_tokens = {
-        k: (str(v).replace("/", "-").replace("\\", "-") if v is not None else "")
+        k: (str(v).replace("/", "-").replace("\\", "-").replace(_EMPTY_MARK, "")
+            if v is not None else "")
         for k, v in tokens.items()
     }
 
-    def _substitute(text: str) -> str:
+    def _substitute(text: str, *, mark_empty: bool) -> str:
         def _replace(m: "re.Match") -> str:
             val = str_tokens.get(m.group(1), "")
-            return val if val else (m.group(2) or "")
+            if val:
+                return val
+            default = m.group(2) or ""
+            if default:
+                return default
+            return _EMPTY_MARK if mark_empty else ""
         return _TOKEN_RE.sub(_replace, text)
 
-    def _process_section(m: "re.Match") -> str:
-        inner = m.group(1)
+    def _all_refs_empty(inner: str) -> Optional[bool]:
         refs = _TOKEN_RE.findall(inner)
-        if not refs:  # literal brackets with no tokens — keep verbatim
-            return inner
-        if all(not (str_tokens.get(name, "") or default) for name, default in refs):
-            return ""
-        return _substitute(inner)
+        if not refs:
+            return None  # no tokens in here — not an optional segment
+        return all(not (str_tokens.get(name, "") or default) for name, default in refs)
 
-    result = _SECTION_RE.sub(_process_section, template)
-    result = _substitute(result)
-    result = result.replace("()", "").replace("[]", "")
+    def _process_bracket_section(m: "re.Match") -> str:
+        inner = m.group(1)
+        empty = _all_refs_empty(inner)
+        if empty is None:  # literal brackets with no tokens — keep verbatim
+            return inner
+        return "" if empty else _substitute(inner, mark_empty=False)
+
+    def _process_paren_section(m: "re.Match") -> str:
+        inner = m.group(1)
+        empty = _all_refs_empty(inner)
+        if empty is None:  # literal parens with no tokens — keep verbatim
+            return m.group(0)
+        return "" if empty else f"({_substitute(inner, mark_empty=False)})"
+
+    # Explicit "[...]" sections first (may themselves contain "(...)" text).
+    result = _SECTION_RE.sub(_process_bracket_section, template)
+    # Then bare "(...)" wrappers that are purely token placeholders — this
+    # only inspects text that still has un-substituted "{{token}}" markup,
+    # so it can never match parens introduced by a substituted value.
+    result = _PAREN_SECTION_RE.sub(_process_paren_section, result)
+    # Remaining bare placeholders: substitute, but mark empty resolutions
+    # with a sentinel so the following cleanup can safely trim only the
+    # template-authored separators around them.
+    result = _substitute(result, mark_empty=True)
+    # Strip a separator ("-", "_", or extra whitespace) that sits directly
+    # against an empty-marker on either side — this is exactly the leftover
+    # connector a template author wrote around a placeholder that turned out
+    # empty (e.g. " - {{episode_title}}" -> " - \0" -> "").
+    result = re.sub(r"[ \t]*[-_][ \t]*" + _EMPTY_MARK, "", result)
+    result = re.sub(_EMPTY_MARK + r"[ \t]*[-_][ \t]*", "", result)
+    # Any leftover markers (no adjacent separator, e.g. two placeholders
+    # butted together) simply vanish.
+    result = result.replace(_EMPTY_MARK, "")
     result = re.sub(r"\s{2,}", " ", result)
-    return result.strip(" -_")
+    return result.strip()
 
 
 def video_extension(filename: str) -> str:

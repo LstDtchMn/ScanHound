@@ -367,7 +367,7 @@ class TestSplitFileProposal:
     def test_fires_when_file_is_short_and_sibling_present(self):
         from backend.rename.service import _detect_split_file
 
-        with patch("backend.rename.service._find_split_sibling",
+        with patch("backend.rename.episodes._find_split_sibling",
                    return_value="/show/S01E05.Part2.mkv"):
             result = _detect_split_file("/show/S01E05.Part1.mkv", 20.0, 44.0)
 
@@ -386,7 +386,7 @@ class TestSplitFileProposal:
     def test_does_not_fire_without_sibling(self):
         from backend.rename.service import _detect_split_file
 
-        with patch("backend.rename.service._find_split_sibling", return_value=None):
+        with patch("backend.rename.episodes._find_split_sibling", return_value=None):
             result = _detect_split_file("/show/S01E05.Part1.mkv", 20.0, 44.0)
         assert result is None
 
@@ -394,7 +394,7 @@ class TestSplitFileProposal:
         """file_min = tmdb_min * 0.6 exactly — condition is >=, so no split."""
         from backend.rename.service import _detect_split_file
 
-        with patch("backend.rename.service._find_split_sibling",
+        with patch("backend.rename.episodes._find_split_sibling",
                    return_value="/show/S01E05.Part2.mkv"):
             result = _detect_split_file("/show/S01E05.Part1.mkv", 26.4, 44.0)
         # 26.4 / 44.0 = 0.6 exactly → condition `file_min >= tmdb_min * 0.6` is True

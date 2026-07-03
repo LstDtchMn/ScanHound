@@ -610,6 +610,61 @@ class TestLoadLibraries:
         saved_modes = [c.args[1] for c in db.save_plex_cache.call_args_list]
         assert saved_modes == ["Movies"]
 
+    def test_partial_movie_library_load_does_not_full_replace_cache(self):
+        # A connection drop mid-library (e.g. the 2nd of 3 movies raises
+        # while iterating, as would happen if Plex drops the connection
+        # partway through) must NOT be treated as a complete load. The
+        # per-library except already swallows the error and moves on, but
+        # the resulting partial _movies list must not be persisted with
+        # full_replace=True — that would wipe a good existing cache with an
+        # incomplete one. Existing cache should be left untouched instead.
+        pm = MagicMock()
+        pm.is_connected = True
+        db = MagicMock()
+
+        good_movie = _make_mock_movie(title="Movie A", rating_key=1)
+
+        class ExplodingMovie:
+            """Raises when Plex connection drops mid-iteration."""
+            @property
+            def ratingKey(self):
+                raise ConnectionError("Plex connection lost")
+
+        mock_lib = MagicMock()
+        mock_lib.all.return_value = [good_movie, ExplodingMovie()]
+        pm.get_library_section.return_value = mock_lib
+
+        config = {"movie_libs": ["Movies"], "tv_libs": []}
+        svc = _make_service(config=config, db=db, plex_manager=pm)
+        svc.load_libraries()
+
+        # The partial set (1 of 2 movies) must not be full-replace saved.
+        movie_saves = [c for c in db.save_plex_cache.call_args_list if c.args[1] == "Movies"]
+        assert not any(c.kwargs.get("full_replace") or (len(c.args) > 3 and c.args[3])
+                       for c in movie_saves), (
+            "Partial library load must not full_replace the cache"
+        )
+
+    def test_complete_movie_library_load_still_full_replaces_cache(self):
+        # Sanity/regression companion: an uninterrupted, complete load must
+        # still behave exactly as before — full_replace=True so stale rows
+        # get pruned.
+        pm = MagicMock()
+        pm.is_connected = True
+        db = MagicMock()
+
+        mock_lib = MagicMock()
+        mock_lib.all.return_value = [_make_mock_movie()]
+        pm.get_library_section.return_value = mock_lib
+
+        config = {"movie_libs": ["Movies"], "tv_libs": []}
+        svc = _make_service(config=config, db=db, plex_manager=pm)
+        svc.load_libraries()
+
+        movie_saves = [c for c in db.save_plex_cache.call_args_list if c.args[1] == "Movies"]
+        assert len(movie_saves) == 1
+        assert movie_saves[0].kwargs.get("full_replace") is True
+
     def test_non_show_library_type_logs_error(self):
         pm = MagicMock()
         pm.is_connected = True
