@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -79,6 +79,22 @@ def _parse_posted_date(s: str) -> float:
     return 0.0
 
 
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _parse_bound_date(s: Optional[str]) -> Optional[datetime]:
+    """Parse a YYYY-MM-DD query param into a datetime, or None if unset.
+
+    Raises ValueError if the string is set but doesn't match the expected
+    format, so callers can turn that into a 422.
+    """
+    if not s:
+        return None
+    if not _DATE_RE.match(s):
+        raise ValueError(f"Invalid date format (expected YYYY-MM-DD): {s!r}")
+    return datetime.strptime(s, "%Y-%m-%d")
+
+
 _SORT_KEYS = {
     "title": lambda i: str(i.get("title", "")).casefold(),
     "year": lambda i: float(i.get("year") or 0),
@@ -90,6 +106,7 @@ _SORT_KEYS = {
 
 def _filter_and_sort(items, *, filter=None, search=None, category=None,
                      genre=None, language=None, quick=None,
+                     posted_after=None, posted_before=None,
                      sort="title", order="asc"):
     """Filter and sort items server-side.
 
@@ -101,6 +118,12 @@ def _filter_and_sort(items, *, filter=None, search=None, category=None,
         genre: list of genres; item must have at least one
         language: list of languages; item must match
         quick: list of quick filters ('4k', 'hdrdv', 'inplex')
+        posted_after: "YYYY-MM-DD" string; inclusive lower bound on posted_date
+            (start of that day). Items with a missing/unparseable posted_date
+            are excluded whenever either bound is set.
+        posted_before: "YYYY-MM-DD" string; inclusive upper bound on
+            posted_date (through the END of that day, i.e. < next-day
+            midnight). Same missing-date exclusion as posted_after.
         sort: sort key (default "title")
         order: "asc" or "desc" (default "asc")
 
@@ -141,6 +164,27 @@ def _filter_and_sort(items, *, filter=None, search=None, category=None,
         if "inplex" in q:
             result = [i for i in result if _has_plex_copy(i)]
 
+    if posted_after or posted_before:
+        after_ts = _parse_bound_date(posted_after).timestamp() if posted_after else None
+        # Inclusive of the whole end day: bound is midnight at the START of
+        # the next day, and we require posted_ts < that.
+        before_ts = None
+        if posted_before:
+            before_dt = _parse_bound_date(posted_before)
+            before_ts = (before_dt + timedelta(days=1)).timestamp()
+
+        def _in_range(i):
+            ts = _parse_posted_date(i.get("posted_date", "") or "")
+            if ts == 0.0:
+                return False  # missing/unparseable posted_date can't be placed in a range
+            if after_ts is not None and ts < after_ts:
+                return False
+            if before_ts is not None and ts >= before_ts:
+                return False
+            return True
+
+        result = [i for i in result if _in_range(i)]
+
     keyfn = _SORT_KEYS.get(sort)
     if keyfn:
         result = sorted(result, key=keyfn, reverse=(order == "desc"))
@@ -165,6 +209,8 @@ class SelectAllRequest(BaseModel):
     genre: Optional[str] = None
     language: Optional[str] = None
     quick: Optional[str] = None
+    posted_after: Optional[str] = None
+    posted_before: Optional[str] = None
 
 
 class DismissRequest(BaseModel):
@@ -181,6 +227,30 @@ def _csv(param: Optional[str]) -> Optional[List[str]]:
         return None
     vals = [p.strip() for p in param.split(",") if p.strip()]
     return vals or None
+
+
+def _validate_date_param(name: str, value: Optional[str]) -> Optional[str]:
+    """Validate a posted_after/posted_before query param is YYYY-MM-DD.
+
+    Returns the value unchanged if valid/unset; raises HTTPException(422)
+    with an explicit message if set but malformed.
+    """
+    if not value:
+        return None
+    if not _DATE_RE.match(value):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid {name} format (expected YYYY-MM-DD): {value!r}",
+        )
+    try:
+        # Regex alone admits calendar-invalid dates like 2026-02-31.
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid {name} date (not a real calendar date): {value!r}",
+        )
+    return value
 
 
 def _compute_status_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -208,6 +278,8 @@ def _shape_results(
     genre: Optional[List[str]] = None,
     language: Optional[List[str]] = None,
     quick: Optional[List[str]] = None,
+    posted_after: Optional[str] = None,
+    posted_before: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Filter / search / sort / paginate item dicts into a results response.
@@ -228,7 +300,8 @@ def _shape_results(
 
     items = _filter_and_sort(
         items, filter=filter, search=search, category=category, genre=genre,
-        language=language, quick=quick, sort=sort, order=order,
+        language=language, quick=quick, posted_after=posted_after,
+        posted_before=posted_before, sort=sort, order=order,
     )
 
     # Per-title counts over the filtered set (post-filter, pre-pagination).
@@ -297,15 +370,19 @@ def get_results(
     genre: Optional[str] = Query(None),
     language: Optional[str] = Query(None),
     quick: Optional[str] = Query(None),
+    posted_after: Optional[str] = Query(None, description="Inclusive lower bound, YYYY-MM-DD"),
+    posted_before: Optional[str] = Query(None, description="Inclusive upper bound, YYYY-MM-DD"),
     include_dismissed: bool = Query(False, description="Include swiped-away items"),
     reg: ServiceRegistry = Depends(get_registry),
 ):
+    posted_after = _validate_date_param("posted_after", posted_after)
+    posted_before = _validate_date_param("posted_before", posted_before)
     items, _ = _load_items("live", reg)
     return _shape_results(
         items, filter=filter, search=search, sort=sort, order=order,
         page=page, per_page=per_page, include_dismissed=include_dismissed, reg=reg,
         category=_csv(category), genre=_csv(genre), language=_csv(language),
-        quick=_csv(quick),
+        quick=_csv(quick), posted_after=posted_after, posted_before=posted_before,
     )
 
 
@@ -321,6 +398,8 @@ def get_cached_results(
     genre: Optional[str] = Query(None),
     language: Optional[str] = Query(None),
     quick: Optional[str] = Query(None),
+    posted_after: Optional[str] = Query(None, description="Inclusive lower bound, YYYY-MM-DD"),
+    posted_before: Optional[str] = Query(None, description="Inclusive upper bound, YYYY-MM-DD"),
     include_dismissed: bool = Query(False, description="Include swiped-away items"),
     reg: ServiceRegistry = Depends(get_registry),
 ):
@@ -330,12 +409,14 @@ def get_cached_results(
     scan. ``source`` is ``"cache"`` and ``last_updated`` is the most recent
     ``last_seen_at`` so the UI can show a "cached as of …" banner.
     """
+    posted_after = _validate_date_param("posted_after", posted_after)
+    posted_before = _validate_date_param("posted_before", posted_before)
     items, last_updated = _load_items("cache", reg)
     return _shape_results(
         items, filter=filter, search=search, sort=sort, order=order,
         page=page, per_page=per_page, include_dismissed=include_dismissed, reg=reg,
         category=_csv(category), genre=_csv(genre), language=_csv(language),
-        quick=_csv(quick),
+        quick=_csv(quick), posted_after=posted_after, posted_before=posted_before,
         extra={"source": "cache", "last_updated": last_updated},
     )
 
@@ -363,10 +444,13 @@ def select_all(req: Optional[SelectAllRequest] = None,
                     _selected.add(gk)
             return {"status": "ok", "selected_count": len(_selected),
                     "group_keys": sorted(_selected)}
+    posted_after = _validate_date_param("posted_after", req.posted_after)
+    posted_before = _validate_date_param("posted_before", req.posted_before)
     items, _ = _load_items("cache" if req.source == "cache" else "live", reg)
     matched = _filter_and_sort(
         items, filter=req.filter, search=req.search, category=_csv(req.category),
         genre=_csv(req.genre), language=_csv(req.language), quick=_csv(req.quick),
+        posted_after=posted_after, posted_before=posted_before,
     )
     keys = [str(i.get("group_key")) for i in matched if i.get("group_key")]
     with _selected_lock:

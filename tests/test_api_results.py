@@ -224,3 +224,94 @@ def test_select_all_filtered_returns_matching_group_keys():
                json={"source": "cache", "filter": "missing", "category": "4k"}).json()
     assert r["selected_count"] == 1
     assert r["group_keys"] == ["A-k"]
+
+
+# ── posted_after / posted_before date-range filter ────────────────────────
+
+def test_posted_after_excludes_items_before_the_bound():
+    early = _it(title="Early", posted_date="June 1, 2026 at 12:00 AM")
+    late = _it(title="Late", posted_date="June 20, 2026 at 12:00 AM")
+    out = _filter_and_sort([early, late], posted_after="2026-06-08")
+    assert {i["title"] for i in out} == {"Late"}
+
+
+def test_posted_before_excludes_items_after_the_bound_inclusive_of_end_of_day():
+    early = _it(title="Early", posted_date="June 1, 2026 at 12:00 AM")
+    boundary_late = _it(title="BoundaryLate", posted_date="June 8, 2026 at 11:59 PM")
+    late = _it(title="Late", posted_date="June 20, 2026 at 12:00 AM")
+    out = _filter_and_sort([early, boundary_late, late], posted_before="2026-06-08")
+    assert {i["title"] for i in out} == {"Early", "BoundaryLate"}
+
+
+def test_posted_after_and_before_both_bounds_inclusive_on_boundary_dates():
+    start_boundary = _it(title="StartBoundary", posted_date="June 8, 2026 at 12:00 AM")
+    end_boundary = _it(title="EndBoundary", posted_date="June 10, 2026 at 11:30 PM")
+    outside_before = _it(title="TooEarly", posted_date="June 7, 2026 at 11:59 PM")
+    outside_after = _it(title="TooLate", posted_date="June 11, 2026 at 12:00 AM")
+    out = _filter_and_sort(
+        [start_boundary, end_boundary, outside_before, outside_after],
+        posted_after="2026-06-08", posted_before="2026-06-10",
+    )
+    assert {i["title"] for i in out} == {"StartBoundary", "EndBoundary"}
+
+
+def test_missing_posted_date_excluded_when_a_bound_is_set():
+    dateless = _it(title="Dateless", posted_date="")
+    dated = _it(title="Dated", posted_date="June 8, 2026 at 12:00 AM")
+    out = _filter_and_sort([dateless, dated], posted_after="2026-06-01")
+    assert {i["title"] for i in out} == {"Dated"}
+
+
+def test_missing_posted_date_included_when_no_bound_is_set():
+    dateless = _it(title="Dateless", posted_date="")
+    dated = _it(title="Dated", posted_date="June 8, 2026 at 12:00 AM")
+    out = _filter_and_sort([dateless, dated])
+    assert {i["title"] for i in out} == {"Dateless", "Dated"}
+
+
+def test_bad_posted_after_format_returns_422_on_cached_endpoint():
+    rows = [_row("A")]
+    c = _client_with_cache(rows)
+    r = c.get("/results/cached", params={"posted_after": "06/08/2026"})
+    assert r.status_code == 422
+
+
+def test_bad_posted_before_format_returns_422_on_live_endpoint():
+    rows = [_row("A")]
+    c = _client_with_cache(rows)
+    r = c.get("/results", params={"posted_before": "not-a-date"})
+    assert r.status_code == 422
+
+
+def test_cached_posted_range_narrows_total_and_title_counts_but_stats_stay_whole_set():
+    rows = [
+        _row("Early", posted_date="June 1, 2026 at 12:00 AM"),
+        _row("Mid", posted_date="June 8, 2026 at 12:00 AM"),
+        _row("Late", posted_date="June 20, 2026 at 12:00 AM"),
+    ]
+    c = _client_with_cache(rows)
+    r = c.get("/results/cached", params={"posted_after": "2026-06-05", "posted_before": "2026-06-10"}).json()
+    assert r["total"] == 1
+    assert r["title_counts"] == {"Mid": 1}
+    assert r["stats"]["total"] == 3  # whole visible set, unaffected by the date range
+
+
+def test_select_all_respects_posted_range():
+    rows = [
+        _row("Early", posted_date="June 1, 2026 at 12:00 AM"),
+        _row("Mid", posted_date="June 8, 2026 at 12:00 AM"),
+    ]
+    c = _client_with_cache(rows)
+    r = c.post("/results/select-all",
+               json={"source": "cache", "posted_after": "2026-06-05"}).json()
+    assert r["group_keys"] == ["Mid-k"]
+
+def test_cached_posted_calendar_invalid_date_422():
+    """Regex-valid but calendar-invalid dates (2026-02-31) must 422, not 500."""
+    rows = [_row("A")]
+    c = _client_with_cache(rows)
+    r = c.get("/results/cached", params={"posted_after": "2026-02-31"})
+    assert r.status_code == 422
+    assert "calendar" in r.json()["detail"].lower() or "Invalid" in r.json()["detail"]
+    r2 = c.get("/results/cached", params={"posted_before": "2025-13-01"})
+    assert r2.status_code == 422

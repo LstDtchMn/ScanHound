@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, tileSize, posterAspect, tileShowMeta, gridGap, gridColumns, GRID_COLUMN_CHOICES, type TileSize, type PosterAspect, type GridGap } from '$lib/stores/results';
+  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, tileSize, posterAspect, tileShowMeta, gridGap, gridColumns, GRID_COLUMN_CHOICES, postedAfter, postedBefore, type TileSize, type PosterAspect, type GridGap } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -13,8 +13,14 @@
     ($searchFilter ? 1 : 0) +
     ($genreFilter.length > 0 ? 1 : 0) +
     ($languageFilter.length > 0 ? 1 : 0) +
-    $quickFilters.length
+    $quickFilters.length +
+    ($postedAfter || $postedBefore ? 1 : 0)
   );
+
+  function clearPostedRange() {
+    postedAfter.set('');
+    postedBefore.set('');
+  }
 
   const quickChips = [
     { key: '4k', label: '4K' },
@@ -271,6 +277,41 @@
     </details>
   {/if}
 
+  <!-- Posted date range -->
+  <div class="flex items-center gap-1">
+    <label for="fb-posted-after" class="sr-only">Posted after</label>
+    <input
+      id="fb-posted-after"
+      type="date"
+      value={$postedAfter}
+      onchange={(e) => postedAfter.set((e.target as HTMLInputElement).value)}
+      title="Posted after (inclusive)"
+      class="bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-1.5 py-1 rounded border border-[var(--border)] text-[11px] focus:outline-none focus:border-[var(--accent)] cursor-pointer w-[8.5rem]
+        {$postedAfter ? 'border-[var(--accent)]' : ''}"
+    />
+    <span class="text-[var(--text-secondary)] text-[11px]">–</span>
+    <label for="fb-posted-before" class="sr-only">Posted before</label>
+    <input
+      id="fb-posted-before"
+      type="date"
+      value={$postedBefore}
+      onchange={(e) => postedBefore.set((e.target as HTMLInputElement).value)}
+      title="Posted before (inclusive of that day)"
+      class="bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-1.5 py-1 rounded border border-[var(--border)] text-[11px] focus:outline-none focus:border-[var(--accent)] cursor-pointer w-[8.5rem]
+        {$postedBefore ? 'border-[var(--accent)]' : ''}"
+    />
+    {#if $postedAfter || $postedBefore}
+      <button
+        onclick={clearPostedRange}
+        aria-label="Clear posted date range"
+        title="Clear posted date range"
+        class="px-1 py-1 rounded text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] transition-colors"
+      >
+        &times;
+      </button>
+    {/if}
+  </div>
+
   <select
     value={$sortBy}
     onchange={(e) => sortBy.set((e.target as HTMLSelectElement).value as SortOption)}
@@ -509,6 +550,43 @@
         </div>
       </div>
     {/if}
+    <!-- Posted date range -->
+    <div>
+      <div class="flex items-center justify-between mb-1.5">
+        <p class="text-xs font-medium text-[var(--text-secondary)]">Posted date</p>
+        {#if $postedAfter || $postedBefore}
+          <button onclick={clearPostedRange} class="text-xs text-[var(--accent)]">Clear</button>
+        {/if}
+      </div>
+      <div class="flex items-center gap-2">
+        <div class="flex-1">
+          <label for="fb-posted-after-sheet" class="sr-only">Posted after</label>
+          <input
+            id="fb-posted-after-sheet"
+            type="date"
+            value={$postedAfter}
+            onchange={(e) => postedAfter.set((e.target as HTMLInputElement).value)}
+            title="Posted after (inclusive)"
+            class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border text-sm focus:outline-none focus:border-[var(--accent)]
+              {$postedAfter ? 'border-[var(--accent)]' : 'border-[var(--border)]'}"
+          />
+        </div>
+        <span class="text-[var(--text-secondary)] text-sm">to</span>
+        <div class="flex-1">
+          <label for="fb-posted-before-sheet" class="sr-only">Posted before</label>
+          <input
+            id="fb-posted-before-sheet"
+            type="date"
+            value={$postedBefore}
+            onchange={(e) => postedBefore.set((e.target as HTMLInputElement).value)}
+            title="Posted before (inclusive of that day)"
+            class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border text-sm focus:outline-none focus:border-[var(--accent)]
+              {$postedBefore ? 'border-[var(--accent)]' : 'border-[var(--border)]'}"
+          />
+        </div>
+      </div>
+    </div>
+
     <div>
       <label for="fb-host" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Download host</label>
       <select id="fb-host" value={$downloadHost} onchange={(e) => downloadHost.set((e.target as HTMLSelectElement).value)} class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm">
