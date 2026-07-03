@@ -496,6 +496,8 @@
             <button
               type="button"
               class="flex w-full items-center gap-2 mb-2 mt-4 first:mt-0 cursor-pointer select-none text-left rounded-lg border-transparent bg-transparent py-0 transition-colors"
+              aria-expanded="true"
+              aria-label="{group.title} — {siblingCounts().get(group.title)} releases, collapse"
               onclick={() => toggleGroup(group.title)}
             >
               <span class="text-[10px] text-[var(--text-secondary)] transition-transform rotate-90">&triangleright;</span>

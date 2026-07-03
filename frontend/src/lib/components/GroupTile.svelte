@@ -1,6 +1,7 @@
 <script lang="ts">
   import Badge from './Badge.svelte';
   import { posterAspect, POSTER_ASPECT_CLASS, tileShowMeta } from '$lib/stores/results';
+  import { settings } from '$lib/stores/settings';
   import { statusVariant, formatStatus } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
 
@@ -20,6 +21,7 @@
   let { title, items, count, formats, statusSummary, sizeRange, dateRange, onToggle }: Props = $props();
 
   let front = $derived(items[0]);
+  let showRating = $derived($settings.show_rating ?? true);
 
   function onKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter' || e.key === ' ') {
@@ -94,6 +96,7 @@
               transition-all duration-200 ease-out"
           >
             <div class="flex items-center gap-1.5 text-[10px] text-white/85 flex-wrap mb-1">
+              {#if showRating && front.rating}<span>&#9733; {front.rating.toFixed(1)}</span>{/if}
               {#if sizeRange}<span class="font-semibold text-white">{sizeRange}</span>{/if}
               {#if dateRange}<span>&middot; {dateRange}</span>{/if}
             </div>
