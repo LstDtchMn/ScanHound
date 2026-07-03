@@ -1412,6 +1412,27 @@ class RenameService:
             return {"ok": False, "error": "Source file missing"}
         dst = os.path.join(job.get("destination_path") or "",
                            job.get("new_filename") or os.path.basename(src))
+        # Collision guard: a prior apply (or a file already present in the
+        # library) may already occupy this destination — e.g. two different
+        # releases of the same title resolve to the identical target path.
+        # place_file() itself refuses to overwrite (raises FileExistsError),
+        # but letting that surface as a hard 'failed' job gives the user no
+        # guidance. Detect it up front and hold for review instead — never
+        # auto-replace or delete the existing file; that stays a manual,
+        # explicit user action.
+        if os.path.lexists(dst):
+            msg = f"A file already exists at the destination: {dst}"
+            try:
+                existing_size = os.path.getsize(dst)
+                candidate_size = os.path.getsize(src)
+                msg += (f" (existing {existing_size} bytes vs. candidate "
+                        f"{candidate_size} bytes)")
+            except OSError:
+                pass
+            msg += " — review to replace or keep the existing file."
+            db.update_rename_job(job_id, status="needs_review", warning_message=msg)
+            self._broadcast(job_id)
+            return {"ok": False, "error": msg}
         method = self._cfg.get("auto_rename_move_method", "hardlink")
         deletions_require_confirmation = self._cfg.get(
             "deletions_require_confirmation", True)

@@ -83,7 +83,7 @@ def _service(db, tmdb_search, *, movie_lib="", tv_lib="", **cfg):
 
 def _extracted(tmp_path, name, content="x"):
     d = tmp_path / "extracted"
-    d.mkdir(exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True)
     f = d / name
     f.write_text(content)
     return str(d), str(f)
@@ -455,6 +455,58 @@ class TestApplyUndo:
         assert job["status"] == "applied"
         assert job["move_method"] in ("hardlink", "copy")
         assert os.path.exists(src)
+
+    def test_apply_second_of_two_colliding_jobs_needs_review_not_failed(self, db, tmp_path):
+        """Two source files that resolve to the identical destination (same
+        title/year/resolution/filename) — e.g. two different releases of the
+        same movie. Applying the first succeeds; applying the second must NOT
+        hard-fail with FileExistsError. It should land needs_review with a
+        clear warning, and the first job/file must be untouched."""
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, src1 = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        save_to2, src2 = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        job1 = db.get_rename_job(jid1)
+        job2 = db.get_rename_job(jid2)
+        # Sanity: both jobs really do target the identical destination file.
+        assert job1["destination_path"] == job2["destination_path"]
+        assert job1["new_filename"] == job2["new_filename"]
+
+        out1 = svc.apply(jid1)
+        assert out1["ok"] is True
+        applied_job1 = db.get_rename_job(jid1)
+        assert applied_job1["status"] == "applied"
+        dst = os.path.join(job1["destination_path"], job1["new_filename"])
+        assert os.path.isfile(dst)
+
+        out2 = svc.apply(jid2)
+        job2_after = db.get_rename_job(jid2)
+        assert job2_after["status"] == "needs_review"
+        assert job2_after["status"] != "failed"
+        assert "already exists" in (job2_after["warning_message"] or "").lower()
+        # The first job/file must be untouched by the second's failed apply.
+        assert db.get_rename_job(jid1)["status"] == "applied"
+        assert os.path.isfile(dst)
+        # Source of the second file must remain in place (nothing deleted).
+        assert os.path.exists(src2)
+
+    def test_apply_to_empty_destination_still_succeeds(self, db, tmp_path):
+        """Non-colliding apply must be unaffected by the new collision guard."""
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+        out = svc.apply(jid)
+        assert out["ok"] is True
+        job = db.get_rename_job(jid)
+        assert job["status"] == "applied"
+        dst = os.path.join(job["destination_path"], job["new_filename"])
+        assert os.path.isfile(dst)
 
     def test_apply_rolls_back_file_when_db_write_fails(self, db, tmp_path):
         """If the 'applied' DB write fails *after* the move, the file must be
