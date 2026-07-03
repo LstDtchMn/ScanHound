@@ -221,6 +221,14 @@ class PlexService:
 
             total_libs = len(movie_libs) + len(tv_libs)
             current_lib_idx = 0
+            # Set when a library-level load is interrupted partway through
+            # (e.g. a Plex connection drop mid-iteration). The per-library
+            # except below already swallows the error and moves on so the
+            # overall load can proceed with the other libraries, but the
+            # resulting _movies/_tv list for that content type is now known
+            # incomplete — it must never full-replace a good existing cache.
+            movies_load_incomplete = False
+            tv_load_incomplete = False
 
             # ── Movies ────────────────────────────────────────────────
             for lib_name in movie_libs:
@@ -266,6 +274,7 @@ class PlexService:
                                     seen_1080.add(uid)
                 except Exception as e:
                     self._log(f"Error loading movie library '{lib_name}': {e}", "error")
+                    movies_load_incomplete = True
 
                 current_lib_idx += 1
 
@@ -354,6 +363,7 @@ class PlexService:
 
                 except Exception as e:
                     self._log(f"Error loading TV library '{lib_name}': {e}", "error")
+                    tv_load_incomplete = True
 
                 current_lib_idx += 1
 
@@ -382,18 +392,33 @@ class PlexService:
                 )
             else:
                 # Persist to cache. Only full-replace a content type when its
-                # load actually returned data — an empty list almost always
+                # load actually returned data AND completed without a
+                # library-level exception — an empty list almost always
                 # means a partial/failed load (e.g. one library's API call
-                # failed), and full_replace would otherwise wipe a good cache.
+                # failed), and a mid-library connection drop leaves a
+                # non-empty but incomplete list; full_replace would otherwise
+                # wipe a good cache with either.
                 self._log("Saving to local cache...")
-                if self.plex_movies:
+                if self.plex_movies and not movies_load_incomplete:
                     self.db.save_plex_cache(self.plex_movies, "Movies", full_replace=True)
-                else:
+                elif not self.plex_movies:
                     self._log("Skipping Movies cache save — load returned 0 (preserving existing cache)", "warning")
-                if self.plex_tv:
-                    self.db.save_plex_cache(self.plex_tv, "TV Shows", full_replace=True)
                 else:
+                    self._log(
+                        "Movies load was interrupted (library error) — skipping full-replace "
+                        "cache save to avoid clobbering good cache with a partial set",
+                        "warning",
+                    )
+                if self.plex_tv and not tv_load_incomplete:
+                    self.db.save_plex_cache(self.plex_tv, "TV Shows", full_replace=True)
+                elif not self.plex_tv:
                     self._log("Skipping TV Shows cache save — load returned 0 (preserving existing cache)", "warning")
+                else:
+                    self._log(
+                        "TV load was interrupted (library error) — skipping full-replace "
+                        "cache save to avoid clobbering good cache with a partial set",
+                        "warning",
+                    )
 
             self._last_full_load_time = time.time()
             self._emit_stats()
