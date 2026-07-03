@@ -17,8 +17,17 @@ services:
       # JD's Windows saveTo paths are translated to these (Settings → Renaming).
       - "F:/Downloads:/library/movies"
       - "G:/Downloads:/library/movies-4k"
+      # crawler.db lives on a Docker-managed named volume (native VM ext4), NOT
+      # the ./data bind mount: SQLite WAL's shared-memory index cannot be
+      # mmap'd correctly across the Docker-for-Windows bind-mount proxy, which
+      # was intermittently corrupting the DB. On first boot the app copy-migrates
+      # the legacy ./data DB into this volume (see backend/config.py). The DV
+      # host-detector handoff files (dv_host.json/.db) stay on ./data since they
+      # must be host-visible.
+      - scanhound_db:/dbvol
     environment:
       - TZ=America/New_York
+      - SCANHOUND_DB_DIR=/dbvol
     labels:
       # scanhound is a locally-built image (no registry) — tell Whats-Up-Docker
       # not to try checking Docker Hub for it (was logging 401 UNAUTHORIZED).
@@ -32,6 +41,10 @@ services:
       # Join the existing shared reverse-proxy network. NPM (also on `proxy`)
       # forwards to this container as http://scanhound:9721.
       - proxy
+
+volumes:
+  # Native Docker volume for crawler.db — off the corrupting Windows bind mount.
+  scanhound_db:
 
 networks:
   proxy:
