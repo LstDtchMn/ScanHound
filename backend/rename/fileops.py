@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime
 import errno
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -44,6 +45,37 @@ def _hash_file(path: str) -> str:
 
 def _trash_bucket_name() -> str:
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _record_trash_manifest(bucket: str, trashed_name: str, original_path: str) -> None:
+    """Append a restore record to ``<bucket>/manifest.json`` (read-modify-write).
+
+    Best-effort: any failure (disk full, permissions, corrupt existing JSON) is
+    logged as a warning and swallowed — losing the ability to restore a file
+    via the manifest is acceptable, but it must never turn a successful trash
+    disposal into a raised exception.
+    """
+    manifest_path = os.path.join(bucket, "manifest.json")
+    try:
+        records = []
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    records = json.load(f)
+                if not isinstance(records, list):
+                    records = []
+            except (OSError, ValueError):
+                records = []
+        records.append({
+            "trashed_name": trashed_name,
+            "original_path": os.path.abspath(original_path),
+            "trashed_at": datetime.datetime.now().isoformat(),
+        })
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2)
+    except OSError:
+        logger.warning("Failed to update trash manifest at %s (non-fatal)", manifest_path,
+                       exc_info=True)
 
 
 def _trash_root_for(path: str) -> str:
@@ -99,6 +131,7 @@ def _trash(path: str) -> str:
             raise
         shutil.move(path, dst)
     logger.info("trash  | %s -> %s", path, dst)
+    _record_trash_manifest(bucket, os.path.basename(dst), path)
     return dst
 
 

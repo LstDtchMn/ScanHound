@@ -317,3 +317,65 @@ class TestFileOps:
         trash_root_dir = os.path.dirname(shutil_bucket)
         if os.path.isdir(trash_root_dir) and not os.listdir(trash_root_dir):
             os.rmdir(trash_root_dir)
+
+    # ── Trash manifest (enables restore) ─────────────────────────────────
+
+    def test_trash_writes_manifest_record(self, tmp_path, monkeypatch):
+        import json as _json
+        trash_root = tmp_path / "appdata" / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        monkeypatch.setattr(fileops, "_trash_bucket_name", lambda: "20260101-000000")
+        f = tmp_path / "movie.mkv"; f.write_text("bye")
+        trashed_path = fileops._trash(str(f))
+
+        bucket = os.path.dirname(trashed_path)
+        manifest_path = os.path.join(bucket, "manifest.json")
+        assert os.path.isfile(manifest_path)
+        with open(manifest_path, "r", encoding="utf-8") as mf:
+            records = _json.load(mf)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["trashed_name"] == "movie.mkv"
+        assert rec["original_path"] == os.path.abspath(str(f))
+        assert "trashed_at" in rec
+
+    def test_trash_manifest_accumulates_multiple_records(self, tmp_path, monkeypatch):
+        import json as _json
+        trash_root = tmp_path / "appdata" / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        monkeypatch.setattr(fileops, "_trash_bucket_name", lambda: "20260101-000000")
+        f1 = tmp_path / "one.mkv"; f1.write_text("1")
+        f2 = tmp_path / "sub" / "two.mkv"; f2.parent.mkdir(); f2.write_text("2")
+
+        p1 = fileops._trash(str(f1))
+        p2 = fileops._trash(str(f2))
+
+        bucket = os.path.dirname(p1)
+        assert bucket == os.path.dirname(p2)
+        manifest_path = os.path.join(bucket, "manifest.json")
+        with open(manifest_path, "r", encoding="utf-8") as mf:
+            records = _json.load(mf)
+        assert len(records) == 2
+        originals = {r["original_path"] for r in records}
+        assert originals == {os.path.abspath(str(f1)), os.path.abspath(str(f2))}
+
+    def test_trash_manifest_write_failure_does_not_raise(self, tmp_path, monkeypatch):
+        """A manifest write failure must be logged, never propagated out of
+        _trash — losing the restore record is acceptable, losing the file
+        disposal guarantee is not."""
+        trash_root = tmp_path / "appdata" / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        f = tmp_path / "movie.mkv"; f.write_text("bye")
+
+        real_open = open
+
+        def _boom(path, *a, **kw):
+            if str(path).endswith("manifest.json"):
+                raise OSError("disk full")
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(fileops, "open", _boom, raising=False)
+        # _trash must still succeed and move the file despite the manifest failure.
+        trashed_path = fileops._trash(str(f))
+        assert not f.exists()
+        assert os.path.isfile(trashed_path)
