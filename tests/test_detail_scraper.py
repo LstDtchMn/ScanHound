@@ -135,6 +135,32 @@ class TestScrapeDetailsFailures:
         assert result is None
 
 
+class TestScrapeDetailsTimeout:
+    """B4: the detail scraper's per-request HTTP call must enforce a timeout
+    (like the 15s listing crawl in scanner_service.py), so a single hung
+    detail page can't wedge a scan indefinitely."""
+
+    def test_request_passes_a_timeout_kwarg(self):
+        scraper = make_scraper()
+        mock_cs = make_mock_scraper(200, MOVIE_HTML)
+        scraper.scrape_details("https://example.com/post", {}, scraper=mock_cs)
+        mock_cs.get.assert_called_once()
+        _, kwargs = mock_cs.get.call_args
+        assert "timeout" in kwargs, "DetailScraper.scrape_details() made an HTTP request with no timeout"
+        assert isinstance(kwargs["timeout"], (int, float)) and kwargs["timeout"] > 0
+
+    def test_timeout_applied_on_every_retry_attempt(self):
+        """Even a 404/retry-triggering response must still carry a timeout on
+        every attempt, not just the first."""
+        scraper = make_scraper()
+        mock_cs = make_mock_scraper(404, b"Not Found")
+        scraper.scrape_details("https://example.com/post", {}, scraper=mock_cs)
+        assert mock_cs.get.call_count >= 1
+        for call in mock_cs.get.call_args_list:
+            _, kwargs = call
+            assert kwargs.get("timeout"), "a retry attempt was made without a timeout"
+
+
 # ── Movie parsing ─────────────────────────────────────────────────────
 
 class TestScrapeDetailsMovie:
