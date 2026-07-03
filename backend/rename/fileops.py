@@ -135,6 +135,145 @@ def _trash(path: str) -> str:
     return dst
 
 
+def _is_safe_component(component: str) -> bool:
+    """Whether a single path component is safe to join under a trash root.
+
+    Rejects empty strings, path separators, and any ``..`` traversal segment
+    so a bucket/name supplied over the API can never escape the trash root.
+    """
+    if not component:
+        return False
+    if os.sep in component or (os.altsep and os.altsep in component):
+        return False
+    if component in ("..", "."):
+        return False
+    return True
+
+
+def _load_manifest(bucket_path: str) -> list:
+    """Read a bucket's manifest.json; returns [] if missing/unreadable."""
+    manifest_path = os.path.join(bucket_path, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        return []
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        return records if isinstance(records, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_manifest(bucket_path: str, records: list) -> None:
+    manifest_path = os.path.join(bucket_path, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+
+
+def list_trash_entries(roots) -> list:
+    """List every trashed file across the given trash roots.
+
+    Each entry: ``{bucket, name, size, trashed_at, original_path, restorable}``.
+    ``original_path`` is ``None`` (and ``restorable`` False) when the bucket's
+    manifest has no record for that file (e.g. it predates the manifest
+    feature, or the manifest itself failed to write). Missing/unreadable
+    roots are skipped silently — trash may simply not exist yet.
+    """
+    entries = []
+    seen_roots = set()
+    for root in roots:
+        root = os.path.abspath(root)
+        if root in seen_roots or not os.path.isdir(root):
+            continue
+        seen_roots.add(root)
+        try:
+            bucket_names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for bucket in bucket_names:
+            bucket_path = os.path.join(root, bucket)
+            if not os.path.isdir(bucket_path):
+                continue
+            manifest = _load_manifest(bucket_path)
+            manifest_by_name = {r.get("trashed_name"): r for r in manifest if r.get("trashed_name")}
+            try:
+                names = sorted(os.listdir(bucket_path))
+            except OSError:
+                continue
+            for name in names:
+                if name == "manifest.json":
+                    continue
+                fpath = os.path.join(bucket_path, name)
+                if not os.path.isfile(fpath):
+                    continue
+                rec = manifest_by_name.get(name)
+                try:
+                    size = os.path.getsize(fpath)
+                except OSError:
+                    size = 0
+                entries.append({
+                    "bucket": bucket,
+                    "name": name,
+                    "size": size,
+                    "trashed_at": rec.get("trashed_at") if rec else None,
+                    "original_path": rec.get("original_path") if rec else None,
+                    "restorable": bool(rec),
+                })
+    return entries
+
+
+def restore_trash_entry(bucket: str, name: str, roots) -> dict:
+    """Restore a manifest-backed trash entry to its recorded original_path.
+
+    Safety:
+      - ``bucket``/``name`` are validated as single path components (no
+        separators, no ``..``) so nothing outside the trash roots is ever
+        reachable, regardless of what a caller supplies.
+      - Refuses (never overwrites) if the destination is already occupied.
+      - Refuses if the entry or its manifest record can't be found.
+
+    Returns ``{"ok": True, "restored_path": ...}`` or
+    ``{"ok": False, "error": ...}``. Never raises for expected failure modes.
+    """
+    if not _is_safe_component(bucket) or not _is_safe_component(name):
+        return {"ok": False, "error": "Invalid bucket or name (path traversal rejected)"}
+
+    for root in roots:
+        root = os.path.abspath(root)
+        bucket_path = os.path.join(root, bucket)
+        if not os.path.isdir(bucket_path):
+            continue
+        fpath = os.path.join(bucket_path, name)
+        if not os.path.isfile(fpath):
+            continue
+        manifest = _load_manifest(bucket_path)
+        rec = next((r for r in manifest if r.get("trashed_name") == name), None)
+        if not rec or not rec.get("original_path"):
+            return {"ok": False, "error": "No manifest record for this entry — cannot restore safely"}
+        original_path = rec["original_path"]
+        if os.path.lexists(original_path):
+            return {"ok": False, "error": f"Destination already exists: {original_path}"}
+        try:
+            os.makedirs(os.path.dirname(original_path) or ".", exist_ok=True)
+            os.rename(fpath, original_path)
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                return {"ok": False, "error": f"Restore failed: {e}"}
+            try:
+                shutil.move(fpath, original_path)
+            except OSError as e2:
+                return {"ok": False, "error": f"Restore failed: {e2}"}
+        remaining = [r for r in manifest if r is not rec]
+        try:
+            _save_manifest(bucket_path, remaining)
+        except OSError:
+            logger.warning("Failed to update manifest after restore at %s (non-fatal)",
+                           bucket_path, exc_info=True)
+        logger.info("restore | %s -> %s", fpath, original_path)
+        return {"ok": True, "restored_path": original_path}
+
+    return {"ok": False, "error": "Trash entry not found"}
+
+
 def place_file(src: str, dst: str, method: str = "hardlink", *,
                automatic: bool = False,
                deletions_require_confirmation: bool = True) -> str:

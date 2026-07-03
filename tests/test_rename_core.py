@@ -379,3 +379,114 @@ class TestFileOps:
         trashed_path = fileops._trash(str(f))
         assert not f.exists()
         assert os.path.isfile(trashed_path)
+
+
+class TestTrashListAndRestore:
+    """list_trash_entries() / restore_trash_entry() — trash browsing + undo."""
+
+    def _trash_one(self, tmp_path, monkeypatch, root, bucket_name, filename, content="x"):
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(root))
+        monkeypatch.setattr(fileops, "_trash_bucket_name", lambda: bucket_name)
+        f = tmp_path / filename
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content)
+        return fileops._trash(str(f)), f
+
+    def test_list_shows_trashed_file_with_original_path(self, tmp_path, monkeypatch):
+        root = tmp_path / "trash"
+        trashed_path, original = self._trash_one(
+            tmp_path, monkeypatch, root, "20260101-000000", "movie.mkv")
+
+        entries = fileops.list_trash_entries([str(root)])
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["bucket"] == "20260101-000000"
+        assert e["name"] == "movie.mkv"
+        assert e["original_path"] == os.path.abspath(str(original))
+        assert e["restorable"] is True
+        assert e["size"] == len("x")
+
+    def test_list_entry_without_manifest_has_null_original_path(self, tmp_path):
+        root = tmp_path / "trash"
+        bucket = root / "20260101-000000"
+        bucket.mkdir(parents=True)
+        (bucket / "orphan.mkv").write_text("orphan")
+
+        entries = fileops.list_trash_entries([str(root)])
+        assert len(entries) == 1
+        assert entries[0]["original_path"] is None
+        assert entries[0]["restorable"] is False
+
+    def test_restore_moves_file_back_and_removes_manifest_record(self, tmp_path, monkeypatch):
+        root = tmp_path / "trash"
+        trashed_path, original = self._trash_one(
+            tmp_path, monkeypatch, root, "20260101-000000", "sub/movie.mkv")
+        assert not original.exists()
+
+        result = fileops.restore_trash_entry("20260101-000000", "movie.mkv", [str(root)])
+        assert result["ok"] is True
+        assert original.exists()
+        assert original.read_text() == "x"
+        assert not os.path.exists(trashed_path)
+
+        # Manifest record removed.
+        manifest_path = os.path.join(os.path.dirname(trashed_path), "manifest.json")
+        import json as _json
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            records = _json.load(f)
+        assert records == []
+
+        entries = fileops.list_trash_entries([str(root)])
+        assert entries == []
+
+    def test_restore_refuses_when_destination_occupied(self, tmp_path, monkeypatch):
+        root = tmp_path / "trash"
+        trashed_path, original = self._trash_one(
+            tmp_path, monkeypatch, root, "20260101-000000", "movie.mkv")
+        # Something now occupies the original path.
+        original.write_text("occupied")
+
+        result = fileops.restore_trash_entry("20260101-000000", "movie.mkv", [str(root)])
+        assert result["ok"] is False
+        assert "already exists" in result["error"].lower()
+        # File stays in trash, untouched.
+        assert os.path.isfile(trashed_path)
+        assert original.read_text() == "occupied"
+
+    def test_restore_missing_manifest_entry_errors(self, tmp_path):
+        root = tmp_path / "trash"
+        bucket = root / "20260101-000000"
+        bucket.mkdir(parents=True)
+        (bucket / "orphan.mkv").write_text("orphan")
+
+        result = fileops.restore_trash_entry("20260101-000000", "orphan.mkv", [str(root)])
+        assert result["ok"] is False
+        assert os.path.isfile(bucket / "orphan.mkv")
+
+    def test_restore_missing_bucket_or_file_errors(self, tmp_path):
+        root = tmp_path / "trash"
+        result = fileops.restore_trash_entry("20260101-999999", "ghost.mkv", [str(root)])
+        assert result["ok"] is False
+
+    @pytest.mark.parametrize("bad_bucket,bad_name", [
+        ("../escape", "movie.mkv"),
+        ("20260101-000000", "../escape.mkv"),
+        ("20260101-000000", "sub/movie.mkv"),
+        ("sub/dir", "movie.mkv"),
+    ])
+    def test_restore_rejects_path_traversal(self, tmp_path, bad_bucket, bad_name):
+        root = tmp_path / "trash"
+        root.mkdir(parents=True)
+        result = fileops.restore_trash_entry(bad_bucket, bad_name, [str(root)])
+        assert result["ok"] is False
+        assert "invalid" in result["error"].lower() or "traversal" in result["error"].lower()
+
+    def test_list_covers_multiple_trash_roots(self, tmp_path, monkeypatch):
+        root1 = tmp_path / "trashA"
+        root2 = tmp_path / "trashB"
+        self._trash_one(tmp_path, monkeypatch, root1, "20260101-000000", "a.mkv")
+        self._trash_one(tmp_path, monkeypatch, root2, "20260101-000001", "b.mkv")
+
+        entries = fileops.list_trash_entries([str(root1), str(root2)])
+        names = {e["name"] for e in entries}
+        assert names == {"a.mkv", "b.mkv"}

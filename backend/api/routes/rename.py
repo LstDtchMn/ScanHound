@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.routes.scanner import TMDB_IMAGE_BASE  # same base+size as Scan posters (w500)
 from backend.api.ws import ws_manager
-from backend.rename import dv_detect, dv_labeler, llm_identify
+from backend.rename import dv_detect, dv_labeler, fileops, llm_identify
 from backend.rename.dv_import import import_dv_host_db
 from backend.rename.service import conflict_annotations
 
@@ -63,6 +63,11 @@ class BulkIdsRequest(BaseModel):
 class BulkSetDestRequest(BaseModel):
     ids: list[int] = []
     destination_root: str = ""
+
+
+class TrashRestoreRequest(BaseModel):
+    bucket: str
+    name: str
 
 
 class ApplyConfidentRequest(BaseModel):
@@ -280,6 +285,60 @@ def rename_health(reg: ServiceRegistry = Depends(get_registry)):
         },
         "llm_enabled": bool(cfg.get("auto_rename_llm_enabled")),
     }
+
+
+def _trash_roots() -> list:
+    """All trash roots worth scanning for the /rename/trash endpoints.
+
+    Covers: the app-data fallback root (``fileops._TRASH_ROOT``) plus every
+    per-volume ``<volume>/.scanhound-trash`` root implied by a manifest
+    record's ``original_path`` (via ``fileops._trash_root_for``) across ALL
+    buckets already discovered under the app-data root — this bootstraps
+    nothing on a fresh install, so it also always includes the trash root for
+    each drive letter currently known to Windows, which is the simplest way to
+    make listing correct without persisting a root registry: a per-volume
+    ``.scanhound-trash`` directory only exists (and is only ever listed) if a
+    disposal actually created it, so scanning every drive's candidate root is
+    cheap (a single ``os.path.isdir`` each) and can't return anything a real
+    trash disposal didn't put there.
+    """
+    roots = {os.path.abspath(fileops._TRASH_ROOT)}
+    if os.name == "nt":
+        import string
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.isdir(drive):
+                roots.add(fileops._trash_root_for(drive))
+    else:
+        roots.add(fileops._trash_root_for("/"))
+    return sorted(roots)
+
+
+@router.get("/trash")
+def list_trash(reg: ServiceRegistry = Depends(get_registry)):
+    """List every trashed file across both trash locations (see _trash_roots).
+
+    Each entry reports {bucket, name, size, trashed_at, original_path,
+    restorable}; original_path is null when the bucket has no manifest record
+    for that file (e.g. it predates the manifest feature)."""
+    return {"entries": fileops.list_trash_entries(_trash_roots())}
+
+
+@router.post("/trash/restore")
+def restore_trash(body: TrashRestoreRequest, reg: ServiceRegistry = Depends(get_registry)):
+    """Restore a manifest-backed trash entry to its original_path.
+
+    Refuses (409) if the destination is occupied or the entry/manifest can't
+    be found; rejects (400) bucket/name values that look like path traversal."""
+    bucket, name = body.bucket, body.name
+    if not fileops._is_safe_component(bucket) or not fileops._is_safe_component(name):
+        raise HTTPException(status_code=400, detail="Invalid bucket or name")
+    result = fileops.restore_trash_entry(bucket, name, _trash_roots())
+    if not result.get("ok"):
+        error = result.get("error", "Restore failed")
+        status = 409 if "already exists" in error.lower() else 404
+        raise HTTPException(status_code=status, detail=error)
+    return result
 
 
 @router.post("/process-folder")

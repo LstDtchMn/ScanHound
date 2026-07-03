@@ -1,9 +1,12 @@
 """Tests for the auto-rename API: /rename/jobs, status, apply/undo, llm/test."""
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.api.main import create_app
 from backend.database import DatabaseManager
+from backend.rename import fileops
 
 
 @pytest.fixture(autouse=True)
@@ -468,3 +471,63 @@ class TestRenameApi:
         r = client.post("/rename/jobs/apply-confident", json={}).json()
         assert r["applied"] == 1 and r["skipped"] == 0
         assert (dest / "Boundary (2020).mkv").exists()
+
+
+class TestTrashEndpoints:
+    """/rename/trash (list) and /rename/trash/restore."""
+
+    def _trash_one(self, tmp_path, monkeypatch, filename="movie.mkv", content="x"):
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        monkeypatch.setattr(fileops, "_trash_bucket_name", lambda: "20260101-000000")
+        f = tmp_path / filename
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content)
+        trashed_path = fileops._trash(str(f))
+        return trash_root, trashed_path, f
+
+    def test_list_shows_trashed_file_with_original_path(self, client, tmp_path, monkeypatch):
+        _, _, original = self._trash_one(tmp_path, monkeypatch)
+        body = client.get("/rename/trash").json()
+        entries = [e for e in body["entries"] if e["name"] == "movie.mkv"]
+        assert len(entries) == 1
+        assert entries[0]["original_path"] == os.path.abspath(str(original))
+        assert entries[0]["restorable"] is True
+
+    def test_restore_puts_file_back_and_removes_manifest_record(self, client, tmp_path, monkeypatch):
+        trash_root, trashed_path, original = self._trash_one(tmp_path, monkeypatch)
+        assert not original.exists()
+
+        resp = client.post("/rename/trash/restore",
+                           json={"bucket": "20260101-000000", "name": "movie.mkv"})
+        assert resp.status_code == 200
+        assert original.exists()
+        assert not os.path.exists(trashed_path)
+
+        body = client.get("/rename/trash").json()
+        assert not any(e["name"] == "movie.mkv" for e in body["entries"])
+
+    def test_restore_occupied_destination_errors_and_keeps_file_in_trash(
+            self, client, tmp_path, monkeypatch):
+        trash_root, trashed_path, original = self._trash_one(tmp_path, monkeypatch)
+        original.write_text("occupied")  # something now occupies the original path
+
+        resp = client.post("/rename/trash/restore",
+                           json={"bucket": "20260101-000000", "name": "movie.mkv"})
+        assert resp.status_code == 409
+        assert os.path.isfile(trashed_path)
+        assert original.read_text() == "occupied"
+
+    def test_restore_traversal_attempt_rejected(self, client, tmp_path, monkeypatch):
+        self._trash_one(tmp_path, monkeypatch)
+        resp = client.post("/rename/trash/restore",
+                           json={"bucket": "20260101-000000", "name": "../escape.mkv"})
+        assert resp.status_code == 400
+
+    def test_restore_missing_entry_errors(self, client, tmp_path, monkeypatch):
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        resp = client.post("/rename/trash/restore",
+                           json={"bucket": "20260101-999999", "name": "ghost.mkv"})
+        assert resp.status_code == 404
