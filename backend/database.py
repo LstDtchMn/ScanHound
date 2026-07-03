@@ -38,6 +38,11 @@ class DatabaseManager:
         self.conn = None
         self._lock = threading.RLock()  # Reentrant lock for thread-safe DB access
         self._init_depth = 0  # Guard against infinite recursion during recovery
+        # Monotonic in-process revision, bumped on every background-cache write.
+        # Folded into get_background_cache_version() so the parse-cache token
+        # changes on EVERY write, immune to CURRENT_TIMESTAMP's 1s resolution
+        # (a same-second in-place upsert would otherwise serve stale blobs).
+        self._bg_cache_rev = 0
         self._dismissed_cache = None  # lazily-populated set[str], kept in sync by mutators
         self.init_db()
 
@@ -1310,6 +1315,7 @@ class DatabaseManager:
                     "data": it.get("data"),
                 } for it in rows])
                 conn.commit()
+                self._bg_cache_rev += 1
             return True
         except Exception as e:
             if conn:
@@ -1585,13 +1591,16 @@ class DatabaseManager:
             'SELECT COUNT(*), MAX(last_seen_at) FROM background_scan_cache',
             one=True, default=None)
         if not row:
-            return (0, None)
-        return (row[0] or 0, row[1])
+            return (0, None, self._bg_cache_rev)
+        return (row[0] or 0, row[1], self._bg_cache_rev)
 
     def clear_background_cache(self):
         """Remove all cached background-scan rows."""
-        return self._mutate(
+        result = self._mutate(
             "DELETE FROM background_scan_cache", label="clear_background_cache")
+        with self._lock:
+            self._bg_cache_rev += 1
+        return result
 
     # ── Auto-rename jobs ──────────────────────────────────────────────
 

@@ -118,9 +118,11 @@ def _init_services(
     if backend.watchlist_manager:
         reg._watchlist_manager = backend.watchlist_manager
 
-    # Analytics
+    # Analytics — pass the shared DatabaseManager so reads go through its
+    # locked connection (Wave B1) instead of opening a second sqlite connection.
     from backend.analytics import StatsDashboard
-    reg._analytics_dashboard = StatsDashboard(backend.db.db_path if backend.db else None)
+    reg._analytics_dashboard = StatsDashboard(
+        backend.db.db_path if backend.db else None, db_manager=backend.db)
 
     logger.info("All services initialized successfully")
 

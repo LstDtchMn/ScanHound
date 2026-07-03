@@ -624,7 +624,8 @@ class TestBackgroundCacheVersion:
     row's JSON blob on each request."""
 
     def test_empty_cache(self, db_manager):
-        assert db_manager.get_background_cache_version() == (0, None)
+        # (count, max_last_seen_at, monotonic_rev)
+        assert db_manager.get_background_cache_version() == (0, None, 0)
 
     def test_changes_on_insert(self, db_manager):
         before = db_manager.get_background_cache_version()
@@ -636,24 +637,35 @@ class TestBackgroundCacheVersion:
         assert after != before
         assert after[0] == 1
 
-    def test_changes_on_reupsert_same_url(self, db_manager):
+    def test_changes_on_reupsert_same_url_same_second(self, db_manager):
         db_manager.upsert_background_cache([
             {"url": "u/1", "title": "A", "year": 2024, "status": "missing",
              "source_category": "4k", "data": "{}"},
         ])
         first = db_manager.get_background_cache_version()
-        # Re-upserting the same URL refreshes last_seen_at (CURRENT_TIMESTAMP)
-        # without changing the row count -- the version must still change so
-        # a re-scrape invalidates any cached parsed-items snapshot.
-        import time
-        time.sleep(1.1)  # last_seen_at has second resolution
+        # Re-upserting the same URL changes NO row count and (within the same
+        # wall-clock second) NO last_seen_at either -- the monotonic rev must
+        # still change so a same-second re-scrape invalidates the parse cache.
+        # No sleep: this is exactly the sub-second window the rev counter closes.
         db_manager.upsert_background_cache([
             {"url": "u/1", "title": "A2", "year": 2024, "status": "missing",
              "source_category": "4k", "data": "{}"},
         ])
         second = db_manager.get_background_cache_version()
-        assert second[0] == first[0] == 1
-        assert second[1] != first[1]
+        assert second[0] == first[0] == 1  # same count
+        assert second != first             # but version changed (via rev)
+        assert second[2] > first[2]        # monotonic rev bumped
+
+    def test_changes_on_clear(self, db_manager):
+        db_manager.upsert_background_cache([
+            {"url": "u/1", "title": "A", "year": 2024, "status": "missing",
+             "source_category": "4k", "data": "{}"},
+        ])
+        before = db_manager.get_background_cache_version()
+        db_manager.clear_background_cache()
+        after = db_manager.get_background_cache_version()
+        assert after != before
+        assert after[2] > before[2]
 
 
 # ---------------------------------------------------------------------------
