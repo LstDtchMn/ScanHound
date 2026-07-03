@@ -19,6 +19,17 @@ from backend.config import DB_PATH
 logger = logging.getLogger(__name__)
 
 
+class RenameJobDBError(Exception):
+    """Raised by create_rename_job() when the INSERT genuinely fails at the DB
+    layer (connection unavailable, disk error, etc). Distinct from the
+    ordinary "already tracked" skip (RenameService._claim_path checks
+    path_has_rename_job() *before* calling create_rename_job, so that case
+    never reaches here) and from a malformed-job caller bug (missing
+    original_path, which still returns None — the caller passed bad data,
+    not a DB failure). Callers that need to tell "silently dropped due to a
+    DB problem" apart from "legitimately skipped" should catch this."""
+
+
 class DatabaseManager:
     """Thread-safe SQLite database manager with connection pooling and auto-recovery."""
 
@@ -70,8 +81,14 @@ class DatabaseManager:
     def get_connection(self):
         """Get or create a database connection (thread-safe).
 
-        Uses WAL journal mode for better concurrent read/write performance
-        and a 5-second busy timeout to handle contention gracefully.
+        Uses WAL journal mode for better concurrent read/write performance, a
+        5-second busy timeout to handle contention gracefully, and
+        synchronous=NORMAL (safe — and the recommended setting — under WAL:
+        SQLite still fsyncs at every checkpoint, so a NORMAL-mode DB can't be
+        corrupted by an application crash; only a power loss/OS crash on a
+        non-durable filesystem/volume can lose the last few committed
+        transactions, which is an acceptable, documented trade-off for the
+        write-throughput win).
         """
         with self._lock:
             if not self.conn:
@@ -79,10 +96,32 @@ class DatabaseManager:
                     self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
                     self.conn.row_factory = sqlite3.Row
                     self.conn.execute("PRAGMA journal_mode=WAL")
+                    self.conn.execute("PRAGMA synchronous=NORMAL")
                     self.conn.execute("PRAGMA busy_timeout=5000")
                 except sqlite3.Error as e:
                     logger.error("Database connection failed: %s", e)
             return self.conn
+
+    def checkpoint(self):
+        """Fold the WAL back into the main DB file (PRAGMA wal_checkpoint(TRUNCATE)).
+
+        Keeps the -wal sidecar from growing unbounded and minimizes the
+        window of data that only exists in the WAL (relevant on a
+        non-durable bind-mounted filesystem). Called once after startup
+        init; periodic scheduling is a follow-up (see db-reliability report
+        — there's no existing periodic-task hook this layer can reach
+        without introducing a scheduler dependency here).
+        """
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                return False
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                return True
+            except sqlite3.Error as e:
+                logger.error("WAL checkpoint failed: %s", e)
+                return False
 
     def _query(self, sql, params=(), *, one=False, default=None):
         """Execute a read query under lock.
@@ -195,6 +234,16 @@ class DatabaseManager:
                     return
 
                 cursor = conn.cursor()
+
+                # ── Startup integrity check ──────────────────────────────
+                # Explicit check (not just relying on a CREATE TABLE happening
+                # to raise) so a corrupt DB is caught even if every table
+                # already exists and no DDL runs this session.
+                cursor.execute("PRAGMA integrity_check")
+                integrity_result = cursor.fetchone()[0]
+                if integrity_result != "ok":
+                    raise sqlite3.DatabaseError(
+                        f"integrity_check failed: {integrity_result}")
 
                 # ── Read current schema version ──────────────────────────
                 cursor.execute("PRAGMA user_version")
@@ -457,7 +506,16 @@ class DatabaseManager:
                 conn.commit()
 
             except sqlite3.DatabaseError as e:
-                logger.error("Database corruption detected: %s", e)
+                # LOUD by design: DB corruption + auto-quarantine is a data-loss
+                # event (every row not yet reflected elsewhere is gone), so this
+                # must never be a quiet log line. ERROR-level log with a
+                # grep-able marker, a best-effort user notification, and a
+                # persisted flag file (survives past the log) that ops/UI code
+                # can check for after the fact.
+                logger.error(
+                    "DATABASE CORRUPTION DETECTED at %s — quarantining and "
+                    "rebuilding a fresh database: %s", self.db_path, e)
+                self._notify_corruption(e)
                 if self.conn:
                     try:
                         self.conn.close()
@@ -471,11 +529,54 @@ class DatabaseManager:
                     try:
                         os.rename(self.db_path, backup_name)
                         logger.warning("Renamed corrupt DB to %s. Creating fresh DB.", backup_name)
+                        self._write_corruption_flag(backup_name, e)
                         self.init_db()
                     except OSError as os_err:
                         logger.critical("Failed to recover DB: %s", os_err)
             finally:
                 self._init_depth = 0
+
+        # One-time WAL checkpoint after a successful (non-corrupt) init, so a
+        # freshly-opened DB doesn't carry forward an unbounded WAL. Best-effort
+        # — never let a checkpoint failure block startup. Periodic scheduling
+        # beyond this one call is a follow-up (see db-reliability report).
+        if self.conn:
+            try:
+                self.checkpoint()
+            except Exception:
+                logger.exception("Post-init WAL checkpoint failed")
+
+    def _notify_corruption(self, error) -> None:
+        """Best-effort loud alert for a DB quarantine event.
+
+        Tries the app's notification bridge if one is reachable; falls back
+        silently (the ERROR log line above is always emitted regardless, so
+        this is a bonus channel, not the primary signal).
+        """
+        try:
+            from backend.notification_bridge import NotificationBridge
+            import backend.app_service as _app_service
+            bridge = getattr(_app_service, "notification_bridge", None)
+            if isinstance(bridge, NotificationBridge):
+                bridge.notify_error(
+                    f"ScanHound database corruption detected at {self.db_path} — "
+                    f"quarantined and rebuilt a fresh database. Error: {error}")
+        except Exception:
+            logger.debug("Corruption notification unavailable (non-fatal)", exc_info=True)
+
+    def _write_corruption_flag(self, backup_name: str, error) -> None:
+        """Persist a marker file recording the quarantine, independent of logs."""
+        try:
+            flag_path = f"{self.db_path}.corrupt_flag.json"
+            with open(flag_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "detected_at": datetime.datetime.now().isoformat(),
+                    "db_path": self.db_path,
+                    "backup_path": backup_name,
+                    "error": str(error),
+                }, f, indent=2)
+        except OSError:
+            logger.exception("Failed to write DB corruption flag file")
 
     # ── Plex cache ───────────────────────────────────────────────────
 
@@ -1481,7 +1582,16 @@ class DatabaseManager:
         return row
 
     def create_rename_job(self, job):
-        """Insert a rename job (dict of column→value); return the new id or None."""
+        """Insert a rename job (dict of column→value); return the new id.
+
+        Returns None only for a malformed ``job`` (missing original_path) —
+        that's a caller bug, not a DB failure. A genuine DB-layer failure
+        (no connection, disk error, constraint violation, etc.) raises
+        RenameJobDBError instead of returning None, so callers can tell
+        "silently dropped because the DB failed" apart from a legitimate
+        no-op and surface it (see RenameService._create / process_folder's
+        ``failed_db`` count).
+        """
         job = self._serialize_rename_row(job)
         cols = [k for k in self._RENAME_FIELDS if k in job]
         if "original_path" not in cols:
@@ -1492,13 +1602,15 @@ class DatabaseManager:
             with self._lock:
                 conn = self.get_connection()
                 if not conn:
-                    return None
+                    raise RenameJobDBError("No database connection available")
                 cur = conn.cursor()
                 cur.execute(
                     f"INSERT INTO rename_jobs ({', '.join(cols)}) VALUES ({placeholders})",
                     {c: job.get(c) for c in cols})
                 conn.commit()
                 return cur.lastrowid
+        except RenameJobDBError:
+            raise
         except Exception as e:
             if conn:
                 try:
@@ -1506,7 +1618,7 @@ class DatabaseManager:
                 except Exception:
                     pass
             logger.error("DB Error (create_rename_job): %s", e)
-            return None
+            raise RenameJobDBError(str(e)) from e
 
     def update_rename_job(self, job_id, **fields):
         """Update arbitrary columns on a rename job."""
