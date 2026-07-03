@@ -4,7 +4,11 @@
 # HTTP & Networking
 requests>=2.28.0,<3.0
 aiohttp>=3.8.0,<4.0
-cloudscraper>=1.2.71,<2.0
+# Pinned exact (A6): cloudscraper does undocumented Cloudflare-challenge
+# parsing internals that break silently across releases; pin to the version
+# actually verified working (matches this dev environment's resolved install)
+# rather than floating on a semver range.
+cloudscraper==1.2.71
 
 # HTML Parsing
 beautifulsoup4>=4.11.0,<5.0
@@ -17,10 +21,18 @@ thefuzz>=0.20.0,<1.0
 
 # Browser Automation (HDEncode link scraping)
 selenium>=4.8.0,<5.0
-undetected-chromedriver>=3.5.0
+# Pinned exact (A6): undetected-chromedriver patches Selenium's Chrome driver
+# internals to evade Cloudflare bot detection — a floating >= range can pull a
+# release that no longer matches the apt-installed chromium/chromedriver pair
+# baked into this image (see download_service.py's version-match preflight),
+# silently breaking all scraping. Matches this dev environment's verified
+# working install; re-verify (driver_preflight()) before bumping.
+undetected-chromedriver==3.5.5
 # Python 3.12 removed stdlib `distutils`, but undetected-chromedriver imports it.
-# setuptools <81 still bundles the distutils shim (81+ dropped it).
-setuptools<81
+# setuptools <81 still bundles the distutils shim (81+ dropped it). Pinned
+# exact (A6) rather than a `<81` ceiling so a new 74-80.x release can't change
+# behavior unverified; matches this dev environment's resolved install.
+setuptools==70.2.0
 
 # Desktop Notifications (lazy-loaded; harmless in a container)
 plyer>=2.1.0,<3.0
