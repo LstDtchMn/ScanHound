@@ -1288,7 +1288,9 @@ class RenameService:
         # off resolution == '2160p'. Probe the actual video width via ffprobe
         # only when the parse left it unknown — never for already-tagged
         # files, so this never adds a subprocess call to the common case.
-        if not match.get("resolution"):
+        # TV never routes through _movie_root's 4K split, so skip the probe
+        # entirely there — it would just be an unnecessary subprocess call.
+        if match.get("media_type") != "tv" and not match.get("resolution"):
             width = None
             try:
                 width = _llm.probe_video_width(path)
@@ -1465,7 +1467,12 @@ class RenameService:
             except OSError:
                 pass
             msg += " — review to replace or keep the existing file."
-            db.update_rename_job(job_id, status="needs_review", warning_message=msg)
+            # Append to (never clobber) a warning already on the job — e.g. a
+            # year-mismatch note set at creation time — so the collision guard
+            # never silently discards an earlier reason the file needs review.
+            existing = job.get("warning_message")
+            combined = f"{existing}; {msg}" if existing else msg
+            db.update_rename_job(job_id, status="needs_review", warning_message=combined)
             self._broadcast(job_id)
             return {"ok": False, "error": msg}
         method = self._cfg.get("auto_rename_move_method", "hardlink")

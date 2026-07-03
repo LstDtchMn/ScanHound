@@ -328,6 +328,42 @@ class TestResolutionProbe:
         assert called["n"] == 0
         assert job["destination_path"].startswith(lib_4k)  # already 2160p, routes fine
 
+    def test_tv_job_unknown_resolution_skips_probe(self, db, tmp_path, monkeypatch):
+        """4K routing only applies to movies (_movie_root keys off resolution
+        for the movie library only) — a TV file with unknown resolution must
+        not pay for an ffprobe subprocess that can't change its routing."""
+        save_to, _ = _extracted(tmp_path, "Test.Show.S01E01.WEB-DL.mkv")
+        called = {"n": 0}
+
+        def _spy(path, timeout=30):
+            called["n"] += 1
+            return 3840
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.probe_video_width", _spy)
+        svc = _service(db, _show_search, tv_lib=str(tmp_path / "tvlib"))
+        ids = svc.process_package("tvpkg", save_to)
+        assert ids
+        assert called["n"] == 0
+
+    def test_movie_job_unknown_resolution_still_probes(self, db, tmp_path, monkeypatch):
+        """Sanity companion to the TV-skip test: movies must still invoke the
+        probe when resolution is unknown, so the guard is TV-specific only."""
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.mkv")
+        called = {"n": 0}
+
+        def _spy(path, timeout=30):
+            called["n"] += 1
+            return 3840
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.probe_video_width", _spy)
+        lib = str(tmp_path / "lib")
+        lib_4k = str(tmp_path / "lib-4k")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_movie_library_4k=lib_4k)
+        ids = svc.process_package("pkg", save_to)
+        assert ids
+        assert called["n"] == 1
+
 
 # ── TMDB year mismatch vs. parsed filename year ─────────────────────────
 
@@ -359,6 +395,41 @@ class TestYearMismatchWarning:
         assert job["year"] == 2025
         assert job["status"] == "matched"
         assert not job["warning_message"]
+
+    def test_collision_at_apply_appends_to_existing_warning(self, db, tmp_path):
+        """A job created with a year-mismatch warning (matched, apply-eligible)
+        that then collides at apply time must keep BOTH the original warning
+        and the new collision text — apply() must never clobber a
+        warning_message that was already set at creation time."""
+        lib = str(tmp_path / "lib")
+        # First job occupies the destination.
+        save_to1, _ = _extracted(tmp_path, "Carolina.Caroline.2025.1080p.mkv")
+        svc = _service(db, _carolina_search_2026, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        out1 = svc.apply(jid1)
+        assert out1["ok"] is True
+
+        # Second job: different source, same target path/filename, so it
+        # collides — and it carries the year-mismatch warning from creation.
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to2, _ = _extracted(
+            second_root, "Carolina.Caroline.2025.1080p.Alt.Release.mkv")
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        job2_before = db.get_rename_job(jid2)
+        assert job2_before["status"] == "matched"
+        assert "2025" in (job2_before["warning_message"] or "")
+        assert "2026" in (job2_before["warning_message"] or "")
+
+        out2 = svc.apply(jid2)
+        assert out2["ok"] is False
+        job2_after = db.get_rename_job(jid2)
+        assert job2_after["status"] == "needs_review"
+        combined = job2_after["warning_message"] or ""
+        # Original year-mismatch text must survive...
+        assert "2025" in combined and "2026" in combined
+        # ...alongside the new collision text.
+        assert "already exists" in combined.lower()
 
 
 # ── duplicate-destination conflict detection ──────────────────────────
