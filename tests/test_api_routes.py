@@ -63,6 +63,7 @@ def _reset_scan_state():
         _scan_state["phase"] = ""
         _scan_state["scanned"] = 0
         _scan_state["total"] = 0
+        _scan_state["holds_slot"] = False
     # The last-scan items are a module global shared across tests; without
     # clearing them a prior scan test leaks results into e.g.
     # test_export_csv_no_results (which then gets 200 instead of 400).
@@ -331,6 +332,52 @@ class TestScanner:
         assert "state" in data
         assert "progress" in data
         assert "phase" in data
+
+    def test_scan_status_never_reports_running_without_holding_slot(self, client):
+        """B3: _scan_state['state']='running' alone must not make /scan/status
+        report running -- only when this scan thread actually holds the
+        ScannerService scan slot (holds_slot=True). Reproduces the
+        scan_start()-vs-_run_scan race window where the optimistic claim
+        hasn't (or never will) be backed by a real slot acquisition."""
+        from backend.api.routes.scanner import _scan_state, _scan_lock
+        with _scan_lock:
+            _scan_state["state"] = "running"
+            _scan_state["holds_slot"] = False  # optimistic claim, slot not acquired
+        resp = client.get("/scan/status")
+        assert resp.json()["state"] == "idle"
+
+    def test_scan_status_reports_running_when_slot_actually_held(self, client):
+        from unittest.mock import MagicMock
+        from backend.api.routes.scanner import _scan_state, _scan_lock
+        from backend.api.dependencies import registry
+        mock_scanner = MagicMock()
+        mock_scanner.scan_in_progress = True
+        registry._scanner_service = mock_scanner
+        with _scan_lock:
+            _scan_state["state"] = "running"
+            _scan_state["holds_slot"] = True
+        resp = client.get("/scan/status")
+        assert resp.json()["state"] == "running"
+
+    def test_scan_status_does_not_leak_holds_slot_field(self, client):
+        resp = client.get("/scan/status")
+        assert "holds_slot" not in resp.json()
+
+    def test_scan_status_running_but_slot_since_released_reports_idle(self, client):
+        """Covers a hard-crashed scan thread that set holds_slot=True but died
+        before its `finally` released the slot and reset state -- the
+        ScannerService's own slot state is the final cross-check."""
+        from unittest.mock import MagicMock
+        from backend.api.routes.scanner import _scan_state, _scan_lock
+        from backend.api.dependencies import registry
+        mock_scanner = MagicMock()
+        mock_scanner.scan_in_progress = False  # slot was released/never truly held
+        registry._scanner_service = mock_scanner
+        with _scan_lock:
+            _scan_state["state"] = "running"
+            _scan_state["holds_slot"] = True
+        resp = client.get("/scan/status")
+        assert resp.json()["state"] == "idle"
 
     def test_scan_stop_returns_stopping(self, client):
         resp = client.post("/scan/stop")

@@ -18,6 +18,19 @@ router = APIRouter(prefix="/scan", tags=["scanner"])
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 
 # Scan state tracking
+#
+# B3: _scan_state["state"] and the ScannerService's real scan-slot
+# (try_acquire_scan/release_scan) are two separate sources of truth.
+# scan_start()/scheduler_trigger() optimistically set state to "running"
+# under _scan_lock *before* the spawned thread ever calls try_acquire_scan()
+# -- that optimistic claim is needed to serialize racing /scan/start calls
+# against each other (the _scan_lock check-then-set below), but it means
+# _scan_state alone can say "running" for a scan that a moment later fails
+# to acquire the slot (a background pre-cache scan got there first) and
+# resets to "idle". _scan_state["holds_slot"] tracks whether *this* scan
+# thread has actually acquired the slot; scan_status() reports "running"
+# only when both are true, so a phantom claim never outlives the brief
+# window before try_acquire_scan() runs.
 _scan_thread: Optional[threading.Thread] = None
 _scan_state: Dict[str, Any] = {
     "state": "idle",
@@ -25,6 +38,7 @@ _scan_state: Dict[str, Any] = {
     "phase": "",
     "scanned": 0,
     "total": 0,
+    "holds_slot": False,
 }
 _scan_lock = threading.Lock()
 
@@ -106,12 +120,18 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
             _scan_state["state"] = "idle"
             _scan_state["progress"] = 0.0
             _scan_state["phase"] = ""
+            _scan_state["holds_slot"] = False
         return
 
     with _scan_lock:
         _scan_state["state"] = "running"
         _scan_state["progress"] = 0.0
         _scan_state["phase"] = "starting"
+        # Only now do we actually hold the scan slot -- scan_status() uses
+        # this to avoid reporting "running" for the brief window between
+        # scan_start()'s optimistic claim and this thread's real acquisition
+        # (or its failure, handled just above).
+        _scan_state["holds_slot"] = True
 
     # Clear stale selections from previous scans
     from backend.api.routes.results import _selected, _selected_lock
@@ -211,6 +231,7 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
             _scan_state["state"] = "idle"
             _scan_state["progress"] = 0.0
             _scan_state["phase"] = ""
+            _scan_state["holds_slot"] = False
 
 
 def _media_item_to_dict(item: Any) -> Dict[str, Any]:
@@ -264,9 +285,24 @@ def _compute_stats(items: Optional[List[Any]]) -> Dict[str, int]:
 
 
 @router.get("/status")
-def scan_status():
+def scan_status(reg: ServiceRegistry = Depends(get_registry)):
     with _scan_lock:
-        return dict(_scan_state)
+        state = dict(_scan_state)
+
+    # B3: never report "running" unless this scan thread actually holds the
+    # scan slot. holds_slot already guards the scan_start()-vs-_run_scan
+    # optimistic-claim race (see the module docstring above _scan_state); this
+    # extra cross-check against the ScannerService's own slot covers the
+    # equally-phantom case where holds_slot is stale (e.g. a hard-crashed
+    # scan thread never reached its `finally`) and the slot has since been
+    # released or taken over by something else.
+    if state.get("state") == "running":
+        scanner = reg.scanner
+        slot_held = bool(scanner.scan_in_progress) if scanner else False
+        if not state.get("holds_slot") or not slot_held:
+            state["state"] = "idle"
+    state.pop("holds_slot", None)
+    return state
 
 
 @router.post("/start")

@@ -242,6 +242,57 @@ def test_select_all_filtered_returns_matching_group_keys():
     assert r["group_keys"] == ["A-k"]
 
 
+# ── B3: _selected stays bounded under many selects ─────────────────────
+
+def test_selected_set_stays_bounded_under_many_selects():
+    from backend.api.routes import results as results_mod
+    c = _client_with_cache([_row("A")])
+    over_cap = results_mod._MAX_SELECTED + 500
+    for batch_start in range(0, over_cap, 500):
+        keys = [f"k-{n}" for n in range(batch_start, batch_start + 500)]
+        r = c.post("/results/select", json={"group_keys": keys, "selected": True})
+        assert r.status_code == 200
+    assert r.json()["selected_count"] <= results_mod._MAX_SELECTED
+    with results_mod._selected_lock:
+        assert len(results_mod._selected) <= results_mod._MAX_SELECTED
+
+
+def test_selected_set_evicts_oldest_first():
+    from backend.api.routes import results as results_mod
+    c = _client_with_cache([_row("A")])
+    with results_mod._selected_lock:
+        results_mod._selected.clear()
+    # Fill to exactly the cap.
+    keys = [f"k-{n}" for n in range(results_mod._MAX_SELECTED)]
+    c.post("/results/select", json={"group_keys": keys, "selected": True})
+    with results_mod._selected_lock:
+        assert "k-0" in results_mod._selected
+    # One more selection should evict the oldest ("k-0"), not truncate arbitrarily.
+    c.post("/results/select", json={"group_keys": ["k-new"], "selected": True})
+    with results_mod._selected_lock:
+        assert len(results_mod._selected) == results_mod._MAX_SELECTED
+        assert "k-0" not in results_mod._selected
+        assert "k-new" in results_mod._selected
+
+
+def test_selected_set_reselecting_moves_to_end_not_evicted():
+    """Re-selecting an already-selected key must not make it the eviction
+    candidate ahead of keys that were never touched again."""
+    from backend.api.routes import results as results_mod
+    c = _client_with_cache([_row("A")])
+    with results_mod._selected_lock:
+        results_mod._selected.clear()
+    keys = [f"k-{n}" for n in range(results_mod._MAX_SELECTED)]
+    c.post("/results/select", json={"group_keys": keys, "selected": True})
+    # Re-select the oldest key -- it should move to the end, so the NEXT
+    # oldest ("k-1") becomes the eviction candidate instead.
+    c.post("/results/select", json={"group_keys": ["k-0"], "selected": True})
+    c.post("/results/select", json={"group_keys": ["k-new"], "selected": True})
+    with results_mod._selected_lock:
+        assert "k-0" in results_mod._selected  # protected by the re-select
+        assert "k-1" not in results_mod._selected  # evicted instead
+
+
 # ── posted_after / posted_before date-range filter ────────────────────────
 
 def test_posted_after_excludes_items_before_the_bound():

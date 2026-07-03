@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -192,8 +193,41 @@ def _filter_and_sort(items, *, filter=None, search=None, category=None,
     return result
 
 # Selection state
-_selected: set = set()
+#
+# B3: ScanHound is a single-user, single-instance app (one browser session
+# talking to one backend process) — there is no per-session/per-user
+# partitioning anywhere in the API, and this module-global set is shared by
+# every request. That's an accepted invariant, not a bug, PROVIDED it stays
+# bounded: without a cap, a client that repeatedly calls POST /select with
+# fresh group_keys (e.g. a buggy UI loop, or scanning a very large site
+# across many sessions without ever deselecting) grows this set forever.
+# _MAX_SELECTED caps it with FIFO eviction (oldest selections dropped first)
+# — generous enough that no real user selection (even "select all" against
+# the full 2000-row background cache) gets truncated, while still bounding
+# worst-case memory.
+_MAX_SELECTED = 5000
+_selected: "OrderedDict[str, None]" = OrderedDict()  # insertion-ordered set
 _selected_lock = threading.Lock()
+
+
+def _selected_add(keys) -> None:
+    """Add group_keys to _selected, evicting the oldest entries first if the
+    result would exceed _MAX_SELECTED. Must be called while holding
+    _selected_lock."""
+    for k in keys:
+        if k in _selected:
+            _selected.move_to_end(k)
+        else:
+            _selected[k] = None
+    while len(_selected) > _MAX_SELECTED:
+        _selected.popitem(last=False)
+
+
+def _selected_discard(keys) -> None:
+    """Remove group_keys from _selected. Must be called while holding
+    _selected_lock."""
+    for k in keys:
+        _selected.pop(k, None)
 
 
 class SelectRequest(BaseModel):
@@ -495,9 +529,9 @@ def get_cached_results(
 def select_items(req: SelectRequest):
     with _selected_lock:
         if req.selected:
-            _selected.update(req.group_keys)
+            _selected_add(req.group_keys)
         else:
-            _selected.difference_update(req.group_keys)
+            _selected_discard(req.group_keys)
         return {"status": "ok", "selected_count": len(_selected)}
 
 
@@ -507,11 +541,13 @@ def select_all(req: Optional[SelectAllRequest] = None,
     if req is None:
         raw_items = get_last_scan_items()
         with _selected_lock:
+            keys = []
             for item in raw_items:
                 gk = getattr(item, "group_key", None) or (
                     item.get("group_key") if isinstance(item, dict) else None)
                 if gk:
-                    _selected.add(gk)
+                    keys.append(gk)
+            _selected_add(keys)
             return {"status": "ok", "selected_count": len(_selected),
                     "group_keys": sorted(_selected)}
     posted_after = _validate_date_param("posted_after", req.posted_after)
@@ -525,7 +561,7 @@ def select_all(req: Optional[SelectAllRequest] = None,
     keys = [str(i.get("group_key")) for i in matched if i.get("group_key")]
     with _selected_lock:
         _selected.clear()
-        _selected.update(keys)
+        _selected_add(keys)
         return {"status": "ok", "selected_count": len(_selected), "group_keys": keys}
 
 
