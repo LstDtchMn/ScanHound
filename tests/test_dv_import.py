@@ -80,11 +80,18 @@ def test_missing_host_db_returns_zero(tmp_path):
     dm.close()
 
 
-def test_dv_import_endpoint(client, tmp_path):
+def test_dv_import_endpoint(client, tmp_path, monkeypatch):
     from backend.api.dependencies import registry
     from backend.database import DatabaseManager
+    from backend.api.routes import rename as rename_routes
     host = tmp_path / "dv_host.db"
     _make_host_db(host, [("Y:/M/a.mkv", "fel", 1.0, 10, "A")])
+    # dv-import confines host_db_path to the configured handoff dir (the
+    # dirname of SCANHOUND_DV_HOST_DB, /data in prod). Point that root at the
+    # test's tmp dir so the confinement passes for the real handoff location.
+    monkeypatch.setattr(
+        rename_routes, "_DEFAULT_DV_HOST_DB", str(tmp_path / "dv_host.db")
+    )
     dm = DatabaseManager(); dm.clear_dv_scans()
     registry.db = dm
     r = client.post("/rename/dv-import", json={"host_db_path": str(host)})

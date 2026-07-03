@@ -36,10 +36,16 @@ def _reset_dv():
     _clear(); yield; _clear()
 
 
-def _seed_host_db(path: str) -> str:
-    """Create a standalone dv_host.db with one FEL row, return its path."""
+def _seed_host_db(path: str, host_db: str = None) -> str:
+    """Create a standalone dv_host.db with one FEL row, return its path.
+
+    host_db: destination path for the db (defaults to a system temp file).
+    Callers that must satisfy the dv-import handoff-dir confinement pass a
+    path inside the configured handoff dir.
+    """
     import tempfile, os
-    fd, host_db = tempfile.mkstemp(prefix="dv_host_", suffix=".db"); os.close(fd)
+    if host_db is None:
+        fd, host_db = tempfile.mkstemp(prefix="dv_host_", suffix=".db"); os.close(fd)
     con = sqlite3.connect(host_db)
     con.execute(
         "CREATE TABLE dv_host (path TEXT PRIMARY KEY, dv_layer TEXT, "
@@ -77,8 +83,15 @@ def test_end_to_end_fel_labels_exactly_once(monkeypatch, tmp_path):
     })
 
     # 2. Seed the host store (the import endpoint takes the path directly in
-    #    its request body -- see DvImportRequest.host_db_path).
-    host_db = _seed_host_db(MOVIE_PATH)
+    #    its request body -- see DvImportRequest.host_db_path). dv-import
+    #    confines host_db_path to the configured handoff dir (dirname of
+    #    SCANHOUND_DV_HOST_DB, /data in prod); seed inside tmp_path and point
+    #    that root there so the real confinement passes.
+    from backend.api.routes import rename as rename_routes
+    host_db = _seed_host_db(MOVIE_PATH, str(tmp_path / "dv_host.db"))
+    monkeypatch.setattr(
+        rename_routes, "_DEFAULT_DV_HOST_DB", str(tmp_path / "dv_host.db")
+    )
 
     # 3. Monkeypatch the Plex client at the PlexManager._server boundary:
     #    - get_library_section() -> _server.library.section(name) -> our fake
