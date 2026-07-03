@@ -887,11 +887,13 @@ class TestMaintenancePass:
         return svc
 
     def test_maintenance_pass_calls_sweep_trash_with_configured_retention(self):
+        from backend.rename import fileops
         svc = self._make_service({"trash_retention_days": 45})
+        expected_roots = fileops.all_trash_roots()
         with patch("backend.rename.fileops.sweep_trash") as mock_sweep:
             mock_sweep.return_value = {"files_deleted": 0, "bytes_freed": 0, "buckets_removed": 0}
             svc._run_maintenance_pass()
-        mock_sweep.assert_called_once_with(45)
+        mock_sweep.assert_called_once_with(45, roots=expected_roots)
 
     def test_maintenance_pass_calls_db_checkpoint(self):
         svc = self._make_service()

@@ -301,41 +301,15 @@ def rename_health(reg: ServiceRegistry = Depends(get_registry)):
     }
 
 
-def _trash_roots() -> list:
-    """All trash roots worth scanning for the /rename/trash endpoints.
-
-    Covers: the app-data fallback root (``fileops._TRASH_ROOT``) plus every
-    per-volume ``<volume>/.scanhound-trash`` root implied by a manifest
-    record's ``original_path`` (via ``fileops._trash_root_for``) across ALL
-    buckets already discovered under the app-data root — this bootstraps
-    nothing on a fresh install, so it also always includes the trash root for
-    each drive letter currently known to Windows, which is the simplest way to
-    make listing correct without persisting a root registry: a per-volume
-    ``.scanhound-trash`` directory only exists (and is only ever listed) if a
-    disposal actually created it, so scanning every drive's candidate root is
-    cheap (a single ``os.path.isdir`` each) and can't return anything a real
-    trash disposal didn't put there.
-    """
-    roots = {os.path.abspath(fileops._TRASH_ROOT)}
-    if os.name == "nt":
-        import string
-        for letter in string.ascii_uppercase:
-            drive = f"{letter}:\\"
-            if os.path.isdir(drive):
-                roots.add(fileops._trash_root_for(drive))
-    else:
-        roots.add(fileops._trash_root_for("/"))
-    return sorted(roots)
-
-
 @router.get("/trash")
 def list_trash(reg: ServiceRegistry = Depends(get_registry)):
-    """List every trashed file across both trash locations (see _trash_roots).
+    """List every trashed file across both trash locations (see
+    fileops.all_trash_roots).
 
     Each entry reports {bucket, name, size, trashed_at, original_path,
     restorable}; original_path is null when the bucket has no manifest record
     for that file (e.g. it predates the manifest feature)."""
-    return {"entries": fileops.list_trash_entries(_trash_roots())}
+    return {"entries": fileops.list_trash_entries(fileops.all_trash_roots())}
 
 
 @router.post("/trash/restore")
@@ -347,7 +321,7 @@ def restore_trash(body: TrashRestoreRequest, reg: ServiceRegistry = Depends(get_
     bucket, name = body.bucket, body.name
     if not fileops._is_safe_component(bucket) or not fileops._is_safe_component(name):
         raise HTTPException(status_code=400, detail="Invalid bucket or name")
-    result = fileops.restore_trash_entry(bucket, name, _trash_roots())
+    result = fileops.restore_trash_entry(bucket, name, fileops.all_trash_roots())
     if not result.get("ok"):
         error = result.get("error", "Restore failed")
         status = 409 if "already exists" in error.lower() else 404

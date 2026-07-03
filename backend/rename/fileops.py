@@ -274,6 +274,32 @@ def restore_trash_entry(bucket: str, name: str, roots) -> dict:
     return {"ok": False, "error": "Trash entry not found"}
 
 
+def all_trash_roots() -> list:
+    """All trash roots worth scanning/sweeping: the app-data fallback root
+    (``_TRASH_ROOT``) plus every per-volume ``<volume>/.scanhound-trash`` root
+    implied by ``_trash_root_for`` for each drive letter currently known to
+    Windows (or ``/`` on POSIX).
+
+    Single source of truth shared by the ``/rename/trash`` list/restore
+    endpoints and the maintenance-pass retention sweep — a disposal on any
+    volume must be reachable (and eventually swept) by both. Scanning every
+    drive's candidate root is cheap (a single ``os.path.isdir`` each); a
+    per-volume ``.scanhound-trash`` directory only exists if a disposal
+    actually created it, so this can't return anything a real trash disposal
+    didn't put there.
+    """
+    roots = {os.path.abspath(_TRASH_ROOT)}
+    if os.name == "nt":
+        import string
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.isdir(drive):
+                roots.add(_trash_root_for(drive))
+    else:
+        roots.add(_trash_root_for("/"))
+    return sorted(roots)
+
+
 def _bucket_age_days(bucket_path: str) -> float:
     """How many days old a trash bucket is.
 
@@ -299,9 +325,9 @@ def sweep_trash(retention_days: int, roots=None) -> dict:
     """Delete trash buckets older than ``retention_days``; remove emptied buckets.
 
     Only ever touches files strictly under the given trash roots (defaults to
-    just ``_TRASH_ROOT`` — callers that also want per-volume
-    ``.scanhound-trash`` roots must pass them explicitly, e.g. via the same
-    root-discovery the /rename/trash endpoints use). Never follows symlinks —
+    :func:`all_trash_roots` — every per-volume ``.scanhound-trash`` root plus
+    the app-data fallback — so a real disposal on any drive is eventually
+    swept even if the caller doesn't pass ``roots`` explicitly). Never follows symlinks —
     a symlink found inside an old bucket is unlinked (removing the link
     itself), never resolved and deleted at its target. Logs a per-run summary
     and is fail-safe: per-file/per-bucket errors are logged and skipped
@@ -310,7 +336,7 @@ def sweep_trash(retention_days: int, roots=None) -> dict:
     Returns ``{"files_deleted": int, "bytes_freed": int, "buckets_removed": int}``.
     """
     if roots is None:
-        roots = [_TRASH_ROOT]
+        roots = all_trash_roots()
     files_deleted = 0
     bytes_freed = 0
     buckets_removed = 0

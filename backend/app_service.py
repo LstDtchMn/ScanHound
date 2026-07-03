@@ -575,7 +575,7 @@ class AppService:
         try:
             from backend.rename import fileops
             retention_days = self.config.get("trash_retention_days", 30)
-            summary = fileops.sweep_trash(retention_days)
+            summary = fileops.sweep_trash(retention_days, roots=fileops.all_trash_roots())
             if summary.get("files_deleted"):
                 logger.info(
                     "Trash sweep: removed %d file(s), freed %d bytes (retention=%dd)",
