@@ -271,23 +271,42 @@ connection.onReconnect(() => {
   handleReconnectSnapshot();
 });
 
-/** All unique genres from current scan results. */
-export const availableGenres = derived(results, ($results) => {
-  const set = new Set<string>();
-  for (const r of $results) {
-    for (const g of r.genres || []) set.add(g);
-  }
-  return [...set].sort();
-});
+/** Server-computed facets (D3) — populated from `/results/cached`'s
+ *  `available_genres`/`available_languages`, which are computed over the
+ *  *entire* filtered-set basis server-side (see backend `_compute_facets`),
+ *  not just whatever page(s) happen to be loaded client-side. Only
+ *  meaningful in paged mode; left empty otherwise. */
+export const serverGenres = writable<string[]>([]);
+export const serverLanguages = writable<string[]>([]);
 
-/** All unique languages from current scan results. */
-export const availableLanguages = derived(results, ($results) => {
-  const set = new Set<string>();
-  for (const r of $results) {
-    if (r.language) set.add(r.language);
+/** Available genre options for the filter UI. In paged mode, the server
+ *  already computed these over the whole matching set (not just loaded
+ *  pages) — see B2/D3 — so use that; otherwise (live mode) derive from the
+ *  in-memory results, same as before. */
+export const availableGenres = derived(
+  [results, pagedMode, serverGenres],
+  ([$results, $paged, $serverGenres]) => {
+    if ($paged) return $serverGenres;
+    const set = new Set<string>();
+    for (const r of $results) {
+      for (const g of r.genres || []) set.add(g);
+    }
+    return [...set].sort();
   }
-  return [...set].sort();
-});
+);
+
+/** Available language options for the filter UI — see availableGenres. */
+export const availableLanguages = derived(
+  [results, pagedMode, serverLanguages],
+  ([$results, $paged, $serverLanguages]) => {
+    if ($paged) return $serverLanguages;
+    const set = new Set<string>();
+    for (const r of $results) {
+      if (r.language) set.add(r.language);
+    }
+    return [...set].sort();
+  }
+);
 
 /** True if the result has at least one matching copy already in Plex. */
 function hasPlexCopy(i: ScanResult): boolean {
@@ -381,6 +400,12 @@ export async function loadResults(reset: boolean): Promise<void> {
     titleCounts.set((data as { title_counts?: Record<string, number> }).title_counts ?? {});
     if (data.stats) stats.set(data.stats);
     hasMore.set(get(results).length < (data.total ?? 0));
+    // Server facets (B2/D3) — computed over the whole matching set, not just
+    // loaded pages. Always present on /results/cached; default to [] so a
+    // response shape mismatch doesn't leave a stale prior value behind.
+    const facets = data as { available_genres?: string[]; available_languages?: string[] };
+    serverGenres.set(facets.available_genres ?? []);
+    serverLanguages.set(facets.available_languages ?? []);
     if ((data as { source?: string }).source === 'cache') {
       cacheUpdatedAt.set((data as { last_updated?: string }).last_updated ?? null);
       fromCache.set(true);

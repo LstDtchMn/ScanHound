@@ -558,6 +558,87 @@ describe('bounded growth of accumulated pages (D1)', () => {
   });
 });
 
+describe('D3: paged-mode facets use server available_genres/available_languages', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('availableGenres/availableLanguages reflect the server facets in paged mode, not just loaded rows', async () => {
+    const { loadResults, pagedMode, availableGenres, availableLanguages } = await import('./results');
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      // Only one item's worth of genres/languages loaded on this page...
+      items: [item({ title: 'A', url: 'a', genres: ['Action'], language: 'English' })],
+      total: 500,
+      stats: { total: 500, missing: 0, upgrade: 0, library: 0 },
+      title_counts: {},
+      // ...but the server facets span the whole matching set (500 items).
+      available_genres: ['Action', 'Comedy', 'Drama', 'Horror'],
+      available_languages: ['English', 'French', 'German']
+    });
+
+    await loadResults(true);
+
+    expect(get(availableGenres)).toEqual(['Action', 'Comedy', 'Drama', 'Horror']);
+    expect(get(availableLanguages)).toEqual(['English', 'French', 'German']);
+  });
+
+  it('in live mode (not paged), facets still derive from loaded results, ignoring any stale server facets', async () => {
+    const { results, pagedMode, availableGenres, availableLanguages } = await import('./results');
+    pagedMode.set(false);
+    results.set([
+      item({ url: 'a', genres: ['Sci-Fi'], language: 'Japanese' }),
+      item({ url: 'b', genres: ['Comedy'], language: 'Japanese' })
+    ]);
+
+    expect(get(availableGenres)).toEqual(['Comedy', 'Sci-Fi']);
+    expect(get(availableLanguages)).toEqual(['Japanese']);
+  });
+
+  it('a fresh page-1 load replaces stale server facets from a previous filter', async () => {
+    const { loadResults, pagedMode, availableGenres } = await import('./results');
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [], total: 0, stats: { total: 0, missing: 0, upgrade: 0, library: 0 },
+      title_counts: {}, available_genres: ['Action'], available_languages: []
+    });
+    await loadResults(true);
+    expect(get(availableGenres)).toEqual(['Action']);
+
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [], total: 0, stats: { total: 0, missing: 0, upgrade: 0, library: 0 },
+      title_counts: {}, available_genres: ['Horror', 'Thriller'], available_languages: []
+    });
+    await loadResults(true);
+    expect(get(availableGenres)).toEqual(['Horror', 'Thriller']);
+  });
+});
+
+describe('D3: select-all in paged mode selects only loaded rows (honest label)', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('selectAll() in paged mode still only selects the urls actually passed/loaded — not the full server match set', async () => {
+    // This documents the D3 decision: rather than silently claiming to select
+    // every server-matched row (which would require plumbing group_key->url
+    // mapping from a backend response, since selectedKeys is url-keyed while
+    // the server's /select-all match set is group_key-keyed), paged mode's
+    // "Select all" button is relabeled "Select loaded (N)" in the UI and the
+    // store keeps exactly its existing (loaded-rows) semantics.
+    const { selectAll, selectedKeys, results, filteredResults, pagedMode, filteredTotal } = await import('./results');
+    pagedMode.set(true);
+    filteredTotal.set(500); // server says 500 total matches
+    results.set([item({ title: 'A', url: 'a' }), item({ title: 'B', url: 'b' })]); // only 2 loaded
+
+    await selectAll(get(filteredResults).map((r) => r.url));
+
+    expect([...get(selectedKeys)].sort()).toEqual(['a', 'b']);
+  });
+});
+
 describe('debounced refetch on filter change (paged mode)', () => {
   // NOTE: the module-level _filterKey subscription is primed the moment this
   // module is first imported, long before these tests run — so we never rely
