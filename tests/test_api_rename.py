@@ -60,6 +60,31 @@ class TestRenameApi:
             "runtime_check", "subtitles", "ocr_credits", "vision", "dv_detection"}
         assert "ok" in body["ollama"] and "llm_enabled" in body
 
+    def test_health_reports_failed_db_and_corruption_flag_fields(self, client):
+        body = client.get("/rename/health").json()
+        assert body["failed_db_last_package"] == 0
+        assert body["db_corruption_flag"] is False
+
+    def test_health_reports_nonzero_failed_db_last_package(self, client):
+        from backend.api.dependencies import registry
+        registry._rename_service.last_package_failed_db = 3
+        try:
+            body = client.get("/rename/health").json()
+            assert body["failed_db_last_package"] == 3
+        finally:
+            registry._rename_service.last_package_failed_db = 0
+
+    def test_health_reports_db_corruption_flag_present(self, client, monkeypatch):
+        from backend.api.dependencies import registry
+        flag_path = f"{registry.db.db_path}.corrupt_flag.json"
+        with open(flag_path, "w", encoding="utf-8") as f:
+            f.write("{}")
+        try:
+            body = client.get("/rename/health").json()
+            assert body["db_corruption_flag"] is True
+        finally:
+            os.remove(flag_path)
+
     def test_status_defaults(self, client):
         body = client.get("/rename/status").json()
         assert body["enabled"] is False
@@ -531,3 +556,25 @@ class TestTrashEndpoints:
         resp = client.post("/rename/trash/restore",
                            json={"bucket": "20260101-999999", "name": "ghost.mkv"})
         assert resp.status_code == 404
+
+
+class TestStartupCorruptionNotify:
+    """_init_services() surfaces a pending DB corruption flag exactly once,
+    after the notification bridge exists."""
+
+    def test_corruption_check_runs_at_startup_with_bridge_and_db_path(self, monkeypatch):
+        calls = []
+
+        def _fake_notify(db_path, bridge):
+            calls.append((db_path, bridge))
+            return False
+
+        monkeypatch.setattr("backend.database.notify_db_corruption_once", _fake_notify)
+        app = create_app(config_override={"plex_url": "", "plex_token": ""})
+        with TestClient(app):
+            pass
+
+        assert len(calls) == 1
+        db_path, bridge = calls[0]
+        assert db_path  # a real path was passed, not None
+        assert bridge is not None  # the notification bridge, not a stub

@@ -261,13 +261,25 @@ def rename_health(reg: ServiceRegistry = Depends(get_registry)):
     """Report which rename fallback capabilities are actually available — the
     external binaries (ffmpeg/ffprobe/tesseract) and the Ollama model — so a
     silently-broken dependency (e.g. a rebuild without tesseract, a model that
-    isn't pulled) is visible instead of just degrading quietly."""
+    isn't pulled) is visible instead of just degrading quietly.
+
+    Also surfaces two otherwise-invisible failure signals: how many files were
+    dropped by the most recent process_package() run due to a genuine DB
+    error (failed_db_last_package), and whether an un-acknowledged database
+    corruption quarantine flag is currently on disk (db_corruption_flag)."""
     cfg = reg.config or {}
     bins = {**llm_identify.dependency_status(), **dv_detect.dependency_status()}
     url = cfg.get("ollama_base_url", "")
     model = cfg.get("ollama_model", "")
     ollama = (llm_identify.test_connection(url) if url
               else {"ok": False, "error": "not configured"})
+
+    failed_db_last_package = getattr(reg._rename_service, "last_package_failed_db", 0)
+    db_corruption_flag = False
+    if reg.db is not None:
+        from backend.database import db_corruption_flag_present
+        db_corruption_flag = db_corruption_flag_present(reg.db.db_path)
+
     return {
         "binaries": bins,
         "capabilities": {
@@ -284,6 +296,8 @@ def rename_health(reg: ServiceRegistry = Depends(get_registry)):
             "error": ollama.get("error"),
         },
         "llm_enabled": bool(cfg.get("auto_rename_llm_enabled")),
+        "failed_db_last_package": failed_db_last_package,
+        "db_corruption_flag": db_corruption_flag,
     }
 
 

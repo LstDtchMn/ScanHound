@@ -5,10 +5,16 @@ import json
 import logging
 import os
 import sqlite3
+from unittest.mock import MagicMock
 
 import pytest
 
-from backend.database import DatabaseManager
+from backend.database import (
+    DatabaseManager,
+    corruption_flag_path,
+    db_corruption_flag_present,
+    notify_db_corruption_once,
+)
 
 
 @pytest.fixture
@@ -300,3 +306,66 @@ class TestLoudCorruptionQuarantine:
             assert any("CORRUPTION" in r.message.upper() for r in error_records)
         finally:
             dm.close()
+
+
+class TestNotifyDbCorruptionOnce:
+    """notify_db_corruption_once() — end-of-startup surfacing of a quarantine
+    that happened during DatabaseManager.init_db(), once the notification
+    bridge actually exists."""
+
+    def test_no_flag_present_is_a_noop(self, db_path):
+        assert db_corruption_flag_present(db_path) is False
+        bridge = MagicMock()
+        assert notify_db_corruption_once(db_path, bridge) is False
+        bridge.notify_error.assert_not_called()
+
+    def test_flag_present_notifies_once_and_renames_flag(self, db_path):
+        flag_path = corruption_flag_path(db_path)
+        with open(flag_path, "w", encoding="utf-8") as f:
+            json.dump({"detected_at": "x", "db_path": db_path,
+                      "backup_path": "y", "error": "z"}, f)
+
+        assert db_corruption_flag_present(db_path) is True
+        bridge = MagicMock()
+        result = notify_db_corruption_once(db_path, bridge)
+
+        assert result is True
+        bridge.notify_error.assert_called_once()
+        (msg,), _ = bridge.notify_error.call_args
+        assert "corruption" in msg.lower()
+
+        # Flag renamed so a second call is a no-op (fires exactly once).
+        assert not os.path.exists(flag_path)
+        assert os.path.exists(f"{db_path}.corrupt_flag.notified.json")
+        assert db_corruption_flag_present(db_path) is False
+
+        bridge2 = MagicMock()
+        assert notify_db_corruption_once(db_path, bridge2) is False
+        bridge2.notify_error.assert_not_called()
+
+    def test_bridge_exception_does_not_prevent_flag_rename(self, db_path):
+        """Even if the bridge itself raises, the flag must still be renamed
+        so the corruption isn't re-announced forever."""
+        flag_path = corruption_flag_path(db_path)
+        with open(flag_path, "w", encoding="utf-8") as f:
+            json.dump({"detected_at": "x"}, f)
+
+        bridge = MagicMock()
+        bridge.notify_error.side_effect = RuntimeError("bridge down")
+
+        result = notify_db_corruption_once(db_path, bridge)  # must not raise
+        assert result is True
+        assert not os.path.exists(flag_path)
+        assert os.path.exists(f"{db_path}.corrupt_flag.notified.json")
+
+    def test_none_bridge_still_renames_flag(self, db_path):
+        """A None bridge (not yet configured) must not crash and must still
+        consume the flag so it doesn't leak into every future call."""
+        flag_path = corruption_flag_path(db_path)
+        with open(flag_path, "w", encoding="utf-8") as f:
+            json.dump({"detected_at": "x"}, f)
+
+        result = notify_db_corruption_once(db_path, None)
+        assert result is True
+        assert not os.path.exists(flag_path)
+        assert os.path.exists(f"{db_path}.corrupt_flag.notified.json")

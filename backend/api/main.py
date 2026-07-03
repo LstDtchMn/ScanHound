@@ -192,6 +192,17 @@ def _init_services(
     from backend.rename.service import RenameService
     reg._rename_service = RenameService(reg)
 
+    # Surface a DB corruption quarantine (if init_db() hit one) now that the
+    # notification bridge actually exists — DatabaseManager._notify_corruption
+    # fires during init_db(), before this bridge is wired up, so it's a
+    # best-effort bonus channel; this is the reliable, once-per-incident alert.
+    if backend.db is not None:
+        try:
+            from backend.database import notify_db_corruption_once
+            notify_db_corruption_once(backend.db.db_path, reg._notification_bridge)
+        except Exception:
+            logger.warning("DB corruption startup check failed (non-fatal)", exc_info=True)
+
 
 def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
     """Background thread that tracks JDownloader download + extraction outcomes.
