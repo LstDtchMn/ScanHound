@@ -55,6 +55,17 @@ TAGS_RE = re.compile(
 # Characters not allowed in filesystem names
 UNSAFE_CHARS_RE = re.compile(r'[<>"/\\|?*]')
 
+# ASCII control characters (0x00-0x1F) — invalid/dangerous in filenames on
+# Windows and generally unwanted anywhere.
+CONTROL_CHARS_RE = re.compile(r'[\x00-\x1f]')
+
+# Windows reserved device basenames (case-insensitive, stem-only — i.e. the
+# name before any extension). Matching the *whole* stem avoids false
+# positives on titles that merely start with or contain a reserved token
+# (e.g. "Conan", "Con Air", "COM1the Movie").
+RESERVED_NAME_RE = re.compile(
+    r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$', re.IGNORECASE)
+
 # Quality/release markers that end an episode title in TV filenames
 EPISODE_BOUNDARY_RE = re.compile(
     r'[.\s](?:Part[.\s\-]?\d|Pt[.\s\-]?\d|'
@@ -213,8 +224,12 @@ def parse_filename(filename) -> FilenameResult:
 def sanitize_filename(name):
     """Make a string safe for use as a filesystem filename.
 
-    Replaces colons with " -" (common Plex convention) and removes all
-    other characters that are illegal on Windows/macOS/Linux filesystems.
+    Replaces colons with " -" (common Plex convention), removes all other
+    characters that are illegal on Windows/macOS/Linux filesystems, strips
+    ASCII control characters, and guards against Windows reserved device
+    basenames (CON, PRN, AUX, NUL, COM1-9, LPT1-9) by appending a trailing
+    underscore so a pathological title becomes a clean job instead of a
+    hard filesystem failure.
 
     Args:
         name: Raw string to sanitize.
@@ -224,5 +239,8 @@ def sanitize_filename(name):
     """
     name = name.replace(":", " -")
     name = UNSAFE_CHARS_RE.sub("", name)
+    name = CONTROL_CHARS_RE.sub("", name)
     name = name.rstrip(". ")
+    if RESERVED_NAME_RE.match(name):
+        name = name + "_"
     return name

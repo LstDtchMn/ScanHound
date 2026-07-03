@@ -191,6 +191,48 @@ class TestSanitizeFilename:
     def test_empty_string(self):
         assert sanitize_filename("") == ""
 
+    def test_windows_reserved_name_con(self):
+        assert sanitize_filename("Con") == "Con_"
+
+    def test_windows_reserved_name_case_insensitive(self):
+        assert sanitize_filename("con") == "con_"
+        assert sanitize_filename("CON") == "CON_"
+
+    def test_windows_reserved_name_nul_stem(self):
+        # sanitize_filename operates on a component/stem, not a full path;
+        # "nul" as a bare stem must be guarded the same as "NUL".
+        assert sanitize_filename("nul") == "nul_"
+
+    def test_windows_reserved_name_com_lpt_ports(self):
+        assert sanitize_filename("COM1") == "COM1_"
+        assert sanitize_filename("com9") == "com9_"
+        assert sanitize_filename("LPT1") == "LPT1_"
+        assert sanitize_filename("lpt9") == "lpt9_"
+
+    def test_windows_reserved_name_prn_aux(self):
+        assert sanitize_filename("PRN") == "PRN_"
+        assert sanitize_filename("AUX") == "AUX_"
+
+    def test_non_reserved_lookalike_unchanged(self):
+        # Must not false-positive on titles that merely start with/contain
+        # a reserved token as a substring.
+        assert sanitize_filename("Conan") == "Conan"
+        assert sanitize_filename("Con Air") == "Con Air"
+        assert sanitize_filename("COM1the Movie") == "COM1the Movie"
+
+    def test_control_chars_stripped(self):
+        result = sanitize_filename("Movie\x00Title\x1f")
+        assert "\x00" not in result
+        assert "\x1f" not in result
+        assert result == "MovieTitle"
+
+    def test_control_chars_stripped_various(self):
+        s = "".join(chr(c) for c in range(0x00, 0x20))
+        assert sanitize_filename(s) == ""
+
+    def test_normal_title_unchanged_with_new_guards(self):
+        assert sanitize_filename("Rush (2013)") == "Rush (2013)"
+
 
 class TestMultiEpisodeParsing:
     def test_double_episode_concatenated(self):
