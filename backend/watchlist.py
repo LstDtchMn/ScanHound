@@ -101,24 +101,46 @@ class WatchlistItem:
 
 
 class WatchlistManager:
-    """Manages the watchlist with database persistence."""
+    """Manages the watchlist with database persistence.
+
+    Normally constructed with a shared ``db_manager=`` (a
+    ``backend.database.DatabaseManager``) so every read/write goes through
+    that manager's single locked connection to crawler.db — the same
+    connection every other subsystem uses — instead of opening a second
+    sqlite3 connection to the same file outside its RLock. The standalone
+    ``db_path=``-only mode is kept for isolated unit tests that spin up their
+    own throwaway SQLite file with no DatabaseManager involved.
+    """
 
     RESOLUTION_ORDER = {'720p': 1, '1080p': 2, '4K': 3}
 
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, db_manager=None):
         self.db_path = db_path or DB_PATH
+        self._db_manager = db_manager
         self._conn: Optional[sqlite3.Connection] = None
-        self._lock = threading.RLock()
+        # Reuse the shared DatabaseManager's RLock when routed through it, so
+        # watchlist reads/writes serialize with every other DB access instead
+        # of only with each other. Falls back to an own RLock in standalone
+        # mode (matches the previous behavior for isolated tests).
+        self._lock = db_manager._lock if db_manager is not None else threading.RLock()
         self._callbacks: List[Callable[[str, WatchlistItem], None]] = []
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        """Get database connection (thread-safe)."""
+        """Get a database connection.
+
+        Delegates to the shared DatabaseManager's locked connection when one
+        was supplied; otherwise falls back to a standalone connection (used
+        only by isolated tests that pass a bare ``db_path``).
+        """
+        if self._db_manager is not None:
+            return self._db_manager.get_connection()
         with self._lock:
             if self._conn is None:
                 self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
                 self._conn.row_factory = sqlite3.Row
                 self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
                 self._conn.execute("PRAGMA busy_timeout=5000")
             return self._conn
 

@@ -15,12 +15,21 @@ def _reset_registry_db():
     (bypassing the ``client`` fixture in test_api_routes.py), so without this
     the mock would leak into whichever test runs next in the same session.
     """
+    from backend.api.routes import results as results_mod
+    with results_mod._cache_parse_lock:
+        results_mod._cache_parse_cache["version"] = None
+        results_mod._cache_parse_cache["items"] = []
+        results_mod._cache_parse_cache["last_updated"] = None
     yield
     from backend.api.dependencies import registry
     registry.db = None
     from backend.api.routes.results import _selected, _selected_lock
     with _selected_lock:
         _selected.clear()
+    with results_mod._cache_parse_lock:
+        results_mod._cache_parse_cache["version"] = None
+        results_mod._cache_parse_cache["items"] = []
+        results_mod._cache_parse_cache["last_updated"] = None
 
 
 def _it(**kw):
@@ -149,10 +158,17 @@ def _row(title, status="missing", category="4k", **kw):
     return {"url": data["url"], "data": json.dumps(data), "last_seen_at": "2026-06-30T00:00:00"}
 
 
-def _client_with_cache(rows):
+def _client_with_cache(rows, version=None):
     registry.db = MagicMock()
     registry.db.get_background_cache.return_value = rows
     registry.db.get_dismissed_urls.return_value = set()
+    # A real (count, max_last_seen_at)-shaped version by default so the B2
+    # parse-cache in results.py behaves like it would against a real
+    # DatabaseManager (unchanged rows -> unchanged version -> cache hit).
+    if version is None:
+        max_seen = max((r.get("last_seen_at") for r in rows), default=None)
+        version = (len(rows), max_seen)
+    registry.db.get_background_cache_version.return_value = version
     # Auth is gated on registry.auth_nonce OR db.has_password(); a bare
     # MagicMock() makes has_password() truthy by default, which would 401
     # every request in this TestClient (no lifespan/token involved here).
@@ -224,6 +240,57 @@ def test_select_all_filtered_returns_matching_group_keys():
                json={"source": "cache", "filter": "missing", "category": "4k"}).json()
     assert r["selected_count"] == 1
     assert r["group_keys"] == ["A-k"]
+
+
+# ── B3: _selected stays bounded under many selects ─────────────────────
+
+def test_selected_set_stays_bounded_under_many_selects():
+    from backend.api.routes import results as results_mod
+    c = _client_with_cache([_row("A")])
+    over_cap = results_mod._MAX_SELECTED + 500
+    for batch_start in range(0, over_cap, 500):
+        keys = [f"k-{n}" for n in range(batch_start, batch_start + 500)]
+        r = c.post("/results/select", json={"group_keys": keys, "selected": True})
+        assert r.status_code == 200
+    assert r.json()["selected_count"] <= results_mod._MAX_SELECTED
+    with results_mod._selected_lock:
+        assert len(results_mod._selected) <= results_mod._MAX_SELECTED
+
+
+def test_selected_set_evicts_oldest_first():
+    from backend.api.routes import results as results_mod
+    c = _client_with_cache([_row("A")])
+    with results_mod._selected_lock:
+        results_mod._selected.clear()
+    # Fill to exactly the cap.
+    keys = [f"k-{n}" for n in range(results_mod._MAX_SELECTED)]
+    c.post("/results/select", json={"group_keys": keys, "selected": True})
+    with results_mod._selected_lock:
+        assert "k-0" in results_mod._selected
+    # One more selection should evict the oldest ("k-0"), not truncate arbitrarily.
+    c.post("/results/select", json={"group_keys": ["k-new"], "selected": True})
+    with results_mod._selected_lock:
+        assert len(results_mod._selected) == results_mod._MAX_SELECTED
+        assert "k-0" not in results_mod._selected
+        assert "k-new" in results_mod._selected
+
+
+def test_selected_set_reselecting_moves_to_end_not_evicted():
+    """Re-selecting an already-selected key must not make it the eviction
+    candidate ahead of keys that were never touched again."""
+    from backend.api.routes import results as results_mod
+    c = _client_with_cache([_row("A")])
+    with results_mod._selected_lock:
+        results_mod._selected.clear()
+    keys = [f"k-{n}" for n in range(results_mod._MAX_SELECTED)]
+    c.post("/results/select", json={"group_keys": keys, "selected": True})
+    # Re-select the oldest key -- it should move to the end, so the NEXT
+    # oldest ("k-1") becomes the eviction candidate instead.
+    c.post("/results/select", json={"group_keys": ["k-0"], "selected": True})
+    c.post("/results/select", json={"group_keys": ["k-new"], "selected": True})
+    with results_mod._selected_lock:
+        assert "k-0" in results_mod._selected  # protected by the re-select
+        assert "k-1" not in results_mod._selected  # evicted instead
 
 
 # ── posted_after / posted_before date-range filter ────────────────────────
@@ -315,3 +382,122 @@ def test_cached_posted_calendar_invalid_date_422():
     assert "calendar" in r.json()["detail"].lower() or "Invalid" in r.json()["detail"]
     r2 = c.get("/results/cached", params={"posted_before": "2025-13-01"})
     assert r2.status_code == 422
+
+
+# ── B2: server facets (available_genres / available_languages) ───────────
+
+def test_cached_facets_reflect_full_set_not_page():
+    rows = [
+        _row("A", genres=["Action", "Thriller"], language="English"),
+        _row("B", genres=["Drama"], language="French"),
+        _row("C", genres=["Action"], language="English"),
+    ]
+    c = _client_with_cache(rows)
+    r = c.get("/results/cached", params={"per_page": 1, "page": 1}).json()
+    # Only 1 item returned on the page, but facets must cover the whole set.
+    assert len(r["items"]) == 1
+    assert r["available_genres"] == ["Action", "Drama", "Thriller"]
+    assert r["available_languages"] == ["English", "French"]
+
+
+def test_cached_facets_unaffected_by_filters():
+    rows = [
+        _row("A", status="missing", genres=["Action"], language="English"),
+        _row("B", status="in_library", genres=["Drama"], language="French"),
+    ]
+    c = _client_with_cache(rows)
+    r = c.get("/results/cached", params={"filter": "missing"}).json()
+    assert r["total"] == 1  # filter narrows the page/total...
+    # ...but facets still reflect the whole (dismissal-filtered) visible set.
+    assert r["available_genres"] == ["Action", "Drama"]
+    assert r["available_languages"] == ["English", "French"]
+
+
+def test_cached_facets_deduplicated_and_sorted():
+    rows = [
+        _row("A", genres=["Zeta", "Action"], language="English"),
+        _row("B", genres=["Action"], language="English"),
+    ]
+    c = _client_with_cache(rows)
+    r = c.get("/results/cached").json()
+    assert r["available_genres"] == ["Action", "Zeta"]
+    assert r["available_languages"] == ["English"]
+
+
+def test_cached_facets_empty_genres_and_missing_language_ignored():
+    rows = [
+        _row("A", genres=[], language=""),
+        _row("B", genres=["Comedy"], language="German"),
+    ]
+    c = _client_with_cache(rows)
+    r = c.get("/results/cached").json()
+    assert r["available_genres"] == ["Comedy"]
+    assert r["available_languages"] == ["German"]
+
+
+def test_live_results_do_not_include_facets():
+    """B2 facets are only added to /results/cached, not the live endpoint."""
+    registry.db = MagicMock()
+    registry.db.get_dismissed_urls.return_value = set()
+    registry.db.has_password.return_value = False
+    c = TestClient(create_app())
+    r = c.get("/results").json()
+    assert "available_genres" not in r
+    assert "available_languages" not in r
+
+
+def test_cached_paging_does_not_change_facets_or_totals():
+    rows = [_row(f"T{n:03d}", genres=["Action"] if n % 2 == 0 else ["Drama"],
+                 language="English") for n in range(50)]
+    c = _client_with_cache(rows)
+    r1 = c.get("/results/cached", params={"per_page": 10, "page": 1}).json()
+    r2 = c.get("/results/cached", params={"per_page": 10, "page": 2}).json()
+    assert r1["total"] == r2["total"] == 50
+    assert r1["available_genres"] == r2["available_genres"] == ["Action", "Drama"]
+    assert r1["available_languages"] == r2["available_languages"] == ["English"]
+
+
+# ── B2: parse-cache (avoid re-parsing all cached JSON blobs every request) ─
+
+def test_cached_reuses_parsed_items_when_version_unchanged(monkeypatch):
+    rows = [_row("A"), _row("B")]
+    c = _client_with_cache(rows)
+
+    row_blobs = {r["data"] for r in rows}
+    parse_calls = []
+    real_loads = json.loads
+
+    def spy_loads(s, *a, **kw):
+        if isinstance(s, str) and s in row_blobs:
+            parse_calls.append(s)
+        return real_loads(s, *a, **kw)
+
+    monkeypatch.setattr(json, "loads", spy_loads)
+
+    r1 = c.get("/results/cached").json()
+    calls_after_first = len(parse_calls)
+    assert calls_after_first == 2  # one json.loads() per cached row, first request
+    r2 = c.get("/results/cached").json()
+
+    assert r1["total"] == r2["total"] == 2
+    # Second request must not re-parse the 2 cached JSON blobs (version
+    # unchanged -> served from the parse cache).
+    assert len(parse_calls) == calls_after_first, (
+        "results/cached re-parsed row JSON on a request where the "
+        "background cache version hadn't changed"
+    )
+
+
+def test_cached_reparses_when_version_changes():
+    rows_v1 = [_row("A")]
+    c = _client_with_cache(rows_v1, version=(1, "2026-06-30T00:00:00"))
+    r1 = c.get("/results/cached").json()
+    assert r1["total"] == 1
+
+    # Simulate a re-scrape: new row set + bumped version.
+    rows_v2 = [_row("A"), _row("B")]
+    registry.db.get_background_cache.return_value = rows_v2
+    registry.db.get_background_cache_version.return_value = (2, "2026-06-30T00:01:00")
+
+    r2 = c.get("/results/cached").json()
+    assert r2["total"] == 2

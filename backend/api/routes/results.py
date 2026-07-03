@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -192,8 +193,41 @@ def _filter_and_sort(items, *, filter=None, search=None, category=None,
     return result
 
 # Selection state
-_selected: set = set()
+#
+# B3: ScanHound is a single-user, single-instance app (one browser session
+# talking to one backend process) — there is no per-session/per-user
+# partitioning anywhere in the API, and this module-global set is shared by
+# every request. That's an accepted invariant, not a bug, PROVIDED it stays
+# bounded: without a cap, a client that repeatedly calls POST /select with
+# fresh group_keys (e.g. a buggy UI loop, or scanning a very large site
+# across many sessions without ever deselecting) grows this set forever.
+# _MAX_SELECTED caps it with FIFO eviction (oldest selections dropped first)
+# — generous enough that no real user selection (even "select all" against
+# the full 2000-row background cache) gets truncated, while still bounding
+# worst-case memory.
+_MAX_SELECTED = 5000
+_selected: "OrderedDict[str, None]" = OrderedDict()  # insertion-ordered set
 _selected_lock = threading.Lock()
+
+
+def _selected_add(keys) -> None:
+    """Add group_keys to _selected, evicting the oldest entries first if the
+    result would exceed _MAX_SELECTED. Must be called while holding
+    _selected_lock."""
+    for k in keys:
+        if k in _selected:
+            _selected.move_to_end(k)
+        else:
+            _selected[k] = None
+    while len(_selected) > _MAX_SELECTED:
+        _selected.popitem(last=False)
+
+
+def _selected_discard(keys) -> None:
+    """Remove group_keys from _selected. Must be called while holding
+    _selected_lock."""
+    for k in keys:
+        _selected.pop(k, None)
 
 
 class SelectRequest(BaseModel):
@@ -281,11 +315,18 @@ def _shape_results(
     posted_after: Optional[str] = None,
     posted_before: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
+    include_facets: bool = False,
 ) -> Dict[str, Any]:
     """Filter / search / sort / paginate item dicts into a results response.
 
     Shared by the live results and the pre-cached results so both behave
     identically (dismissal hiding, stats, selection annotation).
+
+    include_facets: when True, adds ``available_genres``/``available_languages``
+        (B2) computed over the same whole-set basis as ``stats`` — i.e. all
+        visible (non-dismissed) items, before status/search/category/genre/
+        language/quick filtering and before pagination — so the facet lists
+        never shrink to just the current page or the current filter selection.
     """
     # Hide items the user swiped away on the deck (unless explicitly requested).
     if not include_dismissed and reg.db is not None:
@@ -331,31 +372,93 @@ def _shape_results(
         "filtered_stats": _compute_status_counts(items),
         "title_counts": title_counts,
     }
+    if include_facets:
+        response.update(_compute_facets(visible_items))
     if extra:
         response.update(extra)
     return response
+
+
+# Parse-cache for the "cache" source (B2): get_background_cache() can hold up
+# to 2000 rows, and every row's `data` column is a JSON blob that previously
+# got re-parsed with json.loads() on every single request/page. Since the
+# blobs only change when the background scanner upserts a row (which always
+# bumps last_seen_at — see DatabaseManager.upsert_background_cache), we can
+# cheaply detect "nothing changed since last time" via
+# get_background_cache_version() (a single COUNT+MAX query) and skip the
+# full re-parse when the version token is unchanged.
+_cache_parse_lock = threading.Lock()
+_cache_parse_cache: Dict[str, Any] = {"version": None, "items": [], "last_updated": None}
+
+
+def _load_cached_items(reg: ServiceRegistry):
+    """Return (item_dicts, last_updated) for the pre-cached background-scan
+    rows, reusing the previous request's parsed items when the underlying
+    background_scan_cache table hasn't changed (see module docstring above
+    _cache_parse_cache)."""
+    if reg.db is None:
+        return [], None
+
+    version = reg.db.get_background_cache_version()
+    with _cache_parse_lock:
+        if _cache_parse_cache["version"] == version:
+            # Return copies so callers (which mutate items in-place, e.g. to
+            # annotate "selected") never corrupt the cached snapshot.
+            return (
+                [dict(i) for i in _cache_parse_cache["items"]],
+                _cache_parse_cache["last_updated"],
+            )
+
+    items: List[Dict[str, Any]] = []
+    last_updated: Optional[str] = None
+    for row in reg.db.get_background_cache():
+        try:
+            data = json.loads(row.get("data") or "{}")
+        except (ValueError, TypeError):
+            data = {}
+        if not data.get("url"):
+            data["url"] = row.get("url")
+        items.append(data)
+        seen = row.get("last_seen_at")
+        if seen and (last_updated is None or seen > last_updated):
+            last_updated = seen
+
+    with _cache_parse_lock:
+        _cache_parse_cache["version"] = version
+        _cache_parse_cache["items"] = items
+        _cache_parse_cache["last_updated"] = last_updated
+
+    return [dict(i) for i in items], last_updated
 
 
 def _load_items(source: str, reg: ServiceRegistry):
     """Return (item_dicts, last_updated) for the live last-scan set or the
     pre-cached background-scan rows."""
     if source == "cache":
-        items: List[Dict[str, Any]] = []
-        last_updated: Optional[str] = None
-        if reg.db is not None:
-            for row in reg.db.get_background_cache():
-                try:
-                    data = json.loads(row.get("data") or "{}")
-                except (ValueError, TypeError):
-                    data = {}
-                if not data.get("url"):
-                    data["url"] = row.get("url")
-                items.append(data)
-                seen = row.get("last_seen_at")
-                if seen and (last_updated is None or seen > last_updated):
-                    last_updated = seen
-        return items, last_updated
+        return _load_cached_items(reg)
     return [_media_item_to_dict(i) for i in get_last_scan_items()], None
+
+
+def _compute_facets(items: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """Compute server-side facets (available_genres, available_languages)
+    over the given item set. Callers pass the same "whole appropriate set"
+    basis used for the ``stats`` block (post-dismissal, pre status/search/
+    category/genre/language/quick filtering) so facets don't shrink to just
+    the current filter selection or the current page.
+    """
+    genres: set = set()
+    languages: set = set()
+    for i in items:
+        for g in (i.get("genres") or []):
+            if g:
+                genres.add(g)
+        lang = i.get("language")
+        if lang:
+            languages.add(lang)
+    return {
+        "available_genres": sorted(genres),
+        "available_languages": sorted(languages),
+    }
 
 
 @router.get("")
@@ -418,6 +521,7 @@ def get_cached_results(
         category=_csv(category), genre=_csv(genre), language=_csv(language),
         quick=_csv(quick), posted_after=posted_after, posted_before=posted_before,
         extra={"source": "cache", "last_updated": last_updated},
+        include_facets=True,
     )
 
 
@@ -425,9 +529,9 @@ def get_cached_results(
 def select_items(req: SelectRequest):
     with _selected_lock:
         if req.selected:
-            _selected.update(req.group_keys)
+            _selected_add(req.group_keys)
         else:
-            _selected.difference_update(req.group_keys)
+            _selected_discard(req.group_keys)
         return {"status": "ok", "selected_count": len(_selected)}
 
 
@@ -437,11 +541,13 @@ def select_all(req: Optional[SelectAllRequest] = None,
     if req is None:
         raw_items = get_last_scan_items()
         with _selected_lock:
+            keys = []
             for item in raw_items:
                 gk = getattr(item, "group_key", None) or (
                     item.get("group_key") if isinstance(item, dict) else None)
                 if gk:
-                    _selected.add(gk)
+                    keys.append(gk)
+            _selected_add(keys)
             return {"status": "ok", "selected_count": len(_selected),
                     "group_keys": sorted(_selected)}
     posted_after = _validate_date_param("posted_after", req.posted_after)
@@ -455,7 +561,7 @@ def select_all(req: Optional[SelectAllRequest] = None,
     keys = [str(i.get("group_key")) for i in matched if i.get("group_key")]
     with _selected_lock:
         _selected.clear()
-        _selected.update(keys)
+        _selected_add(keys)
         return {"status": "ok", "selected_count": len(_selected), "group_keys": keys}
 
 

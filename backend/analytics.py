@@ -24,6 +24,15 @@ from backend.config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
+# NOTE: StatsDashboard is normally constructed with a shared DatabaseManager
+# (see ``db_manager=``) so all reads go through that manager's single locked
+# connection — the same connection backend.database.DatabaseManager uses for
+# every other subsystem. This avoids a second sqlite3 connection to the same
+# file racing the primary one outside its RLock (and outside its
+# synchronous=NORMAL / busy_timeout / WAL setup). The standalone
+# ``db_path=``-only mode below is kept only for isolated unit tests that spin
+# up their own throwaway SQLite file with no DatabaseManager in the picture.
+
 
 @dataclass
 class LibraryStats:
@@ -120,20 +129,47 @@ class StatsDashboard:
     DOVI_BONUS = 25
     CODEC_SCORES = {'x264': 0, 'x265': 10, 'AV1': 15}
 
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, db_manager=None):
+        """Args:
+            db_path: Only used for the standalone fallback connection (no
+                ``db_manager`` supplied) — typically an isolated test DB.
+            db_manager: Shared ``backend.database.DatabaseManager`` instance.
+                When supplied, all reads use its single locked connection
+                instead of opening a second connection to the same file.
+        """
         self.db_path = db_path or DB_PATH
+        self._db_manager = db_manager
         self._conn: Optional[sqlite3.Connection] = None
-        self._conn_lock = threading.Lock()
+        # RLock (not Lock) — _db_lock() is held for the duration of each method
+        # while _get_connection() below re-acquires it internally, so it must
+        # be reentrant to avoid self-deadlock.
+        self._conn_lock = threading.RLock()
 
     def _get_connection(self) -> sqlite3.Connection:
-        """Get database connection (thread-safe)."""
+        """Get a database connection.
+
+        Delegates to the shared DatabaseManager's locked connection when one
+        was supplied; otherwise falls back to a standalone connection (used
+        only by isolated tests that pass a bare ``db_path``).
+        """
+        if self._db_manager is not None:
+            return self._db_manager.get_connection()
         with self._conn_lock:
             if self._conn is None:
                 self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
                 self._conn.row_factory = sqlite3.Row
                 self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
                 self._conn.execute("PRAGMA busy_timeout=5000")
             return self._conn
+
+    def _db_lock(self):
+        """Return the lock to hold while using the connection.
+
+        The shared DatabaseManager's RLock when routed through it, otherwise
+        this instance's own lock.
+        """
+        return self._db_manager._lock if self._db_manager is not None else self._conn_lock
 
     def get_library_stats(self, mode: str = "Movies") -> LibraryStats:
         """Get statistics for a library.
@@ -145,104 +181,104 @@ class StatsDashboard:
             LibraryStats object
         """
         stats = LibraryStats()
-        conn = self._get_connection()
-        cursor = conn.cursor()
-
         try:
-            # Get all items for this mode
-            cursor.execute(
-                'SELECT * FROM plex_cache WHERE content_type = ?',
-                (mode,)
-            )
-            rows = cursor.fetchall()
+            with self._db_lock():
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                # Get all items for this mode
+                cursor.execute(
+                    'SELECT * FROM plex_cache WHERE content_type = ?',
+                    (mode,)
+                )
+                rows = cursor.fetchall()
 
-            if not rows:
-                return stats
+                if not rows:
+                    return stats
 
-            # Count unique titles (deduplicate multi-version items)
-            cursor.execute(
-                "SELECT COUNT(DISTINCT COALESCE(NULLIF(imdb_id, ''), title || '|' || COALESCE(year, 0))) "
-                "FROM plex_cache WHERE content_type = ?",
-                (mode,)
-            )
-            stats.total_items = cursor.fetchone()[0] or 0
-            resolution_sizes = defaultdict(float)
-            codec_counts = defaultdict(int)
+                # Count unique titles (deduplicate multi-version items)
+                cursor.execute(
+                    "SELECT COUNT(DISTINCT COALESCE(NULLIF(imdb_id, ''), title || '|' || COALESCE(year, 0))) "
+                    "FROM plex_cache WHERE content_type = ?",
+                    (mode,)
+                )
+                stats.total_items = cursor.fetchone()[0] or 0
+                resolution_sizes = defaultdict(float)
+                codec_counts = defaultdict(int)
 
-            # Resolution priority: higher index = better
-            RES_PRIORITY = {'Unknown': 0, '480p': 1, '720p': 2, '1080p': 3, '4K': 4, '2160p': 4}
-            # HDR priority: higher = better (SDR=0, HDR=1, DV=2)
-            def hdr_rank(dovi, hdr):
-                if dovi: return 2
-                if hdr: return 1
-                return 0
+                # Resolution priority: higher index = better
+                RES_PRIORITY = {'Unknown': 0, '480p': 1, '720p': 2, '1080p': 3, '4K': 4, '2160p': 4}
+                # HDR priority: higher = better (SDR=0, HDR=1, DV=2)
+                def hdr_rank(dovi, hdr):
+                    if dovi: return 2
+                    if hdr: return 1
+                    return 0
 
-            # First pass: accumulate total size (all versions — correct for disk usage)
-            # and find each unique title's best resolution + HDR format
-            seen_best = {}  # uid -> { res, hdr_rank, is_4k }
-            for row in rows:
-                size = row['size'] or 0
-                res = row['res'] or 'Unknown'
-                is_dovi = row['dovi']
-                is_hdr = row['hdr']
+                # First pass: accumulate total size (all versions — correct for disk usage)
+                # and find each unique title's best resolution + HDR format
+                seen_best = {}  # uid -> { res, hdr_rank, is_4k }
+                for row in rows:
+                    size = row['size'] or 0
+                    res = row['res'] or 'Unknown'
+                    is_dovi = row['dovi']
+                    is_hdr = row['hdr']
 
-                stats.total_size_gb += size
-                resolution_sizes[res] += size
+                    stats.total_size_gb += size
+                    resolution_sizes[res] += size
 
-                uid = row['imdb_id'] if row['imdb_id'] else f"{row['title']}|{row['year'] or 0}"
-                rank = hdr_rank(is_dovi, is_hdr)
-                res_pri = RES_PRIORITY.get(res, 0)
+                    uid = row['imdb_id'] if row['imdb_id'] else f"{row['title']}|{row['year'] or 0}"
+                    rank = hdr_rank(is_dovi, is_hdr)
+                    res_pri = RES_PRIORITY.get(res, 0)
 
-                if uid not in seen_best:
-                    seen_best[uid] = {'res': res, 'res_pri': res_pri, 'hdr': rank, 'dovi': is_dovi, 'is_hdr': is_hdr}
-                else:
-                    prev = seen_best[uid]
-                    # Keep best resolution
-                    if res_pri > prev['res_pri']:
-                        prev['res'] = res
-                        prev['res_pri'] = res_pri
-                    # Keep best HDR format
-                    if rank > prev['hdr']:
-                        prev['hdr'] = rank
-                        prev['dovi'] = is_dovi
-                        prev['is_hdr'] = is_hdr
+                    if uid not in seen_best:
+                        seen_best[uid] = {'res': res, 'res_pri': res_pri, 'hdr': rank, 'dovi': is_dovi, 'is_hdr': is_hdr}
+                    else:
+                        prev = seen_best[uid]
+                        # Keep best resolution
+                        if res_pri > prev['res_pri']:
+                            prev['res'] = res
+                            prev['res_pri'] = res_pri
+                        # Keep best HDR format
+                        if rank > prev['hdr']:
+                            prev['hdr'] = rank
+                            prev['dovi'] = is_dovi
+                            prev['is_hdr'] = is_hdr
 
-            # Second pass: count per-unique-title using best version
-            resolution_counts = defaultdict(int)
-            quality_scores = []
-            stats.dovi_count = 0
-            stats.hdr_count = 0
-            stats.sdr_count = 0
+                # Second pass: count per-unique-title using best version
+                resolution_counts = defaultdict(int)
+                quality_scores = []
+                stats.dovi_count = 0
+                stats.hdr_count = 0
+                stats.sdr_count = 0
 
-            for best in seen_best.values():
-                resolution_counts[best['res']] += 1
+                for best in seen_best.values():
+                    resolution_counts[best['res']] += 1
 
-                if best['hdr'] == 2:
-                    stats.dovi_count += 1
-                elif best['hdr'] == 1:
-                    stats.hdr_count += 1
-                else:
-                    stats.sdr_count += 1
+                    if best['hdr'] == 2:
+                        stats.dovi_count += 1
+                    elif best['hdr'] == 1:
+                        stats.hdr_count += 1
+                    else:
+                        stats.sdr_count += 1
 
-                score = self.RESOLUTION_SCORES.get(best['res'], 50)
-                if best['dovi']:
-                    score += self.DOVI_BONUS
-                elif best['is_hdr']:
-                    score += self.HDR_BONUS
-                quality_scores.append(min(score, 100))
+                    score = self.RESOLUTION_SCORES.get(best['res'], 50)
+                    if best['dovi']:
+                        score += self.DOVI_BONUS
+                    elif best['is_hdr']:
+                        score += self.HDR_BONUS
+                    quality_scores.append(min(score, 100))
 
-            stats.resolution_counts = dict(resolution_counts)
-            stats.resolution_sizes = dict(resolution_sizes)
-            stats.codec_counts = dict(codec_counts)
+                stats.resolution_counts = dict(resolution_counts)
+                stats.resolution_sizes = dict(resolution_sizes)
+                stats.codec_counts = dict(codec_counts)
 
-            # Calculate overall quality score
-            if quality_scores:
-                stats.quality_score = sum(quality_scores) / len(quality_scores)
+                # Calculate overall quality score
+                if quality_scores:
+                    stats.quality_score = sum(quality_scores) / len(quality_scores)
 
-            # Calculate upgrade potential — unique items whose best resolution is not 4K
-            non_4k_unique = sum(1 for b in seen_best.values() if b['res_pri'] < 4)
-            total_unique = len(seen_best)
-            stats.upgrade_potential = (non_4k_unique / total_unique * 100) if total_unique > 0 else 0
+                # Calculate upgrade potential — unique items whose best resolution is not 4K
+                non_4k_unique = sum(1 for b in seen_best.values() if b['res_pri'] < 4)
+                total_unique = len(seen_best)
+                stats.upgrade_potential = (non_4k_unique / total_unique * 100) if total_unique > 0 else 0
 
         except Exception as e:
             logger.error(f"Error calculating library stats: {e}")
@@ -259,48 +295,48 @@ class StatsDashboard:
             ScanStats object
         """
         stats = ScanStats()
-        conn = self._get_connection()
-        cursor = conn.cursor()
-
         try:
-            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            with self._db_lock():
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cutoff = (datetime.now() - timedelta(days=days)).isoformat()
 
-            cursor.execute('''
-                SELECT * FROM scan_history
-                WHERE timestamp > ?
-                ORDER BY timestamp DESC
-            ''', (cutoff,))
-            rows = cursor.fetchall()
+                cursor.execute('''
+                    SELECT * FROM scan_history
+                    WHERE timestamp > ?
+                    ORDER BY timestamp DESC
+                ''', (cutoff,))
+                rows = cursor.fetchall()
 
-            if not rows:
-                return stats
+                if not rows:
+                    return stats
 
-            stats.total_scans = len(rows)
-            total_duration = 0
-            scans_by_day = defaultdict(int)
+                stats.total_scans = len(rows)
+                total_duration = 0
+                scans_by_day = defaultdict(int)
 
-            for row in rows:
-                stats.total_items_scanned += row['items_scanned'] or 0
-                stats.total_missing_found += row['missing_count'] or 0
-                stats.total_upgrades_found += row['upgrade_count'] or 0
-                total_duration += row['duration_seconds'] or 0
-                stats.items_per_scan.append(row['items_scanned'] or 0)
+                for row in rows:
+                    stats.total_items_scanned += row['items_scanned'] or 0
+                    stats.total_missing_found += row['missing_count'] or 0
+                    stats.total_upgrades_found += row['upgrade_count'] or 0
+                    total_duration += row['duration_seconds'] or 0
+                    stats.items_per_scan.append(row['items_scanned'] or 0)
 
-                # Group by day
+                    # Group by day
+                    try:
+                        scan_date = datetime.fromisoformat(row['timestamp']).strftime('%Y-%m-%d')
+                        scans_by_day[scan_date] += 1
+                    except (ValueError, TypeError):
+                        pass
+
+                stats.avg_duration = total_duration / stats.total_scans if stats.total_scans > 0 else 0
+                stats.scans_per_day = dict(scans_by_day)
+
+                # Get last scan time
                 try:
-                    scan_date = datetime.fromisoformat(row['timestamp']).strftime('%Y-%m-%d')
-                    scans_by_day[scan_date] += 1
-                except (ValueError, TypeError):
+                    stats.last_scan_time = datetime.fromisoformat(rows[0]['timestamp'])
+                except (ValueError, TypeError, IndexError):
                     pass
-
-            stats.avg_duration = total_duration / stats.total_scans if stats.total_scans > 0 else 0
-            stats.scans_per_day = dict(scans_by_day)
-
-            # Get last scan time
-            try:
-                stats.last_scan_time = datetime.fromisoformat(rows[0]['timestamp'])
-            except (ValueError, TypeError, IndexError):
-                pass
 
         except Exception as e:
             logger.error(f"Error calculating scan stats: {e}")
@@ -434,46 +470,46 @@ class StatsDashboard:
         Returns:
             Trend data for visualization
         """
-        conn = self._get_connection()
-        cursor = conn.cursor()
-
         try:
-            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            with self._db_lock():
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cutoff = (datetime.now() - timedelta(days=days)).isoformat()
 
-            cursor.execute('''
-                SELECT
-                    date(timestamp) as scan_date,
-                    SUM(items_scanned) as items,
-                    SUM(missing_count) as missing,
-                    SUM(upgrade_count) as upgrades,
-                    AVG(duration_seconds) as avg_duration,
-                    COUNT(*) as scan_count
-                FROM scan_history
-                WHERE timestamp > ?
-                GROUP BY date(timestamp)
-                ORDER BY scan_date
-            ''', (cutoff,))
+                cursor.execute('''
+                    SELECT
+                        date(timestamp) as scan_date,
+                        SUM(items_scanned) as items,
+                        SUM(missing_count) as missing,
+                        SUM(upgrade_count) as upgrades,
+                        AVG(duration_seconds) as avg_duration,
+                        COUNT(*) as scan_count
+                    FROM scan_history
+                    WHERE timestamp > ?
+                    GROUP BY date(timestamp)
+                    ORDER BY scan_date
+                ''', (cutoff,))
 
-            rows = cursor.fetchall()
+                rows = cursor.fetchall()
 
-            trends = {
-                'dates': [],
-                'items_scanned': [],
-                'missing_found': [],
-                'upgrades_found': [],
-                'avg_duration': [],
-                'scan_count': []
-            }
+                trends = {
+                    'dates': [],
+                    'items_scanned': [],
+                    'missing_found': [],
+                    'upgrades_found': [],
+                    'avg_duration': [],
+                    'scan_count': []
+                }
 
-            for row in rows:
-                trends['dates'].append(row['scan_date'])
-                trends['items_scanned'].append(row['items'] or 0)
-                trends['missing_found'].append(row['missing'] or 0)
-                trends['upgrades_found'].append(row['upgrades'] or 0)
-                trends['avg_duration'].append(round(row['avg_duration'] or 0, 2))
-                trends['scan_count'].append(row['scan_count'] or 0)
+                for row in rows:
+                    trends['dates'].append(row['scan_date'])
+                    trends['items_scanned'].append(row['items'] or 0)
+                    trends['missing_found'].append(row['missing'] or 0)
+                    trends['upgrades_found'].append(row['upgrades'] or 0)
+                    trends['avg_duration'].append(round(row['avg_duration'] or 0, 2))
+                    trends['scan_count'].append(row['scan_count'] or 0)
 
-            return trends
+                return trends
 
         except Exception as e:
             logger.error(f"Error getting trend data: {e}")
@@ -495,49 +531,49 @@ class StatsDashboard:
         Returns:
             Quality breakdown data
         """
-        conn = self._get_connection()
-        cursor = conn.cursor()
-
         try:
-            # Resolution distribution
-            cursor.execute('''
-                SELECT res, COUNT(*) as count, SUM(size) as total_size
-                FROM plex_cache
-                WHERE content_type = ?
-                GROUP BY res
-            ''', (mode,))
+            with self._db_lock():
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                # Resolution distribution
+                cursor.execute('''
+                    SELECT res, COUNT(*) as count, SUM(size) as total_size
+                    FROM plex_cache
+                    WHERE content_type = ?
+                    GROUP BY res
+                ''', (mode,))
 
-            resolution_data = {
-                'labels': [],
-                'counts': [],
-                'sizes': []
-            }
+                resolution_data = {
+                    'labels': [],
+                    'counts': [],
+                    'sizes': []
+                }
 
-            for row in cursor.fetchall():
-                resolution_data['labels'].append(row['res'] or 'Unknown')
-                resolution_data['counts'].append(row['count'])
-                resolution_data['sizes'].append(round(row['total_size'] or 0, 2))
+                for row in cursor.fetchall():
+                    resolution_data['labels'].append(row['res'] or 'Unknown')
+                    resolution_data['counts'].append(row['count'])
+                    resolution_data['sizes'].append(round(row['total_size'] or 0, 2))
 
-            # HDR distribution
-            cursor.execute('''
-                SELECT
-                    SUM(CASE WHEN dovi = 1 THEN 1 ELSE 0 END) as dovi,
-                    SUM(CASE WHEN hdr = 1 AND dovi = 0 THEN 1 ELSE 0 END) as hdr,
-                    SUM(CASE WHEN hdr = 0 AND dovi = 0 THEN 1 ELSE 0 END) as sdr
-                FROM plex_cache
-                WHERE content_type = ?
-            ''', (mode,))
+                # HDR distribution
+                cursor.execute('''
+                    SELECT
+                        SUM(CASE WHEN dovi = 1 THEN 1 ELSE 0 END) as dovi,
+                        SUM(CASE WHEN hdr = 1 AND dovi = 0 THEN 1 ELSE 0 END) as hdr,
+                        SUM(CASE WHEN hdr = 0 AND dovi = 0 THEN 1 ELSE 0 END) as sdr
+                    FROM plex_cache
+                    WHERE content_type = ?
+                ''', (mode,))
 
-            row = cursor.fetchone()
-            hdr_data = {
-                'labels': ['Dolby Vision', 'HDR', 'SDR'],
-                'counts': [row['dovi'] or 0, row['hdr'] or 0, row['sdr'] or 0]
-            }
+                row = cursor.fetchone()
+                hdr_data = {
+                    'labels': ['Dolby Vision', 'HDR', 'SDR'],
+                    'counts': [row['dovi'] or 0, row['hdr'] or 0, row['sdr'] or 0]
+                }
 
-            return {
-                'resolution': resolution_data,
-                'hdr': hdr_data
-            }
+                return {
+                    'resolution': resolution_data,
+                    'hdr': hdr_data
+                }
 
         except Exception as e:
             logger.error(f"Error getting quality breakdown: {e}")
@@ -576,23 +612,24 @@ class StatsDashboard:
         library directory (bucketed by the configured roots when provided).
         """
         roots = roots or {}
-        conn = self._get_connection()
-        cursor = conn.cursor()
         by_status: Dict[str, int] = {}
         by_directory: Dict[str, int] = {}
         by_method: Dict[str, int] = {}
         try:
-            for row in cursor.execute(
-                "SELECT status, COUNT(*) AS n FROM rename_jobs GROUP BY status"
-            ):
-                by_status[row["status"] or "unknown"] = row["n"]
-            for row in cursor.execute(
-                "SELECT destination_path, move_method FROM rename_jobs WHERE status = 'applied'"
-            ):
-                method = row["move_method"] or "unknown"
-                by_method[method] = by_method.get(method, 0) + 1
-                bucket = self._bucket_destination(row["destination_path"], roots)
-                by_directory[bucket] = by_directory.get(bucket, 0) + 1
+            with self._db_lock():
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                for row in cursor.execute(
+                    "SELECT status, COUNT(*) AS n FROM rename_jobs GROUP BY status"
+                ):
+                    by_status[row["status"] or "unknown"] = row["n"]
+                for row in cursor.execute(
+                    "SELECT destination_path, move_method FROM rename_jobs WHERE status = 'applied'"
+                ):
+                    method = row["move_method"] or "unknown"
+                    by_method[method] = by_method.get(method, 0) + 1
+                    bucket = self._bucket_destination(row["destination_path"], roots)
+                    by_directory[bucket] = by_directory.get(bucket, 0) + 1
         except sqlite3.Error as e:
             logger.warning("rename stats query failed: %s", e)
 
