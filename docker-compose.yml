@@ -51,6 +51,17 @@ services:
     networks:
       # Join the existing shared reverse-proxy network. NPM (also on `proxy`)
       # forwards to this container as http://scanhound:9721.
+      #
+      # A4 (documented, not changed): every other container on `proxy` can
+      # reach scanhound:9721 directly, bypassing NPM/Cloudflare Access — an
+      # east-west blast-radius risk if any of those containers is ever
+      # compromised. Not isolating it here: `proxy` is how NPM (a separate
+      # compose project) reaches this container at all, so moving scanhound
+      # off it (or onto a second dedicated network) requires coordinating a
+      # matching change in NPM's own compose file/network config first, or
+      # NPM loses the ability to forward to it. Deferred as an infra change
+      # outside this branch's scope; A1 (fail-closed auth) is the actual
+      # mitigation for what an east-west caller could do to this app today.
       - proxy
 
 volumes:
