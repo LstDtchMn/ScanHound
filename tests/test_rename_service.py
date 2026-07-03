@@ -83,7 +83,7 @@ def _service(db, tmdb_search, *, movie_lib="", tv_lib="", **cfg):
 
 def _extracted(tmp_path, name, content="x"):
     d = tmp_path / "extracted"
-    d.mkdir(exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True)
     f = d / name
     f.write_text(content)
     return str(d), str(f)
@@ -271,6 +271,167 @@ class TestLibraryGuard:
         assert job["status"] == "matched"  # guard doesn't fire when set
 
 
+# ── resolution=None -> ffprobe width fallback routing ──────────────────
+
+class TestResolutionProbe:
+    def test_unknown_resolution_probed_as_4k_routes_to_4k_library(
+            self, db, tmp_path, monkeypatch):
+        """A plain filename with no resolution tag that's actually a 4K file
+        (ffprobe reports width >= 3000) must route to the 4K library, not
+        silently land in the 1080p one."""
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.mkv")
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.probe_video_width",
+            lambda path, timeout=30: 3840)
+        lib = str(tmp_path / "lib")
+        lib_4k = str(tmp_path / "lib-4k")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_movie_library_4k=lib_4k)
+        job = db.get_rename_job(svc.process_package("pkg", save_to)[0])
+        assert job["destination_path"].startswith(lib_4k)
+        assert job["resolution"] == "2160p"
+
+    def test_ffprobe_failure_falls_back_to_1080p_no_crash(
+            self, db, tmp_path, monkeypatch):
+        """If ffprobe errors/times out/can't read the file, routing must fall
+        back to the CURRENT (non-4K) behavior — never raise."""
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.mkv")
+
+        def _boom(path, timeout=30):
+            raise RuntimeError("ffprobe exploded")
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.probe_video_width", _boom)
+        lib = str(tmp_path / "lib")
+        lib_4k = str(tmp_path / "lib-4k")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_movie_library_4k=lib_4k)
+        job = db.get_rename_job(svc.process_package("pkg", save_to)[0])
+        assert job["destination_path"].startswith(lib)
+        assert not job["destination_path"].startswith(lib_4k)
+
+    def test_already_tagged_resolution_skips_probe(self, db, tmp_path, monkeypatch):
+        """Probing is only for unknown resolution — a file already tagged
+        (e.g. 2160p) must not trigger an extra subprocess call."""
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.2160p.mkv")
+        called = {"n": 0}
+
+        def _spy(path, timeout=30):
+            called["n"] += 1
+            return 3840
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.probe_video_width", _spy)
+        lib = str(tmp_path / "lib")
+        lib_4k = str(tmp_path / "lib-4k")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_movie_library_4k=lib_4k)
+        job = db.get_rename_job(svc.process_package("pkg", save_to)[0])
+        assert called["n"] == 0
+        assert job["destination_path"].startswith(lib_4k)  # already 2160p, routes fine
+
+    def test_tv_job_unknown_resolution_skips_probe(self, db, tmp_path, monkeypatch):
+        """4K routing only applies to movies (_movie_root keys off resolution
+        for the movie library only) — a TV file with unknown resolution must
+        not pay for an ffprobe subprocess that can't change its routing."""
+        save_to, _ = _extracted(tmp_path, "Test.Show.S01E01.WEB-DL.mkv")
+        called = {"n": 0}
+
+        def _spy(path, timeout=30):
+            called["n"] += 1
+            return 3840
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.probe_video_width", _spy)
+        svc = _service(db, _show_search, tv_lib=str(tmp_path / "tvlib"))
+        ids = svc.process_package("tvpkg", save_to)
+        assert ids
+        assert called["n"] == 0
+
+    def test_movie_job_unknown_resolution_still_probes(self, db, tmp_path, monkeypatch):
+        """Sanity companion to the TV-skip test: movies must still invoke the
+        probe when resolution is unknown, so the guard is TV-specific only."""
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.mkv")
+        called = {"n": 0}
+
+        def _spy(path, timeout=30):
+            called["n"] += 1
+            return 3840
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.probe_video_width", _spy)
+        lib = str(tmp_path / "lib")
+        lib_4k = str(tmp_path / "lib-4k")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_movie_library_4k=lib_4k)
+        ids = svc.process_package("pkg", save_to)
+        assert ids
+        assert called["n"] == 1
+
+
+# ── TMDB year mismatch vs. parsed filename year ─────────────────────────
+
+def _carolina_search_2026(title, year, media_type):
+    """TMDB's chosen match has year 2026, one off the filename's 2025 — a
+    gap of 1 isn't penalized by confidence scoring, so this stays 'matched'."""
+    return [{"id": 999, "title": "Carolina Caroline", "release_date": "2026-01-15"}]
+
+
+def _carolina_search_2025(title, year, media_type):
+    return [{"id": 999, "title": "Carolina Caroline", "release_date": "2025-01-15"}]
+
+
+class TestYearMismatchWarning:
+    def test_match_year_differs_from_filename_year_warns(self, db, tmp_path):
+        save_to, _ = _extracted(tmp_path, "Carolina.Caroline.2025.1080p.mkv")
+        svc = _service(db, _carolina_search_2026, movie_lib=str(tmp_path / "lib"))
+        job = db.get_rename_job(svc.process_package("pkg", save_to)[0])
+        assert job["year"] == 2026
+        assert job["status"] == "matched"  # purely additive — must not block
+        assert job["warning_message"], "expected a warning to be attached"
+        assert "2025" in job["warning_message"]
+        assert "2026" in job["warning_message"]
+
+    def test_match_year_equal_to_filename_year_no_warning(self, db, tmp_path):
+        save_to, _ = _extracted(tmp_path, "Carolina.Caroline.2025.1080p.mkv")
+        svc = _service(db, _carolina_search_2025, movie_lib=str(tmp_path / "lib"))
+        job = db.get_rename_job(svc.process_package("pkg", save_to)[0])
+        assert job["year"] == 2025
+        assert job["status"] == "matched"
+        assert not job["warning_message"]
+
+    def test_collision_at_apply_appends_to_existing_warning(self, db, tmp_path):
+        """A job created with a year-mismatch warning (matched, apply-eligible)
+        that then collides at apply time must keep BOTH the original warning
+        and the new collision text — apply() must never clobber a
+        warning_message that was already set at creation time."""
+        lib = str(tmp_path / "lib")
+        # First job occupies the destination.
+        save_to1, _ = _extracted(tmp_path, "Carolina.Caroline.2025.1080p.mkv")
+        svc = _service(db, _carolina_search_2026, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        out1 = svc.apply(jid1)
+        assert out1["ok"] is True
+
+        # Second job: different source, same target path/filename, so it
+        # collides — and it carries the year-mismatch warning from creation.
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to2, _ = _extracted(
+            second_root, "Carolina.Caroline.2025.1080p.Alt.Release.mkv")
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        job2_before = db.get_rename_job(jid2)
+        assert job2_before["status"] == "matched"
+        assert "2025" in (job2_before["warning_message"] or "")
+        assert "2026" in (job2_before["warning_message"] or "")
+
+        out2 = svc.apply(jid2)
+        assert out2["ok"] is False
+        job2_after = db.get_rename_job(jid2)
+        assert job2_after["status"] == "needs_review"
+        combined = job2_after["warning_message"] or ""
+        # Original year-mismatch text must survive...
+        assert "2025" in combined and "2026" in combined
+        # ...alongside the new collision text.
+        assert "already exists" in combined.lower()
+
+
 # ── duplicate-destination conflict detection ──────────────────────────
 
 class TestDestinationConflict:
@@ -455,6 +616,58 @@ class TestApplyUndo:
         assert job["status"] == "applied"
         assert job["move_method"] in ("hardlink", "copy")
         assert os.path.exists(src)
+
+    def test_apply_second_of_two_colliding_jobs_needs_review_not_failed(self, db, tmp_path):
+        """Two source files that resolve to the identical destination (same
+        title/year/resolution/filename) — e.g. two different releases of the
+        same movie. Applying the first succeeds; applying the second must NOT
+        hard-fail with FileExistsError. It should land needs_review with a
+        clear warning, and the first job/file must be untouched."""
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, src1 = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        save_to2, src2 = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        job1 = db.get_rename_job(jid1)
+        job2 = db.get_rename_job(jid2)
+        # Sanity: both jobs really do target the identical destination file.
+        assert job1["destination_path"] == job2["destination_path"]
+        assert job1["new_filename"] == job2["new_filename"]
+
+        out1 = svc.apply(jid1)
+        assert out1["ok"] is True
+        applied_job1 = db.get_rename_job(jid1)
+        assert applied_job1["status"] == "applied"
+        dst = os.path.join(job1["destination_path"], job1["new_filename"])
+        assert os.path.isfile(dst)
+
+        out2 = svc.apply(jid2)
+        job2_after = db.get_rename_job(jid2)
+        assert job2_after["status"] == "needs_review"
+        assert job2_after["status"] != "failed"
+        assert "already exists" in (job2_after["warning_message"] or "").lower()
+        # The first job/file must be untouched by the second's failed apply.
+        assert db.get_rename_job(jid1)["status"] == "applied"
+        assert os.path.isfile(dst)
+        # Source of the second file must remain in place (nothing deleted).
+        assert os.path.exists(src2)
+
+    def test_apply_to_empty_destination_still_succeeds(self, db, tmp_path):
+        """Non-colliding apply must be unaffected by the new collision guard."""
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+        out = svc.apply(jid)
+        assert out["ok"] is True
+        job = db.get_rename_job(jid)
+        assert job["status"] == "applied"
+        dst = os.path.join(job["destination_path"], job["new_filename"])
+        assert os.path.isfile(dst)
 
     def test_apply_rolls_back_file_when_db_write_fails(self, db, tmp_path):
         """If the 'applied' DB write fails *after* the move, the file must be

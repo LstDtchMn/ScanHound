@@ -1282,6 +1282,23 @@ class RenameService:
             job.update(status="needs_review", warning_message="No confident match found")
             return self._create(job)
 
+        # Resolution routing fallback: a filename with no resolution tag
+        # (e.g. a 4K release scene-named without "2160p"/"4K") would silently
+        # route to the 1080p/default movie root since _movie_root only keys
+        # off resolution == '2160p'. Probe the actual video width via ffprobe
+        # only when the parse left it unknown — never for already-tagged
+        # files, so this never adds a subprocess call to the common case.
+        # TV never routes through _movie_root's 4K split, so skip the probe
+        # entirely there — it would just be an unnecessary subprocess call.
+        if match.get("media_type") != "tv" and not match.get("resolution"):
+            width = None
+            try:
+                width = _llm.probe_video_width(path)
+            except Exception:
+                width = None  # fail-safe: never let a probe error crash the file
+            if width and width >= 3000:
+                match["resolution"] = "2160p"
+
         fname, dest = _naming.build_target(
             {**match, "original_filename": filename},
             movie_root=self._movie_root(match.get("resolution")),
@@ -1300,16 +1317,36 @@ class RenameService:
             combined_episode=match.get("combined_episode"),
             split_file=match.get("split_file"))
 
+        # TMDB year mismatch: the chosen match's year can legitimately differ
+        # from the filename's parsed year by 1 without being penalised by
+        # confidence scoring (see confidence.match_confidence) — e.g. a
+        # limited theatrical release dated one way in the filename and
+        # another in TMDB. That's silent otherwise: the job stores the
+        # match's year, the destination folder uses it, and confidence stays
+        # high, so the user never sees the substitution. Purely additive/
+        # informational — never blocks apply or changes matching/confidence.
+        filename_year = parse_filename(filename).get("year")
+        match_year = match.get("year")
+        year_warn = ""
+        if filename_year and match_year and int(filename_year) != int(match_year):
+            year_warn = f"Year adjusted {filename_year} -> {match_year} from TMDB match"
+
         runtime_warn = match.get("runtime_warning", "")
         if conf < threshold:
             msg = f"Low confidence ({conf:.0f} < {threshold})"
             if runtime_warn:
                 msg += f"; {runtime_warn}"
+            if year_warn:
+                msg += f"; {year_warn}"
             job.update(status="needs_review", warning_message=msg)
         else:
             job["status"] = "matched"
             if runtime_warn:
                 job["warning_message"] = runtime_warn
+            if year_warn:
+                job["warning_message"] = (
+                    f"{job['warning_message']}; {year_warn}"
+                    if job.get("warning_message") else year_warn)
 
         if match.get("suggested_correction"):
             corr = match["suggested_correction"]
@@ -1412,6 +1449,32 @@ class RenameService:
             return {"ok": False, "error": "Source file missing"}
         dst = os.path.join(job.get("destination_path") or "",
                            job.get("new_filename") or os.path.basename(src))
+        # Collision guard: a prior apply (or a file already present in the
+        # library) may already occupy this destination — e.g. two different
+        # releases of the same title resolve to the identical target path.
+        # place_file() itself refuses to overwrite (raises FileExistsError),
+        # but letting that surface as a hard 'failed' job gives the user no
+        # guidance. Detect it up front and hold for review instead — never
+        # auto-replace or delete the existing file; that stays a manual,
+        # explicit user action.
+        if os.path.lexists(dst):
+            msg = f"A file already exists at the destination: {dst}"
+            try:
+                existing_size = os.path.getsize(dst)
+                candidate_size = os.path.getsize(src)
+                msg += (f" (existing {existing_size} bytes vs. candidate "
+                        f"{candidate_size} bytes)")
+            except OSError:
+                pass
+            msg += " — review to replace or keep the existing file."
+            # Append to (never clobber) a warning already on the job — e.g. a
+            # year-mismatch note set at creation time — so the collision guard
+            # never silently discards an earlier reason the file needs review.
+            existing = job.get("warning_message")
+            combined = f"{existing}; {msg}" if existing else msg
+            db.update_rename_job(job_id, status="needs_review", warning_message=combined)
+            self._broadcast(job_id)
+            return {"ok": False, "error": msg}
         method = self._cfg.get("auto_rename_move_method", "hardlink")
         deletions_require_confirmation = self._cfg.get(
             "deletions_require_confirmation", True)
