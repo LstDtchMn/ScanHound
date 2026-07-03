@@ -13,6 +13,7 @@ from backend.watchlist import (
     WatchlistItemType,
     WatchlistManager,
 )
+from backend.database import DatabaseManager
 
 
 # ── Enums ────────────────────────────────────────────────────────────
@@ -453,6 +454,60 @@ class TestClear:
         remaining = manager.get_all()
         assert len(remaining) == 1
         assert remaining[0].title == "W"
+
+
+class TestDatabaseManagerRouting:
+    """B1: WatchlistManager routed through a shared DatabaseManager must reuse
+    its single locked connection instead of opening a second sqlite3
+    connection to the same file (which would bypass the manager's RLock)."""
+
+    @pytest.fixture
+    def db_manager(self, tmp_path):
+        mgr = DatabaseManager(db_path=str(tmp_path / "shared.db"))
+        yield mgr
+        mgr.close()
+
+    def test_uses_db_manager_lock_not_own_lock(self, db_manager):
+        mgr = WatchlistManager(db_path=db_manager.db_path, db_manager=db_manager)
+        assert mgr._lock is db_manager._lock
+
+    def test_check_against_scan_results_does_not_open_own_connection(self, db_manager, monkeypatch):
+        mgr = WatchlistManager(db_path=db_manager.db_path, db_manager=db_manager)
+        mgr.add(_make_item(title="Dune", imdb_id="tt1160419"))
+
+        real_connect = sqlite3.connect
+        connect_calls = []
+
+        def spy_connect(*args, **kwargs):
+            connect_calls.append((args, kwargs))
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(sqlite3, "connect", spy_connect)
+        scan_items = [
+            {"imdb_id": "tt1160419", "display_title": "Dune Part Two", "year": 2024, "res": "4K", "dovi": False},
+        ]
+        matches = mgr.check_against_scan_results(scan_items)
+
+        assert connect_calls == [], (
+            "WatchlistManager.check_against_scan_results() called sqlite3.connect() "
+            "directly instead of routing through the shared DatabaseManager"
+        )
+        assert len(matches) == 1
+
+    def test_add_and_get_round_trip_via_db_manager(self, db_manager):
+        mgr = WatchlistManager(db_path=db_manager.db_path, db_manager=db_manager)
+        item_id = mgr.add(_make_item(title="Shared DB Item"))
+        fetched = mgr.get(item_id)
+        assert fetched is not None
+        assert fetched.title == "Shared DB Item"
+
+    def test_close_does_not_close_shared_manager_connection(self, db_manager):
+        mgr = WatchlistManager(db_path=db_manager.db_path, db_manager=db_manager)
+        mgr.add(_make_item(title="Still Alive"))
+        mgr.close()
+        # The shared manager's connection must still be usable afterward.
+        assert db_manager.get_connection() is not None
+        assert len(mgr.get_all()) == 1
 
 
 class TestResolutionOrder:

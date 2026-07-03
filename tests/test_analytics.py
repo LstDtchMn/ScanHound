@@ -18,6 +18,7 @@ from backend.analytics import (
     _analytics_lock,
 )
 import backend.analytics as analytics_mod
+from backend.database import DatabaseManager
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────
@@ -437,6 +438,60 @@ class TestRenameStats:
 
 
 # ── Rename destination bucketing: 4K prefix collision (review fix #4) ─
+
+class TestDatabaseManagerRouting:
+    """B1: StatsDashboard routed through a shared DatabaseManager must reuse
+    its single locked connection instead of opening a second sqlite3
+    connection to the same file (which would bypass the manager's RLock)."""
+
+    @pytest.fixture
+    def db_manager(self, tmp_path):
+        """A real DatabaseManager (full schema) seeded with sample rows."""
+        mgr = DatabaseManager(db_path=str(tmp_path / "shared.db"))
+        mgr.save_plex_cache(
+            [
+                {"key": "m1", "clean_title": "Movie A", "year": 2025, "imdb_id": "tt0000001",
+                 "res": "4K", "size": 60.0, "dovi": True, "hdr": True},
+                {"key": "m2", "clean_title": "Movie B", "year": 2024, "imdb_id": "tt0000002",
+                 "res": "4K", "size": 50.0, "dovi": False, "hdr": True},
+                {"key": "m3", "clean_title": "Movie C", "year": 2023, "imdb_id": "tt0000003",
+                 "res": "1080p", "size": 15.0, "dovi": False, "hdr": False},
+                {"key": "m4", "clean_title": "Movie D", "year": 2022, "imdb_id": "tt0000004",
+                 "res": "720p", "size": 5.0, "dovi": False, "hdr": False},
+            ],
+            mode="Movies",
+        )
+        yield mgr
+        mgr.close()
+
+    def test_dashboard_summary_does_not_open_own_connection(self, db_manager, monkeypatch):
+        sd = StatsDashboard(db_path=db_manager.db_path, db_manager=db_manager)
+
+        real_connect = sqlite3.connect
+        connect_calls = []
+
+        def spy_connect(*args, **kwargs):
+            connect_calls.append((args, kwargs))
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(sqlite3, "connect", spy_connect)
+        summary = sd.get_dashboard_summary()
+
+        assert connect_calls == [], (
+            "StatsDashboard.get_dashboard_summary() called sqlite3.connect() "
+            "directly instead of routing through the shared DatabaseManager"
+        )
+        assert summary["library"]["movies"]["total_items"] == 4
+
+    def test_uses_db_manager_lock_not_own_lock(self, db_manager):
+        sd = StatsDashboard(db_path=db_manager.db_path, db_manager=db_manager)
+        assert sd._db_lock() is db_manager._lock
+
+    def test_get_library_stats_via_db_manager(self, db_manager):
+        sd = StatsDashboard(db_path=db_manager.db_path, db_manager=db_manager)
+        stats = sd.get_library_stats("Movies")
+        assert stats.total_items == 4
+
 
 class TestBucketDestination:
     _roots = {"Movies": "/library/movies", "Movies (4K)": "/library/movies-4k",

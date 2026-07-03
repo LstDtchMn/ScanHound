@@ -540,18 +540,20 @@ class AppService:
         except Exception as e:
             logger.debug(f"NotificationManager not available: {e}")
 
-        # Watchlist
+        # Watchlist — routed through the shared DatabaseManager (self.db) so
+        # its reads/writes serialize with every other DB access instead of
+        # opening a second sqlite3 connection to the same file (see B1).
         try:
             from backend.watchlist import WatchlistManager
-            self.watchlist_manager = WatchlistManager()
+            self.watchlist_manager = WatchlistManager(db_manager=self.db)
             logger.info("WatchlistManager initialized")
         except Exception as e:
             logger.debug(f"WatchlistManager not available: {e}")
 
-        # Analytics
+        # Analytics — same shared-DatabaseManager routing as watchlist above.
         try:
             from backend.analytics import StatsDashboard
-            self.stats_dashboard = StatsDashboard()
+            self.stats_dashboard = StatsDashboard(db_manager=self.db)
             logger.info("StatsDashboard initialized")
         except Exception as e:
             logger.debug(f"StatsDashboard not available: {e}")
