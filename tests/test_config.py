@@ -92,7 +92,7 @@ EXPECTED_DEFAULT_KEYS = {
     "auto_rename_movie_library", "auto_rename_movie_library_4k", "auto_rename_tv_library",
     "auto_rename_template_movie", "auto_rename_template_tv",
     "auto_rename_plex_sort_titles", "auto_rename_llm_enabled",
-    "ollama_base_url", "ollama_model", "deletions_require_confirmation",
+    "ollama_base_url", "ollama_model", "ollama_vision_model", "deletions_require_confirmation",
     # Dolby Vision host-detector + labeler
     "dv_library_roots", "dv_detection", "dv_file_tagging", "dv_label_vocab",
     # Debug / logging

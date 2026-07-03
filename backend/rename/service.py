@@ -1086,6 +1086,7 @@ class RenameService:
                 and (not match or match.get("confidence", 0) < threshold)):
             base_url = self._cfg.get("ollama_base_url", "")
             model = self._cfg.get("ollama_model", "")
+            vision_model = self._cfg.get("ollama_vision_model", "")
             if base_url and model:
                 parsed = parse_filename(filename)
                 p_type = "tv" if parsed.get("is_tv") else "movie"
@@ -1139,13 +1140,23 @@ class RenameService:
                         match = picked
 
                 # Vision is the true last resort: only if still weak after subs.
+                # Sends raw frame bytes, so it MUST use a vision-capable model
+                # (ollama_vision_model) — never the text-only ollama_model,
+                # which would silently mishandle/error on image input. If no
+                # vision model is configured, skip the rung entirely rather
+                # than falling back to the text model.
                 if not match or match.get("confidence", 0) < threshold:
-                    vision = _llm.identify_from_frames(
-                        path, base_url=base_url, model=model,
-                        candidates=cands or None)
-                    picked = _apply(vision, "llm_vision")
-                    if picked:
-                        match = picked
+                    if not vision_model:
+                        logger.info(
+                            "vision rung skipped: no ollama_vision_model "
+                            "configured for %s", filename)
+                    else:
+                        vision = _llm.identify_from_frames(
+                            path, base_url=base_url, model=vision_model,
+                            candidates=cands or None)
+                        picked = _apply(vision, "llm_vision")
+                        if picked:
+                            match = picked
 
         # Runtime + episode-validity confirmation.
         # Skipped for season packs (season set, episode=None) — pack duration

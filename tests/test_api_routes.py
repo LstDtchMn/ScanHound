@@ -125,6 +125,16 @@ class TestSettings:
         resp = client.put("/settings", json={"theme_mode": "dark", "bogus_key": 123})
         assert resp.status_code == 422
 
+    def test_ollama_vision_model_round_trips(self, client):
+        """The vision-model config key must be settable/gettable independently
+        of ollama_model — the vision rung's model source (see
+        TestLlmVisionModelRouting in test_rename_service.py)."""
+        resp = client.put("/settings", json={"ollama_vision_model": "minicpm-v:latest"})
+        assert resp.status_code == 200
+        assert "ollama_vision_model" in resp.json()["updated_keys"]
+        data = client.get("/settings").json()
+        assert data.get("ollama_vision_model") == "minicpm-v:latest"
+
     def test_put_settings_ignores_masked_values(self, client):
         """Masked values (••••••••) should not be saved."""
         resp = client.put("/settings", json={"plex_token": "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"})

@@ -365,6 +365,7 @@ export interface Settings {
   auto_rename_llm_enabled?: boolean;
   ollama_base_url?: string;
   ollama_model?: string;
+  ollama_vision_model?: string;
 
   // Dolby Vision host detector + Plex labeling
   dv_library_roots?: string;

@@ -1511,6 +1511,14 @@
               oninput={(e) => settings.update((s) => ({ ...s, ollama_model: e.currentTarget.value }))}
               placeholder="llama3.1:8b" class={inputClass} />
           </label>
+          <label class="block">
+            <Tooltip text="Vision-capable model used ONLY for the frame-identification fallback (reading title cards / credits from extracted video frames). Must be a multimodal model, e.g. minicpm-v:latest — a text-only model like the one above cannot read images. If left blank, the vision fallback is skipped entirely.">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Vision model ⓘ</span>
+            </Tooltip>
+            <input type="text" value={$settings.ollama_vision_model ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, ollama_vision_model: e.currentTarget.value }))}
+              placeholder="minicpm-v:latest" class={inputClass} />
+          </label>
           <div class="flex items-center gap-2">
             <button onclick={testOllamaConnection} disabled={ollamaTesting} class={testBtnClass}>
               {ollamaTesting ? 'Testing…' : 'Test connection'}

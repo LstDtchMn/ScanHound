@@ -728,6 +728,79 @@ class TestLlmFallback:
         assert called["n"] == 0
 
 
+# ── Vision-model routing ────────────────────────────────────────────────
+# The vision rung (identify_from_frames) sends raw image bytes and MUST be
+# routed to a vision-capable model (ollama_vision_model), never the
+# text-only ollama_model — sending frames to a text model silently produces
+# garbage/errors. The subtitle and OCR-credits rungs are text-only calls
+# (tesseract does the OCR; the LLM only ever sees extracted text) and stay
+# on ollama_model.
+
+class TestLlmVisionModelRouting:
+    def _weak_media_service(self, db, tmp_path, monkeypatch, *, ollama_vision_model="vision-m"):
+        """A file whose filename-based match is too weak to short-circuit
+        the media (subs/ocr/vision) fallbacks, with subs+ocr stubbed to
+        no-op so only the vision rung's call is under test."""
+        save_to, _ = _extracted(tmp_path, "gibberish.release.name.mkv")
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.identify_from_subtitles",
+            lambda *a, **k: None)
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.identify_from_credits_ocr",
+            lambda *a, **k: None)
+        svc = _service(
+            db, _weak_search, movie_lib=str(tmp_path / "lib"),
+            auto_rename_llm_enabled=True, ollama_base_url="http://x",
+            ollama_model="text-m", ollama_vision_model=ollama_vision_model)
+        return svc, save_to
+
+    def test_vision_rung_uses_vision_model_not_text_model(self, db, tmp_path, monkeypatch):
+        seen = {}
+
+        def _spy(path, *, base_url, model, **k):
+            seen["model"] = model
+            return {"title": "The Matrix", "year": 1999, "media_type": "movie"}
+        monkeypatch.setattr("backend.rename.llm_identify.identify_from_frames", _spy)
+        svc, save_to = self._weak_media_service(db, tmp_path, monkeypatch)
+        svc.process_package("pkg", save_to)
+        assert seen.get("model") == "vision-m"
+        assert seen.get("model") != "text-m"
+
+    def test_vision_rung_skipped_when_no_vision_model_configured(self, db, tmp_path, monkeypatch):
+        """When ollama_vision_model is empty, the vision rung must be SKIPPED
+        entirely — never called with the text model as a fallback, since
+        that would silently send frames to a non-vision model again."""
+        called = {"n": 0}
+
+        def _spy(*a, **k):
+            called["n"] += 1
+            return {"title": "The Matrix", "year": 1999, "media_type": "movie"}
+        monkeypatch.setattr("backend.rename.llm_identify.identify_from_frames", _spy)
+        svc, save_to = self._weak_media_service(
+            db, tmp_path, monkeypatch, ollama_vision_model="")
+        svc.process_package("pkg", save_to)
+        assert called["n"] == 0
+
+    def test_subtitle_and_ocr_rungs_still_use_text_model(self, db, tmp_path, monkeypatch):
+        """Subs/OCR are text-only LLM calls (tesseract already did the OCR)
+        and must keep using ollama_model, unaffected by the vision-model
+        split."""
+        save_to, _ = _extracted(tmp_path, "gibberish.release.name.mkv")
+        seen = {}
+
+        def _subs_spy(path, *, base_url, model, **k):
+            seen["subs_model"] = model
+            return {"title": "The Matrix", "year": 1999, "media_type": "movie"}
+        monkeypatch.setattr(
+            "backend.rename.llm_identify.identify_from_subtitles", _subs_spy)
+        svc = _service(
+            db, _weak_search, movie_lib=str(tmp_path / "lib"),
+            auto_rename_llm_enabled=True, ollama_base_url="http://x",
+            ollama_model="text-m", ollama_vision_model="vision-m")
+        svc.process_package("pkg", save_to)
+        assert seen.get("subs_model") == "text-m"
+
+
 # ── accept proposal endpoints ─────────────────────────────────────────
 
 class TestAcceptProposals:
