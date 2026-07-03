@@ -107,12 +107,12 @@ class TestDetectSplitFile:
 
     def test_returns_none_when_no_sibling(self):
         # File is short but sibling doesn't exist
-        with patch("backend.rename.service._find_split_sibling", return_value=None):
+        with patch("backend.rename.episodes._find_split_sibling", return_value=None):
             result = _detect_split_file("/show/S01E05.Part1.mkv", 20.0, 44.0)
         assert result is None
 
     def test_detects_split_when_sibling_present(self):
-        with patch("backend.rename.service._find_split_sibling",
+        with patch("backend.rename.episodes._find_split_sibling",
                    return_value="/show/S01E05.Part2.mkv"):
             result = _detect_split_file("/show/S01E05.Part1.mkv", 20.0, 44.0)
         assert result is not None
