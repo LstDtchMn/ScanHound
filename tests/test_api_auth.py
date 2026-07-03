@@ -86,14 +86,43 @@ def test_status_reachable_without_token_when_locked(client):
 
 # ── middleware gating ─────────────────────────────────────────────────
 
-def test_api_open_before_password(client):
-    # No nonce, no password → dev/open mode, API reachable without a token.
-    assert client.get("/results").status_code != 401
+def test_api_closed_before_password_by_default(client, monkeypatch):
+    # No nonce, no password, no escape hatch → fail CLOSED (A1): a reset or
+    # corrupted DB must not silently reopen the whole API. The test-suite-wide
+    # autouse fixture sets SCANHOUND_ALLOW_OPEN=1 (conftest._default_to_open_auth)
+    # so the hundreds of pre-existing route tests keep working unmodified;
+    # explicitly unset it here to exercise the real production default.
+    monkeypatch.delenv("SCANHOUND_ALLOW_OPEN", raising=False)
+    assert client.get("/results").status_code == 401
+
+
+def test_bootstrap_set_password_reachable_with_no_credential(client, monkeypatch):
+    # The one bootstrap surface stays open pre-credential so the lockout in
+    # test_api_closed_before_password_by_default has a way out.
+    monkeypatch.delenv("SCANHOUND_ALLOW_OPEN", raising=False)
+    resp = client.post("/auth/set-password", json={"new_password": PASSWORD})
+    assert resp.status_code == 200, resp.text
+
+
+def test_health_reachable_with_no_credential(client, monkeypatch):
+    monkeypatch.delenv("SCANHOUND_ALLOW_OPEN", raising=False)
+    assert client.get("/health").status_code == 200
 
 
 def test_api_locked_after_password(client):
     _set_first_password(client)
     assert client.get("/results").status_code == 401
+
+
+def test_set_password_route_gated_again_once_password_exists(client, monkeypatch):
+    # Once a credential exists, /auth/set-password is no longer bootstrap-
+    # exempt — the route's own current-password check now applies (covered by
+    # test_change_password_requires_token_and_current), but the middleware
+    # must also gate it like any other protected route without a token.
+    monkeypatch.delenv("SCANHOUND_ALLOW_OPEN", raising=False)
+    _set_first_password(client)
+    resp = client.post("/auth/set-password", json={"new_password": NEW_PASSWORD})
+    assert resp.status_code == 401
 
 
 def test_spa_and_static_paths_never_gated(client):
@@ -102,6 +131,37 @@ def test_spa_and_static_paths_never_gated(client):
     # page could never load. Without a frontend build these 404, never 401.
     for path in ("/login", "/", "/_app/immutable/whatever.js"):
         assert client.get(path).status_code != 401, path
+
+
+def test_spa_paths_open_with_no_credential_either(client, monkeypatch):
+    # Also true in the fail-closed no-credential state — only the protected
+    # API segments are denied, never the SPA shell.
+    monkeypatch.delenv("SCANHOUND_ALLOW_OPEN", raising=False)
+    for path in ("/login", "/", "/_app/immutable/whatever.js"):
+        assert client.get(path).status_code != 401, path
+
+
+# ── escape hatch (SCANHOUND_ALLOW_OPEN) ────────────────────────────────
+# The whole suite runs with SCANHOUND_ALLOW_OPEN=1 by default (see
+# conftest._default_to_open_auth) so these tests are explicit about the value
+# under test rather than relying on that ambient default.
+
+def test_allow_open_escape_hatch_restores_open_behavior(client, monkeypatch):
+    monkeypatch.setenv("SCANHOUND_ALLOW_OPEN", "1")
+    assert client.get("/results").status_code != 401
+
+
+def test_allow_open_escape_hatch_unset_by_default(client, monkeypatch):
+    monkeypatch.delenv("SCANHOUND_ALLOW_OPEN", raising=False)
+    assert client.get("/results").status_code == 401
+
+
+def test_allow_open_only_matters_when_no_credential(client, monkeypatch):
+    # The escape hatch is for the "nothing configured" bootstrap case — it
+    # must not bypass a password that's actually been set.
+    monkeypatch.setenv("SCANHOUND_ALLOW_OPEN", "1")
+    _set_first_password(client)
+    assert client.get("/results").status_code == 401
 
 
 # ── login ─────────────────────────────────────────────────────────────

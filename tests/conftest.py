@@ -35,6 +35,21 @@ for _modname in ("backend.config", "backend.app_service"):
 
 
 @pytest.fixture(autouse=True)
+def _default_to_open_auth(monkeypatch):
+    """Most of the test suite predates the auth system entirely and hits API
+    routes with no password/nonce configured, expecting them reachable (the
+    historical default). Wave A (backend/api/main.py) changed that default to
+    fail-CLOSED when no credential exists, so a corrupted/reset DB can't
+    silently reopen a real deployment. Tests that specifically exercise the
+    fail-closed posture / escape hatch (tests/test_api_auth.py) override this
+    per-test via monkeypatch.setenv/delenv, which layers on top of (and wins
+    over) this autouse default within that test's scope.
+    """
+    monkeypatch.setenv("SCANHOUND_ALLOW_OPEN", "1")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_config_file(tmp_path, monkeypatch):
     """Redirect the app config file to a temp path for EVERY test.
 
