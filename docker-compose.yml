@@ -4,6 +4,11 @@ services:
     image: scanhound:latest
     container_name: scanhound
     restart: unless-stopped
+    # A2: the image already creates+switches to this non-root user (Dockerfile),
+    # but the named volume below (scanhound_db) is Docker-managed and typically
+    # gets created root:root on first `up` — pin the uid/gid here too so compose
+    # and the image agree, and see the one-time chown note on that volume.
+    user: "1000:1000"
     # No host port is published. The app is reached only through Nginx Proxy
     # Manager over the shared `proxy` network (see networks: below), so it is
     # never exposed on the host/LAN — NPM + Cloudflare front it.
@@ -24,6 +29,12 @@ services:
       # the legacy ./data DB into this volume (see backend/config.py). The DV
       # host-detector handoff files (dv_host.json/.db) stay on ./data since they
       # must be host-visible.
+      #
+      # ONE-TIME (A2, existing deployments only): this named volume was likely
+      # created root:root by earlier root-user runs, so the now-non-root
+      # container (uid 1000) may fail to write /dbvol until it's chowned once:
+      #   docker compose run --rm --user root scanhound chown -R 1000:1000 /dbvol
+      # A fresh volume created after this change doesn't need it.
       - scanhound_db:/dbvol
     environment:
       - TZ=America/New_York
