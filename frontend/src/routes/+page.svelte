@@ -29,6 +29,9 @@
     groupSizeRange, groupDateRange, groupStatusSummary, groupFormats,
     type ResultGroup, type GroupFormats
   } from '$lib/grouping';
+  import { isPhone } from '$lib/stores/viewport';
+  import MobileScanView from '$lib/components/mobile/MobileScanView.svelte';
+  import DetailSheet from '$lib/components/mobile/DetailSheet.svelte';
 
   let tmdbKeyMissing = $state(false);
   let tmdbBannerDismissed = $state(
@@ -354,6 +357,9 @@
   </div>
 {/if}
 
+{#if $isPhone}
+  <MobileScanView />
+{:else}
 <FilterBar />
 
 {#if $fromCache}
@@ -729,6 +735,7 @@
   {/if}
 </div>
 {/if}
+{/if}
 
 <StatusBar />
 
@@ -744,5 +751,14 @@
 <ResultActionSheet item={mobileActionItem} onclose={() => (mobileActionItem = null)} />
 
 {#if $selectedDetail}
-  <DetailPanel item={$selectedDetail} onclose={() => selectedDetail.set(null)} />
+  {#if $isPhone}
+    <DetailSheet
+      item={$selectedDetail}
+      siblings={$results.filter((r) => r.group_key === $selectedDetail!.group_key)}
+      onclose={() => selectedDetail.set(null)}
+      onselect={(s) => selectedDetail.set(s)}
+    />
+  {:else}
+    <DetailPanel item={$selectedDetail} onclose={() => selectedDetail.set(null)} />
+  {/if}
 {/if}
