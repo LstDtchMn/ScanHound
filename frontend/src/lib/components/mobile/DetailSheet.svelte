@@ -18,6 +18,19 @@
   }
   let { item, siblings = [], onclose, onselect }: Props = $props();
 
+  /** Existing library copies, parsed from the same plex_versions JSON the
+   *  desktop DetailPanel renders — [{res, dovi, hdr, size(GB)}]. This is the
+   *  upgrade-decision context: what you already own, per version. */
+  let plexVersions = $derived.by(() => {
+    if (!item.plex_versions) return [] as { res?: string; dovi?: boolean; hdr?: boolean; size?: number }[];
+    try {
+      const v = JSON.parse(item.plex_versions);
+      return Array.isArray(v) ? v : [];
+    } catch {
+      return [];
+    }
+  });
+
   let expanded = $state(false);
   let dragY = $state(0);
   let sheetEl = $state<HTMLDivElement>();
@@ -150,6 +163,38 @@
         </div>
       </div>
     </div>
+
+    <!-- In Library: what you already own (the upgrade-decision context) —
+         placed above the fold so it's visible at half-height before grabbing.
+         Same plex_info/plex_versions data the desktop DetailPanel shows. -->
+    {#if item.plex_info && item.plex_info !== '-'}
+      <div class="mt-3 p-2.5 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)]">
+        <h3 class="text-[10px] font-semibold text-[var(--text-secondary)] uppercase tracking-wider mb-1">In Library</h3>
+        <p class="text-xs text-[var(--text-primary)]">{item.plex_info}</p>
+        {#if plexVersions.length > 0}
+          <div class="flex flex-wrap gap-1.5 mt-1.5">
+            {#each plexVersions as pv}
+              <div class="inline-flex items-center gap-1 px-2 py-1 rounded bg-[var(--bg-secondary)] border border-[var(--border)]">
+                <span class="text-xs font-semibold {pv.res === '4K' ? 'text-yellow-500' : 'text-[var(--text-primary)]'}">{pv.res}</span>
+                {#if pv.dovi}<span class="text-[10px] font-bold text-purple-400">DV</span>{/if}
+                {#if pv.hdr && !pv.dovi}<span class="text-[10px] font-bold text-amber-400">HDR</span>{/if}
+                {#if pv.size}<span class="text-[10px] text-[var(--text-secondary)]">{pv.size}GB</span>{/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
+
+    <!-- A copy already grabbed (sent to JD) but not yet showing in Plex -->
+    {#if item.prior_grab}
+      <p class="mt-2 text-[11px] text-[var(--text-secondary)]">
+        Already grabbed: <span class="font-medium text-[var(--text-primary)]">{item.prior_grab.resolution}</span>
+        {#if item.prior_grab.dovi}<span class="font-bold text-purple-400"> DV</span>
+        {:else if item.prior_grab.hdr}<span class="font-bold text-amber-400"> HDR</span>{/if}
+        {#if item.prior_grab.size} · {item.prior_grab.size}{/if}
+      </p>
+    {/if}
 
     {#if item.description}
       <p class="text-xs text-[var(--text-secondary)] mt-3 leading-relaxed">{item.description}</p>
