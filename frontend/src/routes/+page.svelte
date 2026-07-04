@@ -748,7 +748,11 @@
   />
 {/if}
 
-<ResultActionSheet item={mobileActionItem} onclose={() => (mobileActionItem = null)} />
+{#if !$isPhone}
+  <!-- Desktop-branch action sheet (mobileActionItem is only settable from the
+       desktop markup); on phones MobileScanView mounts its own instance. -->
+  <ResultActionSheet item={mobileActionItem} onclose={() => (mobileActionItem = null)} />
+{/if}
 
 {#if $selectedDetail}
   {#if $isPhone}

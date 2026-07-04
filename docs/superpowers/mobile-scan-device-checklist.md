@@ -1,5 +1,10 @@
 # Mobile Scan — on-device test checklist (post web-deploy, pre-APK)
 Test at scanhound.turtleland.us in the phone browser first, then the APK.
+
+> **Maintenance note:** haptics need `<uses-permission android:name="android.permission.VIBRATE" />`
+> in `frontend/src-tauri/gen/android/app/src/main/AndroidManifest.xml`. That directory is
+> git-ignored (generated), so the permission lives on-disk only — after any fresh clone or
+> `npm run android:init`, re-add it next to the INTERNET permission or haptics silently no-op.
 - [ ] Wall renders 2 cols portrait / 3 landscape; stacked group cards work (tap expands in place)
 - [ ] Pull-to-refresh: arrow → armed haptic tick → spinner → list refreshes
 - [ ] Swipe a tile right: green underlay, haptic at threshold, "Grabbed" toast, tile marked downloading

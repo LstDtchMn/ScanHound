@@ -31,8 +31,12 @@
     if (disabled || refreshing || !tracker.state.active) return;
     const s = tracker.move(e.clientX, e.clientY);
     if (s.locked !== 'y' || s.dy <= 0) { pull = 0; armed = false; return; }
-    // While pulling, keep the browser from scrolling/overscroll-glow.
-    e.preventDefault();
+    // Native scroll/overscroll is suppressed by `touch-action: pan-y` +
+    // `overscroll-y-contain` on the scroller (preventDefault on pointermove
+    // has no effect on scrolling per the pointer-events spec). If Android
+    // Chrome ever claims the pan and fires pointercancel mid-pull (resetting
+    // it via onpointercancel below), switch to `touch-action: none` while
+    // y-locked — gated by the on-device checklist's PTR item.
     pull = Math.min(s.dy * DAMP, MAX_PULL);
     const nowArmed = pull >= TRIGGER;
     if (nowArmed && !armed) tap();

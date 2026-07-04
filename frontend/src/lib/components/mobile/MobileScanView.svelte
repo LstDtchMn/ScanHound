@@ -46,7 +46,7 @@
       if (!entries[0].isIntersecting) return;
       if (renderLimit < $filteredResults.length) renderLimit += 60;
       else if ($pagedMode && $hasMore && !$loadingMore) loadResults(false);
-    });
+    }, { rootMargin: '600px' }); // pre-fetch before the user hits the end (desktop parity)
     obs.observe(sentinel);
     return () => obs.disconnect();
   });
