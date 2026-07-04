@@ -7,7 +7,11 @@
   import BottomSheet from './BottomSheet.svelte';
   import type { StatusFilter, SortOption } from '$lib/stores/results';
 
-  let filterSheet = $state(false);
+  interface Props {
+    sheetOpen?: boolean;
+    showMobileTrigger?: boolean;
+  }
+  let { sheetOpen = $bindable(false), showMobileTrigger = true }: Props = $props();
   let activeFilterCount = $derived(
     ($statusFilter !== 'all' ? 1 : 0) +
     ($searchFilter ? 1 : 0) +
@@ -453,19 +457,21 @@
       </button>
     {/each}
   </div>
-  <button
-    onclick={() => (filterSheet = true)}
-    class="relative shrink-0 flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--border)]"
-  >
-    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 4h18M6 12h12M10 20h4" /></svg>
-    Filters
-    {#if activeFilterCount > 0}
-      <span class="absolute -top-1.5 -right-1.5 min-w-[1rem] h-4 px-1 rounded-full bg-[var(--accent)] text-white text-[10px] flex items-center justify-center">{activeFilterCount}</span>
-    {/if}
-  </button>
+  {#if showMobileTrigger}
+    <button
+      onclick={() => (sheetOpen = true)}
+      class="relative shrink-0 flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--border)]"
+    >
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 4h18M6 12h12M10 20h4" /></svg>
+      Filters
+      {#if activeFilterCount > 0}
+        <span class="absolute -top-1.5 -right-1.5 min-w-[1rem] h-4 px-1 rounded-full bg-[var(--accent)] text-white text-[10px] flex items-center justify-center">{activeFilterCount}</span>
+      {/if}
+    </button>
+  {/if}
 </div>
 
-<BottomSheet open={filterSheet} title="View & filters" onclose={() => (filterSheet = false)}>
+<BottomSheet open={sheetOpen} title="View & filters" onclose={() => (sheetOpen = false)}>
   <div class="space-y-4">
     <!-- View switch -->
     <div>
