@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get } from 'svelte/store';
-  import { searchFilter, selectedKeys, deselectAll, filteredResults, markDownloaded, markGrabbedSiblings } from '$lib/stores/results';
+  import { searchFilter, selectedKeys, deselectAll, filteredResults, markDownloaded, markGrabbedSiblings, phoneColumns } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -78,6 +78,20 @@
     <button class="flex-1 flex items-center justify-center gap-1.5 py-2 text-xs text-[var(--text-secondary)]" onclick={ondeck} aria-label="Triage deck">
       <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14-4H5m14 8H5m14 4H5"/></svg>
       Deck
+    </button>
+    <button
+      class="shrink-0 p-2 text-[var(--text-secondary)] active:text-[var(--accent)]"
+      onclick={() => phoneColumns.set($phoneColumns === 1 ? 2 : 1)}
+      aria-label={$phoneColumns === 1 ? 'Switch to 2-column poster wall' : 'Switch to single large poster'}
+      aria-pressed={$phoneColumns === 1}
+    >
+      {#if $phoneColumns === 1}
+        <!-- currently 1-up → icon shows the 2-up wall you'd switch to -->
+        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>
+      {:else}
+        <!-- currently 2-up → icon shows the single large poster you'd switch to -->
+        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><rect x="5" y="4" width="14" height="16" rx="1"/></svg>
+      {/if}
     </button>
   {/if}
 </div>

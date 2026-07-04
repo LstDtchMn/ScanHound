@@ -99,6 +99,11 @@ export type GridColumns = 'auto' | number;
 export const gridColumns = persisted<GridColumns>('sh-grid-columns', 'auto');
 export const GRID_COLUMN_CHOICES: GridColumns[] = ['auto', 2, 3, 4, 5, 6, 8];
 
+/** Phone poster-wall column count: 1 = single large poster per row, 2 = the
+ *  multi-poster wall. Device-local + persisted; independent of the desktop
+ *  gridColumns above (a phone screen only sensibly holds 1 or 2 posters). */
+export const phoneColumns = persisted<1 | 2>('sh-phone-columns', 2);
+
 
 /** Active quick-filter chips: any of '4k' | 'hdrdv' | 'inplex'. */
 export const quickFilters = persisted<string[]>('sh-quick-filters', []);

@@ -2,7 +2,7 @@
   import { get } from 'svelte/store';
   import {
     filteredResults, filteredTotal, titleCounts, pagedMode, hasMore, loadingMore,
-    loadResults, handleReconnectSnapshot,
+    loadResults, handleReconnectSnapshot, phoneColumns,
     dismissItem, restoreItem, markDownloaded, markGrabbedSiblings
   } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
@@ -31,6 +31,8 @@
 
   let renderedResults = $derived($filteredResults.slice(0, renderLimit));
   let groups = $derived(groupResults(renderedResults));
+  // 1-up = single large poster per row (landscape shows 2); 2-up = the wall.
+  let gridClass = $derived($phoneColumns === 1 ? 'grid-cols-1 landscape:grid-cols-2' : 'grid-cols-2 landscape:grid-cols-3');
   let siblingCounts = $derived(computeSiblingCounts($filteredResults, $titleCounts, $pagedMode));
 
   function toggleGroup(title: string) {
@@ -79,7 +81,7 @@
 <FilterBar bind:sheetOpen={filterSheetOpen} showMobileTrigger={false} />
 
 <PullToRefresh onrefresh={refresh}>
-  <div class="grid grid-cols-2 landscape:grid-cols-3 gap-2 p-2">
+  <div class="grid {gridClass} gap-2 p-2">
     {#each groups as group (group.title)}
       {#if isDuplicateGroup(group, siblingCounts) && !expandedGroups.has(group.title)}
         <GroupTile
