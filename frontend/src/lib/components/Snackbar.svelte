@@ -14,6 +14,12 @@
         <div>
           <p class="font-medium text-sm">{toast.title}</p>
           <p class="text-xs text-[var(--text-secondary)] mt-0.5">{toast.body}</p>
+          {#if toast.action}
+            <button
+              class="mt-1.5 text-xs font-semibold text-[var(--accent)] hover:underline"
+              onclick={() => { toast.action?.run(); dismissToast(toast.id); }}
+            >{toast.action.label}</button>
+          {/if}
         </div>
         <button
           class="text-[var(--text-secondary)] hover:text-[var(--text-primary)] text-sm leading-none"

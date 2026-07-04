@@ -1,12 +1,18 @@
 import { writable } from 'svelte/store';
 import { connection } from './connection';
 
+export interface ToastAction {
+  label: string;
+  run: () => void;
+}
+
 export interface Toast {
   id: string;
   title: string;
   body: string;
   priority: string;
   timestamp: number;
+  action?: ToastAction;
 }
 
 const MAX_TOASTS = 5;
@@ -22,9 +28,14 @@ connection.on('notification', (data) => {
   );
 });
 
-export function addToast(title: string, body: string, priority = 'normal') {
+export function addToast(
+  title: string,
+  body: string,
+  priority = 'normal',
+  action?: ToastAction
+) {
   const id = crypto.randomUUID();
-  const toast: Toast = { id, title, body, priority, timestamp: Date.now() };
+  const toast: Toast = { id, title, body, priority, timestamp: Date.now(), action };
 
   toasts.update((t) => {
     const next = [toast, ...t].slice(0, MAX_TOASTS);
