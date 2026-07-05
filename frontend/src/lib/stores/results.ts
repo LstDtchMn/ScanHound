@@ -53,13 +53,12 @@ export const resolutionFilter = persisted<string[]>('sh-resolution-filter', []);
 export function toggleResolutionFilter(key: string) {
   resolutionFilter.update((r) => (r.includes(key) ? r.filter((x) => x !== key) : [...r, key]));
 }
-/** The filter keys an item satisfies: its resolution, plus 'TV' when it's a
- *  TV show (matches backend _resolution_keys). */
+/** The filter keys an item satisfies. A TV show keys ONLY as 'TV' (never by
+ *  resolution) so the 4K/1080p filters are movies-only; a movie keys by its
+ *  resolution. Matches backend _resolution_keys. */
 export function resolutionKeysFor(i: ScanResult): string[] {
-  const keys: string[] = [];
-  if (i.resolution) keys.push(i.resolution);
-  if (i.category === 'tv' || i.season != null) keys.push('TV');
-  return keys;
+  if (i.category === 'tv' || i.season != null) return ['TV'];
+  return i.resolution ? [i.resolution] : [];
 }
 /** Date-range filter bounds, "YYYY-MM-DD" strings; '' means off. Session-only
  *  (not persisted), same as genre/language filters. Inclusive on both ends —

@@ -35,17 +35,15 @@ def _effective_category(item: Dict[str, Any]) -> str:
 
 
 def _resolution_keys(item: Dict[str, Any]) -> set:
-    """Filter keys an item satisfies for the resolution/type facet: its own
-    resolution ('4K'/'1080p'/'720p'), plus 'TV' when it's a TV show. The
+    """Filter keys an item satisfies for the resolution/type facet. A TV show
+    keys ONLY as 'TV' (never by resolution) so the 4K/1080p filters are
+    movies-only; a movie keys by its resolution ('4K'/'1080p'/'720p'). The
     frontend twin is resolutionKeysFor() in stores/results.ts — keep in sync.
     """
-    keys = set()
-    res = item.get("resolution")
-    if res:
-        keys.add(res)
     if _effective_category(item) == "tv":
-        keys.add("TV")
-    return keys
+        return {"TV"}
+    res = item.get("resolution")
+    return {res} if res else set()
 
 
 def _has_plex_copy(item: Dict[str, Any]) -> bool:

@@ -64,17 +64,19 @@ def test_quick_inplex_and_hdrdv():
     assert {i["title"] for i in _filter_and_sort([inplex, dv, plain], quick=["hdrdv"])} == {"D"}
 
 
-def test_resolution_facet_is_or_combined():
+def test_resolution_facet_is_or_combined_and_movies_only():
     uhd = _it(title="U", resolution="4K", category="4k", season=None)
     hd = _it(title="H", resolution="1080p", category="remux", season=None)
-    tv = _it(title="T", resolution="1080p", category="tv", season=1)
-    # Single key filters to that resolution/type.
+    tv = _it(title="T", resolution="4K", category="tv", season=1)  # a 4K TV show
+    # 4K/1080p are MOVIES ONLY — a 4K TV show must NOT appear under '4K'.
     assert {i["title"] for i in _filter_and_sort([uhd, hd, tv], resolution=["4K"])} == {"U"}
-    # 'TV' keys off effective category, not resolution — matches the TV row
-    # regardless of its 1080p resolution.
+    assert {i["title"] for i in _filter_and_sort([uhd, hd, tv], resolution=["1080p"])} == {"H"}
+    # 'TV' keys off effective category, regardless of the show's resolution.
     assert {i["title"] for i in _filter_and_sort([uhd, hd, tv], resolution=["TV"])} == {"T"}
-    # OR within the set: 4K + 1080p shows the union (both res rows + the 1080p TV row).
-    assert {i["title"] for i in _filter_and_sort([uhd, hd, tv], resolution=["4K", "1080p"])} == {"U", "H", "T"}
+    # OR within the set: 4K + 1080p shows only the movies (no TV leakage).
+    assert {i["title"] for i in _filter_and_sort([uhd, hd, tv], resolution=["4K", "1080p"])} == {"U", "H"}
+    # 4K + TV shows the 4K movie AND the TV show.
+    assert {i["title"] for i in _filter_and_sort([uhd, hd, tv], resolution=["4K", "TV"])} == {"U", "T"}
     # No filter shows everything.
     assert len(_filter_and_sort([uhd, hd, tv])) == 3
 
