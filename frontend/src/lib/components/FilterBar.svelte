@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, tileSize, posterAspect, tileShowMeta, gridGap, gridColumns, GRID_COLUMN_CHOICES, postedAfter, postedBefore, pagedMode, filteredTotal, type TileSize, type PosterAspect, type GridGap } from '$lib/stores/results';
+  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, tileSize, posterAspect, tileShowMeta, gridGap, gridColumns, GRID_COLUMN_CHOICES, postedAfter, postedBefore, pagedMode, filteredTotal, mobileChromeCollapsed, type TileSize, type PosterAspect, type GridGap } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import { DOWNLOAD_HOSTS } from '$lib/constants';
+  import { scanState } from '$lib/stores/scanner';
   import BottomSheet from './BottomSheet.svelte';
   import type { StatusFilter, SortOption } from '$lib/stores/results';
 
@@ -25,6 +26,11 @@
     postedAfter.set('');
     postedBefore.set('');
   }
+
+  // Collapses in sync with ScanControls' mobile bar and the layout's mobile
+  // title bar (same store, same idle-gate) so the phone's top chrome moves
+  // as one coherent unit rather than partially collapsing.
+  let hideMobileRow = $derived($mobileChromeCollapsed && $scanState === 'idle');
 
   const quickChips = [
     { key: '4k', label: '4K' },
@@ -440,8 +446,13 @@
   </div>
 </div>
 
-<!-- Mobile toolbar: scrollable status chips + a Filters button → bottom sheet -->
-<div class="flex md:hidden items-center gap-1.5 px-2 py-1.5 border-b border-[var(--border)]">
+<!-- Mobile toolbar: scrollable status chips + a Filters button → bottom sheet.
+     Collapses fully (grid-rows 0fr) in sync with the scan bar / title bar. -->
+<div
+  class="grid md:hidden transition-[grid-template-rows] duration-200 ease-out"
+  style="grid-template-rows: {hideMobileRow ? '0fr' : '1fr'};"
+>
+<div class="overflow-hidden flex items-center gap-1.5 px-2 py-1.5 border-b border-[var(--border)]">
   <div class="flex-1 min-w-0 overflow-x-auto flex gap-1">
     {#each filters as f}
       <button
@@ -469,6 +480,7 @@
       {/if}
     </button>
   {/if}
+</div>
 </div>
 
 <BottomSheet open={sheetOpen} title="View & filters" onclose={() => (sheetOpen = false)}>

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { scanState, scanProgress, scanPhase, scanItemCount, startScan, stopScan } from '$lib/stores/scanner';
   import type { ScanType } from '$lib/stores/scanner';
-  import { clearResults, categoryFilter, scanBarCollapsed } from '$lib/stores/results';
+  import { clearResults, categoryFilter, mobileChromeCollapsed } from '$lib/stores/results';
   import { get } from 'svelte/store';
   import BottomSheet from './BottomSheet.svelte';
 
@@ -83,7 +83,7 @@
 
   // Auto-hide the mobile bar per scroll direction (set by MobileScanView), but
   // never while a scan is actually running/stopping — progress must stay pinned.
-  let hideMobileBar = $derived($scanBarCollapsed && $scanState === 'idle');
+  let hideMobileBar = $derived($mobileChromeCollapsed && $scanState === 'idle');
 
   function handleStart() {
     hasInteracted = true;

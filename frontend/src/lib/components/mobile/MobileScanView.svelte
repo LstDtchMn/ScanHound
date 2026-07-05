@@ -2,7 +2,7 @@
   import { get } from 'svelte/store';
   import {
     filteredResults, filteredTotal, titleCounts, pagedMode, hasMore, loadingMore,
-    loadResults, handleReconnectSnapshot, phoneColumns, scanBarCollapsed,
+    loadResults, handleReconnectSnapshot, phoneColumns, mobileChromeCollapsed,
     dismissItem, restoreItem, markDownloaded, markGrabbedSiblings
   } from '$lib/stores/results';
   import { onMount } from 'svelte';
@@ -68,15 +68,15 @@
   let lastScrollTop = 0;
   function onWallScroll(scrollTop: number) {
     const delta = scrollTop - lastScrollTop;
-    if (scrollTop < 24) scanBarCollapsed.set(false);
-    else if (delta > 6) scanBarCollapsed.set(true);
-    else if (delta < -6) scanBarCollapsed.set(false);
+    if (scrollTop < 24) mobileChromeCollapsed.set(false);
+    else if (delta > 6) mobileChromeCollapsed.set(true);
+    else if (delta < -6) mobileChromeCollapsed.set(false);
     lastScrollTop = scrollTop;
   }
 
   onMount(() => {
-    scanBarCollapsed.set(false); // start visible
-    return () => scanBarCollapsed.set(false); // never leave it hidden after navigating away
+    mobileChromeCollapsed.set(false); // start visible
+    return () => mobileChromeCollapsed.set(false); // never leave it hidden after navigating away
   });
 
   function grab(item: ScanResult) {

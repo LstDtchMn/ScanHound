@@ -104,11 +104,14 @@ export const GRID_COLUMN_CHOICES: GridColumns[] = ['auto', 2, 3, 4, 5, 6, 8];
  *  gridColumns above (a phone screen only sensibly holds 1 or 2 posters). */
 export const phoneColumns = persisted<1 | 2>('sh-phone-columns', 2);
 
-/** True when the phone scan bar should auto-hide (set by MobileScanView from
- *  scroll direction: collapse on scroll-down into the wall, reveal on scroll-up).
- *  Session-only (not persisted) — it's a transient scroll affordance. The scan
- *  bar ignores this while a scan is running so progress stays pinned. */
-export const scanBarCollapsed = writable<boolean>(false);
+/** True when the phone's top chrome (the layout's "ScanHound" title bar, the
+ *  scan-controls bar, and the FilterBar status-chip row) should auto-hide, in
+ *  sync, as one unit — set by MobileScanView from scroll direction (collapse
+ *  on scroll-down into the wall, reveal on scroll-up). Session-only (not
+ *  persisted) — a transient scroll affordance. Each consumer additionally
+ *  ignores this while a scan is running, so progress/status stay visible and
+ *  the three regions never end up half-collapsed relative to each other. */
+export const mobileChromeCollapsed = writable<boolean>(false);
 
 
 /** Active quick-filter chips: any of '4k' | 'hdrdv' | 'inplex'. */

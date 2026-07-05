@@ -11,7 +11,8 @@
   import { connection } from '$lib/stores/connection';
   import { hasRemoteServer, currentToken } from '$lib/stores/server';
   import { logPanelOpen } from '$lib/stores/logs';
-  import { viewMode, setViewMode, selectAll, deselectAll } from '$lib/stores/results';
+  import { viewMode, setViewMode, selectAll, deselectAll, mobileChromeCollapsed } from '$lib/stores/results';
+  import { scanState } from '$lib/stores/scanner';
   import { setAuthNonce, api, setUnauthorizedHandler } from '$lib/api/client';
   import { refreshAuthStatus, handleUnauthorized } from '$lib/stores/auth';
   import { goto } from '$app/navigation';
@@ -25,6 +26,11 @@
   let isDark = $derived($theme === 'dark');
   // The login screen renders bare (no sidebar / chrome around it).
   let isLoginRoute = $derived($page.url.pathname === '/login');
+  // Collapses the mobile title bar's content row in sync with the Scan page's
+  // scan bar / FilterBar chip row (same store, same idle-gate) — only ever
+  // set true on the Scan route; other routes never touch this store, so the
+  // header stays visible there as normal.
+  let hideMobileHeader = $derived($mobileChromeCollapsed && $scanState === 'idle');
 
   // On a packaged app (Android/desktop) with no remote server configured, the
   // bundled frontend isn't same-origin with any backend. If the initial health
@@ -136,24 +142,28 @@
 <div class="flex h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
   <Sidebar />
   <div class="flex-1 flex flex-col overflow-hidden">
-    <!-- Mobile top bar (visible below md) -->
-    <div
-      class="flex md:hidden items-center h-12 px-3 border-b border-[var(--border)] bg-[var(--bg-secondary)]"
-      style="padding-top: env(safe-area-inset-top);"
-    >
-      <span class="text-sm font-semibold text-[var(--accent)]">ScanHound</span>
-      <div class="flex-1"></div>
-      <button
-        onclick={toggleTheme}
-        class="p-1.5 rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] transition-colors"
-        aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-      >
-        {#if isDark}
-          <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" /></svg>
-        {:else}
-          <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" /></svg>
-        {/if}
-      </button>
+    <!-- Mobile top bar (visible below md). Outer shell (safe-area padding +
+         border/bg) always stays so the notch area never looks broken; only
+         the actual title-row content collapses via grid-rows, in sync with
+         the Scan page's scan bar / FilterBar chip row. -->
+    <div class="md:hidden bg-[var(--bg-secondary)] border-b border-[var(--border)]" style="padding-top: env(safe-area-inset-top);">
+      <div class="grid transition-[grid-template-rows] duration-200 ease-out" style="grid-template-rows: {hideMobileHeader ? '0fr' : '1fr'};">
+        <div class="overflow-hidden flex items-center h-12 px-3">
+          <span class="text-sm font-semibold text-[var(--accent)]">ScanHound</span>
+          <div class="flex-1"></div>
+          <button
+            onclick={toggleTheme}
+            class="p-1.5 rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] transition-colors"
+            aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            {#if isDark}
+              <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" /></svg>
+            {:else}
+              <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" /></svg>
+            {/if}
+          </button>
+        </div>
+      </div>
     </div>
     <ConnectionBanner />
     {#key $page.url.pathname}
