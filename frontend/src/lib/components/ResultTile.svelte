@@ -1,6 +1,7 @@
 <script lang="ts">
   import Badge from './Badge.svelte';
   import { toggleSelect, selectedKeys, selectedDetail, posterAspect, POSTER_ASPECT_CLASS, tileShowMeta } from '$lib/stores/results';
+  import { isPhone } from '$lib/stores/viewport';
   import { settings } from '$lib/stores/settings';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -120,7 +121,7 @@
 
     <!-- Status badge — top right -->
     <div class="absolute top-1.5 right-1.5 z-10">
-      <Badge label={formatStatus(effectiveStatus)} variant={statusVariant(effectiveStatus)} />
+      <Badge label={formatStatus(effectiveStatus)} variant={statusVariant(effectiveStatus)} size={$isPhone ? 'lg' : 'sm'} />
     </div>
 
     <!-- Selection checkbox — top left; custom chip with an accessible native input underneath -->
@@ -177,57 +178,72 @@
     <!-- Bottom scrim content: DV/HDR chips (left) + title/year (stacked above), hover-reveal secondary meta -->
     {#if $tileShowMeta}
       <div class="absolute inset-x-0 bottom-0 z-10 p-2 pt-6">
-        <!-- Hover-reveal secondary metadata: rating/RT/size/genres/plex-versions/prior-grab.
-             Not lost — this is a relocation; the same data is always available in the detail panel. -->
-        <div
-          class="max-h-0 opacity-0 overflow-hidden
-            group-hover:max-h-48 group-hover:opacity-100 group-focus-within:max-h-48 group-focus-within:opacity-100
-            transition-all duration-200 ease-out"
-        >
-          <div class="flex items-center gap-1.5 text-[10px] text-white/85 flex-wrap mb-1">
-            {#if item.resolution}<span class="font-semibold text-white">{item.resolution}</span>{/if}
-            {#if item.size}<span>&middot; {item.size}</span>{/if}
-            {#if showRating && item.rating}<span>&middot; &#9733; {item.rating.toFixed(1)}{#if showVotes && item.votes}<span class="opacity-70"> ({formatCount(item.votes)})</span>{/if}</span>{/if}
-            {#if item.rt_score}<span>&middot; RT {item.rt_score}%</span>{/if}
+        {#if $isPhone}
+          <!-- Phone: no hover state exists on touch (a tap opens the detail sheet
+               before any :hover/:focus-within CSS can fire), so the facts that
+               matter for a grab/skip decision must be ALWAYS visible here, not
+               hover-gated like desktop's reveal below — and sized to actually
+               read at arm's length. Deliberately a smaller set than desktop's
+               hover panel (no genres/posted-date/Plex-versions/prior-grab) to
+               keep the wall scannable; those stay one tap away in DetailSheet. -->
+          <div class="flex items-center gap-1.5 text-sm text-white/90 flex-nowrap overflow-hidden whitespace-nowrap mb-1 font-medium">
+            {#if item.resolution}<span class="font-bold text-white shrink-0">{item.resolution}</span>{/if}
+            {#if item.size}<span class="shrink-0">&middot; {item.size}</span>{/if}
+            {#if showRating && item.rating}<span class="shrink-0">&middot; &#9733; {item.rating.toFixed(1)}</span>{/if}
+            {#if item.rt_score}<span class="truncate">&middot; RT {item.rt_score}%</span>{/if}
           </div>
-          {#if showGenres && item.genres?.length}
-            <div class="text-[10px] text-white/70 truncate mb-1">{item.genres.slice(0, 3).join(', ')}</div>
-          {/if}
-          {#if item.posted_date || (item.language && item.language !== 'English')}
-            <div class="flex items-center gap-1.5 text-[10px] text-white/70 truncate mb-1">
-              {#if item.posted_date}<span class="opacity-80">{item.posted_date}</span>{/if}
-              {#if item.language && item.language !== 'English'}<span class="opacity-60">&middot; {item.language}</span>{/if}
+        {:else}
+          <!-- Desktop: unchanged hover-reveal secondary metadata (mouse-hover works fine here). -->
+          <div
+            class="max-h-0 opacity-0 overflow-hidden
+              group-hover:max-h-48 group-hover:opacity-100 group-focus-within:max-h-48 group-focus-within:opacity-100
+              transition-all duration-200 ease-out"
+          >
+            <div class="flex items-center gap-1.5 text-[10px] text-white/85 flex-wrap mb-1">
+              {#if item.resolution}<span class="font-semibold text-white">{item.resolution}</span>{/if}
+              {#if item.size}<span>&middot; {item.size}</span>{/if}
+              {#if showRating && item.rating}<span>&middot; &#9733; {item.rating.toFixed(1)}{#if showVotes && item.votes}<span class="opacity-70"> ({formatCount(item.votes)})</span>{/if}</span>{/if}
+              {#if item.rt_score}<span>&middot; RT {item.rt_score}%</span>{/if}
             </div>
-          {/if}
-          {#if plexVersions.length > 0}
-            <div class="flex items-center gap-1 flex-wrap text-[9px] mb-1">
-              <span class="font-semibold text-[var(--accent)]">Plex:</span>
-              {#each plexVersions as pv, i}
-                {#if i > 0}<span class="text-white/30">&middot;</span>{/if}
-                <span class="inline-flex items-center gap-0.5 text-white/80">
-                  <Badge label={pv.res} variant={pv.res === '4K' ? 'warning' : 'default'} size="xs" />
-                  {#if pv.dovi}<Badge label="DV" variant="accent" size="xs" />{/if}
-                  {#if pv.hdr && !pv.dovi}<Badge label="HDR" variant="warning" size="xs" />{/if}
-                  {#if pv.size}<span class="opacity-70">{pv.size}GB</span>{/if}
-                </span>
-              {/each}
-            </div>
-          {/if}
-          {#if item.prior_grab}
-            <div class="flex items-center gap-1 text-[9px] text-amber-400 truncate mb-1" title="A different version of this title was already sent to JDownloader">
-              <span class="font-medium">Grabbed:</span>
-              <span>{item.prior_grab.resolution}</span>
-              {#if item.prior_grab.size}<span class="opacity-75">&middot; {item.prior_grab.size}</span>{/if}
-            </div>
-          {/if}
-        </div>
+            {#if showGenres && item.genres?.length}
+              <div class="text-[10px] text-white/70 truncate mb-1">{item.genres.slice(0, 3).join(', ')}</div>
+            {/if}
+            {#if item.posted_date || (item.language && item.language !== 'English')}
+              <div class="flex items-center gap-1.5 text-[10px] text-white/70 truncate mb-1">
+                {#if item.posted_date}<span class="opacity-80">{item.posted_date}</span>{/if}
+                {#if item.language && item.language !== 'English'}<span class="opacity-60">&middot; {item.language}</span>{/if}
+              </div>
+            {/if}
+            {#if plexVersions.length > 0}
+              <div class="flex items-center gap-1 flex-wrap text-[9px] mb-1">
+                <span class="font-semibold text-[var(--accent)]">Plex:</span>
+                {#each plexVersions as pv, i}
+                  {#if i > 0}<span class="text-white/30">&middot;</span>{/if}
+                  <span class="inline-flex items-center gap-0.5 text-white/80">
+                    <Badge label={pv.res} variant={pv.res === '4K' ? 'warning' : 'default'} size="xs" />
+                    {#if pv.dovi}<Badge label="DV" variant="accent" size="xs" />{/if}
+                    {#if pv.hdr && !pv.dovi}<Badge label="HDR" variant="warning" size="xs" />{/if}
+                    {#if pv.size}<span class="opacity-70">{pv.size}GB</span>{/if}
+                  </span>
+                {/each}
+              </div>
+            {/if}
+            {#if item.prior_grab}
+              <div class="flex items-center gap-1 text-[9px] text-amber-400 truncate mb-1" title="A different version of this title was already sent to JDownloader">
+                <span class="font-medium">Grabbed:</span>
+                <span>{item.prior_grab.resolution}</span>
+                {#if item.prior_grab.size}<span class="opacity-75">&middot; {item.prior_grab.size}</span>{/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
 
         <!-- DV/HDR chips (bottom-left) + Title/year (always visible, sits at the very bottom of the scrim) -->
         <div class="flex items-center gap-1 mb-1">
-          {#if item.dovi}<Badge label="DV" variant="accent" size="xs" />{/if}
-          {#if item.hdr && !item.dovi}<Badge label="HDR" variant="warning" size="xs" />{/if}
+          {#if item.dovi}<Badge label="DV" variant="accent" size={$isPhone ? 'lg' : 'xs'} />{/if}
+          {#if item.hdr && !item.dovi}<Badge label="HDR" variant="warning" size={$isPhone ? 'lg' : 'xs'} />{/if}
         </div>
-        <p class="text-sm font-semibold text-white truncate leading-tight" title={item.title}>
+        <p class="{$isPhone ? 'text-base' : 'text-sm'} font-semibold text-white truncate leading-tight" title={item.title}>
           {item.title}{#if item.year}<span class="font-normal text-white/70">&nbsp;({item.year})</span>{/if}
         </p>
       </div>
