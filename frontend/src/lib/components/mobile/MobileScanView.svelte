@@ -2,9 +2,10 @@
   import { get } from 'svelte/store';
   import {
     filteredResults, filteredTotal, titleCounts, pagedMode, hasMore, loadingMore,
-    loadResults, handleReconnectSnapshot, phoneColumns,
+    loadResults, handleReconnectSnapshot, phoneColumns, scanBarCollapsed,
     dismissItem, restoreItem, markDownloaded, markGrabbedSiblings
   } from '$lib/stores/results';
+  import { onMount } from 'svelte';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -59,6 +60,25 @@
     renderLimit = 60;
   }
 
+  // Auto-hide the scan bar as you scroll down into the wall, reveal on scroll
+  // up — like a mobile browser's address bar. Small dead zones (near the top,
+  // and a 6px wiggle-room per direction) avoid flicker on tiny scroll jitter.
+  // ScanControls itself ignores this while a scan is running, so progress
+  // always stays pinned regardless of scroll.
+  let lastScrollTop = 0;
+  function onWallScroll(scrollTop: number) {
+    const delta = scrollTop - lastScrollTop;
+    if (scrollTop < 24) scanBarCollapsed.set(false);
+    else if (delta > 6) scanBarCollapsed.set(true);
+    else if (delta < -6) scanBarCollapsed.set(false);
+    lastScrollTop = scrollTop;
+  }
+
+  onMount(() => {
+    scanBarCollapsed.set(false); // start visible
+    return () => scanBarCollapsed.set(false); // never leave it hidden after navigating away
+  });
+
   function grab(item: ScanResult) {
     if (!item.url) return;
     api.download(item.url, item.title, get(downloadHost), item.year,
@@ -80,7 +100,7 @@
 
 <FilterBar bind:sheetOpen={filterSheetOpen} showMobileTrigger={false} />
 
-<PullToRefresh onrefresh={refresh}>
+<PullToRefresh onrefresh={refresh} onscroll={onWallScroll}>
   <div class="grid {gridClass} gap-2 p-2">
     {#each groups as group (group.title)}
       {#if isDuplicateGroup(group, siblingCounts) && !expandedGroups.has(group.title)}

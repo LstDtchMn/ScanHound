@@ -1,7 +1,7 @@
 <script lang="ts">
   import { scanState, scanProgress, scanPhase, scanItemCount, startScan, stopScan } from '$lib/stores/scanner';
   import type { ScanType } from '$lib/stores/scanner';
-  import { clearResults, categoryFilter } from '$lib/stores/results';
+  import { clearResults, categoryFilter, scanBarCollapsed } from '$lib/stores/results';
   import { get } from 'svelte/store';
   import BottomSheet from './BottomSheet.svelte';
 
@@ -80,6 +80,10 @@
     categoryFilter.set(cats);
   });
   let scanTypeLabel = $derived(scanTypes.find((t) => t.value === selectedType)?.label ?? 'Scan');
+
+  // Auto-hide the mobile bar per scroll direction (set by MobileScanView), but
+  // never while a scan is actually running/stopping — progress must stay pinned.
+  let hideMobileBar = $derived($scanBarCollapsed && $scanState === 'idle');
 
   function handleStart() {
     hasInteracted = true;
@@ -197,8 +201,14 @@
   {/if}
 </div>
 
-<!-- Mobile scan bar -->
-<div class="flex md:hidden items-center gap-2 px-3 py-2 border-b border-[var(--border)]">
+<!-- Mobile scan bar: collapses via a CSS-grid height animation (no fixed
+     max-height guess needed) when hideMobileBar is true. Grid row itself
+     carries the transition so both open and close animate smoothly. -->
+<div
+  class="grid md:hidden transition-[grid-template-rows] duration-200 ease-out"
+  style="grid-template-rows: {hideMobileBar ? '0fr' : '1fr'};"
+>
+<div class="overflow-hidden flex items-center gap-2 px-3 py-2 border-b border-[var(--border)]">
   {#if $scanState === 'idle'}
     <button
       onclick={() => (scanSheet = true)}
@@ -228,6 +238,7 @@
       class="shrink-0 px-4 py-2 bg-[var(--error)] text-white rounded-lg text-sm font-semibold disabled:opacity-50"
     >{$scanState === 'stopping' ? '…' : 'Stop'}</button>
   {/if}
+</div>
 </div>
 
 <BottomSheet open={scanSheet} title="Scan options" onclose={() => (scanSheet = false)}>

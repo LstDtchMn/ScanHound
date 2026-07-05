@@ -5,10 +5,11 @@
 
   interface Props {
     onrefresh: () => Promise<void> | void;
+    onscroll?: (scrollTop: number) => void;
     disabled?: boolean;
     children: Snippet;
   }
-  let { onrefresh, disabled = false, children }: Props = $props();
+  let { onrefresh, onscroll, disabled = false, children }: Props = $props();
 
   const TRIGGER = 70;   // px of (damped) pull that arms the refresh
   const MAX_PULL = 110;
@@ -88,6 +89,7 @@
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
     onpointercancel={onPointerUp}
+    onscroll={() => onscroll?.(scroller?.scrollTop ?? 0)}
     role="presentation"
   >
     {@render children()}
