@@ -4,16 +4,16 @@
    *  match. Renders nothing when there's no score. */
   interface Props {
     score: number | null | undefined;
-    /** 'sm' for the tile facts line, 'lg' for the phone tile / detail sheet. */
-    size?: 'sm' | 'lg';
+    /** 'sm' facts line, 'lg' phone tile / sheet, 'xl' single-tile / swipe deck. */
+    size?: 'sm' | 'lg' | 'xl';
   }
   let { score, size = 'sm' }: Props = $props();
 
   let fresh = $derived(score != null && score >= 60);
   // Official-ish Tomatometer colors: fresh red, rotten green.
   let color = $derived(fresh ? '#FA320A' : '#0AC855');
-  let icon = $derived(size === 'lg' ? 'w-4 h-4' : 'w-3.5 h-3.5');
-  let text = $derived(size === 'lg' ? 'text-sm' : 'text-[11px]');
+  let icon = $derived(size === 'xl' ? 'w-6 h-6' : size === 'lg' ? 'w-4 h-4' : 'w-3.5 h-3.5');
+  let text = $derived(size === 'xl' ? 'text-lg' : size === 'lg' ? 'text-sm' : 'text-[11px]');
 </script>
 
 {#if score != null}

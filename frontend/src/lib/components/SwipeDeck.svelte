@@ -10,6 +10,25 @@
   import { statusVariant, formatStatus, formatCount } from '$lib/constants';
   import { onDestroy } from 'svelte';
   import Badge from './Badge.svelte';
+  import RtBadge from './RtBadge.svelte';
+  import type { ScanResult } from '$lib/api/types';
+
+  /** Distinct Plex library copies for a card — deduped by res+size (so two
+   *  same-res different-size copies both show), matching ResultTile. */
+  interface PlexVersion { res: string; hdr: boolean; dovi: boolean; size: number | string }
+  function plexVersionsOf(item: ScanResult): PlexVersion[] {
+    try {
+      const raw = JSON.parse(item.plex_versions || '[]');
+      if (!Array.isArray(raw) || raw.length === 0) return [];
+      const seen = new Set<string>();
+      return raw.filter((v: PlexVersion) => {
+        const key = `${v.res}|${v.size}|${v.hdr}|${v.dovi}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    } catch { return []; }
+  }
 
   const THRESHOLD = 90;   // px past which a release commits to an action
   const TAP_SLOP = 6;     // movement under this counts as a tap, not a drag
@@ -201,11 +220,11 @@
 
             <!-- Status badge -->
             <div class="absolute top-3 left-3">
-              <Badge label={formatStatus(item.status)} variant={statusVariant(item.status)} />
+              <Badge label={formatStatus(item.status)} variant={statusVariant(item.status)} size="xl" />
             </div>
             <div class="absolute top-3 right-3 flex gap-1">
-              {#if item.dovi}<Badge label="DV" variant="accent" />{/if}
-              {#if item.hdr && !item.dovi}<Badge label="HDR" variant="warning" />{/if}
+              {#if item.dovi}<Badge label="DV" variant="accent" size="xl" />{/if}
+              {#if item.hdr && !item.dovi}<Badge label="HDR" variant="warning" size="xl" />{/if}
             </div>
 
             <!-- Swipe-intent overlays (top card only) -->
@@ -214,16 +233,37 @@
               <div class="absolute top-6 right-6 px-3 py-1 rounded-lg border-2 border-[var(--error)] text-[var(--error)] font-extrabold text-2xl rotate-[12deg]" style="opacity: {intent === 'skip' ? overlayOpacity : 0}">SKIP</div>
             {/if}
 
-            <!-- Info -->
+            <!-- Info — sized big for arm's-length reading in the deck. -->
             <div class="absolute bottom-0 left-0 right-0 p-4 text-white">
-              <p class="text-lg font-bold leading-tight">{item.title}{#if item.year}<span class="font-normal opacity-80"> ({item.year})</span>{/if}</p>
-              <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-1 text-sm opacity-90">
-                {#if item.resolution}<span class="font-semibold">{item.resolution}</span>{/if}
+              <p class="text-3xl font-bold leading-tight">{item.title}{#if item.year}<span class="font-normal opacity-80"> ({item.year})</span>{/if}</p>
+              <div class="flex flex-wrap items-center gap-x-2.5 gap-y-1 mt-2 text-xl opacity-95 font-medium">
+                {#if item.resolution}<span class="font-bold">{item.resolution}</span>{/if}
                 {#if item.size}<span>· {item.size}</span>{/if}
-                {#if item.rating}<span>· ★ {item.rating.toFixed(1)}{#if item.votes}<span class="opacity-70 text-xs"> ({formatCount(item.votes)})</span>{/if}</span>{/if}
+                {#if item.rating}<span>· ★ {item.rating.toFixed(1)}</span>{/if}
+                {#if item.rt_score != null}<span class="flex items-center">·&nbsp;<RtBadge score={item.rt_score} size="xl" /></span>{/if}
               </div>
+              <!-- Ownership context: what you already have in Plex (res + DV/HDR +
+                   size, all distinct copies) and/or a prior grab — the upgrade call. -->
+              {#if plexVersionsOf(item).length > 0 || item.prior_grab}
+                <div class="flex items-center gap-2 mt-1.5 text-lg overflow-x-auto whitespace-nowrap scrollbar-none">
+                  {#if plexVersionsOf(item).length > 0}
+                    <span class="shrink-0 font-semibold text-[var(--accent)]">Plex:</span>
+                    {#each plexVersionsOf(item) as pv, i}
+                      {#if i > 0}<span class="text-white/30 shrink-0">·</span>{/if}
+                      <span class="inline-flex items-center gap-1 shrink-0">
+                        <span class="font-bold {pv.res === '4K' ? 'text-yellow-400' : 'text-white/90'}">{pv.res}</span>
+                        {#if pv.dovi}<span class="font-bold text-purple-300">DV</span>{:else if pv.hdr}<span class="font-bold text-amber-300">HDR</span>{/if}
+                        {#if pv.size}<span class="text-white/60">{pv.size}GB</span>{/if}
+                      </span>
+                    {/each}
+                  {/if}
+                  {#if item.prior_grab}
+                    <span class="shrink-0 inline-flex items-center gap-1 text-amber-400" title="A different version was already sent to JDownloader">↓ {item.prior_grab.resolution}{#if item.prior_grab.size} <span class="text-amber-400/70">{item.prior_grab.size}</span>{/if}</span>
+                  {/if}
+                </div>
+              {/if}
               {#if item.genres?.length}
-                <p class="text-xs opacity-70 mt-0.5 truncate">{item.genres.slice(0, 3).join(' · ')}</p>
+                <p class="text-base opacity-70 mt-1 truncate">{item.genres.slice(0, 3).join(' · ')}</p>
               {/if}
             </div>
           </div>

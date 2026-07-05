@@ -1,7 +1,7 @@
 <script lang="ts">
   import Badge from './Badge.svelte';
   import RtBadge from './RtBadge.svelte';
-  import { posterAspect, POSTER_ASPECT_CLASS, tileShowMeta } from '$lib/stores/results';
+  import { posterAspect, POSTER_ASPECT_CLASS, tileShowMeta, phoneColumns } from '$lib/stores/results';
   import { isPhone } from '$lib/stores/viewport';
   import { settings } from '$lib/stores/settings';
   import { statusVariant, formatStatus } from '$lib/constants';
@@ -24,6 +24,7 @@
 
   let front = $derived(items[0]);
   let showRating = $derived($settings.show_rating ?? true);
+  let big = $derived($isPhone && $phoneColumns === 1); // single-tile → bigger text
 
   function onKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter' || e.key === ' ') {
@@ -86,7 +87,7 @@
 
       <!-- Count badge — top-left, always visible (this is the "what am I looking at" cue) -->
       <div class="absolute top-1.5 left-1.5 z-10">
-        <Badge label="{count} releases" variant="info" size={$isPhone ? 'lg' : 'sm'} />
+        <Badge label="{count} releases" variant="info" size={big ? 'xl' : $isPhone ? 'lg' : 'sm'} />
       </div>
 
       {#if $tileShowMeta}
@@ -95,16 +96,16 @@
             <!-- Phone: always-visible facts (no hover state on touch — same
                  reasoning as ResultTile). rt_score is title-level so it's
                  valid to show from the front release. -->
-            <div class="flex items-center gap-1.5 text-sm text-white/90 flex-nowrap overflow-hidden whitespace-nowrap mb-1 font-medium">
+            <div class="flex items-center gap-1.5 {big ? 'text-xl' : 'text-sm'} text-white/90 flex-nowrap overflow-hidden whitespace-nowrap mb-1 font-medium">
               {#if showRating && front.rating}<span class="shrink-0">&#9733; {front.rating.toFixed(1)}</span>{/if}
-              {#if front.rt_score != null}<span class="shrink-0 flex items-center">&middot;&nbsp;<RtBadge score={front.rt_score} size="lg" /></span>{/if}
+              {#if front.rt_score != null}<span class="shrink-0 flex items-center">&middot;&nbsp;<RtBadge score={front.rt_score} size={big ? 'xl' : 'lg'} /></span>{/if}
               {#if sizeRange}<span class="font-bold text-white shrink-0">&middot; {sizeRange}</span>{/if}
               {#if dateRange}<span class="truncate">&middot; {dateRange}</span>{/if}
             </div>
             {#if statusSummary.length}
               <div class="flex items-center gap-1 flex-nowrap overflow-hidden mb-1">
                 {#each statusSummary as st}
-                  <span class="shrink-0"><Badge label={`${st.count} ${formatStatus(st.status)}`} variant={statusVariant(st.status)} size="lg" /></span>
+                  <span class="shrink-0"><Badge label={`${st.count} ${formatStatus(st.status)}`} variant={statusVariant(st.status)} size={big ? 'xl' : 'lg'} /></span>
                 {/each}
               </div>
             {/if}
@@ -132,11 +133,11 @@
 
           <!-- Aggregate format chips (always visible, like ResultTile's DV/HDR row) -->
           <div class="flex items-center gap-1 mb-1 flex-wrap">
-            {#each formats.res as r}<Badge label={r} size={$isPhone ? 'lg' : 'xs'} />{/each}
-            {#if formats.dv}<Badge label="DV" variant="accent" size={$isPhone ? 'lg' : 'xs'} />{/if}
-            {#if formats.hdr}<Badge label="HDR" variant="warning" size={$isPhone ? 'lg' : 'xs'} />{/if}
+            {#each formats.res as r}<Badge label={r} size={big ? 'xl' : $isPhone ? 'lg' : 'xs'} />{/each}
+            {#if formats.dv}<Badge label="DV" variant="accent" size={big ? 'xl' : $isPhone ? 'lg' : 'xs'} />{/if}
+            {#if formats.hdr}<Badge label="HDR" variant="warning" size={big ? 'xl' : $isPhone ? 'lg' : 'xs'} />{/if}
           </div>
-          <p class="{$isPhone ? 'text-base' : 'text-sm'} font-semibold text-white truncate leading-tight" title={title}>
+          <p class="{big ? 'text-2xl' : $isPhone ? 'text-base' : 'text-sm'} font-semibold text-white truncate leading-tight" title={title}>
             {title}{#if front.year}<span class="font-normal text-white/70">&nbsp;({front.year})</span>{/if}
           </p>
         </div>

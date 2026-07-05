@@ -1,7 +1,7 @@
 <script lang="ts">
   import Badge from './Badge.svelte';
   import RtBadge from './RtBadge.svelte';
-  import { toggleSelect, selectedKeys, selectedDetail, posterAspect, POSTER_ASPECT_CLASS, tileShowMeta } from '$lib/stores/results';
+  import { toggleSelect, selectedKeys, selectedDetail, posterAspect, POSTER_ASPECT_CLASS, tileShowMeta, phoneColumns } from '$lib/stores/results';
   import { isPhone } from '$lib/stores/viewport';
   import { settings } from '$lib/stores/settings';
   import { api } from '$lib/api/client';
@@ -14,6 +14,9 @@
   let showRating = $derived($settings.show_rating ?? true);
   let showVotes = $derived($settings.show_votes ?? true);
   let showGenres = $derived($settings.show_genres ?? true);
+  // Single large poster (1-up) → much bigger text; the poster fills the width
+  // so the small 2-up sizes read as tiny. 2-up keeps the prior sizes.
+  let big = $derived($isPhone && $phoneColumns === 1);
 
   interface Props {
     item: ScanResult;
@@ -46,19 +49,22 @@
   }
   function onPosterLeave() { posterHovered = false; }
 
-  // Parse plex_versions JSON into badge data
-  interface PlexVersion { res: string; hdr: string; dovi: boolean; size: string }
+  // Parse plex_versions JSON into badge data. Dedup key includes SIZE so two
+  // distinct library copies at the same resolution (e.g. a 24GB and a 7GB
+  // 1080p) both survive — matching the backend's (res,size,dovi,hdr) key. Only
+  // truly identical rows (same file in two Plex libraries) collapse.
+  interface PlexVersion { res: string; hdr: string; dovi: boolean; size: string | number }
   let plexVersions: PlexVersion[] = $derived.by(() => {
     try {
       const raw = JSON.parse(item.plex_versions || '[]');
       if (!Array.isArray(raw) || raw.length === 0) return [];
       const seen = new Set<string>();
       return raw.filter((v: PlexVersion) => {
-        const key = `${v.res}|${v.hdr}|${v.dovi}`;
+        const key = `${v.res}|${v.size}|${v.hdr}|${v.dovi}`;
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
-      }).slice(0, 4);
+      });
     } catch { return []; }
   });
 
@@ -122,7 +128,7 @@
 
     <!-- Status badge — top right -->
     <div class="absolute top-1.5 right-1.5 z-10">
-      <Badge label={formatStatus(effectiveStatus)} variant={statusVariant(effectiveStatus)} size={$isPhone ? 'lg' : 'sm'} />
+      <Badge label={formatStatus(effectiveStatus)} variant={statusVariant(effectiveStatus)} size={big ? 'xl' : $isPhone ? 'lg' : 'sm'} />
     </div>
 
     <!-- Selection checkbox — top left; custom chip with an accessible native input underneath -->
@@ -187,17 +193,19 @@
                read at arm's length. Deliberately a smaller set than desktop's
                hover panel (no genres/posted-date/Plex-versions/prior-grab) to
                keep the wall scannable; those stay one tap away in DetailSheet. -->
-          <div class="flex items-center gap-1.5 text-sm text-white/90 flex-nowrap overflow-hidden whitespace-nowrap mb-1 font-medium">
+          <div class="flex items-center gap-1.5 {big ? 'text-xl' : 'text-sm'} text-white/90 flex-nowrap overflow-hidden whitespace-nowrap mb-1 font-medium">
             {#if item.resolution}<span class="font-bold text-white shrink-0">{item.resolution}</span>{/if}
             {#if item.size}<span class="shrink-0">&middot; {item.size}</span>{/if}
             {#if showRating && item.rating}<span class="shrink-0">&middot; &#9733; {item.rating.toFixed(1)}</span>{/if}
-            {#if item.rt_score != null}<span class="shrink-0 flex items-center">&middot;&nbsp;<RtBadge score={item.rt_score} size="lg" /></span>{/if}
+            {#if item.rt_score != null}<span class="shrink-0 flex items-center">&middot;&nbsp;<RtBadge score={item.rt_score} size={big ? 'xl' : 'lg'} /></span>{/if}
           </div>
           <!-- Ownership context (the whole point of an upgrade): what you already
-               have, right on the poster. In Plex (per-version res/DV/HDR) and/or
-               a different version already sent to JDownloader. Single truncating row. -->
+               have, right on the poster — per Plex copy: resolution + DV/HDR +
+               SIZE, so you can compare against this release. All distinct copies
+               show (deduped by res+size, so two same-res different-size copies
+               both appear). Plus any prior JDownloader grab. -->
           {#if plexVersions.length > 0 || item.prior_grab}
-            <div class="flex items-center gap-1 text-xs flex-nowrap overflow-hidden whitespace-nowrap mb-1">
+            <div class="flex items-center gap-1.5 {big ? 'text-lg' : 'text-xs'} flex-nowrap overflow-x-auto whitespace-nowrap mb-1 scrollbar-none">
               {#if plexVersions.length > 0}
                 <span class="shrink-0 font-semibold text-[var(--accent)]">Plex:</span>
                 {#each plexVersions as pv, i}
@@ -205,12 +213,13 @@
                   <span class="inline-flex items-center gap-0.5 shrink-0">
                     <span class="font-semibold {pv.res === '4K' ? 'text-yellow-400' : 'text-white/90'}">{pv.res}</span>
                     {#if pv.dovi}<span class="font-bold text-purple-300">DV</span>{:else if pv.hdr}<span class="font-bold text-amber-300">HDR</span>{/if}
+                    {#if pv.size}<span class="text-white/60">{pv.size}GB</span>{/if}
                   </span>
                 {/each}
               {/if}
               {#if item.prior_grab}
-                <span class="shrink-0 inline-flex items-center gap-0.5 text-amber-400" title="A different version was already sent to JDownloader">
-                  &#8595; {item.prior_grab.resolution}
+                <span class="shrink-0 inline-flex items-center gap-1 text-amber-400" title="A different version was already sent to JDownloader">
+                  &#8595; {item.prior_grab.resolution}{#if item.prior_grab.size} <span class="text-amber-400/70">{item.prior_grab.size}</span>{/if}
                 </span>
               {/if}
             </div>
@@ -263,10 +272,10 @@
 
         <!-- DV/HDR chips (bottom-left) + Title/year (always visible, sits at the very bottom of the scrim) -->
         <div class="flex items-center gap-1 mb-1">
-          {#if item.dovi}<Badge label="DV" variant="accent" size={$isPhone ? 'lg' : 'xs'} />{/if}
-          {#if item.hdr && !item.dovi}<Badge label="HDR" variant="warning" size={$isPhone ? 'lg' : 'xs'} />{/if}
+          {#if item.dovi}<Badge label="DV" variant="accent" size={big ? 'xl' : $isPhone ? 'lg' : 'xs'} />{/if}
+          {#if item.hdr && !item.dovi}<Badge label="HDR" variant="warning" size={big ? 'xl' : $isPhone ? 'lg' : 'xs'} />{/if}
         </div>
-        <p class="{$isPhone ? 'text-base' : 'text-sm'} font-semibold text-white truncate leading-tight" title={item.title}>
+        <p class="{big ? 'text-2xl' : $isPhone ? 'text-base' : 'text-sm'} font-semibold text-white truncate leading-tight" title={item.title}>
           {item.title}{#if item.year}<span class="font-normal text-white/70">&nbsp;({item.year})</span>{/if}
         </p>
       </div>

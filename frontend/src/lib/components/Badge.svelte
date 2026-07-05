@@ -6,7 +6,7 @@
   interface Props {
     label: string;
     variant?: BadgeVariant;
-    size?: 'sm' | 'xs' | 'lg';
+    size?: 'sm' | 'xs' | 'lg' | 'xl';
   }
   let { label, variant = 'default', size = 'sm' }: Props = $props();
 
@@ -23,7 +23,8 @@
   const sizes: Record<string, string> = {
     sm: 'px-1.5 py-0.5 text-[10px]',
     xs: 'px-1 py-px text-[9px]',
-    lg: 'px-2 py-1 text-sm'
+    lg: 'px-2 py-1 text-sm',
+    xl: 'px-2.5 py-1 text-base font-semibold'
   };
 </script>
 
