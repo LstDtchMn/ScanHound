@@ -239,7 +239,7 @@
               <div class="flex flex-wrap items-center gap-x-2.5 gap-y-1 mt-2 text-xl opacity-95 font-medium">
                 {#if item.resolution}<span class="font-bold">{item.resolution}</span>{/if}
                 {#if item.size}<span>· {item.size}</span>{/if}
-                {#if item.rating}<span>· ★ {item.rating.toFixed(1)}</span>{/if}
+                {#if item.rating}<span>· ★ {item.rating.toFixed(1)}{#if item.votes}<span class="opacity-70"> ({formatCount(item.votes)})</span>{/if}</span>{/if}
                 {#if item.rt_score != null}<span class="flex items-center">·&nbsp;<RtBadge score={item.rt_score} size="xl" /></span>{/if}
               </div>
               <!-- Ownership context: what you already have in Plex (res + DV/HDR +

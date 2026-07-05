@@ -5,7 +5,7 @@
   import { markDownloaded, markGrabbedSiblings } from '$lib/stores/results';
   import { addToast } from '$lib/stores/notifications';
   import { copyResultLinks } from '$lib/resultActions';
-  import { statusVariant, formatStatus } from '$lib/constants';
+  import { statusVariant, formatStatus, formatCount } from '$lib/constants';
   import Badge from '../Badge.svelte';
   import RtBadge from '../RtBadge.svelte';
   import { createDragTracker } from './gestures';
@@ -154,7 +154,7 @@
       <div class="min-w-0">
         <h2 class="text-base font-bold text-[var(--text-primary)] leading-snug">{item.title}</h2>
         <p class="text-xs text-[var(--text-secondary)] mt-0.5 flex items-center flex-wrap gap-x-1">
-          <span>{item.year || ''}{#if item.rating} · ★ {item.rating.toFixed(1)}{/if}{#if item.size} · {item.size}{/if}</span>
+          <span>{item.year || ''}{#if item.rating} · ★ {item.rating.toFixed(1)}{#if item.votes} ({formatCount(item.votes)}){/if}{/if}{#if item.size} · {item.size}{/if}</span>
           {#if item.rt_score != null}<span class="flex items-center">·&nbsp;<RtBadge score={item.rt_score} size="lg" /></span>{/if}
         </p>
         <div class="flex flex-wrap gap-1 mt-2">

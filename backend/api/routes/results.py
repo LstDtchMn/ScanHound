@@ -346,6 +346,25 @@ def _shape_results(
         language/quick filtering and before pagination — so the facet lists
         never shrink to just the current page or the current filter selection.
     """
+    # Overlay 'downloaded' from the central downloads table at READ time, so a
+    # grab is remembered across reloads and shared between the app and web —
+    # independent of when the background scan last folded download history in.
+    # An exact-URL match wins over whatever the cached/scanned status was
+    # (mirrors the scanner's own url-in-history -> DOWNLOADED rule). Non-mutating
+    # (copies the touched dicts) so the underlying cache list isn't rewritten.
+    if reg.db is not None:
+        try:
+            downloaded = reg.db.get_downloaded_urls()
+        except Exception:
+            downloaded = set()
+        if downloaded:
+            items = [
+                {**i, "status": "downloaded"}
+                if i.get("url") in downloaded and i.get("status") != "downloaded"
+                else i
+                for i in items
+            ]
+
     # Hide items the user swiped away on the deck (unless explicitly requested).
     if not include_dismissed and reg.db is not None:
         dismissed = reg.db.get_dismissed_urls()

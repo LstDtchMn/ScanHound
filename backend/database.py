@@ -874,6 +874,17 @@ class DatabaseManager:
         return self._query('SELECT 1 FROM downloads WHERE url = ?', (url,),
                            one=True, default=None) is not None
 
+    def get_downloaded_urls(self):
+        """Set of every URL grabbed successfully (non-failed) — the central,
+        authoritative record of what's been downloaded. Used to overlay
+        'downloaded' status onto results at read time so a grab is remembered
+        across reloads / app + web without waiting for a re-scan. Mirrors the
+        scanner's _load_download_history query."""
+        rows = self._query(
+            "SELECT url FROM downloads WHERE COALESCE(status, 'completed') != 'failed'",
+            default=[])
+        return {r[0] for r in rows if r and r[0]}
+
     def get_history_count(self):
         """Return the total number of downloaded URLs."""
         row = self._query('SELECT COUNT(*) FROM downloads', one=True, default=None)

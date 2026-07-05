@@ -4,7 +4,7 @@
   import { posterAspect, POSTER_ASPECT_CLASS, tileShowMeta, phoneColumns } from '$lib/stores/results';
   import { isPhone } from '$lib/stores/viewport';
   import { settings } from '$lib/stores/settings';
-  import { statusVariant, formatStatus } from '$lib/constants';
+  import { statusVariant, formatStatus, formatCount } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
 
   interface GroupFormats { res: string[]; dv: boolean; hdr: boolean; }
@@ -97,7 +97,7 @@
                  reasoning as ResultTile). rt_score is title-level so it's
                  valid to show from the front release. -->
             <div class="flex items-center gap-1.5 {big ? 'text-xl' : 'text-sm'} text-white/90 flex-nowrap overflow-hidden whitespace-nowrap mb-1 font-medium">
-              {#if showRating && front.rating}<span class="shrink-0">&#9733; {front.rating.toFixed(1)}</span>{/if}
+              {#if showRating && front.rating}<span class="shrink-0">&#9733; {front.rating.toFixed(1)}{#if front.votes}<span class="text-white/60 font-normal"> ({formatCount(front.votes)})</span>{/if}</span>{/if}
               {#if front.rt_score != null}<span class="shrink-0 flex items-center">&middot;&nbsp;<RtBadge score={front.rt_score} size={big ? 'xl' : 'lg'} /></span>{/if}
               {#if sizeRange}<span class="font-bold text-white shrink-0">&middot; {sizeRange}</span>{/if}
               {#if dateRange}<span class="truncate">&middot; {dateRange}</span>{/if}

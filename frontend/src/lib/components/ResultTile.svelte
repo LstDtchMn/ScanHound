@@ -196,7 +196,7 @@
           <div class="flex items-center gap-1.5 {big ? 'text-xl' : 'text-sm'} text-white/90 flex-nowrap overflow-hidden whitespace-nowrap mb-1 font-medium">
             {#if item.resolution}<span class="font-bold text-white shrink-0">{item.resolution}</span>{/if}
             {#if item.size}<span class="shrink-0">&middot; {item.size}</span>{/if}
-            {#if showRating && item.rating}<span class="shrink-0">&middot; &#9733; {item.rating.toFixed(1)}</span>{/if}
+            {#if showRating && item.rating}<span class="shrink-0">&middot; &#9733; {item.rating.toFixed(1)}{#if showVotes && item.votes}<span class="text-white/60 font-normal"> ({formatCount(item.votes)})</span>{/if}</span>{/if}
             {#if item.rt_score != null}<span class="shrink-0 flex items-center">&middot;&nbsp;<RtBadge score={item.rt_score} size={big ? 'xl' : 'lg'} /></span>{/if}
           </div>
           <!-- Ownership context (the whole point of an upgrade): what you already

@@ -179,6 +179,7 @@ def _client_with_cache(rows, version=None):
     registry.db = MagicMock()
     registry.db.get_background_cache.return_value = rows
     registry.db.get_dismissed_urls.return_value = set()
+    registry.db.get_downloaded_urls.return_value = set()
     # A real (count, max_last_seen_at)-shaped version by default so the B2
     # parse-cache in results.py behaves like it would against a real
     # DatabaseManager (unchanged rows -> unchanged version -> cache hit).
@@ -191,6 +192,21 @@ def _client_with_cache(rows, version=None):
     # every request in this TestClient (no lifespan/token involved here).
     registry.db.has_password.return_value = False
     return TestClient(create_app())
+
+
+def test_downloaded_urls_overlay_marks_downloaded_at_read_time():
+    # Cache still says 'missing' (it predates the grab); the central downloads
+    # table knows the URL was grabbed. The read overlay must mark it downloaded.
+    rows = [_row("A", status="missing"), _row("B", status="missing")]
+    c = _client_with_cache(rows)
+    registry.db.get_downloaded_urls.return_value = {"u/A"}
+    data = c.get("/results/cached", params={"per_page": 100}).json()
+    by_title = {i["title"]: i for i in data["items"]}
+    assert by_title["A"]["status"] == "downloaded"   # overlaid from central DB
+    assert by_title["B"]["status"] == "missing"       # untouched
+    # And it counts toward the 'downloaded' status filter without a re-scan.
+    only_dl = c.get("/results/cached", params={"filter": "downloaded", "per_page": 100}).json()
+    assert {i["title"] for i in only_dl["items"]} == {"A"}
 
 
 def test_cached_stats_whole_set_but_filtered_narrows():
