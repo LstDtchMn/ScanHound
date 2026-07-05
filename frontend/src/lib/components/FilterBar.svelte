@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, tileSize, posterAspect, tileShowMeta, gridGap, gridColumns, GRID_COLUMN_CHOICES, postedAfter, postedBefore, pagedMode, filteredTotal, mobileChromeCollapsed, type TileSize, type PosterAspect, type GridGap } from '$lib/stores/results';
+  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, resolutionFilter, toggleResolutionFilter, RESOLUTION_KEYS, tileSize, posterAspect, tileShowMeta, gridGap, gridColumns, GRID_COLUMN_CHOICES, postedAfter, postedBefore, pagedMode, filteredTotal, mobileChromeCollapsed, type TileSize, type PosterAspect, type GridGap } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -19,6 +19,7 @@
     ($genreFilter.length > 0 ? 1 : 0) +
     ($languageFilter.length > 0 ? 1 : 0) +
     $quickFilters.length +
+    $resolutionFilter.length +
     ($postedAfter || $postedBefore ? 1 : 0)
   );
 
@@ -466,6 +467,16 @@
         {:else if f.value === 'upgrade' && $stats.upgrade > 0}<span class="ml-0.5 opacity-70">{$stats.upgrade}</span>
         {:else if f.value === 'library' && $stats.library > 0}<span class="ml-0.5 opacity-70">{$stats.library}</span>{/if}
       </button>
+    {/each}
+    <!-- Resolution/type facet (4K / 1080p / TV) — multi-toggle, OR-combined. -->
+    <span class="shrink-0 w-px my-1 bg-[var(--border)]"></span>
+    {#each RESOLUTION_KEYS as rk}
+      <button
+        onclick={() => toggleResolutionFilter(rk)}
+        aria-pressed={$resolutionFilter.includes(rk)}
+        class="shrink-0 px-2.5 py-1.5 rounded-full text-xs font-medium transition-colors
+          {$resolutionFilter.includes(rk) ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)]'}"
+      >{rk}</button>
     {/each}
   </div>
   {#if showMobileTrigger}

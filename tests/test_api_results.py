@@ -64,6 +64,21 @@ def test_quick_inplex_and_hdrdv():
     assert {i["title"] for i in _filter_and_sort([inplex, dv, plain], quick=["hdrdv"])} == {"D"}
 
 
+def test_resolution_facet_is_or_combined():
+    uhd = _it(title="U", resolution="4K", category="4k", season=None)
+    hd = _it(title="H", resolution="1080p", category="remux", season=None)
+    tv = _it(title="T", resolution="1080p", category="tv", season=1)
+    # Single key filters to that resolution/type.
+    assert {i["title"] for i in _filter_and_sort([uhd, hd, tv], resolution=["4K"])} == {"U"}
+    # 'TV' keys off effective category, not resolution — matches the TV row
+    # regardless of its 1080p resolution.
+    assert {i["title"] for i in _filter_and_sort([uhd, hd, tv], resolution=["TV"])} == {"T"}
+    # OR within the set: 4K + 1080p shows the union (both res rows + the 1080p TV row).
+    assert {i["title"] for i in _filter_and_sort([uhd, hd, tv], resolution=["4K", "1080p"])} == {"U", "H", "T"}
+    # No filter shows everything.
+    assert len(_filter_and_sort([uhd, hd, tv])) == 3
+
+
 def test_typed_sort_size_and_posted():
     a = _it(title="A", size="9 GB", posted_date="June 8, 2026 at 12:00 AM")
     b = _it(title="B", size="10 GB", posted_date="July 3, 2026 at 12:00 AM")

@@ -44,6 +44,23 @@ export function toggleGenreFilter(genre: string) {
 export function toggleLanguageFilter(lang: string) {
   languageFilter.update((l) => (l.includes(lang) ? l.filter((x) => x !== lang) : [...l, lang]));
 }
+/** Resolution/type facet: any of '4K' | '1080p' | 'TV'. OR-combined (like
+ *  genres) — an item shows if it matches ANY selected key, so selecting both
+ *  4K and 1080p shows the union rather than the (empty) intersection. Persisted
+ *  per-device. 'TV' keys off the effective crawl category, not resolution. */
+export const RESOLUTION_KEYS = ['4K', '1080p', 'TV'] as const;
+export const resolutionFilter = persisted<string[]>('sh-resolution-filter', []);
+export function toggleResolutionFilter(key: string) {
+  resolutionFilter.update((r) => (r.includes(key) ? r.filter((x) => x !== key) : [...r, key]));
+}
+/** The filter keys an item satisfies: its resolution, plus 'TV' when it's a
+ *  TV show (matches backend _resolution_keys). */
+export function resolutionKeysFor(i: ScanResult): string[] {
+  const keys: string[] = [];
+  if (i.resolution) keys.push(i.resolution);
+  if (i.category === 'tv' || i.season != null) keys.push('TV');
+  return keys;
+}
 /** Date-range filter bounds, "YYYY-MM-DD" strings; '' means off. Session-only
  *  (not persisted), same as genre/language filters. Inclusive on both ends —
  *  postedBefore covers through the END of that day. */
@@ -102,7 +119,7 @@ export const GRID_COLUMN_CHOICES: GridColumns[] = ['auto', 2, 3, 4, 5, 6, 8];
 /** Phone poster-wall column count: 1 = single large poster per row, 2 = the
  *  multi-poster wall. Device-local + persisted; independent of the desktop
  *  gridColumns above (a phone screen only sensibly holds 1 or 2 posters). */
-export const phoneColumns = persisted<1 | 2>('sh-phone-columns', 2);
+export const phoneColumns = persisted<1 | 2>('sh-phone-columns', 1);
 
 /** True when the phone's top chrome (the layout's "ScanHound" title bar, the
  *  scan-controls bar, and the FilterBar status-chip row) should auto-hide, in
@@ -358,7 +375,7 @@ let loadGeneration = 0;
 function filterQueryKey(): string {
   return JSON.stringify([
     get(statusFilter), get(searchFilter), get(genreFilter), get(languageFilter),
-    get(quickFilters), get(categoryFilter), get(sortBy), get(postedAfter), get(postedBefore)
+    get(quickFilters), get(categoryFilter), get(resolutionFilter), get(sortBy), get(postedAfter), get(postedBefore)
   ]);
 }
 
@@ -370,6 +387,7 @@ function buildResultParams(page: number): Record<string, string> {
   const g = get(genreFilter); if (g.length) p.genre = g.join(',');
   const l = get(languageFilter); if (l.length) p.language = l.join(',');
   const qf = get(quickFilters); if (qf.length) p.quick = qf.join(',');
+  const rf = get(resolutionFilter); if (rf.length) p.resolution = rf.join(',');
   const pa = get(postedAfter); if (pa) p.posted_after = pa;
   const pb = get(postedBefore); if (pb) p.posted_before = pb;
   const so = SORT_PARAM[get(sortBy)]; p.sort = so.sort; p.order = so.order;
@@ -452,8 +470,8 @@ export async function loadResults(reset: boolean): Promise<void> {
 }
 
 export const filteredResults = derived(
-  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls, categoryFilter, pagedMode, postedAfter, postedBefore],
-  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed, $category, $paged, $postedAfter, $postedBefore]) => {
+  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls, categoryFilter, resolutionFilter, pagedMode, postedAfter, postedBefore],
+  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed, $category, $resolution, $paged, $postedAfter, $postedBefore]) => {
     if ($paged) return $results; // server already filtered + sorted
     let items = $results;
     // Hide swiped-away ("skip") items everywhere they'd otherwise appear.
@@ -493,6 +511,12 @@ export const filteredResults = derived(
     }
     if ($postedAfter || $postedBefore) {
       items = items.filter((i) => inPostedRange(i.posted_date, $postedAfter, $postedBefore));
+    }
+    // Resolution/type facet (4K / 1080p / TV) — OR within the set: an item
+    // shows if it matches ANY selected key (mirrors backend _resolution_keys).
+    if ($resolution.length > 0) {
+      const rset = new Set($resolution);
+      items = items.filter((i) => resolutionKeysFor(i).some((k) => rset.has(k)));
     }
     // Quick-filter chips (AND-combined with the above)
     if ($quick.includes('4k')) items = items.filter((i) => i.resolution === '4K');
@@ -740,7 +764,7 @@ export const focusedIndex = writable<number>(-1);
  *  after a short debounce — but only in paged mode, and never on the initial
  *  subscribe (which fires immediately with the current values). */
 const _filterKey = derived(
-  [statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy, postedAfter, postedBefore],
+  [statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, resolutionFilter, sortBy, postedAfter, postedBefore],
   (vals) => JSON.stringify(vals)
 );
 let _filterDebounce: ReturnType<typeof setTimeout> | undefined;

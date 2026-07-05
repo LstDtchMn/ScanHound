@@ -1,5 +1,6 @@
 <script lang="ts">
   import Badge from './Badge.svelte';
+  import RtBadge from './RtBadge.svelte';
   import { toggleSelect, selectedKeys, selectedDetail, posterAspect, POSTER_ASPECT_CLASS, tileShowMeta } from '$lib/stores/results';
   import { isPhone } from '$lib/stores/viewport';
   import { settings } from '$lib/stores/settings';
@@ -190,8 +191,30 @@
             {#if item.resolution}<span class="font-bold text-white shrink-0">{item.resolution}</span>{/if}
             {#if item.size}<span class="shrink-0">&middot; {item.size}</span>{/if}
             {#if showRating && item.rating}<span class="shrink-0">&middot; &#9733; {item.rating.toFixed(1)}</span>{/if}
-            {#if item.rt_score}<span class="truncate">&middot; RT {item.rt_score}%</span>{/if}
+            {#if item.rt_score != null}<span class="shrink-0 flex items-center">&middot;&nbsp;<RtBadge score={item.rt_score} size="lg" /></span>{/if}
           </div>
+          <!-- Ownership context (the whole point of an upgrade): what you already
+               have, right on the poster. In Plex (per-version res/DV/HDR) and/or
+               a different version already sent to JDownloader. Single truncating row. -->
+          {#if plexVersions.length > 0 || item.prior_grab}
+            <div class="flex items-center gap-1 text-xs flex-nowrap overflow-hidden whitespace-nowrap mb-1">
+              {#if plexVersions.length > 0}
+                <span class="shrink-0 font-semibold text-[var(--accent)]">Plex:</span>
+                {#each plexVersions as pv, i}
+                  {#if i > 0}<span class="text-white/30 shrink-0">·</span>{/if}
+                  <span class="inline-flex items-center gap-0.5 shrink-0">
+                    <span class="font-semibold {pv.res === '4K' ? 'text-yellow-400' : 'text-white/90'}">{pv.res}</span>
+                    {#if pv.dovi}<span class="font-bold text-purple-300">DV</span>{:else if pv.hdr}<span class="font-bold text-amber-300">HDR</span>{/if}
+                  </span>
+                {/each}
+              {/if}
+              {#if item.prior_grab}
+                <span class="shrink-0 inline-flex items-center gap-0.5 text-amber-400" title="A different version was already sent to JDownloader">
+                  &#8595; {item.prior_grab.resolution}
+                </span>
+              {/if}
+            </div>
+          {/if}
         {:else}
           <!-- Desktop: unchanged hover-reveal secondary metadata (mouse-hover works fine here). -->
           <div

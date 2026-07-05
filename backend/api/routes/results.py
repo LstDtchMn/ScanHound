@@ -34,6 +34,20 @@ def _effective_category(item: Dict[str, Any]) -> str:
     return "tv" if item.get("season") is not None else "4k"
 
 
+def _resolution_keys(item: Dict[str, Any]) -> set:
+    """Filter keys an item satisfies for the resolution/type facet: its own
+    resolution ('4K'/'1080p'/'720p'), plus 'TV' when it's a TV show. The
+    frontend twin is resolutionKeysFor() in stores/results.ts — keep in sync.
+    """
+    keys = set()
+    res = item.get("resolution")
+    if res:
+        keys.add(res)
+    if _effective_category(item) == "tv":
+        keys.add("TV")
+    return keys
+
+
 def _has_plex_copy(item: Dict[str, Any]) -> bool:
     """Check if item has at least one Plex version.
 
@@ -106,7 +120,7 @@ _SORT_KEYS = {
 
 
 def _filter_and_sort(items, *, filter=None, search=None, category=None,
-                     genre=None, language=None, quick=None,
+                     genre=None, language=None, quick=None, resolution=None,
                      posted_after=None, posted_before=None,
                      sort="title", order="asc"):
     """Filter and sort items server-side.
@@ -154,6 +168,10 @@ def _filter_and_sort(items, *, filter=None, search=None, category=None,
     if language:
         lset = set(language)
         result = [i for i in result if i.get("language") in lset]
+
+    if resolution:
+        rset = set(resolution)
+        result = [i for i in result if _resolution_keys(i) & rset]
 
     if quick:
         q = set(quick)
@@ -243,6 +261,7 @@ class SelectAllRequest(BaseModel):
     genre: Optional[str] = None
     language: Optional[str] = None
     quick: Optional[str] = None
+    resolution: Optional[str] = None
     posted_after: Optional[str] = None
     posted_before: Optional[str] = None
 
@@ -312,6 +331,7 @@ def _shape_results(
     genre: Optional[List[str]] = None,
     language: Optional[List[str]] = None,
     quick: Optional[List[str]] = None,
+    resolution: Optional[List[str]] = None,
     posted_after: Optional[str] = None,
     posted_before: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
@@ -341,7 +361,8 @@ def _shape_results(
 
     items = _filter_and_sort(
         items, filter=filter, search=search, category=category, genre=genre,
-        language=language, quick=quick, posted_after=posted_after,
+        language=language, quick=quick, resolution=resolution,
+        posted_after=posted_after,
         posted_before=posted_before, sort=sort, order=order,
     )
 
@@ -473,6 +494,7 @@ def get_results(
     genre: Optional[str] = Query(None),
     language: Optional[str] = Query(None),
     quick: Optional[str] = Query(None),
+    resolution: Optional[str] = Query(None, description="Resolution/type facet CSV: 4K,1080p,TV (OR)"),
     posted_after: Optional[str] = Query(None, description="Inclusive lower bound, YYYY-MM-DD"),
     posted_before: Optional[str] = Query(None, description="Inclusive upper bound, YYYY-MM-DD"),
     include_dismissed: bool = Query(False, description="Include swiped-away items"),
@@ -485,7 +507,7 @@ def get_results(
         items, filter=filter, search=search, sort=sort, order=order,
         page=page, per_page=per_page, include_dismissed=include_dismissed, reg=reg,
         category=_csv(category), genre=_csv(genre), language=_csv(language),
-        quick=_csv(quick), posted_after=posted_after, posted_before=posted_before,
+        quick=_csv(quick), resolution=_csv(resolution), posted_after=posted_after, posted_before=posted_before,
     )
 
 
@@ -501,6 +523,7 @@ def get_cached_results(
     genre: Optional[str] = Query(None),
     language: Optional[str] = Query(None),
     quick: Optional[str] = Query(None),
+    resolution: Optional[str] = Query(None, description="Resolution/type facet CSV: 4K,1080p,TV (OR)"),
     posted_after: Optional[str] = Query(None, description="Inclusive lower bound, YYYY-MM-DD"),
     posted_before: Optional[str] = Query(None, description="Inclusive upper bound, YYYY-MM-DD"),
     include_dismissed: bool = Query(False, description="Include swiped-away items"),
@@ -519,7 +542,7 @@ def get_cached_results(
         items, filter=filter, search=search, sort=sort, order=order,
         page=page, per_page=per_page, include_dismissed=include_dismissed, reg=reg,
         category=_csv(category), genre=_csv(genre), language=_csv(language),
-        quick=_csv(quick), posted_after=posted_after, posted_before=posted_before,
+        quick=_csv(quick), resolution=_csv(resolution), posted_after=posted_after, posted_before=posted_before,
         extra={"source": "cache", "last_updated": last_updated},
         include_facets=True,
     )
@@ -556,6 +579,7 @@ def select_all(req: Optional[SelectAllRequest] = None,
     matched = _filter_and_sort(
         items, filter=req.filter, search=req.search, category=_csv(req.category),
         genre=_csv(req.genre), language=_csv(req.language), quick=_csv(req.quick),
+        resolution=_csv(req.resolution),
         posted_after=posted_after, posted_before=posted_before,
     )
     keys = [str(i.get("group_key")) for i in matched if i.get("group_key")]
