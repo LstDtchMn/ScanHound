@@ -34,7 +34,35 @@ def _make_service(config=None, db=None):
     """Build a DownloadService with mocked dependencies."""
     cfg = config or {}
     database = db or MagicMock()
+    # Default (mock DBs only): not a duplicate, so the normal download flow runs
+    # unless a test opts into the dedup path explicitly. Real DatabaseManagers
+    # answer is_downloaded() truthfully from their own rows.
+    if isinstance(database, MagicMock):
+        database.is_downloaded.return_value = False
     return DownloadService(config=cfg, db=database)
+
+
+class TestDownloadDedup:
+    def test_already_grabbed_url_is_skipped_without_scraping(self):
+        db = MagicMock()
+        svc = _make_service(config={"jd_enabled": True, "jd_method": "folder"}, db=db)
+        db.is_downloaded.return_value = True   # central table says already grabbed
+        svc.scrape_links = MagicMock(side_effect=AssertionError("must not scrape a dup"))
+        res = svc.download_item("u/dup", "Dune", None, "1080p", "20 GB")
+        assert res["success"] is True
+        assert res["method"] == "duplicate"
+        assert "Already grabbed" in res["message"]
+        svc.scrape_links.assert_not_called()
+
+    def test_failed_prior_grab_does_not_block_retry(self):
+        db = MagicMock()
+        svc = _make_service(config={"jd_enabled": True, "jd_method": "folder"}, db=db)
+        db.is_downloaded.return_value = False  # only a failed row existed → retryable
+        svc.scrape_links = MagicMock(return_value=[])  # no links → not a duplicate short-circuit
+        svc._is_supported_download_link = MagicMock(return_value=False)
+        res = svc.download_item("u/retry", "Dune", None, "1080p", "20 GB")
+        assert res["method"] != "duplicate"   # proceeded past the dedup guard
+        svc.scrape_links.assert_called_once()
 
 
 @dataclass

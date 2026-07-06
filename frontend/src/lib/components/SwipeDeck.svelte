@@ -258,7 +258,7 @@
                     {/each}
                   {/if}
                   {#if item.prior_grab}
-                    <span class="shrink-0 inline-flex items-center gap-1 text-amber-400" title="A different version was already sent to JDownloader">↓ {item.prior_grab.resolution}{#if item.prior_grab.size} <span class="text-amber-400/70">{item.prior_grab.size}</span>{/if}</span>
+                    <span class="shrink-0 inline-flex items-center gap-1 text-amber-400 font-semibold" title="A different version was already sent to JDownloader">↓ Grabbed {item.prior_grab.resolution}{#if item.prior_grab.size} <span class="font-normal text-amber-400/80">· {item.prior_grab.size}</span>{/if}</span>
                   {/if}
                 </div>
               {/if}

@@ -94,6 +94,11 @@ def download_item(
                     "type": "notification",
                     "data": {"title": "Download Failed", "body": message, "priority": "high"},
                 })
+            elif method == "duplicate":
+                ws_manager.broadcast_sync({
+                    "type": "notification",
+                    "data": {"title": "Already grabbed", "body": message, "priority": "normal"},
+                })
             elif method == "jdownloader":
                 ws_manager.broadcast_sync({
                     "type": "notification",
@@ -142,7 +147,7 @@ def download_batch(
             # Each item is scraped for its real file-host links before being
             # sent on. Previously the raw page URLs (e.g. hdencode.org posts)
             # were forwarded to JDownloader, which can't resolve them.
-            delivered = diverted = failed = 0
+            delivered = diverted = failed = skipped = 0
             for i, item in enumerate(req.items):
                 ws_manager.broadcast_sync({
                     "type": "download:batch_progress",
@@ -155,9 +160,12 @@ def download_batch(
                     hdr=item.hdr, dovi=item.dovi,
                     progress_callback=_on_progress,
                 )
+                method = (res or {}).get("method")
                 if not (res or {}).get("success"):
                     failed += 1
-                elif (res or {}).get("method") == "jdownloader":
+                elif method == "duplicate":
+                    skipped += 1
+                elif method == "jdownloader":
                     delivered += 1
                 else:
                     diverted += 1
@@ -168,6 +176,8 @@ def download_batch(
             # Honest summary: distinguish JD deliveries, clipboard/browser
             # diversions, and outright failures instead of "Processed N".
             parts = [f"{delivered} sent to JDownloader"]
+            if skipped:
+                parts.append(f"{skipped} already grabbed")
             if diverted:
                 parts.append(f"{diverted} copied/opened")
             if failed:

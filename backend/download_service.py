@@ -245,7 +245,13 @@ class DownloadService:
                             f.write(f"packageName={package_name[:50]}\n")
                             if destination:
                                 f.write(f"downloadFolder={destination}\n")
-                            f.write("autoStart=TRUE\n\n")
+                            # autoConfirm moves it out of the linkgrabber without a
+                            # manual confirm; forcedStart begins the download even if
+                            # JD's queue is paused — together they make a grab
+                            # actually start, not just sit queued.
+                            f.write("autoConfirm=TRUE\n")
+                            f.write("autoStart=TRUE\n")
+                            f.write("forcedStart=TRUE\n\n")
                     self._log(f"Sent {len(links)} links to JDownloader folder", "success")
                     return True
                 except Exception as e:
@@ -1583,6 +1589,24 @@ class DownloadService:
         if not url:
             result["message"] = "No URL provided"
             return result
+
+        # Dedup: if this exact release was already grabbed successfully, don't
+        # scrape or re-send it — that just creates a duplicate JDownloader entry.
+        # (A prior *failed* grab doesn't count, so retries still work.)
+        if self.db is not None:
+            try:
+                already = self.db.is_downloaded(url)
+            except Exception:
+                already = False
+            if already:
+                result["success"] = True
+                result["method"] = "duplicate"
+                result["message"] = f"Already grabbed — skipped: {title}"
+                self._log(f"[Download] skip duplicate: {title}", "info")
+                self._progress("download:complete",
+                               {"title": title, "url": url, "method": "duplicate", "link_count": 0},
+                               _cb=progress_callback)
+                return result
 
         _cb = progress_callback
         self._progress("download:started", {"title": title, "url": url}, _cb=_cb)

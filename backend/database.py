@@ -874,6 +874,14 @@ class DatabaseManager:
         return self._query('SELECT 1 FROM downloads WHERE url = ?', (url,),
                            one=True, default=None) is not None
 
+    def is_downloaded(self, url):
+        """True if this URL was already grabbed SUCCESSFULLY (non-failed) — used
+        to skip re-sending a duplicate to JDownloader. A prior 'failed' row does
+        not count, so a failed grab can still be retried."""
+        return self._query(
+            "SELECT 1 FROM downloads WHERE url = ? AND COALESCE(status, 'completed') != 'failed'",
+            (url,), one=True, default=None) is not None
+
     def get_downloaded_urls(self):
         """Set of every URL grabbed successfully (non-failed) — the central,
         authoritative record of what's been downloaded. Used to overlay
