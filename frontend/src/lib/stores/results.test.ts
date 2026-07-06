@@ -40,6 +40,7 @@ const {
   quickFilters,
   filteredResults,
   deckResults,
+  deckGroups,
   dismissItem,
   restoreItem,
   pagedMode,
@@ -234,6 +235,44 @@ describe('deckResults', () => {
 
     dismissItem('b');
     expect(get(deckResults)).toEqual([]);
+  });
+});
+
+describe('deckGroups', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('collapses same-title releases into one group, best resolution first', () => {
+    results.set([
+      item({ url: 'hd', title: 'Dune', group_key: 'dune|2021', resolution: '1080p', status: 'missing', size: '8 GB' }),
+      item({ url: 'uhd', title: 'Dune', group_key: 'dune|2021', resolution: '4K', status: 'missing', size: '20 GB' }),
+      item({ url: 'blade', title: 'Blade', group_key: 'blade|1998', resolution: '1080p', status: 'missing' })
+    ]);
+    const groups = get(deckGroups);
+    expect(groups.length).toBe(2); // two titles, not three releases
+    const dune = groups.find((g) => g.key === 'dune|2021')!;
+    expect(dune.releases.map((r) => r.url)).toEqual(['uhd', 'hd']); // best (4K) first
+    expect(dune.best.url).toBe('uhd');
+  });
+
+  it('ranks Dolby Vision above SDR at the same resolution when picking best', () => {
+    results.set([
+      item({ url: 'sdr', title: 'X', group_key: 'x', resolution: '4K', dovi: false, status: 'missing' }),
+      item({ url: 'dv', title: 'X', group_key: 'x', resolution: '4K', dovi: true, status: 'missing' })
+    ]);
+    expect(get(deckGroups)[0].best.url).toBe('dv');
+  });
+
+  it('only groups actionable releases (grabbed/library siblings drop out)', () => {
+    results.set([
+      item({ url: 'a', title: 'Y', group_key: 'y', resolution: '4K', status: 'downloaded' }),
+      item({ url: 'b', title: 'Y', group_key: 'y', resolution: '1080p', status: 'missing' })
+    ]);
+    const groups = get(deckGroups);
+    expect(groups.length).toBe(1);
+    expect(groups[0].releases.map((r) => r.url)).toEqual(['b']); // only the still-missing one
   });
 });
 

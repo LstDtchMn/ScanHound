@@ -1,6 +1,6 @@
 <script lang="ts">
   import {
-    deckResults, results, selectedKeys, selectedDetail,
+    deckGroups, results, selectedKeys, selectedDetail,
     dismissItem, restoreItem, toggleSelect, deselectAll, markDownloaded,
     deckNeedsMore, loadResults
   } from '$lib/stores/results';
@@ -33,14 +33,27 @@
   const THRESHOLD = 90;   // px past which a release commits to an action
   const TAP_SLOP = 6;     // movement under this counts as a tap, not a drag
 
-  let deck = $derived($deckResults);
-  let top = $derived(deck[0] ?? null);
+  // One card per TITLE (group), not per release, so you never swipe through
+  // duplicates. `resolvedKeys` hides a group the instant it's acted on (its
+  // other releases stay actionable but the whole title leaves the deck).
+  let resolvedKeys = $state(new Set<string>());
+  let groups = $derived($deckGroups.filter((g) => !resolvedKeys.has(g.key)));
+  let top = $derived(groups[0] ?? null);
 
-  // Top up the server-paged pool as the deck runs low, so swiping never
-  // outpaces what's loaded. Re-runs as $deckResults.length shrinks (cards
-  // consumed/selected) or grows (a page lands).
+  // Which release of the top group will be grabbed (default = best). Reset
+  // whenever the top card changes to a different title.
+  let selectedReleaseUrl = $state<string | null>(null);
+  let prevTopKey = '';
   $effect(() => {
-    if (deckNeedsMore($deckResults.length)) loadResults(false);
+    if (top && top.key !== prevTopKey) { prevTopKey = top.key; selectedReleaseUrl = top.best.url; }
+  });
+  let selectedRelease = $derived(
+    top ? (top.releases.find((r) => r.url === selectedReleaseUrl) ?? top.best) : null
+  );
+
+  // Top up the server-paged pool as the deck runs low (counts GROUPS now).
+  $effect(() => {
+    if (deckNeedsMore(groups.length)) loadResults(false);
   });
 
   // Top-card drag state
@@ -54,8 +67,9 @@
   let intent = $derived(dx > 30 ? 'select' : dx < -30 ? 'skip' : null);
   let overlayOpacity = $derived(Math.min(Math.abs(dx) / THRESHOLD, 1));
 
-  // Undo stack (most recent last)
-  type Swipe = { url: string; title: string; action: 'select' | 'skip' };
+  // Undo stack (most recent last). A group-level action: 'select' queued the
+  // chosen release; 'skip' dismissed every release of the title.
+  type Swipe = { key: string; title: string; action: 'select' | 'skip'; selectedUrl?: string; urls: string[] };
   let undoStack = $state<Swipe[]>([]);
 
   // Selected items (pulled from the full result set — selected cards leave the deck)
@@ -88,11 +102,11 @@
     dragging = false;
     const moved = Math.hypot(dx, dy);
     if (moved < TAP_SLOP) {
-      // Treated as a tap → open details
-      const item = top;
+      // Treated as a tap → open details for the currently-selected release
+      const rel = selectedRelease;
       dx = 0;
       dy = 0;
-      if (item) selectedDetail.set(item);
+      if (rel) selectedDetail.set(rel);
       return;
     }
     if (dx > THRESHOLD) commit('select');
@@ -115,8 +129,9 @@
     // Guard re-entry: an in-flight animation must finish before the next action,
     // otherwise a rapid double-tap on the buttons commits the same card twice.
     if (animating) return;
-    const item = top;
-    if (!item) return;
+    const group = top;
+    const chosen = selectedRelease;
+    if (!group) return;
     animating = true;
     const dir = action === 'select' ? 1 : -1;
     // Fly off-screen, then mutate the stores so the card leaves the deck.
@@ -124,16 +139,22 @@
     dy = dy * 1.2;
     if (actionTimer) clearTimeout(actionTimer);
     actionTimer = setTimeout(() => {
-      const entry: Swipe = { url: item.url, title: item.title, action };
+      const urls = group.releases.map((r) => r.url);
+      const entry: Swipe = { key: group.key, title: group.title, action, selectedUrl: chosen?.url, urls };
       undoStack = [...undoStack.slice(-9), entry];
+      // Resolve the whole title so it leaves the deck (its other releases stay
+      // actionable in the wall but won't re-offer here).
+      resolvedKeys = new Set(resolvedKeys).add(group.key);
       if (action === 'select') {
-        toggleSelect(item.url);
+        if (chosen?.url) toggleSelect(chosen.url);  // queue the chosen release in the tray
       } else {
-        // If the dismiss didn't persist, the store already reverted the card
-        // back into the deck on its own — drop the now-stale undo entry so
-        // "Undo" doesn't sit there as a no-op.
-        dismissItem(item.url, item.title).then((persisted) => {
-          if (!persisted) undoStack = undoStack.filter((s) => s !== entry);
+        // Skip the whole title → dismiss every release. If NONE persisted
+        // (offline), un-resolve so it comes back and drop the stale undo entry.
+        Promise.all(urls.map((u) => dismissItem(u, group.title))).then((res) => {
+          if (!res.some(Boolean)) {
+            undoStack = undoStack.filter((s) => s !== entry);
+            resolvedKeys = new Set([...resolvedKeys].filter((k) => k !== group.key));
+          }
         });
       }
       dx = 0;
@@ -147,8 +168,12 @@
     const last = undoStack[undoStack.length - 1];
     if (!last) return;
     undoStack = undoStack.slice(0, -1);
-    if (last.action === 'select') toggleSelect(last.url); // deselect → reappears
-    else restoreItem(last.url);
+    resolvedKeys = new Set([...resolvedKeys].filter((k) => k !== last.key)); // un-hide the title
+    if (last.action === 'select') {
+      if (last.selectedUrl) toggleSelect(last.selectedUrl); // deselect the queued release
+    } else {
+      last.urls.forEach((u) => restoreItem(u)); // un-dismiss every release
+    }
   }
 
   async function downloadSelected() {
@@ -200,7 +225,9 @@
       {/if}
 
       <div class="relative w-full max-w-sm aspect-[2/3]">
-        {#each deck.slice(0, 3) as item, i (item.url)}
+        {#each groups.slice(0, 3) as group, i (group.key)}
+          {@const info = group.best}
+          {@const shown = i === 0 ? (selectedRelease ?? group.best) : group.best}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             class="absolute inset-0 rounded-2xl overflow-hidden border border-[var(--border)] bg-[var(--bg-secondary)] shadow-xl {i === 0 ? 'cursor-grab active:cursor-grabbing touch-none' : 'pointer-events-none'}"
@@ -211,20 +238,21 @@
             onpointercancel={i === 0 ? onPointerUp : undefined}
           >
             <!-- Poster -->
-            {#if item.poster_url}
-              <img src={item.poster_url} alt={item.title} class="absolute inset-0 w-full h-full object-cover" draggable="false" />
+            {#if info.poster_url}
+              <img src={info.poster_url} alt={info.title} class="absolute inset-0 w-full h-full object-cover" draggable="false" />
             {:else}
               <div class="absolute inset-0 flex items-center justify-center text-[var(--text-secondary)]">No poster</div>
             {/if}
             <div class="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-black/40"></div>
 
-            <!-- Status badge -->
-            <div class="absolute top-3 left-3">
-              <Badge label={formatStatus(item.status)} variant={statusVariant(item.status)} size="xl" />
+            <!-- Status badge (of the selected release) + version count -->
+            <div class="absolute top-3 left-3 flex items-center gap-1.5">
+              <Badge label={formatStatus(shown.status)} variant={statusVariant(shown.status)} size="xl" />
+              {#if group.releases.length > 1}<Badge label="{group.releases.length} versions" variant="info" size="lg" />{/if}
             </div>
             <div class="absolute top-3 right-3 flex gap-1">
-              {#if item.dovi}<Badge label="DV" variant="accent" size="xl" />{/if}
-              {#if item.hdr && !item.dovi}<Badge label="HDR" variant="warning" size="xl" />{/if}
+              {#if shown.dovi}<Badge label="DV" variant="accent" size="xl" />{/if}
+              {#if shown.hdr && !shown.dovi}<Badge label="HDR" variant="warning" size="xl" />{/if}
             </div>
 
             <!-- Swipe-intent overlays (top card only) -->
@@ -235,21 +263,41 @@
 
             <!-- Info — sized big for arm's-length reading in the deck. -->
             <div class="absolute bottom-0 left-0 right-0 p-4 text-white">
-              <p class="text-3xl font-bold leading-tight">{item.title}{#if item.year}<span class="font-normal opacity-80"> ({item.year})</span>{/if}</p>
+              <p class="text-3xl font-bold leading-tight">{info.title}{#if info.year}<span class="font-normal opacity-80"> ({info.year})</span>{/if}</p>
               <div class="flex flex-wrap items-center gap-x-2.5 gap-y-1 mt-2 text-xl opacity-95 font-medium">
-                {#if item.resolution}<span class="font-bold">{item.resolution}</span>{/if}
-                {#if item.size}<span>· {item.size}</span>{/if}
-                {#if item.rating}<span>· ★ {item.rating.toFixed(1)}{#if item.votes}<span class="opacity-70"> ({formatCount(item.votes)})</span>{/if}</span>{/if}
-                {#if item.rt_score != null}<span class="flex items-center">·&nbsp;<RtBadge score={item.rt_score} size="xl" /></span>{/if}
+                {#if shown.resolution}<span class="font-bold">{shown.resolution}</span>{/if}
+                {#if shown.size}<span>· {shown.size}</span>{/if}
+                {#if info.rating}<span>· ★ {info.rating.toFixed(1)}{#if info.votes}<span class="opacity-70"> ({formatCount(info.votes)})</span>{/if}</span>{/if}
+                {#if info.rt_score != null}<span class="flex items-center">·&nbsp;<RtBadge score={info.rt_score} size="xl" /></span>{/if}
               </div>
-              <!-- Ownership context: what you already have in Plex (res + DV/HDR +
-                   size, all distinct copies) and/or a prior grab — the upgrade call. -->
-              {#if plexVersionsOf(item).length > 0 || item.prior_grab}
+
+              <!-- Quality picker (top card only, when there's a choice). Tap a
+                   chip to pick which version to grab; the chosen one is what a
+                   right-swipe queues. stopPropagation so tapping doesn't drag. -->
+              {#if i === 0 && group.releases.length > 1}
+                <div class="flex items-center gap-2 mt-2.5 overflow-x-auto whitespace-nowrap scrollbar-none pb-0.5">
+                  {#each group.releases as rel (rel.url)}
+                    <button
+                      onpointerdown={(e) => e.stopPropagation()}
+                      onclick={(e) => { e.stopPropagation(); selectedReleaseUrl = rel.url; }}
+                      class="shrink-0 px-3 py-1.5 rounded-lg text-base font-semibold border-2 transition-colors
+                        {rel.url === selectedReleaseUrl
+                          ? 'bg-[var(--accent)] border-[var(--accent)] text-white'
+                          : 'bg-black/40 border-white/30 text-white/90'}"
+                    >
+                      {rel.resolution || '?'}{#if rel.dovi} DV{:else if rel.hdr && rel.hdr !== 'SDR'} HDR{/if}{#if rel.size} · {rel.size}{/if}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+
+              <!-- Ownership context: what you already have in Plex + any prior grab. -->
+              {#if plexVersionsOf(info).length > 0 || info.prior_grab}
                 <div class="flex items-center gap-2 mt-1.5 text-lg overflow-x-auto whitespace-nowrap scrollbar-none">
-                  {#if plexVersionsOf(item).length > 0}
+                  {#if plexVersionsOf(info).length > 0}
                     <span class="shrink-0 font-semibold text-[var(--accent)]">Plex:</span>
-                    {#each plexVersionsOf(item) as pv, i}
-                      {#if i > 0}<span class="text-white/30 shrink-0">·</span>{/if}
+                    {#each plexVersionsOf(info) as pv, j}
+                      {#if j > 0}<span class="text-white/30 shrink-0">·</span>{/if}
                       <span class="inline-flex items-center gap-1 shrink-0">
                         <span class="font-bold {pv.res === '4K' ? 'text-yellow-400' : 'text-white/90'}">{pv.res}</span>
                         {#if pv.dovi}<span class="font-bold text-purple-300">DV</span>{:else if pv.hdr}<span class="font-bold text-amber-300">HDR</span>{/if}
@@ -257,13 +305,13 @@
                       </span>
                     {/each}
                   {/if}
-                  {#if item.prior_grab}
-                    <span class="shrink-0 inline-flex items-center gap-1 text-amber-400 font-semibold" title="A different version was already sent to JDownloader">↓ Grabbed {item.prior_grab.resolution}{#if item.prior_grab.size} <span class="font-normal text-amber-400/80">· {item.prior_grab.size}</span>{/if}</span>
+                  {#if info.prior_grab}
+                    <span class="shrink-0 inline-flex items-center gap-1 text-amber-400 font-semibold" title="A different version was already sent to JDownloader">↓ Grabbed {info.prior_grab.resolution}{#if info.prior_grab.size} <span class="font-normal text-amber-400/80">· {info.prior_grab.size}</span>{/if}</span>
                   {/if}
                 </div>
               {/if}
-              {#if item.genres?.length}
-                <p class="text-base opacity-70 mt-1 truncate">{item.genres.slice(0, 3).join(' · ')}</p>
+              {#if info.genres?.length}
+                <p class="text-base opacity-70 mt-1 truncate">{info.genres.slice(0, 3).join(' · ')}</p>
               {/if}
             </div>
           </div>
@@ -289,7 +337,7 @@
         title="Skip (swipe left)"
       >✕</button>
       <button
-        onclick={() => top && selectedDetail.set(top)}
+        onclick={() => selectedRelease && selectedDetail.set(selectedRelease)}
         class="w-11 h-11 rounded-full flex items-center justify-center bg-[var(--bg-secondary)] border-2 border-[var(--border)] text-[var(--text-secondary)] shadow hover:text-[var(--text-primary)] active:scale-95 transition"
         aria-label="Details"
         title="Details"

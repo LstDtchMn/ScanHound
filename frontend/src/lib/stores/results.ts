@@ -1,7 +1,7 @@
 import { writable, derived, get } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { connection } from './connection';
-import { resolutionRank } from '$lib/constants';
+import { resolutionRank, sizeToGB } from '$lib/constants';
 import type { ScanResult, ScanStats } from '$lib/api/types';
 
 export type StatusFilter = 'all' | 'missing' | 'upgrade' | 'library';
@@ -567,10 +567,46 @@ export const deckResults = derived(
     $filtered.filter((i) => !!i.url && isActionable(i.status) && !$selected.has(i.url))
 );
 
+/** A swipe-deck group: one entry per title (group_key), holding every
+ *  still-actionable release of that title, best-first. Lets the deck show a
+ *  single card per title with a quality picker instead of one card per
+ *  release, so you never swipe through duplicates. */
+export interface DeckGroup {
+  key: string;
+  title: string;
+  best: ScanResult;
+  releases: ScanResult[];
+}
+
+/** Rank a release for "best": resolution, then DV, then HDR, then size. */
+function releaseRank(i: ScanResult): number {
+  return resolutionRank(i.resolution) * 1000
+    + (i.dovi ? 300 : 0)
+    + (i.hdr && i.hdr !== 'SDR' ? 100 : 0)
+    + Math.min(sizeToGB(i.size) ?? 0, 99);
+}
+
+export const deckGroups = derived(deckResults, ($deck) => {
+  const map = new Map<string, DeckGroup>();
+  for (const item of $deck) {
+    const key = item.group_key || item.title;
+    let g = map.get(key);
+    if (!g) { g = { key, title: item.title, best: item, releases: [] }; map.set(key, g); }
+    g.releases.push(item);
+  }
+  const groups = [...map.values()];
+  for (const g of groups) {
+    g.releases.sort((a, b) => releaseRank(b) - releaseRank(a));
+    g.best = g.releases[0];
+  }
+  return groups;
+});
+
 /** True when the swipe deck's card pool is running low and another server
- *  page should be fetched to top it up (paged mode only). */
-export function deckNeedsMore(remainingActionable: number): boolean {
-  return get(pagedMode) && get(hasMore) && !get(loadingMore) && remainingActionable < 8;
+ *  page should be fetched to top it up (paged mode only). Counts GROUPS now,
+ *  since the deck shows one card per title. */
+export function deckNeedsMore(remainingGroups: number): boolean {
+  return get(pagedMode) && get(hasMore) && !get(loadingMore) && remainingGroups < 6;
 }
 
 /** Load the persisted dismissal set from the server (call once on app start). */
