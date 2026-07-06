@@ -1,6 +1,7 @@
 import { writable, derived, get } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { connection } from './connection';
+import { resolutionRank } from '$lib/constants';
 import type { ScanResult, ScanStats } from '$lib/api/types';
 
 export type StatusFilter = 'all' | 'missing' | 'upgrade' | 'library';
@@ -701,13 +702,23 @@ export function markGrabbedSiblings(grabbedUrl: string | undefined | null) {
       hdr: grabbed.hdr || '',
       dovi: grabbed.dovi ?? false
     };
-    return items.map((it) =>
-      it.group_key === grabbed.group_key &&
-      it.url !== grabbedUrl &&
-      (it.status || '').toLowerCase().includes('missing')
-        ? { ...it, prior_grab: note }
-        : it
-    );
+    const grabbedRank = resolutionRank(grabbed.resolution);
+    // Reclassify still-missing siblings so they leave the swipe deck instantly
+    // (matching the server's read-time overlay in _shape_results): a sibling
+    // with a higher resolution than what you grabbed becomes an 'upgrade'
+    // (stays actionable to grab); anything equal/lower becomes
+    // 'downloaded_similar' (you already have a copy — non-actionable).
+    return items.map((it) => {
+      if (
+        it.group_key === grabbed.group_key &&
+        it.url !== grabbedUrl &&
+        (it.status || '').toLowerCase().includes('missing')
+      ) {
+        const status = resolutionRank(it.resolution) > grabbedRank ? 'upgrade' : 'downloaded_similar';
+        return { ...it, status, prior_grab: note };
+      }
+      return it;
+    });
   });
 }
 

@@ -46,6 +46,66 @@ def _resolution_keys(item: Dict[str, Any]) -> set:
     return {res} if res else set()
 
 
+_RES_RANK = {"2160p": 4, "4k": 4, "uhd": 4, "1080p": 3, "720p": 2, "480p": 1}
+
+
+def _res_rank(res) -> int:
+    return _RES_RANK.get((res or "").strip().lower(), 0)
+
+
+def _title_key(normalized: str, season) -> str:
+    return f"{normalized}|S{season}" if season is not None else normalized
+
+
+def _overlay_download_state(items, db):
+    """Overlay download state onto result items from the central downloads
+    table (see caller for the rule table). Pure/non-mutating: returns a new
+    list, copying only the dicts it changes. Best-effort — any DB hiccup
+    leaves items untouched."""
+    from backend.app_service import normalize_title  # deferred: avoid import cycle
+    try:
+        downloaded = db.get_downloaded_urls()
+    except Exception:
+        downloaded = set()
+    # Best grabbed resolution per (normalized_title, season).
+    grabbed: Dict[str, Dict[str, Any]] = {}
+    try:
+        for row in db.get_downloaded_titles():
+            nt, season, res, size, _url = row
+            if not nt:
+                continue
+            k = _title_key(nt, season)
+            rank = _res_rank(res)
+            cur = grabbed.get(k)
+            if cur is None or rank > cur["rank"]:
+                grabbed[k] = {"rank": rank, "resolution": res or "", "size": size or ""}
+    except Exception:
+        grabbed = {}
+
+    if not downloaded and not grabbed:
+        return items
+
+    out = []
+    for i in items:
+        url = i.get("url")
+        if url in downloaded:
+            out.append(i if i.get("status") == "downloaded" else {**i, "status": "downloaded"})
+            continue
+        status = (i.get("status") or "").lower()
+        # Only reclassify still-missing siblings; never touch library/upgrade/downloaded.
+        if grabbed and status.startswith("missing"):
+            g = grabbed.get(_title_key(normalize_title(i.get("title", "")), i.get("season")))
+            if g is not None:
+                note = i.get("prior_grab") or {
+                    "resolution": g["resolution"], "size": g["size"], "downloaded_at": None,
+                }
+                new_status = "upgrade" if _res_rank(i.get("resolution")) > g["rank"] else "downloaded_similar"
+                out.append({**i, "status": new_status, "prior_grab": note})
+                continue
+        out.append(i)
+    return out
+
+
 def _has_plex_copy(item: Dict[str, Any]) -> bool:
     """Check if item has at least one Plex version.
 
@@ -346,24 +406,21 @@ def _shape_results(
         language/quick filtering and before pagination — so the facet lists
         never shrink to just the current page or the current filter selection.
     """
-    # Overlay 'downloaded' from the central downloads table at READ time, so a
-    # grab is remembered across reloads and shared between the app and web —
-    # independent of when the background scan last folded download history in.
-    # An exact-URL match wins over whatever the cached/scanned status was
-    # (mirrors the scanner's own url-in-history -> DOWNLOADED rule). Non-mutating
-    # (copies the touched dicts) so the underlying cache list isn't rewritten.
+    # Overlay download state from the central downloads table at READ time, so
+    # a grab is remembered across reloads and shared between the app and web —
+    # independent of when the background scan last folded download history in,
+    # and covering SIBLING releases (other URLs of the same title). Rules:
+    #   * exact URL grabbed            -> 'downloaded'
+    #   * a still-missing sibling of a grabbed title:
+    #       - lower/equal resolution   -> 'downloaded_similar' (you have a copy;
+    #                                     leaves the swipe deck, non-actionable)
+    #       - higher resolution        -> 'upgrade' (genuinely better than what
+    #                                     you grabbed; stays actionable to grab)
+    # Never clobbers a library/upgrade/downloaded status. Non-mutating (copies
+    # only the touched dicts). Mirrors the scanner's url/title history rules so
+    # the deck stops re-offering versions of something you already grabbed.
     if reg.db is not None:
-        try:
-            downloaded = reg.db.get_downloaded_urls()
-        except Exception:
-            downloaded = set()
-        if downloaded:
-            items = [
-                {**i, "status": "downloaded"}
-                if i.get("url") in downloaded and i.get("status") != "downloaded"
-                else i
-                for i in items
-            ]
+        items = _overlay_download_state(items, reg.db)
 
     # Hide items the user swiped away on the deck (unless explicitly requested).
     if not include_dismissed and reg.db is not None:

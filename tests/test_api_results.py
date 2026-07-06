@@ -180,6 +180,7 @@ def _client_with_cache(rows, version=None):
     registry.db.get_background_cache.return_value = rows
     registry.db.get_dismissed_urls.return_value = set()
     registry.db.get_downloaded_urls.return_value = set()
+    registry.db.get_downloaded_titles.return_value = []
     # A real (count, max_last_seen_at)-shaped version by default so the B2
     # parse-cache in results.py behaves like it would against a real
     # DatabaseManager (unchanged rows -> unchanged version -> cache hit).
@@ -207,6 +208,30 @@ def test_downloaded_urls_overlay_marks_downloaded_at_read_time():
     # And it counts toward the 'downloaded' status filter without a re-scan.
     only_dl = c.get("/results/cached", params={"filter": "downloaded", "per_page": 100}).json()
     assert {i["title"] for i in only_dl["items"]} == {"A"}
+
+
+def test_grabbed_sibling_versions_are_reclassified():
+    # Same title "Dune", three separate release URLs at different resolutions,
+    # all still 'missing' in the cache. You grabbed the 1080p one.
+    from backend.app_service import normalize_title
+    rows = [
+        _row("Dune", url="d/1080", resolution="1080p"),
+        _row("Dune", url="d/4k", resolution="4K"),
+        _row("Dune", url="d/720", resolution="720p"),
+    ]
+    c = _client_with_cache(rows)
+    registry.db.get_downloaded_urls.return_value = {"d/1080"}
+    # (normalized_title, season, resolution, size, url)
+    registry.db.get_downloaded_titles.return_value = [
+        (normalize_title("Dune"), None, "1080p", "20 GB", "d/1080"),
+    ]
+    data = c.get("/results/cached", params={"per_page": 100}).json()
+    by_url = {i["url"]: i for i in data["items"]}
+    assert by_url["d/1080"]["status"] == "downloaded"          # the exact grab
+    assert by_url["d/720"]["status"] == "downloaded_similar"   # lower res → have a copy
+    assert by_url["d/4k"]["status"] == "upgrade"               # higher res → real upgrade
+    # The downloaded_similar sibling carries the grabbed-version note.
+    assert by_url["d/720"]["prior_grab"]["resolution"] == "1080p"
 
 
 def test_cached_stats_whole_set_but_filtered_narrows():
