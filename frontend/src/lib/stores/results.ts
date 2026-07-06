@@ -703,19 +703,25 @@ export function markGrabbedSiblings(grabbedUrl: string | undefined | null) {
       dovi: grabbed.dovi ?? false
     };
     const grabbedRank = resolutionRank(grabbed.resolution);
-    // Reclassify still-missing siblings so they leave the swipe deck instantly
-    // (matching the server's read-time overlay in _shape_results): a sibling
-    // with a higher resolution than what you grabbed becomes an 'upgrade'
-    // (stays actionable to grab); anything equal/lower becomes
-    // 'downloaded_similar' (you already have a copy — non-actionable).
+    const grabbedDovi = grabbed.dovi ?? false;
+    // Reclassify still-missing siblings so the deck updates instantly (matching
+    // the server's read-time overlay in _shape_results): a sibling that's
+    // genuinely better than what you grabbed — higher resolution, or same
+    // resolution with a Dolby Vision gain — stays 'missing' (grabbable, and out
+    // of the Upgrades tab), just annotated with what you already grabbed;
+    // anything equal/lower becomes 'downloaded_similar' (you have a copy —
+    // non-actionable, leaves the deck).
     return items.map((it) => {
       if (
         it.group_key === grabbed.group_key &&
         it.url !== grabbedUrl &&
         (it.status || '').toLowerCase().includes('missing')
       ) {
-        const status = resolutionRank(it.resolution) > grabbedRank ? 'upgrade' : 'downloaded_similar';
-        return { ...it, status, prior_grab: note };
+        const rank = resolutionRank(it.resolution);
+        const isBetter = rank > grabbedRank || (rank === grabbedRank && (it.dovi ?? false) && !grabbedDovi);
+        return isBetter
+          ? { ...it, prior_grab: note }
+          : { ...it, status: 'downloaded_similar', prior_grab: note };
       }
       return it;
     });

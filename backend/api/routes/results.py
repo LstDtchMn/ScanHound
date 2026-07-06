@@ -53,37 +53,52 @@ def _res_rank(res) -> int:
     return _RES_RANK.get((res or "").strip().lower(), 0)
 
 
-def _title_key(normalized: str, season) -> str:
-    return f"{normalized}|S{season}" if season is not None else normalized
+def _is_better_grab(item, grab) -> bool:
+    """Is `item` a genuinely better release than the best `grab` you already
+    got? Higher resolution, or same resolution with a Dolby Vision gain — the
+    exact rule the scanner uses (_download_status_for). Used to keep such a
+    sibling actionable (still grabbable) instead of hiding it as a duplicate."""
+    ir, gr = _res_rank(item.get("resolution")), grab["rank"]
+    return ir > gr or (ir == gr and bool(item.get("dovi")) and not grab["dovi"])
 
 
 def _overlay_download_state(items, db):
     """Overlay download state onto result items from the central downloads
-    table (see caller for the rule table). Pure/non-mutating: returns a new
-    list, copying only the dicts it changes. Best-effort — any DB hiccup
-    leaves items untouched."""
-    from backend.app_service import normalize_title  # deferred: avoid import cycle
+    table so a grab is remembered across reloads / app + web without a re-scan,
+    and its SIBLING releases (other URLs of the same title) stop reading
+    'missing'. Sibling matching is by ``group_key`` (already normalized|year|
+    season — year- and season-aware, the same key the client + scanner use), so
+    a 2021 remake never contaminates the 1984 original. DV/HDR is honored via
+    the item's own flags. Rules:
+      * exact URL grabbed                         -> 'downloaded'
+      * still-missing sibling, NOT better than the grab -> 'downloaded_similar'
+        (you have a copy; non-actionable, leaves the swipe deck)
+      * still-missing sibling that IS better (higher res, or =res + DV gain) ->
+        left 'missing' + a prior_grab note (stays grabbable and OUT of the
+        Upgrades tab/stat, exactly like the scanner) so a real upgrade isn't
+        hidden or conflated with Plex upgrades.
+    Never touches a library/upgrade/downloaded status. Pure/non-mutating
+    (copies only changed dicts). `items` here is the full result set (paginated
+    later), so every grabbed item sits alongside its siblings."""
     try:
         downloaded = db.get_downloaded_urls()
     except Exception:
         downloaded = set()
-    # Best grabbed resolution per (normalized_title, season).
-    grabbed: Dict[str, Dict[str, Any]] = {}
-    try:
-        for row in db.get_downloaded_titles():
-            nt, season, res, size, _url = row
-            if not nt:
-                continue
-            k = _title_key(nt, season)
-            rank = _res_rank(res)
-            cur = grabbed.get(k)
-            if cur is None or rank > cur["rank"]:
-                grabbed[k] = {"rank": rank, "resolution": res or "", "size": size or ""}
-    except Exception:
-        grabbed = {}
-
-    if not downloaded and not grabbed:
+    if not downloaded:
         return items
+
+    # Best grabbed version per group_key, from the grabbed items present here.
+    grabbed: Dict[str, Dict[str, Any]] = {}
+    for i in items:
+        if i.get("url") in downloaded:
+            gk = i.get("group_key")
+            if not gk:
+                continue
+            rank, dv = _res_rank(i.get("resolution")), bool(i.get("dovi"))
+            cur = grabbed.get(gk)
+            if cur is None or rank > cur["rank"] or (rank == cur["rank"] and dv and not cur["dovi"]):
+                grabbed[gk] = {"rank": rank, "dovi": dv,
+                               "resolution": i.get("resolution") or "", "size": i.get("size") or ""}
 
     out = []
     for i in items:
@@ -92,16 +107,17 @@ def _overlay_download_state(items, db):
             out.append(i if i.get("status") == "downloaded" else {**i, "status": "downloaded"})
             continue
         status = (i.get("status") or "").lower()
+        g = grabbed.get(i.get("group_key")) if grabbed else None
         # Only reclassify still-missing siblings; never touch library/upgrade/downloaded.
-        if grabbed and status.startswith("missing"):
-            g = grabbed.get(_title_key(normalize_title(i.get("title", "")), i.get("season")))
-            if g is not None:
-                note = i.get("prior_grab") or {
-                    "resolution": g["resolution"], "size": g["size"], "downloaded_at": None,
-                }
-                new_status = "upgrade" if _res_rank(i.get("resolution")) > g["rank"] else "downloaded_similar"
-                out.append({**i, "status": new_status, "prior_grab": note})
-                continue
+        if g is not None and status.startswith("missing"):
+            note = i.get("prior_grab") or {
+                "resolution": g["resolution"], "size": g["size"], "downloaded_at": None,
+            }
+            if _is_better_grab(i, g):
+                out.append({**i, "prior_grab": note})            # stays missing/grabbable
+            else:
+                out.append({**i, "status": "downloaded_similar", "prior_grab": note})
+            continue
         out.append(i)
     return out
 

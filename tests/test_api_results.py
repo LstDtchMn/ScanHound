@@ -211,27 +211,56 @@ def test_downloaded_urls_overlay_marks_downloaded_at_read_time():
 
 
 def test_grabbed_sibling_versions_are_reclassified():
-    # Same title "Dune", three separate release URLs at different resolutions,
-    # all still 'missing' in the cache. You grabbed the 1080p one.
-    from backend.app_service import normalize_title
+    # Same title/group "Dune", three release URLs at different resolutions, all
+    # 'missing' in the cache. You grabbed the 1080p one.
     rows = [
-        _row("Dune", url="d/1080", resolution="1080p"),
-        _row("Dune", url="d/4k", resolution="4K"),
-        _row("Dune", url="d/720", resolution="720p"),
+        _row("Dune", url="d/1080", resolution="1080p", group_key="dune|2021"),
+        _row("Dune", url="d/4k", resolution="4K", group_key="dune|2021"),
+        _row("Dune", url="d/720", resolution="720p", group_key="dune|2021"),
     ]
     c = _client_with_cache(rows)
     registry.db.get_downloaded_urls.return_value = {"d/1080"}
-    # (normalized_title, season, resolution, size, url)
-    registry.db.get_downloaded_titles.return_value = [
-        (normalize_title("Dune"), None, "1080p", "20 GB", "d/1080"),
-    ]
     data = c.get("/results/cached", params={"per_page": 100}).json()
     by_url = {i["url"]: i for i in data["items"]}
     assert by_url["d/1080"]["status"] == "downloaded"          # the exact grab
     assert by_url["d/720"]["status"] == "downloaded_similar"   # lower res → have a copy
-    assert by_url["d/4k"]["status"] == "upgrade"               # higher res → real upgrade
-    # The downloaded_similar sibling carries the grabbed-version note.
+    # Higher-res sibling stays grabbable + annotated (NOT dumped in Upgrades tab).
+    assert by_url["d/4k"]["status"] == "missing"
+    assert by_url["d/4k"]["prior_grab"]["resolution"] == "1080p"
     assert by_url["d/720"]["prior_grab"]["resolution"] == "1080p"
+    # Downloaded/similar leave the deck; the better 4K stays counted as missing.
+    assert data["stats"]["upgrade"] == 0
+
+
+def test_sibling_match_is_year_aware_no_remake_contamination():
+    # Two different "Dune" movies (1984 vs 2021) → different group_keys. Grabbing
+    # the 2021 one must NOT reclassify the 1984 one.
+    rows = [
+        _row("Dune", url="d/2021", resolution="1080p", group_key="dune|2021"),
+        _row("Dune", url="d/1984", resolution="1080p", group_key="dune|1984"),
+    ]
+    c = _client_with_cache(rows)
+    registry.db.get_downloaded_urls.return_value = {"d/2021"}
+    data = c.get("/results/cached", params={"per_page": 100}).json()
+    by_url = {i["url"]: i for i in data["items"]}
+    assert by_url["d/2021"]["status"] == "downloaded"
+    assert by_url["d/1984"]["status"] == "missing"   # different film, untouched
+
+
+def test_sibling_dv_gain_at_same_resolution_stays_grabbable():
+    # Grabbed 4K SDR; a 4K Dolby Vision sibling is a real upgrade → must stay
+    # missing (grabbable), not be hidden as downloaded_similar.
+    rows = [
+        _row("Blade", url="b/sdr", resolution="4K", dovi=False, group_key="blade|2020"),
+        _row("Blade", url="b/dv", resolution="4K", dovi=True, group_key="blade|2020"),
+    ]
+    c = _client_with_cache(rows)
+    registry.db.get_downloaded_urls.return_value = {"b/sdr"}
+    data = c.get("/results/cached", params={"per_page": 100}).json()
+    by_url = {i["url"]: i for i in data["items"]}
+    assert by_url["b/sdr"]["status"] == "downloaded"
+    assert by_url["b/dv"]["status"] == "missing"     # DV gain → still worth grabbing
+    assert by_url["b/dv"]["prior_grab"]["resolution"] == "4K"
 
 
 def test_cached_stats_whole_set_but_filtered_narrows():
