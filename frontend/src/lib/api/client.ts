@@ -136,10 +136,15 @@ export const api = {
   deselectAll: () => request('/results/deselect-all', { method: 'POST' }),
   exportCsv: () =>
     request<{ filepath: string }>('/results/export', { method: 'POST' }),
-  dismissItems: (urls: string[], titles?: Record<string, string>, dismissed = true) =>
+  dismissItems: (
+    urls: string[],
+    titles?: Record<string, string>,
+    dismissed = true,
+    meta?: Record<string, { group_key?: string; resolution?: string; dovi?: boolean }>
+  ) =>
     request<{ status: string; dismissed_count: number }>('/results/dismiss', {
       method: 'POST',
-      body: JSON.stringify({ urls, titles: titles ?? null, dismissed })
+      body: JSON.stringify({ urls, titles: titles ?? null, meta: meta ?? null, dismissed })
     }),
   dismissedList: () =>
     request<{ items: { url: string; title: string | null; dismissed_at: string }[]; count: number }>(

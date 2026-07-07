@@ -338,6 +338,15 @@ class DatabaseManager:
                         dismissed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 ''')
+                # Title-level skip context: group_key + the skipped release's
+                # quality, so a same-or-lower version of a skipped title stays
+                # hidden while a genuine upgrade (higher res / DV gain) can still
+                # surface. Added via idempotent ALTERs for existing DBs.
+                for _col, _decl in (("group_key", "TEXT"), ("resolution", "TEXT"), ("dovi", "INTEGER")):
+                    try:
+                        cursor.execute(f"ALTER TABLE dismissed_items ADD COLUMN {_col} {_decl}")
+                    except sqlite3.OperationalError:
+                        pass  # column already exists
 
                 # Durable per-package download + extraction outcome, polled from
                 # JDownloader. Keyed by JD package name so the row survives even
@@ -1135,12 +1144,24 @@ class DatabaseManager:
         """Dismiss multiple URLs in one transaction.
 
         Args:
-            items: Iterable of (url, title) pairs. Re-dismissing an
-                already-dismissed URL updates its title when a non-null
-                title is supplied, instead of silently keeping the old one.
+            items: Iterable of (url, title) OR (url, title, group_key,
+                resolution, dovi) tuples. The extra fields power title-level
+                skip: a same-or-lower release of a skipped title stays hidden
+                while a genuine upgrade can resurface. Re-dismissing updates
+                the stored fields when non-null values are supplied.
         """
-        pairs = [(url, title) for url, title in items if url]
-        if not pairs:
+        rows = []
+        for it in items:
+            url = it[0]
+            if not url:
+                continue
+            title = it[1] if len(it) > 1 else None
+            group_key = it[2] if len(it) > 2 else None
+            resolution = it[3] if len(it) > 3 else None
+            dovi = (1 if it[4] else 0) if len(it) > 4 else None
+            rows.append({"url": url, "title": title, "group_key": group_key,
+                         "resolution": resolution, "dovi": dovi})
+        if not rows:
             return True
         conn = None
         try:
@@ -1149,12 +1170,16 @@ class DatabaseManager:
                 if not conn:
                     return False
                 conn.cursor().executemany('''
-                    INSERT INTO dismissed_items (url, title) VALUES (:url, :title)
+                    INSERT INTO dismissed_items (url, title, group_key, resolution, dovi)
+                    VALUES (:url, :title, :group_key, :resolution, :dovi)
                     ON CONFLICT(url) DO UPDATE SET
-                        title = COALESCE(excluded.title, dismissed_items.title)
-                ''', [{"url": u, "title": t} for u, t in pairs])
+                        title = COALESCE(excluded.title, dismissed_items.title),
+                        group_key = COALESCE(excluded.group_key, dismissed_items.group_key),
+                        resolution = COALESCE(excluded.resolution, dismissed_items.resolution),
+                        dovi = COALESCE(excluded.dovi, dismissed_items.dovi)
+                ''', rows)
                 conn.commit()
-                self._dismissed_urls_set().update(u for u, _ in pairs)
+                self._dismissed_urls_set().update(r["url"] for r in rows)
             return True
         except Exception as e:
             if conn:
@@ -1208,6 +1233,17 @@ class DatabaseManager:
         return self._query_dicts(
             'SELECT url, title, dismissed_at FROM dismissed_items '
             'ORDER BY dismissed_at DESC LIMIT ?', (limit,), default=[])
+
+    def get_dismissed_title_quality(self):
+        """Per dismissed group_key, the (resolution, dovi) of the BEST release
+        that was skipped — so the read path can hide same-or-lower releases of
+        a skipped title while letting a genuine upgrade resurface. Rows without
+        a group_key (legacy per-URL dismissals) are ignored here; those still
+        hide by exact URL."""
+        return self._query(
+            "SELECT group_key, resolution, dovi FROM dismissed_items "
+            "WHERE group_key IS NOT NULL AND group_key != ''",
+            default=[])
 
     def clear_dismissed_items(self):
         """Clear all dismissed-item records."""

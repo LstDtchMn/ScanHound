@@ -93,7 +93,11 @@
   }
 
   function dismissWithUndo(item: ScanResult) {
-    dismissItem(item.url, item.title);
+    dismissItem(item.url, item.title, {
+      group_key: item.group_key,
+      resolution: item.resolution,
+      dovi: item.dovi
+    });
     addToast('Dismissed', item.title, 'normal', { label: 'Undo', run: () => restoreItem(item.url) });
   }
 </script>

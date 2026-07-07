@@ -179,6 +179,7 @@ def _client_with_cache(rows, version=None):
     registry.db = MagicMock()
     registry.db.get_background_cache.return_value = rows
     registry.db.get_dismissed_urls.return_value = set()
+    registry.db.get_dismissed_title_quality.return_value = []
     registry.db.get_downloaded_urls.return_value = set()
     registry.db.get_downloaded_titles.return_value = []
     # A real (count, max_last_seen_at)-shaped version by default so the B2
@@ -245,6 +246,39 @@ def test_sibling_match_is_year_aware_no_remake_contamination():
     by_url = {i["url"]: i for i in data["items"]}
     assert by_url["d/2021"]["status"] == "downloaded"
     assert by_url["d/1984"]["status"] == "missing"   # different film, untouched
+
+
+def test_skipped_title_hides_same_or_lower_keeps_upgrade():
+    # User swiped-left ("skip") the title at 1080p. A 1080p re-upload and a 720p
+    # re-encode must stay hidden; only a genuine 4K upgrade may resurface.
+    rows = [
+        _row("Heat", url="h/1080", resolution="1080p", group_key="heat|1995"),
+        _row("Heat", url="h/720", resolution="720p", group_key="heat|1995"),
+        _row("Heat", url="h/4k", resolution="4K", group_key="heat|1995"),
+    ]
+    c = _client_with_cache(rows)
+    # No exact URL is dismissed (the originally-skipped release rolled off); the
+    # title-level threshold is what gates the re-uploads.
+    registry.db.get_dismissed_title_quality.return_value = [("heat|1995", "1080p", 0)]
+    data = c.get("/results/cached", params={"per_page": 100}).json()
+    by_url = {i["url"]: i for i in data["items"]}
+    assert "h/1080" not in by_url   # same res as skipped → hidden
+    assert "h/720" not in by_url    # lower res → hidden
+    assert "h/4k" in by_url          # genuine upgrade → resurfaces
+
+
+def test_skipped_title_dv_gain_at_same_resolution_resurfaces():
+    # Skipped a 4K non-DV release; a 4K Dolby Vision version is an upgrade.
+    rows = [
+        _row("Sicario", url="s/4k", resolution="4K", dovi=False, group_key="sicario|2015"),
+        _row("Sicario", url="s/4kdv", resolution="4K", dovi=True, group_key="sicario|2015"),
+    ]
+    c = _client_with_cache(rows)
+    registry.db.get_dismissed_title_quality.return_value = [("sicario|2015", "4K", 0)]
+    data = c.get("/results/cached", params={"per_page": 100}).json()
+    by_url = {i["url"]: i for i in data["items"]}
+    assert "s/4k" not in by_url     # same res, no DV gain → hidden
+    assert "s/4kdv" in by_url        # DV gain at same res → resurfaces
 
 
 def test_sibling_dv_gain_at_same_resolution_stays_grabbable():

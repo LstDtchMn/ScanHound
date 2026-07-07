@@ -159,6 +159,23 @@ class TestDismissedItems:
         db_manager.remove_dismissed_items(["http://x/a", "http://x/b"])
         assert db_manager.get_dismissed_urls() == set()
 
+    def test_dismiss_records_title_quality(self, db_manager):
+        # Rich tuple (url, title, group_key, resolution, dovi) powers title-level skip.
+        db_manager.add_dismissed_items([("http://x/a", "Heat", "heat|1995", "1080p", False)])
+        assert [tuple(r) for r in db_manager.get_dismissed_title_quality()] == [("heat|1995", "1080p", 0)]
+
+    def test_dismiss_two_arg_tuple_has_no_group_key(self, db_manager):
+        # Legacy (url, title) dismissals record no group_key → excluded from the
+        # title-quality query (they still hide by exact URL).
+        db_manager.add_dismissed_items([("http://x/a", "Heat")])
+        assert list(db_manager.get_dismissed_title_quality()) == []
+
+    def test_redismiss_backfills_group_key(self, db_manager):
+        # A bare URL dismissal, later re-dismissed with metadata, gains the fields.
+        db_manager.add_dismissed_item("http://x/a")
+        db_manager.add_dismissed_items([("http://x/a", "Heat", "heat|1995", "4K", True)])
+        assert [tuple(r) for r in db_manager.get_dismissed_title_quality()] == [("heat|1995", "4K", 1)]
+
 
 class TestDownloadHistory:
 

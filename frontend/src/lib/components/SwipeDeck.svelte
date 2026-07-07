@@ -150,7 +150,15 @@
       } else {
         // Skip the whole title → dismiss every release. If NONE persisted
         // (offline), un-resolve so it comes back and drop the stale undo entry.
-        Promise.all(urls.map((u) => dismissItem(u, group.title))).then((res) => {
+        Promise.all(
+          group.releases.map((r) =>
+            dismissItem(r.url, group.title, {
+              group_key: r.group_key,
+              resolution: r.resolution,
+              dovi: r.dovi
+            })
+          )
+        ).then((res) => {
           if (!res.some(Boolean)) {
             undoStack = undoStack.filter((s) => s !== entry);
             resolvedKeys = new Set([...resolvedKeys].filter((k) => k !== group.key));

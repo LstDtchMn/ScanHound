@@ -622,7 +622,9 @@ export async function hydrateDismissed() {
 /** Swipe-left: dismiss an item (optimistic), persisting it server-side.
  *  Resolves false if the server call failed and the optimistic update was
  *  reverted — callers can use this to drop a now-stale undo entry. */
-export function dismissItem(url: string, title?: string): Promise<boolean> {
+export interface DismissMeta { group_key?: string; resolution?: string; dovi?: boolean }
+
+export function dismissItem(url: string, title?: string, meta?: DismissMeta): Promise<boolean> {
   if (!url) return Promise.resolve(false);
   dismissedUrls.update((s) => {
     const next = new Set(s);
@@ -638,7 +640,7 @@ export function dismissItem(url: string, title?: string): Promise<boolean> {
     });
     if (removed) filteredTotal.update((n) => Math.max(0, n - 1));
   }
-  return api.dismissItems([url], title ? { [url]: title } : undefined, true).then(
+  return api.dismissItems([url], title ? { [url]: title } : undefined, true, meta ? { [url]: meta } : undefined).then(
     () => true,
     () => {
       // Revert on failure so the UI reflects the server's truth.

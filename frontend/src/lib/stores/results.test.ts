@@ -288,7 +288,22 @@ describe('dismissItem / restoreItem', () => {
     expect(api.dismissItems).toHaveBeenCalledWith(
       ['https://example.com/x'],
       { 'https://example.com/x': 'X' },
-      true
+      true,
+      undefined
+    );
+  });
+
+  it('forwards per-url title-quality meta for title-level skip', () => {
+    dismissItem('https://example.com/x', 'X', {
+      group_key: 'x|2020',
+      resolution: '1080p',
+      dovi: false
+    });
+    expect(api.dismissItems).toHaveBeenCalledWith(
+      ['https://example.com/x'],
+      { 'https://example.com/x': 'X' },
+      true,
+      { 'https://example.com/x': { group_key: 'x|2020', resolution: '1080p', dovi: false } }
     );
   });
 

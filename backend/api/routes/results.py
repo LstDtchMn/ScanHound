@@ -344,6 +344,10 @@ class DismissRequest(BaseModel):
     urls: List[str]
     # Optional url -> title map, stored for display in the "dismissed" manager.
     titles: Optional[Dict[str, str]] = None
+    # Optional url -> {group_key, resolution, dovi} for title-level skip, so a
+    # same-or-lower release of a skipped title stays hidden while an upgrade can
+    # resurface. Absent = a plain per-URL dismissal (back-compatible).
+    meta: Optional[Dict[str, Dict[str, Any]]] = None
     # True = dismiss (skip), False = un-dismiss (restore).
     dismissed: bool = True
 
@@ -438,11 +442,32 @@ def _shape_results(
     if reg.db is not None:
         items = _overlay_download_state(items, reg.db)
 
-    # Hide items the user swiped away on the deck (unless explicitly requested).
+    # Hide items the user swiped away (unless explicitly requested). Two levels:
+    #   * the exact dismissed URL is always hidden;
+    #   * every same-or-LOWER-quality release of a skipped TITLE (group_key) is
+    #     hidden too — so a smaller/similar re-upload doesn't resurface — while a
+    #     genuine upgrade (higher res / DV gain) over what was skipped can still
+    #     appear. Mirrors the grab-sibling rule via _is_better_grab.
     if not include_dismissed and reg.db is not None:
         dismissed = reg.db.get_dismissed_urls()
-        if dismissed:
-            items = [i for i in items if i.get("url") not in dismissed]
+        skipped_titles: Dict[str, Dict[str, Any]] = {}
+        try:
+            for gk, res, dv in reg.db.get_dismissed_title_quality():
+                if not gk:
+                    continue
+                rank, dovi = _res_rank(res), bool(dv)
+                cur = skipped_titles.get(gk)
+                if cur is None or rank > cur["rank"] or (rank == cur["rank"] and dovi and not cur["dovi"]):
+                    skipped_titles[gk] = {"rank": rank, "dovi": dovi}
+        except Exception:
+            skipped_titles = {}
+        if dismissed or skipped_titles:
+            def _keep(i):
+                if i.get("url") in dismissed:
+                    return False
+                s = skipped_titles.get(i.get("group_key")) if skipped_titles else None
+                return s is None or _is_better_grab(i, s)
+            items = [i for i in items if _keep(i)]
 
     # Snapshot of all visible (non-dismissed) items for the overall stats,
     # before status/search/category/genre/language/quick filtering narrows
@@ -693,8 +718,15 @@ def dismiss_items(req: DismissRequest, reg: ServiceRegistry = Depends(get_regist
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
     titles = req.titles or {}
+    meta = req.meta or {}
     if req.dismissed:
-        db.add_dismissed_items((url, titles.get(url)) for url in req.urls if url)
+        def _rows():
+            for url in req.urls:
+                if not url:
+                    continue
+                m = meta.get(url) or {}
+                yield (url, titles.get(url), m.get("group_key"), m.get("resolution"), m.get("dovi"))
+        db.add_dismissed_items(_rows())
     else:
         db.remove_dismissed_items(req.urls)
     return {"status": "ok", "dismissed_count": db.get_dismissed_count()}
