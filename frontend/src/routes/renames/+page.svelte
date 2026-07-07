@@ -205,7 +205,7 @@
 
 </script>
 
-<div class="flex-1 overflow-auto p-4 flex flex-col gap-4">
+<div class="flex-1 min-h-0 overflow-auto p-4 flex flex-col gap-4">
   <RenamesHeader
     onDolbyVision={dolbyVision}
     onReidentifyAll={reidentifyAll}
