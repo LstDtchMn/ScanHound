@@ -7,6 +7,39 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.16.0",
+    date: "2026-07-07",
+    summary: "Title-level skip (dismiss a title, not just one release)",
+    changes: [
+      "Swiping a title away ('skip') now hides not just that release but same-or-lower-quality re-uploads of the same title on future scans — so a smaller or identical re-encode won't keep resurfacing after you've said no",
+      "A genuine upgrade over what you skipped — a higher resolution, or Dolby Vision the skipped copy lacked — still surfaces, so you never miss a real improvement",
+      "The rule is applied server-side, so a dismissed title stays dismissed when you come back later, on both the app and the web",
+    ],
+  },
+  {
+    version: "2.15.0",
+    date: "2026-07-07",
+    summary: "Download memory, JDownloader auto-start, and deck grouping",
+    changes: [
+      "Grabbed releases are now remembered in a central database: a title you downloaded stays marked 'Downloaded' across reloads and on every device (app + web), without waiting for a re-scan",
+      "The swipe deck now shows one card per title with a quality picker — choose the resolution/edition you want instead of swiping through every duplicate release",
+      "Sending to JDownloader now auto-starts the download and skips anything already grabbed, so there are no duplicate entries",
+      "The 'Grabbed' label now shows the resolution and size you got (e.g. 4K · 65.9 GB), and rating vote counts now appear next to scores",
+      "Sibling releases of a grabbed title reclassify correctly — year-aware (a 2021 remake never gets confused with the 1984 original) and Dolby-Vision-aware — instead of lingering as red 'Missing'",
+    ],
+  },
+  {
+    version: "2.14.0",
+    date: "2026-07-07",
+    summary: "Mobile-native Scan experience",
+    changes: [
+      "A brand-new phone experience for Scan: a swipeable poster deck (swipe right to grab, left to dismiss), long-press for actions, and haptic feedback",
+      "Pull-to-refresh, a bottom toolbar (search / filters / deck / bulk), and a drag-up detail sheet showing your In-Library versions and prior grab for upgrade decisions",
+      "The scan bar and filter chips auto-hide as you scroll (like a browser address bar) to maximize the poster wall, with a 1-up / 2-up poster toggle",
+      "Rotten Tomatoes Tomatometer theming, on-poster ownership, larger legible text on the deck and tiles, and a movies-only 4K/1080p filter",
+    ],
+  },
+  {
     version: "2.13.0",
     date: "2026-06-29",
     summary: "Configurable columns + 'Downloaded Similar' status",
