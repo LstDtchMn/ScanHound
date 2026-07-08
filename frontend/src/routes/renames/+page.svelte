@@ -205,7 +205,16 @@
 
 </script>
 
-<div class="flex-1 min-h-0 overflow-auto p-4 flex flex-col gap-4">
+<!--
+  Scroll container. MUST be a plain block, not `flex flex-col`: as a flex
+  column, the jobs <ul> becomes a flex item with the default flex-shrink:1,
+  so it shrinks to the leftover height and its `overflow-hidden` (rounded
+  corners) clips every row past the fold — the container then thinks its
+  content fits and never scrolls. A block lets each section keep its natural
+  height so the container overflows and scrolls (same pattern as the Scan
+  page). `space-y-4` replaces the old `gap-4`.
+-->
+<div class="flex-1 min-h-0 overflow-auto p-4 space-y-4">
   <RenamesHeader
     onDolbyVision={dolbyVision}
     onReidentifyAll={reidentifyAll}
