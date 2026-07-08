@@ -2,7 +2,6 @@
   import type { ScanResult } from '$lib/api/types';
   import { api } from '$lib/api/client';
   import { downloadHost } from '$lib/stores/downloads';
-  import { markDownloaded, markGrabbedSiblings } from '$lib/stores/results';
   import { addToast } from '$lib/stores/notifications';
   import { copyResultLinks } from '$lib/resultActions';
   import { statusVariant, formatStatus, formatCount } from '$lib/constants';
@@ -55,10 +54,11 @@
     api.download(item.url, item.title, $downloadHost, item.year,
                  item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false)
       .then(() => {
-        markDownloaded([item.url]);
-        markGrabbedSiblings(item.url);
+        // "started" only — the download:complete (method=jdownloader) WS event
+        // marks it grabbed once it truly reaches JDownloader; a failed send
+        // leaves it Missing rather than falsely archived.
         success();
-        addToast('Grabbed', item.title);
+        addToast('Sending', item.title);
         onclose();
       })
       .catch(() => addToast('Error', 'Download failed', 'error'));

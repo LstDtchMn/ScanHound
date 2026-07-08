@@ -1,7 +1,7 @@
 <script lang="ts">
   import {
     deckGroups, results, selectedKeys, selectedDetail,
-    dismissItem, restoreItem, toggleSelect, deselectAll, markDownloaded,
+    dismissItem, restoreItem, toggleSelect, deselectAll,
     deckNeedsMore, loadResults
   } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
@@ -188,16 +188,16 @@
     if (selectedItems.length === 0 || downloading) return;
     downloading = true;
     try {
-      const urls = selectedItems.map((i) => i.url);
       await api.downloadBatch(
         selectedItems.map((i) => ({ url: i.url, title: i.title, year: i.year, resolution: i.resolution, size: i.size, hdr: i.hdr, dovi: i.dovi })),
         $downloadHost
       );
       addToast('Download', `Sending ${selectedItems.length} item(s) to JDownloader…`);
-      // Mark as downloaded (status → non-actionable) so they leave the deck for
-      // good, then clear the tray. Without this, deselecting would re-surface
-      // the just-downloaded cards.
-      markDownloaded(urls);
+      // Do NOT optimistically mark these downloaded: the batch endpoint only
+      // returns "started". Each item is marked grabbed by the per-item
+      // download:complete (method=jdownloader) WS event once it actually reaches
+      // JDownloader; items that fail (Cloudflare block, dead source) correctly
+      // stay Missing instead of being falsely archived.
       deselectAll();
     } catch (e) {
       addToast('Error', e instanceof Error ? e.message : 'Failed to start downloads', 'error');

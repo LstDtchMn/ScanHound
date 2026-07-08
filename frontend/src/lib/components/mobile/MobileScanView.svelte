@@ -3,7 +3,7 @@
   import {
     filteredResults, filteredTotal, titleCounts, pagedMode, hasMore, loadingMore,
     loadResults, handleReconnectSnapshot, phoneColumns, mobileChromeCollapsed,
-    dismissItem, restoreItem, markDownloaded, markGrabbedSiblings
+    dismissItem, restoreItem
   } from '$lib/stores/results';
   import { onMount } from 'svelte';
   import { downloadHost } from '$lib/stores/downloads';
@@ -84,10 +84,11 @@
     api.download(item.url, item.title, get(downloadHost), item.year,
                  item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false)
       .then(() => {
-        markDownloaded([item.url]);
-        markGrabbedSiblings(item.url);
+        // The POST only returns "started"; the item is marked grabbed by the
+        // download:complete (method=jdownloader) WS event once it actually
+        // reaches JDownloader. A failed scrape/send leaves it Missing.
         success();
-        addToast('Grabbed', item.title);
+        addToast('Sending', item.title);
       })
       .catch(() => addToast('Error', `Grab failed: ${item.title}`, 'error'));
   }

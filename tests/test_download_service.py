@@ -1020,6 +1020,30 @@ class TestDownloadItem:
         mock_wb.assert_not_called()
         assert "download:failed" in events
 
+    def test_failed_jd_send_in_server_mode_is_not_archived(self):
+        """The reported bug: a JD send that fails must NOT be archived as grabbed.
+
+        In server/headless mode the clipboard fallback is a phantom delivery, so
+        it must be skipped — a failed JDownloader hand-off ends as an honest
+        failure and only writes a 'failed' history row (which does not count as
+        grabbed), never 'completed'/'clipboard'.
+        """
+        svc = _make_service(config={"jd_enabled": True, "jd_method": "api"})
+        svc.server_mode = True
+        svc.scrape_links = MagicMock(return_value=["http://rg.net/file1"])
+        svc.send_to_jdownloader = MagicMock(return_value=False)  # JD send fails
+        svc.copy_to_clipboard = MagicMock(return_value=True)     # would "succeed" if reached
+        svc.save_to_history = MagicMock()
+
+        result = svc.download_item("http://page.com", "Movie", None, "4K", "50 GB")
+
+        assert result["success"] is False
+        assert result["method"] == ""
+        svc.copy_to_clipboard.assert_not_called()  # gated off in server mode
+        # Not archived as grabbed: only a 'failed' row (if any) is permitted.
+        for call in svc.save_to_history.call_args_list:
+            assert call.kwargs.get("status", "completed") == "failed"
+
     @patch("backend.download_service.webbrowser.open", return_value=False)
     def test_browser_unavailable_is_failure(self, mock_wb):
         """If no browser actually launches, it's a failure, not a success."""

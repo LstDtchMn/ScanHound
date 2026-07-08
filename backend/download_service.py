@@ -278,7 +278,11 @@ class DownloadService:
                 try:
                     device = self._connect_jd_device(force=(attempt == 2))
                     device.linkgrabber.add_links(payload)
-                    self._log("Sent to JDownloader API", "success")
+                    self._log(
+                        f"Sent to JDownloader API: package {package_name[:50]!r}, "
+                        f"{len(links)} link(s) (attempt {attempt})",
+                        "success",
+                    )
                     return True
                 except Exception as e:
                     self._invalidate_jd_cache()
@@ -864,6 +868,36 @@ class DownloadService:
             soup = BeautifulSoup(html, 'html.parser')
             anchors = soup.find_all('a', href=True)
             self._log(f"[HDEncode][diag] {len(anchors)} links, {len(html)} bytes of HTML")
+
+            # The visible text is the single most useful signal for *why* a scrape
+            # came back empty — it distinguishes a Cloudflare/bot challenge, a
+            # login wall, and a Chrome network-error page ("This site can't be
+            # reached") from an actual layout change. Log a short snippet.
+            body_text = " ".join((soup.get_text(" ") or "").split())[:240]
+            self._log(f"[HDEncode][diag] visible text: {body_text!r}")
+
+            # Chrome's own error page (host unreachable / timed out) renders with a
+            # real <title> of the host but no usable content — call it out plainly
+            # so it isn't mistaken for a site layout change.
+            err_low = body_text.lower()
+            if any(m in err_low for m in (
+                "site can't be reached", "site can’t be reached", "took too long to respond",
+                "err_", "no internet", "dns_probe", "connection was reset",
+            )):
+                self._log(
+                    "[HDEncode][diag] this is a browser NETWORK-ERROR page, not the site — "
+                    "the source host was unreachable from the container (DNS/blocked/down).",
+                    "warning",
+                )
+            elif len(anchors) == 0 and len(html) > 40000:
+                # A large document with zero anchors is the signature of an
+                # unsolved Cloudflare/bot challenge (JS-only shell), NOT a
+                # renamed button — say so instead of guessing "layout change".
+                self._log(
+                    "[HDEncode][diag] large HTML but ZERO anchors — almost certainly an "
+                    "unsolved Cloudflare/bot challenge (undetected-chromedriver didn't clear it).",
+                    "warning",
+                )
 
             hosts = ("rapidgator", "nitroflare", "1fichier", "ddownload")
             host_links = [a['href'] for a in anchors if any(h in a['href'].lower() for h in hosts)]
@@ -1673,11 +1707,19 @@ class DownloadService:
                 result["history_saved"] = self.save_to_history(
                     url, title, season, resolution, size, status="completed", hdr=hdr, dovi=dovi
                 )
+                self._log(
+                    f"[Download] {title}: delivered to JDownloader "
+                    f"({len(links)} link(s)) — archived as grabbed", "info")
                 self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
                 return result
 
-        # Step 3: Fallback to clipboard
-        if self.copy_to_clipboard(links):
+        # Step 3: Fallback to clipboard — but ONLY on the desktop app. In
+        # server/headless mode (Docker) there is no user clipboard, so a
+        # "success" here would be a phantom grab: the item gets archived as
+        # delivered even though nothing reached JDownloader. Skip it (same
+        # reasoning as the browser fallback below) so a failed JD send stays an
+        # honest failure and the item is NOT archived.
+        if not self.server_mode and self.copy_to_clipboard(links):
             result["success"] = True
             result["method"] = "clipboard"
             result["message"] = f"Copied {len(links)} links to clipboard"

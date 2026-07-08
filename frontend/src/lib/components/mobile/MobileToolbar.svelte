@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get } from 'svelte/store';
-  import { searchFilter, selectedKeys, deselectAll, filteredResults, markDownloaded, markGrabbedSiblings, phoneColumns } from '$lib/stores/results';
+  import { searchFilter, selectedKeys, deselectAll, filteredResults, phoneColumns } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -28,19 +28,21 @@
 
   async function grabAll() {
     const items = selItems;
-    let ok = 0;
+    let sent = 0;
     for (const item of items) {
       if (!item.url) continue;
       try {
         await api.download(item.url, item.title, get(downloadHost), item.year,
                            item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false);
-        markDownloaded([item.url]);
-        markGrabbedSiblings(item.url);
-        ok++;
+        // Don't optimistically mark grabbed: the POST only returns "started".
+        // Each item flips to Downloaded via its download:complete
+        // (method=jdownloader) WS event once it truly reaches JDownloader;
+        // failures stay Missing.
+        sent++;
       } catch { /* per-item failure tolerated; summarized below */ }
     }
     success();
-    addToast('Grabbed', `${ok} of ${items.length} sent to JDownloader`);
+    addToast('Sending', `${sent} of ${items.length} to JDownloader…`);
     deselectAll();
   }
 </script>
