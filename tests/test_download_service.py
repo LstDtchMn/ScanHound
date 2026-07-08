@@ -407,6 +407,96 @@ class TestGetDriver:
         old_driver.quit.assert_called_once()
 
 
+def _driver_for(*, error_div=False, title="", anchors=True, body_text=""):
+    """A fake WebDriver whose find_elements answers per-selector."""
+    d = MagicMock()
+    d.title = title
+
+    def _find_elements(_by, selector):
+        if selector == "#main-frame-error":
+            return [MagicMock()] if error_div else []
+        if selector == "a[href]":
+            return [MagicMock()] if anchors else []
+        return []
+
+    d.find_elements.side_effect = _find_elements
+    body = MagicMock()
+    body.text = body_text
+    d.find_element.return_value = body
+    return d
+
+
+@patch("backend.download_service._ensure_selenium")
+@patch("backend.download_service._By", MagicMock())
+class TestBrowserErrorPage:
+    """Chromium in the container intermittently serves its OWN network-error page
+    (bare-hostname title, zero anchors, no Cloudflare markers). It must be detected
+    and healed, not misread as 'no links / Cloudflare wall'."""
+
+    URL = "https://hdencode.org/killing-faith-2025-2160p/"
+
+    def test_detects_error_page_and_extracts_err_code(self, _ensure):
+        svc = _make_service()
+        driver = _driver_for(error_div=True,
+                             body_text="This site can't be reached\nERR_NAME_NOT_RESOLVED")
+        assert svc._browser_error_code(driver, self.URL) == "ERR_NAME_NOT_RESOLVED"
+
+    def test_real_page_is_not_an_error_page(self, _ensure):
+        svc = _make_service()
+        driver = _driver_for(error_div=False, title="Killing.Faith.2025.2160p – 23.7 GB",
+                             anchors=True)
+        assert svc._browser_error_code(driver, self.URL) is None
+
+    def test_bare_hostname_title_with_no_anchors_is_an_error_page(self, _ensure):
+        """The exact signature seen in production: title == host, zero anchors."""
+        svc = _make_service()
+        driver = _driver_for(error_div=False, title="hdencode.org", anchors=False)
+        assert svc._browser_error_code(driver, self.URL) == "ERR_UNKNOWN"
+
+    def test_hostname_title_but_real_anchors_is_not_an_error_page(self, _ensure):
+        """Guard against a false positive on a real page titled like its host."""
+        svc = _make_service()
+        driver = _driver_for(error_div=False, title="hdencode.org", anchors=True)
+        assert svc._browser_error_code(driver, self.URL) is None
+
+
+@patch("backend.download_service.time.sleep", MagicMock())
+class TestNavigateSelfHeals:
+    URL = "https://hdencode.org/x/"
+
+    def test_recycles_and_retries_then_succeeds(self):
+        svc = _make_service()
+        bad, good = MagicMock(), MagicMock()
+        svc.get_driver = MagicMock(side_effect=[bad, good])
+        svc._recycle_driver = MagicMock()
+        # First navigation lands on the browser error page, second is clean.
+        svc._browser_error_code = MagicMock(side_effect=["ERR_NAME_NOT_RESOLVED", None])
+
+        result = svc._navigate(self.URL, tag="HDEncode")
+        assert result is good
+        svc._recycle_driver.assert_called_once()   # the bad browser was thrown away
+        assert svc.get_driver.call_count == 2
+
+    def test_returns_none_when_host_stays_unreachable(self):
+        svc = _make_service()
+        svc.get_driver = MagicMock(return_value=MagicMock())
+        svc._recycle_driver = MagicMock()
+        svc._browser_error_code = MagicMock(return_value="ERR_CONNECTION_RESET")
+
+        assert svc._navigate(self.URL, tag="HDEncode", attempts=3) is None
+        assert svc._recycle_driver.call_count == 3
+
+    def test_navigation_exception_also_recycles(self):
+        svc = _make_service()
+        driver = MagicMock()
+        driver.get.side_effect = RuntimeError("session died")
+        svc.get_driver = MagicMock(return_value=driver)
+        svc._recycle_driver = MagicMock()
+
+        assert svc._navigate(self.URL, attempts=2) is None
+        assert svc._recycle_driver.call_count == 2
+
+
 class TestCleanupDriver:
     def test_quit_and_none(self):
         svc = _make_service()
@@ -466,6 +556,9 @@ class TestScrapeLinksHDEncode:
         mock_driver = MagicMock()
         svc.cached_driver = mock_driver
         mock_driver.title = "ok"
+        # Real Selenium returns a list; [] means "no #main-frame-error", i.e. the
+        # browser is showing the site, not its own network-error page.
+        mock_driver.find_elements.return_value = []
 
         # Simulate finding an access button and clicking it
         mock_wait = MagicMock()

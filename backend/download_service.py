@@ -860,6 +860,86 @@ class DownloadService:
                 finally:
                     self.cached_driver = None
 
+    def _recycle_driver(self) -> None:
+        """Quit and drop the cached browser so the next get_driver() builds a fresh one.
+
+        Unlike cleanup_driver() this does NOT wait for active scrapes to finish —
+        it is called from *inside* a scrape that already holds the (reentrant)
+        driver lock, so waiting would deadlock.
+        """
+        with self._driver_lock:
+            if self.cached_driver:
+                try:
+                    self.cached_driver.quit()
+                except Exception:
+                    pass
+                finally:
+                    self.cached_driver = None
+
+    def _browser_error_code(self, driver, url: str) -> Optional[str]:
+        """Return Chrome's ``ERR_*`` code if the browser is showing its OWN
+        network-error page rather than the site, else ``None``.
+
+        Chromium in the container intermittently cannot resolve/connect (Docker's
+        embedded DNS), and renders an instant error page whose <title> is the bare
+        hostname with zero anchors. That page contains no Cloudflare markers, so
+        the old code mistook it for "a Cloudflare wall or changed layout" and
+        reported "no links found" — failing every grab until the container was
+        restarted. Detecting it lets us recycle the browser and retry.
+        """
+        _ensure_selenium()
+        try:
+            if not driver.find_elements(_By.CSS_SELECTOR, "#main-frame-error"):
+                # Fallback signature: Chrome titles a neterror page with the bare
+                # host. Require zero anchors so a real page can't false-positive.
+                host = (urlparse(url).netloc or "").lower()
+                title = (driver.title or "").strip().lower()
+                if not (host and title == host
+                        and not driver.find_elements(_By.CSS_SELECTOR, "a[href]")):
+                    return None
+        except Exception:
+            return None
+        try:
+            text = driver.find_element(_By.TAG_NAME, "body").text
+        except Exception:
+            text = ""
+        if not isinstance(text, str):
+            text = ""
+        match = re.search(r"ERR_[A-Z_]+", text)
+        return match.group(0) if match else "ERR_UNKNOWN"
+
+    def _navigate(self, url: str, tag: str = "Scrape", attempts: int = 3):
+        """Load ``url``, healing the browser if it serves its own error page.
+
+        Returns the live driver, or ``None`` if the host is genuinely unreachable
+        after ``attempts`` tries. Each retry recycles the browser, because a fresh
+        Chrome usually resolves the host fine even when the previous one couldn't.
+        """
+        last: Optional[str] = None
+        for attempt in range(1, attempts + 1):
+            driver = self.get_driver()
+            try:
+                driver.get(url)
+            except Exception as e:
+                last = str(e)
+                self._log(f"[{tag}] navigation raised (attempt {attempt}/{attempts}): {e}", "warning")
+            else:
+                code = self._browser_error_code(driver, url)
+                if not code:
+                    return driver
+                last = code
+                self._log(
+                    f"[{tag}] browser could not reach the site ({code}) — a network/DNS "
+                    f"error, NOT a Cloudflare wall. Recycling the browser and retrying "
+                    f"({attempt}/{attempts}).",
+                    "warning",
+                )
+            self._recycle_driver()
+            if attempt < attempts:
+                time.sleep(min(2 * attempt, 5))
+        self._log(f"[{tag}] giving up — {url} unreachable from the container ({last})", "error")
+        return None
+
     def _log_page_diagnostics(self, driver, keyword: Optional[str] = None) -> None:
         """Emit detailed diagnostics about the current page to debug empty scrapes."""
         try:
@@ -1010,10 +1090,14 @@ class DownloadService:
                 if keyword is None:
                     self._log(f"[HDEncode] Unknown host '{service_type}', defaulting to rapidgator", "warning")
                     keyword = "rapidgator"
-                driver = self.get_driver()
                 try:
                     self._log(f"[HDEncode] Loading page ({service_type}): {url}")
-                    driver.get(url)
+                    # Navigates with browser-error-page detection + recycle/retry,
+                    # so a transient container DNS/connect failure doesn't silently
+                    # look like "no links on the page".
+                    driver = self._navigate(url, tag="HDEncode")
+                    if driver is None:
+                        return []
 
                     # Let any Cloudflare "Just a moment…" challenge resolve
                     # before we look for page elements.
@@ -1124,8 +1208,9 @@ class DownloadService:
 
         try:
             self._log(f"[DDLBase] Scraping links from: {url}")
-            driver = self.get_driver()
-            driver.get(url)
+            driver = self._navigate(url, tag="DDLBase")
+            if driver is None:
+                return []
             # DDLBase is Cloudflare-protected; wait for any "Just a moment…"
             # challenge to clear before parsing (the HDEncode path does the
             # same), then let the page JS render the boolk shortlink tags.
