@@ -12,6 +12,19 @@ describe('normalizeTitle', () => {
     expect(normalizeTitle('Killing Faith (2025)')).toBe('killing faith');
     expect(normalizeTitle('Dr. Quinn, Medicine Woman')).toBe('dr quinn medicine woman');
   });
+
+  it('does not collapse a bare-year title to an empty string', () => {
+    // Regression: the whole title IS a year (e.g. the movies "1917", "2012",
+    // "1984", "2010") — stripping standalone years must not erase them, or
+    // unrelated movies would all normalize to the same '' key.
+    expect(normalizeTitle('1917')).not.toBe('');
+    expect(normalizeTitle('2012')).not.toBe('');
+    expect(normalizeTitle('1917')).not.toBe(normalizeTitle('2012'));
+  });
+
+  it('normalizes a title with no year at all', () => {
+    expect(normalizeTitle('The Matrix')).toBe('the matrix');
+  });
 });
 
 describe('resRank', () => {
@@ -42,5 +55,14 @@ describe('groupDownloads', () => {
     const g = groupDownloads(items)[0];
     expect(g.isDuplicate).toBe(true);
     expect(g.items).toHaveLength(2);
+  });
+
+  it('breaks ties by size when resRank is equal', () => {
+    const items = [
+      r({ name: 'Foo (2020) [1080p]', title: 'Foo', bytes_total: 500 }),
+      r({ name: 'Foo (2020) [1080p]', title: 'Foo', bytes_total: 2000 }),
+    ];
+    const g = groupDownloads(items)[0];
+    expect(g.best.bytes_total).toBe(2000);
   });
 });
