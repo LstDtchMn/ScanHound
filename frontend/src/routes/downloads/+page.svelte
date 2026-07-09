@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
   import { api } from '$lib/api/client';
+  import MobileDownloadsView from '$lib/components/mobile/MobileDownloadsView.svelte';
+  import { mobile } from '$lib/stores/media';
   import Badge from '$lib/components/Badge.svelte';
   import Skeleton from '$lib/components/Skeleton.svelte';
   import ErrorCard from '$lib/components/ErrorCard.svelte';
@@ -316,6 +319,7 @@
   }
 
   onMount(() => {
+    if (get(mobile)) return;
     loadHistory();
     loadJdLinks();
     loadResults();
@@ -338,6 +342,9 @@
   });
 </script>
 
+{#if $mobile}
+  <MobileDownloadsView />
+{:else}
 <div class="p-4 border-b border-[var(--border)]">
   <div class="flex items-center gap-3 flex-wrap">
     <h1 class="text-lg font-semibold">Downloads</h1>
@@ -729,3 +736,4 @@
     animation: shimmer 1.5s infinite;
   }
 </style>
+{/if}
