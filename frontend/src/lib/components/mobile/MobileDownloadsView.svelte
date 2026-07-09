@@ -10,6 +10,8 @@
   let busy = $state(false);
   let timer: ReturnType<typeof setTimeout> | null = null;
   let delay = 2500;
+  let alive = true;
+  let inFlight = false;
 
   const groups = $derived(groupDownloads(results));
   const active = $derived(results.filter((r) => r.state === 'downloading').length);
@@ -27,6 +29,8 @@
   }
 
   async function poll() {
+    if (inFlight) return;
+    inFlight = true;
     try {
       results = await api.downloadResults();
       loaded = true;
@@ -34,13 +38,14 @@
     } catch {
       delay = Math.min(delay * 2, 10000);   // back off on error, keep last list
     } finally {
-      if (document.visibilityState === 'visible') timer = setTimeout(poll, delay);
+      inFlight = false;
+      if (alive && document.visibilityState === 'visible') timer = setTimeout(poll, delay);
     }
   }
 
   function onVisibility() {
     if (document.visibilityState === 'visible') {
-      if (!timer) poll();
+      if (!timer && !inFlight) poll();
     } else if (timer) {
       clearTimeout(timer);
       timer = null;
@@ -52,6 +57,7 @@
     document.addEventListener('visibilitychange', onVisibility);
   });
   onDestroy(() => {
+    alive = false;
     if (timer) clearTimeout(timer);
     document.removeEventListener('visibilitychange', onVisibility);
   });
@@ -70,7 +76,7 @@
   }
 
   async function clearFinished() {
-    const done = results.filter((r) => r.state === 'extracted' || r.downloaded === 1);
+    const done = results.filter((r) => r.state === 'extracted' || r.state === 'failed');
     if (!done.length) return;
     for (const r of done) {
       try { await api.removeDownloadResult(r.name); } catch { /* idempotent; ignore */ }
