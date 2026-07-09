@@ -62,9 +62,10 @@ WebSocket events. Deploy via `docker compose up -d --build` only.
   `classifyJob` helper — not the server's ≥95% apply-confident threshold.
 - `ffprobe` probes are **fail-safe and time-boxed** (return null on missing file /
   missing binary / timeout ~20–30s). **`dovi_tool` (FEL/MEL extraction) is NEVER
-  run synchronously in a request** — it streams the whole file (up to 1800s); use
-  only the cached `dv_scan` layer, else show "Dolby Vision" without the FEL/MEL
-  sub-label.
+  run synchronously in a request** — it streams the whole file (up to 1800s). The
+  compare shows the cached `dv_scan` layer, else "Dolby Vision" without the
+  FEL/MEL sub-label, with an on-demand button that runs `dovi_tool` on a
+  background thread and delivers the result over WebSocket (B5).
 - Reuse existing modules — `conflicts.py` (ranking), `fileops._trash`,
   `RematchModal`, the `renames` store actions. Do not duplicate their logic.
 - Rename Pydantic models use Pydantic v2 default `extra='ignore'` (only
@@ -189,6 +190,22 @@ are absent (so every existing `test_rename_service.py` ranking test still passes
 `conflict_preview` passes the probed specs; the normal jobs-list annotation path
 passes nothing and behaves exactly as before.
 
+### B5. On-demand DV FEL/MEL scan for the two conflict files (new)
+
+`probe_specs` reports `dv_layer` only from the **cache**. When the user wants the
+authoritative FEL/MEL for a DV conflict, a button triggers a background scan of
+just the two files — reusing the existing DV machinery, never blocking the request.
+
+- **`POST /rename/jobs/{id}/scan-dv-conflict`** — resolves the incoming
+  (`original_path`) and existing (`dst`) paths, and on a **background thread** runs
+  `dv_detect.detect_layer(path)` on each DV-capable file, `upsert_dv_scan`-ing the
+  result ([database.py:1502](backend/database.py:1502)), then broadcasts the
+  existing `dv:scan_done` WebSocket event. Returns immediately (`{ status:
+  'scanning' }`). Guarded so only one scan per job runs at a time.
+- This reuses `dv_detect.detect_layer` (the only FEL/MEL source of truth) and the
+  `dv_scan` cache exactly as the folder scan does — so the next `conflict-preview`
+  reads the now-cached `dv_layer`.
+
 ---
 
 ## Frontend components
@@ -220,6 +237,7 @@ export interface ConflictComparison {
 - `applyRename(id, body?: { conflict_strategy?: 'overwrite' | 'keep_both' | 'skip' })`
   → passes an optional JSON body (`request` auto-sets Content-Type when a body is
   present); backward compatible.
+- `scanConflictDv(id)` → `request<{ status: string }>('/rename/jobs/${id}/scan-dv-conflict', { method: 'POST' })` (the on-demand FEL/MEL scan, B5).
 - Store: `applyJob(id, strategy?)` forwards to `api.applyRename`.
 
 ### F3. `MobileRenamesView.svelte` (new)
@@ -274,6 +292,11 @@ conflict preview (below).
     (Resolution, HDR/DV, Video, Audio, Bitrate, Size, Duration) with the better
     cell per row emphasized and the **recommended** column flagged (★ + `reason`).
     Falls back to a size-only row if a probe returns null.
+  - **DV layer (on-demand):** when either file's `hdr` is "Dolby Vision" but its
+    `dv_layer` is null (not cached), the HDR/DV row shows "Dolby Vision" plus a
+    **Scan DV layers** button → `api.scanConflictDv(id)` (button → "Scanning DV…").
+    On the existing `dv:scan_done` WS event while this card is active, refetch
+    `conflictPreview(id)` so FEL/MEL fills in and the recommendation updates.
   - **Actions:** **Overwrite** (danger-styled; subtext "existing file moves to
     Trash — recoverable") → `applyJob(id, 'overwrite')`; **Keep both** ("adds a
     second version") → `applyJob(id, 'keep_both')`; **Skip** → next.
@@ -336,6 +359,10 @@ Wrap the list/grid + `StatusDashboard` + `RenameFilterBar` + `BulkBar` in
   reproduces today's hold-for-review; bodyless POST still 200s. `dedupe_dest`
   produces a case-insensitively-unique name preserving the extension. Undo of an
   overwrite restores the displaced original.
+- `scan-dv-conflict`: returns immediately (`{status:'scanning'}`), runs
+  `detect_layer` on a background thread for both paths, `upsert_dv_scan`s the
+  result, and broadcasts `dv:scan_done`; a second call while one is running is
+  a no-op (per-job guard). Assert `dovi_tool` is not invoked on the request thread.
 
 **Frontend**
 - `review.ts`: `classifyJob` bucket boundaries (matched-100 + warning → needsReview;
@@ -349,7 +376,9 @@ Wrap the list/grid + `StatusDashboard` + `RenameFilterBar` + `BulkBar` in
   expand; **conflict card fetches `conflictPreview` once on activation (previewSeq
   guard), renders the two-column table, flags the recommended side, and Overwrite/
   Keep-both call `applyJob` with the right strategy**; non-conflict card shows plain
-  Apply.
+  Apply. The **Scan DV layers** button shows only when a file is "Dolby Vision"
+  with a null `dv_layer`, calls `scanConflictDv`, and a `dv:scan_done` event
+  re-fetches `conflictPreview`.
 - Follow the existing vitest store/component patterns.
 
 ## Out of Scope (deferred)
@@ -361,8 +390,9 @@ Wrap the list/grid + `StatusDashboard` + `RenameFilterBar` + `BulkBar` in
 - **Desktop parity for the compare view / Overwrite / Keep-both** — the backend
   endpoints are shared and available, but wiring the desktop `RenameRow`/`RenameCard`
   to them is a follow-up; v1 ships the mobile deck.
-- **FEL/MEL in the live preview when uncached** — shown only from the `dv_scan`
-  cache; running `dovi_tool` on demand (slow) is out of scope.
+- **Synchronous FEL/MEL in the compare** — FEL/MEL is shown from the `dv_scan`
+  cache instantly, or resolved by the on-demand background scan (B5); `dovi_tool`
+  is never run inline in the compare request.
 - **Plex named-edition tagging for Keep-both** — v1 uses a numeric-suffix version in
   the same folder; a `{edition-…}` naming scheme is a later refinement.
 - **A browsable phone list** (the A+C hybrid) and **redesigning the DV/Trash/Process
