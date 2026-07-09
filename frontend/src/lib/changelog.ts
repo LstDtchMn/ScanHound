@@ -7,6 +7,17 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.23.0",
+    date: "2026-07-09",
+    summary: "Mobile Downloads: live progress, controls, and duplicate cleanup",
+    changes: [
+      "The mobile Downloads tab now shows your JDownloader queue live — per-item progress bars, size, host, and status (queued/downloading/extracting/finished/failed), refreshing automatically while the tab is open",
+      "Pause, resume, or stop the whole queue from your phone, and clear finished/failed downloads with one tap",
+      "Duplicate releases of the same title (or an accidental double-grab) are grouped together with a 'Keep best, cancel rest' action, so cleaning up a cluttered queue no longer means guessing which release is which",
+      "Canceling a download now actually removes it from JDownloader, not just the list",
+    ],
+  },
+  {
     version: "2.22.1",
     date: "2026-07-09",
     summary: "Group titles by their corrected name, not the raw scrape",
