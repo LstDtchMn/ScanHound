@@ -12,8 +12,10 @@ import aiohttp
 import html as html_lib
 import json
 import logging
+import shutil
 import smtplib
 import string
+import sys
 import threading
 import time
 import uuid
@@ -130,10 +132,20 @@ class DesktopNotificationChannel(NotificationChannel):
         """Get the appropriate notifier for the platform."""
         try:
             from plyer import notification as plyer_notification
-            return plyer_notification.notify
         except ImportError:
             logger.warning("plyer not installed, desktop notifications disabled")
             return None
+        # In a headless container plyer's Linux backend shells out to gdbus /
+        # notify-send, which aren't installed → every send raises
+        # FileNotFoundError and spams ERROR logs. Disable the channel when
+        # neither backend exists. (DISPLAY is set for Xvfb, so it can't gate
+        # this — probe the actual binaries.)
+        if sys.platform.startswith("linux") and not (
+                shutil.which("gdbus") or shutil.which("notify-send")):
+            logger.info("No desktop notification backend (gdbus/notify-send) "
+                        "present — desktop notifications disabled")
+            return None
+        return plyer_notification.notify
 
     async def send(self, notification: Notification) -> bool:
         """Send desktop notification."""
@@ -154,6 +166,13 @@ class DesktopNotificationChannel(NotificationChannel):
             )
             logger.debug(f"Desktop notification sent: {notification.title}")
             return True
+        except FileNotFoundError as e:
+            # The notification backend vanished (headless host) — self-disable so
+            # every subsequent send doesn't re-raise and spam the log. Belt-and-
+            # suspenders behind the _get_notifier probe.
+            self._notifier = None
+            logger.debug(f"Desktop notification backend missing; disabling channel: {e}")
+            return False
         except Exception as e:
             logger.error(f"Failed to send desktop notification: {e}")
             return False

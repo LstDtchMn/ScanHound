@@ -848,12 +848,6 @@ class DownloadService:
                         pass
                     self.cached_driver = None
 
-            options = _uc.ChromeOptions()
-            options.add_argument("--window-size=1920,1080")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--start-minimized")
             # Detect the installed Chrome/Chromium major version so
             # undetected-chromedriver fetches a *matching* driver. Without it,
             # uc grabs the latest driver, which fails when the installed browser
@@ -867,27 +861,67 @@ class DownloadService:
                     "Could not detect Chrome version; undetected-chromedriver "
                     "will guess a driver and may mismatch the browser."
                 )
-            # Target the bundled/pinned browser binary when present (Linux/Docker).
             chrome_bin = os.environ.get("CHROME_BIN")
-            if chrome_bin and os.path.exists(chrome_bin):
-                options.binary_location = chrome_bin
-            # On Linux/Docker, use the apt-installed chromedriver — always
-            # version-matched to the apt chromium, so uc never downloads a
-            # mismatched driver (belt-and-suspenders behind version_main
-            # detection). Windows desktop keeps uc's auto-managed driver: no
-            # such system path exists there.
-            uc_kwargs: Dict[str, Any] = {"options": options, "version_main": chrome_ver}
             system_driver = "/usr/bin/chromedriver"
-            if os.path.exists(system_driver):
-                uc_kwargs["driver_executable_path"] = system_driver
-            self.cached_driver = _uc.Chrome(**uc_kwargs)
+
+            # Launch with a bounded retry. Chrome intermittently fails to start
+            # in the container ("session not created: cannot connect to chrome")
+            # — a wedged/orphaned chrome process, a transient Xvfb hiccup, or a
+            # launch race. Observed live as bursts of ~26 back-to-back failures
+            # that killed every scrape until they cleared. Reaping stale
+            # processes + a short backoff lets a fresh launch recover instead of
+            # failing the scrape outright. We hold _driver_lock here, and
+            # scrape_links holds it too, so no other scrape can own a live
+            # driver while we reap.
+            last_err: Optional[Exception] = None
+            for attempt in range(1, 4):
+                options = _uc.ChromeOptions()
+                options.add_argument("--window-size=1920,1080")
+                options.add_argument("--disable-gpu")
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                options.add_argument("--start-minimized")
+                if chrome_bin and os.path.exists(chrome_bin):
+                    options.binary_location = chrome_bin
+                # On Linux/Docker, use the apt-installed chromedriver — always
+                # version-matched to the apt chromium, so uc never downloads a
+                # mismatched driver. Windows desktop keeps uc's auto-managed one.
+                uc_kwargs: Dict[str, Any] = {"options": options, "version_main": chrome_ver}
+                if os.path.exists(system_driver):
+                    uc_kwargs["driver_executable_path"] = system_driver
+                try:
+                    self.cached_driver = _uc.Chrome(**uc_kwargs)
+                except Exception as e:
+                    last_err = e
+                    self.cached_driver = None
+                    self._log(f"[Scrape] Chrome launch failed "
+                              f"(attempt {attempt}/3): {e}", "warning")
+                    self._kill_stale_chrome()
+                    time.sleep(min(2 * attempt, 5))
+                    continue
+                try:
+                    # Cosmetic on the Windows desktop app; unsupported under the
+                    # container's headless Xvfb display, so make it best-effort.
+                    self.cached_driver.minimize_window()
+                except Exception:
+                    pass
+                return self.cached_driver
+            # All attempts failed — surface the real error to the caller so the
+            # scrape reports an honest failure (not a silent empty result).
+            raise last_err if last_err else RuntimeError("Chrome could not be launched")
+
+    def _kill_stale_chrome(self) -> None:
+        """Best-effort reap of orphaned chrome/chromedriver processes that can
+        wedge a fresh launch. Linux/container only; a no-op on Windows and safe
+        to call under _driver_lock (no other scrape owns a live driver then)."""
+        if sys.platform.startswith("win"):
+            return
+        for pat in ("chromedriver", "chrome", "chromium"):
             try:
-                # Cosmetic on the Windows desktop app; unsupported under the
-                # container's headless Xvfb display, so make it best-effort.
-                self.cached_driver.minimize_window()
+                subprocess.run(["pkill", "-9", "-f", pat],
+                               capture_output=True, timeout=5)
             except Exception:
                 pass
-            return self.cached_driver
 
     def cleanup_driver(self):
         """Quit and clean up the cached Chrome driver (thread-safe).

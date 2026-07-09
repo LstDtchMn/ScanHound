@@ -37,8 +37,10 @@ class NotificationBridge:
         # Map config keys to notification channels
         notif_config = {}
 
-        # Desktop
-        if config.get("desktop_notifications", True):
+        # Desktop — default OFF: ScanHound runs headless (Docker), where there
+        # is no desktop notification backend. Aligns with the channel registry
+        # default and prevents fresh installs from spamming gdbus errors.
+        if config.get("desktop_notifications", False):
             notif_config["desktop_enabled"] = True
 
         # Discord

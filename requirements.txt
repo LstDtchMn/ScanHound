@@ -18,6 +18,11 @@ thefuzz>=0.20.0,<1.0
 # Browser Automation (lazy-loaded for link resolution)
 selenium>=4.8.0,<5.0
 undetected-chromedriver>=3.5.0
+# undetected-chromedriver imports distutils, which Python 3.12 removed from the
+# stdlib. setuptools <81 still ships the distutils shim (81+ dropped it), so pin
+# below 81 to keep scrapes working on a local 3.12 run. (The Docker image pins
+# setuptools==70.2.0 in requirements-docker.txt for the same reason.)
+setuptools<81
 
 # GUI (v1 QML interface — still functional)
 PySide6>=6.7.0

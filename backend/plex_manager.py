@@ -130,8 +130,23 @@ class PathMapping:
 class PlexManager:
     """Manages Plex server connection and library operations."""
 
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        """Prepend http:// to a bare host:port and strip a trailing slash.
+
+        plexapi/requests raise "No connection adapters were found for 'X'" when
+        a URL has no scheme. Returns '' for falsy input so we never fabricate a
+        URL when Plex is unconfigured or in account mode. Prefix check, not
+        urlparse (urlparse misreads 'host:port' host as the scheme)."""
+        if not url:
+            return ""
+        u = url.strip()
+        if u and not u.lower().startswith(("http://", "https://")):
+            u = "http://" + u
+        return u.rstrip('/')
+
     def __init__(self, url: str = "", token: str = ""):
-        self._url = url.rstrip('/') if url else ""
+        self._url = self._normalize_url(url)
         self._token = token
         self._server = None
         self._account = None  # MyPlexAccount instance for remote connections
@@ -170,7 +185,7 @@ class PlexManager:
             password: Plex account password (for account mode)
             server_name: Target server name (for account mode)
         """
-        self._url = url.rstrip('/') if url else ""
+        self._url = self._normalize_url(url)
         self._token = token
         self._connection_mode = connection_mode
         self._username = username

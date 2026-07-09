@@ -329,6 +329,27 @@ class TestPathMapping:
 # 4. PlexManager - Properties
 # ======================================================================
 
+class TestPlexUrlNormalization:
+    """A bare host:port must gain http:// so requests/plexapi don't raise
+    'No connection adapters were found'."""
+
+    def test_bare_host_port_gets_http(self):
+        assert PlexManager(url="192.168.1.170:32400", token="t")._url \
+            == "http://192.168.1.170:32400"
+
+    def test_scheme_preserved_and_trailing_slash_stripped(self):
+        assert PlexManager(url="https://plex.example.com/", token="t")._url \
+            == "https://plex.example.com"
+
+    def test_empty_stays_empty(self):
+        assert PlexManager(url="", token="t")._url == ""
+
+    def test_configure_also_normalizes(self):
+        mgr = PlexManager()
+        mgr.configure("192.168.1.170:32400", "t")
+        assert mgr._url == "http://192.168.1.170:32400"
+
+
 class TestPlexManagerProperties:
     """Tests for PlexManager properties."""
 

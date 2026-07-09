@@ -402,6 +402,10 @@ def test_notification(
             token = cfg.get("plex_token", "")
             if not url or not token:
                 raise HTTPException(status_code=400, detail="Plex URL and token required")
+            # A bare host:port would make requests raise "No connection adapters
+            # were found for 'X'" — prepend the scheme (mirrors validate_config).
+            if not url.lower().startswith(("http://", "https://")):
+                url = "http://" + url
             resp = requests.get(
                 f"{url.rstrip('/')}/identity",
                 headers={"X-Plex-Token": token, "Accept": "application/json"},

@@ -554,6 +554,18 @@ def validate_config(config: dict) -> dict:
     if cleaned.get('plex_refresh_mode') not in (None, "auto", "force_refresh", "cache_only"):
         cleaned['plex_refresh_mode'] = "auto"
 
+    # Normalize plex_url: a bare host:port (no scheme) makes requests/plexapi
+    # raise the cryptic "No connection adapters were found for 'X'". Self-heal
+    # it here (runs on every config load) so it can never reach a request.
+    # Use a prefix check, NOT urlparse — urlparse('192.168.1.170:32400')
+    # misparses the host as the scheme. Skip empty/None (unconfigured / account
+    # mode) so we never fabricate a URL.
+    _plex_url = cleaned.get('plex_url')
+    if isinstance(_plex_url, str) and _plex_url.strip():
+        _u = _plex_url.strip()
+        if not _u.lower().startswith(('http://', 'https://')):
+            cleaned['plex_url'] = 'http://' + _u
+
     # Threshold bounds (0-100)
     for key in ('tv_match_threshold', 'low_match_threshold', 'movie_match_threshold'):
         val = cleaned.get(key)

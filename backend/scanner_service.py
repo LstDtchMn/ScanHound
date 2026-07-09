@@ -602,6 +602,15 @@ class ScannerService:
 
             self._log(f"Crawling {source_name}...")
 
+            # Cloudflare-blocked sources 403 EVERY page, which used to log one
+            # "HTTP 403" warning per page (hundreds per run). Count instead: emit
+            # a single aggregated warning per source, back off between blocked
+            # pages, and stop the source after a few consecutive blocks rather
+            # than firing all N doomed requests with no delay.
+            blocked_total = 0
+            blocked_streak = 0
+            last_block_status = None
+
             for page_num in range(1, pages + 1):
                 if self.stop_scan_flag:
                     break
@@ -622,8 +631,16 @@ class ScannerService:
                 try:
                     resp = await loop.run_in_executor(None, lambda u=url: scraper.get(u, timeout=15))
                     if resp.status_code != 200:
-                        self._log(f"HTTP {resp.status_code}", "warning")
+                        blocked_total += 1
+                        blocked_streak += 1
+                        last_block_status = resp.status_code
+                        # Back off (grows with the streak) so a blocked source
+                        # isn't hammered with N requests in a few seconds.
+                        await asyncio.sleep(min(0.5 * blocked_streak, 3.0))
+                        if blocked_streak >= 3:
+                            break  # session can't clear the block this run
                         continue
+                    blocked_streak = 0  # a good page resets the streak
 
                     soup = BeautifulSoup(resp.content, 'html.parser')
                     posts = self._select_posts(soup, source_id)
@@ -663,6 +680,12 @@ class ScannerService:
                     await asyncio.sleep(0.3)
                 except Exception as e:
                     self._log(f"Crawl error: {e}", "error")
+
+            if blocked_total:
+                self._log(
+                    f"{source_name}: {blocked_total} page(s) blocked "
+                    f"(HTTP {last_block_status}) — Cloudflare not cleared; this "
+                    f"source's results may be incomplete this run", "warning")
 
         if skipped_count:
             self._log(f"Skipped {skipped_count} previously scanned URLs")

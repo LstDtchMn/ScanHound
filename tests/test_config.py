@@ -377,6 +377,20 @@ class TestValidateConfigPreservesValid:
         assert result["plex_url"] == "http://example.com"
         assert result["plex_token"] == "abc123"
 
+    def test_schemeless_plex_url_gets_http_prefix(self):
+        # A bare host:port makes requests raise "No connection adapters found".
+        assert validate_config({"plex_url": "192.168.1.170:32400"})["plex_url"] \
+            == "http://192.168.1.170:32400"
+
+    def test_plex_url_with_scheme_untouched(self):
+        for u in ("http://192.168.1.170:32400", "https://plex.example.com"):
+            assert validate_config({"plex_url": u})["plex_url"] == u
+
+    def test_empty_plex_url_not_fabricated(self):
+        # Unconfigured / account mode: never invent a URL.
+        assert validate_config({"plex_url": ""})["plex_url"] == ""
+        assert "plex_url" not in validate_config({})  # absent stays absent
+
     def test_returns_new_dict(self):
         original = {"min_size_mb": 200}
         result = validate_config(original)

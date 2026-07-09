@@ -340,26 +340,28 @@ class PlexService:
                                 first_error = f"{show.title}: {type(e).__name__}: {e}"
                             logger.debug(f"Error loading show '{show.title}': {e}")
 
-                    # Diagnostics
+                    # Diagnostics. "only specials" is NORMAL (a show with just a
+                    # season-0/specials season) — it is not a load problem, so it
+                    # doesn't belong in the warning list (it fired 83x/scan). It's
+                    # surfaced as informational context on the success line instead.
                     diag = []
                     if tv_errors:
                         diag.append(f"{tv_errors} errored")
                     if tv_no_seasons:
                         diag.append(f"{tv_no_seasons} had no seasons")
-                    if tv_all_specials:
-                        diag.append(f"{tv_all_specials} only specials")
                     if tv_extract_fail:
                         diag.append(f"{tv_extract_fail} season extracts failed")
+                    specials_note = f" ({tv_all_specials} specials-only)" if tv_all_specials else ""
 
                     if diag:
                         self._log(
-                            f"TV loading: {total_items} shows, {tv_seasons} seasons. "
+                            f"TV loading: {total_items} shows, {tv_seasons} seasons{specials_note}. "
                             f"Issues: {', '.join(diag)}."
                             + (f" First error: {first_error}" if first_error else ""),
                             "warning" if tv_seasons > 0 else "error",
                         )
                     else:
-                        self._log(f"Loaded {tv_seasons} seasons from {total_items} shows in '{lib_name}'", "success")
+                        self._log(f"Loaded {tv_seasons} seasons from {total_items} shows in '{lib_name}'{specials_note}", "success")
 
                 except Exception as e:
                     self._log(f"Error loading TV library '{lib_name}': {e}", "error")
