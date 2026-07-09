@@ -116,6 +116,10 @@ class SettingsUpdate(BaseModel):
     auto_rename_movie_library: Optional[str] = None
     auto_rename_movie_library_4k: Optional[str] = None
     auto_rename_tv_library: Optional[str] = None
+    # host => container path mappings (one per line); maps JDownloader's Windows
+    # save paths into the container's mounted view. Editable in the UI but was
+    # missing here, so saving it 422'd under extra="forbid".
+    auto_rename_path_mappings: Optional[str] = None
     auto_rename_template_movie: Optional[str] = None
     auto_rename_template_tv: Optional[str] = None
     auto_rename_plex_sort_titles: Optional[bool] = None
@@ -146,6 +150,7 @@ class SettingsUpdate(BaseModel):
     jd_method: Optional[str] = None
     jd_folder: Optional[str] = None
     jd_movies_folder: Optional[str] = None
+    jd_movies_folder_4k: Optional[str] = None
     jd_tv_folder: Optional[str] = None
     jd_email: Optional[str] = None
     jd_password: Optional[str] = None

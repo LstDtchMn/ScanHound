@@ -75,6 +75,7 @@ class AppConfig(TypedDict, total=False):
     jd_method: Literal["folder", "api"]
     jd_folder: str
     jd_movies_folder: str
+    jd_movies_folder_4k: str
     jd_tv_folder: str
     jd_email: str
     jd_password: str
@@ -410,6 +411,13 @@ _DEFAULT_CONFIG: AppConfig = {
     "jd_method": "folder",
     "jd_folder": "",
     "jd_movies_folder": "",
+    # JD download/extract folder for 4K movies specifically. Point this at a
+    # folder on the SAME physical drive as the 4K library so the post-download
+    # rename is an instant same-volume move instead of a slow cross-drive copy
+    # (through the WSL2 bind mount). Requires a matching auto_rename_path_mappings
+    # entry so the extract is found on the right mount. Empty = falls back to
+    # jd_movies_folder (then JD's own default).
+    "jd_movies_folder_4k": "",
     "jd_tv_folder": "",
     "jd_email": "",
     "jd_password": "",

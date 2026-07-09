@@ -928,6 +928,19 @@
               />
             </label>
             <label class="block">
+              <span class="text-sm text-[var(--text-secondary)]">4K Movies Download Folder</span>
+              <input
+                type="text"
+                value={$settings.jd_movies_folder_4k as string ?? ''}
+                oninput={(e) => settings.update((s) => ({ ...s, jd_movies_folder_4k: e.currentTarget.value }))}
+                placeholder="e.g. G:\Downloads (same drive as the 4K library)"
+                class={inputClass}
+              />
+              <span class="mt-1 block text-[11px] text-[var(--text-secondary)]">
+                Point this at a folder on the <strong>same physical drive</strong> as your 4K library so 4K renames are instant moves, not slow cross-drive copies. Add a matching Path Mapping below (host&nbsp;⇒&nbsp;container) so the extract is found.
+              </span>
+            </label>
+            <label class="block">
               <span class="text-sm text-[var(--text-secondary)]">TV Shows Download Folder</span>
               <input
                 type="text"

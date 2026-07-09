@@ -68,7 +68,8 @@ EXPECTED_DEFAULT_KEYS = {
     # Libraries
     "movie_libs", "tv_libs", "known_libraries",
     # JDownloader
-    "jd_enabled", "jd_method", "jd_folder", "jd_movies_folder", "jd_tv_folder",
+    "jd_enabled", "jd_method", "jd_folder", "jd_movies_folder",
+    "jd_movies_folder_4k", "jd_tv_folder",
     "jd_email", "jd_password", "jd_device",
     # Source / filtering
     "exclude_720p", "source_2160p", "source_remux", "source_tv_packs",

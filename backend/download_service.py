@@ -1888,9 +1888,16 @@ class DownloadService:
         else:
             package_name = "ScanHound Download"
 
-        # Per-type download folder: TV (has a season) vs movies, when configured.
+        # Per-type download folder: TV (has a season) vs movies, when
+        # configured. 4K movies get their OWN folder when set, so they can be
+        # downloaded/extracted straight onto the same physical drive as the 4K
+        # library — turning the post-download rename from a slow cross-drive
+        # copy into an instant same-volume move. Falls back to jd_movies_folder.
         if season is not None:
             destination = (self.config.get("jd_tv_folder") or "").strip()
+        elif self._res_rank(resolution) >= self._res_rank("2160p"):
+            destination = ((self.config.get("jd_movies_folder_4k") or "").strip()
+                           or (self.config.get("jd_movies_folder") or "").strip())
         else:
             destination = (self.config.get("jd_movies_folder") or "").strip()
 

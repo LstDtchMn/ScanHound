@@ -45,6 +45,33 @@ def test_settings_model_accepts_dv_keys_and_4k():
     assert dumped["auto_rename_movie_library_4k"] == "Movies 4K"
 
 
+def test_settings_model_accepts_jd_4k_folder_and_path_mappings():
+    # Regression: the 4K download folder + host=>container path mappings must be
+    # settable via the API. path_mappings was editable in the UI but missing
+    # from the extra="forbid" model, so saving it 422'd — breaking the 4K
+    # instant-move workflow (which needs a G:\Downloads => /library/movies-4k map).
+    m = SettingsUpdate(
+        jd_movies_folder_4k="G:\\Downloads",
+        auto_rename_path_mappings="F:\\Downloads => /library/movies\nG:\\Downloads => /library/movies-4k",
+    )
+    dumped = m.model_dump(exclude_unset=True)
+    assert dumped["jd_movies_folder_4k"] == "G:\\Downloads"
+    assert "movies-4k" in dumped["auto_rename_path_mappings"]
+
+
+def test_all_frontend_editable_settings_keys_are_in_model():
+    # Guard against the whole class of bug: any settings key editable in the UI
+    # but absent from SettingsUpdate silently 422s the user's entire save
+    # (frontend sends a diff of changed keys). Keep the model a superset.
+    import re
+    from pathlib import Path
+    page = Path("frontend/src/routes/settings/+page.svelte").read_text(encoding="utf-8")
+    editable = set(re.findall(r"\.\.\.s,\s*([a-z_0-9]+):", page))
+    model = set(SettingsUpdate.model_fields.keys())
+    missing = editable - model
+    assert not missing, f"UI-editable settings missing from SettingsUpdate (would 422): {sorted(missing)}"
+
+
 def test_defaults_have_dv_keys():
     from backend.config import _DEFAULT_CONFIG
     assert _DEFAULT_CONFIG["dv_detection"] is False

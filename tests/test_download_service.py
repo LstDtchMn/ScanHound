@@ -42,6 +42,49 @@ def _make_service(config=None, db=None):
     return DownloadService(config=cfg, db=database)
 
 
+class TestDownloadFolderRouting:
+    """4K movies route to their own JD folder so they extract onto the 4K
+    library's drive (instant same-volume rename instead of a cross-drive copy).
+    TV → jd_tv_folder; non-4K movies → jd_movies_folder."""
+
+    def _capture_destination(self, config, **item):
+        svc = _make_service(config={**config, "jd_enabled": True, "jd_method": "api"})
+        svc.scrape_links = MagicMock(return_value=["http://rg.net/f1"])
+        svc._is_supported_download_link = MagicMock(return_value=True)
+        svc.send_to_jdownloader = MagicMock(return_value=True)
+        svc.save_to_history = MagicMock(return_value=True)
+        svc.db.is_downloaded.return_value = False
+        svc.db.get_downloaded_title_quality.return_value = []
+        svc.download_item("u/x", item.get("title", "M"), item.get("season"),
+                          item.get("resolution", ""), "50 GB",
+                          year=item.get("year"))
+        assert svc.send_to_jdownloader.called
+        return svc.send_to_jdownloader.call_args.kwargs.get("destination")
+
+    CFG = {"jd_movies_folder": "F:\\Downloads",
+           "jd_movies_folder_4k": "G:\\Downloads",
+           "jd_tv_folder": "T:\\Downloads"}
+
+    def test_4k_movie_routes_to_4k_folder(self):
+        assert self._capture_destination(self.CFG, resolution="2160p", season=None) == "G:\\Downloads"
+
+    def test_uhd_and_4k_aliases_route_to_4k_folder(self):
+        assert self._capture_destination(self.CFG, resolution="4K", season=None) == "G:\\Downloads"
+        assert self._capture_destination(self.CFG, resolution="UHD", season=None) == "G:\\Downloads"
+
+    def test_1080p_movie_routes_to_movies_folder(self):
+        assert self._capture_destination(self.CFG, resolution="1080p", season=None) == "F:\\Downloads"
+
+    def test_tv_routes_to_tv_folder_even_if_4k(self):
+        # A 4K TV episode still goes to the TV folder (season is not None).
+        assert self._capture_destination(self.CFG, resolution="2160p", season=2) == "T:\\Downloads"
+
+    def test_4k_folder_falls_back_to_movies_folder_when_unset(self):
+        cfg = {"jd_movies_folder": "F:\\Downloads", "jd_movies_folder_4k": "",
+               "jd_tv_folder": ""}
+        assert self._capture_destination(cfg, resolution="2160p", season=None) == "F:\\Downloads"
+
+
 class TestDownloadDedup:
     def test_already_grabbed_url_is_skipped_without_scraping(self):
         db = MagicMock()
