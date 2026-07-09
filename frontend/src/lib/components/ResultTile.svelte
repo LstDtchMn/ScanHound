@@ -277,7 +277,7 @@
           {#if item.hdr && !item.dovi}<Badge label="HDR" variant="warning" size={big ? 'xl' : $isPhone ? 'lg' : 'xs'} />{/if}
         </div>
         <p class="{big ? 'text-2xl' : $isPhone ? 'text-base' : 'text-sm'} font-semibold text-white truncate leading-tight" title={item.title}>
-          {item.title}{#if item.year}<span class="font-normal text-white/70">&nbsp;({item.year})</span>{/if}
+          {item.title}{#if item.season != null}<span class="font-bold text-[var(--accent)]">&nbsp;S{String(item.season).padStart(2, '0')}</span>{/if}{#if item.year}<span class="font-normal text-white/70">&nbsp;({item.year})</span>{/if}
         </p>
       </div>
     {/if}

@@ -271,7 +271,7 @@
 
             <!-- Info — sized big for arm's-length reading in the deck. -->
             <div class="absolute bottom-0 left-0 right-0 p-4 text-white">
-              <p class="text-3xl font-bold leading-tight">{info.title}{#if info.year}<span class="font-normal opacity-80"> ({info.year})</span>{/if}</p>
+              <p class="text-3xl font-bold leading-tight">{info.title}{#if info.season != null}<span class="text-[var(--accent)]"> S{String(info.season).padStart(2, '0')}</span>{/if}{#if info.year}<span class="font-normal opacity-80"> ({info.year})</span>{/if}</p>
               <div class="flex flex-wrap items-center gap-x-2.5 gap-y-1 mt-2 text-xl opacity-95 font-medium">
                 {#if shown.resolution}<span class="font-bold">{shown.resolution}</span>{/if}
                 {#if shown.size}<span>· {shown.size}</span>{/if}

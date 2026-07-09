@@ -153,7 +153,9 @@
         <img src={item.poster_url} alt="" class="w-20 rounded-md shrink-0 self-start" />
       {/if}
       <div class="min-w-0">
-        <h2 class="text-base font-bold text-[var(--text-primary)] leading-snug">{item.title}</h2>
+        <h2 class="text-base font-bold text-[var(--text-primary)] leading-snug">
+          {item.title}{#if item.season != null}<span class="text-[var(--accent)]"> · Season {item.season}</span>{/if}
+        </h2>
         <p class="text-xs text-[var(--text-secondary)] mt-0.5 flex items-center flex-wrap gap-x-1">
           <span>{item.year || ''}{#if item.rating} · ★ {item.rating.toFixed(1)}{#if item.votes} ({formatCount(item.votes)}){/if}{/if}{#if item.size} · {item.size}{/if}</span>
           {#if item.rt_score != null}<span class="flex items-center">·&nbsp;<RtBadge score={item.rt_score} size="lg" /></span>{/if}

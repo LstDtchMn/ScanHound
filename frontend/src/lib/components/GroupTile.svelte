@@ -138,7 +138,7 @@
             {#if formats.hdr}<Badge label="HDR" variant="warning" size={big ? 'xl' : $isPhone ? 'lg' : 'xs'} />{/if}
           </div>
           <p class="{big ? 'text-2xl' : $isPhone ? 'text-base' : 'text-sm'} font-semibold text-white truncate leading-tight" title={title}>
-            {title}{#if front.year}<span class="font-normal text-white/70">&nbsp;({front.year})</span>{/if}
+            {title}{#if front.season != null}<span class="font-bold text-[var(--accent)]">&nbsp;S{String(front.season).padStart(2, '0')}</span>{/if}{#if front.year}<span class="font-normal text-white/70">&nbsp;({front.year})</span>{/if}
           </p>
         </div>
       {/if}
