@@ -123,6 +123,22 @@ def _trash_bucket_name() -> str:
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def dedupe_dest(dst: str) -> str:
+    """Return ``dst`` if free, else the next ``"{base} ({n}){ext}"`` that does not
+    exist. Case-insensitive existence check via ``os.path.lexists`` (NTFS mounts
+    are case-insensitive); the extension is preserved. Used by Keep-both."""
+    if not os.path.lexists(dst):
+        return dst
+    directory = os.path.dirname(dst)
+    base, ext = os.path.splitext(os.path.basename(dst))
+    n = 1
+    while True:
+        candidate = os.path.join(directory, f"{base} ({n}){ext}")
+        if not os.path.lexists(candidate):
+            return candidate
+        n += 1
+
+
 def _record_trash_manifest(bucket: str, trashed_name: str, original_path: str) -> None:
     """Append a restore record to ``<bucket>/manifest.json`` (read-modify-write).
 
@@ -219,12 +235,7 @@ def _trash(path: str) -> str:
         bucket = os.path.join(root, _trash_bucket_name())
         os.makedirs(bucket, exist_ok=True)
     name = os.path.basename(path)
-    base, ext = os.path.splitext(name)
-    dst = os.path.join(bucket, name)
-    n = 1
-    while os.path.lexists(dst):
-        dst = os.path.join(bucket, f"{base} ({n}){ext}")
-        n += 1
+    dst = dedupe_dest(os.path.join(bucket, name))
     try:
         os.rename(path, dst)
     except OSError as e:
