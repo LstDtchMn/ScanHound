@@ -7,6 +7,15 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.23.1",
+    date: "2026-07-09",
+    summary: "Two minor fixes from a code-review pass",
+    changes: [
+      "Fixed the Missing count occasionally reading one too high after a failed dismiss that raced with a background refresh (self-corrected on the next load; now it never over-counts)",
+      "The desktop Downloads page now loads correctly if you resize a browser window across the phone/desktop breakpoint instead of showing an empty view until reload",
+    ],
+  },
+  {
     version: "2.23.0",
     date: "2026-07-09",
     summary: "Mobile Downloads: live progress, controls, and duplicate cleanup",

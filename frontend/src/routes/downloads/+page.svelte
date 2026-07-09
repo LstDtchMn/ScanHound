@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { get } from 'svelte/store';
   import { api } from '$lib/api/client';
   import MobileDownloadsView from '$lib/components/mobile/MobileDownloadsView.svelte';
   import { mobile } from '$lib/stores/media';
@@ -318,8 +317,13 @@
     collapsedGroups = next;
   }
 
-  onMount(() => {
-    if (get(mobile)) return;
+  // Desktop data-loading + live subscriptions. Set up lazily the first time we
+  // are NOT on a phone, and only once. This runs on the desktop route only; the
+  // phone view (MobileDownloadsView) does its own polling, so we skip this on
+  // mobile to avoid double-polling.
+  let desktopTeardown: (() => void) | null = null;
+  function initDesktop() {
+    if (desktopTeardown) return;  // already set up
     loadHistory();
     loadJdLinks();
     loadResults();
@@ -338,7 +342,17 @@
     // Periodic fallback refresh (covers any missed push / reconnect) — lightweight
     // /jd-state, not the full link list (which can be megabytes).
     const id = setInterval(() => { loadResults(); loadJdState(); }, 5000);
-    return () => { clearInterval(id); offState(); offResults(); };
+    desktopTeardown = () => { clearInterval(id); offState(); offResults(); };
+  }
+
+  onMount(() => {
+    // `mobile` is a live matchMedia store — subscribing (fires immediately with
+    // the current value) means a window resized ACROSS the md breakpoint (a
+    // desktop browser narrowed then widened) still wires up the desktop view
+    // rather than leaving it uninitialized/empty. On an actual phone `mobile`
+    // stays true, so initDesktop never runs and we don't double-poll.
+    const unsub = mobile.subscribe((isMobile) => { if (!isMobile) initDesktop(); });
+    return () => { unsub(); desktopTeardown?.(); };
   });
 </script>
 

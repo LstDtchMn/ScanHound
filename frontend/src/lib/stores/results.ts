@@ -652,8 +652,16 @@ export function dismissItem(url: string, title?: string, meta?: DismissMeta): Pr
       // Paged mode physically dropped the row — put it back, or the failed
       // dismiss silently vanishes it from the list until the next refresh.
       if (removedRow) {
-        results.update((items) => (items.some((i) => i.url === url) ? items : [removedRow!, ...items]));
-        filteredTotal.update((n) => n + 1);
+        let reinserted = false;
+        results.update((items) => {
+          if (items.some((i) => i.url === url)) return items;  // a concurrent load already re-added it
+          reinserted = true;
+          return [removedRow!, ...items];
+        });
+        // Only bump the count if WE re-added the row — otherwise a concurrent
+        // loadResults(true) already reset filteredTotal to the server total, and
+        // an unconditional +1 would over-count (mirrors restoreItem's guard).
+        if (reinserted) filteredTotal.update((n) => n + 1);
       }
       return false;
     }

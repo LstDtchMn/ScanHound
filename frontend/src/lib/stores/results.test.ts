@@ -340,6 +340,23 @@ describe('dismissItem / restoreItem', () => {
     expect(get(dismissedUrls).has('a')).toBe(false);
   });
 
+  it('paged mode: a failed dismiss does NOT over-count filteredTotal when a concurrent load already re-added the row', async () => {
+    pagedMode.set(true);
+    vi.mocked(api.dismissItems).mockRejectedValueOnce(new Error('network'));
+    const a = item({ url: 'a', title: 'A' });
+    results.set([a, item({ url: 'b', title: 'B' })]);
+    filteredTotal.set(2);
+    const p = dismissItem('a', 'A');                 // optimistic: removes 'a', filteredTotal -> 1
+    expect(get(results).map((r) => r.url)).toEqual(['b']);
+    // Simulate a concurrent loadResults(true) landing before the rejection:
+    // it repopulates 'a' and resets filteredTotal to the server total.
+    results.set([a, item({ url: 'b', title: 'B' })]);
+    filteredTotal.set(2);
+    await p; // let the rejection-revert run
+    expect(get(results).filter((r) => r.url === 'a')).toHaveLength(1); // not double-added
+    expect(get(filteredTotal)).toBe(2); // not 3 — the +1 is skipped since we didn't re-insert
+  });
+
   it('is a no-op for an empty url', () => {
     dismissItem('');
     expect(get(dismissedUrls).size).toBe(0);
