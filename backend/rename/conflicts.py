@@ -43,8 +43,17 @@ def _quality_score(job: dict) -> tuple:
     duplicate-target group can recommend which copy to keep. Higher is better.
 
     Returns a comparable tuple (so ties fall through to the next signal):
-        (resolution_rank, dolby_vision, hdr, source_rank, audio_rank, edition)
-    Pure string heuristics over the original filename — no I/O."""
+        (resolution_rank, dolby_vision, dv_layer_rank, hdr, source_rank, audio_rank, edition)
+    Pure string heuristics over the original filename — no I/O.
+
+    Note on tuple placement: `dv_layer_rank` sits right after the binary `dv` bit
+    rather than before it (as a naive reading of "ranks above the binary DV bit"
+    might suggest) so that index 1 stays the `dv` bit — preserving an existing
+    regression test that indexes into it directly. This is a no-op behaviorally:
+    dv_layer_rank > 0 always forces dv = 1 (see below), so the two orderings are
+    mathematically equivalent for every comparison — the achievable (dv,
+    dv_layer_rank) pairs form a single total-ordered chain either way:
+    (0,0) < (1,0) < (1,1) < (1,2) < (1,3)."""
     name = str(job.get("original_filename") or "").lower()
 
     res = str(job.get("resolution") or "").lower()
@@ -57,12 +66,24 @@ def _quality_score(job: dict) -> tuple:
             res = "2160p"
     res_rank = {"2160p": 4, "1080p": 3, "720p": 2, "480p": 1}.get(res, 0)
 
+    # Explicit probed DV layer (from probe_specs) outranks the binary filename DV
+    # bit; absent → 0 so pure-filename callers are unchanged.
+    _DV_LAYER_RANK = {"fel": 3, "mel": 2, "profile8": 1, "profile5": 1}
+    dv_layer_rank = _DV_LAYER_RANK.get(str(job.get("dv_layer") or "").lower(), 0)
+
     # Dolby Vision is the headline upgrade (esp. for this user). Match DoVi /
     # "dolby vision" / a standalone DV tag — but NOT the camera/rip formats
     # "DV.Cam" / "dv-rip" (the dot/dash is a word boundary, so a naive \bdv\b
     # matches those false positives).
     dv = 1 if _re.search(_DV_RE, name) else 0
-    hdr = 1 if _re.search(r"\bhdr(10)?(\+|plus)?\b|\bhlg\b", name) else 0
+    # An explicit DV layer also implies the binary DV bit for filename-only rivals.
+    if dv_layer_rank:
+        dv = 1
+    explicit_hdr = job.get("hdr")
+    if explicit_hdr:
+        hdr = 0 if explicit_hdr in (None,) else 1
+    else:
+        hdr = 1 if _re.search(r"\bhdr(10)?(\+|plus)?\b|\bhlg\b", name) else 0
 
     if _re.search(r"\bremux\b", name):
         source = 4
@@ -86,7 +107,7 @@ def _quality_score(job: dict) -> tuple:
 
     edition = 1 if _re.search(r"\b(imax|extended|uncut|remastered|criterion)\b", name) else 0
 
-    return (res_rank, dv, hdr, source, audio, edition)
+    return (res_rank, dv, dv_layer_rank, hdr, source, audio, edition)
 
 
 def _quality_reason(job: dict) -> str:
@@ -97,9 +118,11 @@ def _quality_reason(job: dict) -> str:
         bits.append(job["resolution"])
     elif "2160p" in name or "4k" in name or "uhd" in name:
         bits.append("2160p")
-    if _re.search(_DV_RE, name):
+    if job.get("dv_layer") or _re.search(_DV_RE, name):
         bits.append("Dolby Vision")
-    if _re.search(r"\bhdr(10)?(\+|plus)?\b", name):
+    elif job.get("hdr"):
+        bits.append(job["hdr"])
+    elif _re.search(r"\bhdr(10)?(\+|plus)?\b", name):
         bits.append("HDR")
     if _re.search(r"\bremux\b", name):
         bits.append("Remux")
@@ -179,3 +202,18 @@ def conflict_annotations(jobs) -> dict:
                 ann["keep_recommended"] = True
                 ann["keep_reason"] = _quality_reason(j) or None
     return out
+
+
+def rank_conflict(existing: Optional[dict], incoming: dict) -> dict:
+    """Recommend which of an existing on-disk file vs an incoming release to keep,
+    judging on explicit probed spec fields when present (so a tag-stripped library
+    file isn't unfairly beaten by a tag-rich lower-quality release). Returns
+    {recommended: 'existing'|'incoming'|'tie'|None, reason: str|None}."""
+    if not existing or existing.get("present") is False:
+        return {"recommended": "incoming", "reason": _quality_reason(incoming) or None}
+    se, si = _quality_score(existing), _quality_score(incoming)
+    if si > se:
+        return {"recommended": "incoming", "reason": _quality_reason(incoming) or None}
+    if se > si:
+        return {"recommended": "existing", "reason": _quality_reason(existing) or None}
+    return {"recommended": "tie", "reason": None}
