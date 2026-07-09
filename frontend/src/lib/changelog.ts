@@ -7,6 +7,49 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.20.0",
+    date: "2026-07-09",
+    summary: "Rename progress bars + crash-safe, corruption-verified moves",
+    changes: [
+      "Applying files now shows progress: a per-item bar with live GB/percent for a real cross-drive copy (instant same-drive moves just flash), plus an overall 'Applying X of N' bar for a whole batch",
+      "Moves are now crash- and power-loss-safe: the file is streamed to a temp sidecar, flushed to disk, verified, then swapped into place in one atomic step — a crash never leaves a half-written file at the destination, and your original is always kept until the copy is confirmed good",
+      "End-to-end corruption check: every cross-drive copy is checksum-verified by reading the bytes back from the physical disk (not memory), so a bad write or transfer error is caught and rejected instead of silently replacing your file",
+      "If the app or PC dies mid-move, any job left half-applied is automatically recovered on restart so you can just re-apply it",
+    ],
+  },
+  {
+    version: "2.19.0",
+    date: "2026-07-09",
+    summary: "Instant 4K renames",
+    changes: [
+      "4K movie downloads can now land directly on the same drive as your 4K library (new '4K Movies Download Folder' setting), so the post-download rename is an instant move instead of a slow cross-drive copy — a 50GB remux goes from ~18 minutes to a fraction of a second",
+      "Measured the difference: a cross-drive copy through the container runs ~4.7x slower than a native Windows transfer; keeping the file on one drive avoids the copy entirely",
+      "Fixed a settings bug where saving your path mappings silently failed",
+    ],
+  },
+  {
+    version: "2.18.0",
+    date: "2026-07-09",
+    summary: "Self-healing scraper + far quieter logs",
+    changes: [
+      "The link scraper now recovers on its own when the browser hits a transient network error (it was previously misreporting these as a Cloudflare wall and giving up until a restart)",
+      "A Cloudflare-blocked source no longer floods the log with hundreds of identical warnings — it backs off and reports once",
+      "Silenced harmless headless-server noise (desktop-notification errors) and self-healed a Plex URL that was missing its http:// prefix",
+    ],
+  },
+  {
+    version: "2.17.0",
+    date: "2026-07-08",
+    summary: "Smarter downloads, reliable applies, and rename fixes",
+    changes: [
+      "Duplicate protection: grabbing a title you already have at the same-or-lower quality is now skipped automatically (only a genuine upgrade — higher resolution or added Dolby Vision — goes through), so you stop re-downloading the same movie",
+      "Skipped and downloaded titles stay hidden when you reopen the app, and no longer resurface — unless a better version appears",
+      "Applying renames no longer times out on big files: applies run in the background with an 'Applying…' status and land live, so moving a large 4K file can't fail the request anymore",
+      "Fixed a matcher bug where underscore-named files (e.g. 'The_Threesome_2025') lost their last title word and matched the wrong movie; re-identifying now gets them right",
+      "Posters now show for older items in the Renames list, and the list scrolls properly again",
+    ],
+  },
+  {
     version: "2.16.0",
     date: "2026-07-07",
     summary: "Title-level skip (dismiss a title, not just one release)",

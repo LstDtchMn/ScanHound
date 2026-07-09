@@ -40,9 +40,25 @@ _TRASH_ROOT = os.path.join(_DATA_DIR, "trash")
 _COPY_CHUNK = 8 * 1024 * 1024
 
 
-def _hash_file(path: str) -> str:
+def _hash_file(path: str, *, cold: bool = False) -> str:
+    """blake2b digest of a file's bytes.
+
+    ``cold=True`` drops the file's page cache first (fsync + POSIX_FADV_DONTNEED)
+    so the hash reads from the physical device instead of the write-back cache.
+    This is what makes the post-copy verify catch a *latent bad disk write* — a
+    plain read-back right after writing would be served the still-correct bytes
+    from RAM and miss on-disk corruption. No-op on platforms without
+    posix_fadvise (e.g. the Windows desktop build), where it degrades to a
+    normal cached hash."""
     h = hashlib.blake2b()
     with open(path, "rb") as f:
+        if cold:
+            try:
+                os.fsync(f.fileno())
+                if hasattr(os, "posix_fadvise"):
+                    os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except OSError:
+                pass
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
@@ -86,8 +102,11 @@ def _copy_verify_atomic(src: str, dst: str,
             fo.flush()
             os.fsync(fo.fileno())
         shutil.copystat(src, part)
-        if src_h.hexdigest() != _hash_file(part):
-            raise OSError("Copy verification failed (hash mismatch)")
+        # Verify from the PHYSICAL disk (cold read), not the write cache, so a
+        # latent bad write can't slip through and become the destination.
+        if src_h.hexdigest() != _hash_file(part, cold=True):
+            raise OSError("Copy verification failed (hash mismatch — "
+                          "possible disk/transfer corruption; source kept)")
         os.replace(part, dst)  # atomic on the destination volume
     except BaseException:
         # Never leave a stray .part behind on failure (it would be reused on the

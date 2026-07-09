@@ -109,6 +109,20 @@ class TestFileOps:
         assert seen[-1][0] == seen[-1][1] == src.stat().st_size  # ends at 100%
         assert all(t == src.stat().st_size for _, t in seen)     # total is stable
 
+    def test_corrupted_copy_is_rejected_source_kept(self, tmp_path, monkeypatch):
+        # Simulate the destination bytes being corrupt on disk: the cold-read
+        # verify hash won't match the source, so the copy is rejected, the real
+        # destination is never created, and the source is preserved.
+        src = tmp_path / "src.mkv"; src.write_bytes(b"good" * 4096)
+        dst = tmp_path / "lib" / "out.mkv"
+        monkeypatch.setattr(fileops, "_hash_file",
+                            lambda p, **kw: "deadbeef")  # verify read returns garbage
+        with pytest.raises(OSError, match="verification failed"):
+            fileops.place_file(str(src), str(dst), "copy")
+        assert not dst.exists()
+        assert not (tmp_path / "lib" / "out.mkv.part").exists()
+        assert src.read_bytes() == b"good" * 4096
+
     def test_crash_before_atomic_rename_leaves_no_partial_dst(self, tmp_path, monkeypatch):
         # Simulate a crash at the worst moment: bytes written to .part, but the
         # process dies just before the atomic rename. The real destination must
