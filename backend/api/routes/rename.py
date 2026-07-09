@@ -184,12 +184,15 @@ def _service(reg: ServiceRegistry):
 @router.post("/jobs/apply-confident")
 def apply_confident(body: ApplyConfidentRequest,
                     reg: ServiceRegistry = Depends(get_registry)):
-    return _service(reg).apply_confident(body.ids)
+    # Queued: applying moves files (cross-device copies can take minutes) —
+    # never inside the HTTP request. Progress arrives per-job over the WS.
+    return _service(reg).queue_apply(body.ids, confident_only=True)
 
 
 @router.post("/jobs/bulk/apply")
 def bulk_apply(body: BulkIdsRequest, reg: ServiceRegistry = Depends(get_registry)):
-    return _service(reg).bulk_apply(body.ids)
+    # Queued (see apply-confident): returns {queued, skipped} immediately.
+    return _service(reg).queue_apply(body.ids)
 
 
 @router.post("/jobs/bulk/reidentify")
@@ -219,9 +222,15 @@ def bulk_set_destination(body: BulkSetDestRequest,
 
 @router.post("/jobs/{job_id}/apply")
 def apply_job(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
-    out = _service(reg).apply(job_id)
+    # Queued (see apply-confident): the actual move runs on a worker thread and
+    # reports back over the WS, so a slow cross-device copy can't time out the
+    # request. queued=0 means the job wasn't eligible (already applied/applying).
+    out = _service(reg).queue_apply([job_id])
     if not out.get("ok"):
         raise HTTPException(status_code=400, detail=out.get("error", "Apply failed"))
+    if not out.get("queued"):
+        raise HTTPException(status_code=400,
+                            detail="Job is not applicable (already applied or in progress)")
     return out
 
 

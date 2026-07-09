@@ -94,7 +94,7 @@ def download_item(
                     "type": "notification",
                     "data": {"title": "Download Failed", "body": message, "priority": "high"},
                 })
-            elif method == "duplicate":
+            elif method in ("duplicate", "duplicate_similar"):
                 ws_manager.broadcast_sync({
                     "type": "notification",
                     "data": {"title": "Already grabbed", "body": message, "priority": "normal"},
@@ -163,7 +163,7 @@ def download_batch(
                 method = (res or {}).get("method")
                 if not (res or {}).get("success"):
                     failed += 1
-                elif method == "duplicate":
+                elif method in ("duplicate", "duplicate_similar"):
                     skipped += 1
                 elif method == "jdownloader":
                     delivered += 1

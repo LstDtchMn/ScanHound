@@ -495,6 +495,10 @@ class DatabaseManager:
                     'ALTER TABLE downloads ADD COLUMN hdr TEXT',
                     'ALTER TABLE downloads ADD COLUMN dovi INTEGER DEFAULT 0',
                     'ALTER TABLE rename_jobs ADD COLUMN poster_path TEXT',
+                    # Year makes the grab key year-aware (normalized|year|season)
+                    # for send-time duplicate protection + the read-time overlay,
+                    # so a 2021 remake never blocks/marks the 1984 original.
+                    'ALTER TABLE downloads ADD COLUMN year INTEGER',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -850,14 +854,14 @@ class DatabaseManager:
 
     def add_to_history(self, url, title, normalized_title=None, season=None,
                        resolution=None, size=None, status="completed",
-                       hdr=None, dovi=False):
+                       hdr=None, dovi=False, year=None):
         """Record a downloaded URL with optional metadata for title-based matching.
 
         Uses ON CONFLICT to preserve the original date_added when re-downloading.
         """
         return self._mutate('''
-            INSERT INTO downloads (url, title, normalized_title, season, resolution, size, status, hdr, dovi)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO downloads (url, title, normalized_title, season, resolution, size, status, hdr, dovi, year)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 normalized_title = excluded.normalized_title,
@@ -866,10 +870,24 @@ class DatabaseManager:
                 size = excluded.size,
                 status = excluded.status,
                 hdr = excluded.hdr,
-                dovi = excluded.dovi
+                dovi = excluded.dovi,
+                year = COALESCE(excluded.year, downloads.year)
         ''', (url, title, normalized_title, season, resolution, size, status,
-              hdr or None, 1 if dovi else 0),
+              hdr or None, 1 if dovi else 0, year),
             label="add_history")
+
+    def get_downloaded_title_quality(self):
+        """Per non-failed grab: (normalized_title, year, season, resolution, dovi).
+
+        Powers send-time duplicate protection and the read-time overlay's
+        title-keyed sibling matching — both need to know what quality of a
+        title was already grabbed, independent of whether the grabbed URL is
+        still in the background cache."""
+        return self._query(
+            "SELECT normalized_title, year, season, resolution, dovi FROM downloads "
+            "WHERE COALESCE(status, 'completed') != 'failed' "
+            "AND normalized_title IS NOT NULL AND normalized_title != ''",
+            default=[])
 
     def get_downloaded_titles(self):
         """Get all downloaded items with their normalized titles and seasons."""

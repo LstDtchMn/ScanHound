@@ -357,3 +357,35 @@ class TestMinorParsingFixes:
         assert p["imdb_id"] == "tt0446029"
         assert "tt0446029" not in p["title"]
         assert p["title"] == "Scott Pilgrim"
+
+
+# ── Trailing-group strip must not eat the last title word ───────────
+# A scene group only sits at the END of the full stem, after year/res/SxxEyy.
+# Once the title was truncated at one of those tokens, the group is already
+# gone — stripping anyway deleted the last word of underscore-delimited names
+# ("The_Threesome" → "The" → matched the wrong movie) and maimed hyphenated
+# titles ("Spider-Man" → "Spider").
+
+class TestTrailingGroupStrip:
+    def test_underscore_title_keeps_last_word(self):
+        p = parse_filename("The_Threesome_2025_2160p_AMZN_WEB-DL_H.265_DTS-HD_MA_5.1.mkv")
+        assert p["title"] == "The Threesome"
+        assert p["year"] == 2025
+
+    def test_underscore_multiword_title_intact(self):
+        assert parse_filename("The_Da_Vinci_Code_2006.mkv")["title"] == "The Da Vinci Code"
+        assert parse_filename("Murder_at_1600_1997_1080p.mkv")["title"] == "Murder at 1600"
+
+    def test_hyphenated_title_survives(self):
+        assert parse_filename("Spider-Man.2002.1080p.BluRay.x264-GROUP.mkv")["title"] == "Spider Man"
+        assert parse_filename("Kick-Ass.2010.720p.mkv")["title"] == "Kick Ass"
+
+    def test_group_still_stripped_when_no_structural_tokens(self):
+        # No year/resolution → title_part is the whole stem → the trailing
+        # -GROUP is really a group and must still be removed.
+        assert parse_filename("Movie.Title-SPARKS.mkv")["title"] == "Movie Title"
+
+    def test_tv_underscore_title_intact(self):
+        p = parse_filename("Some_Show_S01E03_1080p_WEB-DL.mkv")
+        assert p["title"] == "Some Show"
+        assert p["season"] == 1 and p["episode"] == 3

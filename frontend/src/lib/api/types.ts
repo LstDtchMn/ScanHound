@@ -521,9 +521,15 @@ export interface BulkApplyResult {
   error: string | null;
 }
 export interface BulkApplyResponse {
-  results: BulkApplyResult[];
-  applied: number;
-  failed: number;
+  // Applies are queued to a background worker (cross-device moves can take
+  // minutes); per-job outcomes arrive over the rename:job WS event.
+  ok?: boolean;
+  queued?: number;
+  skipped?: number;
+  // Legacy synchronous fields (older servers):
+  results?: BulkApplyResult[];
+  applied?: number;
+  failed?: number;
 }
 
 export interface BulkReidentifyResponse {
@@ -547,10 +553,13 @@ export interface BulkSetDestResponse {
 }
 
 export interface ApplyConfidentResponse {
-  results: BulkApplyResult[];
-  applied: number;
-  skipped: number;
-  failed: number;
+  ok?: boolean;
+  queued?: number;
+  skipped?: number;
+  // Legacy synchronous fields (older servers):
+  results?: BulkApplyResult[];
+  applied?: number;
+  failed?: number;
 }
 
 export interface RematchPreviewResponse {

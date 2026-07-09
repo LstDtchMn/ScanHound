@@ -181,6 +181,7 @@ def _client_with_cache(rows, version=None):
     registry.db.get_dismissed_urls.return_value = set()
     registry.db.get_dismissed_title_quality.return_value = []
     registry.db.get_downloaded_urls.return_value = set()
+    registry.db.get_downloaded_title_quality.return_value = []
     registry.db.get_downloaded_titles.return_value = []
     # A real (count, max_last_seen_at)-shaped version by default so the B2
     # parse-cache in results.py behaves like it would against a real
@@ -246,6 +247,46 @@ def test_sibling_match_is_year_aware_no_remake_contamination():
     by_url = {i["url"]: i for i in data["items"]}
     assert by_url["d/2021"]["status"] == "downloaded"
     assert by_url["d/1984"]["status"] == "missing"   # different film, untouched
+
+
+def test_downloaded_overlay_survives_cache_rotation():
+    # The grabbed URL has ROLLED OUT of the background cache (early-stop keeps
+    # only recent pages). The downloads table still knows the title+year+season
+    # and quality — siblings must stay reclassified, not resurface as missing.
+    rows = [
+        _row("Dune", url="d/4k", resolution="4K", group_key="dune|2021|S0"),
+        _row("Dune", url="d/720", resolution="720p", group_key="dune|2021|S0"),
+    ]
+    c = _client_with_cache(rows)
+    registry.db.get_downloaded_urls.return_value = set()      # URL gone from cache
+    registry.db.get_downloaded_title_quality.return_value = [
+        ("dune", 2021, None, "1080p", 0),                      # the recorded grab
+    ]
+    data = c.get("/results/cached", params={"per_page": 100}).json()
+    by_url = {i["url"]: i for i in data["items"]}
+    assert by_url["d/720"]["status"] == "downloaded_similar"   # lower → have a copy
+    assert by_url["d/4k"]["status"] == "missing"               # better → still grabbable
+    assert by_url["d/4k"]["prior_grab"]["resolution"] == "1080p"
+
+
+def test_dismiss_without_meta_backfills_from_cache():
+    # An old app bundle sends urls+titles but no meta. The server must fill
+    # group_key/resolution/dovi from its own cached item so title-level skip
+    # still works.
+    rows = [_row("Heat", url="h/1080", resolution="1080p",
+                 group_key="heat|1995|S0", dovi=False)]
+    c = _client_with_cache(rows)
+    captured = {}
+    def _capture(rows_iter):
+        captured["rows"] = list(rows_iter)
+        return True
+    registry.db.add_dismissed_items.side_effect = _capture
+    r = c.post("/results/dismiss",
+               json={"urls": ["h/1080"], "titles": {"h/1080": "Heat"},
+                     "dismissed": True})
+    assert r.status_code == 200
+    (url, title, gk, res, dovi), = captured["rows"]
+    assert url == "h/1080" and gk == "heat|1995|S0" and res == "1080p"
 
 
 def test_skipped_title_hides_same_or_lower_keeps_upgrade():

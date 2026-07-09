@@ -85,7 +85,7 @@
 
   async function handleDownload(
     url: string, title: string, year?: number | null,
-    meta?: { resolution?: string; size?: string; hdr?: string; dovi?: boolean }
+    meta?: { resolution?: string; size?: string; hdr?: string; dovi?: boolean; season?: number | null }
   ) {
     const id = downloadQueue.add(title);
     try {
@@ -93,7 +93,7 @@
       // resolution / HDR / DV instead of blanks.
       await api.download(url, title, $downloadHost, year,
                          meta?.resolution || '', meta?.size || '',
-                         meta?.hdr || '', meta?.dovi ?? false);
+                         meta?.hdr || '', meta?.dovi ?? false, meta?.season);
       downloadQueue.markSent(id);
       addToast('Download', `Sent: ${title} (${$downloadHost})`);
     } catch (e) {

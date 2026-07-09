@@ -1316,6 +1316,116 @@ class RenameService:
         return {"new_filename": fname, "destination_path": dest,
                 "library_configured": lib_set, "warning": warning}
 
+    def backfill_posters(self, limit: int = 200) -> dict:
+        """Fill poster_path on jobs that predate poster capture (2026-07-04).
+
+        Cheap + idempotent: only touches jobs with an empty poster_path. Jobs
+        with a tmdb_id use a direct details() lookup; the rest do one search by
+        title+year and take the top hit's poster (display-only — the match
+        itself is never altered). Safe to run repeatedly (maintenance loop).
+        """
+        db = self._db
+        client = self._tmdb_client()
+        if db is None or client is None:
+            return {"filled": 0, "checked": 0}
+        jobs = [j for j in (db.list_rename_jobs(limit=100000) or [])
+                if not j.get("poster_path") and (j.get("title") or "").strip()]
+        filled = 0
+        for job in jobs[:limit]:
+            mtype = job.get("media_type") or "movie"
+            poster = None
+            try:
+                if job.get("tmdb_id"):
+                    details = client.details(int(job["tmdb_id"]), media_type=mtype)
+                    poster = (details or {}).get("poster_path")
+                else:
+                    hits = client.search(job["title"], media_type=mtype,
+                                         year=job.get("year")) or []
+                    poster = (hits[0] or {}).get("poster_path") if hits else None
+            except Exception:
+                continue  # network blip — the next pass retries
+            if poster:
+                try:
+                    db.update_rename_job(job["id"], poster_path=poster)
+                    filled += 1
+                except Exception:
+                    logger.debug("poster backfill: DB write failed for job %s",
+                                 job.get("id"))
+        if filled:
+            rlog.info("poster | backfilled %d poster(s)", filled)
+        return {"filled": filled, "checked": len(jobs[:limit])}
+
+    def queue_apply(self, ids: Optional[list] = None,
+                    confident_only: bool = False) -> dict:
+        """Queue applies to run on a background thread and return immediately.
+
+        Applying moves/copies the file. Cross-device placements (hardlink
+        EXDEV → full byte copy through the Docker bind mounts) can take many
+        minutes for a remux — far beyond any HTTP/proxy timeout — so the
+        request must never wait for them. Each job is flipped to a transient
+        'applying' status up front (broadcast, so every client shows progress
+        instantly) and lands on applied/failed/needs_review via the per-job
+        broadcast in apply().
+
+        With ``confident_only``, only matched jobs at confidence >= 95 are
+        eligible (the server-enforced 'Apply all confident' gate).
+        """
+        db = self._db
+        if db is None:
+            return {"ok": False, "queued": 0, "skipped": 0,
+                    "error": "Database unavailable"}
+        if ids is not None:
+            jobs = [db.get_rename_job(int(j)) for j in ids or []]
+            jobs = [j for j in jobs if j]
+        else:
+            jobs = db.list_rename_jobs(limit=100000) or []
+
+        eligible, skipped = [], 0
+        for job in jobs:
+            status = job.get("status")
+            conf = job.get("match_confidence") or 0.0
+            if status in ("applied", "applying"):
+                skipped += 1
+                continue
+            if confident_only and (status != "matched" or conf < 95):
+                skipped += 1
+                continue
+            if not confident_only and status not in ("matched", "needs_review"):
+                skipped += 1
+                continue
+            eligible.append(int(job["id"]))
+
+        if not eligible:
+            return {"ok": True, "queued": 0, "skipped": skipped}
+
+        for jid in eligible:
+            try:
+                db.update_rename_job(jid, status="applying")
+                self._broadcast(jid)
+            except Exception:
+                logger.exception("queue_apply: could not mark job %s applying", jid)
+
+        def _worker(job_ids: list) -> None:
+            # Serialize with other bulk operations; blocking here is fine —
+            # we're on a daemon thread, not an HTTP request.
+            with self._bulk_lock:
+                for jid in job_ids:
+                    try:
+                        self.apply(jid)
+                    except Exception:
+                        logger.exception("queued apply failed for job %s", jid)
+                        try:
+                            db.update_rename_job(
+                                jid, status="failed",
+                                error_message="apply crashed — see server log")
+                            self._broadcast(jid)
+                        except Exception:
+                            pass
+
+        threading.Thread(target=_worker, args=(eligible,), daemon=True,
+                         name="rename-apply").start()
+        return {"ok": True, "queued": len(eligible), "skipped": skipped}
+
     def bulk_apply(self, ids: list) -> dict:
         if not self._bulk_lock.acquire(blocking=False):
             return {"results": [], "applied": 0, "failed": 0, "busy": True}

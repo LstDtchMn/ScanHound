@@ -170,17 +170,17 @@ export const api = {
 
   // Downloads
   download: (url: string, title: string, serviceType = 'Rapidgator', year?: number | null,
-             resolution = '', size = '', hdr = '', dovi = false) =>
+             resolution = '', size = '', hdr = '', dovi = false, season?: number | null) =>
     request('/download', {
       method: 'POST',
       body: JSON.stringify({ url, title, service_type: serviceType, year: year ?? null,
-                             resolution, size, hdr, dovi })
+                             resolution, size, hdr, dovi, season: season ?? null })
     }),
-  downloadBatch: (items: { url: string; title: string; year?: number | null; resolution?: string; size?: string; hdr?: string; dovi?: boolean }[], serviceType = 'Rapidgator') =>
+  downloadBatch: (items: { url: string; title: string; year?: number | null; season?: number | null; resolution?: string; size?: string; hdr?: string; dovi?: boolean }[], serviceType = 'Rapidgator') =>
     request('/download/batch', {
       method: 'POST',
       body: JSON.stringify({ items: items.map(i => ({
-        url: i.url, title: i.title, year: i.year ?? null,
+        url: i.url, title: i.title, year: i.year ?? null, season: i.season ?? null,
         resolution: i.resolution ?? '', size: i.size ?? '', hdr: i.hdr ?? '', dovi: i.dovi ?? false,
         service_type: serviceType,
       })) })

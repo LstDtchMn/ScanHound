@@ -52,7 +52,8 @@
   function grab() {
     if (!item.url) return;
     api.download(item.url, item.title, $downloadHost, item.year,
-                 item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false)
+                 item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false,
+                 item.season)
       .then(() => {
         // "started" only — the download:complete (method=jdownloader) WS event
         // marks it grabbed once it truly reaches JDownloader; a failed send

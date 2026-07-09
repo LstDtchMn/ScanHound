@@ -84,21 +84,48 @@ def _overlay_download_state(items, db):
         downloaded = db.get_downloaded_urls()
     except Exception:
         downloaded = set()
-    if not downloaded:
-        return items
 
-    # Best grabbed version per group_key, from the grabbed items present here.
+    # Best grabbed version per group_key. Two sources, merged:
+    #   1. Title-keyed rows straight from the downloads table (normalized|year|
+    #      Sseason — the scanner's group_key recipe). These survive the grabbed
+    #      URL rolling out of the background cache, which used to silently
+    #      un-mark a whole title ("downloaded items come up again").
+    #   2. URL-anchored grabbed items still present here (covers legacy rows
+    #      recorded before the year column existed).
     grabbed: Dict[str, Dict[str, Any]] = {}
+
+    def _better(rank, dv, cur):
+        return cur is None or rank > cur["rank"] or (rank == cur["rank"] and dv and not cur["dovi"])
+
+    try:
+        rows = db.get_downloaded_title_quality()
+    except Exception:
+        rows = []
+    for row in rows if isinstance(rows, list) else []:
+        try:
+            nt, yr, se, res, dv = row[0], row[1], row[2], row[3], row[4]
+        except Exception:
+            continue
+        if not nt or yr is None:
+            continue  # legacy row (no year) — the URL-anchored pass covers it
+        gk = f"{nt}|{yr or 0}|S{se or 0}"
+        rank, dovi = _res_rank(res), bool(dv)
+        if _better(rank, dovi, grabbed.get(gk)):
+            grabbed[gk] = {"rank": rank, "dovi": dovi,
+                           "resolution": res or "", "size": ""}
+
     for i in items:
         if i.get("url") in downloaded:
             gk = i.get("group_key")
             if not gk:
                 continue
             rank, dv = _res_rank(i.get("resolution")), bool(i.get("dovi"))
-            cur = grabbed.get(gk)
-            if cur is None or rank > cur["rank"] or (rank == cur["rank"] and dv and not cur["dovi"]):
+            if _better(rank, dv, grabbed.get(gk)):
                 grabbed[gk] = {"rank": rank, "dovi": dv,
                                "resolution": i.get("resolution") or "", "size": i.get("size") or ""}
+
+    if not downloaded and not grabbed:
+        return items
 
     out = []
     for i in items:
@@ -720,6 +747,28 @@ def dismiss_items(req: DismissRequest, reg: ServiceRegistry = Depends(get_regist
     titles = req.titles or {}
     meta = req.meta or {}
     if req.dismissed:
+        # Server-side meta backfill: an older app bundle (or any client that
+        # doesn't send per-url meta) would otherwise record a URL-only
+        # dismissal, and the title-level skip — "don't resurface a same-or-
+        # lower re-upload" — silently wouldn't apply. The server already knows
+        # every URL's group_key/resolution/dovi from the cached results, so
+        # fill the gaps here instead of trusting the client to.
+        missing = [u for u in req.urls
+                   if u and not (meta.get(u) or {}).get("group_key")]
+        if missing:
+            try:
+                cached_items, _ = _load_cached_items(reg)
+                by_url = {i.get("url"): i for i in cached_items}
+            except Exception:
+                by_url = {}
+            for u in missing:
+                item = by_url.get(u)
+                if item:
+                    meta[u] = {"group_key": item.get("group_key"),
+                               "resolution": item.get("resolution"),
+                               "dovi": bool(item.get("dovi"))}
+                    titles.setdefault(u, item.get("title"))
+
         def _rows():
             for url in req.urls:
                 if not url:

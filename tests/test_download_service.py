@@ -58,11 +58,79 @@ class TestDownloadDedup:
         db = MagicMock()
         svc = _make_service(config={"jd_enabled": True, "jd_method": "folder"}, db=db)
         db.is_downloaded.return_value = False  # only a failed row existed → retryable
+        db.get_downloaded_title_quality.return_value = []
         svc.scrape_links = MagicMock(return_value=[])  # no links → not a duplicate short-circuit
         svc._is_supported_download_link = MagicMock(return_value=False)
         res = svc.download_item("u/retry", "Dune", None, "1080p", "20 GB")
         assert res["method"] != "duplicate"   # proceeded past the dedup guard
         svc.scrape_links.assert_called_once()
+
+    # ── Title-level dedup: a DIFFERENT URL of an already-grabbed title ──
+
+    @staticmethod
+    def _svc_with_prior(prior_rows):
+        from backend.app_service import normalize_title  # noqa: F401 (doc)
+        db = MagicMock()
+        db.is_downloaded.return_value = False
+        db.get_downloaded_title_quality.return_value = prior_rows
+        svc = _make_service(config={"jd_enabled": True, "jd_method": "folder"}, db=db)
+        svc.scrape_links = MagicMock(return_value=[])
+        svc._is_supported_download_link = MagicMock(return_value=False)
+        return svc
+
+    def test_same_title_same_quality_different_url_is_skipped(self):
+        # The production duplicate: two 4K releases of the same movie, grabbed
+        # via different URLs. The second must be recognized as a duplicate.
+        from backend.app_service import normalize_title
+        svc = self._svc_with_prior([(normalize_title("Michael"), 2026, None, "4K", 0)])
+        svc.scrape_links = MagicMock(side_effect=AssertionError("must not scrape a title dup"))
+        res = svc.download_item("u/other-release", "Michael", None, "4K", "80 GB", year=2026)
+        assert res["success"] is True
+        assert res["method"] == "duplicate_similar"
+        svc.scrape_links.assert_not_called()
+
+    def test_lower_resolution_is_also_skipped(self):
+        from backend.app_service import normalize_title
+        svc = self._svc_with_prior([(normalize_title("Michael"), 2026, None, "4K", 0)])
+        res = svc.download_item("u/1080", "Michael", None, "1080p", "30 GB", year=2026)
+        assert res["method"] == "duplicate_similar"
+
+    def test_higher_resolution_passes_as_upgrade(self):
+        from backend.app_service import normalize_title
+        svc = self._svc_with_prior([(normalize_title("Avatar"), 2025, None, "1080p", 0)])
+        res = svc.download_item("u/4k", "Avatar", None, "4K", "70 GB", year=2025)
+        assert res["method"] != "duplicate_similar"   # proceeded (upgrade)
+        svc.scrape_links.assert_called_once()
+
+    def test_dv_gain_at_same_resolution_passes(self):
+        from backend.app_service import normalize_title
+        svc = self._svc_with_prior([(normalize_title("Sicario"), 2015, None, "4K", 0)])
+        res = svc.download_item("u/dv", "Sicario", None, "4K", "60 GB", year=2015, dovi=True)
+        assert res["method"] != "duplicate_similar"
+        svc.scrape_links.assert_called_once()
+
+    def test_different_season_is_never_blocked(self):
+        # S01 grabbed must not block S02 (season matches strictly).
+        from backend.app_service import normalize_title
+        svc = self._svc_with_prior([(normalize_title("Equal Justice"), 2026, 1, "1080p", 0)])
+        res = svc.download_item("u/s02", "Equal Justice", 2, "1080p", "50 GB", year=2026)
+        assert res["method"] != "duplicate_similar"
+        svc.scrape_links.assert_called_once()
+
+    def test_different_year_is_never_blocked(self):
+        # Dune (2021) grabbed must not block Dune (1984).
+        from backend.app_service import normalize_title
+        svc = self._svc_with_prior([(normalize_title("Dune"), 2021, None, "4K", 0)])
+        res = svc.download_item("u/1984", "Dune", None, "4K", "60 GB", year=1984)
+        assert res["method"] != "duplicate_similar"
+        svc.scrape_links.assert_called_once()
+
+    def test_legacy_row_without_year_still_blocks(self):
+        # Rows recorded before the year column match on title+season alone.
+        from backend.app_service import normalize_title
+        svc = self._svc_with_prior([(normalize_title("Notting Hill"), None, None, "4K", 0)])
+        res = svc.download_item("u/remux", "Notting Hill", None, "4K", "80 GB", year=1999)
+        assert res["method"] == "duplicate_similar"
 
 
 @dataclass
@@ -211,7 +279,7 @@ class TestSaveToHistory:
             url="http://a.com", title="Test Movie",
             normalized_title="test movie", season=None,
             resolution="4K", size="50 GB", status="completed",
-            hdr=None, dovi=False,
+            hdr=None, dovi=False, year=None,
         )
         assert "http://a.com" in svc.download_history
         assert "test movie" in svc._downloaded_titles_lookup
@@ -628,6 +696,9 @@ class TestScrapeDDLBaseLinks:
         mock_driver = MagicMock()
         svc.cached_driver = mock_driver
         mock_driver.title = "ok"
+        # Real Selenium returns a list; [] = "not the browser's error page"
+        # (see _browser_error_code), so _navigate proceeds normally.
+        mock_driver.find_elements.return_value = []
 
         mock_driver.page_source = """
         <html><body>
@@ -664,6 +735,7 @@ class TestScrapeDDLBaseLinks:
         mock_driver = MagicMock()
         svc.cached_driver = mock_driver
         mock_driver.title = "ok"
+        mock_driver.find_elements.return_value = []  # not a browser error page
 
         mock_driver.page_source = """
         <html><body>

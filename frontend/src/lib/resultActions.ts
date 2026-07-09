@@ -8,7 +8,12 @@ import type { ScanResult } from './api/types';
 
 export function downloadResult(item: ScanResult, host: string): void {
   if (!item.url) return;
-  api.download(item.url, item.title, host, item.year).catch(() => addToast('Error', 'Download failed', 'error'));
+  // Full metadata so the central downloads row records resolution/season/DV —
+  // that row powers duplicate protection and the read-time overlay.
+  api.download(item.url, item.title, host, item.year,
+               item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false,
+               item.season)
+    .catch(() => addToast('Error', 'Download failed', 'error'));
 }
 
 export async function copyResultLinks(item: ScanResult, host: string): Promise<void> {

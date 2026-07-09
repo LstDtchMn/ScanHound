@@ -14,6 +14,8 @@ export const STATUS_VARIANTS: Record<string, BadgeVariant> = {
   downloaded_similar: 'orange',
   downloaded: 'accent',
   downloading: 'info',
+  // Rename jobs: transient state while a queued background file move runs.
+  applying: 'info',
 };
 
 /** Human-readable label for scan result status. */
@@ -26,6 +28,7 @@ const STATUS_LABELS: Record<string, string> = {
   downloaded_similar: 'Downloaded Similar',
   downloaded: 'Downloaded',
   downloading: 'Downloading',
+  applying: 'Applying…',
 };
 
 export function formatStatus(status: string | null | undefined): string {

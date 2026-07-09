@@ -78,14 +78,23 @@ EPISODE_BOUNDARY_RE = re.compile(
 )
 
 
-def _clean_title(raw: str) -> str:
+def _clean_title(raw: str, strip_trailing_group: bool = True) -> str:
     """Turn a raw title fragment into a clean search title: drop bracketed
-    content and a trailing release-group tag, normalize ._- to spaces, strip
-    known release tags, and collapse whitespace."""
+    content and (optionally) a trailing release-group tag, normalize ._- to
+    spaces, strip known release tags, and collapse whitespace.
+
+    ``strip_trailing_group`` must be False when ``raw`` was already truncated
+    at a structural token (year / resolution / SxxEyy): a scene group only
+    ever sits at the very END of the full stem, after those tokens, so it is
+    already gone from a truncated fragment — and stripping anyway deletes the
+    LAST TITLE WORD of underscore-delimited names ("The_Threesome" → "The")
+    and hyphenated titles ("Spider-Man" → "Spider").
+    """
     s = re.sub(r'\[.*?\]', '', raw or '')
     s = re.sub(r'\(.*?\)', '', s)
     s = re.sub(r'\{.*?\}', '', s)             # {imdb-tt…}, {edition-…} etc.
-    s = re.sub(r'[-_][A-Za-z0-9]+$', '', s)   # trailing -GROUP / _GROUP
+    if strip_trailing_group:
+        s = re.sub(r'[-_][A-Za-z0-9]+$', '', s)   # trailing -GROUP / _GROUP
     s = re.sub(r'[\.\-_]', ' ', s)
     s = re.sub(r'\btt\d{7,8}\b', ' ', s, flags=re.IGNORECASE)  # bare imdb id
     s = re.sub(r'\s+', ' ', s).strip()
@@ -144,12 +153,19 @@ def parse_filename(filename) -> FilenameResult:
     if imdb_match:
         result["imdb_id"] = imdb_match.group(1).lower()
 
+    # Whether title_part gets cut at a structural token (SxxEyy / resolution /
+    # year). When it does, the release group — which only ever follows those
+    # tokens — is already gone, so _clean_title must NOT strip a "trailing
+    # group" (it would eat the last title word instead).
+    truncated = False
+
     # 1. Season / episode
     se_match = re.search(r'[.\s\-_]S(\d{1,2})E(\d{1,3})', name, re.IGNORECASE)
     if se_match:
         result["season"] = int(se_match.group(1))
         result["episode"] = int(se_match.group(2))
         result["is_tv"] = True
+        truncated = True
         title_part = name[:se_match.start()]
         # Extract candidate episode title: text between SxxExx and quality marker
         after_ep = name[se_match.end():]
@@ -171,6 +187,7 @@ def parse_filename(filename) -> FilenameResult:
             result["season"] = int(alt.group(1))
             result["episode"] = int(alt.group(2))
             result["is_tv"] = True
+            truncated = True
             title_part = name[:alt.start()]
         else:
             title_part = name
@@ -183,6 +200,7 @@ def parse_filename(filename) -> FilenameResult:
         # Truncate title at resolution if it appears in title_part
         rpos = title_part.lower().find(res_match.group(1).lower())
         if rpos > 0:
+            truncated = True
             title_part = title_part[:rpos]
 
     # 3. Year — delimiter classes include '_' so underscore-delimited scene
@@ -195,6 +213,7 @@ def parse_filename(filename) -> FilenameResult:
         result["year"] = int(year_match.group(1))
         ypos = title_part.find(year_match.group(0))
         if ypos > 0:
+            truncated = True
             title_part = title_part[:ypos]
 
     # 3b. a.k.a. / alternate title — split so each side can be searched on its
@@ -204,12 +223,12 @@ def parse_filename(filename) -> FilenameResult:
                          flags=re.IGNORECASE)
     if len(aka_split) == 2:
         title_part = aka_split[0]
-        aka_clean = _clean_title(aka_split[1])
+        aka_clean = _clean_title(aka_split[1], strip_trailing_group=not truncated)
         if aka_clean:
             result["aka"] = aka_clean
 
     # 4. Clean title
-    result["title"] = _clean_title(title_part)
+    result["title"] = _clean_title(title_part, strip_trailing_group=not truncated)
 
     # Part indicator: Part1, Part 2, Pt1, Pt.2, Part 10, … (1-2 digits so a
     # double-digit part isn't truncated to its leading digit and collided).

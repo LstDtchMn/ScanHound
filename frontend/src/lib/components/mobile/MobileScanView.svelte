@@ -82,7 +82,8 @@
   function grab(item: ScanResult) {
     if (!item.url) return;
     api.download(item.url, item.title, get(downloadHost), item.year,
-                 item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false)
+                 item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false,
+                 item.season)
       .then(() => {
         // The POST only returns "started"; the item is marked grabbed by the
         // download:complete (method=jdownloader) WS event once it actually

@@ -198,14 +198,15 @@ class DownloadService:
 
     def save_to_history(self, url: str, title: str, season: Optional[int],
                         resolution: str, size: str, status: str = "completed",
-                        hdr: str = "", dovi: bool = False):
+                        hdr: str = "", dovi: bool = False,
+                        year: Optional[int] = None):
         """Save a downloaded item to history."""
         try:
             normalized = normalize_title(title)
             self.db.add_to_history(
                 url=url, title=title, normalized_title=normalized,
                 season=season, resolution=resolution, size=size,
-                status=status, hdr=hdr or None, dovi=dovi,
+                status=status, hdr=hdr or None, dovi=dovi, year=year,
             )
             with self._history_lock:
                 self.download_history.add(url)
@@ -220,6 +221,58 @@ class DownloadService:
         except Exception as e:
             logger.error(f"Failed to save to history: {e}")
             return False
+
+    # Resolution ranking for the title-level dedup — mirrors the scanner's
+    # upgrade rule (_RES_RANK in api/routes/results.py; keep in sync).
+    _RES_RANK = {"2160p": 4, "4k": 4, "uhd": 4, "1080p": 3, "720p": 2, "480p": 1}
+
+    @classmethod
+    def _res_rank(cls, res) -> int:
+        return cls._RES_RANK.get((res or "").strip().lower(), 0)
+
+    def _best_prior_grab(self, title: str, year: Optional[int],
+                         season: Optional[int]) -> Optional[Dict[str, Any]]:
+        """The best-quality non-failed grab already recorded for this title.
+
+        Key: normalized title + year + season. A stored NULL year matches any
+        requested year (legacy rows predate the year column); season matches
+        strictly (None only matches None) so one season pack never blocks
+        another. Returns {'resolution', 'dovi'} or None.
+        """
+        if self.db is None or not title:
+            return None
+        try:
+            rows = self.db.get_downloaded_title_quality()
+        except Exception:
+            return None
+        if not isinstance(rows, list):
+            return None  # e.g. a MagicMock db in tests
+        want = normalize_title(title)
+        best: Optional[Dict[str, Any]] = None
+        for row in rows:
+            try:
+                nt, yr, se, res, dv = row[0], row[1], row[2], row[3], row[4]
+            except Exception:
+                continue
+            if nt != want:
+                continue
+            if se != season:
+                continue
+            if yr is not None and year is not None and int(yr) != int(year):
+                continue
+            cand = {"resolution": res, "dovi": bool(dv)}
+            if best is None or self._is_quality_upgrade(
+                    cand["resolution"], cand["dovi"], best):
+                best = cand
+        return best
+
+    def _is_quality_upgrade(self, resolution: str, dovi: bool,
+                            prior: Dict[str, Any]) -> bool:
+        """Higher resolution, or DV gain at the same resolution — the same
+        rule the scanner + read-time overlay use for 'worth grabbing again'."""
+        new_rank, old_rank = self._res_rank(resolution), self._res_rank(prior.get("resolution"))
+        return new_rank > old_rank or (
+            new_rank == old_rank and bool(dovi) and not prior.get("dovi"))
 
     # ── JDownloader ───────────────────────────────────────────────────
 
@@ -1726,6 +1779,29 @@ class DownloadService:
                                {"title": title, "url": url, "method": "duplicate", "link_count": 0},
                                _cb=progress_callback)
                 return result
+            # Title-level dedup: a DIFFERENT release URL of the same title
+            # (same year + season) that is the same-or-lower quality than a
+            # copy already grabbed is a duplicate too — that's how "grab both
+            # 4K remuxes of the same movie" slipped through. Only a genuine
+            # upgrade (higher resolution, or DV gain at the same resolution)
+            # passes. Legacy rows without a recorded year match on title+season
+            # alone; season must match exactly so S01 never blocks S02.
+            prior = self._best_prior_grab(title, year, season)
+            if prior is not None and not self._is_quality_upgrade(
+                    resolution, dovi, prior):
+                result["success"] = True
+                result["method"] = "duplicate_similar"
+                result["message"] = (
+                    f"Already grabbed {prior.get('resolution') or '?'} of "
+                    f"{title} — skipped (this is not an upgrade)")
+                self._log(f"[Download] skip same-title duplicate: {title} "
+                          f"({resolution or '?'} vs grabbed {prior.get('resolution') or '?'})",
+                          "info")
+                self._progress("download:complete",
+                               {"title": title, "url": url,
+                                "method": "duplicate_similar", "link_count": 0},
+                               _cb=progress_callback)
+                return result
 
         _cb = progress_callback
         self._progress("download:started", {"title": title, "url": url}, _cb=_cb)
@@ -1790,7 +1866,8 @@ class DownloadService:
                 result["method"] = "jdownloader"
                 result["message"] = f"Sent {len(links)} links to JDownloader"
                 result["history_saved"] = self.save_to_history(
-                    url, title, season, resolution, size, status="completed", hdr=hdr, dovi=dovi
+                    url, title, season, resolution, size, status="completed",
+                    hdr=hdr, dovi=dovi, year=year
                 )
                 self._log(
                     f"[Download] {title}: delivered to JDownloader "
@@ -1809,7 +1886,8 @@ class DownloadService:
             result["method"] = "clipboard"
             result["message"] = f"Copied {len(links)} links to clipboard"
             result["history_saved"] = self.save_to_history(
-                url, title, season, resolution, size, status="clipboard", hdr=hdr, dovi=dovi
+                url, title, season, resolution, size, status="clipboard",
+                hdr=hdr, dovi=dovi, year=year
             )
             self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
             return result
@@ -1822,7 +1900,8 @@ class DownloadService:
             result["method"] = "browser"
             result["message"] = "Opened URL in browser"
             result["history_saved"] = self.save_to_history(
-                url, title, season, resolution, size, status="browser", hdr=hdr, dovi=dovi
+                url, title, season, resolution, size, status="browser",
+                hdr=hdr, dovi=dovi, year=year
             )
             self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
             return result
@@ -1834,7 +1913,8 @@ class DownloadService:
             result["message"] = "JDownloader is disabled and no clipboard/browser is available."
         self._log(f"[Download] {title}: {result['message']}", "warning")
         try:
-            self.save_to_history(url, title, season, resolution, size, status="failed", hdr=hdr, dovi=dovi)
+            self.save_to_history(url, title, season, resolution, size,
+                                 status="failed", hdr=hdr, dovi=dovi, year=year)
         except Exception:
             pass
         self._progress("download:failed", {"title": title, "url": url, "message": result["message"]}, _cb=_cb)

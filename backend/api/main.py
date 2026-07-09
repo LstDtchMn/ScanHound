@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
@@ -131,7 +133,8 @@ def _init_services(
 
     # Auto-connect to Plex on startup if configured (direct or account mode).
     if _should_auto_connect_plex(reg.config):
-        import threading
+        # (threading is imported at module level — a local import here would
+        # shadow it for the whole function and break earlier uses.)
         def _auto_connect_plex():
             from backend.api.ws import ws_manager
             try:
@@ -195,6 +198,18 @@ def _init_services(
     # work; it self-gates on auto_rename_enabled (off by default).
     from backend.rename.service import RenameService
     reg._rename_service = RenameService(reg)
+
+    # One-shot poster backfill for jobs created before poster capture existed
+    # (they render as "No poster" otherwise). Delayed + threaded so startup
+    # never blocks on TMDB; idempotent (only touches empty poster_path rows).
+    def _poster_backfill():
+        time.sleep(30)  # let the app settle first
+        try:
+            reg._rename_service.backfill_posters()
+        except Exception:
+            logger.debug("poster backfill failed (non-fatal)", exc_info=True)
+    threading.Thread(target=_poster_backfill, name="poster-backfill",
+                     daemon=True).start()
 
     # Surface a DB corruption quarantine (if init_db() hit one) now that the
     # notification bridge actually exists — DatabaseManager._notify_corruption

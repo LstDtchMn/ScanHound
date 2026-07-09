@@ -119,11 +119,13 @@ async function runBulk(label: string, fn: (ids: number[]) => Promise<void>) {
 
 export function bulkApply() {
   return runBulk('Apply', async (ids) => {
+    // Applies are queued server-side (cross-device moves can take minutes);
+    // each job reports back over the rename:job WS event as it lands.
     const r = await api.bulkApply(ids);
     addToast(
-      `Applied ${r.applied}`,
-      `${r.failed} failed`,
-      r.failed ? 'warning' : 'success'
+      `Applying ${r.queued ?? 0} in background`,
+      r.skipped ? `${r.skipped} skipped (already applied/in progress)` : 'Progress updates live',
+      'info'
     );
   });
 }
@@ -155,9 +157,9 @@ export async function applyConfident(ids?: number[]) {
   try {
     const r = await api.applyConfident(ids);
     addToast(
-      `Applied ${r.applied} confident`,
-      `${r.skipped} skipped, ${r.failed} failed`,
-      r.failed ? 'warning' : 'success'
+      `Applying ${r.queued ?? 0} confident in background`,
+      `${r.skipped ?? 0} skipped — progress updates live`,
+      'info'
     );
   } catch (e) {
     addToast(

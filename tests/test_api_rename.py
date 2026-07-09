@@ -38,6 +38,25 @@ def _client_with_library(movie_library: str):
     return TestClient(app)
 
 
+def _wait_settled(client, jid, timeout=8.0):
+    """Poll until a queued apply finishes (status leaves 'applying').
+
+    Applies now run on a background worker (the HTTP response only queues),
+    so tests must wait for the terminal status before asserting on files.
+    """
+    import time as _t
+    deadline = _t.monotonic() + timeout
+    status = None
+    while _t.monotonic() < deadline:
+        jobs = client.get("/rename/jobs").json()["jobs"]
+        job = next((j for j in jobs if j["id"] == jid), None)
+        status = job and job.get("status")
+        if status not in ("applying", "matched"):
+            return status
+        _t.sleep(0.05)
+    return status
+
+
 def _seed_job(**fields):
     dm = DatabaseManager()
     job = {"original_path": "/x/y.mkv", "original_filename": "y.mkv", "status": "pending"}
@@ -168,8 +187,10 @@ class TestRenameApi:
         jid = _seed_job(status="matched", title="Movie",
                         original_path=str(src), destination_path=str(dest),
                         new_filename="Movie (2020).mkv")
-        # default move_method is hardlink → source remains, link created
+        # default move_method is hardlink → source remains, link created.
+        # Applies are queued to a background worker now; wait for it to land.
         assert client.post(f"/rename/jobs/{jid}/apply").status_code == 200
+        assert _wait_settled(client, jid) == "applied"
         assert (dest / "Movie (2020).mkv").exists()
         assert client.post(f"/rename/jobs/{jid}/undo").status_code == 200
         assert not (dest / "Movie (2020).mkv").exists()
@@ -370,10 +391,11 @@ class TestRenameApi:
                         destination_path=str(dest), new_filename="Bad (2020).mkv")
         r = client.post("/rename/jobs/bulk/apply",
                         json={"ids": [ok, bad]}).json()
-        by = {x["id"]: x for x in r["results"]}
-        assert by[ok]["ok"] is True
-        assert by[bad]["ok"] is False and by[bad]["error"]
-        assert r["applied"] == 1 and r["failed"] == 1
+        assert r["queued"] == 2                      # both accepted for background apply
+        assert _wait_settled(client, ok) == "applied"
+        assert _wait_settled(client, bad) == "failed"
+        jobs = {j["id"]: j for j in client.get("/rename/jobs").json()["jobs"]}
+        assert jobs[bad]["error_message"]            # the failure reason survives
 
     def test_bulk_delete_counts(self, client):
         a = _seed_job(status="needs_review", title="A")
@@ -491,18 +513,19 @@ class TestRenameApi:
                         original_path=str(src), destination_path=str(dest),
                         new_filename="Ok (2020).mkv")
         r = client.post("/rename/jobs/apply-confident", json={}).json()
-        assert r["applied"] == 1 and r["skipped"] == 0
+        assert r["queued"] == 1 and r["skipped"] == 0
+        assert _wait_settled(client, jid) == "applied"
         assert (dest / "Ok (2020).mkv").exists()
 
     def test_apply_confident_skips_matched_94(self, client):
         jid = _seed_job(status="matched", title="Low", match_confidence=94)
         r = client.post("/rename/jobs/apply-confident", json={}).json()
-        assert r["applied"] == 0 and r["skipped"] == 1
+        assert r["queued"] == 0 and r["skipped"] == 1
 
     def test_apply_confident_skips_needs_review_99(self, client):
         jid = _seed_job(status="needs_review", title="NR", match_confidence=99)
         r = client.post("/rename/jobs/apply-confident", json={}).json()
-        assert r["applied"] == 0 and r["skipped"] == 1
+        assert r["queued"] == 0 and r["skipped"] == 1
 
     def test_apply_confident_scoped_to_ids(self, client, tmp_path):
         dest = tmp_path / "lib"
@@ -515,8 +538,11 @@ class TestRenameApi:
                       destination_path=str(dest), new_filename="B (2020).mkv")
         # Scope to only A; B (also confident) must be untouched.
         r = client.post("/rename/jobs/apply-confident", json={"ids": [a]}).json()
-        assert r["applied"] == 1
-        assert all(x["id"] == a for x in r["results"])
+        assert r["queued"] == 1
+        assert _wait_settled(client, a) == "applied"
+        # B (also confident) must be untouched.
+        jobs = {j["id"]: j for j in client.get("/rename/jobs").json()["jobs"]}
+        assert jobs[b]["status"] == "matched"
 
     def test_apply_confident_empty_ids_applies_nothing(self, client, tmp_path):
         # An empty ids list is an explicit empty selection: must apply nothing,
@@ -528,7 +554,7 @@ class TestRenameApi:
                         original_path=str(src), destination_path=str(dest),
                         new_filename="Ok (2020).mkv")
         r = client.post("/rename/jobs/apply-confident", json={"ids": []}).json()
-        assert r["applied"] == 0 and r["skipped"] == 0 and r["failed"] == 0
+        assert r["queued"] == 0 and r["skipped"] == 0
         # The file must NOT have been moved.
         assert not (dest / "Ok (2020).mkv").exists()
         assert src.exists()
@@ -541,7 +567,8 @@ class TestRenameApi:
                         original_path=str(src), destination_path=str(dest),
                         new_filename="Boundary (2020).mkv")
         r = client.post("/rename/jobs/apply-confident", json={}).json()
-        assert r["applied"] == 1 and r["skipped"] == 0
+        assert r["queued"] == 1 and r["skipped"] == 0
+        assert _wait_settled(client, jid) == "applied"
         assert (dest / "Boundary (2020).mkv").exists()
 
 
