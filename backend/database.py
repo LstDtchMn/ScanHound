@@ -495,6 +495,10 @@ class DatabaseManager:
                     'ALTER TABLE downloads ADD COLUMN hdr TEXT',
                     'ALTER TABLE downloads ADD COLUMN dovi INTEGER DEFAULT 0',
                     'ALTER TABLE rename_jobs ADD COLUMN poster_path TEXT',
+                    # Human-readable reasons a match is < 100% (JSON list of
+                    # strings) — surfaced in the Renames UI so a low-confidence
+                    # match explains itself.
+                    'ALTER TABLE rename_jobs ADD COLUMN match_reasons TEXT',
                     # Year makes the grab key year-aware (normalized|year|season)
                     # for send-time duplicate protection + the read-time overlay,
                     # so a 2021 remake never blocks/marks the 1984 original.
@@ -1684,10 +1688,12 @@ class DatabaseManager:
         "match_source", "move_method", "proposed_match", "plex_sort_title",
         "warning_message", "error_message", "processed_at", "reverted_at",
         "suggested_correction", "combined_episode", "split_file", "poster_path",
+        "match_reasons",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.
-    _JSON_RENAME_FIELDS = frozenset({"suggested_correction", "combined_episode", "split_file"})
+    _JSON_RENAME_FIELDS = frozenset({"suggested_correction", "combined_episode",
+                                     "split_file", "match_reasons"})
 
     def _serialize_rename_row(self, row: dict) -> dict:
         """JSON-encode dict/list values for _JSON_RENAME_FIELDS before DB write."""

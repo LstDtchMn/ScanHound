@@ -71,6 +71,65 @@ def compute_sort_title(title: Optional[str]) -> Optional[str]:
     return title
 
 
+# Friendly names for how a title was identified (a fallback method is itself a
+# reason to be less than fully certain).
+_MATCH_SOURCE_LABELS = {
+    "fuzzy": "a fuzzy title match",
+    "vision": "AI vision on the poster/frames",
+    "ocr": "OCR of the opening credits",
+    "subtitle": "text from the subtitle track",
+    "multi": "a broad multi-search",
+    "imdb": "an embedded IMDb id",
+}
+
+
+def build_match_reasons(parsed: dict, match: dict, threshold: int) -> list:
+    """Human-readable reasons a match is < 100% certain, for the Renames UI.
+
+    Pure/derives from the parsed filename + the chosen match, so it explains the
+    same signals that fed confidence scoring (title similarity, year, runtime,
+    identification method). Returns [] for an exact 100% match."""
+    conf = match.get("confidence") or 0.0
+    if conf >= 100:
+        return []
+    reasons: list = []
+
+    def _norm(s):
+        return _re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+    src = (match.get("source") or "").lower()
+    label = _MATCH_SOURCE_LABELS.get(src)
+    if label:
+        reasons.append(f"Matched using {label} rather than a clean title match")
+
+    p_title = (parsed.get("title") or "").strip()
+    m_title = (match.get("title") or "").strip()
+    if p_title and m_title and _norm(p_title) != _norm(m_title):
+        reasons.append(
+            f"Filename title “{p_title}” doesn't exactly match “{m_title}”")
+
+    p_year, m_year = parsed.get("year"), match.get("year")
+    try:
+        if p_year and m_year and int(p_year) != int(m_year):
+            reasons.append(
+                f"Year differs: filename says {p_year}, the match is {m_year}")
+        elif not p_year and match.get("media_type") != "tv":
+            reasons.append("No year in the filename to confirm the match")
+    except (TypeError, ValueError):
+        pass
+
+    if match.get("runtime_warning"):
+        reasons.append(match["runtime_warning"])
+
+    if not reasons:
+        reasons.append(f"Title is a close but not exact match (~{conf:.0f}% similar)")
+
+    if conf < threshold:
+        reasons.append(
+            f"Overall confidence {conf:.0f}% is below the {threshold}% auto-apply threshold")
+    return reasons
+
+
 class RenameService:
     def __init__(self, registry, tmdb_search: Optional[Callable] = None):
         self._reg = registry
@@ -1001,7 +1060,12 @@ class RenameService:
             new_filename=fname, destination_path=dest,
             suggested_correction=match.get("suggested_correction"),
             combined_episode=match.get("combined_episode"),
-            split_file=match.get("split_file"))
+            split_file=match.get("split_file"),
+            # Explain a less-than-certain match so the UI can show the why.
+            # Re-parse the filename here (cheap, pure) rather than relying on a
+            # `parsed` local that isn't bound on every code path into this point.
+            match_reasons=build_match_reasons(
+                parse_filename(filename), match, self._threshold()))
 
         # TMDB year mismatch: the chosen match's year can legitimately differ
         # from the filename's parsed year by 1 without being penalised by
@@ -1273,6 +1337,7 @@ class RenameService:
                                  media_type=mtype, season=sea, episode=epi,
                                  poster_path=poster_path, destination_path=None,
                                  match_confidence=100.0, match_source="manual",
+                                 match_reasons=[],  # manual pick — no uncertainty
                                  status="needs_review", warning_message=warning)
             self._broadcast(job_id)
             return {"ok": True, "status": "needs_review", "new_filename": None,
@@ -1285,8 +1350,8 @@ class RenameService:
                              media_type=mtype, season=sea, episode=epi,
                              poster_path=poster_path, new_filename=fname,
                              destination_path=dest, match_confidence=100.0,
-                             match_source="manual", status="matched",
-                             warning_message=None)
+                             match_source="manual", match_reasons=[],
+                             status="matched", warning_message=None)
         self._broadcast(job_id)
         return {"ok": True, "status": "matched", "new_filename": fname,
                 "destination_path": dest, "warning": None}

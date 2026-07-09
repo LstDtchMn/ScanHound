@@ -1376,3 +1376,51 @@ class TestDryRunPreview:
         out = svc.process_folder(str(tmp_path), dry_run=True)
         assert out["previews"][0]["tracked"] is True
         db.close()
+
+
+# ── Match-reason explanations (why a match is < 100%) ────────────────
+
+class TestBuildMatchReasons:
+    def _reasons(self, parsed, match, threshold=70):
+        from backend.rename.service import build_match_reasons
+        return build_match_reasons(parsed, match, threshold)
+
+    def test_exact_match_has_no_reasons(self):
+        r = self._reasons({"title": "Heat", "year": 1995},
+                          {"title": "Heat", "year": 1995, "confidence": 100.0})
+        assert r == []
+
+    def test_title_mismatch_is_explained(self):
+        r = self._reasons(
+            {"title": "The Threesome", "year": 2025},
+            {"title": "The Housemaid", "year": 2025, "confidence": 58.0,
+             "source": "deterministic"})
+        assert any("doesn't exactly match" in x and "Housemaid" in x for x in r)
+        assert any("below the 70% auto-apply threshold" in x for x in r)
+
+    def test_year_mismatch_is_explained(self):
+        r = self._reasons(
+            {"title": "Dune", "year": 1984},
+            {"title": "Dune", "year": 2021, "confidence": 75.0})
+        assert any("Year differs" in x and "1984" in x and "2021" in x for x in r)
+
+    def test_fallback_source_is_a_reason(self):
+        r = self._reasons(
+            {"title": "Some Show", "year": None},
+            {"title": "Some Show", "year": 2020, "confidence": 80.0,
+             "source": "ocr", "media_type": "movie"})
+        assert any("OCR of the opening credits" in x for x in r)
+
+    def test_runtime_warning_included(self):
+        r = self._reasons(
+            {"title": "X", "year": 2020},
+            {"title": "X", "year": 2020, "confidence": 65.0,
+             "runtime_warning": "Runtime mismatch: file 45min vs TMDB 22min"})
+        assert any("Runtime mismatch" in x for x in r)
+
+    def test_close_match_still_gets_a_reason(self):
+        # No title/year/source/runtime issue but conf < 100 → generic close note.
+        r = self._reasons(
+            {"title": "Movie", "year": 2020},
+            {"title": "Movie", "year": 2020, "confidence": 92.0})
+        assert r and any("close but not exact" in x for x in r)

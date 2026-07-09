@@ -88,6 +88,7 @@ export interface RenameJob {
   resolution: string | null;
   match_confidence: number | null;
   match_source: string | null; // deterministic | llm | manual
+  match_reasons?: string[] | null; // why a match is < 100% certain
   move_method: string | null;
   warning_message: string | null;
   error_message: string | null;
