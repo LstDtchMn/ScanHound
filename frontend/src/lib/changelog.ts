@@ -7,6 +7,14 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.21.1",
+    date: "2026-07-09",
+    summary: "Fix wrong title/poster on mis-scraped docuseries releases",
+    changes: [
+      "Fixed a release showing another title's name and poster — and appearing as a separate look-alike tile in the deck — when it was scraped with the wrong IMDb ID. This mostly hit episodes of a docuseries that share a series name (e.g. 'Untold UK: Liverpool's Miracle of Istanbul' picking up 'Untold UK: Vinnie Jones'). ScanHound now checks that an IMDb-matched title actually matches the release before trusting it, and re-derives the correct match when it doesn't.",
+    ],
+  },
+  {
     version: "2.21.0",
     date: "2026-07-09",
     summary: "Week-in-review bug sweep: duplicate protection, safer applies, accurate counts",

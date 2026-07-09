@@ -24,6 +24,33 @@ logger = logging.getLogger(__name__)
 # Minimum token_sort_ratio required to accept a TMDB search result.
 _TMDB_MATCH_THRESHOLD = 80
 
+# Minimum token_sort_ratio for a TMDB entry resolved *by imdb_id* (the fast
+# path, which otherwise trusts the id blindly) to be accepted as the same work
+# we parsed. A release scraped with the wrong imdb id — commonly a sibling
+# episode of the same docuseries — would otherwise silently overwrite the
+# title, poster and ratings. token_sort_ratio is order-insensitive but, unlike
+# token_set/partial_ratio, is NOT inflated by a shared series prefix, so
+# "Untold UK: Liverpool's Miracle of Istanbul" scores 42 against "Untold UK:
+# Vinnie Jones" (rejected) while real canonicalisations score 78-100 (kept).
+_IMDB_TITLE_TRUST_THRESHOLD = 70
+
+
+def _tmdb_result_title(result: dict) -> str:
+    """The best display title on a TMDB result (movie or TV shapes)."""
+    return (result.get("title") or result.get("name")
+            or result.get("original_title") or result.get("original_name") or "")
+
+
+def _imdb_result_trustworthy(parsed_title: str, result: dict) -> bool:
+    """True if a find()-by-imdb result plausibly names the same work as the
+    parsed release title. Returns True when there's nothing to compare (an
+    empty title) so a data gap never blocks a legitimate match."""
+    resolved = _tmdb_result_title(result).lower().strip()
+    parsed = (parsed_title or "").lower().strip()
+    if not resolved or not parsed:
+        return True
+    return fuzz.token_sort_ratio(parsed, resolved) >= _IMDB_TITLE_TRUST_THRESHOLD
+
 
 def _best_tmdb_result(query_title: str, results: list) -> dict | None:
     """Pick the TMDB result whose title best matches *query_title*.
@@ -120,8 +147,17 @@ class MetadataEnricher:
                     data = tmdb.find(item.imdb_id)
                     if data:
                         results = data.get("movie_results", []) + data.get("tv_results", [])
-                        if results:
+                        if results and _imdb_result_trustworthy(item.title, results[0]):
                             result_data = results[0]
+                        elif results:
+                            # The scraped imdb id names a different work (usually a
+                            # sibling episode of the same docuseries). Don't let it
+                            # overwrite title/poster/ratings — drop the id so the
+                            # title search below re-derives the correct one.
+                            logger.info(
+                                "Rejected imdb-id %s for %r: resolved title %r doesn't match",
+                                item.imdb_id, item.title, _tmdb_result_title(results[0]))
+                            item.imdb_id = None
 
                 if not result_data:
                     search_type = "tv" if item.season is not None else "movie"

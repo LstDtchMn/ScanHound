@@ -294,7 +294,7 @@ class TestTmdbFindPath:
         mock_tmdb.external_ids.return_value = {"imdb_id": "tt0903747"}
 
         enricher = _make_enricher()
-        item = _item(imdb_id="tt0903747", season=1)
+        item = _item(imdb_id="tt0903747", season=1, title="Breaking Bad")
         with patch("backend.metadata_enricher.TmdbClient", return_value=mock_tmdb):
             _run(enricher, [item])
 
@@ -325,6 +325,61 @@ class TestTmdbFindPath:
             _run(enricher, [item])
 
         assert item.imdb_id == "tt0903747"
+
+
+# ---------------------------------------------------------------------------
+# imdb-id fast-path title guard
+# ---------------------------------------------------------------------------
+
+class TestImdbTitleGuard:
+    """A release scraped with the wrong imdb id (commonly a sibling episode of
+    the same docuseries) must not overwrite title/poster/ratings via the
+    otherwise-blind find()-by-imdb fast path."""
+
+    def _clean_scrapers(self):
+        s = MagicMock()
+        s.scrape_imdb_data.return_value = {"rating": 0, "votes": 0}
+        s.scrape_rt_score.return_value = {"critics": None}
+        return s
+
+    def test_wrong_imdb_sibling_rejected_and_search_recovers(self):
+        mock_tmdb = MagicMock()
+        # find() by the WRONG scraped id resolves to a different sibling.
+        mock_tmdb.find.return_value = {"movie_results": [_tmdb_movie_result(
+            title="Untold UK: Vinnie Jones", original_title="Untold UK: Vinnie Jones",
+            poster_path="/vinnie.jpg", overview="Vinnie doc")]}
+        # The title search returns the CORRECT work.
+        mock_tmdb.search.return_value = [_tmdb_movie_result(
+            title="Untold UK: Liverpool's Miracle of Istanbul",
+            original_title="Untold UK: Liverpool's Miracle of Istanbul",
+            poster_path="/liverpool.jpg", overview="Liverpool doc", id=999)]
+        mock_tmdb.details.return_value = {"imdb_id": "tt41801280"}
+
+        enricher = _make_enricher(scrapers=self._clean_scrapers())
+        item = _item(title="Untold UK Liverpools Miracle of Istanbul", imdb_id="tt41801288")
+        with patch("backend.metadata_enricher.TmdbClient", return_value=mock_tmdb):
+            _run(enricher, [item])
+
+        assert "Vinnie" not in item.title            # wrong sibling never applied
+        assert item.poster_path == "/liverpool.jpg"   # correct poster from search
+        assert item.description == "Liverpool doc"
+        assert item.imdb_id == "tt41801280"           # bad id dropped, correct re-derived
+
+    def test_matching_imdb_still_trusted(self):
+        mock_tmdb = MagicMock()
+        mock_tmdb.find.return_value = {"movie_results": [_tmdb_movie_result(
+            title="Untold UK: Vinnie Jones", original_title="Untold UK: Vinnie Jones",
+            poster_path="/vinnie.jpg", overview="Vinnie doc")]}
+        mock_tmdb.details.return_value = {"imdb_id": "tt41801288"}
+
+        enricher = _make_enricher(scrapers=self._clean_scrapers())
+        item = _item(title="Untold UK Vinnie Jones", imdb_id="tt41801288")
+        with patch("backend.metadata_enricher.TmdbClient", return_value=mock_tmdb):
+            _run(enricher, [item])
+
+        assert item.title == "Untold UK: Vinnie Jones"   # canonicalisation kept
+        assert item.description == "Vinnie doc"
+        mock_tmdb.search.assert_not_called()             # fast path was trusted
 
 
 # ---------------------------------------------------------------------------
