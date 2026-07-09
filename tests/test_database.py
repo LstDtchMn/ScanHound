@@ -320,6 +320,21 @@ class TestDownloadResults:
         rows = db_manager.get_download_results()
         assert rows[0]["error"] == "Extraction error"
 
+    def test_delete_download_result_removes_only_named_row(self, db_manager):
+        db_manager.upsert_download_result(name="Foo [1080p]", title="Foo", host="rg.net",
+                                          bytes_total=100, bytes_loaded=50, downloaded=0,
+                                          extraction="na", state="downloading", error=None)
+        db_manager.upsert_download_result(name="Bar [4K]", title="Bar", host="rg.net",
+                                          bytes_total=100, bytes_loaded=100, downloaded=1,
+                                          extraction="success", state="extracted", error=None)
+        n = db_manager.delete_download_result("Foo [1080p]")
+        assert n == 1
+        names = {r["name"] for r in db_manager.get_download_results()}
+        assert names == {"Bar [4K]"}
+
+    def test_delete_download_result_missing_is_noop(self, db_manager):
+        assert db_manager.delete_download_result("nope") == 0
+
 
 class TestLegacyMigration:
 

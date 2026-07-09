@@ -988,6 +988,27 @@ class DatabaseManager:
         """Delete all tracked download/extraction outcomes."""
         return self._mutate("DELETE FROM download_results", label="clear_download_results")
 
+    def delete_download_result(self, name):
+        """Delete the tracked download/extraction outcome for a single package
+        by its JDownloader package ``name``. Returns rows affected (0 if none).
+
+        Unlike ``_mutate`` (which returns True/False), this needs the actual
+        row count for the caller to distinguish "deleted" from "already gone",
+        so it talks to the connection directly under the same lock pattern.
+        """
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return 0
+                cursor = conn.execute(
+                    "DELETE FROM download_results WHERE name = ?", (name,))
+                conn.commit()
+                return cursor.rowcount
+        except Exception as e:
+            logger.error("DB Error (delete_download_result): %s", e)
+            return 0
+
 
     @staticmethod
     def _backup_file(path: str) -> None:
