@@ -139,7 +139,13 @@
   {@render children()}
 {:else}
 <a href="#main-content" class="sr-only">Skip to content</a>
-<div class="flex h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
+<!-- h-dvh (dynamic viewport height), NOT h-screen (100vh): on mobile browsers
+     100vh is the LARGE viewport (behind the retractable URL bar), so a fixed
+     h-screen shell pushes the bottom-anchored MobileTabBar below the visible
+     area. The scan page scrolls internally (the document never scrolls), so the
+     URL bar never retracts to reveal it — leaving the phone nav unreachable.
+     dvh tracks the actually-visible height; == 100vh on desktop (no regression). -->
+<div class="flex h-dvh bg-[var(--bg-primary)] text-[var(--text-primary)]">
   <Sidebar />
   <div class="flex-1 flex flex-col overflow-hidden">
     <!-- Mobile top bar (visible below md). Outer shell (safe-area padding +

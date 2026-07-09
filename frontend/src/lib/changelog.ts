@@ -7,6 +7,14 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.23.2",
+    date: "2026-07-09",
+    summary: "Fix: bottom navigation was unreachable on phones",
+    changes: [
+      "Fixed the bottom navigation bar (Scan / Downloads / Renames / Watchlist / Stats / Settings) being pushed off the bottom of the screen on mobile browsers — it sat behind the address bar because the app used a fixed 100vh height. It now uses the dynamic viewport height, so the nav is always visible and you can reach Downloads and Renames from the scan page.",
+    ],
+  },
+  {
     version: "2.23.1",
     date: "2026-07-09",
     summary: "Two minor fixes from a code-review pass",
