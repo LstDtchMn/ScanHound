@@ -631,14 +631,14 @@ export function dismissItem(url: string, title?: string, meta?: DismissMeta): Pr
     next.add(url);
     return next;
   });
+  let removedRow: ScanResult | undefined;
   if (get(pagedMode)) {
-    let removed = false;
     results.update((items) => {
       const next = items.filter((i) => i.url !== url);
-      removed = next.length !== items.length;
+      if (next.length !== items.length) removedRow = items.find((i) => i.url === url);
       return next;
     });
-    if (removed) filteredTotal.update((n) => Math.max(0, n - 1));
+    if (removedRow) filteredTotal.update((n) => Math.max(0, n - 1));
   }
   return api.dismissItems([url], title ? { [url]: title } : undefined, true, meta ? { [url]: meta } : undefined).then(
     () => true,
@@ -649,27 +649,54 @@ export function dismissItem(url: string, title?: string, meta?: DismissMeta): Pr
         next.delete(url);
         return next;
       });
+      // Paged mode physically dropped the row — put it back, or the failed
+      // dismiss silently vanishes it from the list until the next refresh.
+      if (removedRow) {
+        results.update((items) => (items.some((i) => i.url === url) ? items : [removedRow!, ...items]));
+        filteredTotal.update((n) => n + 1);
+      }
       return false;
     }
   );
 }
 
-/** Undo a dismissal so the item can reappear. */
-export function restoreItem(url: string): Promise<boolean> {
+/** Undo a dismissal so the item can reappear.
+ *
+ *  Pass the original row as `item` so paged mode can bring it back: paged
+ *  dismiss physically drops the row from `results` (see dismissItem), so
+ *  clearing the dismissed flag alone can't resurrect it — there's nothing left
+ *  to un-hide. We re-insert at the FRONT so an undone swipe returns to the top
+ *  of the deck. Without `item` (or outside paged mode) this is just the flag
+ *  clear, which is all the reactive-filter views need. */
+export function restoreItem(url: string, item?: ScanResult): Promise<boolean> {
   if (!url) return Promise.resolve(false);
   dismissedUrls.update((s) => {
     const next = new Set(s);
     next.delete(url);
     return next;
   });
+  let reinserted = false;
+  if (item && get(pagedMode)) {
+    results.update((items) => {
+      if (items.some((i) => i.url === url)) return items;  // already present
+      reinserted = true;
+      return [item, ...items];
+    });
+    if (reinserted) filteredTotal.update((n) => n + 1);
+  }
   return api.dismissItems([url], undefined, false).then(
     () => true,
     () => {
+      // Revert the optimistic un-dismiss: re-hide, and drop the row we restored.
       dismissedUrls.update((s) => {
         const next = new Set(s);
         next.add(url);
         return next;
       });
+      if (reinserted) {
+        results.update((items) => items.filter((i) => i.url !== url));
+        filteredTotal.update((n) => Math.max(0, n - 1));
+      }
       return false;
     }
   );
@@ -749,7 +776,8 @@ export function markGrabbedSiblings(grabbedUrl: string | undefined | null) {
     // of the Upgrades tab), just annotated with what you already grabbed;
     // anything equal/lower becomes 'downloaded_similar' (you have a copy —
     // non-actionable, leaves the deck).
-    return items.map((it) => {
+    let missingDelta = 0;
+    const next = items.map((it) => {
       if (
         it.group_key === grabbed.group_key &&
         it.url !== grabbedUrl &&
@@ -757,12 +785,18 @@ export function markGrabbedSiblings(grabbedUrl: string | undefined | null) {
       ) {
         const rank = resolutionRank(it.resolution);
         const isBetter = rank > grabbedRank || (rank === grabbedRank && (it.dovi ?? false) && !grabbedDovi);
-        return isBetter
-          ? { ...it, prior_grab: note }
-          : { ...it, status: 'downloaded_similar', prior_grab: note };
+        if (isBetter) return { ...it, prior_grab: note };
+        // Leaving the 'missing' pool for 'downloaded_similar' — keep the
+        // Missing counter honest (same bookkeeping markDownloaded does).
+        missingDelta--;
+        return { ...it, status: 'downloaded_similar', prior_grab: note };
       }
       return it;
     });
+    if (missingDelta) {
+      stats.update((st) => ({ ...st, missing: Math.max(0, st.missing + missingDelta) }));
+    }
+    return next;
   });
 }
 

@@ -163,13 +163,38 @@ def _trash_root_for(path: str) -> str:
     would EXDEV into ``_TRASH_ROOT`` and ``shutil.move`` would silently copy
     the full media file into (often OneDrive-synced) app-data.
 
-    Falls back to the module-level ``_TRASH_ROOT`` if ``path`` has no drive
-    anchor (e.g. a relative path with no drive component on this platform).
+    Falls back to the module-level ``_TRASH_ROOT`` only if the source's volume
+    can't be determined.
+
+    Windows uses the drive anchor. POSIX (the Docker deployment) has no drive
+    anchor — os.path.splitdrive always returns '' there — so we walk up to the
+    source's MOUNT POINT (where st_dev changes vs the parent) and site the trash
+    inside it. Each library is its own bind mount, so this keeps disposal an
+    instant same-device rename instead of an EXDEV copy of the whole media file
+    into the app-data /data mount.
     """
-    anchor, _ = os.path.splitdrive(os.path.abspath(path))
-    if not anchor:
+    p = os.path.abspath(path)
+    anchor, _ = os.path.splitdrive(p)
+    if anchor:  # Windows: the drive root is the volume root.
+        return os.path.join(anchor + os.sep, ".scanhound-trash")
+    # POSIX: find the mount point by walking up while st_dev is unchanged.
+    try:
+        base = p if os.path.exists(p) else os.path.dirname(p)
+        dev = os.stat(base).st_dev
+        cur = os.path.dirname(p) or "/"
+        while True:
+            parent = os.path.dirname(cur)
+            if parent == cur:  # reached filesystem root
+                break
+            try:
+                if os.stat(parent).st_dev != dev:
+                    break  # `cur` is the mount point of the source's volume
+            except OSError:
+                break
+            cur = parent
+        return os.path.join(cur, ".scanhound-trash")
+    except OSError:
         return _TRASH_ROOT
-    return os.path.join(anchor + os.sep, ".scanhound-trash")
 
 
 def _trash(path: str) -> str:

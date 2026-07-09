@@ -176,6 +176,9 @@ class AutoGrabService:
                     resolution=item.resolution,
                     size=item.size,
                     service_type=service_type,
+                    year=item.year,
+                    hdr=item.hdr,
+                    dovi=item.dovi,
                 )
 
                 if result.get("success"):

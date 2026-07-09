@@ -106,13 +106,25 @@ def _overlay_download_state(items, db):
             nt, yr, se, res, dv = row[0], row[1], row[2], row[3], row[4]
         except Exception:
             continue
-        if not nt or yr is None:
-            continue  # legacy row (no year) — the URL-anchored pass covers it
-        gk = f"{nt}|{yr or 0}|S{se or 0}"
+        if not nt:
+            continue
         rank, dovi = _res_rank(res), bool(dv)
-        if _better(rank, dovi, grabbed.get(gk)):
-            grabbed[gk] = {"rank": rank, "dovi": dovi,
-                           "resolution": res or "", "size": ""}
+        # Reconstruct the SAME group_key(s) the scanner's _group() assigns:
+        #   movie -> "{nt}|{year}|S0"
+        #   TV    -> "{nt}|S{season}" (single-season) OR "{nt}|TV" (multi-season)
+        # We can't tell single- vs multi-season from one grab row, so populate
+        # BOTH TV keys. A movie with an unknown year can't be reconstructed (the
+        # URL-anchored pass below covers it while the grab is still cached).
+        if se is not None:
+            keys = [f"{nt}|S{se}", f"{nt}|TV"]
+        elif yr is not None:
+            keys = [f"{nt}|{yr}|S0"]
+        else:
+            continue
+        for gk in keys:
+            if _better(rank, dovi, grabbed.get(gk)):
+                grabbed[gk] = {"rank": rank, "dovi": dovi,
+                               "resolution": res or "", "size": ""}
 
     for i in items:
         if i.get("url") in downloaded:

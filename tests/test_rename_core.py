@@ -341,11 +341,26 @@ class TestFileOps:
             os.path.commonpath([root, root])  # root is not nested under _DATA_DIR
         assert not root.startswith(fileops._DATA_DIR)
 
-    def test_trash_root_for_falls_back_to_trash_root_when_no_drive(self, monkeypatch):
-        """If splitdrive yields no anchor (relative path with no drive), fall
-        back to the module-level _TRASH_ROOT rather than raising."""
+    def test_trash_root_for_posix_sites_bucket_on_source_device(self, tmp_path):
+        """On POSIX (no drive anchor — the Docker deployment) the trash root
+        must sit on the SOURCE's own volume so disposal is an instant same-device
+        rename, not an EXDEV copy of the whole media file into /data. We assert
+        the bucket's parent shares the source's st_dev."""
+        if os.name == "nt":
+            pytest.skip("POSIX mount-walk behaviour; drive-anchor path covered above")
+        src = tmp_path / "movie.mkv"; src.write_text("x")
+        root = fileops._trash_root_for(str(src))
+        assert os.path.basename(root) == ".scanhound-trash"
+        # The bucket's mount point is on the same device as the source.
+        assert os.stat(os.path.dirname(root)).st_dev == os.stat(str(src)).st_dev
+
+    def test_trash_root_for_falls_back_when_source_unstattable(self, monkeypatch):
+        """If the source's device can't be determined (stat fails), fall back to
+        the module-level _TRASH_ROOT rather than raising."""
         monkeypatch.setattr(fileops.os.path, "splitdrive", lambda p: ("", p))
-        assert fileops._trash_root_for("whatever") == fileops._TRASH_ROOT
+        monkeypatch.setattr(fileops.os, "stat",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("no dev")))
+        assert fileops._trash_root_for("/nonexistent/movie.mkv") == fileops._TRASH_ROOT
 
     def test_trash_moves_into_source_volume_bucket_without_data_dir_copy(self, tmp_path):
         """End-to-end (no _TRASH_ROOT monkeypatch): trashing a source file

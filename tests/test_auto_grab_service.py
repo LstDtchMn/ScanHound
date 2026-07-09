@@ -317,6 +317,20 @@ class TestProcessItems:
         assert len(report.grabbed_items) == 1
         assert report.grabbed_items[0].title == "My Movie"
 
+    def test_forwards_year_hdr_dovi_for_dedup(self):
+        # Regression: auto-grab used to drop year/hdr/dovi, so every recorded
+        # grab landed with a NULL year and title-level dedup fell back to
+        # title+season only (a 2021 remake could falsely block the 1984 grab).
+        ds = MagicMock()
+        ds.download_item.return_value = {"success": True, "method": "jdownloader"}
+        svc = make_service(download_service=ds)
+        item = make_item(title="Dune", year=2021, hdr="HDR", dovi=True)
+        svc.process_items([item])
+        kw = ds.download_item.call_args.kwargs
+        assert kw.get("year") == 2021
+        assert kw.get("hdr") == "HDR"
+        assert kw.get("dovi") is True
+
     def test_log_callback_called(self):
         svc = make_service()
         log_calls = []

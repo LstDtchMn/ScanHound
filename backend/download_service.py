@@ -750,7 +750,11 @@ class DownloadService:
                 if self._results_cache.get(name) != change_key:
                     self._results_cache[name] = change_key
                     try:
-                        self.db.upsert_download_result(**row)
+                        # 'save_to' is for the returned dict (auto-rename hook),
+                        # not a DB column — passing it would TypeError and the
+                        # whole row (silently) never persists to download_results.
+                        self.db.upsert_download_result(
+                            **{k: v for k, v in row.items() if k != "save_to"})
                     except Exception as e:
                         logger.debug("upsert_download_result failed: %s", e)
 

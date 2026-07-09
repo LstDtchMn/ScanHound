@@ -1197,7 +1197,21 @@ class RenameService:
             db.update_rename_job(job_id, status="failed", error_message="Source file missing")
             self._broadcast(job_id)
             return {"ok": False, "error": "Source file missing"}
-        dst = os.path.join(job.get("destination_path") or "",
+        # Destination guard: a job whose library isn't configured has an empty or
+        # RELATIVE destination_path (build_target used an empty root). Applying it
+        # would place the media under the container's CWD (/app overlay) — invisible
+        # to Plex and a multi-GB copy into the writable layer. Refuse and hold for
+        # review instead of writing to a junk location. (The identify/rematch paths
+        # already guard this; the apply path — reachable via bulk-apply on a
+        # needs_review job — did not.)
+        dest_dir = job.get("destination_path") or ""
+        if not dest_dir or not os.path.isabs(dest_dir):
+            msg = ("Library not configured — set the destination in "
+                   "Settings → Renaming before applying")
+            db.update_rename_job(job_id, status="needs_review", warning_message=msg)
+            self._broadcast(job_id)
+            return {"ok": False, "error": msg}
+        dst = os.path.join(dest_dir,
                            job.get("new_filename") or os.path.basename(src))
         # Collision guard: a prior apply (or a file already present in the
         # library) may already occupy this destination — e.g. two different
@@ -1485,12 +1499,17 @@ class RenameService:
         if not eligible:
             return {"ok": True, "queued": 0, "skipped": skipped}
 
-        for jid in eligible:
+        for job in jobs:
+            if int(job["id"]) not in set(eligible):
+                continue
             try:
-                db.update_rename_job(jid, status="applying")
-                self._broadcast(jid)
+                # Remember the status we're leaving so crash recovery restores it
+                # (a needs_review job must not come back as auto-appliable 'matched').
+                db.update_rename_job(int(job["id"]), status="applying",
+                                     prior_status=job.get("status"))
+                self._broadcast(int(job["id"]))
             except Exception:
-                logger.exception("queue_apply: could not mark job %s applying", jid)
+                logger.exception("queue_apply: could not mark job %s applying", job.get("id"))
 
         def _worker(job_ids: list) -> None:
             # Serialize with other bulk operations; blocking here is fine —

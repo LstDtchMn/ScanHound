@@ -7,6 +7,19 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.21.0",
+    date: "2026-07-09",
+    summary: "Week-in-review bug sweep: duplicate protection, safer applies, accurate counts",
+    changes: [
+      "Fewer duplicate downloads: auto-grab now records each release's year, so a title you already own is matched precisely — and TV seasons you've grabbed are correctly recognized instead of quietly resurfacing as Missing after the source rolls out of cache",
+      "Undo actually works again on the phone: undoing a dismissed or skipped title brings it right back to the deck (in the browse view it had been silently doing nothing), and a dismiss that fails to reach the server no longer makes the title vanish from your list",
+      "The Missing count stays honest after a grab — sibling releases that drop out of the list no longer leave the counter stuck too high",
+      "Applying a rename is safer: a file whose library isn't configured is now held for review with a clear message instead of being moved into a hidden location, and a rename you flagged for review is never silently promoted to auto-apply after an unclean shutdown or crash",
+      "A Cloudflare-blocked source no longer purges still-listed titles from your results (they were being wrongly dropped as 'gone' and reappearing later as brand-new), and a normal end-of-list page is no longer mistaken for a block",
+      "Under the hood: download history now persists reliably, re-identified items refresh their info immediately, and disposed files during a move are kept on the source drive instead of being copied into app storage",
+    ],
+  },
+  {
     version: "2.20.0",
     date: "2026-07-09",
     summary: "Rename progress bars + crash-safe, corruption-verified moves",

@@ -100,7 +100,7 @@
       resolution: item.resolution,
       dovi: item.dovi
     });
-    addToast('Dismissed', item.title, 'normal', { label: 'Undo', run: () => restoreItem(item.url) });
+    addToast('Dismissed', item.title, 'normal', { label: 'Undo', run: () => restoreItem(item.url, item) });
   }
 </script>
 

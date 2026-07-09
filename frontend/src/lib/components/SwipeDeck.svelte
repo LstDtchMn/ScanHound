@@ -69,7 +69,7 @@
 
   // Undo stack (most recent last). A group-level action: 'select' queued the
   // chosen release; 'skip' dismissed every release of the title.
-  type Swipe = { key: string; title: string; action: 'select' | 'skip'; selectedUrl?: string; urls: string[] };
+  type Swipe = { key: string; title: string; action: 'select' | 'skip'; selectedUrl?: string; urls: string[]; releases: ScanResult[] };
   let undoStack = $state<Swipe[]>([]);
 
   // Selected items (pulled from the full result set — selected cards leave the deck)
@@ -140,7 +140,7 @@
     if (actionTimer) clearTimeout(actionTimer);
     actionTimer = setTimeout(() => {
       const urls = group.releases.map((r) => r.url);
-      const entry: Swipe = { key: group.key, title: group.title, action, selectedUrl: chosen?.url, urls };
+      const entry: Swipe = { key: group.key, title: group.title, action, selectedUrl: chosen?.url, urls, releases: group.releases };
       undoStack = [...undoStack.slice(-9), entry];
       // Resolve the whole title so it leaves the deck (its other releases stay
       // actionable in the wall but won't re-offer here).
@@ -180,7 +180,9 @@
     if (last.action === 'select') {
       if (last.selectedUrl) toggleSelect(last.selectedUrl); // deselect the queued release
     } else {
-      last.urls.forEach((u) => restoreItem(u)); // un-dismiss every release
+      // Pass the row back so paged mode can re-insert it (a paged dismiss drops
+      // the row from `results`, so a flag-only restore leaves nothing to show).
+      last.releases.forEach((r) => restoreItem(r.url, r)); // un-dismiss every release
     }
   }
 

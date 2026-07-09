@@ -345,8 +345,12 @@ class DatabaseManager:
                 for _col, _decl in (("group_key", "TEXT"), ("resolution", "TEXT"), ("dovi", "INTEGER")):
                     try:
                         cursor.execute(f"ALTER TABLE dismissed_items ADD COLUMN {_col} {_decl}")
-                    except sqlite3.OperationalError:
-                        pass  # column already exists
+                    except sqlite3.OperationalError as e:
+                        # Only tolerate "already exists"; re-raise a real failure
+                        # (locked / disk I/O) so we don't leave the column missing
+                        # and then blow up later in add_dismissed_items.
+                        if "duplicate column" not in str(e).lower():
+                            raise
 
                 # Durable per-package download + extraction outcome, polled from
                 # JDownloader. Keyed by JD package name so the row survives even
@@ -499,6 +503,10 @@ class DatabaseManager:
                     # strings) — surfaced in the Renames UI so a low-confidence
                     # match explains itself.
                     'ALTER TABLE rename_jobs ADD COLUMN match_reasons TEXT',
+                    # Status a job had just before it was flipped to the transient
+                    # 'applying' — so crash recovery restores needs_review (not a
+                    # blanket 'matched' that would bypass the review gate).
+                    'ALTER TABLE rename_jobs ADD COLUMN prior_status TEXT',
                     # Year makes the grab key year-aware (normalized|year|season)
                     # for send-time duplicate protection + the read-time overlay,
                     # so a 2021 remake never blocks/marks the 1984 original.
@@ -1602,6 +1610,11 @@ class DatabaseManager:
                     "WHERE url = :url",
                     [{'url': u['url'], 'status': u.get('status', ''), 'data': u.get('data')} for u in rows])
                 conn.commit()
+                # Bump the cache revision: this is an in-place blob mutation that
+                # changes neither COUNT(*) nor MAX(last_seen_at), so without this
+                # the read-side parse-cache version (get_background_cache_version)
+                # would be unchanged and serve stale, pre-re-match items.
+                self._bg_cache_rev += 1
             return True
         except Exception as e:
             if conn:
@@ -1688,7 +1701,7 @@ class DatabaseManager:
         "match_source", "move_method", "proposed_match", "plex_sort_title",
         "warning_message", "error_message", "processed_at", "reverted_at",
         "suggested_correction", "combined_episode", "split_file", "poster_path",
-        "match_reasons",
+        "match_reasons", "prior_status",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.
@@ -1800,8 +1813,12 @@ class DatabaseManager:
             one=True, default=[0])
         count = (n[0] if n else 0) or 0
         if count:
+            # Restore the pre-apply status (needs_review stays needs_review, so a
+            # human-gated match isn't silently promoted to auto-appliable);
+            # fall back to 'matched' for legacy rows with no prior_status.
             self._mutate(
-                "UPDATE rename_jobs SET status = 'matched' WHERE status = 'applying'",
+                "UPDATE rename_jobs SET status = COALESCE(prior_status, 'matched'), "
+                "prior_status = NULL WHERE status = 'applying'",
                 label="reset_applying_rename_jobs")
         return count
 

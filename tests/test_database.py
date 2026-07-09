@@ -174,6 +174,22 @@ class TestDismissedItems:
         assert db_manager.get_rename_job(d)["status"] == "needs_review"   # untouched
         assert db_manager.reset_applying_rename_jobs() == 0  # idempotent
 
+    def test_reset_applying_restores_prior_status(self, db_manager):
+        # A job flipped needs_review -> applying (bulk-apply) must come BACK as
+        # needs_review on crash recovery, not be silently promoted to auto-
+        # appliable 'matched'. Legacy rows with no prior_status fall back to
+        # 'matched'.
+        gated = db_manager.create_rename_job(
+            {"original_path": "/x/gated.mkv", "status": "applying",
+             "prior_status": "needs_review"})
+        legacy = db_manager.create_rename_job(
+            {"original_path": "/x/legacy.mkv", "status": "applying"})  # no prior_status
+        assert db_manager.reset_applying_rename_jobs() == 2
+        assert db_manager.get_rename_job(gated)["status"] == "needs_review"
+        assert db_manager.get_rename_job(legacy)["status"] == "matched"
+        # prior_status is cleared so a later real apply can't re-stash a stale value.
+        assert not db_manager.get_rename_job(gated).get("prior_status")
+
     def test_dismiss_records_title_quality(self, db_manager):
         # Rich tuple (url, title, group_key, resolution, dovi) powers title-level skip.
         db_manager.add_dismissed_items([("http://x/a", "Heat", "heat|1995", "1080p", False)])

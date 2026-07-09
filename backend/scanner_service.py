@@ -631,14 +631,20 @@ class ScannerService:
                 try:
                     resp = await loop.run_in_executor(None, lambda u=url: scraper.get(u, timeout=15))
                     if resp.status_code != 200:
-                        blocked_total += 1
-                        blocked_streak += 1
-                        last_block_status = resp.status_code
-                        # Back off (grows with the streak) so a blocked source
-                        # isn't hammered with N requests in a few seconds.
-                        await asyncio.sleep(min(0.5 * blocked_streak, 3.0))
-                        if blocked_streak >= 3:
-                            break  # session can't clear the block this run
+                        # ONLY a Cloudflare / rate-limit block (403/429/503) is a
+                        # "block": it fails every page, so back off and abandon the
+                        # source, and (below) mark the crawl incomplete so still-
+                        # listed items aren't purged. A 404/other is ordinary
+                        # end-of-content — skip that page quietly.
+                        if resp.status_code in (403, 429, 503):
+                            blocked_total += 1
+                            blocked_streak += 1
+                            last_block_status = resp.status_code
+                            # Back off (grows with the streak) so a blocked source
+                            # isn't hammered with N requests in a few seconds.
+                            await asyncio.sleep(min(0.5 * blocked_streak, 3.0))
+                            if blocked_streak >= 3:
+                                break  # session can't clear the block this run
                         continue
                     blocked_streak = 0  # a good page resets the streak
 
@@ -682,6 +688,11 @@ class ScannerService:
                     self._log(f"Crawl error: {e}", "error")
 
             if blocked_total:
+                # A blocked source's crawl is INCOMPLETE — treat it like an
+                # early-stop so the caller does NOT purge still-listed items it
+                # simply couldn't reach (they'd reappear as new when the block
+                # clears).
+                early_stopped = True
                 self._log(
                     f"{source_name}: {blocked_total} page(s) blocked "
                     f"(HTTP {last_block_status}) — Cloudflare not cleared; this "

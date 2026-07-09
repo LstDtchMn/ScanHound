@@ -270,6 +270,23 @@ class TestLibraryGuard:
         job = db.get_rename_job(svc.process_package("ok", save_to)[0])
         assert job["status"] == "matched"  # guard doesn't fire when set
 
+    def test_apply_refuses_job_without_absolute_destination(self, db, tmp_path):
+        # The apply path (reachable via bulk-apply on a needs_review job) must
+        # refuse a job whose destination_path is empty/relative — otherwise the
+        # media is moved under the container CWD (/app overlay), invisible to
+        # Plex and a multi-GB copy into the writable layer. Source stays put.
+        src = tmp_path / "Movie.2020.1080p.mkv"; src.write_text("data")
+        svc = _service(db, _matrix_search)  # search fn unused; apply() called directly
+        jid = db.create_rename_job({
+            "original_path": str(src), "status": "matched",
+            "destination_path": "",  # library not configured
+            "new_filename": "Movie (2020).mkv"})
+        out = svc.apply(jid)
+        assert out["ok"] is False
+        assert "not configured" in (out.get("error") or "").lower()
+        assert db.get_rename_job(jid)["status"] == "needs_review"
+        assert src.exists()  # untouched — not moved into the app overlay
+
 
 # ── resolution=None -> ffprobe width fallback routing ──────────────────
 

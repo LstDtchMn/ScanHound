@@ -43,6 +43,9 @@ const {
   deckGroups,
   dismissItem,
   restoreItem,
+  markGrabbedSiblings,
+  stats,
+  filteredTotal,
   pagedMode,
   postedAfter,
   postedBefore
@@ -322,10 +325,84 @@ describe('dismissItem / restoreItem', () => {
     expect(get(dismissedUrls).has('https://example.com/z')).toBe(false);
   });
 
+  it('paged mode: a failed dismiss re-inserts the removed row', async () => {
+    pagedMode.set(true);
+    vi.mocked(api.dismissItems).mockRejectedValueOnce(new Error('network'));
+    const a = item({ url: 'a', title: 'A' });
+    results.set([a, item({ url: 'b', title: 'B' })]);
+    filteredTotal.set(2);
+    dismissItem('a', 'A');
+    expect(get(results).map((r) => r.url)).toEqual(['b']); // optimistically removed
+    await vi.waitFor(() => {
+      expect(get(results).map((r) => r.url)).toContain('a'); // restored on API failure
+    });
+    expect(get(filteredTotal)).toBe(2);
+    expect(get(dismissedUrls).has('a')).toBe(false);
+  });
+
   it('is a no-op for an empty url', () => {
     dismissItem('');
     expect(get(dismissedUrls).size).toBe(0);
     expect(api.dismissItems).not.toHaveBeenCalled();
+  });
+
+  it('paged mode: dismiss drops the row and restore(item) re-inserts it', () => {
+    pagedMode.set(true);
+    const a = item({ url: 'a', title: 'A' });
+    results.set([a, item({ url: 'b', title: 'B' })]);
+    filteredTotal.set(2);
+
+    dismissItem('a', 'A');
+    expect(get(results).map((r) => r.url)).toEqual(['b']); // physically removed
+    expect(get(filteredTotal)).toBe(1);
+
+    restoreItem('a', a);
+    expect(get(results).map((r) => r.url)).toContain('a'); // brought back
+    expect(get(filteredTotal)).toBe(2);
+    expect(get(dismissedUrls).has('a')).toBe(false);
+  });
+
+  it('paged-mode restore does not duplicate an already-present row', () => {
+    pagedMode.set(true);
+    const a = item({ url: 'a', title: 'A' });
+    results.set([a]);
+    filteredTotal.set(1);
+    restoreItem('a', a); // row never left results
+    expect(get(results).filter((r) => r.url === 'a')).toHaveLength(1);
+    expect(get(filteredTotal)).toBe(1);
+  });
+});
+
+describe('markGrabbedSiblings', () => {
+  beforeEach(() => {
+    resetStores();
+    stats.set({ total: 3, missing: 3, upgrade: 0, library: 0 });
+    vi.clearAllMocks();
+  });
+
+  it('flips equal/lower siblings to downloaded_similar and decrements missing', () => {
+    results.set([
+      item({ url: 'g', group_key: 'k', resolution: '1080p', dovi: false, status: 'downloaded' }),
+      item({ url: 'lo', group_key: 'k', resolution: '720p', dovi: false, status: 'missing' }),
+      item({ url: 'other', group_key: 'z', resolution: '1080p', status: 'missing' })
+    ]);
+    markGrabbedSiblings('g');
+    const byUrl = Object.fromEntries(get(results).map((r) => [r.url, r]));
+    expect(byUrl.lo.status).toBe('downloaded_similar'); // same title, not an upgrade
+    expect(byUrl.other.status).toBe('missing');         // different group, untouched
+    expect(get(stats).missing).toBe(2);                 // one sibling left the missing pool
+  });
+
+  it('leaves a genuinely-better sibling missing and does not decrement', () => {
+    results.set([
+      item({ url: 'g', group_key: 'k', resolution: '1080p', dovi: false, status: 'downloaded' }),
+      item({ url: 'hi', group_key: 'k', resolution: '2160p', dovi: false, status: 'missing' })
+    ]);
+    markGrabbedSiblings('g');
+    const hi = get(results).find((r) => r.url === 'hi')!;
+    expect(hi.status).toBe('missing');       // higher res stays grabbable
+    expect(hi.prior_grab).toBeTruthy();       // but annotated with what you have
+    expect(get(stats).missing).toBe(3);       // unchanged
   });
 });
 

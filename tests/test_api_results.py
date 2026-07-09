@@ -269,6 +269,28 @@ def test_downloaded_overlay_survives_cache_rotation():
     assert by_url["d/4k"]["prior_grab"]["resolution"] == "1080p"
 
 
+def test_grabbed_tv_sibling_reclassified_by_title_quality():
+    # TV overlay regression: served TV items carry the YEARLESS single-season key
+    # "dune|S1" (assigned by detect_duplicate_groups), but the title-quality
+    # overlay used to reconstruct "{title}|{year}|S{season}" — which never matched
+    # a TV item, so grabbed TV siblings resurfaced as missing after cache rotation.
+    # The overlay must reconstruct TV keys as "{title}|S{season}".
+    rows = [
+        _row("Dune", season=1, group_key="dune|S1", resolution="4K", url="d/s1-4k"),
+        _row("Dune", season=1, group_key="dune|S1", resolution="720p", url="d/s1-720"),
+    ]
+    c = _client_with_cache(rows)
+    registry.db.get_downloaded_urls.return_value = set()       # grabbed URL gone from cache
+    registry.db.get_downloaded_title_quality.return_value = [
+        ("dune", None, 1, "1080p", 0),                          # grabbed S1 at 1080p
+    ]
+    data = c.get("/results/cached", params={"per_page": 100}).json()
+    by_url = {i["url"]: i for i in data["items"]}
+    assert by_url["d/s1-720"]["status"] == "downloaded_similar"  # lower → have a copy
+    assert by_url["d/s1-4k"]["status"] == "missing"              # better → still grabbable
+    assert by_url["d/s1-4k"]["prior_grab"]["resolution"] == "1080p"
+
+
 def test_dismiss_without_meta_backfills_from_cache():
     # An old app bundle sends urls+titles but no meta. The server must fill
     # group_key/resolution/dovi from its own cached item so title-level skip
