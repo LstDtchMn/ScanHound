@@ -1780,6 +1780,25 @@ class DatabaseManager:
                 (limit,), default=[])
         return [self._deserialize_rename_row(r) for r in (rows or [])]
 
+    def reset_applying_rename_jobs(self):
+        """Reset jobs stuck in the transient 'applying' state back to 'matched'.
+
+        'applying' is set just before a queued move runs; if the process
+        crashed or the box lost power mid-apply, the job would otherwise be
+        stuck there forever (queue_apply skips 'applying'). Called once at
+        startup so orphaned applies become retriable again. The move itself is
+        crash-safe (verified copy to a .part sidecar, atomic rename, source kept
+        until verified), so re-applying is always safe. Returns the row count."""
+        n = self._query(
+            "SELECT COUNT(*) FROM rename_jobs WHERE status = 'applying'",
+            one=True, default=[0])
+        count = (n[0] if n else 0) or 0
+        if count:
+            self._mutate(
+                "UPDATE rename_jobs SET status = 'matched' WHERE status = 'applying'",
+                label="reset_applying_rename_jobs")
+        return count
+
     def count_rename_jobs_by_status(self):
         """Return a ``{status: count}`` map over all rename jobs."""
         rows = self._query(

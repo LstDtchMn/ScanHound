@@ -199,6 +199,18 @@ def _init_services(
     from backend.rename.service import RenameService
     reg._rename_service = RenameService(reg)
 
+    # Crash recovery: any job left in the transient 'applying' state (process
+    # died mid-move) is reset to 'matched' so it can be retried. The move is
+    # crash-safe, so this never risks a half-applied file.
+    if backend.db is not None:
+        try:
+            n = backend.db.reset_applying_rename_jobs()
+            if n:
+                logger.info("Recovered %d rename job(s) stuck in 'applying' "
+                            "after an unclean shutdown", n)
+        except Exception:
+            logger.warning("applying-job recovery failed (non-fatal)", exc_info=True)
+
     # One-shot poster backfill for jobs created before poster capture existed
     # (they render as "No poster" otherwise). Delayed + threaded so startup
     # never blocks on TMDB; idempotent (only touches empty poster_path rows).

@@ -2,7 +2,7 @@
   import RenamePoster from './RenamePoster.svelte';
   import BadgeCluster from './BadgeCluster.svelte';
   import { tileShowMeta } from '$lib/stores/results';
-  import { selectedJobIds, toggleSelect } from '$lib/stores/renames';
+  import { selectedJobIds, toggleSelect, renameProgress } from '$lib/stores/renames';
   import type { RenameJob } from '$lib/api/types';
 
   let { job, onRematch }: { job: RenameJob; onRematch: (job: RenameJob) => void } = $props();
@@ -44,6 +44,16 @@
       {#if job.new_filename}
         <div class="text-[10px] text-[var(--text-secondary)] truncate" title={job.new_filename}>
           {job.new_filename}
+        </div>
+      {/if}
+      {#if job.status === 'applying'}
+        <div class="mt-1 h-1 rounded-full bg-[var(--bg-tertiary)] overflow-hidden">
+          {#if $renameProgress.get(job.id)}
+            <div class="h-full bg-[var(--accent)] transition-[width] duration-200"
+                 style="width: {$renameProgress.get(job.id)?.pct ?? 0}%"></div>
+          {:else}
+            <div class="h-full w-1/3 bg-[var(--accent)]/70 animate-pulse"></div>
+          {/if}
         </div>
       {/if}
     </div>

@@ -159,6 +159,21 @@ class TestDismissedItems:
         db_manager.remove_dismissed_items(["http://x/a", "http://x/b"])
         assert db_manager.get_dismissed_urls() == set()
 
+    def test_reset_applying_rename_jobs(self, db_manager):
+        # Crash recovery: jobs stuck 'applying' after an unclean shutdown must
+        # be reset to 'matched' (retriable); other statuses are untouched.
+        a = db_manager.create_rename_job({"original_path": "/x/a.mkv", "status": "applying"})
+        b = db_manager.create_rename_job({"original_path": "/x/b.mkv", "status": "applying"})
+        c = db_manager.create_rename_job({"original_path": "/x/c.mkv", "status": "applied"})
+        d = db_manager.create_rename_job({"original_path": "/x/d.mkv", "status": "needs_review"})
+        n = db_manager.reset_applying_rename_jobs()
+        assert n == 2
+        assert db_manager.get_rename_job(a)["status"] == "matched"
+        assert db_manager.get_rename_job(b)["status"] == "matched"
+        assert db_manager.get_rename_job(c)["status"] == "applied"        # untouched
+        assert db_manager.get_rename_job(d)["status"] == "needs_review"   # untouched
+        assert db_manager.reset_applying_rename_jobs() == 0  # idempotent
+
     def test_dismiss_records_title_quality(self, db_manager):
         # Rich tuple (url, title, group_key, resolution, dovi) powers title-level skip.
         db_manager.add_dismissed_items([("http://x/a", "Heat", "heat|1995", "1080p", False)])

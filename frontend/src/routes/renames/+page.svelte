@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import {
     renameJobs, renameStatus, renameCategory, renameQuery, renameSort,
-    viewMode,
+    viewMode, renameQueue,
     loadRenameJobs, loadRenameStatus, loadDvScans,
     applyJob, undoJob, deleteJob,
     acceptCombinedJob, acceptCorrectionJob,
@@ -220,6 +220,22 @@
     onReidentifyAll={reidentifyAll}
     {reidentifyingAll}
   />
+
+  {#if $renameQueue}
+    <div class="rounded-lg border border-[var(--accent)]/40 bg-[var(--accent)]/5 px-3 py-2">
+      <div class="flex items-center justify-between text-xs">
+        <span class="font-medium text-[var(--text-primary)]">
+          Applying {Math.min($renameQueue.done + 1, $renameQueue.total)} of {$renameQueue.total}
+          {#if $renameQueue.current_title}<span class="text-[var(--text-secondary)]"> — {$renameQueue.current_title}</span>{/if}
+        </span>
+        <span class="text-[var(--text-secondary)]">{Math.round(($renameQueue.done / Math.max($renameQueue.total, 1)) * 100)}%</span>
+      </div>
+      <div class="mt-1 h-1.5 rounded-full bg-[var(--bg-tertiary)] overflow-hidden">
+        <div class="h-full bg-[var(--accent)] transition-[width] duration-300"
+             style="width: {($renameQueue.done / Math.max($renameQueue.total, 1)) * 100}%"></div>
+      </div>
+    </div>
+  {/if}
 
   {#if $renameStatus && !$renameStatus.enabled}
     <p class="text-xs text-[var(--text-secondary)]">

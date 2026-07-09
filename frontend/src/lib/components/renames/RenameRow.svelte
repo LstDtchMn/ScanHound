@@ -1,7 +1,7 @@
 <script lang="ts">
   import RenamePoster from './RenamePoster.svelte';
   import BadgeCluster from './BadgeCluster.svelte';
-  import { selectedJobIds, toggleSelect, applyJob } from '$lib/stores/renames';
+  import { selectedJobIds, toggleSelect, applyJob, renameProgress } from '$lib/stores/renames';
   import type { RenameJob } from '$lib/api/types';
 
   let { job, onRematch }: { job: RenameJob; onRematch: (job: RenameJob) => void } = $props();
@@ -14,6 +14,12 @@
       .join(' ')
   );
   let canApply = $derived(job.status === 'matched' || job.status === 'needs_review');
+  let applying = $derived(job.status === 'applying');
+  let prog = $derived($renameProgress.get(job.id));
+
+  function gb(bytes: number): string {
+    return (bytes / 1024 ** 3).toFixed(1);
+  }
 
   async function apply() {
     busy = true;
@@ -55,6 +61,26 @@
     {:else if job.warning_message}
       <div class="text-xs text-[var(--warning)] truncate" title={job.warning_message}>
         {job.warning_message}
+      </div>
+    {/if}
+    {#if applying}
+      <div class="mt-1">
+        <div class="h-1.5 rounded-full bg-[var(--bg-tertiary)] overflow-hidden">
+          {#if prog}
+            <div class="h-full bg-[var(--accent)] transition-[width] duration-200"
+                 style="width: {prog.pct}%"></div>
+          {:else}
+            <!-- No byte progress yet: instant same-drive move, or just starting -->
+            <div class="h-full w-1/3 bg-[var(--accent)]/70 animate-pulse"></div>
+          {/if}
+        </div>
+        <div class="mt-0.5 text-[11px] text-[var(--text-secondary)]">
+          {#if prog}
+            Moving… {prog.pct}% ({gb(prog.bytes_done)} / {gb(prog.bytes_total)} GB)
+          {:else}
+            Applying…
+          {/if}
+        </div>
       </div>
     {/if}
   </div>

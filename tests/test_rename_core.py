@@ -92,6 +92,58 @@ class TestFileOps:
         assert fileops.place_file(str(src), str(dst), "copy") == "copy"
         assert dst.read_bytes() == b"hello world" and src.exists()
 
+    def test_copy_leaves_no_part_file_on_success(self, tmp_path):
+        src = tmp_path / "src.mkv"; src.write_bytes(b"x" * 5000)
+        dst = tmp_path / "lib" / "out.mkv"
+        fileops.place_file(str(src), str(dst), "copy")
+        assert dst.exists()
+        assert not (tmp_path / "lib" / "out.mkv.part").exists()
+
+    def test_copy_reports_progress(self, tmp_path):
+        src = tmp_path / "src.mkv"; src.write_bytes(b"y" * (20 * 1024 * 1024 + 7))
+        dst = tmp_path / "out.mkv"
+        seen = []
+        fileops.place_file(str(src), str(dst), "copy",
+                           progress_cb=lambda d, t: seen.append((d, t)))
+        assert seen, "progress_cb never called"
+        assert seen[-1][0] == seen[-1][1] == src.stat().st_size  # ends at 100%
+        assert all(t == src.stat().st_size for _, t in seen)     # total is stable
+
+    def test_crash_before_atomic_rename_leaves_no_partial_dst(self, tmp_path, monkeypatch):
+        # Simulate a crash at the worst moment: bytes written to .part, but the
+        # process dies just before the atomic rename. The real destination must
+        # NOT exist (no partial file), and the source is untouched.
+        src = tmp_path / "src.mkv"; src.write_bytes(b"z" * 4096)
+        dst = tmp_path / "lib" / "out.mkv"
+
+        def _boom(*a, **k):
+            raise OSError("simulated power loss")
+        monkeypatch.setattr(fileops.os, "replace", _boom)
+
+        with pytest.raises(OSError):
+            fileops.place_file(str(src), str(dst), "copy")
+        assert not dst.exists(), "a partial file was left at the real destination!"
+        assert not (tmp_path / "lib" / "out.mkv.part").exists()  # .part cleaned up
+        assert src.read_bytes() == b"z" * 4096                    # source intact
+
+    def test_crash_mid_move_keeps_source_recoverable(self, tmp_path, monkeypatch):
+        # Cross-device 'move' that crashes mid-copy: source must survive so the
+        # file is never lost, and no partial appears at the destination.
+        src = tmp_path / "src.mkv"; src.write_bytes(b"q" * 8192)
+        dst = tmp_path / "lib" / "out.mkv"
+        # Force the EXDEV (cross-device) branch, then crash the atomic rename.
+        real_rename = fileops.os.rename
+        def _exdev(a, b):
+            import errno as _e
+            raise OSError(_e.EXDEV, "cross-device")
+        monkeypatch.setattr(fileops.os, "rename", _exdev)
+        monkeypatch.setattr(fileops.os, "replace",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("crash")))
+        with pytest.raises(OSError):
+            fileops.place_file(str(src), str(dst), "move")
+        assert src.exists() and src.read_bytes() == b"q" * 8192   # NEVER lost
+        assert not dst.exists()
+
     def test_refuses_to_overwrite(self, tmp_path):
         src = tmp_path / "src.mkv"; src.write_text("a")
         dst = tmp_path / "out.mkv"; dst.write_text("existing")

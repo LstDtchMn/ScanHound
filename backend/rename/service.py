@@ -1164,10 +1164,32 @@ class RenameService:
         method = self._cfg.get("auto_rename_move_method", "hardlink")
         deletions_require_confirmation = self._cfg.get(
             "deletions_require_confirmation", True)
+        # Per-item progress: only a genuine cross-device COPY streams bytes and
+        # fires this; a same-device rename/hardlink completes instantly and
+        # never calls it. Throttled to ~2.5 Hz so a big remux doesn't flood the
+        # socket, but always emits the final 100%.
+        _last_emit = [0.0]
+
+        def _progress(done: int, total: int) -> None:
+            import time as _t
+            now = _t.monotonic()
+            if done < total and (now - _last_emit[0]) < 0.4:
+                return
+            _last_emit[0] = now
+            try:
+                from backend.api.ws import ws_manager
+                pct = int(done * 100 / total) if total else 0
+                ws_manager.broadcast_sync({
+                    "type": "rename:progress",
+                    "data": {"id": job_id, "bytes_done": done,
+                             "bytes_total": total, "pct": pct}})
+            except Exception:
+                pass
         try:
             used = _fileops.place_file(
                 src, dst, method, automatic=automatic,
-                deletions_require_confirmation=deletions_require_confirmation)
+                deletions_require_confirmation=deletions_require_confirmation,
+                progress_cb=_progress)
         except Exception as e:
             rlog.warning("move   | FAILED %s -> %s (%s): %s", src, dst, method, e)
             db.update_rename_job(job_id, status="failed", error_message=str(e))
@@ -1408,8 +1430,12 @@ class RenameService:
         def _worker(job_ids: list) -> None:
             # Serialize with other bulk operations; blocking here is fine —
             # we're on a daemon thread, not an HTTP request.
+            total = len(job_ids)
             with self._bulk_lock:
-                for jid in job_ids:
+                for idx, jid in enumerate(job_ids):
+                    job = db.get_rename_job(jid) if db else None
+                    self._broadcast_queue(idx, total,
+                                          (job or {}).get("title") if job else None)
                     try:
                         self.apply(jid)
                     except Exception:
@@ -1421,10 +1447,24 @@ class RenameService:
                             self._broadcast(jid)
                         except Exception:
                             pass
+                # Signal completion so the UI clears the queue bar.
+                self._broadcast_queue(total, total, None)
 
         threading.Thread(target=_worker, args=(eligible,), daemon=True,
                          name="rename-apply").start()
         return {"ok": True, "queued": len(eligible), "skipped": skipped}
+
+    def _broadcast_queue(self, done: int, total: int, current_title) -> None:
+        """Emit overall apply-queue progress (job ``done`` of ``total``)."""
+        try:
+            from backend.api.ws import ws_manager
+            ws_manager.broadcast_sync({
+                "type": "rename:queue_progress",
+                "data": {"done": done, "total": total,
+                         "current_title": current_title,
+                         "active": done < total}})
+        except Exception:
+            pass
 
     def bulk_apply(self, ids: list) -> dict:
         if not self._bulk_lock.acquire(blocking=False):

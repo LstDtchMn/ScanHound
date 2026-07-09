@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import shutil
+from typing import Callable, Optional
 
 from backend.config import _DATA_DIR
 
@@ -34,6 +35,10 @@ MOVE_METHODS = ("move", "copy", "hardlink", "symlink")
 # Trash root — overridable by tests via monkeypatch.
 _TRASH_ROOT = os.path.join(_DATA_DIR, "trash")
 
+# Streaming-copy chunk size. Big enough to keep USB HDD sequential throughput
+# high; small enough for smooth progress reporting.
+_COPY_CHUNK = 8 * 1024 * 1024
+
 
 def _hash_file(path: str) -> str:
     h = hashlib.blake2b()
@@ -41,6 +46,58 @@ def _hash_file(path: str) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _copy_verify_atomic(src: str, dst: str,
+                        progress_cb: Optional[Callable[[int, int], None]] = None) -> None:
+    """Crash-safe verified copy of ``src`` → ``dst``.
+
+    Streams into a ``dst + '.part'`` sidecar on the *destination* volume, flushes
+    to disk (fsync), hash-verifies (blake2b, matching :func:`_hash_file`), then
+    atomically renames it into place with :func:`os.replace`. Consequences:
+
+    * A crash/power-loss mid-copy never leaves a partial file at the real
+      destination — only a ``.part`` temp, which the next apply truncates and
+      reuses. ``dst`` appears only once every byte is on disk and verified.
+    * The source is untouched here, so it is always recoverable; the caller
+      disposes of it only after this returns (for a 'move').
+
+    ``progress_cb(bytes_done, bytes_total)`` is called as bytes are written
+    (best-effort — exceptions from it are swallowed).
+    """
+    part = dst + ".part"
+    total = os.path.getsize(src) or 0
+    src_h = hashlib.blake2b()
+    done = 0
+    try:
+        with open(src, "rb") as fi, open(part, "wb") as fo:
+            while True:
+                chunk = fi.read(_COPY_CHUNK)
+                if not chunk:
+                    break
+                fo.write(chunk)
+                src_h.update(chunk)
+                done += len(chunk)
+                if progress_cb:
+                    try:
+                        progress_cb(done, total)
+                    except Exception:
+                        pass
+            fo.flush()
+            os.fsync(fo.fileno())
+        shutil.copystat(src, part)
+        if src_h.hexdigest() != _hash_file(part):
+            raise OSError("Copy verification failed (hash mismatch)")
+        os.replace(part, dst)  # atomic on the destination volume
+    except BaseException:
+        # Never leave a stray .part behind on failure (it would be reused on the
+        # next attempt anyway, but clean up eagerly).
+        try:
+            if os.path.exists(part):
+                os.remove(part)
+        except Exception:
+            pass
+        raise
 
 
 def _trash_bucket_name() -> str:
@@ -386,7 +443,8 @@ def sweep_trash(retention_days: int, roots=None) -> dict:
 
 def place_file(src: str, dst: str, method: str = "hardlink", *,
                automatic: bool = False,
-               deletions_require_confirmation: bool = True) -> str:
+               deletions_require_confirmation: bool = True,
+               progress_cb: Optional[Callable[[int, int], None]] = None) -> str:
     """Place ``src`` at ``dst`` using ``method``; return the method used.
 
     Collision-safe: refuses to overwrite an existing destination. Verifies
@@ -427,22 +485,19 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
         return "symlink"
 
     if method == "copy":
-        shutil.copy2(src, dst)
-        if _hash_file(src) != _hash_file(dst):
-            os.remove(dst)
-            raise OSError("Copy verification failed (hash mismatch)")
+        _copy_verify_atomic(src, dst, progress_cb)
         return "copy"
 
-    # move: rename first (instant same-fs), else copy + verify + dispose of source.
+    # move: rename first (instant same-fs), else crash-safe copy + dispose source.
     try:
         os.rename(src, dst)
     except OSError as e:
         if e.errno != errno.EXDEV:
             raise
-        shutil.copy2(src, dst)
-        if _hash_file(src) != _hash_file(dst):
-            os.remove(dst)
-            raise OSError("Cross-device move verification failed (hash mismatch)")
+        _copy_verify_atomic(src, dst, progress_cb)
+        # The copy is fully on disk + verified; only now is it safe to remove
+        # the source. A crash before this point loses nothing (source intact,
+        # no partial at dst); a crash after leaves a harmless duplicate.
         if deletions_require_confirmation:
             _trash(src)
         else:

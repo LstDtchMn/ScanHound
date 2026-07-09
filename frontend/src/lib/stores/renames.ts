@@ -190,6 +190,47 @@ export async function deleteJob(id: number) {
   await loadRenameStatus();
 }
 
+// ── Apply progress ───────────────────────────────────────────────────
+// Per-job byte progress for an in-flight move (only a cross-device COPY emits
+// this; same-device renames finish instantly). Keyed by job id.
+export interface RenameProgress { pct: number; bytes_done: number; bytes_total: number; }
+export const renameProgress = writable<Map<number, RenameProgress>>(new Map());
+
+// Overall apply-queue progress ("job X of N"). null when nothing is applying.
+export interface RenameQueueProgress { done: number; total: number; current_title: string | null; }
+export const renameQueue = writable<RenameQueueProgress | null>(null);
+
+connection.on('rename:progress', (data) => {
+  const id = data.id as number;
+  if (!id) return;
+  renameProgress.update((m) => {
+    const next = new Map(m);
+    next.set(id, {
+      pct: (data.pct as number) ?? 0,
+      bytes_done: (data.bytes_done as number) ?? 0,
+      bytes_total: (data.bytes_total as number) ?? 0,
+    });
+    return next;
+  });
+});
+
+let queueClearTimer: ReturnType<typeof setTimeout>;
+connection.on('rename:queue_progress', (data) => {
+  const active = !!data.active;
+  clearTimeout(queueClearTimer);
+  if (!active) {
+    // Brief "100%" flash, then clear the queue bar.
+    renameQueue.set({ done: (data.done as number) ?? 0, total: (data.total as number) ?? 0, current_title: null });
+    queueClearTimer = setTimeout(() => renameQueue.set(null), 1500);
+    return;
+  }
+  renameQueue.set({
+    done: (data.done as number) ?? 0,
+    total: (data.total as number) ?? 0,
+    current_title: (data.current_title as string) ?? null,
+  });
+});
+
 // Live updates: upsert a job whenever the backend broadcasts a change.
 connection.on('rename:job', (data) => {
   const job = data as unknown as RenameJob;
@@ -203,6 +244,16 @@ connection.on('rename:job', (data) => {
     }
     return [job, ...jobs];
   });
+  // Once a job leaves 'applying' (applied/failed/needs_review), drop its
+  // per-item progress so the bar disappears.
+  if (job.status !== 'applying') {
+    renameProgress.update((m) => {
+      if (!m.has(job.id)) return m;
+      const next = new Map(m);
+      next.delete(job.id);
+      return next;
+    });
+  }
   loadRenameStatus();
 });
 
