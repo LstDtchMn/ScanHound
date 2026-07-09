@@ -378,6 +378,52 @@ class TestCreateMediaItem:
         assert "|S3" in item.group_key
 
 
+class TestAssignGroupKeys:
+    """ScannerService._assign_group_keys rebuilds group_key from the CURRENT
+    (post-enrichment) title/year/season, using the uniform recipe
+    {normalized_title}|{year or 0}|S{season or 0} — so a title that enrichment
+    corrected regroups under the right key instead of a frozen bogus one."""
+
+    def _svc(self, items):
+        svc = _make_service()
+        svc.items = items
+        return svc
+
+    def test_rebuilds_from_corrected_title(self):
+        # Guacamole case: parse froze a garbage key ("gua-killingfaith"),
+        # enrichment fixed the title to "Killing Faith".
+        svc = self._svc([
+            MediaItem(id="a", title="Killing Faith", year=2025, season=None,
+                      group_key="guakillingfaith|2025|S0"),
+        ])
+        svc._assign_group_keys()
+        assert svc.items[0].group_key == "killing faith|2025|S0"
+
+    def test_two_releases_same_title_merge_to_one_group(self):
+        svc = self._svc([
+            MediaItem(id="a", title="Killing Faith", year=2025,
+                      group_key="guakillingfaith|2025|S0"),
+            MediaItem(id="b", title="Killing Faith", year=2025,
+                      group_key="killing faith|2025|S0"),
+        ])
+        svc._assign_group_keys()
+        assert svc.items[0].group_key == svc.items[1].group_key == "killing faith|2025|S0"
+
+    def test_movie_and_tv_uniform_format(self):
+        svc = self._svc([
+            MediaItem(id="m", title="Dune", year=2021, season=None),
+            MediaItem(id="t", title="The Bear", year=2022, season=3),
+        ])
+        svc._assign_group_keys()
+        assert svc.items[0].group_key == "dune|2021|S0"
+        assert svc.items[1].group_key == "the bear|2022|S3"
+
+    def test_missing_year_normalizes_to_zero(self):
+        svc = self._svc([MediaItem(id="x", title="Some Show", year=0, season=1)])
+        svc._assign_group_keys()
+        assert svc.items[0].group_key == "some show|0|S1"
+
+
 # ── ScannerService.detect_duplicate_groups ───────────────────────────
 
 class TestMatchAgainstPlex:

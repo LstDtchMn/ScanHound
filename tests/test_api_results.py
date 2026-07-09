@@ -270,19 +270,19 @@ def test_downloaded_overlay_survives_cache_rotation():
 
 
 def test_grabbed_tv_sibling_reclassified_by_title_quality():
-    # TV overlay regression: served TV items carry the YEARLESS single-season key
-    # "dune|S1" (assigned by detect_duplicate_groups), but the title-quality
-    # overlay used to reconstruct "{title}|{year}|S{season}" — which never matched
-    # a TV item, so grabbed TV siblings resurfaced as missing after cache rotation.
-    # The overlay must reconstruct TV keys as "{title}|S{season}".
+    # TV overlay regression: served TV items carry the uniform key
+    # "{title}|{year}|S{season}" (e.g. "dune|2021|S1") assigned by the scanner's
+    # _assign_group_keys after enrichment. The title-quality overlay must
+    # reconstruct that SAME format so a grabbed TV sibling stays reclassified
+    # after the grabbed URL rolls out of the background cache.
     rows = [
-        _row("Dune", season=1, group_key="dune|S1", resolution="4K", url="d/s1-4k"),
-        _row("Dune", season=1, group_key="dune|S1", resolution="720p", url="d/s1-720"),
+        _row("Dune", season=1, group_key="dune|2021|S1", resolution="4K", url="d/s1-4k"),
+        _row("Dune", season=1, group_key="dune|2021|S1", resolution="720p", url="d/s1-720"),
     ]
     c = _client_with_cache(rows)
     registry.db.get_downloaded_urls.return_value = set()       # grabbed URL gone from cache
     registry.db.get_downloaded_title_quality.return_value = [
-        ("dune", None, 1, "1080p", 0),                          # grabbed S1 at 1080p
+        ("dune", 2021, 1, "1080p", 0),                          # grabbed S1 (2021) at 1080p
     ]
     data = c.get("/results/cached", params={"per_page": 100}).json()
     by_url = {i["url"]: i for i in data["items"]}

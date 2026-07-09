@@ -484,6 +484,14 @@ class ScannerService:
         # ── Enrich metadata ───────────────────────────────────────────
         await self._enrich_metadata_async()
 
+        # ── Finalize grouping ─────────────────────────────────────────
+        # group_key was seeded at parse time, but enrichment can CORRECT a
+        # garbage-parsed title (e.g. a release-group leak "gua-killingfaith" ->
+        # "Killing Faith") and fill in the year. Rebuild it now from the final
+        # canonical title/year/season so a fixed title groups (and dedups) under
+        # the right key instead of a frozen bogus one.
+        self._assign_group_keys()
+
         self._log(f"Scan complete: {len(self.items)} items found", "success")
 
     # ── Source building ───────────────────────────────────────────────
@@ -1301,6 +1309,21 @@ class ScannerService:
         )
 
     # ── Grouping ──────────────────────────────────────────────────────
+
+    def _assign_group_keys(self):
+        """(Re)derive each item's group_key from its CURRENT (post-enrichment)
+        title/year/season, using the canonical uniform recipe:
+
+            ``{normalized_title}|{year or 0}|S{season or 0}``
+
+        Movies key on title+year (season 0); TV keys on title+year+season. This
+        runs after enrichment so a corrected title (e.g. a release-group leak
+        fixed to the real name) regroups under the right key — the read-time
+        overlays in api/routes/results.py reconstruct this exact format.
+        """
+        for item in self.items:
+            norm = normalize_title(item.title)
+            item.group_key = f"{norm}|{item.year or 0}|S{item.season or 0}"
 
     def detect_duplicate_groups(self, filtered_items: Optional[List[MediaItem]] = None):
         """Group items by normalized title to detect duplicates and multi-season entries.

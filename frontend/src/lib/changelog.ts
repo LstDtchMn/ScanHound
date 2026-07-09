@@ -7,6 +7,14 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.22.1",
+    date: "2026-07-09",
+    summary: "Group titles by their corrected name, not the raw scrape",
+    changes: [
+      "Fixed a title that was mis-parsed on scrape (a release-group name bleeding into the title — e.g. 'Killing Faith' briefly grouping under 'guakillingfaith') from appearing as a separate look-alike tile. Every title's group is now rebuilt from its final, corrected name after metadata lookup, so all releases of a title stay on one card. As a bonus this makes the TV upgrade/duplicate overlay match correctly for the first time. (Existing entries heal on the next background scan.)",
+    ],
+  },
+  {
     version: "2.22.0",
     date: "2026-07-09",
     summary: "DV-aware upgrades + language on cards",

@@ -109,22 +109,17 @@ def _overlay_download_state(items, db):
         if not nt:
             continue
         rank, dovi = _res_rank(res), bool(dv)
-        # Reconstruct the SAME group_key(s) the scanner's _group() assigns:
-        #   movie -> "{nt}|{year}|S0"
-        #   TV    -> "{nt}|S{season}" (single-season) OR "{nt}|TV" (multi-season)
-        # We can't tell single- vs multi-season from one grab row, so populate
-        # BOTH TV keys. A movie with an unknown year can't be reconstructed (the
-        # URL-anchored pass below covers it while the grab is still cached).
-        if se is not None:
-            keys = [f"{nt}|S{se}", f"{nt}|TV"]
-        elif yr is not None:
-            keys = [f"{nt}|{yr}|S0"]
-        else:
+        # Reconstruct the scanner's uniform post-enrichment group_key
+        # (_assign_group_keys): "{normalized_title}|{year or 0}|S{season or 0}".
+        # Movies -> "{nt}|{year}|S0"; TV -> "{nt}|{year}|S{season}". A row with
+        # neither year nor season can't be anchored — the URL-anchored pass below
+        # covers it while the grab is still cached.
+        if yr is None and se is None:
             continue
-        for gk in keys:
-            if _better(rank, dovi, grabbed.get(gk)):
-                grabbed[gk] = {"rank": rank, "dovi": dovi,
-                               "resolution": res or "", "size": ""}
+        gk = f"{nt}|{yr or 0}|S{se or 0}"
+        if _better(rank, dovi, grabbed.get(gk)):
+            grabbed[gk] = {"rank": rank, "dovi": dovi,
+                           "resolution": res or "", "size": ""}
 
     for i in items:
         if i.get("url") in downloaded:
