@@ -824,6 +824,22 @@ class TestJdControlsAndResults:
         resp = client.delete("/download/results")
         assert resp.status_code == 200
 
+    # -- results/remove (POST) --
+
+    def test_remove_download_result_endpoint(self, client):
+        mock_dl = MagicMock()
+        mock_dl.remove_package.return_value = {"ok": True, "removed": 1}
+        registry._download_service = mock_dl
+        resp = client.post("/download/results/remove", json={"name": "Foo [1080p]"})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "removed": 1}
+        mock_dl.remove_package.assert_called_once_with("Foo [1080p]")
+
+    def test_remove_download_result_no_service_returns_503(self, client):
+        registry._download_service = None
+        resp = client.post("/download/results/remove", json={"name": "Foo [1080p]"})
+        assert resp.status_code == 503
+
 
 # ── Analytics ─────────────────────────────────────────────────────────
 

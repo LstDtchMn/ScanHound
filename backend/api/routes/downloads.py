@@ -435,3 +435,16 @@ def clear_download_results(reg: ServiceRegistry = Depends(get_registry)):
     if reg.db:
         reg.db.clear_download_results()
     return {"status": "cleared"}
+
+
+class RemoveResultRequest(BaseModel):
+    name: str
+
+
+@router.post("/results/remove")
+def remove_download_result(req: RemoveResultRequest, reg: ServiceRegistry = Depends(get_registry)):
+    """Remove a single tracked download package (JDownloader + DB row)."""
+    dl = reg.download
+    if not dl:
+        raise HTTPException(status_code=503, detail="Download service not available")
+    return dl.remove_package(req.name)

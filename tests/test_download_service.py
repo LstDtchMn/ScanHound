@@ -2045,3 +2045,39 @@ class TestGetJdStatus:
         assert len(pkg["links"]) == 2
         assert pkg["bytes_total"] == 200
         assert pkg["online"] == 2
+
+
+class TestRemovePackage:
+    def _svc_with_device(self, packages):
+        svc = _make_service(db=MagicMock())
+        device = MagicMock()
+        device.downloads.query_packages.return_value = packages
+        svc._connect_jd_device = MagicMock(return_value=device)
+        return svc, device
+
+    def test_remove_package_removes_matching_uuid_and_row(self):
+        svc, device = self._svc_with_device([
+            {"name": "Foo [1080p]", "uuid": 111},
+            {"name": "Bar [4K]", "uuid": 222},
+        ])
+        svc.db.delete_download_result.return_value = 1
+        out = svc.remove_package("Foo [1080p]")
+        assert out["ok"] is True
+        device.downloads.remove_links.assert_called_once_with([], [111])
+        svc.db.delete_download_result.assert_called_once_with("Foo [1080p]")
+
+    def test_remove_package_absent_in_jd_still_deletes_row_idempotent(self):
+        svc, device = self._svc_with_device([{"name": "Bar [4K]", "uuid": 222}])
+        svc.db.delete_download_result.return_value = 1
+        out = svc.remove_package("Foo [1080p]")  # not in JD
+        assert out["ok"] is True
+        device.downloads.remove_links.assert_not_called()
+        svc.db.delete_download_result.assert_called_once_with("Foo [1080p]")
+
+    def test_remove_package_jd_unreachable_still_deletes_row(self):
+        svc = _make_service(db=MagicMock())
+        svc._connect_jd_device = MagicMock(side_effect=Exception("no jd"))
+        svc.db.delete_download_result.return_value = 1
+        out = svc.remove_package("Foo [1080p]")
+        assert out["ok"] is True   # DB row cleared even when JD is down
+        svc.db.delete_download_result.assert_called_once_with("Foo [1080p]")

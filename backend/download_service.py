@@ -634,6 +634,32 @@ class DownloadService:
             self._invalidate_jd_cache()
             return {"ok": False, "error": str(e)}
 
+    def remove_package(self, name: str) -> dict:
+        """Remove a single download package from JDownloader (by package name)
+        and delete its tracked result row. Idempotent: succeeds even when the
+        package is already gone from JD or JD is unreachable — the DB row is
+        always cleared so the UI reflects the removal."""
+        name = (name or "").strip()
+        if not name:
+            return {"ok": False, "error": "No package name"}
+        # Best-effort JD removal (never blocks the DB cleanup).
+        try:
+            device = self._connect_jd_device()
+            packages = device.downloads.query_packages([{"name": True, "uuid": True}]) or []
+            uuids = [p.get("uuid") for p in packages if p.get("name") == name and p.get("uuid") is not None]
+            if uuids:
+                device.downloads.remove_links([], uuids)
+                self._log(f"JDownloader: removed package '{name}'", "info")
+        except Exception as e:
+            logger.warning("remove_package JD step failed for %r: %s", name, e)
+            self._invalidate_jd_cache()
+        removed = 0
+        try:
+            removed = self.db.delete_download_result(name) if self.db else 0
+        except Exception as e:
+            logger.warning("remove_package DB delete failed for %r: %s", name, e)
+        return {"ok": True, "removed": removed}
+
     def poll_results(self, record: bool = True) -> List[Dict[str, Any]]:
         """Poll JDownloader's Downloads list, derive each package's download +
         extraction outcome, and optionally persist it to the DB.
