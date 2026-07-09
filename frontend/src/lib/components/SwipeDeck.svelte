@@ -320,8 +320,10 @@
                   {/if}
                 </div>
               {/if}
-              {#if info.genres?.length}
-                <p class="text-base opacity-70 mt-1 truncate">{info.genres.slice(0, 3).join(' · ')}</p>
+              {#if info.language || info.genres?.length}
+                <p class="text-base mt-1 truncate">
+                  {#if info.language}<span class="text-[var(--accent)] font-medium">{info.language}</span>{/if}{#if info.language && info.genres?.length}<span class="opacity-40"> · </span>{/if}{#if info.genres?.length}<span class="opacity-70">{info.genres.slice(0, 3).join(' · ')}</span>{/if}
+                </p>
               {/if}
             </div>
           </div>

@@ -447,6 +447,38 @@ class TestCalculateMovieUpgradeStatus:
         assert status == matching_engine.app.STATUS_DV_UPGRADE
         assert color == matching_engine.app.COLOR_DV_UPGRADE
 
+    def test_dv_loss_below_threshold_stays_in_library(self, matching_engine):
+        """A bigger same-res file that would DROP Dolby Vision is NOT an upgrade
+        unless it clears the higher DV-loss threshold (default 20%). +15% < 20%
+        => In Library (this is the Killing Faith case)."""
+        plex = _make_plex(res="4K", size=11.95, dovi=True, rating_key="P1")
+        web = _make_web(res="4K", size="13.8 GB", dovi=False)   # +15%, no DV
+        status, _, _, _ = matching_engine.calculate_movie_upgrade_status(web, [plex])
+        assert status == matching_engine.app.STATUS_IN_LIBRARY
+
+    def test_dv_loss_above_threshold_is_size_upgrade(self, matching_engine):
+        """Past the DV-loss threshold a bigger non-DV file still counts. +30% >= 20%."""
+        plex = _make_plex(res="4K", size=10.0, dovi=True, rating_key="P1")
+        web = _make_web(res="4K", size="13 GB", dovi=False)     # +30%, no DV
+        status, _, _, _ = matching_engine.calculate_movie_upgrade_status(web, [plex])
+        assert status == matching_engine.app.STATUS_UPGRADE_SIZE
+
+    def test_dv_preserved_uses_normal_sensitivity(self, matching_engine):
+        """When no DV is lost (plex has none), a small +15% still upgrades at the
+        normal 2% sensitivity — the higher DV-loss threshold does not apply."""
+        plex = _make_plex(res="4K", size=10.0, dovi=False, rating_key="P1")
+        web = _make_web(res="4K", size="11.5 GB", dovi=False)   # +15%, DV on neither
+        status, _, _, _ = matching_engine.calculate_movie_upgrade_status(web, [plex])
+        assert status == matching_engine.app.STATUS_UPGRADE_SIZE
+
+    def test_dv_loss_threshold_is_configurable(self, matching_engine, mock_app):
+        """Lowering the DV-loss threshold re-enables the +15% DV-dropping upgrade."""
+        mock_app.config["upgrade_dv_loss_sensitivity"] = 10   # 10% bar
+        plex = _make_plex(res="4K", size=11.95, dovi=True, rating_key="P1")
+        web = _make_web(res="4K", size="13.8 GB", dovi=False)  # +15% > 10%
+        status, _, _, _ = matching_engine.calculate_movie_upgrade_status(web, [plex])
+        assert status == matching_engine.app.STATUS_UPGRADE_SIZE
+
     def test_strict_resolution_mismatch_forces_missing(self, matching_engine, mock_app):
         """Strict mode with 1080p local + 4K web => MISSING (not an upgrade)."""
         mock_app.config["strict_resolution"] = True

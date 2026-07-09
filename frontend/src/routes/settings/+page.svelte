@@ -1020,7 +1020,7 @@
           </label>
 
           <label class="block">
-            <Tooltip text="How much larger (as a percentage) a new file must be than your existing copy at the same resolution to count as a size upgrade — e.g. 10 means it must be at least 10% larger. Lower flags more upgrades (even minor re-encodes); higher only flags clearly bigger files. Resolution and Dolby Vision upgrades are always flagged regardless of size.">
+            <Tooltip text="How much larger (as a percentage) a new file must be than your existing copy at the same resolution to count as a size upgrade — e.g. 10 means it must be at least 10% larger. Lower flags more upgrades (even minor re-encodes); higher only flags clearly bigger files. A resolution jump (1080p→4K) is always flagged; a file that ADDS Dolby Vision is always flagged; a file that would LOSE Dolby Vision uses the higher threshold below instead.">
               <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Upgrade Sensitivity (%) ⓘ</span>
             </Tooltip>
             <input
@@ -1029,6 +1029,20 @@
               max="100"
               value={$settings.upgrade_sensitivity as number ?? 10}
               oninput={(e) => settings.update((s) => ({ ...s, upgrade_sensitivity: parseInt(e.currentTarget.value) || 10 }))}
+              class={inputSmClass}
+            />
+          </label>
+
+          <label class="block">
+            <Tooltip text="A higher bar, only for a same-resolution file that is bigger but would DROP Dolby Vision (your copy has DV, the new one doesn't). It must be at least this much larger to still count as an upgrade — otherwise it stays In Library. Set equal to Upgrade Sensitivity to treat DV loss the same as any other size upgrade. Only applies when Dolby Vision upgrades are enabled below.">
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">DV-loss Upgrade Threshold (%) ⓘ</span>
+            </Tooltip>
+            <input
+              type="number"
+              min="0"
+              max="100"
+              value={$settings.upgrade_dv_loss_sensitivity as number ?? 20}
+              oninput={(e) => settings.update((s) => ({ ...s, upgrade_dv_loss_sensitivity: parseInt(e.currentTarget.value) || 20 }))}
               class={inputSmClass}
             />
           </label>

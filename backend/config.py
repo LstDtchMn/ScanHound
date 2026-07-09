@@ -58,6 +58,7 @@ class AppConfig(TypedDict, total=False):
 
     # Upgrade Rules
     upgrade_sensitivity: int  # percentage
+    upgrade_dv_loss_sensitivity: int  # % size gain required for an upgrade that drops DV
     rule_1080_4k: bool
     rule_1080_4k_size: bool
     rule_1080_1080: bool
@@ -404,6 +405,10 @@ _DEFAULT_CONFIG: AppConfig = {
     "plex_invalidate_on_new_content": True,
     "ignore_keywords": "Cam, TS, HC, KORSUB, TC",
     "upgrade_sensitivity": 10,
+    # A same-resolution "upgrade" that would DROP Dolby Vision (your copy has DV,
+    # the new file doesn't) must be at least this much larger to still count —
+    # a higher bar than upgrade_sensitivity, since losing DV is a real cost.
+    "upgrade_dv_loss_sensitivity": 20,
     "movie_libs": ["Movies (1080p)", "Movies (4K HDR)"],
     "tv_libs": ["TV Shows"],
     "known_libraries": [],
@@ -558,6 +563,8 @@ def validate_config(config: dict) -> dict:
         cleaned['cache_duration'] = 0
     if _safe_numeric(cleaned.get('upgrade_sensitivity'), 0) < 0:
         cleaned['upgrade_sensitivity'] = 0
+    if _safe_numeric(cleaned.get('upgrade_dv_loss_sensitivity'), 0) < 0:
+        cleaned['upgrade_dv_loss_sensitivity'] = 0
 
     if cleaned.get('plex_refresh_mode') not in (None, "auto", "force_refresh", "cache_only"):
         cleaned['plex_refresh_mode'] = "auto"

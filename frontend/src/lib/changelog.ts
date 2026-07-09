@@ -7,6 +7,15 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.22.0",
+    date: "2026-07-09",
+    summary: "DV-aware upgrades + language on cards",
+    changes: [
+      "Upgrades no longer talk you into losing Dolby Vision: a bigger same-resolution file that would DROP DV (your copy has DV, the new one doesn't) is now only flagged as an upgrade if it clears a separate, higher threshold — new 'DV-loss Upgrade Threshold (%)' setting, default 20%. Normal DV-preserving upgrades still use your Upgrade Sensitivity. So a slightly-bigger HDR10 file no longer reads as an upgrade over your 4K Dolby Vision copy.",
+      "Each title's language now shows on the triage-deck card (leading the genres line), so foreign-language releases are obvious at a glance.",
+    ],
+  },
+  {
     version: "2.21.1",
     date: "2026-07-09",
     summary: "Fix wrong title/poster on mis-scraped docuseries releases",

@@ -100,6 +100,7 @@ class SettingsUpdate(BaseModel):
 
     # Upgrade Rules
     upgrade_sensitivity: Optional[int] = None
+    upgrade_dv_loss_sensitivity: Optional[int] = None
 
     # Background pre-cache scanning
     background_scan_enabled: Optional[bool] = None

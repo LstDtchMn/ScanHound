@@ -689,6 +689,15 @@ class MatchingEngine:
         p_size = exact.get('size', 0)
         w_size = self.app.parse_size(web.get('size', '0'))
         sens = self.app.config.get("upgrade_sensitivity", 10) / 100.0
+        # A same-resolution size upgrade that would DROP Dolby Vision (your copy
+        # has DV, the new file doesn't) is held to a higher bar — DV is the
+        # premium attribute, so only a clearly bigger file (default 20% via
+        # upgrade_dv_loss_sensitivity, vs the normal upgrade_sensitivity) is worth
+        # losing it. Gated on rule_dv; the resolution jump in Case 2 is exempt.
+        web_loses_dv = (self.app.config.get("rule_dv", True)
+                        and exact.get('dovi') and not web_dovi)
+        size_sens = (self.app.config.get("upgrade_dv_loss_sensitivity", 20) / 100.0
+                     if web_loses_dv else sens)
         is_upgrade = False
 
         # Define display tags early for use in logic
@@ -740,7 +749,7 @@ class MatchingEngine:
 
             # Case 3: Same Resolution Size Upgrade (1080p)
             elif self.app.config.get("rule_1080_1080", True) and exact.get('res') == '1080p' and web_res == '1080p':
-                if w_size > (p_size * (1 + sens)):
+                if w_size > (p_size * (1 + size_sens)):
                     is_upgrade = True
                     diff = int(((w_size - p_size) / p_size) * 100) if p_size > 0 else 0
                     # Check if also a DV upgrade
@@ -754,11 +763,11 @@ class MatchingEngine:
                         info = f"{p_size}GB (Web +{diff}%)"
                     logger.debug("  rule_1080_1080: size upgrade web=%.1fGB plex=%.1fGB (+%d%%)", w_size, p_size, diff)
                 else:
-                    logger.debug("  rule_1080_1080: SKIPPED web=%.1fGB <= plex=%.1fGB * (1+%.2f)", w_size, p_size, sens)
+                    logger.debug("  rule_1080_1080: SKIPPED web=%.1fGB <= plex=%.1fGB * (1+%.2f) [loses_dv=%s]", w_size, p_size, size_sens, web_loses_dv)
 
             # Case 4: Same Resolution Size Upgrade (4K)
             elif self.app.config.get("rule_4k_4k", True) and exact.get('res') == '4K' and web_res == '4K':
-                if w_size > (p_size * (1 + sens)):
+                if w_size > (p_size * (1 + size_sens)):
                     is_upgrade = True
                     diff = int(((w_size - p_size) / p_size) * 100) if p_size > 0 else 0
                     # Check if also a DV upgrade
@@ -772,10 +781,11 @@ class MatchingEngine:
                         info = f"{p_size}GB [{r_disp}]{dv_tag} (Web +{diff}%)"
                     logger.debug("  rule_4k_4k: size upgrade web=%.1fGB plex=%.1fGB (+%d%%)", w_size, p_size, diff)
                 else:
-                    logger.debug("  rule_4k_4k: SKIPPED web=%.1fGB <= plex=%.1fGB * (1+%.2f)", w_size, p_size, sens)
+                    logger.debug("  rule_4k_4k: SKIPPED web=%.1fGB <= plex=%.1fGB * (1+%.2f) [loses_dv=%s]", w_size, p_size, size_sens, web_loses_dv)
 
-            # Case 5: Codec/HDR Preference Upgrade
-            if not is_upgrade and exact.get('res') == web_res:
+            # Case 5: Codec/HDR Preference Upgrade — never at the cost of DV
+            # (a preferred codec isn't worth dropping a Dolby Vision copy).
+            if not is_upgrade and exact.get('res') == web_res and not web_loses_dv:
                 is_pref, pref_type = self.check_codec_preference(web)
                 if is_pref:
                     # Allow size reduction for HEVC (efficiency)

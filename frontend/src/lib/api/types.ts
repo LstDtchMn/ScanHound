@@ -296,6 +296,7 @@ export interface Settings {
 
   // Upgrade Rules
   upgrade_sensitivity?: number;
+  upgrade_dv_loss_sensitivity?: number;
   rule_1080_4k?: boolean;
   rule_1080_4k_size?: boolean;
   rule_1080_1080?: boolean;

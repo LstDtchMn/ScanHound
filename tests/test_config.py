@@ -63,7 +63,8 @@ EXPECTED_DEFAULT_KEYS = {
     # Filtering
     "ignore_keywords",
     # Upgrade rules
-    "upgrade_sensitivity", "rule_1080_4k", "rule_1080_4k_size",
+    "upgrade_sensitivity", "upgrade_dv_loss_sensitivity",
+    "rule_1080_4k", "rule_1080_4k_size",
     "rule_1080_1080", "rule_4k_4k", "rule_dv", "strict_resolution",
     # Libraries
     "movie_libs", "tv_libs", "known_libraries",
