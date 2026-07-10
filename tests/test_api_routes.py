@@ -1802,3 +1802,34 @@ class TestPipelineRoutes:
                            "WHERE url = ?", ("http://pi/4",)).fetchone()
         assert row[0] is None  # cleared to pending
         assert row[1] == "555"  # old uuid excluded
+
+    def test_regrab_eligible_set_branch_clears_verdict_and_backgrounds(self, client, db_manager, monkeypatch):
+        """Mirrors test_regrab_clears_verdict_and_backgrounds, but forces the
+        primary lookup in pipeline.py's regrab_item (get_downloads_needing_reconcile,
+        pipeline.py:55-56) to actually find the row, instead of falling through
+        to the raw-SELECT fallback (pipeline.py:57-67) that the other test
+        exercises. add_to_history always stamps last_grabbed_at = CURRENT_TIMESTAMP,
+        which is too recent for the reconcile query's 30-minute window, so age
+        it back manually before hitting the endpoint."""
+        db_manager.add_to_history("http://pi/5", "Quux", package_name="Quux [1080p]",
+                                  resolution="1080p", year=2024)
+        db_manager.upsert_pipeline_verdict("http://pi/5", "download_failed", package_uuid="777")
+        conn = db_manager.get_connection()
+        conn.execute("UPDATE downloads SET last_grabbed_at = datetime('now', '-1 hour') "
+                     "WHERE url = ?", ("http://pi/5",))
+        conn.commit()
+        # Sanity check: confirms this test actually drives the eligible-set
+        # (branch A) code path, not just the raw-SELECT fallback (branch B).
+        eligible_urls = [r["url"] for r in db_manager.get_downloads_needing_reconcile(limit=100000)]
+        assert "http://pi/5" in eligible_urls
+        calls = {}
+        def fake_add_task(fn, *a, **kw):
+            calls["called"] = True
+        monkeypatch.setattr("fastapi.BackgroundTasks.add_task", fake_add_task)
+        resp = client.post("/pipeline/regrab", json={"url": "http://pi/5"})
+        assert resp.status_code == 200
+        assert calls.get("called") is True
+        row = conn.execute("SELECT category, excluded_uuid FROM pipeline_verdicts "
+                           "WHERE url = ?", ("http://pi/5",)).fetchone()
+        assert row[0] is None  # cleared to pending
+        assert row[1] == "777"  # old uuid excluded
