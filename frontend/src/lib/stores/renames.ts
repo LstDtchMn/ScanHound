@@ -86,8 +86,8 @@ export async function refreshRenames() {
   await refresh();
 }
 
-export async function applyJob(id: number) {
-  await api.applyRename(id);
+export async function applyJob(id: number, strategy?: 'overwrite' | 'keep_both' | 'skip') {
+  await api.applyRename(id, strategy ? { conflict_strategy: strategy } : undefined);
   await refresh();
 }
 

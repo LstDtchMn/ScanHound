@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, RenameHealthResponse } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, RenameHealthResponse, ConflictComparison } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -339,8 +339,13 @@ export const api = {
     return request<{ jobs: RenameJob[]; counts: Record<string, number> }>(`/rename/jobs${qs}`);
   },
   getRenameStatus: () => request<RenameStatus>('/rename/status'),
-  applyRename: (id: number) =>
-    request<{ ok: boolean }>(`/rename/jobs/${id}/apply`, { method: 'POST' }),
+  applyRename: (id: number, body?: { conflict_strategy?: 'overwrite' | 'keep_both' | 'skip' }) =>
+    request<{ ok: boolean }>(`/rename/jobs/${id}/apply`,
+      { method: 'POST', body: body ? JSON.stringify(body) : undefined }),
+  conflictPreview: (id: number) =>
+    request<ConflictComparison>(`/rename/jobs/${id}/conflict-preview`, { method: 'POST' }),
+  scanConflictDv: (id: number) =>
+    request<{ status: string }>(`/rename/jobs/${id}/scan-dv-conflict`, { method: 'POST' }),
   undoRename: (id: number) =>
     request<{ ok: boolean }>(`/rename/jobs/${id}/undo`, { method: 'POST' }),
   rematchRename: (id: number, tmdbId: number, mediaType?: string, season?: number, episode?: number) =>

@@ -565,6 +565,19 @@ export interface ApplyConfidentResponse {
   failed?: number;
 }
 
+export interface FileSpec {
+  present: boolean; path: string | null; size_bytes: number | null;
+  resolution: string | null; video_codec: string | null; hdr: string | null;
+  dv_layer: string | null; audio: string | null;
+  duration_min: number | null; bitrate: number | null;
+}
+export interface ConflictComparison {
+  existing: FileSpec | null;
+  incoming: FileSpec;
+  recommended: 'existing' | 'incoming' | 'tie' | null;
+  reason: string | null;
+}
+
 export interface RematchPreviewResponse {
   new_filename: string;
   destination_path: string | null;
