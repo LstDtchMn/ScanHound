@@ -199,15 +199,30 @@ FastAPI, SQLite (`DatabaseManager`), the existing `sources` registry
   - `clear_pipeline_verdict(url)` — called by regrab/grab-alternative. Does
     **NOT** delete the row (a full delete would also forget the uuid worth
     excluding — see N2's fix below). Instead: `UPDATE pipeline_verdicts SET
-    excluded_uuid = COALESCE(package_uuid, excluded_uuid), package_uuid = NULL,
+    excluded_uuid = CASE WHEN package_uuid IS NULL THEN excluded_uuid
+    WHEN excluded_uuid IS NULL THEN package_uuid
+    ELSE excluded_uuid || ',' || package_uuid END, package_uuid = NULL,
     category = NULL, dismissed = 0, checked_at = CURRENT_TIMESTAMP WHERE
-    url = ?` (or INSERT a fresh minimal row if none exists yet). `category
-    IS NULL` marks "pending re-evaluation" and is always eligible for
-    reconcile (see the fixed eligibility rule below).
+    url = ?` (or INSERT a fresh minimal row if none exists yet). **`excluded_uuid`
+    ACCUMULATES (comma-joined), never overwrites** — a single-value overwrite
+    would let a THIRD regrab's exclusion erase the SECOND regrab's, re-opening
+    the same lock-in race for a two-in-a-row regrab chain where the second
+    attempt's `download_results` row is delayed (failed send / poller outage);
+    the matching query in §2 filters with `package_uuid NOT IN
+    (split excluded_uuid on ',')`, not `!=`. `category IS NULL` marks "pending
+    re-evaluation" and is always eligible for reconcile (see the fixed
+    eligibility rule below).
   - `get_downloads_needing_reconcile(limit)` — rows where `package_name IS NOT
     NULL`, `last_grabbed_at` is more than 30 minutes ago, AND (no verdict row
     yet, OR (`verdict.dismissed = 0` AND `verdict.category IS NOT 'verified'`)).
-    **Deliberately no `checked_at` comparison in this WHERE clause** — an
+    **Use `IS NOT`, never `!=`** — `category` is NULL for a just-cleared
+    regrab (see `clear_pipeline_verdict` above), and SQL `NULL != 'verified'`
+    evaluates to NULL (falsy), not TRUE — a `!=` here would silently exclude
+    every just-regrabbed row from ever being reconciled again, permanently
+    freezing it. `ORDER BY checked_at ASC` (nulls/never-checked first) so a
+    large backlog of long-failing items doesn't starve newer grabs from ever
+    being reached within one `limit`-sized batch.
+    **Deliberately no `checked_at` comparison in the WHERE clause** — an
     earlier draft gated eligibility on `checked_at < last_grabbed_at`, which
     freezes every verdict after its first write (`checked_at` becomes "now,"
     which is always after the unchanging `last_grabbed_at`, so nothing would
@@ -235,11 +250,14 @@ specified precisely here since it's the crux fix):
 2. Else (first reconcile for this attempt, or the uuid'd row aged out of
    `download_results`), match by `download_results.name = downloads.package_name
    AND download_results.updated_at >= downloads.last_grabbed_at - 5s AND
-   (download_results.package_uuid IS NULL OR download_results.package_uuid !=
-   pipeline_verdicts.excluded_uuid)` (the 5s margin absorbs clock/ordering slop
-   between the grab request and JD's first poll; the `excluded_uuid` exclusion
-   is what stops a regrab from re-adopting the superseded package it's
-   retrying — see the `excluded_uuid` column above). Among remaining
+   (download_results.package_uuid IS NULL OR download_results.package_uuid NOT IN
+   (<excluded_uuid split on ',' — comma-joined, accumulates across repeated
+   regrabs, never a single overwritten value>))` (the 5s margin absorbs
+   clock/ordering slop between the grab request and JD's first poll; the
+   `excluded_uuid` exclusion is what stops a regrab from re-adopting the
+   superseded package it's retrying — see the `excluded_uuid` column above; it
+   must accumulate, not overwrite, or a second-in-a-row regrab can un-exclude
+   the first's package). Among remaining
    candidates, take **`MAX(download_results.id)`** — the surrogate PK is
    strictly insertion-order monotonic
    ([database.py:359-373](backend/database.py:359)), so the newer attempt's
