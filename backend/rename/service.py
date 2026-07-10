@@ -1178,13 +1178,25 @@ class RenameService:
 
     # ── UI-driven actions ─────────────────────────────────────────────
 
-    def apply(self, job_id: int, automatic: bool = False) -> dict:
+    def apply(self, job_id: int, automatic: bool = False,
+             conflict_strategy: Optional[str] = None) -> dict:
         """Apply a matched job's placement.
 
         ``automatic`` marks an apply with no per-item human confirmation
         (e.g. the auto-rename pipeline with confirmation disabled). Such
         applies never consume the source file — see
         :func:`backend.rename.fileops.place_file`.
+
+        ``conflict_strategy`` resolves a destination collision (see the guard
+        below) without requiring a separate review round-trip:
+          - ``None`` (default) or ``'skip'`` — hold for review; the file at
+            ``dst`` is never touched.
+          - ``'overwrite'`` — the file occupying ``dst`` is moved to the
+            recoverable trash (:func:`fileops._trash`), never deleted, then
+            the incoming file is placed at ``dst``.
+          - ``'keep_both'`` — the incoming file is placed under a
+            deduped sibling name (:func:`fileops.dedupe_dest`); the existing
+            file at ``dst`` is left untouched.
         """
         db = self._db
         job = db.get_rename_job(job_id) if db else None
@@ -1222,23 +1234,50 @@ class RenameService:
         # auto-replace or delete the existing file; that stays a manual,
         # explicit user action.
         if os.path.lexists(dst):
-            msg = f"A file already exists at the destination: {dst}"
+            # Same-inode re-apply (already hardlinked to this exact destination)
+            # is a no-op success, not a conflict — never trash a file onto
+            # itself.
             try:
-                existing_size = os.path.getsize(dst)
-                candidate_size = os.path.getsize(src)
-                msg += (f" (existing {existing_size} bytes vs. candidate "
-                        f"{candidate_size} bytes)")
+                if os.path.samefile(src, dst):
+                    db.update_rename_job(job_id, status="applied", processed_at=_now())
+                    self._broadcast(job_id)
+                    return {"ok": True, "already": True}
             except OSError:
                 pass
-            msg += " — review to replace or keep the existing file."
-            # Append to (never clobber) a warning already on the job — e.g. a
-            # year-mismatch note set at creation time — so the collision guard
-            # never silently discards an earlier reason the file needs review.
-            existing = job.get("warning_message")
-            combined = f"{existing}; {msg}" if existing else msg
-            db.update_rename_job(job_id, status="needs_review", warning_message=combined)
-            self._broadcast(job_id)
-            return {"ok": False, "error": msg}
+            if conflict_strategy == "overwrite":
+                # Displace the occupant into the recoverable trash — never a
+                # hard delete — then fall through to the normal placement
+                # below (dst is now free).
+                _fileops._trash(dst)
+            elif conflict_strategy == "keep_both":
+                # Place the incoming file alongside the existing one under a
+                # deduped sibling name; the existing file is never touched.
+                # Persist the rewritten filename so the job record (and any
+                # subsequent undo) reflects where the file actually landed.
+                new_dst = _fileops.dedupe_dest(dst)
+                db.update_rename_job(job_id, new_filename=os.path.basename(new_dst))
+                dst = new_dst
+            else:
+                # None → hold for review (existing behavior); 'skip' → same,
+                # explicit — either way the file at dst is left untouched and
+                # the job goes back to needs_review (never left 'applying').
+                msg = f"A file already exists at the destination: {dst}"
+                try:
+                    existing_size = os.path.getsize(dst)
+                    candidate_size = os.path.getsize(src)
+                    msg += (f" (existing {existing_size} bytes vs. candidate "
+                            f"{candidate_size} bytes)")
+                except OSError:
+                    pass
+                msg += " — review to replace or keep the existing file."
+                # Append to (never clobber) a warning already on the job — e.g. a
+                # year-mismatch note set at creation time — so the collision guard
+                # never silently discards an earlier reason the file needs review.
+                existing = job.get("warning_message")
+                combined = f"{existing}; {msg}" if existing else msg
+                db.update_rename_job(job_id, status="needs_review", warning_message=combined)
+                self._broadcast(job_id)
+                return {"ok": False, "error": msg}
         method = self._cfg.get("auto_rename_move_method", "hardlink")
         deletions_require_confirmation = self._cfg.get(
             "deletions_require_confirmation", True)
@@ -1457,7 +1496,8 @@ class RenameService:
         return {"filled": filled, "checked": len(jobs[:limit])}
 
     def queue_apply(self, ids: Optional[list] = None,
-                    confident_only: bool = False) -> dict:
+                    confident_only: bool = False,
+                    conflict_strategy: Optional[str] = None) -> dict:
         """Queue applies to run on a background thread and return immediately.
 
         Applying moves/copies the file. Cross-device placements (hardlink
@@ -1470,6 +1510,10 @@ class RenameService:
 
         With ``confident_only``, only matched jobs at confidence >= 95 are
         eligible (the server-enforced 'Apply all confident' gate).
+
+        ``conflict_strategy`` is threaded through to every queued
+        :meth:`apply` call — see its docstring for the overwrite/keep_both/
+        skip semantics.
         """
         db = self._db
         if db is None:
@@ -1521,7 +1565,7 @@ class RenameService:
                     self._broadcast_queue(idx, total,
                                           (job or {}).get("title") if job else None)
                     try:
-                        self.apply(jid)
+                        self.apply(jid, conflict_strategy=conflict_strategy)
                     except Exception:
                         logger.exception("queued apply failed for job %s", jid)
                         try:

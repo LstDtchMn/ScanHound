@@ -2,9 +2,9 @@
 import logging
 import os
 import threading
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
@@ -123,6 +123,10 @@ class ApplyConfidentRequest(BaseModel):
     ids: Optional[list[int]] = None
 
 
+class ApplyRequest(BaseModel):
+    conflict_strategy: Optional[Literal["overwrite", "keep_both", "skip"]] = None
+
+
 @router.get("/jobs")
 def list_jobs(status: Optional[str] = None, limit: int = 200,
               reg: ServiceRegistry = Depends(get_registry)):
@@ -221,11 +225,14 @@ def bulk_set_destination(body: BulkSetDestRequest,
 
 
 @router.post("/jobs/{job_id}/apply")
-def apply_job(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
+def apply_job(job_id: int, body: ApplyRequest = Body(default=ApplyRequest()),
+              reg: ServiceRegistry = Depends(get_registry)):
     # Queued (see apply-confident): the actual move runs on a worker thread and
     # reports back over the WS, so a slow cross-device copy can't time out the
     # request. queued=0 means the job wasn't eligible (already applied/applying).
-    out = _service(reg).queue_apply([job_id])
+    # body is optional — a bodyless POST (existing clients) applies with no
+    # conflict_strategy, i.e. today's hold-for-review-on-collision behavior.
+    out = _service(reg).queue_apply([job_id], conflict_strategy=body.conflict_strategy)
     if not out.get("ok"):
         raise HTTPException(status_code=400, detail=out.get("error", "Apply failed"))
     if not out.get("queued"):
