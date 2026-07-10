@@ -71,6 +71,22 @@ export function resolutionKeysFor(i: ScanResult): string[] {
  *  postedBefore covers through the END of that day. */
 export const postedAfter = writable<string>('');
 export const postedBefore = writable<string>('');
+
+/** Reset every content-narrowing filter that can silently hide items with no
+ *  obvious indicator — the escape hatch for the empty-state self-diagnosis
+ *  (see hiddenByFiltersCount below). Deliberately excludes statusFilter/
+ *  quickFilters/categoryFilter: those are coarse view toggles the user just
+ *  set on purpose (their state is visibly reflected in pressed tabs/chips),
+ *  not the "narrowed once, forgot about it" trap this exists to escape. */
+export function clearAllFilters() {
+  resolutionFilter.set([]);
+  genreFilter.set([]);
+  languageFilter.set([]);
+  postedAfter.set('');
+  postedBefore.set('');
+  searchFilter.set('');
+}
+
 export const viewMode = persisted<ViewMode>('sh-view-mode', 'grid');
 /** Whether the user has explicitly picked a view (vs. the platform default).
  *  Lets phones default to the swipe deck without overriding a deliberate choice. */
@@ -453,6 +469,16 @@ export async function loadResults(reset: boolean): Promise<void> {
     filteredTotal.set(data.total ?? items.length);
     titleCounts.set((data as { title_counts?: Record<string, number> }).title_counts ?? {});
     if (data.stats) stats.set(data.stats);
+    // filtered_stats (B/self-diagnosing empty state) is always sent by the
+    // current backend (_shape_results), but fall back to a total-only shape
+    // so an older/mismatched response can't crash the derived filteredStats —
+    // total is still correct (it's the same figure as `total` above), just
+    // without a per-status breakdown.
+    serverFilteredStats.set(
+      (data as { filtered_stats?: ScanStats }).filtered_stats ?? {
+        total: data.total ?? items.length, missing: 0, upgrade: 0, library: 0
+      }
+    );
     // Derive from page*per_page vs total, NOT results.length (the cap-eviction
     // above pins results.length at PAGED_RESULTS_CAP while total keeps growing,
     // which would leave hasMore permanently true → infinite fetch loop).
@@ -555,6 +581,56 @@ export const filteredResults = derived(
       }
     });
     return items;
+  }
+);
+
+/** Pure per-status breakdown of a result list — mirrors the backend's
+ *  _compute_status_counts (backend/api/routes/results.py) status-substring
+ *  matching so client- and server-computed counts agree. Exported for direct
+ *  unit testing and reused by filteredStats below. */
+export function computeStatusCounts(items: ScanResult[]): ScanStats {
+  return {
+    total: items.length,
+    missing: items.filter((i) => (i.status || '').toLowerCase().includes('missing')).length,
+    upgrade: items.filter((i) => (i.status || '').toLowerCase().includes('upgrade')).length,
+    library: items.filter((i) => (i.status || '').toLowerCase().includes('library')).length
+  };
+}
+
+/** Paged/cached-mode input to `filteredStats` below — the server's
+ *  `filtered_stats` (post ALL filters, pre-pagination; computed over the
+ *  *whole* matching set, not just the loaded page — see backend
+ *  _shape_results) for the current filter set. Populated by loadResults();
+ *  ignored outside paged mode. */
+export const serverFilteredStats = writable<ScanStats>({ total: 0, missing: 0, upgrade: 0, library: 0 });
+
+/** Post-filter status breakdown for the currently active filter set — the
+ *  counterpart to `stats`, which is deliberately unfiltered (see backend
+ *  _shape_results: `stats` snapshots visible items *before* status/search/
+ *  category/genre/language/quick/resolution/date filtering, so it always
+ *  reads as "how many exist" regardless of what's currently narrowed).
+ *  Comparing the two per-tab (see hiddenByFiltersCount) is what lets the
+ *  empty state tell "your filters hid everything" apart from "there's
+ *  genuinely nothing here". Paged mode trusts the server's filtered_stats;
+ *  live mode has no per-filter-change server round trip (filtering there is
+ *  entirely client-side), so it's derived from the same filteredResults the
+ *  UI already renders. */
+export const filteredStats = derived(
+  [filteredResults, pagedMode, serverFilteredStats],
+  ([$filteredResults, $paged, $serverFilteredStats]) =>
+    $paged ? $serverFilteredStats : computeStatusCounts($filteredResults)
+);
+
+/** How many items for the ACTIVE status tab exist but are hidden by the
+ *  current content filters (resolution/genre/language/date/search) — 0 both
+ *  when filters aren't hiding anything and (correctly) when there's
+ *  genuinely nothing to show. Drives the "0 shown — N hidden by filters"
+ *  empty-state self-diagnosis; see clearAllFilters for the escape hatch. */
+export const hiddenByFiltersCount = derived(
+  [stats, filteredStats, statusFilter],
+  ([$stats, $filteredStats, $statusFilter]) => {
+    const key: keyof ScanStats = $statusFilter === 'all' ? 'total' : $statusFilter;
+    return Math.max(0, $stats[key] - $filteredStats[key]);
   }
 );
 
@@ -727,6 +803,7 @@ export function restoreItem(url: string, item?: ScanResult): Promise<boolean> {
 export function clearResults() {
   results.set([]);
   stats.set({ total: 0, missing: 0, upgrade: 0, library: 0 });
+  serverFilteredStats.set({ total: 0, missing: 0, upgrade: 0, library: 0 });
   selectedKeys.set(new Set());
   selectedDetail.set(null);
   focusedIndex.set(-1);

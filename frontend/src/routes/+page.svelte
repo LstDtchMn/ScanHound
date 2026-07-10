@@ -9,7 +9,7 @@
   import ResultActionSheet from '$lib/components/ResultActionSheet.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
   import SwipeDeck from '$lib/components/SwipeDeck.svelte';
-  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS, loadResults, hasMore, loadingMore, loadError, filteredTotal, titleCounts, pagedMode, statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy } from '$lib/stores/results';
+  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS, loadResults, hasMore, loadingMore, loadError, filteredTotal, titleCounts, pagedMode, statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy, hiddenByFiltersCount, clearAllFilters } from '$lib/stores/results';
   import { mobile } from '$lib/stores/media';
   import { addToast } from '$lib/stores/notifications';
   import { get } from 'svelte/store';
@@ -582,8 +582,22 @@
           <circle cx="20" cy="20" r="14"/>
           <line x1="30" y1="30" x2="42" y2="42"/>
         </svg>
-        <p class="text-sm text-[var(--text-secondary)]">No results match your filter</p>
-        <p class="text-xs text-[var(--text-secondary)] opacity-60">Try adjusting the status filter or search text.</p>
+        {#if $hiddenByFiltersCount > 0}
+          <!-- Self-diagnosis: the active tab genuinely has matches — filters are
+               what's hiding them, not an empty library. See resolutionFilter's
+               history (frontend/src/lib/stores/results.ts) for why this matters:
+               a filter that quietly narrows content and outlives the session
+               (or is just easy to forget about) can silently zero out a tab. -->
+          <p class="text-sm text-[var(--text-secondary)]">0 shown &mdash; {$hiddenByFiltersCount} hidden by filters</p>
+          <p class="text-xs text-[var(--text-secondary)] opacity-60">Your resolution, genre, language, date, or search filter is hiding every matching item.</p>
+          <button
+            onclick={() => clearAllFilters()}
+            class="px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-[var(--accent)] hover:opacity-90 transition-opacity"
+          >Clear filters</button>
+        {:else}
+          <p class="text-sm text-[var(--text-secondary)]">No results match your filter</p>
+          <p class="text-xs text-[var(--text-secondary)] opacity-60">Try adjusting the status filter or search text.</p>
+        {/if}
       {:else}
         <!-- Pre-flight checklist -->
         <div class="flex flex-col items-center gap-5 max-w-sm">

@@ -48,7 +48,12 @@ const {
   filteredTotal,
   pagedMode,
   postedAfter,
-  postedBefore
+  postedBefore,
+  resolutionFilter,
+  computeStatusCounts,
+  filteredStats,
+  hiddenByFiltersCount,
+  clearAllFilters
 } = await import('./results');
 
 function item(overrides: Partial<ScanResult>): ScanResult {
@@ -95,6 +100,7 @@ function resetStores() {
   genreFilter.set([]);
   languageFilter.set([]);
   quickFilters.set([]);
+  resolutionFilter.set([]);
   postedAfter.set('');
   postedBefore.set('');
   // These suites exercise the legacy client-side filter+sort pipeline
@@ -921,6 +927,38 @@ describe('debounced refetch on filter change (paged mode)', () => {
     }
   });
 
+  it('clearAllFilters (the empty-state "Clear filters" action) triggers the debounced refetch in paged mode', async () => {
+    vi.useFakeTimers();
+    try {
+      pagedMode.set(true);
+      resolutionFilter.set(['4K', '1080p']); // baseline: the "stuck filter" trap state
+      vi.clearAllTimers();
+      (api.getCachedResults as any).mockClear();
+      (api.getCachedResults as any).mockResolvedValue({
+        items: [item({ status: 'missing', url: 'tv1' })],
+        total: 1,
+        stats: { total: 1, missing: 1, upgrade: 0, library: 0 },
+        filtered_stats: { total: 1, missing: 1, upgrade: 0, library: 0 },
+        title_counts: {}
+      });
+
+      clearAllFilters();
+      expect(get(resolutionFilter)).toEqual([]);
+
+      vi.advanceTimersByTime(200);
+      expect(api.getCachedResults).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(100);
+      await vi.runAllTimersAsync();
+      expect(api.getCachedResults).toHaveBeenCalledTimes(1);
+      // The refetch's response is what actually brings the hidden item back —
+      // trace confirmed: results (passthrough in paged mode) now holds it.
+      expect(get(results).map((i) => i.url)).toEqual(['tv1']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('never refetches while pagedMode is false, even past the debounce window', async () => {
     vi.useFakeTimers();
     try {
@@ -1044,5 +1082,126 @@ describe('deckNeedsMore', () => {
     expect(deckNeedsMore(20)).toBe(false);
     hasMore.set(false);
     expect(deckNeedsMore(3)).toBe(false);
+  });
+});
+
+describe('resolutionFilter is session-only (not persisted)', () => {
+  it('is a plain writable — starts empty regardless of any localStorage value', async () => {
+    // Regression test for the "zero Missing items" bug: resolutionFilter used
+    // to be `persisted('sh-resolution-filter', [])`, so a value written to
+    // localStorage by a prior session would silently narrow every future
+    // session with no visible indicator. Simulate that prior-session write
+    // and confirm a fresh import ignores it.
+    localStorage.setItem('sh-resolution-filter', JSON.stringify(['4K', '1080p']));
+    expect(get(resolutionFilter)).toEqual([]);
+  });
+});
+
+describe('computeStatusCounts (pure)', () => {
+  it('counts total and each status by substring match, mirroring the backend', () => {
+    const counts = computeStatusCounts([
+      item({ status: 'missing', url: 'a' }),
+      item({ status: 'missing', url: 'b' }),
+      item({ status: 'upgrade', url: 'c' }),
+      item({ status: 'in_library', url: 'd' }),
+      item({ status: 'downloaded', url: 'e' })
+    ]);
+    expect(counts).toEqual({ total: 5, missing: 2, upgrade: 1, library: 1 });
+  });
+
+  it('returns all-zero counts for an empty list', () => {
+    expect(computeStatusCounts([])).toEqual({ total: 0, missing: 0, upgrade: 0, library: 0 });
+  });
+});
+
+describe('filteredStats / hiddenByFiltersCount (empty-state self-diagnosis)', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('live mode: filteredStats derives from filteredResults, and hiddenByFiltersCount is 0 when nothing is hidden', async () => {
+    const { results: r, stats: st, statusFilter: sf } = await import('./results');
+    r.set([item({ status: 'missing', url: 'a' }), item({ status: 'missing', url: 'b' })]);
+    st.set({ total: 2, missing: 2, upgrade: 0, library: 0 });
+    sf.set('missing');
+    expect(get(filteredStats)).toEqual({ total: 2, missing: 2, upgrade: 0, library: 0 });
+    expect(get(hiddenByFiltersCount)).toBe(0);
+  });
+
+  it('live mode: a content filter (resolution) hiding every match for the active tab is reflected as hiddenByFiltersCount', async () => {
+    // Reproduces the reported bug directly: two TV items are 'missing', but a
+    // stuck resolutionFilter of {4K, 1080p} matches neither (TV only ever
+    // keys as 'TV' — see resolutionKeysFor), so filteredResults goes to 0
+    // while the true baseline (stats) still says 2.
+    const { results: r, stats: st, statusFilter: sf, resolutionFilter: rf } = await import('./results');
+    r.set([
+      item({ status: 'missing', url: 'tv1', season: 1, category: 'tv' }),
+      item({ status: 'missing', url: 'tv2', season: 2, category: 'tv' })
+    ]);
+    st.set({ total: 2, missing: 2, upgrade: 0, library: 0 });
+    sf.set('missing');
+    rf.set(['4K', '1080p']);
+    expect(get(filteredResults)).toEqual([]);
+    expect(get(hiddenByFiltersCount)).toBe(2);
+  });
+
+  it('clearAllFilters resets resolutionFilter (and the other content filters) so the hidden items reappear', async () => {
+    const {
+      results: r, stats: st, statusFilter: sf, resolutionFilter: rf,
+      genreFilter: gf, languageFilter: lf, postedAfter: pa, postedBefore: pb, searchFilter: sef
+    } = await import('./results');
+    r.set([item({ status: 'missing', url: 'tv1', season: 1, category: 'tv' })]);
+    st.set({ total: 1, missing: 1, upgrade: 0, library: 0 });
+    sf.set('missing');
+    rf.set(['4K', '1080p']);
+    gf.set(['Horror']);
+    lf.set(['French']);
+    pa.set('2020-01-01');
+    pb.set('2020-12-31');
+    sef.set('nomatch');
+    expect(get(filteredResults)).toEqual([]);
+    expect(get(hiddenByFiltersCount)).toBe(1);
+
+    clearAllFilters();
+
+    expect(get(rf)).toEqual([]);
+    expect(get(gf)).toEqual([]);
+    expect(get(lf)).toEqual([]);
+    expect(get(pa)).toBe('');
+    expect(get(pb)).toBe('');
+    expect(get(sef)).toBe('');
+    expect(get(filteredResults).map((i) => i.url)).toEqual(['tv1']);
+    expect(get(hiddenByFiltersCount)).toBe(0);
+  });
+
+  it('paged mode: filteredStats/hiddenByFiltersCount come from the server filtered_stats field', async () => {
+    const { loadResults, pagedMode, stats: st, statusFilter: sf } = await import('./results');
+    pagedMode.set(true);
+    sf.set('missing');
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [], total: 0,
+      stats: { total: 340, missing: 340, upgrade: 0, library: 0 },
+      filtered_stats: { total: 0, missing: 0, upgrade: 0, library: 0 },
+      title_counts: {}
+    });
+    await loadResults(true);
+    expect(get(st).missing).toBe(340);
+    expect(get(filteredStats).missing).toBe(0);
+    expect(get(hiddenByFiltersCount)).toBe(340);
+  });
+
+  it('paged mode: hiddenByFiltersCount is 0 once filtered_stats catches up with stats (e.g. after clearing filters)', async () => {
+    const { loadResults, pagedMode, stats: st, statusFilter: sf } = await import('./results');
+    pagedMode.set(true);
+    sf.set('missing');
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ status: 'missing', url: 'a' })], total: 340,
+      stats: { total: 340, missing: 340, upgrade: 0, library: 0 },
+      filtered_stats: { total: 340, missing: 340, upgrade: 0, library: 0 },
+      title_counts: {}
+    });
+    await loadResults(true);
+    expect(get(hiddenByFiltersCount)).toBe(0);
   });
 });

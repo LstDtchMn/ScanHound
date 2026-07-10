@@ -3,7 +3,7 @@
   import {
     filteredResults, filteredTotal, titleCounts, pagedMode, hasMore, loadingMore,
     loadResults, handleReconnectSnapshot, phoneColumns, mobileChromeCollapsed,
-    dismissItem, restoreItem
+    dismissItem, restoreItem, hiddenByFiltersCount, clearAllFilters
   } from '$lib/stores/results';
   import { onMount } from 'svelte';
   import { downloadHost } from '$lib/stores/downloads';
@@ -140,7 +140,19 @@
     </div>
   {/if}
   {#if $filteredTotal === 0}
-    <p class="text-center text-sm text-[var(--text-secondary)] py-10">No results — pull to refresh or adjust filters.</p>
+    {#if $hiddenByFiltersCount > 0}
+      <!-- Self-diagnosis: matches exist for this tab, filters are hiding them
+           all — see hiddenByFiltersCount / clearAllFilters (results.ts). -->
+      <div class="flex flex-col items-center gap-2 py-10 px-6 text-center">
+        <p class="text-sm text-[var(--text-secondary)]">0 shown &mdash; {$hiddenByFiltersCount} hidden by filters</p>
+        <button
+          onclick={() => clearAllFilters()}
+          class="px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-[var(--accent)] hover:opacity-90 transition-opacity"
+        >Clear filters</button>
+      </div>
+    {:else}
+      <p class="text-center text-sm text-[var(--text-secondary)] py-10">No results — pull to refresh or adjust filters.</p>
+    {/if}
   {/if}
 </PullToRefresh>
 
