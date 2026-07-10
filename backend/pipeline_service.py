@@ -83,6 +83,30 @@ def categorize(download_row: dict, result_row: Optional[dict], rename_rows: list
         if result_row is None:
             if jd_method != "api":
                 return ("unknown", "folder-mode grab has no results row to reconcile", None, None)
+            # The download_results row is NOT permanent: the Downloads UI's
+            # per-item "remove" (removeDownloadResult) and "clear all"
+            # (clearDownloadResults) actions delete rows, and the poller never
+            # repopulates a deleted one. So a fully-processed grab (all rename
+            # jobs 'applied', Plex already ingesting) can end up here purely
+            # because the user did routine Downloads housekeeping. When we still
+            # hold rename_jobs evidence, trust it and fall through to the same
+            # rename-status/Plex-verification logic used when a result row
+            # exists — rather than blindly declaring 'never_started' and
+            # surfacing a Re-grab button for a release already in Plex.
+            #
+            # GATE (regrab safety): only fall through when this grab has NEVER
+            # been regrabbed (no excluded_uuid). excluded_uuid is populated by
+            # clear_pipeline_verdict on every regrab/grab-alternative and never
+            # cleared, so an empty value proves there is exactly one attempt and
+            # the rename_rows unambiguously belong to it. If it IS set, the
+            # rename_rows may be STALE leftovers from a superseded prior attempt
+            # (regrab clears the download_results uuid pin but does not delete
+            # old rename_jobs rows), so we must not trust them — fall back to the
+            # honest never_started/too-soon logic below.
+            if rename_rows and not download_row.get("excluded_uuid"):
+                return _categorize_from_rename_rows(
+                    download_row, rename_rows, plex_max_ts,
+                    package_uuid=None, grace_margin_minutes=grace_margin_minutes, db=db)
             last_grabbed = download_row.get("last_grabbed_at")
             if last_grabbed and _minutes_since(last_grabbed) > 30:
                 return ("never_started", None, None, None)
@@ -98,38 +122,55 @@ def categorize(download_row: dict, result_row: Optional[dict], rename_rows: list
         if state == "extracted" and not rename_rows:
             return ("pending_rename", None, package_uuid, None)
 
-        if any(r.get("status") in _FAILED_RENAME_STATUSES for r in rename_rows):
-            failed = next(r for r in rename_rows if r.get("status") in _FAILED_RENAME_STATUSES)
-            detail = failed.get("error_message") or failed.get("warning_message")
-            return ("rename_failed", detail, package_uuid, None)
-        if any(r.get("status") in _PENDING_RENAME_STATUSES for r in rename_rows):
-            return ("pending_rename", None, package_uuid, None)
-        if any(r.get("status") == "reverted" for r in rename_rows):
-            return ("rename_failed", "reverted", package_uuid, None)
-
-        if rename_rows and all(r.get("status") == "applied" for r in rename_rows):
-            latest = max(rename_rows, key=lambda r: r.get("processed_at") or "")
-            processed_at = latest.get("processed_at")
-            if not processed_at:
-                return ("unknown", None, package_uuid, None)
-            dt = datetime.fromisoformat(processed_at)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            content_type = "TV Shows" if latest.get("media_type") == "tv" else "Movies"
-            cache_max = plex_max_ts.get(content_type, 0)
-            if cache_max < dt.timestamp() + grace_margin_minutes * 60:
-                return ("in_progress", None, package_uuid, None)
-            resolution = latest.get("resolution") or download_row.get("resolution")
-            match = find_plex_match(db, latest.get("imdb_id"), latest.get("title"),
-                                    latest.get("year"), latest.get("season"), resolution)
-            if match:
-                return ("verified", None, package_uuid, str(match.get("rating_key") or ""))
-            return ("not_in_plex", None, package_uuid, None)
-
-        return ("unknown", None, package_uuid, None)
+        return _categorize_from_rename_rows(
+            download_row, rename_rows, plex_max_ts,
+            package_uuid=package_uuid, grace_margin_minutes=grace_margin_minutes, db=db)
     except Exception:
         logger.exception("categorize failed for %s", download_row.get("url"))
         return ("unknown", "categorize error", None, None)
+
+
+def _categorize_from_rename_rows(download_row: dict, rename_rows: list,
+                                 plex_max_ts: dict, package_uuid: Optional[str],
+                                 grace_margin_minutes: int, db) -> tuple:
+    """Derive a verdict from rename_jobs evidence (+ Plex-cache freshness gate).
+
+    Shared by the normal 'result row present and extracted' path and by the
+    fallthrough categorize() uses when the download_results row was deleted out
+    from under a fully-processed grab. Depends only on rename_rows / download_row
+    / plex_max_ts / db — never on result_row — so it is safe to call in both.
+    Callers that want the applied->Plex verification pass in rename_rows; with
+    no rename_rows this returns ('unknown', ...).
+    """
+    if any(r.get("status") in _FAILED_RENAME_STATUSES for r in rename_rows):
+        failed = next(r for r in rename_rows if r.get("status") in _FAILED_RENAME_STATUSES)
+        detail = failed.get("error_message") or failed.get("warning_message")
+        return ("rename_failed", detail, package_uuid, None)
+    if any(r.get("status") in _PENDING_RENAME_STATUSES for r in rename_rows):
+        return ("pending_rename", None, package_uuid, None)
+    if any(r.get("status") == "reverted" for r in rename_rows):
+        return ("rename_failed", "reverted", package_uuid, None)
+
+    if rename_rows and all(r.get("status") == "applied" for r in rename_rows):
+        latest = max(rename_rows, key=lambda r: r.get("processed_at") or "")
+        processed_at = latest.get("processed_at")
+        if not processed_at:
+            return ("unknown", None, package_uuid, None)
+        dt = datetime.fromisoformat(processed_at)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        content_type = "TV Shows" if latest.get("media_type") == "tv" else "Movies"
+        cache_max = plex_max_ts.get(content_type, 0)
+        if cache_max < dt.timestamp() + grace_margin_minutes * 60:
+            return ("in_progress", None, package_uuid, None)
+        resolution = latest.get("resolution") or download_row.get("resolution")
+        match = find_plex_match(db, latest.get("imdb_id"), latest.get("title"),
+                                latest.get("year"), latest.get("season"), resolution)
+        if match:
+            return ("verified", None, package_uuid, str(match.get("rating_key") or ""))
+        return ("not_in_plex", None, package_uuid, None)
+
+    return ("unknown", None, package_uuid, None)
 
 
 def _minutes_since(sqlite_timestamp: str) -> float:

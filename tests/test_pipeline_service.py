@@ -116,6 +116,72 @@ class TestPlexGate:
         assert cat == "verified" and rk == "rk1"
 
 
+class TestResultRowDeletedFallthrough:
+    """The download_results row is NOT permanent — the Downloads UI's per-item
+    'remove' (removeDownloadResult) and 'clear all' (clearDownloadResults)
+    actions delete rows, and the poller never repopulates a deleted one. A grab
+    that fully processed (all rename_jobs 'applied', Plex ingested) but whose
+    result row was later removed by routine housekeeping must NOT be reported
+    'never_started' (which surfaces a misleading Re-grab button for a release
+    already correctly sitting in Plex). categorize() should fall through to the
+    same rename-status/Plex-verification logic it uses when the result row
+    exists — GATED so stale rename rows from a superseded pre-regrab attempt
+    can't fool it."""
+
+    def test_result_row_deleted_but_processed_and_plex_fresh_is_verified(self, monkeypatch):
+        # EXACT confirmed scenario: result_row=None (row removed via UI), all
+        # rename_rows 'applied', Plex cache fresh past the grace margin, and NO
+        # excluded_uuid (grab was never regrabbed). Must be 'verified', not
+        # 'never_started'.
+        import backend.pipeline_service as ps
+        monkeypatch.setattr(ps, "find_plex_match",
+                            lambda db, imdb_id, title, year, season, resolution: {"rating_key": "rk_live"})
+        d = _download_row(last_grabbed_at="2020-01-01 00:00:00")  # long past 30 min
+        rows = [_rename_row(status="applied", processed_at=datetime.now(timezone.utc).isoformat())]
+        fresh_cache = {"Movies": datetime.now(timezone.utc).timestamp() + 10000}
+        cat, detail, uuid, rk = categorize(d, None, rows, fresh_cache, jd_method="api")
+        assert cat == "verified"
+        assert rk == "rk_live"
+
+    def test_result_row_deleted_but_processed_and_no_plex_match_is_not_in_plex(self, monkeypatch):
+        # Same fallthrough, but Plex has no matching item -> honest 'not_in_plex',
+        # still NOT 'never_started'.
+        import backend.pipeline_service as ps
+        monkeypatch.setattr(ps, "find_plex_match", lambda *a, **k: None)
+        d = _download_row(last_grabbed_at="2020-01-01 00:00:00")
+        rows = [_rename_row(status="applied", processed_at=datetime.now(timezone.utc).isoformat())]
+        fresh_cache = {"Movies": datetime.now(timezone.utc).timestamp() + 10000}
+        cat, *_ = categorize(d, None, rows, fresh_cache, jd_method="api")
+        assert cat == "not_in_plex"
+
+    def test_result_row_deleted_after_regrab_does_not_trust_stale_rename_rows(self, monkeypatch):
+        # Regrab-safety GATE: this grab HAS been regrabbed (excluded_uuid set),
+        # so the only rename_rows present are STALE ones left over from the
+        # prior, now-superseded attempt (regrab clears the download_results uuid
+        # pin + adds to excluded_uuid but does NOT delete old rename_jobs rows).
+        # find_plex_match is stubbed to return a match, so IF the ungated
+        # fallthrough were reached it would wrongly report 'verified' from stale
+        # evidence for a NEW attempt that never reached that stage. The gate must
+        # hold: no verified/not_in_plex, and the honest answer past 30 min is
+        # 'never_started'.
+        import backend.pipeline_service as ps
+        monkeypatch.setattr(ps, "find_plex_match", lambda *a, **k: {"rating_key": "stale_rk"})
+        d = _download_row(last_grabbed_at="2020-01-01 00:00:00", excluded_uuid="old-superseded-uuid")
+        stale = _rename_row(status="applied",
+                            processed_at="2019-06-01T00:00:00+00:00")  # from before the regrab
+        fresh_cache = {"Movies": datetime.now(timezone.utc).timestamp() + 10000}
+        cat, *_ = categorize(d, None, [stale], fresh_cache, jd_method="api")
+        assert cat not in ("verified", "not_in_plex")
+        assert cat == "never_started"
+
+    def test_result_row_none_and_no_rename_rows_still_never_started(self):
+        # The genuine never_started case must remain reachable: no result row AND
+        # no rename evidence at all, past the 30-min window.
+        d = _download_row(last_grabbed_at="2020-01-01 00:00:00")
+        cat, *_ = categorize(d, None, [], {}, jd_method="api")
+        assert cat == "never_started"
+
+
 class TestMalformed:
     def test_malformed_input_never_raises(self):
         cat, *_ = categorize({}, {"state": "bogus"}, [{"status": "bogus"}], {}, jd_method="api")
