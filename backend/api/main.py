@@ -235,6 +235,17 @@ def _init_services(
             logger.warning("DB corruption startup check failed (non-fatal)", exc_info=True)
 
 
+def _rename_dedup_key(r: Dict[str, Any]) -> str:
+    """Durable dedup key for the auto-rename hand-off set.
+
+    Keyed by the package's ``package_uuid`` so two extracted packages that
+    happen to share a display ``name`` are each handed to auto-rename rather
+    than the second being silently skipped as a "duplicate". Legacy rows
+    without a uuid (pre-migration) fall back to ``name``.
+    """
+    return r.get("package_uuid") or r.get("name") or ""
+
+
 def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
     """Background thread that tracks JDownloader download + extraction outcomes.
 
@@ -272,15 +283,23 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                     # blocks on filesystem walks / TMDB lookups.
                     if cfg.get("auto_rename_enabled") and reg._rename_service:
                         for r in results:
-                            name = r.get("name")
+                            key = _rename_dedup_key(r)
                             if (r.get("state") == "extracted" and r.get("save_to")
-                                    and name not in handed_to_rename):
-                                handed_to_rename.add(name)
+                                    and key not in handed_to_rename):
+                                handed_to_rename.add(key)
                                 threading.Thread(
                                     target=reg._rename_service.process_package,
-                                    args=(name, r.get("save_to")),
+                                    args=(r.get("name"), r.get("save_to")),
                                     name="auto-rename", daemon=True,
                                 ).start()
+                    # Prune stale keys so the set doesn't grow unbounded. Only
+                    # when this poll actually returned rows — poll_results()
+                    # returns [] on a transient JD failure, and clearing the
+                    # set on an empty poll would re-hand every still-live
+                    # package to auto-rename on the next good poll.
+                    if results:
+                        live_keys = {_rename_dedup_key(r) for r in results}
+                        handed_to_rename &= live_keys
             except Exception as e:
                 logger.debug("results poller error: %s", e)
             # Sleep in short slices so shutdown stays responsive.

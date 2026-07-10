@@ -1677,3 +1677,29 @@ class TestErrorContracts:
             assert resp.status_code >= 400, f"{path} returned {resp.status_code}"
             data = resp.json()
             assert "detail" in data, f"{path} error response missing 'detail' field: {data}"
+
+
+class TestRenameDedupKey:
+    """The auto-rename hand-off hook must dedup by package_uuid, not name,
+    so two extracted packages that share a display name are each handed to
+    auto-rename instead of the second being skipped as a false "duplicate".
+    """
+
+    def test_same_name_distinct_uuid_yields_distinct_keys(self):
+        from backend.api.main import _rename_dedup_key
+        row_a = {"name": "Movie.Name.2024", "package_uuid": "uuid-aaa"}
+        row_b = {"name": "Movie.Name.2024", "package_uuid": "uuid-bbb"}
+        key_a = _rename_dedup_key(row_a)
+        key_b = _rename_dedup_key(row_b)
+        assert key_a != key_b
+        assert key_a == "uuid-aaa"
+        assert key_b == "uuid-bbb"
+
+    def test_legacy_row_without_uuid_falls_back_to_name(self):
+        from backend.api.main import _rename_dedup_key
+        row = {"name": "Legacy.Package.2020", "package_uuid": None}
+        assert _rename_dedup_key(row) == "Legacy.Package.2020"
+
+    def test_row_missing_both_returns_empty_string(self):
+        from backend.api.main import _rename_dedup_key
+        assert _rename_dedup_key({}) == ""
