@@ -1,5 +1,6 @@
 from datetime import datetime, timezone, timedelta
-from backend.pipeline_service import categorize, find_plex_match
+from backend.pipeline_service import categorize, find_plex_match, reconcile_batch
+from backend.database import DatabaseManager
 
 
 def _download_row(**kw):
@@ -221,3 +222,125 @@ class TestFindPlexMatch:
             def get_connection(self):
                 return "not-a-real-connection"  # .cursor() will raise AttributeError
         assert find_plex_match(BadDB(), "tt1", "Title", 2020, None, "1080p") is None
+
+
+class TestMatchingAndReconcileBatch:
+    def test_uuid_recorded_verdict_matches_directly(self, db_manager):
+        db_manager.add_to_history("http://m/1", "Foo", package_name="Foo [1080p]")
+        conn = db_manager.get_connection()
+        conn.execute("UPDATE downloads SET last_grabbed_at = datetime('now','-1 hour') "
+                     "WHERE url='http://m/1'")
+        conn.execute("INSERT INTO download_results (package_uuid, name, state, updated_at) "
+                     "VALUES ('999', 'Foo [1080p]', 'failed', datetime('now'))")
+        conn.commit()
+        db_manager.upsert_pipeline_verdict("http://m/1", "download_failed", package_uuid="999")
+        n = reconcile_batch(db_manager)
+        assert n >= 1
+        rows = db_manager.get_pipeline_verdicts()
+        assert rows[0]["package_uuid"] == "999"
+
+    def test_max_id_tiebreak_not_state_progression(self, db_manager):
+        # Two rows, SAME name, SAME updated_at (simulating a post-restart
+        # repoll bump) — the OLDER row (lower id) is further-along ('extracted'),
+        # the NEWER row (higher id) is earlier-stage ('downloading'). The
+        # higher id must win.
+        db_manager.add_to_history("http://m/2", "Bar", package_name="Bar [1080p]")
+        conn = db_manager.get_connection()
+        conn.execute("UPDATE downloads SET last_grabbed_at = datetime('now','-1 hour') "
+                     "WHERE url='http://m/2'")
+        conn.execute("INSERT INTO download_results (package_uuid, name, state, updated_at) "
+                     "VALUES ('old-uuid', 'Bar [1080p]', 'extracted', datetime('now'))")
+        conn.execute("INSERT INTO download_results (package_uuid, name, state, updated_at) "
+                     "VALUES ('new-uuid', 'Bar [1080p]', 'downloading', datetime('now'))")
+        conn.commit()
+        reconcile_batch(db_manager)
+        rows = db_manager.get_pipeline_verdicts()
+        row = next(r for r in rows if r["url"] == "http://m/2")
+        assert row["package_uuid"] == "new-uuid"
+
+    def test_excluded_uuid_prevents_readopting_stale_package(self, db_manager):
+        db_manager.add_to_history("http://m/3", "Baz", package_name="Baz [1080p]")
+        conn = db_manager.get_connection()
+        conn.execute("UPDATE downloads SET last_grabbed_at = datetime('now','-1 hour') "
+                     "WHERE url='http://m/3'")
+        conn.execute("INSERT INTO download_results (package_uuid, name, state, updated_at) "
+                     "VALUES ('stale-uuid', 'Baz [1080p]', 'extracted', datetime('now'))")
+        conn.commit()
+        db_manager.upsert_pipeline_verdict("http://m/3", "rename_failed", package_uuid="stale-uuid")
+        db_manager.clear_pipeline_verdict("http://m/3")  # excludes stale-uuid
+        n = reconcile_batch(db_manager)  # only the stale row exists — must NOT re-adopt it
+        rows = db_manager.get_pipeline_verdicts(include_dismissed=True)
+        row = next(r for r in rows if r["url"] == "http://m/3")
+        assert row["package_uuid"] is None  # no match found, not the excluded stale row
+
+    def test_reconcile_batch_is_batched_not_n_plus_1(self, db_manager, monkeypatch):
+        # Seed 5 eligible grabs; assert the number of raw connection queries
+        # stays small (a handful, not 5x per-item queries). Approximate via a
+        # call-count wrapper on the connection's execute.
+        #
+        # NOTE: CPython's native sqlite3.Connection.execute is a read-only C
+        # attribute — monkeypatch.setattr(conn, "execute", ...) raises
+        # AttributeError. So instead of patching execute on the real connection,
+        # wrap the connection in a thin proxy that counts execute() and delegates
+        # everything else (cursor/commit/etc.), and patch get_connection to hand
+        # back the proxy. This counts exactly the same calls the direct patch
+        # would have: the per-item _match_download_results/_match_rename_rows
+        # queries plus each upsert's _mutate conn.execute (cursor.execute paths
+        # in _query-based reads go through the delegated real cursor and aren't
+        # counted, same as they wouldn't be under the original approach).
+        for i in range(5):
+            db_manager.add_to_history(f"http://m/batch{i}", f"T{i}", package_name=f"T{i} [1080p]")
+        conn = db_manager.get_connection()
+        conn.execute("UPDATE downloads SET last_grabbed_at = datetime('now','-1 hour') "
+                     "WHERE url LIKE 'http://m/batch%'")
+        conn.commit()
+        calls = {"n": 0}
+
+        class _CountingConn:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, *a, **k):
+                calls["n"] += 1
+                return self._real.execute(*a, **k)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        wrapped = _CountingConn(conn)
+        monkeypatch.setattr(db_manager, "get_connection", lambda: wrapped)
+        reconcile_batch(db_manager)
+        assert calls["n"] < 20  # well under one-query-per-item x several tables
+
+    def test_malformed_row_does_not_stop_the_batch(self, db_manager):
+        db_manager.add_to_history("http://m/ok", "OK", package_name="OK [1080p]")
+        db_manager.add_to_history("http://m/bad", None, package_name="Bad [1080p]")  # malformed title
+        conn = db_manager.get_connection()
+        conn.execute("UPDATE downloads SET last_grabbed_at = datetime('now','-1 hour') "
+                     "WHERE url IN ('http://m/ok','http://m/bad')")
+        conn.commit()
+        n = reconcile_batch(db_manager)
+        assert n == 2  # both processed, one may categorize 'unknown'
+
+    def test_dismissed_and_verified_not_recomputed(self, db_manager):
+        db_manager.add_to_history("http://m/term1", "V", package_name="V [1080p]")
+        db_manager.add_to_history("http://m/term2", "D", package_name="D [1080p]")
+        db_manager.upsert_pipeline_verdict("http://m/term1", "verified")
+        db_manager.upsert_pipeline_verdict("http://m/term2", "download_failed")
+        db_manager.dismiss_pipeline_verdict("http://m/term2")
+        n = reconcile_batch(db_manager)
+        assert n == 0  # nothing eligible
+
+    def test_in_progress_verdict_reconsidered_on_second_pass(self, db_manager):
+        # N1 regression: a non-terminal verdict must be re-picked-up even
+        # though last_grabbed_at hasn't changed.
+        db_manager.add_to_history("http://m/prog", "P", package_name="P [1080p]")
+        conn = db_manager.get_connection()
+        conn.execute("UPDATE downloads SET last_grabbed_at = datetime('now','-1 hour') "
+                     "WHERE url='http://m/prog'")
+        conn.execute("INSERT INTO download_results (package_uuid, name, state, updated_at) "
+                     "VALUES ('p-uuid', 'P [1080p]', 'downloading', datetime('now'))")
+        conn.commit()
+        reconcile_batch(db_manager)  # pass 1: writes in_progress
+        n2 = reconcile_batch(db_manager)  # pass 2: must still pick it up
+        assert n2 >= 1

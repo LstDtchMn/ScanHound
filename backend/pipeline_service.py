@@ -138,3 +138,99 @@ def _minutes_since(sqlite_timestamp: str) -> float:
     except ValueError:
         return 0.0
     return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+
+
+def _match_download_results(conn, download_row: dict) -> Optional[dict]:
+    """Match one grab to its download_results row.
+
+    uuid-first: a previously-recorded verdict.package_uuid (passed in under the
+    key 'verdict_package_uuid') pins the match to that exact package, so a
+    verdict that has already locked onto a specific download keeps following it.
+
+    Fallback: name + last_grabbed_at-window, with any accumulated excluded_uuid
+    (a comma-joined list built by clear_pipeline_verdict on each regrab) filtered
+    out, tiebreaking on MAX(id) — the surrogate AUTOINCREMENT primary key, which
+    is strictly monotonic even when two repolled rows share the same
+    second-resolution updated_at. The tiebreak is deliberately MAX(id), NOT
+    state-progression: after a regrab-following-a-late-failure, the newer package
+    (higher id) may legitimately be at an *earlier* pipeline stage than the stale
+    one, and it must still win. See the plan's Task 4 rationale.
+    """
+    uuid = download_row.get("verdict_package_uuid")
+    if uuid:
+        cur = conn.execute(
+            "SELECT * FROM download_results WHERE package_uuid = ?", (uuid,))
+        row = cur.fetchone()
+        if row is not None:
+            return dict(row)
+    excluded = (download_row.get("excluded_uuid") or "").split(",")
+    excluded = [e for e in excluded if e]
+    name = download_row.get("package_name")
+    last_grabbed = download_row.get("last_grabbed_at")
+    if not name or not last_grabbed:
+        return None
+    sql = ("SELECT * FROM download_results WHERE name = ? "
+           "AND updated_at >= datetime(?, '-5 seconds')")
+    params = [name, last_grabbed]
+    if excluded:
+        # Only filter uuids when there is something to exclude. Keep NULL-uuid
+        # rows (a fresh package not yet assigned a uuid) AND any non-excluded
+        # uuid; `package_uuid NOT IN (...)` alone would drop NULL rows because
+        # `NULL NOT IN (...)` is NULL/falsy in SQL. When `excluded` is empty we
+        # add no uuid predicate at all — every name+window row is a candidate.
+        placeholders = ",".join("?" * len(excluded))
+        sql += f" AND (package_uuid IS NULL OR package_uuid NOT IN ({placeholders}))"
+        params.extend(excluded)
+    sql += " ORDER BY id DESC LIMIT 1"
+    cur = conn.execute(sql, tuple(params))
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _match_rename_rows(conn, package_name: Optional[str]) -> list:
+    """All rename_jobs rows for this grab's package_name (there can be several
+    when a package expands to multiple media files)."""
+    if not package_name:
+        return []
+    cur = conn.execute("SELECT * FROM rename_jobs WHERE package_name = ?", (package_name,))
+    return [dict(r) for r in cur.fetchall()]
+
+
+def reconcile_batch(db, limit: int = 500, jd_method: str = "api") -> int:
+    """Reconcile up to `limit` eligible grabs and upsert their verdicts.
+
+    Returns the count processed. Per-item failures are caught and categorized
+    'unknown' rather than aborting the batch (this function itself does not
+    swallow batch-level errors — the maintenance-loop caller wraps this in its
+    own try/except). `jd_method` is passed by the caller (Task 5's maintenance
+    hook, which owns the live config) as `config.get("jd_method", "folder")`;
+    it defaults to "api" here since DatabaseManager holds no config reference.
+    """
+    candidates = db.get_downloads_needing_reconcile(limit=limit)
+    if not candidates:
+        return 0
+    conn = db.get_connection()
+    if not conn:
+        return 0
+    plex_max_ts = db.get_plex_cache_max_timestamp()
+    processed = 0
+    for row in candidates:
+        try:
+            row["verdict_package_uuid"] = row.get("package_uuid")
+            result_row = _match_download_results(conn, row)
+            rename_rows = _match_rename_rows(conn, row.get("package_name"))
+            category, detail, package_uuid, plex_rating_key = categorize(
+                row, result_row, rename_rows, plex_max_ts, jd_method=jd_method, db=db)
+            if category is not None:
+                db.upsert_pipeline_verdict(row["url"], category, detail=detail,
+                                           package_uuid=package_uuid,
+                                           plex_rating_key=plex_rating_key)
+            processed += 1
+        except Exception:
+            logger.exception("reconcile_batch: item failed for %s", row.get("url"))
+            try:
+                db.upsert_pipeline_verdict(row["url"], "unknown", detail="reconcile error")
+            except Exception:
+                pass
+            processed += 1
+    return processed
