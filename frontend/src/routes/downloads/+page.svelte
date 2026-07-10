@@ -525,7 +525,7 @@
       style="height: 20rem"
       use:persistResize={'sh-tracker-h'}
     >
-      {#each dlResults as r (r.name)}
+      {#each dlResults as r (r.id)}
         {@const badge = trackerDownloadBadge(r)}
         <div class="flex items-center gap-3 px-3 py-2 rounded border {r.state === 'failed' ? 'border-[var(--error)]/50 bg-[var(--error)]/5' : 'border-[var(--border)]'} text-xs">
           <Badge label={badge.label} variant={badge.variant} />

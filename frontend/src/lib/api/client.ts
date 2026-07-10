@@ -223,10 +223,10 @@ export const api = {
     request<DownloadResult[]>(`/download/results?limit=${limit}`),
   clearDownloadResults: () =>
     request<{ status: string }>('/download/results', { method: 'DELETE' }),
-  removeDownloadResult: (name: string) =>
+  removeDownloadResult: (id: number) =>
     request<{ ok: boolean; removed: number }>('/download/results/remove', {
       method: 'POST',
-      body: JSON.stringify({ name })
+      body: JSON.stringify({ id })
     }),
 
   // Settings

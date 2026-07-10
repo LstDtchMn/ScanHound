@@ -79,15 +79,15 @@
     const done = results.filter((r) => r.state === 'extracted' || r.state === 'failed');
     if (!done.length) return;
     for (const r of done) {
-      try { await api.removeDownloadResult(r.name); } catch { /* idempotent; ignore */ }
+      try { await api.removeDownloadResult(r.id); } catch { /* idempotent; ignore */ }
     }
     await poll();
   }
 
   async function cancel(r: DownloadResult) {
     try {
-      await api.removeDownloadResult(r.name);
-      results = results.filter((x) => x.name !== r.name);   // optimistic
+      await api.removeDownloadResult(r.id);
+      results = results.filter((x) => x.id !== r.id);   // optimistic
       addToast('Removed', r.title || r.name);
     } catch (e) {
       addToast('Error', e instanceof Error ? e.message : 'Could not remove', 'error');
@@ -95,8 +95,8 @@
   }
 
   async function keepBest(g: DownloadGroup) {
-    if (!confirm(`Keep "${g.best.name}" and cancel ${g.items.length - 1} other release(s) of ${g.title}?`)) return;
-    for (const r of g.items) if (r.name !== g.best.name) await cancel(r);
+    if (!confirm(`Keep "${g.best.name}" and cancel ${g.activeItems.length - 1} other release(s) of ${g.title}?`)) return;
+    for (const r of g.activeItems) if (r.id !== g.best.id) await cancel(r);
   }
 </script>
 
@@ -123,10 +123,12 @@
             <span class="text-xs font-semibold px-2 py-0.5 rounded bg-amber-500/20 text-amber-400">{g.items.length} duplicates</span>
             <span class="text-sm font-medium truncate">{g.title}</span>
             <div class="flex-1"></div>
-            <button class="text-xs px-2 py-1 rounded bg-[var(--accent)] text-white" onclick={() => keepBest(g)}>Keep best</button>
+            {#if g.canKeepBest}
+              <button class="text-xs px-2 py-1 rounded bg-[var(--accent)] text-white" onclick={() => keepBest(g)}>Keep best</button>
+            {/if}
           </div>
         {/if}
-        {#each g.items as r (r.name)}
+        {#each g.items as r (r.id)}
           <div class="py-1.5 {g.isDuplicate ? 'pl-2 border-l-2 border-[var(--border)]' : ''}">
             <div class="flex items-center gap-2">
               {#if !g.isDuplicate}<span class="text-sm font-medium truncate">{r.title || r.name}</span>{/if}
