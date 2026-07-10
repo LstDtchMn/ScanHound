@@ -154,6 +154,52 @@ def test_conflict_preview_recommends_existing_dv_over_tag_rich_lower(db, tmp_pat
     assert db.get_rename_job(jid) == before
 
 
+# ── FIX 5: a genuinely FAILED probe (ffprobe missing/timeout/error — not the
+#    legitimate {present: False} "no file here" result) on either side must
+#    not produce a confidently-wrong recommendation from filename-only data ──
+
+def test_conflict_preview_probe_failure_on_existing_yields_no_recommendation(
+        db, tmp_path, monkeypatch):
+    svc = _service(db)
+    jid, src, dst = _make_job(
+        db, tmp_path, src_name="New.Movie.2026.1080p.mkv",
+        dst_name="Movie (2026).mkv", create_dst=True)
+
+    # incoming probes fine; existing (dst) probe FAILS (returns None, as
+    # probe_specs does on a missing ffprobe binary / timeout / parse error).
+    specs = {src: {"present": True, "resolution": "1080p", "hdr": None,
+                    "dv_layer": None, "video_codec": "HEVC"}}
+    monkeypatch.setattr(svcmod, "probe_specs", lambda p, **k: specs.get(p))
+
+    out = svc.conflict_preview(jid)
+
+    assert out["recommended"] is None
+    assert out["reason"] is None
+    # Degraded specs are still returned so the UI can show what it has.
+    assert out["existing"] is not None
+    assert out["existing"]["present"] is True
+    assert out["incoming"] is not None
+    assert out["incoming"]["present"] is True
+
+
+def test_conflict_preview_probe_failure_on_incoming_yields_no_recommendation(
+        db, tmp_path, monkeypatch):
+    svc = _service(db)
+    jid, src, dst = _make_job(
+        db, tmp_path, src_name="New.Movie.2026.1080p.mkv",
+        dst_name="Movie (2026).mkv", create_dst=False)
+
+    # incoming (src) probe FAILS; destination doesn't exist (legit, not a
+    # failure) so `existing` stays a clean {present: False}.
+    monkeypatch.setattr(svcmod, "probe_specs", lambda p, **k: None)
+
+    out = svc.conflict_preview(jid)
+
+    assert out["recommended"] is None
+    assert out["reason"] is None
+    assert out["existing"]["present"] is False
+
+
 # ── job not found: clean dict, never raises ──────────────────────────────
 
 def test_conflict_preview_job_not_found(db):

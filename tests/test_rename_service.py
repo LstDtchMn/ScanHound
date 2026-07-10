@@ -606,7 +606,12 @@ class TestApplyUndo:
         dst = os.path.join(lib, "The Matrix (1999)", job["new_filename"])
         assert os.path.isfile(dst) and not os.path.exists(src)
 
-        assert svc.undo(jid)["ok"] is True
+        undo_out = svc.undo(jid)
+        assert undo_out["ok"] is True
+        # FIX 6: restore_warning must be present and None on a normal
+        # (non-overwrite) undo — nothing was ever displaced into trash.
+        assert "restore_warning" in undo_out
+        assert undo_out["restore_warning"] is None
         assert db.get_rename_job(jid)["status"] == "reverted"
         assert os.path.exists(src) and not os.path.exists(dst)
 

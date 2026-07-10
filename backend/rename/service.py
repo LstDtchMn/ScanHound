@@ -745,7 +745,13 @@ class RenameService:
     def scan_conflict_dv(self, job_id: int) -> dict:
         """Detect + cache the DV FEL/MEL layer of a conflict's two files (incoming
         source + existing destination). Reuses dv_detect + the dv_scan cache.
-        Intended to run on a background thread (see the route)."""
+        Intended to run on a background thread (see the route).
+
+        Single-flighted on the shared bulk lock (mirrors scan_folder_dv): a
+        dovi_tool RPU walk streams the whole file and can take up to 1800s, so
+        a second concurrent scan (of this conflict or a full-folder DV sweep)
+        must not run at the same time — it would double the I/O and race the
+        same dv_scan rows."""
         db = self._db
         if db is None:
             return {"error": "Database unavailable", "scanned": 0}
@@ -754,41 +760,47 @@ class RenameService:
             return {"error": "Job not found", "scanned": 0}
         if not _dv.available():
             return {"error": "dovi_tool is not installed in this build", "scanned": 0}
-        dest_dir = job.get("destination_path") or ""
-        dst = os.path.join(dest_dir, job.get("new_filename")
-                           or os.path.basename(job.get("original_path") or "")) \
-            if dest_dir else None
-        paths = [p for p in (job.get("original_path"), dst)
-                 if p and os.path.isfile(p)]
-        scanned = 0
-        for path in paths:
-            # Skip-check is itself fail-safe: a stat error just means "scan it"
-            # (mirrors scan_folder_dv).
-            try:
-                st = os.stat(path)
-                if db.dv_scan_is_current(path, st.st_mtime, st.st_size):
-                    continue
-            except OSError:
-                st = None
-            # Detect + record. Any failure is recorded as 'unknown' (with a
-            # null signature so a later run retries it) rather than dropped —
-            # so a bad file never silently vanishes from the inventory.
-            try:
-                layer = _dv.detect_layer(path).get("layer", _dv.LAYER_UNKNOWN)
-                title = parse_filename(os.path.basename(path)).get("title") or None
-                db.upsert_dv_scan(path, layer, title=title,
-                                  sig_mtime=(st.st_mtime if st else None),
-                                  sig_size=(st.st_size if st else None),
-                                  source="scan")
-            except Exception:
-                logger.exception("scan_conflict_dv failed on %s", path)
+        if not self._bulk_lock.acquire(blocking=False):
+            return {"error": "Another bulk rename operation is already running",
+                    "scanned": 0, "busy": True}
+        try:
+            dest_dir = job.get("destination_path") or ""
+            dst = os.path.join(dest_dir, job.get("new_filename")
+                               or os.path.basename(job.get("original_path") or "")) \
+                if dest_dir else None
+            paths = [p for p in (job.get("original_path"), dst)
+                     if p and os.path.isfile(p)]
+            scanned = 0
+            for path in paths:
+                # Skip-check is itself fail-safe: a stat error just means "scan it"
+                # (mirrors scan_folder_dv).
                 try:
-                    db.upsert_dv_scan(path, _dv.LAYER_UNKNOWN, sig_mtime=None,
-                                      sig_size=None, source="scan")
+                    st = os.stat(path)
+                    if db.dv_scan_is_current(path, st.st_mtime, st.st_size):
+                        continue
+                except OSError:
+                    st = None
+                # Detect + record. Any failure is recorded as 'unknown' (with a
+                # null signature so a later run retries it) rather than dropped —
+                # so a bad file never silently vanishes from the inventory.
+                try:
+                    layer = _dv.detect_layer(path).get("layer", _dv.LAYER_UNKNOWN)
+                    title = parse_filename(os.path.basename(path)).get("title") or None
+                    db.upsert_dv_scan(path, layer, title=title,
+                                      sig_mtime=(st.st_mtime if st else None),
+                                      sig_size=(st.st_size if st else None),
+                                      source="scan")
                 except Exception:
-                    logger.exception("scan_conflict_dv: could not record failure for %s", path)
-            scanned += 1
-        return {"job_id": job_id, "scanned": scanned}
+                    logger.exception("scan_conflict_dv failed on %s", path)
+                    try:
+                        db.upsert_dv_scan(path, _dv.LAYER_UNKNOWN, sig_mtime=None,
+                                          sig_size=None, source="scan")
+                    except Exception:
+                        logger.exception("scan_conflict_dv: could not record failure for %s", path)
+                scanned += 1
+            return {"job_id": job_id, "scanned": scanned}
+        finally:
+            self._bulk_lock.release()
 
     def reidentify(self, job_id: int) -> dict:
         """Re-run identification for an existing (not-yet-applied) job — re-matches
@@ -1407,6 +1419,11 @@ class RenameService:
         # overwrote a prior file (captured in trash), restore it so undo is
         # symmetric and no data is stranded. Best-effort: a normal undo (no
         # overwrite ever happened) simply finds no matching trash entry.
+        # ``restore_warning`` surfaces a failure here to the caller instead of
+        # only a server-log line — the new file was still reverted (ok stays
+        # True), but the displaced original may be left stranded in trash and
+        # the UI/caller should know.
+        restore_warning = None
         try:
             dst_key = os.path.normcase(os.path.abspath(dst))
             roots = _fileops.trash_roots(dst)
@@ -1419,15 +1436,21 @@ class RenameService:
                 restore_result = _fileops.restore_trash_entry(
                     cands[0]["bucket"], cands[0]["name"], roots)
                 if not restore_result.get("ok"):
+                    restore_warning = (
+                        "The file that was overwritten could not be restored "
+                        f"from trash ({restore_result.get('error') or 'unknown error'}); "
+                        "it remains recoverable there.")
                     logger.warning(
                         "undo: overwrite-original restore failed for job %s, "
                         "destination %s left stranded in trash: %s",
                         job_id, dst, restore_result.get("error"))
         except Exception:
+            restore_warning = ("The file that was overwritten could not be "
+                               "restored from trash (see server logs).")
             logger.exception("undo: overwrite-original restore best-effort failed")
         db.update_rename_job(job_id, status="reverted", reverted_at=_now())
         self._broadcast(job_id)
-        return {"ok": True}
+        return {"ok": True, "restore_warning": restore_warning}
 
     def rematch(self, job_id: int, tmdb_id: int, media_type: Optional[str] = None,
                 season: Optional[int] = None, episode: Optional[int] = None) -> dict:
@@ -1538,6 +1561,12 @@ class RenameService:
         probed technical specs (see rank_conflict) rather than filenames, so a
         Plex-renamed library file (tags stripped) isn't unfairly beaten by a
         tag-rich but lower-quality incoming release.
+
+        If ``probe_specs`` genuinely FAILED (ffprobe missing/timeout/error —
+        distinct from "file doesn't exist", which is a legitimate {present:
+        False} result) on either side, that spec is filename-only/bare — never
+        emit a confidently-wrong recommendation off degraded data. Both specs
+        are still returned (degraded) so the UI can show what it has.
         """
         db = self._db
         job = db.get_rename_job(job_id) if db else None
@@ -1548,17 +1577,23 @@ class RenameService:
         dst = (os.path.join(dest_dir, job.get("new_filename")
                             or os.path.basename(job.get("original_path") or ""))
                if dest_dir else None)
-        incoming = probe_specs(job.get("original_path"), db=db) or {
+        incoming_probe = probe_specs(job.get("original_path"), db=db)
+        incoming = incoming_probe or {
             "present": os.path.exists(job.get("original_path") or ""),
             "path": job.get("original_path")}
         incoming["original_filename"] = job.get("original_filename")
         incoming["resolution"] = incoming.get("resolution") or job.get("resolution")
+        existing_probe_failed = False
         if dst and os.path.lexists(dst):
-            existing = probe_specs(dst, db=db) or {"present": True, "path": dst}
+            existing_probe = probe_specs(dst, db=db)
+            existing = existing_probe or {"present": True, "path": dst}
             existing["original_filename"] = os.path.basename(dst)
+            existing_probe_failed = existing_probe is None
         else:
             existing = {"present": False, "path": dst}
         rec = rank_conflict(existing, {**incoming, "id": job_id})
+        if incoming_probe is None or existing_probe_failed:
+            rec = {"recommended": None, "reason": None}
         return {"existing": existing, "incoming": incoming,
                 "recommended": rec["recommended"], "reason": rec["reason"]}
 

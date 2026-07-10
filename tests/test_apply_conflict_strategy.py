@@ -118,6 +118,36 @@ class TestOverwrite:
         assert db.get_rename_job(jid)["status"] == "reverted"
         # Trash bucket is empty again (nothing left stranded).
         assert fileops.list_trash_entries([str(trash_root)]) == []
+        # FIX 6: a successful restore reports no warning.
+        assert out.get("restore_warning") is None
+
+    def test_undo_of_overwrite_surfaces_restore_failure(self, db, tmp_path, monkeypatch):
+        """FIX 6 attack: if the trash-restore of the displaced original fails,
+        undo() must still report ok:True (the NEW file was reverted — that
+        part genuinely succeeded) but must surface the restore failure via
+        restore_warning instead of only a server-log warning that the caller
+        never sees."""
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+
+        svc = _service(db)
+        jid, src, existing = _make_conflict(db, tmp_path)
+
+        svc.apply(jid, conflict_strategy="overwrite")
+        assert open(existing, "rb").read() == b"NEW"
+
+        monkeypatch.setattr(
+            fileops, "restore_trash_entry",
+            lambda *a, **k: {"ok": False, "error": "simulated restore failure"})
+
+        out = svc.undo(jid)
+
+        assert out["ok"] is True  # the placed file was still reverted
+        assert os.path.exists(str(src))
+        assert db.get_rename_job(jid)["status"] == "reverted"
+        # The failure is now surfaced, not silent.
+        assert out.get("restore_warning")
+        assert "simulated restore failure" in out["restore_warning"]
 
     def test_overwrite_same_inode_reapply_is_noop_not_trashed(self, db, tmp_path, monkeypatch):
         """Re-applying a job whose src/dst are already the same file (e.g. a

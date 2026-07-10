@@ -119,6 +119,28 @@ class TestScanConflictDv:
         assert first["scanned"] == 2
         assert second["scanned"] == 0
 
+    def test_busy_when_bulk_lock_held_does_not_scan(self, svc, db, tmp_path):
+        """A dovi_tool RPU walk streams the whole file (up to 1800s) — a
+        second concurrent scan (of this conflict, a full-folder DV sweep, or
+        another bulk rename op) must not run at the same time. Mirrors
+        scan_folder_dv's single-flight guard."""
+        jid, src_path, dst_path = _conflict_job(db, tmp_path)
+        assert svc._bulk_lock.acquire(blocking=False)  # simulate an in-flight op
+        try:
+            with patch("backend.rename.dv_detect.available", return_value=True), \
+                 patch("backend.rename.dv_detect.detect_layer") as mock_detect:
+                out = svc.scan_conflict_dv(jid)
+        finally:
+            svc._bulk_lock.release()
+
+        assert out.get("busy") is True
+        assert out["scanned"] == 0
+        assert out.get("error")
+        mock_detect.assert_not_called()
+        # Neither file was touched in the DB.
+        assert db.get_dv_scan(src_path) is None
+        assert db.get_dv_scan(dst_path) is None
+
     def test_failed_detect_recorded_as_unknown(self, svc, db, tmp_path):
         # Mirrors test_rename_service.py::TestDvFolderScan::
         # test_every_file_accounted_including_failures — a detect_layer failure
