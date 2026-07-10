@@ -983,7 +983,7 @@ class DatabaseManager:
     # ── Pipeline tracker verdicts ────────────────────────────────────
 
     def get_pipeline_verdicts(self, category=None, include_dismissed=False):
-        """Return pipeline verdicts, joined with their downloads/rename_jobs
+        """Return pipeline verdicts, joined with their downloads
         display fields, most-recently-checked first."""
         clauses = []
         params = []

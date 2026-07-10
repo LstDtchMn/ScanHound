@@ -1069,4 +1069,11 @@ class TestPipelineVerdicts:
         db_manager.upsert_pipeline_verdict("http://p/8", "download_failed")
         db_manager.clear_history()
         assert db_manager.get_pipeline_verdicts(include_dismissed=True) == []
+        # get_pipeline_verdicts INNER JOINs against downloads (also emptied by
+        # clear_history), so an empty result above would pass even if the
+        # DELETE FROM pipeline_verdicts line were silently removed. Query the
+        # table directly to prove the row is actually gone, not just unjoinable.
+        conn = db_manager.get_connection()
+        count = conn.execute("SELECT COUNT(*) FROM pipeline_verdicts").fetchone()[0]
+        assert count == 0
 
