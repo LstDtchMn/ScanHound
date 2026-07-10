@@ -1050,6 +1050,31 @@ class DatabaseManager:
             (limit,),
         )
 
+    def get_download_result_id(self, package_uuid, name):
+        """Resolve a download_results row id for a package: by ``package_uuid``
+        when present, else the most recent legacy NULL-uuid row with the same
+        ``name``. Returns None if no matching row exists.
+
+        Used by the poller to recover an id for a row whose write the
+        in-memory uuid->id cache doesn't (yet) know about — e.g. after a
+        process restart — without re-inserting a duplicate row.
+        """
+        try:
+            if package_uuid is not None:
+                row = self._query(
+                    "SELECT id FROM download_results WHERE package_uuid = ?",
+                    (package_uuid,), one=True, default=None)
+                if row:
+                    return row[0]
+            row = self._query(
+                "SELECT id FROM download_results WHERE package_uuid IS NULL AND name = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (name,), one=True, default=None)
+            return row[0] if row else None
+        except Exception as e:
+            logger.error("DB Error (get_download_result_id): %s", e)
+            return None
+
     def clear_download_results(self):
         """Delete all tracked download/extraction outcomes."""
         return self._mutate("DELETE FROM download_results", label="clear_download_results")

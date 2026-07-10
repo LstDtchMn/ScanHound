@@ -42,6 +42,14 @@ def _make_service(config=None, db=None):
     return DownloadService(config=cfg, db=database)
 
 
+@pytest.fixture
+def download_service(db_manager):
+    """A DownloadService wired to the real (temp-file) ``db_manager`` fixture
+    (see tests/conftest.py) rather than a MagicMock — for tests that need
+    genuine adopt-or-insert / delete-by-id database behavior."""
+    return _make_service(db=db_manager)
+
+
 class TestDownloadFolderRouting:
     """4K movies route to their own JD folder so they extract onto the 4K
     library's drive (instant same-volume rename instead of a cross-drive copy).
@@ -1716,10 +1724,10 @@ class TestPollResults:
         with patch.object(svc, "_connect_jd_device", return_value=device):
             results = svc.poll_results(record=False)
         assert results == [{
-            "name": "Pkg.Queued", "title": "Pkg.Queued", "host": "",
+            "id": None, "name": "Pkg.Queued", "title": "Pkg.Queued", "host": "",
             "bytes_total": 1000, "bytes_loaded": 0, "downloaded": 0,
             "extraction": "na", "state": "queued", "error": None,
-            "save_to": "",
+            "package_uuid": "1", "save_to": "",
         }]
 
     def test_downloading_state(self):
@@ -1953,6 +1961,8 @@ class TestPollResults:
         assert second[0]["title"] == "Real Movie"
 
     def test_caches_pruned_to_live_packages(self):
+        # Caches are keyed by the package's JD uuid (stringified), not its
+        # name, so PkgA (uuid 1) and PkgB (uuid 2) key as "1" / "2".
         db = MagicMock()
         db.get_scraped_link_titles.return_value = {"http://rg/a": {"title": "Movie A", "resolution": ""}}
         svc, _db = self._svc(db=db)
@@ -1964,13 +1974,41 @@ class TestPollResults:
         deviceB = self._device(packages=[pkgB], links=[])
         with patch.object(svc, "_connect_jd_device", side_effect=[deviceA, deviceB]):
             svc.poll_results(record=True)
-            assert "PkgA" in svc._results_cache
-            assert "PkgA" in svc._best_titles  # resolved a real title from the map
+            assert "1" in svc._results_cache
+            assert "1" in svc._best_titles  # resolved a real title from the map
+            assert "1" in svc._uuid_id
             svc.poll_results(record=True)
-        # PkgA dropped out of JD's list -> evicted from BOTH caches; PkgB retained.
-        assert "PkgA" not in svc._results_cache
-        assert "PkgA" not in svc._best_titles
-        assert "PkgB" in svc._results_cache
+        # PkgA (uuid 1) dropped out of JD's list -> evicted from ALL THREE
+        # caches; PkgB (uuid 2) retained.
+        assert "1" not in svc._results_cache
+        assert "1" not in svc._best_titles
+        assert "1" not in svc._uuid_id
+        assert "2" in svc._results_cache
+
+    def test_poll_two_same_name_two_rows_with_ids(self, db_manager):
+        # Two distinct JD packages that happen to share a display name (e.g.
+        # two separate grabs of the same title) must persist as two
+        # independent download_results rows keyed by their distinct uuids --
+        # not collapse into one row via name-based adoption.
+        svc, _db = self._svc(db=db_manager)
+        pkg1 = {"name": "Same.Pkg", "uuid": 111, "bytesLoaded": 500, "bytesTotal": 1000,
+                "finished": False, "status": ""}
+        pkg2 = {"name": "Same.Pkg", "uuid": 222, "bytesLoaded": 1000, "bytesTotal": 1000,
+                "finished": True, "status": ""}
+        device = self._device(packages=[pkg1, pkg2], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=True)
+
+        assert len(results) == 2
+        rows = db_manager.get_download_results()
+        assert len(rows) == 2  # two independent rows, not one adopted row
+
+        by_uuid = {r["package_uuid"]: r for r in results}
+        assert set(by_uuid) == {"111", "222"}
+        for r in results:
+            assert isinstance(r["id"], int)
+            assert isinstance(r["package_uuid"], str)
+        assert by_uuid["111"]["id"] != by_uuid["222"]["id"]
 
 
 class TestGetJdStatus:
@@ -2048,36 +2086,66 @@ class TestGetJdStatus:
 
 
 class TestRemovePackage:
-    def _svc_with_device(self, packages):
+    def _svc_with_rows(self, rows):
         svc = _make_service(db=MagicMock())
+        svc.db.get_download_results.return_value = rows
         device = MagicMock()
-        device.downloads.query_packages.return_value = packages
         svc._connect_jd_device = MagicMock(return_value=device)
         return svc, device
 
     def test_remove_package_removes_matching_uuid_and_row(self):
-        svc, device = self._svc_with_device([
-            {"name": "Foo [1080p]", "uuid": 111},
-            {"name": "Bar [4K]", "uuid": 222},
+        svc, device = self._svc_with_rows([
+            {"id": 1, "name": "Foo [1080p]", "package_uuid": "111"},
+            {"id": 2, "name": "Bar [4K]", "package_uuid": "222"},
         ])
         svc.db.delete_download_result.return_value = 1
-        out = svc.remove_package("Foo [1080p]")
+        out = svc.remove_package(1)
         assert out["ok"] is True
-        device.downloads.remove_links.assert_called_once_with([], [111])
-        svc.db.delete_download_result.assert_called_once_with("Foo [1080p]")
+        device.downloads.remove_links.assert_called_once_with([], [111])  # int, not "111"
+        svc.db.delete_download_result.assert_called_once_with(1)
 
-    def test_remove_package_absent_in_jd_still_deletes_row_idempotent(self):
-        svc, device = self._svc_with_device([{"name": "Bar [4K]", "uuid": 222}])
+    def test_remove_package_no_uuid_still_deletes_row_idempotent(self):
+        # Row has no package_uuid (legacy row, or JD never reported one) ->
+        # JD is never contacted, but the DB row is still cleared.
+        svc, device = self._svc_with_rows([{"id": 5, "name": "Foo [1080p]", "package_uuid": None}])
         svc.db.delete_download_result.return_value = 1
-        out = svc.remove_package("Foo [1080p]")  # not in JD
+        out = svc.remove_package(5)
         assert out["ok"] is True
         device.downloads.remove_links.assert_not_called()
-        svc.db.delete_download_result.assert_called_once_with("Foo [1080p]")
+        svc.db.delete_download_result.assert_called_once_with(5)
+
+    def test_remove_package_unknown_id_still_ok_idempotent(self):
+        # id not present among tracked rows at all (already removed) -> no JD
+        # call, but delete is still attempted (idempotent no-op downstream).
+        svc, device = self._svc_with_rows([{"id": 1, "name": "Foo", "package_uuid": "111"}])
+        svc.db.delete_download_result.return_value = 0
+        out = svc.remove_package(999)
+        assert out["ok"] is True
+        device.downloads.remove_links.assert_not_called()
+        svc.db.delete_download_result.assert_called_once_with(999)
 
     def test_remove_package_jd_unreachable_still_deletes_row(self):
         svc = _make_service(db=MagicMock())
+        svc.db.get_download_results.return_value = [
+            {"id": 7, "name": "Foo [1080p]", "package_uuid": "111"},
+        ]
         svc._connect_jd_device = MagicMock(side_effect=Exception("no jd"))
         svc.db.delete_download_result.return_value = 1
-        out = svc.remove_package("Foo [1080p]")
+        out = svc.remove_package(7)
         assert out["ok"] is True   # DB row cleared even when JD is down
-        svc.db.delete_download_result.assert_called_once_with("Foo [1080p]")
+        svc.db.delete_download_result.assert_called_once_with(7)
+
+
+def test_remove_package_by_id_single_uuid(download_service, db_manager, monkeypatch):
+    """Against the real DB (not a MagicMock): removing by row id sends only
+    that row's uuid to JD (as an int) and leaves no tracked row behind."""
+    rid = db_manager.upsert_download_result("Foo", package_uuid="111", state="downloading")
+    calls = {}
+    class _Dev:
+        class downloads:
+            @staticmethod
+            def remove_links(links, uuids): calls["uuids"] = uuids
+    monkeypatch.setattr(download_service, "_connect_jd_device", lambda: _Dev())
+    out = download_service.remove_package(rid)
+    assert out["ok"] and calls["uuids"] == [111]           # int, not "111"
+    assert db_manager.get_download_results() == []

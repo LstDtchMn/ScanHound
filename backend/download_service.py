@@ -151,11 +151,16 @@ class DownloadService:
         self._JD_CONN_TTL = 90.0
         # Per-package last-recorded signature so the poller only writes rows
         # that actually changed (avoids re-upserting a large stable queue).
+        # Keyed by cache_key = str(package uuid) when JD reports one, else the
+        # package name (legacy/uuid-less fallback).
         self._results_cache: Dict[str, tuple] = {}
-        # Best real title ever resolved for a JD package name. Lets a transient
-        # scrape-map miss keep the previously-resolved title instead of
-        # regressing the display back to the raw (often obfuscated) JD name.
+        # Best real title ever resolved for a JD package (by cache_key). Lets a
+        # transient scrape-map miss keep the previously-resolved title instead
+        # of regressing the display back to the raw (often obfuscated) JD name.
         self._best_titles: Dict[str, str] = {}
+        # cache_key -> download_results row id, so poll_results can attach the
+        # durable DB id to each returned row without a query on every poll.
+        self._uuid_id: Dict[str, int] = {}
 
         # Callbacks
         self._log_fn: Optional[Callable[[str, str], None]] = None
@@ -634,30 +639,32 @@ class DownloadService:
             self._invalidate_jd_cache()
             return {"ok": False, "error": str(e)}
 
-    def remove_package(self, name: str) -> dict:
-        """Remove a single download package from JDownloader (by package name)
-        and delete its tracked result row. Idempotent: succeeds even when the
-        package is already gone from JD or JD is unreachable — the DB row is
-        always cleared so the UI reflects the removal."""
-        name = (name or "").strip()
-        if not name:
-            return {"ok": False, "error": "No package name"}
-        # Best-effort JD removal (never blocks the DB cleanup).
+    def remove_package(self, id_: int) -> dict:
+        """Remove a single tracked download by its row id: remove ONLY that
+        package from JD (by its uuid) and delete its result row. Idempotent:
+        succeeds even when the package is already gone from JD, has no known
+        uuid, or JD is unreachable — the DB row is always cleared so the UI
+        reflects the removal."""
+        row = None
         try:
-            device = self._connect_jd_device()
-            packages = device.downloads.query_packages([{"name": True, "uuid": True}]) or []
-            uuids = [p.get("uuid") for p in packages if p.get("name") == name and p.get("uuid") is not None]
-            if uuids:
-                device.downloads.remove_links([], uuids)
-                self._log(f"JDownloader: removed package '{name}'", "info")
-        except Exception as e:
-            logger.warning("remove_package JD step failed for %r: %s", name, e)
-            self._invalidate_jd_cache()
+            rows = self.db.get_download_results(limit=100000) if self.db else []
+            row = next((r for r in rows if r.get("id") == id_), None)
+        except Exception:
+            row = None
+        uuid = (row or {}).get("package_uuid")
+        if uuid:
+            try:
+                device = self._connect_jd_device()
+                device.downloads.remove_links([], [int(uuid)])  # JD expects the native int64
+                self._log(f"JDownloader: removed package uuid {uuid}", "info")
+            except Exception as e:
+                logger.warning("remove_package JD step failed for id %s (uuid %s): %s", id_, uuid, e)
+                self._invalidate_jd_cache()
         removed = 0
         try:
-            removed = self.db.delete_download_result(name) if self.db else 0
+            removed = self.db.delete_download_result(id_) if self.db else 0
         except Exception as e:
-            logger.warning("remove_package DB delete failed for %r: %s", name, e)
+            logger.warning("remove_package DB delete failed for id %s: %s", id_, e)
         return {"ok": True, "removed": removed}
 
     def poll_results(self, record: bool = True) -> List[Dict[str, Any]]:
@@ -717,6 +724,14 @@ class DownloadService:
         results: List[Dict[str, Any]] = []
         for pkg in packages:
             name = pkg.get("name") or "(unnamed package)"
+            u = pkg.get("uuid")
+            # JD's uuid is a native int64; stringify it so it's a stable dict/DB
+            # key (JSON round-trips int keys as strings anyway) and so callers
+            # comparing package_uuid values don't have to care about type.
+            package_uuid = str(u) if u is not None else None
+            # Identity for the per-poll caches below: the package's durable JD
+            # uuid when known, else its (legacy/uuid-less) name.
+            cache_key = package_uuid or name
             child_links = by_pkg.get(pkg.get("uuid"), [])
             bytes_total = pkg.get("bytesTotal") or 0
             bytes_loaded = pkg.get("bytesLoaded") or 0
@@ -726,9 +741,9 @@ class DownloadService:
             # Keep a once-resolved real title even if the scrape map transiently
             # misses on a later poll (don't regress to the raw JD package name).
             if title and title != name:
-                self._best_titles[name] = title
-            elif name in self._best_titles:
-                title = self._best_titles[name]
+                self._best_titles[cache_key] = title
+            elif cache_key in self._best_titles:
+                title = self._best_titles[cache_key]
 
             statuses = [str(l.get("status") or "").lower() for l in child_links]
             all_status = " ".join(statuses + [str(pkg.get("status") or "").lower()])
@@ -761,10 +776,12 @@ class DownloadService:
                 state = "queued"
 
             row = {
+                "id": None,
                 "name": name, "title": title, "host": host,
                 "bytes_total": bytes_total, "bytes_loaded": bytes_loaded,
                 "downloaded": 1 if downloaded else 0,
                 "extraction": extraction, "state": state, "error": error,
+                "package_uuid": package_uuid,
                 # saveTo (extracted output folder) — consumed by the auto-rename
                 # hook when the package reaches the "extracted" state.
                 "save_to": pkg.get("saveTo") or "",
@@ -772,25 +789,56 @@ class DownloadService:
             results.append(row)
 
             if record and self.db:
+                # 'save_to' is for the returned dict (auto-rename hook) and
+                # 'id' is derived, not stored — passing either would TypeError
+                # and the whole row would (silently) never persist.
+                db_fields = {k: v for k, v in row.items() if k not in ("save_to", "id")}
                 change_key = (state, bytes_loaded, extraction, row["downloaded"], error, title)
-                if self._results_cache.get(name) != change_key:
-                    self._results_cache[name] = change_key
+                if self._results_cache.get(cache_key) != change_key:
                     try:
-                        # 'save_to' is for the returned dict (auto-rename hook),
-                        # not a DB column — passing it would TypeError and the
-                        # whole row (silently) never persists to download_results.
-                        self.db.upsert_download_result(
-                            **{k: v for k, v in row.items() if k != "save_to"})
+                        rid = self.db.upsert_download_result(**db_fields)
                     except Exception as e:
                         logger.debug("upsert_download_result failed: %s", e)
+                        rid = None
+                    # Only prime the change-cache once the write actually
+                    # landed — a failed/exception'd write must NOT be marked
+                    # "recorded", or the next poll would wrongly skip retrying it.
+                    if rid is not None:
+                        self._results_cache[cache_key] = change_key
+                        self._uuid_id[cache_key] = rid
+
+                row["id"] = self._uuid_id.get(cache_key)
+                if row["id"] is None:
+                    # cache-suppressed row (unchanged since a prior process's
+                    # run) whose id this in-memory map never learned — recover
+                    # it from the DB rather than emit an id-less row.
+                    try:
+                        row["id"] = self.db.get_download_result_id(package_uuid, name)
+                    except Exception as e:
+                        logger.debug("get_download_result_id failed: %s", e)
+                    if row["id"] is not None:
+                        self._uuid_id[cache_key] = row["id"]
+                    else:
+                        # No row exists at all yet — write one now instead of
+                        # emitting an id-less row.
+                        try:
+                            rid = self.db.upsert_download_result(**db_fields)
+                        except Exception as e:
+                            logger.debug("upsert_download_result retry failed: %s", e)
+                            rid = None
+                        if rid is not None:
+                            self._results_cache[cache_key] = change_key
+                            self._uuid_id[cache_key] = rid
+                            row["id"] = rid
 
         # Bound the per-package caches to packages currently in JD's list so they
         # don't grow without limit over the long-lived poller's lifetime. Only
         # prunes after a successful poll (early returns above skip this), so a
         # transient JD blip never discards resolved titles.
-        live_names = {r["name"] for r in results}
-        self._results_cache = {k: v for k, v in self._results_cache.items() if k in live_names}
-        self._best_titles = {k: v for k, v in self._best_titles.items() if k in live_names}
+        live_keys = {r["package_uuid"] or r["name"] for r in results}
+        self._results_cache = {k: v for k, v in self._results_cache.items() if k in live_keys}
+        self._best_titles = {k: v for k, v in self._best_titles.items() if k in live_keys}
+        self._uuid_id = {k: v for k, v in self._uuid_id.items() if k in live_keys}
 
         return results
 
