@@ -30,6 +30,16 @@ export function partitionJobs(jobs: RenameJob[]): { ready: RenameJob[]; needsRev
   return { ready, needsReview };
 }
 
+export type ReviewScope = 'needsReview' | 'all';
+
+/** Ordered work queue for RenameReviewDeck: needsReview-only, or
+ *  ready-then-needsReview when scope is 'all' (both sub-lists are already
+ *  confidence-ascending via partitionJobs). */
+export function deckQueue(jobs: RenameJob[], scope: ReviewScope): RenameJob[] {
+  const { ready, needsReview } = partitionJobs(jobs);
+  return scope === 'needsReview' ? needsReview : [...ready, ...needsReview];
+}
+
 export function hasDestinationConflict(job: RenameJob): boolean {
   if (job.destination_conflict) return true;
   return /already exists/i.test(job.warning_message ?? '');
