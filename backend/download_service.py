@@ -1893,7 +1893,8 @@ class DownloadService:
     def download_item(self, url: str, title: str, season: Optional[int],
                       resolution: str, size: str, service_type: str = "Rapidgator",
                       year: Optional[int] = None, hdr: str = "", dovi: bool = False,
-                      progress_callback: Optional[Callable] = None) -> Dict[str, Any]:
+                      progress_callback: Optional[Callable] = None,
+                      force: bool = False) -> Dict[str, Any]:
         """Download a single item: scrape links, send to JD or clipboard.
 
         Returns dict with 'success', 'method', 'link_count', 'message'.
@@ -1913,7 +1914,10 @@ class DownloadService:
         # Dedup: if this exact release was already grabbed successfully, don't
         # scrape or re-send it — that just creates a duplicate JDownloader entry.
         # (A prior *failed* grab doesn't count, so retries still work.)
-        if self.db is not None:
+        # `force=True` (used only by the pipeline tracker's regrab/grab-alternative
+        # actions) skips both gates entirely — that's the user explicitly
+        # overriding "don't re-grab," not an accident to guard against.
+        if self.db is not None and not force:
             try:
                 already = self.db.is_downloaded(url)
             except Exception:

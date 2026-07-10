@@ -1424,6 +1424,39 @@ class TestDownloadItem:
 
 
 # ======================================================================
+# download_item(force=...) — pipeline tracker regrab/grab-alternative bypass
+# ======================================================================
+
+def test_download_item_force_bypasses_is_downloaded_gate(download_service, monkeypatch):
+    # Arrange: url already marked completed in history.
+    download_service.db.add_to_history("http://f/1", "Foo", status="completed")
+    monkeypatch.setattr(download_service, "scrape_links", lambda *a, **k: ["http://link1"])
+    monkeypatch.setattr(download_service, "send_to_jdownloader", lambda *a, **k: True)
+    result = download_service.download_item(
+        url="http://f/1", title="Foo", season=None, resolution="1080p", size="1GB",
+        force=True)
+    assert result["method"] != "duplicate"
+
+
+def test_download_item_force_bypasses_quality_gate(download_service, monkeypatch):
+    download_service.db.add_to_history("http://f/2", "Foo", status="completed",
+                                       normalized_title="foo", resolution="1080p", year=2024)
+    monkeypatch.setattr(download_service, "scrape_links", lambda *a, **k: ["http://link2"])
+    monkeypatch.setattr(download_service, "send_to_jdownloader", lambda *a, **k: True)
+    result = download_service.download_item(
+        url="http://f/3", title="Foo", season=None, resolution="1080p", size="1GB",
+        year=2024, force=True)  # different url, same-or-lower quality
+    assert result["method"] != "duplicate_similar"
+
+
+def test_download_item_default_force_false_unchanged(download_service, monkeypatch):
+    download_service.db.add_to_history("http://f/4", "Foo", status="completed")
+    result = download_service.download_item(
+        url="http://f/4", title="Foo", season=None, resolution="1080p", size="1GB")
+    assert result["method"] == "duplicate"  # existing gate still blocks a normal accidental duplicate
+
+
+# ======================================================================
 # open_in_plex
 # ======================================================================
 
