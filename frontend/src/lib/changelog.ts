@@ -7,6 +7,16 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.24.1",
+    date: "2026-07-10",
+    summary: "Duplicate downloads now coexist and cancel individually",
+    changes: [
+      "If the same release ends up grabbed twice (an accidental double-add), both copies now show up in Downloads instead of one silently overwriting the other's row — so the duplicate is actually visible, and 'Cancel' removes exactly the one copy you clicked (previously it could clear both).",
+      "'Keep best' on a duplicate group now only ever cancels other still-downloading copies — it will never cancel a finished download or a historical record, so re-grabbing something you already have can't kill the new download.",
+      "Under the hood, downloads are now tracked by JDownloader's durable package id instead of by name; the existing download history migrates automatically on update (every row preserved) and nothing else changes.",
+    ],
+  },
+  {
     version: "2.24.0",
     date: "2026-07-09",
     summary: "Mobile Renames: one-at-a-time review + real conflict resolution",
