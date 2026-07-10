@@ -30,17 +30,33 @@ export function resRank(name: string): number {
   return 1;
 }
 
+/** States that count as "in flight" — not yet a finished/historical row. */
+const ACTIVE = new Set(['queued', 'downloading', 'extracting']);
+
+/** True if a result is still in progress (queued/downloading/extracting) rather
+ *  than a finished, failed, or otherwise historical row. */
+export function isActive(r: DownloadResult): boolean {
+  return ACTIVE.has(r.state);
+}
+
 export interface DownloadGroup {
   key: string;
   title: string;
   items: DownloadResult[];
+  activeItems: DownloadResult[];
   isDuplicate: boolean;
   best: DownloadResult;
+  canKeepBest: boolean;
 }
 
 /** Group downloads by normalized title. A group with >1 item is a duplicate
  *  group (covers both "same title, different releases" and "exact same package
- *  twice"). `best` is the highest-resolution then largest item — the one to keep. */
+ *  twice"). `best` is the highest-resolution then largest item among the
+ *  ACTIVE (queued/downloading/extracting) rows when any exist — so a live
+ *  re-grab is preferred over a higher-res but finished historical row — and
+ *  falls back to ranking across all items when nothing is active. `canKeepBest`
+ *  only offers the "keep best, cancel the rest" action when there are >=2
+ *  active rows to actually choose between. */
 export function groupDownloads(results: DownloadResult[]): DownloadGroup[] {
   const byKey = new Map<string, DownloadResult[]>();
   for (const r of results) {
@@ -55,10 +71,20 @@ export function groupDownloads(results: DownloadResult[]): DownloadGroup[] {
   }
   const groups: DownloadGroup[] = [];
   for (const [key, items] of byKey) {
-    const best = [...items].sort(
+    const activeItems = items.filter(isActive);
+    const rankPool = activeItems.length ? activeItems : items;
+    const best = [...rankPool].sort(
       (a, b) => resRank(b.name) - resRank(a.name) || (b.bytes_total || 0) - (a.bytes_total || 0)
     )[0];
-    groups.push({ key, title: items[0].title || items[0].name, items, isDuplicate: items.length > 1, best });
+    groups.push({
+      key,
+      title: items[0].title || items[0].name,
+      items,
+      activeItems,
+      isDuplicate: items.length > 1,
+      best,
+      canKeepBest: activeItems.length >= 2
+    });
   }
   return groups;
 }

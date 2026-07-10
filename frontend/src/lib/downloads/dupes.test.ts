@@ -1,10 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { normalizeTitle, resRank, groupDownloads } from './dupes';
+import { normalizeTitle, resRank, groupDownloads, isActive } from './dupes';
 import type { DownloadResult } from '$lib/api/types';
 
 function r(over: Partial<DownloadResult>): DownloadResult {
-  return { name: 'X [1080p]', title: 'X', host: 'rg.net', bytes_total: 100, bytes_loaded: 0,
-    downloaded: 0, extraction: 'na', state: 'downloading', error: null, updated_at: '', ...over };
+  return { id: 0, package_uuid: null, name: 'X [1080p]', title: 'X', host: 'rg.net', bytes_total: 100,
+    bytes_loaded: 0, downloaded: 0, extraction: 'na', state: 'downloading', error: null, updated_at: '',
+    ...over };
 }
 
 describe('normalizeTitle', () => {
@@ -64,5 +65,37 @@ describe('groupDownloads', () => {
     ];
     const g = groupDownloads(items)[0];
     expect(g.best.bytes_total).toBe(2000);
+  });
+
+  it('best is chosen among ACTIVE rows, not a finished historical row', () => {
+    const g = groupDownloads([
+      r({ id: 1, title: 'Foo', name: 'Foo.2160p', state: 'finished' }), // historical, higher res
+      r({ id: 2, title: 'Foo', name: 'Foo.1080p', state: 'downloading' }) // live re-grab
+    ])[0];
+    expect(g.best.id).toBe(2); // the live one, NOT the finished 2160p
+    expect(g.canKeepBest).toBe(false); // only 1 active row → not offered
+  });
+
+  it('canKeepBest true only with >=2 active rows', () => {
+    const g = groupDownloads([
+      r({ id: 1, title: 'Foo', name: 'Foo.2160p', state: 'downloading' }),
+      r({ id: 2, title: 'Foo', name: 'Foo.1080p', state: 'downloading' })
+    ])[0];
+    expect(g.canKeepBest).toBe(true);
+    expect(g.best.id).toBe(1);
+  });
+});
+
+describe('isActive', () => {
+  it('treats queued/downloading/extracting as active', () => {
+    expect(isActive(r({ state: 'queued' }))).toBe(true);
+    expect(isActive(r({ state: 'downloading' }))).toBe(true);
+    expect(isActive(r({ state: 'extracting' }))).toBe(true);
+  });
+
+  it('treats downloaded/extracted/failed as inactive', () => {
+    expect(isActive(r({ state: 'downloaded' }))).toBe(false);
+    expect(isActive(r({ state: 'extracted' }))).toBe(false);
+    expect(isActive(r({ state: 'failed' }))).toBe(false);
   });
 });

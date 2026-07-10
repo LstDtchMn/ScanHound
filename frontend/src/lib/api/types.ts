@@ -498,16 +498,19 @@ export interface DownloadHistoryEntry {
 
 /** Persisted per-item download + extraction outcome, polled from JDownloader. */
 export interface DownloadResult {
+  id: number;
+  package_uuid: string | null;
   name: string; // JDownloader package name
-  title: string; // resolved movie/show title
-  host: string;
+  title: string | null; // resolved movie/show title
+  host: string | null;
   bytes_total: number;
   bytes_loaded: number;
   downloaded: number; // 0 | 1
   extraction: 'na' | 'running' | 'success' | 'error' | string;
   state: 'queued' | 'downloading' | 'downloaded' | 'extracting' | 'extracted' | 'failed' | string;
   error: string | null;
-  updated_at: string;
+  updated_at?: string; // REST only
+  save_to?: string; // WS only
 }
 
 export interface TmdbSearchResult {
