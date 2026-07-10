@@ -573,7 +573,9 @@ export interface FileSpec {
 }
 export interface ConflictComparison {
   existing: FileSpec | null;
-  incoming: FileSpec;
+  // null when the job wasn't found (backend conflict_preview returns
+  // {existing:null, incoming:null, ...} in that case) — consumers must null-check.
+  incoming: FileSpec | null;
   recommended: 'existing' | 'incoming' | 'tie' | null;
   reason: string | null;
 }
