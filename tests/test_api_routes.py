@@ -1737,3 +1737,68 @@ class TestRenameDedupKey:
     def test_row_missing_both_returns_empty_string(self):
         from backend.api.main import _rename_dedup_key
         assert _rename_dedup_key({}) == ""
+
+
+# ── Pipeline tracker ──────────────────────────────────────────────────
+
+class TestPipelineRoutes:
+    """GET /pipeline/items,/counts + POST /pipeline/dismiss,/regrab.
+
+    NOTE: unlike the rest of this file (which mutates the shared session-wide
+    `registry.db` set up by `_init_services` during the module `client`
+    fixture), these tests override `client` at class scope to swap in the
+    conftest `db_manager` fixture's isolated temp-file DB. That fixture
+    creates a *fresh* DatabaseManager per test (see tests/conftest.py), so
+    swapping it into `registry.db` gives each test a clean pipeline_verdicts
+    table — required for e.g. test_dismiss_endpoint's exact-equality
+    `get_pipeline_verdicts() == []` assertion to be safe regardless of
+    test execution order, instead of accumulating rows from every other
+    test that runs against the shared DB.
+    """
+
+    @pytest.fixture
+    def client(self, db_manager):
+        app = create_app(config_override={"plex_url": "", "plex_token": ""})
+        with TestClient(app) as c:
+            registry.db = db_manager
+            yield c
+
+    def test_items_returns_verdicts(self, client, db_manager):
+        db_manager.add_to_history("http://pi/1", "Foo", package_name="Foo [1080p]")
+        db_manager.upsert_pipeline_verdict("http://pi/1", "download_failed", detail="offline")
+        resp = client.get("/pipeline/items")
+        assert resp.status_code == 200
+        items = resp.json()
+        assert any(i["url"] == "http://pi/1" and i["category"] == "download_failed" for i in items)
+
+    def test_counts_excludes_dismissed(self, client, db_manager):
+        db_manager.add_to_history("http://pi/2", "Bar", package_name="Bar [1080p]")
+        db_manager.upsert_pipeline_verdict("http://pi/2", "rename_failed")
+        db_manager.dismiss_pipeline_verdict("http://pi/2")
+        resp = client.get("/pipeline/counts")
+        counts = resp.json()
+        assert counts.get("rename_failed", 0) == 0
+
+    def test_dismiss_endpoint(self, client, db_manager):
+        db_manager.add_to_history("http://pi/3", "Baz", package_name="Baz [1080p]")
+        db_manager.upsert_pipeline_verdict("http://pi/3", "not_in_plex")
+        resp = client.post("/pipeline/dismiss", json={"url": "http://pi/3"})
+        assert resp.status_code == 200
+        assert db_manager.get_pipeline_verdicts() == []
+
+    def test_regrab_clears_verdict_and_backgrounds(self, client, db_manager, monkeypatch):
+        db_manager.add_to_history("http://pi/4", "Qux", package_name="Qux [1080p]",
+                                  resolution="1080p", year=2024)
+        db_manager.upsert_pipeline_verdict("http://pi/4", "download_failed", package_uuid="555")
+        calls = {}
+        def fake_add_task(fn, *a, **kw):
+            calls["called"] = True
+        monkeypatch.setattr("fastapi.BackgroundTasks.add_task", fake_add_task)
+        resp = client.post("/pipeline/regrab", json={"url": "http://pi/4"})
+        assert resp.status_code == 200
+        assert calls.get("called") is True
+        conn = db_manager.get_connection()
+        row = conn.execute("SELECT category, excluded_uuid FROM pipeline_verdicts "
+                           "WHERE url = ?", ("http://pi/4",)).fetchone()
+        assert row[0] is None  # cleared to pending
+        assert row[1] == "555"  # old uuid excluded
