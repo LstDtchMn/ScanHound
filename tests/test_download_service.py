@@ -2010,6 +2010,42 @@ class TestPollResults:
             assert isinstance(r["package_uuid"], str)
         assert by_uuid["111"]["id"] != by_uuid["222"]["id"]
 
+    def test_remove_package_evicts_caches_no_ghost_id_on_next_poll(self, db_manager):
+        # Ghost-id resurrection regression: remove_package() deletes the DB
+        # row, but if the JD-side removal fails (JD unreachable -- the
+        # intentional idempotent-success path) the package is still in JD's
+        # list. Without evicting the poller's caches, the next poll's
+        # unchanged-state skip branch would re-emit the stale (now-deleted)
+        # row id straight from self._uuid_id -- a dangling id the frontend
+        # would receive for a row that no longer exists in the DB.
+        svc, _db = self._svc(db=db_manager)
+        pkg = {"name": "Ghost.Pkg", "uuid": 111, "bytesLoaded": 500, "bytesTotal": 1000,
+               "finished": False, "status": ""}
+        device1 = self._device(packages=[pkg], links=[])
+        device2 = self._device(packages=[pkg], links=[])  # identical state -> unchanged change_key
+        with patch.object(svc, "_connect_jd_device",
+                           side_effect=[device1, Exception("jd down"), device2]):
+            first = svc.poll_results(record=True)
+            deleted_id = first[0]["id"]
+            assert isinstance(deleted_id, int)
+            assert "111" in svc._uuid_id  # cache primed by the first poll
+
+            out = svc.remove_package(deleted_id)
+            assert out["ok"] is True  # idempotent-success contract preserved even though JD failed
+            assert db_manager.get_download_results() == []  # DB row is gone
+            # Eviction happened: the package's cache_key ("111") no longer
+            # resolves to the deleted id (or anything) in any of the caches.
+            assert "111" not in svc._uuid_id
+            assert "111" not in svc._results_cache
+            assert "111" not in svc._best_titles
+
+            second = svc.poll_results(record=True)
+
+        # Same package, unchanged state, still present in JD -> must NOT
+        # re-emit the deleted id. It gets a fresh row (fresh INSERT id).
+        assert second[0]["id"] is not None
+        assert second[0]["id"] != deleted_id
+
 
 class TestGetJdStatus:
     def _device(self, lg_packages=None, lg_links=None, dl_packages=None, dl_links=None, state="RUNNING"):

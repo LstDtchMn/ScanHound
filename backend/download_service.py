@@ -652,6 +652,7 @@ class DownloadService:
         except Exception:
             row = None
         uuid = (row or {}).get("package_uuid")
+        name = (row or {}).get("name")
         if uuid:
             try:
                 device = self._connect_jd_device()
@@ -665,6 +666,18 @@ class DownloadService:
             removed = self.db.delete_download_result(id_) if self.db else 0
         except Exception as e:
             logger.warning("remove_package DB delete failed for id %s: %s", id_, e)
+        # Evict this package from the poller's in-memory caches (keyed by
+        # cache_key = package_uuid or name — pop both, since a legacy row may
+        # be name-keyed). Without this, an unchanged package still present in
+        # JD (e.g. the JD-side removal above failed) hits poll_results()'s
+        # unchanged-state skip branch on the next poll and re-emits the id we
+        # just deleted from the DB (ghost-id resurrection). Evicting forces
+        # that poll to treat it as a fresh row instead.
+        for key in (uuid, name):
+            if key:
+                self._results_cache.pop(key, None)
+                self._uuid_id.pop(key, None)
+                self._best_titles.pop(key, None)
         return {"ok": True, "removed": removed}
 
     def poll_results(self, record: bool = True) -> List[Dict[str, Any]]:
