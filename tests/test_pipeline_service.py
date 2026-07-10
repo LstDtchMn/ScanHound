@@ -1,5 +1,5 @@
 from datetime import datetime, timezone, timedelta
-from backend.pipeline_service import categorize
+from backend.pipeline_service import categorize, find_plex_match
 
 
 def _download_row(**kw):
@@ -96,7 +96,15 @@ class TestPlexGate:
         cat, *_ = categorize(_download_row(), self._extracted_result(), rows, fresh_cache, jd_method="api")
         assert cat == "not_in_plex"
 
-    def test_resolution_normalization_2160p_matches_4k(self, monkeypatch):
+    def test_categorize_forwards_resolution_to_find_plex_match_stub(self, monkeypatch):
+        # NOTE: despite the old name ("...2160p_matches_4k"), find_plex_match is
+        # stubbed here to match unconditionally — this does NOT exercise
+        # _normalize_res or any real resolution-matching logic. It only proves
+        # categorize() wires the rename row's resolution through to
+        # find_plex_match's positional args and surfaces the returned
+        # rating_key as "verified". Real _normalize_res / find_plex_match
+        # matching behavior (including 2160p==4K equivalence) is covered
+        # against a real DB in TestFindPlexMatch below.
         import backend.pipeline_service as ps
         rows = [_rename_row(status="applied", resolution="2160p")]
         fresh_cache = {"Movies": datetime.now(timezone.utc).timestamp() + 10000}
@@ -111,3 +119,105 @@ class TestMalformed:
     def test_malformed_input_never_raises(self):
         cat, *_ = categorize({}, {"state": "bogus"}, [{"status": "bogus"}], {}, jd_method="api")
         assert cat == "unknown"
+
+
+def _insert_plex_row(conn, *, key, rating_key, imdb_id=None, title=None, year=None,
+                     res=None, season=None, is_tv=0):
+    """Insert a row directly into the real plex_cache table (schema per
+    backend/database.py's CREATE TABLE IF NOT EXISTS plex_cache)."""
+    conn.execute(
+        """INSERT INTO plex_cache (
+               key, title, original_title, year, res, size, imdb_id,
+               rating_key, media_id, is_tv, season, episode_count,
+               content_type, dovi, hdr, last_updated, library_name
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (key, title, title, year, res, 10.0, imdb_id, rating_key, None,
+         1 if is_tv else 0, season, None, "TV Shows" if is_tv else "Movies",
+         0, 0, "2026-07-10T00:00:00", "Test Library"),
+    )
+    conn.commit()
+
+
+class TestFindPlexMatch:
+    """find_plex_match() exercised against a REAL sqlite plex_cache table
+    (via the db_manager fixture's temp-file DatabaseManager), not mocked —
+    this is what actually covers the multi-row-per-imdb_id fix and the '?'
+    resolution-sentinel fix from commit dea3df9."""
+
+    def test_movie_two_resolutions_returns_the_requested_one(self, db_manager):
+        # Same imdb_id, two rows: a 1080p copy and a 4K copy — the exact
+        # shape (library holding both versions of one film) that a plain
+        # fetchone() could grab the wrong one of.
+        conn = db_manager.get_connection()
+        _insert_plex_row(conn, key="rk_1080", rating_key="rk_1080", imdb_id="tt999",
+                         title="foo", year=2024, res="1080p")
+        _insert_plex_row(conn, key="rk_4k", rating_key="rk_4k", imdb_id="tt999",
+                         title="foo", year=2024, res="4K")
+
+        match_4k = find_plex_match(db_manager, "tt999", "Foo", 2024, None, "2160p")
+        assert match_4k is not None
+        assert match_4k["rating_key"] == "rk_4k"
+
+        match_1080 = find_plex_match(db_manager, "tt999", "Foo", 2024, None, "1080p")
+        assert match_1080 is not None
+        assert match_1080["rating_key"] == "rk_1080"
+
+    def test_tv_show_multiple_seasons_returns_the_requested_season(self, db_manager):
+        conn = db_manager.get_connection()
+        _insert_plex_row(conn, key="s1", rating_key="rk_s1", imdb_id="tt777",
+                         title="bar", year=2020, res="1080p", season=1, is_tv=1)
+        _insert_plex_row(conn, key="s2", rating_key="rk_s2", imdb_id="tt777",
+                         title="bar", year=2020, res="1080p", season=2, is_tv=1)
+
+        match = find_plex_match(db_manager, "tt777", "Bar", 2020, 2, None)
+        assert match is not None
+        assert match["rating_key"] == "rk_s2"
+
+        match_s1 = find_plex_match(db_manager, "tt777", "Bar", 2020, 1, None)
+        assert match_s1 is not None
+        assert match_s1["rating_key"] == "rk_s1"
+
+    def test_unknown_resolution_sentinel_still_matches_any_requested_res(self, db_manager):
+        # Plex's res="?" (unknown) must not be treated as a literal value that
+        # fails to equal "1080p" — _normalize_res("?") -> None skips the gate.
+        conn = db_manager.get_connection()
+        _insert_plex_row(conn, key="unk", rating_key="rk_unk", imdb_id="tt555",
+                         title="baz", year=2022, res="?")
+
+        match = find_plex_match(db_manager, "tt555", "Baz", 2022, None, "1080p")
+        assert match is not None
+        assert match["rating_key"] == "rk_unk"
+
+    def test_no_match_wrong_imdb_id_returns_none(self, db_manager):
+        conn = db_manager.get_connection()
+        _insert_plex_row(conn, key="k1", rating_key="rk1", imdb_id="tt111",
+                         title="qux", year=2019, res="1080p")
+        # imdb_id doesn't match ANY row, and title/year given also don't match
+        # the stored row (title="qux"/year=2019) — so neither the imdb_id path
+        # NOR the title+year fallback path can succeed. (A wrong imdb_id paired
+        # with a title/year that DOES match a stored row legitimately falls
+        # back to a title match by design — see the docstring: "imdb_id first,
+        # else normalized title+year" — that's not exercised by this test.)
+        assert find_plex_match(db_manager, "tt_does_not_exist", "Nonexistent Title", 1901, None, "1080p") is None
+
+    def test_no_match_title_fallback_wrong_year_returns_none(self, db_manager):
+        conn = db_manager.get_connection()
+        _insert_plex_row(conn, key="k1", rating_key="rk1", imdb_id="tt111",
+                         title="qux", year=2019, res="1080p")
+        # No imdb_id given -> falls back to title match, but year mismatches.
+        assert find_plex_match(db_manager, None, "Qux", 1999, None, "1080p") is None
+
+    def test_none_connection_from_get_connection_returns_none(self):
+        class NoneConnDB:
+            def get_connection(self):
+                return None
+        assert find_plex_match(NoneConnDB(), "tt1", "Title", 2020, None, "1080p") is None
+
+    def test_db_is_none_does_not_raise(self):
+        assert find_plex_match(None, "tt1", "Title", 2020, None, "1080p") is None
+
+    def test_malformed_db_handle_does_not_raise(self):
+        class BadDB:
+            def get_connection(self):
+                return "not-a-real-connection"  # .cursor() will raise AttributeError
+        assert find_plex_match(BadDB(), "tt1", "Title", 2020, None, "1080p") is None
