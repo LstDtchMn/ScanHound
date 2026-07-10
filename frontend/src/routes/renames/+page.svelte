@@ -10,6 +10,7 @@
     dvSyncRunning, dvSyncProgress, dvSyncResult
   } from '$lib/stores/renames';
   import { categoryOf } from '$lib/renames/category';
+  import { matchesQuery } from '$lib/renames/review';
   import {
     tileSize, gridColumns, gridGap, TILE_MIN_PX, GRID_GAP_CLASS
   } from '$lib/stores/results';
@@ -157,11 +158,6 @@
   }
 
   // --- Derived visible set: status → category → query → sort ---
-  function matchesQuery(j: RenameJob, q: string): boolean {
-    if (!q) return true;
-    const hay = `${j.title ?? ''} ${j.original_filename ?? ''} ${j.new_filename ?? ''}`.toLowerCase();
-    return hay.includes(q.toLowerCase());
-  }
   function sortJobs(arr: RenameJob[], mode: typeof $renameSort): RenameJob[] {
     const a = [...arr];
     switch (mode) {
