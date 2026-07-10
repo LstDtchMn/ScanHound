@@ -347,7 +347,7 @@ export const api = {
   scanConflictDv: (id: number) =>
     request<{ status: string }>(`/rename/jobs/${id}/scan-dv-conflict`, { method: 'POST' }),
   undoRename: (id: number) =>
-    request<{ ok: boolean }>(`/rename/jobs/${id}/undo`, { method: 'POST' }),
+    request<{ ok: boolean; restore_warning?: string | null }>(`/rename/jobs/${id}/undo`, { method: 'POST' }),
   rematchRename: (id: number, tmdbId: number, mediaType?: string, season?: number, episode?: number) =>
     request<RematchConfirmResponse>(`/rename/jobs/${id}/rematch`, {
       method: 'POST',

@@ -92,7 +92,10 @@ export async function applyJob(id: number, strategy?: 'overwrite' | 'keep_both' 
 }
 
 export async function undoJob(id: number) {
-  await api.undoRename(id);
+  const r = await api.undoRename(id);
+  if (r.restore_warning) {
+    addToast('Undo', r.restore_warning, 'warning');
+  }
   await refresh();
 }
 
