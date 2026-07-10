@@ -357,7 +357,9 @@ class DatabaseManager:
                 # after the package is cleared from JDownloader's list.
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS download_results (
-                        name TEXT PRIMARY KEY,
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        package_uuid TEXT,
+                        name TEXT,
                         title TEXT,
                         host TEXT,
                         bytes_total INTEGER DEFAULT 0,
@@ -369,6 +371,41 @@ class DatabaseManager:
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 ''')
+                # ── download_results: name-PK → surrogate-id rebuild (once) ──
+                # Guarded, crash-safe, and self-contained: a failure raises
+                # RuntimeError (NOT sqlite3.*Error), so it can never reach the
+                # corrupt-DB quarantine below (which would wipe the whole DB).
+                dr_cols = {r[1] for r in cursor.execute("PRAGMA table_info(download_results)")}
+                if dr_cols and "id" not in dr_cols:
+                    try:
+                        cursor.execute("DROP TABLE IF EXISTS download_results_new")
+                        if conn.in_transaction:
+                            conn.commit()
+                        cursor.execute("BEGIN IMMEDIATE")
+                        cursor.execute('''
+                            CREATE TABLE download_results_new (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                package_uuid TEXT, name TEXT, title TEXT, host TEXT,
+                                bytes_total INTEGER DEFAULT 0, bytes_loaded INTEGER DEFAULT 0,
+                                downloaded INTEGER DEFAULT 0, extraction TEXT DEFAULT 'na',
+                                state TEXT DEFAULT 'queued', error TEXT,
+                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
+                        ''')
+                        cursor.execute('''
+                            INSERT INTO download_results_new
+                                (package_uuid, name, title, host, bytes_total, bytes_loaded,
+                                 downloaded, extraction, state, error, updated_at)
+                            SELECT NULL, name, title, host, bytes_total, bytes_loaded,
+                                   downloaded, extraction, state, error, updated_at
+                            FROM download_results
+                        ''')
+                        cursor.execute("DROP TABLE download_results")
+                        cursor.execute("ALTER TABLE download_results_new RENAME TO download_results")
+                        conn.commit()
+                    except Exception as e:
+                        conn.rollback()
+                        logger.exception("download_results rebuild failed")
+                        raise RuntimeError("download_results migration failed") from e
 
                 # Admin password (single row) for browser / self-hosted auth.
                 # bcrypt hash only — never the plaintext. Absent row = no
@@ -478,6 +515,10 @@ class DatabaseManager:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_updated ON plex_cache(last_updated)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_date ON downloads(date_added)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_download_results_updated ON download_results(updated_at DESC)')
+                cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_download_results_uuid '
+                               'ON download_results(package_uuid) WHERE package_uuid IS NOT NULL')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_download_results_name '
+                               'ON download_results(name)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp DESC)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_bg_cache_last_seen ON background_scan_cache(last_seen_at)')
@@ -955,30 +996,52 @@ class DatabaseManager:
 
         Keyed by JD package name. Refreshes updated_at on every poll so the
         list can be ordered by most-recent activity.
+
+        Implemented as an explicit lookup-then-write (rather than SQLite's
+        ON CONFLICT upsert) because `name` is no longer covered by a UNIQUE
+        constraint after the download_results rebuild (surrogate `id` PK +
+        nullable `package_uuid`, so the same name can legitimately appear on
+        multiple rows once callers start passing package_uuid). This keeps
+        the existing one-row-per-name contract intact for current callers;
+        uuid-based identity is a follow-up. The whole lookup+write happens
+        under one lock hold (RLock, reentrant) so it can't race with a
+        concurrent delete/insert for the same name.
         """
-        return self._mutate('''
-            INSERT INTO download_results (
-                name, title, host, bytes_total, bytes_loaded,
-                downloaded, extraction, state, error, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(name) DO UPDATE SET
-                title = excluded.title,
-                host = excluded.host,
-                bytes_total = excluded.bytes_total,
-                bytes_loaded = excluded.bytes_loaded,
-                downloaded = excluded.downloaded,
-                extraction = excluded.extraction,
-                state = excluded.state,
-                error = excluded.error,
-                updated_at = CURRENT_TIMESTAMP
-        ''', (name, title, host, bytes_total, bytes_loaded,
-              downloaded, extraction, state, error),
-            label="upsert_download_result")
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM download_results WHERE name = ?", (name,))
+                row = cur.fetchone()
+                if row is not None:
+                    cur.execute('''
+                        UPDATE download_results SET
+                            title = ?, host = ?, bytes_total = ?, bytes_loaded = ?,
+                            downloaded = ?, extraction = ?, state = ?, error = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    ''', (title, host, bytes_total, bytes_loaded, downloaded,
+                          extraction, state, error, row[0]))
+                else:
+                    cur.execute('''
+                        INSERT INTO download_results (
+                            name, title, host, bytes_total, bytes_loaded,
+                            downloaded, extraction, state, error, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ''', (name, title, host, bytes_total, bytes_loaded,
+                          downloaded, extraction, state, error))
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error("DB Error (upsert_download_result): %s", e)
+            return False
 
     def get_download_results(self, limit=200):
         """Return tracked download/extraction outcomes, most recent first."""
         return self._query_dicts(
-            "SELECT name, title, host, bytes_total, bytes_loaded, "
+            "SELECT id, package_uuid, name, title, host, bytes_total, bytes_loaded, "
             "downloaded, extraction, state, error, updated_at "
             "FROM download_results ORDER BY updated_at DESC LIMIT ?",
             (limit,),

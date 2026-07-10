@@ -336,6 +336,49 @@ class TestDownloadResults:
         assert db_manager.delete_download_result("nope") == 0
 
 
+class TestDownloadResultsSchemaMigration:
+    """download_results: name-PK -> surrogate-id rebuild (crash-safe, once)."""
+
+    def test_migration_preserves_legacy_rows(self, tmp_path):
+        db_path = str(tmp_path / "t.db")
+        # Seed an OLD-shape download_results table + rows, then open DatabaseManager.
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE download_results (name TEXT PRIMARY KEY, title TEXT, "
+                     "host TEXT, bytes_total INTEGER, bytes_loaded INTEGER, downloaded INTEGER, "
+                     "extraction TEXT, state TEXT, error TEXT, updated_at TIMESTAMP)")
+        conn.execute("INSERT INTO download_results (name,title,host,bytes_total,bytes_loaded,"
+                     "downloaded,extraction,state,error) VALUES "
+                     "('Foo [1080p]','Foo','rapidgator',100,100,1,'success','finished',NULL)")
+        conn.commit(); conn.close()
+        db = DatabaseManager(db_path=db_path)
+        cols = {r[1] for r in db.get_connection().execute("PRAGMA table_info(download_results)")}
+        assert "id" in cols and "package_uuid" in cols
+        rows = db.get_download_results()
+        assert len(rows) == 1
+        assert rows[0]["name"] == "Foo [1080p]" and rows[0]["package_uuid"] is None
+        assert isinstance(rows[0]["id"], int)
+        db.close()
+
+    def test_migration_idempotent_and_indexes_on_fresh_db(self, tmp_path):
+        db = DatabaseManager(db_path=str(tmp_path / "t.db"))  # fresh -> new schema directly
+        idx = {r[1] for r in db.get_connection().execute("PRAGMA index_list(download_results)")}
+        assert "idx_download_results_uuid" in idx
+        # second open is a no-op (idempotent)
+        db.close(); db2 = DatabaseManager(db_path=str(tmp_path / "t.db")); db2.close()
+
+    def test_orphan_new_table_does_not_break_rebuild(self, tmp_path):
+        db_path = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE download_results (name TEXT PRIMARY KEY, title TEXT, host TEXT, "
+                     "bytes_total INTEGER, bytes_loaded INTEGER, downloaded INTEGER, extraction TEXT, "
+                     "state TEXT, error TEXT, updated_at TIMESTAMP)")
+        conn.execute("CREATE TABLE download_results_new (x INTEGER)")  # planted orphan
+        conn.commit(); conn.close()
+        db = DatabaseManager(db_path=db_path)  # must not raise
+        assert "id" in {r[1] for r in db.get_connection().execute("PRAGMA table_info(download_results)")}
+        db.close()
+
+
 class TestLegacyMigration:
 
     def test_migrate_history_json_imports_rows_and_backs_up(self, db_manager, tmp_path):
