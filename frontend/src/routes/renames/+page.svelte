@@ -18,6 +18,7 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import type { RenameJob } from '$lib/api/types';
+  import { isPhone } from '$lib/stores/viewport';
 
   import RenamesHeader from '$lib/components/renames/RenamesHeader.svelte';
   import StatusDashboard from '$lib/components/renames/StatusDashboard.svelte';
@@ -27,6 +28,7 @@
   import RenameCard from '$lib/components/renames/RenameCard.svelte';
   import RematchModal from '$lib/components/renames/RematchModal.svelte';
   import TrashPanel from '$lib/components/renames/TrashPanel.svelte';
+  import MobileRenamesView from '$lib/components/renames/MobileRenamesView.svelte';
 
   // Status filter is local orchestrator state (surfaced via the stat cards):
   // all | needs_review | matched | applied | failed.
@@ -241,6 +243,9 @@
     </p>
   {/if}
 
+  {#if $isPhone}
+  <MobileRenamesView />
+  {:else}
   <StatusDashboard {statusFilter} onFilter={(s) => (statusFilter = s)} />
 
   <RenameFilterBar />
@@ -347,6 +352,7 @@
           </li>
       {/each}
     </ul>
+  {/if}
   {/if}
 
   <!-- Dolby Vision scan surface — the StatusDashboard DV card scrolls here. -->
