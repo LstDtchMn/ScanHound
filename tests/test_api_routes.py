@@ -1833,3 +1833,68 @@ class TestPipelineRoutes:
                            "WHERE url = ?", ("http://pi/5",)).fetchone()
         assert row[0] is None  # cleared to pending
         assert row[1] == "777"  # old uuid excluded
+
+
+class TestPipelineSearch:
+    """POST /pipeline/search-sources + POST /pipeline/grab-alternative.
+
+    Reuses TestPipelineRoutes's class-scoped `client` fixture pattern (swaps
+    the conftest `db_manager` fixture's isolated temp-file DB into
+    registry.db) for the same reason: search-sources looks up the grab's
+    title/season from the `downloads` table, so it needs a clean table it
+    controls rather than the shared session-wide DB.
+    """
+
+    @pytest.fixture
+    def client(self, db_manager):
+        app = create_app(config_override={"plex_url": "", "plex_token": ""})
+        with TestClient(app) as c:
+            registry.db = db_manager
+            yield c
+
+    def test_search_sources_returns_partial_results_on_one_source_failure(self, client, db_manager, monkeypatch):
+        db_manager.add_to_history("http://ps/1", "Foo", package_name="Foo [1080p]")
+
+        class FakeSource:
+            name = "fakegood"
+            class config:
+                requires_auth = False
+        class FakeBadSource:
+            name = "fakebad"
+            class config:
+                requires_auth = False
+
+        async def fake_search_all(self, query, mode="all", **kw):
+            from backend.sources.base import PageResult, ParsedRelease
+            return {
+                "fakegood": PageResult(releases=[ParsedRelease(title="Foo", url="http://alt/1", source="fakegood")]),
+                "fakebad": PageResult(releases=[], errors=["boom"]),
+            }
+        monkeypatch.setattr("backend.sources.registry.SourceRegistry.search_all", fake_search_all)
+        resp = client.post("/pipeline/search-sources", json={"url": "http://ps/1"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["releases"]) == 1
+        assert any("boom" in e for e in body["errors"])
+
+    def test_grab_alternative_maps_parsed_release_to_force_grab(self, client, db_manager, monkeypatch):
+        calls = {}
+        def fake_add_task(self, fn, *a, **kw):
+            # NOTE: monkeypatching a plain function onto BackgroundTasks.add_task
+            # still goes through the descriptor protocol, so the first positional
+            # arg received here is the bound `self` (the BackgroundTasks instance),
+            # not the task callable — hence the explicit `self` param so `a` lines
+            # up with the args grab_alternative actually passed to _run_grab.
+            calls["args"] = a
+        monkeypatch.setattr("fastapi.BackgroundTasks.add_task", fake_add_task)
+        resp = client.post("/pipeline/grab-alternative", json={
+            "display_title": "Foo", "url": "http://alt/2", "year": 2024,
+            "res": "1080p", "size": "5 GB", "dovi": False, "hdr": "",
+            "season": None,
+        })
+        assert resp.status_code == 200
+        assert "args" in calls
+        # args[2] is the DownloadRequest, args[3] is force=True
+        req = calls["args"][2]
+        assert req.url == "http://alt/2" and req.resolution == "1080p"
+        assert calls["args"][3] is True
