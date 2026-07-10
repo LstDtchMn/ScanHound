@@ -47,10 +47,15 @@ export function toggleLanguageFilter(lang: string) {
 }
 /** Resolution/type facet: any of '4K' | '1080p' | 'TV'. OR-combined (like
  *  genres) — an item shows if it matches ANY selected key, so selecting both
- *  4K and 1080p shows the union rather than the (empty) intersection. Persisted
- *  per-device. 'TV' keys off the effective crawl category, not resolution. */
+ *  4K and 1080p shows the union rather than the (empty) intersection.
+ *  Session-only (not persisted), same as genre/language filters — a filter
+ *  that narrows *content* must never silently outlive the session, or a user
+ *  who once narrowed to {4K, 1080p} stays narrowed forever with no visible
+ *  indicator (this previously dropped every TV item, since TV never carries
+ *  a resolution key — see resolutionKeysFor below). 'TV' keys off the
+ *  effective crawl category, not resolution. */
 export const RESOLUTION_KEYS = ['4K', '1080p', 'TV'] as const;
-export const resolutionFilter = persisted<string[]>('sh-resolution-filter', []);
+export const resolutionFilter = writable<string[]>([]);
 export function toggleResolutionFilter(key: string) {
   resolutionFilter.update((r) => (r.includes(key) ? r.filter((x) => x !== key) : [...r, key]));
 }
