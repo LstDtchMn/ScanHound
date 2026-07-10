@@ -59,6 +59,64 @@ class OpenPlexRequest(BaseModel):
     plex_rating_key: Optional[str] = None
 
 
+def _run_grab(dl, reg: ServiceRegistry, req: "DownloadRequest", force: bool = False) -> None:
+    """Execute one grab and report its outcome over WS — the shared body used
+    by BOTH the existing POST /download route and the pipeline tracker's
+    regrab/grab-alternative actions. `force=True` (pipeline-only) bypasses
+    download_item's two dedup gates."""
+    try:
+        def _on_progress(event: str, data: dict):
+            ws_manager.broadcast_sync({"type": event, "data": data})
+
+        result = dl.download_item(
+            url=req.url, title=req.title, season=req.season,
+            resolution=req.resolution, size=req.size,
+            service_type=req.service_type, year=req.year,
+            hdr=req.hdr, dovi=req.dovi,
+            progress_callback=_on_progress,
+            force=force,
+        )
+        # Report the *honest* outcome: only a JDownloader hand-off counts as
+        # a delivery. A failed scrape or a clipboard/browser fallback must
+        # not look like a successful "Download".
+        success = bool((result or {}).get("success"))
+        method = (result or {}).get("method", "")
+        message = (result or {}).get("message", "") or f"Sent: {req.title}"
+        if not success:
+            ws_manager.broadcast_sync({
+                "type": "notification",
+                "data": {"title": "Download Failed", "body": message, "priority": "high"},
+            })
+        elif method in ("duplicate", "duplicate_similar"):
+            ws_manager.broadcast_sync({
+                "type": "notification",
+                "data": {"title": "Already grabbed", "body": message, "priority": "normal"},
+            })
+        elif method == "jdownloader":
+            ws_manager.broadcast_sync({
+                "type": "notification",
+                "data": {"title": "Download", "body": message, "priority": "normal"},
+            })
+            # Persist the 'grabbed similar' note onto this title's siblings.
+            _persist_grab_annotations(reg)
+        else:
+            # clipboard/browser — succeeded, but nothing reached JDownloader.
+            ws_manager.broadcast_sync({
+                "type": "notification",
+                "data": {"title": "Download", "body": f"{message} (not sent to JDownloader — method: {method})", "priority": "warning"},
+            })
+    except Exception as e:
+        logger.exception("Download failed for %s", req.title)
+        try:
+            dl.save_to_history(req.url, req.title, req.season, req.resolution, req.size, status="failed", hdr=req.hdr, dovi=req.dovi)
+        except Exception:
+            pass
+        ws_manager.broadcast_sync({
+            "type": "notification",
+            "data": {"title": "Download Failed", "body": str(e), "priority": "high"},
+        })
+
+
 @router.post("")
 def download_item(
     req: DownloadRequest,
@@ -71,59 +129,7 @@ def download_item(
     if not dl:
         raise HTTPException(status_code=503, detail="Download service not available")
 
-    def _do_download():
-        try:
-            def _on_progress(event: str, data: dict):
-                ws_manager.broadcast_sync({"type": event, "data": data})
-
-            result = dl.download_item(
-                url=req.url, title=req.title, season=req.season,
-                resolution=req.resolution, size=req.size,
-                service_type=req.service_type, year=req.year,
-                hdr=req.hdr, dovi=req.dovi,
-                progress_callback=_on_progress,
-            )
-            # Report the *honest* outcome: only a JDownloader hand-off counts as
-            # a delivery. A failed scrape or a clipboard/browser fallback must
-            # not look like a successful "Download".
-            success = bool((result or {}).get("success"))
-            method = (result or {}).get("method", "")
-            message = (result or {}).get("message", "") or f"Sent: {req.title}"
-            if not success:
-                ws_manager.broadcast_sync({
-                    "type": "notification",
-                    "data": {"title": "Download Failed", "body": message, "priority": "high"},
-                })
-            elif method in ("duplicate", "duplicate_similar"):
-                ws_manager.broadcast_sync({
-                    "type": "notification",
-                    "data": {"title": "Already grabbed", "body": message, "priority": "normal"},
-                })
-            elif method == "jdownloader":
-                ws_manager.broadcast_sync({
-                    "type": "notification",
-                    "data": {"title": "Download", "body": message, "priority": "normal"},
-                })
-                # Persist the 'grabbed similar' note onto this title's siblings.
-                _persist_grab_annotations(reg)
-            else:
-                # clipboard/browser — succeeded, but nothing reached JDownloader.
-                ws_manager.broadcast_sync({
-                    "type": "notification",
-                    "data": {"title": "Download", "body": f"{message} (not sent to JDownloader — method: {method})", "priority": "warning"},
-                })
-        except Exception as e:
-            logger.exception("Download failed for %s", req.title)
-            try:
-                dl.save_to_history(req.url, req.title, req.season, req.resolution, req.size, status="failed", hdr=req.hdr, dovi=req.dovi)
-            except Exception:
-                pass
-            ws_manager.broadcast_sync({
-                "type": "notification",
-                "data": {"title": "Download Failed", "body": str(e), "priority": "high"},
-            })
-
-    background_tasks.add_task(_do_download)
+    background_tasks.add_task(_run_grab, dl, reg, req, False)
     return {"status": "started", "title": req.title}
 
 

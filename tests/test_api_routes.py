@@ -633,6 +633,19 @@ class TestDownloads:
         resp = client.post("/download")
         assert resp.status_code == 422
 
+    def test_existing_download_route_behavior_unchanged_after_refactor(self, client, monkeypatch):
+        # Regression: the existing POST /download route must still queue a
+        # background task and return {"status": "started", ...} exactly as before.
+        calls = {}
+        def fake_add_task(fn, *a, **kw):
+            calls["fn"] = fn
+        monkeypatch.setattr("fastapi.BackgroundTasks.add_task", fake_add_task)
+        resp = client.post("/download", json={"url": "http://t/1", "title": "Test Movie",
+                                              "resolution": "1080p"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "started"
+        assert "fn" in calls
+
 
 # ── JD Controls & Download Results ──────────────────────────────────────
 
