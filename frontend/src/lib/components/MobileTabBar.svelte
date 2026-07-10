@@ -9,7 +9,7 @@
   style="padding-bottom: env(safe-area-inset-bottom);"
   aria-label="Primary"
 >
-  {#each navItems as nav}
+  {#each navItems.filter((n) => !n.desktopOnly) as nav}
     {@const active = $page.url.pathname === nav.href}
     <a
       href={nav.href}

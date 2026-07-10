@@ -6,13 +6,18 @@ export interface NavItem {
   label: string;
   short: string;
   icon: string;
+  // When true, this item is desktop-only and must be filtered out of the
+  // mobile bottom tab bar (see MobileTabBar.svelte). Used for entries whose
+  // mobile access is provided some other way (e.g. Pipeline is reachable on
+  // phone via a ?view=pipeline switch inside the /downloads mobile view).
+  desktopOnly?: boolean;
 }
 
 export const navItems: readonly NavItem[] = [
   { href: '/', label: 'Scan', short: 'Scan', icon: 'search' },
   { href: '/downloads', label: 'Downloads', short: 'DLs', icon: 'download' },
   { href: '/renames', label: 'Renames', short: 'Renames', icon: 'rename' },
-  { href: '/pipeline', label: 'Pipeline', short: 'Pipeline', icon: 'pipeline' },
+  { href: '/pipeline', label: 'Pipeline', short: 'Pipeline', icon: 'pipeline', desktopOnly: true },
   { href: '/watchlist', label: 'Watchlist', short: 'Watch', icon: 'bookmark' },
   { href: '/analytics', label: 'Analytics', short: 'Stats', icon: 'chart' },
   { href: '/settings', label: 'Settings', short: 'Settings', icon: 'gear' }

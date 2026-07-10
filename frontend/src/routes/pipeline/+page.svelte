@@ -75,8 +75,11 @@
       await api.regrabPipelineItem(item.url);
       addToast('Re-grab', `Retrying ${item.title || item.url}…`);
       // The backend clears this item's verdict (category -> null) as soon as
-      // the regrab is accepted, so refresh counts to reflect that shift.
+      // the regrab is accepted, so refresh counts AND the item list to reflect
+      // that shift (otherwise the row keeps showing its stale pre-regrab
+      // category with action buttons still enabled).
       counts = await api.getPipelineCounts();
+      items = await api.getPipelineItems(activeCategory ?? undefined);
     } catch (e) {
       addToast('Error', e instanceof Error ? e.message : 'Could not regrab', 'error');
     } finally {
