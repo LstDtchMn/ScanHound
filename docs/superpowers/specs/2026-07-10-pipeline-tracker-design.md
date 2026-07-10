@@ -23,8 +23,9 @@ detailed below, silently **block** a same-URL re-grab too.
 **No new grab machinery** — but the existing grab path (`download_item`) has
 two dedup gates that must be explicitly bypassed for a pipeline-initiated grab,
 or the buttons this feature exists to add are no-ops (see §4). Re-grab and
-"grab alternative" both call the same internal `dl.download_item(...)` the
-existing `POST /download` route calls, backgrounded the same way
+"grab alternative" both go through a shared `_run_grab` helper — extracted
+from the existing route's `_do_download` wrapper so the WS progress/notification
+bridge isn't silently lost (see §5) — backgrounded the same way
 (`background_tasks.add_task`, [downloads.py:126](backend/api/routes/downloads.py:126))
 with a new `force=True` parameter.
 
@@ -34,11 +35,12 @@ with a new `force=True` parameter.
 uses — see §2) with `package_name` + a per-attempt timestamp as the initial
 discovery path, since `package_uuid` is only known *after* JD assigns it.
 
-**One additive schema change**: `downloads` gains two nullable columns —
-`package_name TEXT` and `last_grabbed_at TIMESTAMP` — written at grab time (the
-name string is already computed at the call site; this just persists it, at
-its actual truncated form). Old rows keep both `NULL` and simply can't
-reconcile-link (they predate this feature; they don't crash it).
+**One additive schema change**: `downloads` gains three nullable columns —
+`package_name TEXT`, `last_grabbed_at TIMESTAMP`, and `service_type TEXT` —
+written at grab time (the name string is already computed at the call site;
+this just persists it, at its actual truncated form). Old rows keep them all
+`NULL` and simply can't reconcile-link (they predate this feature; they don't
+crash it).
 
 **Verdicts persist** in a new `pipeline_verdicts` table (hybrid design, keyed by
 `downloads.url`), which ALSO stores the discovered `package_uuid` once found —
@@ -88,10 +90,13 @@ FastAPI, SQLite (`DatabaseManager`), the existing `sources` registry
   `DatabaseManager.get_plex_cache_max_timestamp()` — only emit `not_in_plex`
   when the cache has actually been refreshed *since* the rename applied (plus a
   small margin for Plex's own scan lag). See §2 for the exact comparison.
-- **Re-grab and grab-alternative reuse `dl.download_item(...)` with
-  `force=True`** — no new send-to-JD / clipboard / browser fallback logic, but
-  a new parameter to bypass the two dedup gates that otherwise make both
-  actions silent no-ops (§4).
+- **Re-grab and grab-alternative reuse the existing grab path (via a shared
+  `_run_grab` wrapper, §5) with a new `force=True` parameter** — no new
+  send-to-JD / clipboard / browser fallback logic, but `force` is required to
+  bypass the two dedup gates that otherwise make both actions silent no-ops
+  (§4), and the shared wrapper is required so the WS progress/notification
+  bridge (which only exists in the *route's* wrapper, not in `download_item`
+  itself) isn't silently dropped.
 - **`search_all()` is currently unreferenced anywhere in the codebase** — this
   feature is its first real caller. Its endpoint must handle a source throwing,
   timing out, or returning garbage without taking down the request (per-source
@@ -116,7 +121,7 @@ FastAPI, SQLite (`DatabaseManager`), the existing `sources` registry
 
 ### 1. Schema (`backend/database.py`)
 
-- `downloads` gains two columns via the existing guarded `_column_migrations`
+- `downloads` gains THREE columns via the existing guarded `_column_migrations`
   `ALTER TABLE` list (additive, no PK change — a plain guarded `ALTER TABLE ADD
   COLUMN`, same mechanism as every other optional column in this table):
   - `package_name TEXT` — the canonical (truncated) name, written at grab time.
@@ -125,14 +130,24 @@ FastAPI, SQLite (`DatabaseManager`), the existing `sources` registry
     `download_results`/`rename_jobs` rows belong to *this* attempt when the
     name string collides with an earlier attempt or a different release of the
     same title/year/resolution.
+  - `service_type TEXT` — the host `scrape_links` used for the original grab
+    ([download_service.py:1238-1272](backend/download_service.py:1238) picks
+    which host's links to harvest by this field). Without it, a regrab of a
+    Nitroflare-only original defaults to the `DownloadRequest` default
+    ("Rapidgator"), scrapes zero links, and fails where the original
+    succeeded — persist it so regrab can pass the SAME value back.
 - New table:
   ```sql
   CREATE TABLE IF NOT EXISTS pipeline_verdicts (
       url TEXT PRIMARY KEY REFERENCES downloads(url),
-      category TEXT NOT NULL,       -- see Categories below
-      detail TEXT,                  -- error text / stalled-at description
-      package_uuid TEXT,            -- discovered download_results.package_uuid, once matched
-      plex_rating_key TEXT,         -- set once verified
+      category TEXT,                 -- NULL = pending re-evaluation (e.g. just regrabbed); see Categories below
+      detail TEXT,                   -- error text / stalled-at description
+      package_uuid TEXT,             -- CONFIRMED-current download_results.package_uuid match, once found
+      excluded_uuid TEXT,            -- a uuid known to be STALE for this url (the superseded attempt,
+                                      -- set by regrab) — the fallback match must never re-adopt it, closing
+                                      -- the race where a post-restart repoll bumps the OLD package's
+                                      -- updated_at before the NEW package even exists in download_results
+      plex_rating_key TEXT,          -- set once verified
       checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       dismissed INTEGER DEFAULT 0
   )
@@ -140,34 +155,66 @@ FastAPI, SQLite (`DatabaseManager`), the existing `sources` registry
   ```
   A fresh, additive table — no migration risk, no existing data to preserve.
 - `compute_package_name(title, year, resolution) -> str` — new pure helper
-  (module-level, `backend/download_service.py`), extracted verbatim from the
-  existing inline computation at
-  [download_service.py:1976-1980](backend/download_service.py:1976):
-  `f"{title} ({year}) [{resolution}]"[:50] if year else f"{title} [{resolution}]"[:50]`
-  (match the existing conditional exactly — do not change today's naming
-  format, only make it reusable and consistently truncated). Called from BOTH
-  the existing `download_item` call site and the new `save_to_history`
-  persist call.
-- `add_to_history` gains `package_name=None` params, included in the
-  `INSERT`/`ON CONFLICT DO UPDATE`:
-  `package_name = COALESCE(excluded.package_name, downloads.package_name)`
-  (never let a later status-only update null out an already-known name), and
+  (module-level, `backend/download_service.py`), matching the existing inline
+  computation at [download_service.py:1976-1980](backend/download_service.py:1976)
+  **exactly** (two sequential conditionals, not a single f-string — do not
+  collapse them, the collapsed form breaks the empty-resolution/empty-title
+  cases the real code guards):
+  ```python
+  def compute_package_name(title: str, year: Optional[int], resolution: str) -> str:
+      if not title:
+          return "ScanHound Download"[:50]
+      name = f"{title} ({year})" if year else title
+      package_name = f"{name} [{resolution}]" if resolution else name
+      return package_name[:50]
+  ```
+  Called from BOTH the existing `download_item` call site (replacing its
+  inline computation, behavior-identical) and the new `save_to_history`
+  persist call, so they can never drift apart.
+- `add_to_history` gains `package_name=None, service_type=None` params,
+  included in the `INSERT`/`ON CONFLICT DO UPDATE`:
+  `package_name = COALESCE(excluded.package_name, downloads.package_name)`,
+  `service_type = COALESCE(excluded.service_type, downloads.service_type)`
+  (never let a later status-only update null out an already-known value), and
   `last_grabbed_at = CURRENT_TIMESTAMP` **unconditionally** in both the INSERT
-  values and the `ON CONFLICT DO UPDATE SET` list (every call — success,
-  clipboard, browser, or failed-send — is a genuine new attempt; this is what
-  makes a regrab's timestamp move forward even though `date_added` is
-  deliberately preserved by the existing `ON CONFLICT` behavior).
+  values and the `ON CONFLICT DO UPDATE SET` list (every call that actually
+  reaches `save_to_history` — success, clipboard, browser, or failed-send — is
+  a genuine new attempt; this is what makes a regrab's timestamp move forward
+  even though `date_added` is deliberately preserved, unlisted, by the
+  existing `ON CONFLICT` behavior). **Known gap, documented not silently
+  accepted:** the scrape-failure early return
+  ([download_service.py:1944-1962](backend/download_service.py:1944)) exits
+  BEFORE `save_to_history` is ever called — a grab that dies at the scrape
+  step never creates a `downloads` row at all (first grab: invisible to the
+  tracker; a regrab that dies here doesn't bump `last_grabbed_at`, which is
+  benign since the stale verdict is simply re-derived unchanged next pass).
 - New CRUD:
   - `get_pipeline_verdicts(category=None, include_dismissed=False)` — joined
     read for the API.
-  - `upsert_pipeline_verdict(url, category, detail, package_uuid, plex_rating_key, dismissed=False)`.
+  - `upsert_pipeline_verdict(url, category, detail, package_uuid, plex_rating_key, dismissed=False)`
+    — **always sets `checked_at = CURRENT_TIMESTAMP` explicitly in the SQL**
+    (the column `DEFAULT` only fires on INSERT, never on UPDATE — an
+    `ON CONFLICT DO UPDATE` must list it).
   - `dismiss_pipeline_verdict(url)`.
-  - `clear_pipeline_verdict(url)` — used by regrab/grab-alternative to force a
-    fresh reconcile of the new attempt.
-  - `get_downloads_needing_reconcile(limit)` — rows with `package_name IS NOT
-    NULL` and (`last_grabbed_at` more than 30 minutes ago) and (no verdict, OR
-    a non-`dismissed` non-`verified` verdict whose `checked_at` predates
-    `last_grabbed_at` — i.e. stale relative to the current attempt).
+  - `clear_pipeline_verdict(url)` — called by regrab/grab-alternative. Does
+    **NOT** delete the row (a full delete would also forget the uuid worth
+    excluding — see N2's fix below). Instead: `UPDATE pipeline_verdicts SET
+    excluded_uuid = COALESCE(package_uuid, excluded_uuid), package_uuid = NULL,
+    category = NULL, dismissed = 0, checked_at = CURRENT_TIMESTAMP WHERE
+    url = ?` (or INSERT a fresh minimal row if none exists yet). `category
+    IS NULL` marks "pending re-evaluation" and is always eligible for
+    reconcile (see the fixed eligibility rule below).
+  - `get_downloads_needing_reconcile(limit)` — rows where `package_name IS NOT
+    NULL`, `last_grabbed_at` is more than 30 minutes ago, AND (no verdict row
+    yet, OR (`verdict.dismissed = 0` AND `verdict.category IS NOT 'verified'`)).
+    **Deliberately no `checked_at` comparison in this WHERE clause** — an
+    earlier draft gated eligibility on `checked_at < last_grabbed_at`, which
+    freezes every verdict after its first write (`checked_at` becomes "now,"
+    which is always after the unchanging `last_grabbed_at`, so nothing would
+    ever be re-picked-up — the entire hourly loop would degenerate to one
+    check per grab, ever). Every non-terminal (`dismissed`/`verified`) verdict
+    is reconsidered on every pass; `checked_at` is informational only (shown
+    in the UI as "last checked").
   - `get_plex_cache_max_timestamp()` — **already exists**
     ([database.py:853](backend/database.py:853)), reused as-is; returns
     `{content_type: max_last_updated_epoch_float}`.
@@ -187,12 +234,23 @@ specified precisely here since it's the crux fix):
    how `download_results`' own uuid identity works post-migration).
 2. Else (first reconcile for this attempt, or the uuid'd row aged out of
    `download_results`), match by `download_results.name = downloads.package_name
-   AND download_results.updated_at >= downloads.last_grabbed_at - 5s` (the 5s
-   margin absorbs clock/ordering slop between the grab request and JD's first
-   poll), taking the row with `MAX(updated_at)`. If more than one candidate
-   remains, prefer the one whose `state` is furthest along
-   (`extracted > extracting > downloading > queued > failed`), same rationale
-   as picking "the row that's actually this attempt, not a stale sibling."
+   AND download_results.updated_at >= downloads.last_grabbed_at - 5s AND
+   (download_results.package_uuid IS NULL OR download_results.package_uuid !=
+   pipeline_verdicts.excluded_uuid)` (the 5s margin absorbs clock/ordering slop
+   between the grab request and JD's first poll; the `excluded_uuid` exclusion
+   is what stops a regrab from re-adopting the superseded package it's
+   retrying — see the `excluded_uuid` column above). Among remaining
+   candidates, take **`MAX(download_results.id)`** — the surrogate PK is
+   strictly insertion-order monotonic
+   ([database.py:359-373](backend/database.py:359)), so the newer attempt's
+   row always wins regardless of poll-refresh noise. **Do NOT tiebreak by
+   `state`/"furthest along"** — a container restart empties the poller's
+   in-memory change-detection cache, so the first poll after any restart
+   re-touches `updated_at` on EVERY still-listed JD package including old,
+   already-superseded ones; a state-based tiebreak would then deterministically
+   prefer a stale `extracted` row over the genuinely new `downloading` one,
+   which is exactly the regrab-after-late-stage-failure case this feature
+   exists to fix.
 3. Once a `download_results` row is matched, if it has a non-null
    `package_uuid`, persist it onto `pipeline_verdicts.package_uuid` so step 1
    applies on the next pass.
@@ -216,10 +274,15 @@ LIST (a package can span multiple files — season packs create one `rename_jobs
 row per file, [rename/service.py:515,545](backend/rename/service.py:515)).
 
 - No `download_results` row at all:
-  - If `jd_method != 'api'` (folder/crawljob mode — the poller never writes
-    `download_results` in this mode, [main.py:268](backend/api/main.py:268)) →
-    `unknown` (documented blind spot: this mode structurally can't be
-    reconciled without a results row; do not mis-flag as `never_started`).
+  - If the CURRENT `jd_method` config != `'api'` (folder/crawljob mode — the
+    poller never writes `download_results` in this mode,
+    [main.py:268](backend/api/main.py:268)) → `unknown` (documented blind
+    spot: this mode structurally can't be reconciled without a results row; do
+    not mis-flag as `never_started`). Note: `jd_method` is read live at
+    reconcile time, not stored per-grab — a user who switches folder→api will
+    see their OLD folder-mode grabs re-evaluated under the api-mode rule and
+    flagged `never_started` (accepted; a one-time, self-resolving cosmetic
+    quirk of a rare settings change, not worth a per-grab snapshot column).
   - Else if `downloads.last_grabbed_at` is more than 30 minutes ago →
     `never_started`.
   - Else → no verdict written yet this pass (too soon to judge).
@@ -234,12 +297,23 @@ row per file, [rename/service.py:515,545](backend/rename/service.py:515)).
 - `result_row.state == 'extracted'` and `rename_rows` is empty → `pending_rename`.
 - Any row in `rename_rows` has `status in ('failed', 'needs_review')` →
   `rename_failed` (detail = that row's `error_message` or `warning_message`).
+- Any row in `rename_rows` has `status in ('pending', 'matched', 'applying')`
+  (auto-apply in flight, or matched awaiting apply — a real, common, transient
+  state; do NOT let this fall through to `unknown`) → `pending_rename`.
+- Any row in `rename_rows` has `status == 'reverted'` → `rename_failed` (detail:
+  "reverted" — treat like a failure, it's not in the library).
 - All rows in `rename_rows` have `status == 'applied'`:
-  - `latest_processed_at = max(r.processed_at for r in rename_rows)`, parsed as
-    UTC (SQLite `CURRENT_TIMESTAMP` is UTC-naive text — **must** attach
-    `tzinfo=timezone.utc` before comparing to the epoch floats from
-    `get_plex_cache_max_timestamp()`, or the comparison silently skews by the
-    server's local UTC offset).
+  - `latest_processed_at = max(r.processed_at for r in rename_rows)`. **Parse
+    with `datetime.fromisoformat(processed_at)`** — `rename_jobs.processed_at`
+    is written by the rename service's own `_now()` helper
+    ([rename/service.py:62-63](backend/rename/service.py:62),
+    `datetime.now(timezone.utc).isoformat()`), which is an already
+    **timezone-AWARE** ISO-8601 string (NOT SQLite's `CURRENT_TIMESTAMP`,
+    which would be naive text — that premise does not apply to this column).
+    `fromisoformat` on that string yields an aware `datetime` directly; only
+    attach `tzinfo=timezone.utc` defensively if a legacy/malformed row somehow
+    parses as naive. Compare `latest_processed_at.timestamp()` (epoch) against
+    `get_plex_cache_max_timestamp()`'s epoch floats.
   - `content_type = 'TV Shows' if rename_rows[0].media_type == 'tv' else 'Movies'`.
   - `cache_fresh_enough = plex_max_ts.get(content_type, 0) >= latest_processed_at.timestamp() + grace_margin_minutes * 60`
     (the margin is Plex's own scan lag after a cache refresh, not "time since
@@ -251,12 +325,21 @@ row per file, [rename/service.py:515,545](backend/rename/service.py:515)).
     equality — `plex_cache.title` is Plex's clean title, `rename_jobs.title` is
     TMDB's, they won't always match verbatim) + `year`, **AND** matching
     `season` (for TV — `plex_cache` rows are per-season) **AND** a resolution
-    check (`plex_cache.res` vs `rename_jobs.resolution`, normalized so `'2160p'`
-    and `'4K'` are treated as equal — without this, a 2160p grab whose rename
-    never landed silently "verifies" against the library's existing 1080p copy,
-    the one false-positive class the spec must not allow into the terminal
-    `verified` state). Found → `verified` (`plex_rating_key` = the match).
-    Not found → `not_in_plex`.
+    check (`plex_cache.res` vs the download's known resolution, normalized so
+    `'2160p'` and Plex's literal `'4K'` are treated as equal — without this, a
+    2160p grab whose rename never landed silently "verifies" against the
+    library's existing 1080p copy, the one false-positive class the spec must
+    not allow into the terminal `verified` state). **Resolution source and
+    unknown-handling:** prefer `rename_rows[0].resolution`; if NULL (rename
+    only enforces a resolution field for non-TV,
+    [rename/service.py:1100](backend/rename/service.py:1100)), fall back to
+    `download_row.resolution` (the grab always has one). If BOTH are
+    empty/unknown, or `plex_cache.res == '?'`, **skip the resolution check
+    entirely** rather than failing it strictly — a resolution-less TV rename
+    must not be pushed to a false `not_in_plex` just because neither side has
+    a comparable value. Found (imdb/title+year AND season AND
+    resolution-known-and-matching-or-skipped) → `verified` (`plex_rating_key` =
+    the match). Not found → `not_in_plex`.
 - Anything else unresolved/malformed → `unknown` (never raises).
 
 `reconcile_batch(db, limit=500) -> int` — pulls
@@ -317,28 +400,44 @@ segment.
 - `GET /pipeline/counts` → `{category: count}` for the nav badge / chip counts
   (dismissed excluded).
 - `POST /pipeline/dismiss {url}` → `dismiss_pipeline_verdict(url)`.
+- **Shared helper `_run_grab(dl, reg, req, force)`** — extracted from the
+  existing route's inner `_do_download`
+  ([downloads.py:74-125](backend/api/routes/downloads.py:74)) so BOTH the
+  original `POST /download` route and the two new pipeline endpoints go
+  through the SAME wrapper: the `_on_progress` callback that bridges
+  `download_item` to WS ([download_service.py:182-187](backend/download_service.py:182)
+  forwards to the callback and does **nothing** without one — omitting it, as
+  the first draft's bare `dl.download_item(...)` call would have, silently
+  drops every `download:*` event), the success/failure `notification`
+  broadcasts, `_persist_grab_annotations(reg)` on delivery, and the
+  exception→`save_to_history(status="failed")` handler. Add a `force: bool`
+  parameter threaded through to `download_item`. This is a refactor of the
+  existing route (behavior-identical when `force=False`, the default), not new
+  logic.
 - `POST /pipeline/regrab {url}` → loads the `downloads` row's stored
-  title/season/year/resolution/size/hdr/dovi, `clear_pipeline_verdict(url)`
-  (so the reconcile treats this as a fresh attempt — cheap, synchronous, no
-  scraping), then **backgrounds** the grab exactly like the existing route
-  (`background_tasks.add_task(lambda: dl.download_item(..., force=True))`),
-  returns `{"status": "started"}` immediately. The outcome surfaces over the
-  existing WS `download:*` notification channel, same as any other grab —
-  `download_item` runs a Selenium scrape + Cloudflare wait (30s+), so it must
-  never run synchronously inside a request handler (the existing route already
-  knows this; this endpoint must match it, not "wait for success then clear
-  the verdict" as originally drafted — that ordering is impossible given the
-  background execution model).
-- `POST /pipeline/search-sources {url}` → looks up the `downloads` row's
-  title/season, calls `registry.search_all(title, mode)` with a request-level
-  timeout, EXCLUDES sources requiring Selenium/auth (adithd — see Global
-  Constraints), flattens `{source: PageResult}` into one ranked list (dedupe by
-  url) plus a per-source errors list for the frontend. Never raises for a
-  single source's failure (isolation already exists in `search_all` itself).
+  title/season/year/resolution/size/hdr/dovi/service_type,
+  `clear_pipeline_verdict(url)` (cheap, synchronous, no scraping — moves the
+  current `package_uuid` to `excluded_uuid` per §1), then
+  `background_tasks.add_task(_run_grab, dl, reg, req, force=True)`, returns
+  `{"status": "started"}` immediately. Outcome surfaces over the existing WS
+  channel via the shared helper.
+- `POST /pipeline/search-sources {url}` → **`async def`** (`search_all` is a
+  coroutine — [registry.py:275](backend/sources/registry.py:275) — the
+  existing download routes are sync, this one must not be). Looks up the
+  `downloads` row's title/season, calls `await registry.search_all(title,
+  mode)` with a request-level timeout, EXCLUDES sources whose
+  `SourceConfig.requires_auth` is `True` (adithd today — filter on the flag,
+  not a hardcoded name, so this stays correct if another auth-requiring source
+  is added later), flattens `{source: PageResult}` into one ranked list
+  (dedupe by url) plus a per-source errors list for the frontend. Never raises
+  for a single source's failure (isolation already exists in `search_all`
+  itself).
 - `POST /pipeline/grab-alternative` → body is a `ParsedRelease.to_dict()` shape
   (`display_title`/`url`/`year`/`res`/`size`/`dovi`/`hdr`/`season`); maps onto
-  `DownloadRequest` (`display_title→title`, `res→resolution`, etc.) and calls
-  the same backgrounded `force=True` grab path as regrab.
+  `DownloadRequest` (`display_title→title`, `res→resolution`, etc., leaving
+  `service_type` at its default since an alternative release is from a
+  different source than the original grab) and calls the same
+  `background_tasks.add_task(_run_grab, ..., force=True)` path as regrab.
 
 ### 6. Config (`backend/config.py`)
 
@@ -384,16 +483,22 @@ folder-mode-with-no-results-row — logged, shown last, expected to be non-zero)
 
 ## Data Flow
 
-1. A grab writes `downloads.package_name` (via `compute_package_name`) and bumps
-   `last_grabbed_at` at send time — for every attempt, not just the first.
+1. A grab writes `downloads.package_name`/`service_type` (via
+   `compute_package_name`) and bumps `last_grabbed_at` at send time — for
+   every attempt that reaches `save_to_history`, not just the first.
 2. Hourly (+ once at startup) maintenance pass calls `reconcile_batch`, which
-   matches each un-terminal/stale-relative-to-last_grabbed_at grab to its
-   `download_results` row (uuid-first, name+time fallback), its `rename_jobs`
-   rows, and a Plex-cache-freshness check, and upserts a verdict.
+   re-evaluates every grab with `package_name IS NOT NULL` that isn't
+   `dismissed`/`verified` (regardless of when it was last checked — see the
+   fixed eligibility rule in §1), matches it to its `download_results` row
+   (uuid-first, else name+time+`excluded_uuid`-filtered fallback), its
+   `rename_jobs` rows, and a Plex-cache-freshness check, and upserts a
+   verdict.
 3. `/pipeline` page reads verdicts (fast — no live joins on page load).
-4. Re-grab / grab-alternative → clear the old verdict synchronously, background
-   `download_item(..., force=True)` → the next reconcile pass matches the new
-   attempt fresh via `last_grabbed_at`.
+4. Re-grab / grab-alternative → `clear_pipeline_verdict` (synchronous: moves
+   the current `package_uuid` to `excluded_uuid`, resets `category` to NULL) →
+   background the grab via the shared `_run_grab(..., force=True)` helper →
+   the next reconcile pass matches the new attempt fresh via
+   `last_grabbed_at`, unable to re-adopt the superseded package.
 5. Search-sources → `registry.search_all` (auth-requiring sources excluded) →
    picker → grab-alternative.
 
@@ -408,45 +513,76 @@ folder-mode-with-no-results-row — logged, shown last, expected to be non-zero)
 - Regrab/grab-alternative: the HTTP response only confirms the grab was
   *queued* (backgrounded); success/failure surfaces over the existing WS
   `download:*` notification channel, identically to a normal grab from the Scan
-  page — no new failure-reporting path.
+  page — no new failure-reporting path (guaranteed by routing both through the
+  same `_run_grab` helper the existing route uses).
+- `pipeline_verdicts.url REFERENCES downloads(url)` is **not** DB-enforced —
+  this connection never sets `PRAGMA foreign_keys` (verified,
+  [database.py:101-104](backend/database.py:101)), so the `REFERENCES` clause
+  is documentation only. The manual cascade in `clear_history()` (§1) is the
+  real enforcement mechanism; do not "simplify" it to `ON DELETE CASCADE` and
+  assume it works.
 
 ## Testing
 
 - **`compute_package_name`**: matches the exact existing inline format
   (with/without year), truncates at 50 chars identically to
   `send_to_jdownloader`'s two call sites.
+- **`compute_package_name`**: matches the real two-conditional form (title-only
+  fallback, with/without year, with/without resolution), truncates at 50 chars
+  identically to `send_to_jdownloader`'s two call sites.
 - **`pipeline_service.categorize`**: one test per category boundary, INCLUDING:
   the folder-mode-no-results-row → `unknown` (not `never_started`); the
-  Plex-cache-freshness gate (cache refreshed BEFORE the rename → `in_progress`
-  even after 6+ hours elapsed; cache refreshed AFTER the rename + margin → the
-  real check runs) — using literal UTC-naive `processed_at` strings and epoch
-  floats to pin the timezone-conversion correctness; a multi-row `rename_rows`
-  case where one file failed → `rename_failed` even though others applied; the
-  resolution-normalization check (`'2160p'` vs `'4K'`) preventing a false
-  `verified` against a lower-quality library copy; a `download_results` row
-  whose error text contains "offline"/"not found" reaching `download_failed`
-  with that detail preserved; malformed/partial input never raising (falls to
-  `unknown`).
+  Plex-cache-freshness gate using a REAL `_now()`-style aware ISO string for
+  `processed_at` (e.g. `"2026-07-10T12:00:00+00:00"`) parsed via
+  `datetime.fromisoformat` and compared against an epoch float — cache max
+  timestamp BEFORE `processed_at` → `in_progress` even after 6+ hours elapsed
+  by wall-clock; cache max timestamp AFTER `processed_at` + margin → the real
+  Plex-match check runs; a multi-row `rename_rows` case where one file failed
+  → `rename_failed` even though others applied; `pending`/`matched`/`applying`
+  rows → `pending_rename` (not `unknown`); a `reverted` row → `rename_failed`;
+  the resolution-normalization check (`'2160p'` vs `'4K'`) preventing a false
+  `verified` against a lower-quality library copy; the resolution-unknown case
+  (both sides empty/`'?'`) SKIPPING the resolution check rather than failing
+  it; a `download_results` row whose error text contains "offline"/"not found"
+  reaching `download_failed` with that detail preserved; malformed/partial
+  input never raising (falls to `unknown`).
 - **Matching logic**: a `package_uuid`-recorded verdict matches directly
   (single query, no name/time fallback needed); a fresh reconcile with a
   name-collision between two DIFFERENT `downloads.url` rows (same
   title/year/resolution, different `last_grabbed_at`) correctly picks the
   `download_results` row within its own attempt's time window, not the other
-  url's.
+  url's; **the tiebreak uses `MAX(id)`, not state-progression** — construct two
+  candidate rows with the SAME `updated_at` (simulating a post-restart repoll
+  touching both) where the OLDER row (lower `id`) has a further-along `state`
+  (`extracted`) and the NEWER row (higher `id`) has an earlier `state`
+  (`downloading`) and assert the newer/higher-id row wins; **the
+  `excluded_uuid` filter** — after `clear_pipeline_verdict` moves a uuid to
+  `excluded_uuid`, a reconcile pass where the OLD package is the only
+  candidate in the time window finds NO match (not the excluded row) rather
+  than re-adopting it.
 - **`reconcile_batch`**: batched (no N+1) — assert query count; a single
   malformed row doesn't stop the rest of the batch; a `dismissed` verdict is
-  not recomputed; a `verified` verdict is not recomputed (terminal).
+  not recomputed; a `verified` verdict is not recomputed (terminal); **an
+  `in_progress` verdict written on pass 1 IS reconsidered on pass 2** even
+  though nothing about `last_grabbed_at` changed (the N1 regression test — the
+  original eligibility bug would make this assertion fail).
 - **`download_item(force=True)`**: bypasses BOTH the `is_downloaded` and
   `_best_prior_grab` gates and actually re-sends; `force=False` (the existing
   default) behavior is completely unchanged (regression-test the two gates
   still block a normal accidental duplicate).
 - **API**: `/pipeline/items` filter + join correctness; `/pipeline/regrab`
-  clears the old verdict synchronously and backgrounds the grab (assert
-  `background_tasks.add_task` was called, not that the grab completed inline);
-  `/pipeline/search-sources` returns partial results when one mocked source
-  raises, and excludes adithd; `/pipeline/grab-alternative` correctly maps a
-  `ParsedRelease` dict onto a `force=True` grab call; `clear_history()` also
-  clears `pipeline_verdicts`.
+  calls `clear_pipeline_verdict` synchronously and backgrounds the grab via
+  the shared `_run_grab` helper (assert `background_tasks.add_task` was
+  called, not that the grab completed inline); `/pipeline/search-sources`
+  returns partial results when one mocked source raises, and excludes any
+  source with `requires_auth=True` (assert by the flag, not a hardcoded name);
+  `/pipeline/grab-alternative` correctly maps a `ParsedRelease` dict onto a
+  `force=True` grab call; `clear_history()` also clears `pipeline_verdicts`.
+- **`_run_grab` shared helper**: the existing `POST /download` route's
+  behavior is UNCHANGED after the refactor (regression test: WS progress
+  events, notifications, `_persist_grab_annotations`, and the
+  failed-save-to-history exception path all still fire exactly as before,
+  `force` defaulting to `False`).
 - **Frontend**: category chip counts render; Dismiss removes an item and
   persists (mock the API); the search modal renders partial results + a
   per-source error without crashing; Grab-alternative closes the modal on
