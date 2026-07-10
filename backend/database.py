@@ -265,6 +265,23 @@ class DatabaseManager:
                     )
                 ''')
 
+                # Pipeline-tracker reconcile verdicts — one row per grab url,
+                # persisted so 'verified' is terminal and Dismiss survives
+                # even after the underlying stage rows age out. See
+                # docs/superpowers/specs/2026-07-10-pipeline-tracker-design.md.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS pipeline_verdicts (
+                        url TEXT PRIMARY KEY REFERENCES downloads(url),
+                        category TEXT,
+                        detail TEXT,
+                        package_uuid TEXT,
+                        excluded_uuid TEXT,
+                        plex_rating_key TEXT,
+                        checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        dismissed INTEGER DEFAULT 0
+                    )
+                ''')
+
                 # 2. Plex cache
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS plex_cache (
@@ -528,6 +545,8 @@ class DatabaseManager:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_dv_scan_layer ON dv_scan(dv_layer)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_rename_jobs_status ON rename_jobs(status)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_rename_jobs_detected ON rename_jobs(detected_at DESC)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_pipeline_verdicts_category '
+                               'ON pipeline_verdicts(category)')
 
                 # ── Column migrations (guarded by "duplicate column name") ─
                 _column_migrations = [
@@ -913,8 +932,19 @@ class DatabaseManager:
     # ── Download history ─────────────────────────────────────────────
 
     def clear_history(self):
-        """Delete all download history records."""
-        return self._mutate("DELETE FROM downloads", label="clear_history")
+        """Delete all download history records (and their pipeline verdicts)."""
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                conn.execute("DELETE FROM pipeline_verdicts")
+                conn.execute("DELETE FROM downloads")
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error("DB Error (clear_history): %s", e)
+            return False
 
     def add_to_history(self, url, title, normalized_title=None, season=None,
                        resolution=None, size=None, status="completed",
@@ -949,6 +979,110 @@ class DatabaseManager:
         ''', (url, title, normalized_title, season, resolution, size, status,
               hdr or None, 1 if dovi else 0, year, package_name, service_type),
             label="add_history")
+
+    # ── Pipeline tracker verdicts ────────────────────────────────────
+
+    def get_pipeline_verdicts(self, category=None, include_dismissed=False):
+        """Return pipeline verdicts, joined with their downloads/rename_jobs
+        display fields, most-recently-checked first."""
+        clauses = []
+        params = []
+        if not include_dismissed:
+            clauses.append("v.dismissed = 0")
+        if category:
+            clauses.append("v.category = ?")
+            params.append(category)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return self._query_dicts(f'''
+            SELECT v.url, v.category, v.detail, v.package_uuid, v.excluded_uuid,
+                   v.plex_rating_key, v.checked_at, v.dismissed,
+                   d.title, d.year, d.season, d.resolution, d.package_name
+            FROM pipeline_verdicts v
+            JOIN downloads d ON d.url = v.url
+            {where}
+            ORDER BY v.checked_at DESC
+        ''', tuple(params))
+
+    def upsert_pipeline_verdict(self, url, category, detail=None, package_uuid=None,
+                                plex_rating_key=None, dismissed=False):
+        """Insert/update a verdict for url. checked_at is always refreshed
+        explicitly — the column DEFAULT only fires on INSERT, never UPDATE."""
+        return self._mutate('''
+            INSERT INTO pipeline_verdicts (url, category, detail, package_uuid, plex_rating_key, dismissed, checked_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(url) DO UPDATE SET
+                category = excluded.category,
+                detail = excluded.detail,
+                package_uuid = excluded.package_uuid,
+                plex_rating_key = excluded.plex_rating_key,
+                dismissed = excluded.dismissed,
+                checked_at = CURRENT_TIMESTAMP
+        ''', (url, category, detail, package_uuid, plex_rating_key, 1 if dismissed else 0),
+            label="upsert_pipeline_verdict")
+
+    def dismiss_pipeline_verdict(self, url):
+        return self._mutate(
+            "UPDATE pipeline_verdicts SET dismissed = 1, checked_at = CURRENT_TIMESTAMP WHERE url = ?",
+            (url,), label="dismiss_pipeline_verdict")
+
+    def clear_pipeline_verdict(self, url):
+        """Called by regrab/grab-alternative: move any confirmed package_uuid
+        into excluded_uuid (accumulating — comma-joined, never overwritten, so
+        a second-in-a-row regrab can't un-exclude the first's stale package),
+        clear package_uuid, and reset category to NULL ('pending
+        re-evaluation' — always reconcile-eligible)."""
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                cur = conn.cursor()
+                cur.execute("SELECT package_uuid, excluded_uuid FROM pipeline_verdicts WHERE url = ?", (url,))
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO pipeline_verdicts (url, category, checked_at) "
+                        "VALUES (?, NULL, CURRENT_TIMESTAMP)", (url,))
+                    conn.commit()
+                    return True
+                pkg_uuid, excluded = row[0], row[1]
+                if pkg_uuid is None:
+                    new_excluded = excluded
+                elif excluded is None:
+                    new_excluded = pkg_uuid
+                else:
+                    new_excluded = f"{excluded},{pkg_uuid}"
+                cur.execute(
+                    "UPDATE pipeline_verdicts SET excluded_uuid = ?, package_uuid = NULL, "
+                    "category = NULL, dismissed = 0, checked_at = CURRENT_TIMESTAMP WHERE url = ?",
+                    (new_excluded, url))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error("DB Error (clear_pipeline_verdict): %s", e)
+            return False
+
+    def get_downloads_needing_reconcile(self, limit=500):
+        """Grabs eligible for the pipeline reconcile pass: have a package_name,
+        are past the 30-minute too-soon-to-judge window, and are not yet
+        dismissed/verified (terminal). Uses IS NOT (not !=) so a just-cleared
+        verdict — category IS NULL — is correctly re-included: SQL NULL != 'x'
+        is NULL/falsy, which would otherwise permanently freeze a regrab.
+        Ordered oldest-checked-first for round-robin fairness under a large
+        backlog (NULLs — never checked — sort first)."""
+        return self._query_dicts('''
+            SELECT d.url, d.title, d.year, d.season, d.resolution, d.size, d.hdr, d.dovi,
+                   d.package_name, d.service_type, d.last_grabbed_at,
+                   v.category AS verdict_category, v.dismissed AS verdict_dismissed,
+                   v.package_uuid, v.excluded_uuid
+            FROM downloads d
+            LEFT JOIN pipeline_verdicts v ON v.url = d.url
+            WHERE d.package_name IS NOT NULL
+              AND d.last_grabbed_at <= datetime('now', '-30 minutes')
+              AND (v.url IS NULL OR (v.dismissed = 0 AND v.category IS NOT 'verified'))
+            ORDER BY v.checked_at ASC
+            LIMIT ?
+        ''', (limit,))
 
     def get_downloaded_title_quality(self):
         """Per non-failed grab: (normalized_title, year, season, resolution, dovi).

@@ -999,3 +999,74 @@ class TestEdgeCases:
         db_manager.add_to_history("http://after.com", "After")
         assert db_manager.is_in_history("http://after.com")
 
+
+class TestPipelineVerdicts:
+
+    def test_pipeline_verdict_upsert_and_get(self, db_manager):
+        db_manager.add_to_history("http://p/1", "Foo", package_name="Foo [1080p]")
+        db_manager.upsert_pipeline_verdict("http://p/1", "download_failed", detail="offline",
+                                           package_uuid="111")
+        rows = db_manager.get_pipeline_verdicts()
+        assert len(rows) == 1
+        assert rows[0]["category"] == "download_failed"
+        assert rows[0]["detail"] == "offline"
+        assert rows[0]["package_uuid"] == "111"
+
+    def test_pipeline_verdict_dismiss_excluded_by_default(self, db_manager):
+        db_manager.add_to_history("http://p/2", "Foo", package_name="Foo [1080p]")
+        db_manager.upsert_pipeline_verdict("http://p/2", "rename_failed")
+        db_manager.dismiss_pipeline_verdict("http://p/2")
+        assert db_manager.get_pipeline_verdicts() == []
+        assert len(db_manager.get_pipeline_verdicts(include_dismissed=True)) == 1
+
+    def test_clear_pipeline_verdict_accumulates_excluded_uuid_not_overwrites(self, db_manager):
+        db_manager.add_to_history("http://p/3", "Foo", package_name="Foo [1080p]")
+        db_manager.upsert_pipeline_verdict("http://p/3", "download_failed", package_uuid="111")
+        db_manager.clear_pipeline_verdict("http://p/3")  # 1st regrab: excludes 111
+        db_manager.upsert_pipeline_verdict("http://p/3", "download_failed", package_uuid="222")
+        db_manager.clear_pipeline_verdict("http://p/3")  # 2nd regrab: must ALSO still exclude 111
+        conn = db_manager.get_connection()
+        row = conn.execute("SELECT excluded_uuid, category, package_uuid FROM pipeline_verdicts "
+                           "WHERE url = ?", ("http://p/3",)).fetchone()
+        assert "111" in row[0] and "222" in row[0]
+        assert row[1] is None  # category reset to NULL (pending re-evaluation)
+        assert row[2] is None  # package_uuid cleared
+
+    def test_get_downloads_needing_reconcile_excludes_verified_and_dismissed(self, db_manager):
+        db_manager.add_to_history("http://p/4", "A", package_name="A [1080p]")
+        db_manager.add_to_history("http://p/5", "B", package_name="B [1080p]")
+        db_manager.add_to_history("http://p/6", "C", package_name="C [1080p]")
+        db_manager.upsert_pipeline_verdict("http://p/4", "verified")
+        db_manager.upsert_pipeline_verdict("http://p/5", "download_failed")
+        db_manager.dismiss_pipeline_verdict("http://p/5")
+        # p/6 has no verdict yet — must be included once past the 30-min window; force
+        # last_grabbed_at back in time for this test:
+        conn = db_manager.get_connection()
+        conn.execute("UPDATE downloads SET last_grabbed_at = datetime('now', '-1 hour') "
+                     "WHERE url = 'http://p/6'")
+        conn.commit()
+        rows = db_manager.get_downloads_needing_reconcile(limit=100)
+        urls = {r["url"] for r in rows}
+        assert "http://p/4" not in urls  # verified, terminal
+        assert "http://p/5" not in urls  # dismissed
+        assert "http://p/6" in urls      # no verdict, past the 30-min window
+
+    def test_get_downloads_needing_reconcile_reincludes_null_category_after_clear(self, db_manager):
+        # N1 regression: a category=NULL row (just-cleared by regrab) must be
+        # reconcile-eligible, not silently excluded by a `!=` comparison.
+        db_manager.add_to_history("http://p/7", "D", package_name="D [1080p]")
+        conn = db_manager.get_connection()
+        conn.execute("UPDATE downloads SET last_grabbed_at = datetime('now', '-1 hour') "
+                     "WHERE url = 'http://p/7'")
+        conn.commit()
+        db_manager.upsert_pipeline_verdict("http://p/7", "download_failed")
+        db_manager.clear_pipeline_verdict("http://p/7")  # category -> NULL
+        rows = db_manager.get_downloads_needing_reconcile(limit=100)
+        assert "http://p/7" in {r["url"] for r in rows}
+
+    def test_clear_history_cascades_pipeline_verdicts(self, db_manager):
+        db_manager.add_to_history("http://p/8", "E", package_name="E [1080p]")
+        db_manager.upsert_pipeline_verdict("http://p/8", "download_failed")
+        db_manager.clear_history()
+        assert db_manager.get_pipeline_verdicts(include_dismissed=True) == []
+
