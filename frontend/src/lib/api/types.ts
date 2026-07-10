@@ -625,3 +625,57 @@ export interface RenameHealthResponse {
   failed_db_last_package: number;
   db_corruption_flag: boolean;
 }
+
+/** One row from GET /pipeline/items — a reconcile verdict joined with its
+ *  grab's display fields. `category` is null while pending re-evaluation
+ *  (regrab/grab-alternative reset it via clear_pipeline_verdict, and it
+ *  stays null until the next reconcile pass judges it). */
+export interface PipelineItem {
+  url: string;
+  category: string | null;
+  detail: string | null;
+  package_uuid: string | null;
+  excluded_uuid: string | null;
+  plex_rating_key: string | null;
+  checked_at: string;
+  dismissed: number; // 0 | 1
+  title: string | null;
+  year: number | null;
+  season: number | null;
+  resolution: string | null;
+  package_name: string | null;
+}
+
+/** GET /pipeline/counts — count of non-dismissed items per category. */
+export type PipelineCounts = Record<string, number>;
+
+/** One release from POST /pipeline/search-sources, mirroring the backend's
+ *  ParsedRelease.to_dict() (backend/sources/base.py) field-for-field. Every
+ *  key is always present in the response; only imdb_id/tmdb_id/season/
+ *  episode_number/episodes can be null (source dataclass fields default to
+ *  None). `year` defaults to 0 (never null) when a source can't parse one. */
+export interface AlternativeRelease {
+  display_title: string;
+  url: string;
+  year: number;
+  res: string;
+  size: string;
+  dovi: boolean;
+  hdr: string;
+  imdb_id: string | null;
+  tmdb_id: string | null;
+  is_tv: boolean;
+  season: number | null;
+  episode_number: number | null;
+  episodes: number | null;
+  search_key: string;
+  source: string;
+  codec: string;
+  audio: string;
+  release_group: string;
+}
+
+export interface SearchSourcesResponse {
+  releases: AlternativeRelease[];
+  errors: string[];
+}

@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, RenameHealthResponse, ConflictComparison } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -45,7 +45,7 @@ export async function fetchWithTimeout(
   }
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+async function request<T>(path: string, options?: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
   const headers = new Headers(options?.headers);
   if (options?.body !== undefined && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
@@ -54,7 +54,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     headers.set('Authorization', `Bearer ${authNonce}`);
   }
 
-  const resp = await fetchWithTimeout(`${apiBase()}${path}`, { ...options, headers }, REQUEST_TIMEOUT_MS);
+  const resp = await fetchWithTimeout(`${apiBase()}${path}`, { ...options, headers }, timeoutMs);
   if (!resp.ok) {
     if (resp.status === 401 && !path.startsWith('/auth/')) {
       unauthorizedHandler?.();
@@ -444,5 +444,47 @@ export const api = {
     request<TrashRestoreResponse>('/rename/trash/restore', {
       method: 'POST',
       body: JSON.stringify({ bucket, name })
+    }),
+
+  // Pipeline tracker
+  getPipelineItems: (category?: string, includeDismissed = false) => {
+    const qs = new URLSearchParams();
+    if (category) qs.set('category', category);
+    if (includeDismissed) qs.set('include_dismissed', 'true');
+    const suffix = qs.toString() ? `?${qs}` : '';
+    return request<PipelineItem[]>(`/pipeline/items${suffix}`);
+  },
+  getPipelineCounts: () => request<PipelineCounts>('/pipeline/counts'),
+  dismissPipelineItem: (url: string) =>
+    request<{ ok: boolean }>('/pipeline/dismiss', { method: 'POST', body: JSON.stringify({ url }) }),
+  regrabPipelineItem: (url: string) =>
+    request<{ status: string }>('/pipeline/regrab', { method: 'POST', body: JSON.stringify({ url }) }),
+  // Backend allows up to 45s for the multi-source search (asyncio.wait_for(...,
+  // timeout=45.0) in backend/api/routes/pipeline.py) — override the client's
+  // default 15s timeout so a slow-but-successful search isn't reported as a
+  // client-side timeout.
+  searchPipelineSources: (url: string) =>
+    request<SearchSourcesResponse>(
+      '/pipeline/search-sources',
+      { method: 'POST', body: JSON.stringify({ url }) },
+      50_000
+    ),
+  // The backend's AlternativeReleaseRequest model only reads these 8 fields
+  // (backend/api/routes/pipeline.py) — send just that subset rather than the
+  // full AlternativeRelease, which also carries source-only metadata
+  // (imdb_id, tmdb_id, codec, audio, search_key, ...) the endpoint ignores.
+  grabAlternative: (release: AlternativeRelease) =>
+    request<{ status: string }>('/pipeline/grab-alternative', {
+      method: 'POST',
+      body: JSON.stringify({
+        display_title: release.display_title,
+        url: release.url,
+        year: release.year,
+        res: release.res,
+        size: release.size,
+        dovi: release.dovi,
+        hdr: release.hdr,
+        season: release.season
+      })
     }),
 };
