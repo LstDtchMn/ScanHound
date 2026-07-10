@@ -747,7 +747,9 @@ class RenameService:
         source + existing destination). Reuses dv_detect + the dv_scan cache.
         Intended to run on a background thread (see the route)."""
         db = self._db
-        job = db.get_rename_job(job_id) if db else None
+        if db is None:
+            return {"error": "Database unavailable", "scanned": 0}
+        job = db.get_rename_job(job_id)
         if not job:
             return {"error": "Job not found", "scanned": 0}
         if not _dv.available():
@@ -760,18 +762,32 @@ class RenameService:
                  if p and os.path.isfile(p)]
         scanned = 0
         for path in paths:
+            # Skip-check is itself fail-safe: a stat error just means "scan it"
+            # (mirrors scan_folder_dv).
             try:
                 st = os.stat(path)
                 if db.dv_scan_is_current(path, st.st_mtime, st.st_size):
                     continue
+            except OSError:
+                st = None
+            # Detect + record. Any failure is recorded as 'unknown' (with a
+            # null signature so a later run retries it) rather than dropped —
+            # so a bad file never silently vanishes from the inventory.
+            try:
                 layer = _dv.detect_layer(path).get("layer", _dv.LAYER_UNKNOWN)
                 title = parse_filename(os.path.basename(path)).get("title") or None
                 db.upsert_dv_scan(path, layer, title=title,
-                                  sig_mtime=st.st_mtime, sig_size=st.st_size,
+                                  sig_mtime=(st.st_mtime if st else None),
+                                  sig_size=(st.st_size if st else None),
                                   source="scan")
-                scanned += 1
             except Exception:
                 logger.exception("scan_conflict_dv failed on %s", path)
+                try:
+                    db.upsert_dv_scan(path, _dv.LAYER_UNKNOWN, sig_mtime=None,
+                                      sig_size=None, source="scan")
+                except Exception:
+                    logger.exception("scan_conflict_dv: could not record failure for %s", path)
+            scanned += 1
         return {"job_id": job_id, "scanned": scanned}
 
     def reidentify(self, job_id: int) -> dict:

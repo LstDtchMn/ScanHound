@@ -280,13 +280,18 @@ def scan_dv_conflict(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
     """On-demand Dolby Vision FEL/MEL scan of a conflict's two files (incoming
     source + existing destination). Slow (an RPU walk per file), so it runs in
     the background and broadcasts the result over the WebSocket — mirrors
-    dv-scan-folder's fire-and-forget pattern, scoped to one job's two files."""
+    dv-scan-folder's fire-and-forget pattern, scoped to one job's two files.
+
+    Broadcasts its own ``dv:conflict_scan_done`` event rather than reusing
+    dv-scan-folder's ``dv:scan_done`` — that event is already bound to the
+    full-library DV-scan panel's state on the frontend, and reusing it here
+    would corrupt that panel's progress/result state."""
     svc = _service(reg)
 
     def _run():
         try:
             result = svc.scan_conflict_dv(job_id)
-            ws_manager.broadcast_sync({"type": "dv:scan_done", "data": result})
+            ws_manager.broadcast_sync({"type": "dv:conflict_scan_done", "data": result})
         except Exception:
             logger.exception("scan-dv-conflict failed")
 

@@ -118,3 +118,23 @@ class TestScanConflictDv:
             second = svc.scan_conflict_dv(jid)
         assert first["scanned"] == 2
         assert second["scanned"] == 0
+
+    def test_failed_detect_recorded_as_unknown(self, svc, db, tmp_path):
+        # Mirrors test_rename_service.py::TestDvFolderScan::
+        # test_every_file_accounted_including_failures — a detect_layer failure
+        # on one of the two files must still be recorded (as 'unknown'), not
+        # silently dropped, so the file stays visible in the inventory.
+        jid, src_path, dst_path = _conflict_job(db, tmp_path)
+
+        def fake_detect(path):
+            if path == src_path:
+                return {"layer": "fel", "tool": True, "error": None}
+            raise OSError("boom")  # destination file fails detection
+
+        with patch("backend.rename.dv_detect.available", return_value=True), \
+             patch("backend.rename.dv_detect.detect_layer", side_effect=fake_detect):
+            out = svc.scan_conflict_dv(jid)
+
+        assert out["scanned"] == 2  # both files accounted for, none dropped
+        assert db.get_dv_scan(src_path)["dv_layer"] == "fel"
+        assert db.get_dv_scan(dst_path)["dv_layer"] == "unknown"
