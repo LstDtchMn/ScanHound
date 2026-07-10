@@ -1855,15 +1855,6 @@ class TestPipelineSearch:
     def test_search_sources_returns_partial_results_on_one_source_failure(self, client, db_manager, monkeypatch):
         db_manager.add_to_history("http://ps/1", "Foo", package_name="Foo [1080p]")
 
-        class FakeSource:
-            name = "fakegood"
-            class config:
-                requires_auth = False
-        class FakeBadSource:
-            name = "fakebad"
-            class config:
-                requires_auth = False
-
         async def fake_search_all(self, query, mode="all", **kw):
             from backend.sources.base import PageResult, ParsedRelease
             return {
@@ -1876,6 +1867,82 @@ class TestPipelineSearch:
         body = resp.json()
         assert len(body["releases"]) == 1
         assert any("boom" in e for e in body["errors"])
+
+    def test_search_sources_excludes_requires_auth_source(self, client, db_manager, monkeypatch):
+        """Regression test for the requires_auth exclusion in search_sources
+        (backend/api/routes/pipeline.py, inside search_sources: the
+        `if source_cfg is not None and getattr(source_cfg, "requires_auth", False): continue`
+        branch). The prior test in this class never actually drove that branch:
+        its fake source names didn't match anything real SourceRegistry.get_enabled_sources()
+        returns, so the `next(...)` lookup always fell through to None and the
+        `continue` was never taken.
+
+        Here we monkeypatch SourceRegistry.get_enabled_sources itself (the
+        endpoint constructs its own `SourceRegistry()` instance per pipeline.py:99,
+        so class-level monkeypatching is the correct seam — it applies to any
+        instance via the descriptor protocol) to return two *real* SourceBase
+        instances built from actual SourceConfig/PageResult/ParsedRelease
+        dataclasses — one with requires_auth=True (standing in for adithd), one
+        with requires_auth=False — and monkeypatch search_all to return results
+        for both. This exercises the endpoint's real filtering code for real:
+        if the `continue` were deleted or the condition inverted, the auth
+        source's release would leak into the response and this test would fail.
+        """
+        from backend.sources.base import SourceBase, SourceConfig, PageResult, ParsedRelease
+
+        db_manager.add_to_history("http://ps/2", "Bar", package_name="Bar [1080p]")
+
+        class FakeAuthSource(SourceBase):
+            @classmethod
+            def get_config(cls):
+                return SourceConfig(name="authsource", display_name="Auth Source",
+                                     base_url="http://auth.example", requires_auth=True)
+
+            async def fetch_page(self, page=1, mode="movies", **kwargs):
+                return PageResult(releases=[])
+
+            def parse_release(self, raw_data):
+                return None
+
+        class FakeOpenSource(SourceBase):
+            @classmethod
+            def get_config(cls):
+                return SourceConfig(name="opensource", display_name="Open Source",
+                                     base_url="http://open.example", requires_auth=False)
+
+            async def fetch_page(self, page=1, mode="movies", **kwargs):
+                return PageResult(releases=[])
+
+            def parse_release(self, raw_data):
+                return None
+
+        auth_source = FakeAuthSource()
+        open_source = FakeOpenSource()
+
+        def fake_get_enabled_sources(self):
+            return [auth_source, open_source]
+
+        async def fake_search_all(self, query, mode="all", **kw):
+            return {
+                "authsource": PageResult(releases=[
+                    ParsedRelease(title="Bar AUTH", url="http://alt/auth", source="authsource")
+                ]),
+                "opensource": PageResult(releases=[
+                    ParsedRelease(title="Bar OPEN", url="http://alt/open", source="opensource")
+                ]),
+            }
+
+        monkeypatch.setattr("backend.sources.registry.SourceRegistry.get_enabled_sources",
+                             fake_get_enabled_sources)
+        monkeypatch.setattr("backend.sources.registry.SourceRegistry.search_all", fake_search_all)
+
+        resp = client.post("/pipeline/search-sources", json={"url": "http://ps/2"})
+        assert resp.status_code == 200
+        body = resp.json()
+        urls = [r["url"] for r in body["releases"]]
+        assert "http://alt/open" in urls  # requires_auth=False source is surfaced
+        assert "http://alt/auth" not in urls  # requires_auth=True source is excluded
+        assert len(body["releases"]) == 1
 
     def test_grab_alternative_maps_parsed_release_to_force_grab(self, client, db_manager, monkeypatch):
         calls = {}
