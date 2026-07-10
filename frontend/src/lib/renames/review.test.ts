@@ -21,6 +21,7 @@ describe('classifyJob', () => {
   it('failed → needsReview', () => expect(classifyJob(job({ status: 'failed' }))).toBe('needsReview'));
   it('applied → inactive', () => expect(classifyJob(job({ status: 'applied' }))).toBe('inactive'));
   it('pending → inactive', () => expect(classifyJob(job({ status: 'pending' }))).toBe('inactive'));
+  it('applying → inactive', () => expect(classifyJob(job({ status: 'applying' }))).toBe('inactive'));
 });
 
 describe('partitionJobs', () => {

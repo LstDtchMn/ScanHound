@@ -4,7 +4,10 @@ export type ReviewBucket = 'ready' | 'needsReview' | 'inactive';
 
 export function classifyJob(job: RenameJob): ReviewBucket {
   const status = job.status;
-  if (status === 'applied' || status === 'reverted' || status === 'pending') return 'inactive';
+  // 'applying' is the transient state while a queued apply/overwrite is still
+  // moving the file — treat it as inactive so the deck auto-advances instead
+  // of leaving a stuck card with live buttons and inflating the review count.
+  if (status === 'applied' || status === 'reverted' || status === 'pending' || status === 'applying') return 'inactive';
   const conf = job.match_confidence ?? 0;
   const clean = status === 'matched' && conf >= 100 && !job.warning_message && !job.destination_conflict;
   return clean ? 'ready' : 'needsReview';
