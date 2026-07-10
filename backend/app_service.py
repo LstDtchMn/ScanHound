@@ -591,6 +591,16 @@ class AppService:
         except Exception:
             logger.exception("Periodic WAL checkpoint failed (non-fatal)")
 
+        try:
+            if self.db is not None and self.config.get("pipeline_reconcile_enabled", True):
+                from backend.pipeline_service import reconcile_batch
+                jd_method = self.config.get("jd_method", "folder")
+                n = reconcile_batch(self.db, jd_method=jd_method)
+                if n:
+                    logger.info("Pipeline reconcile: checked %d grab(s)", n)
+        except Exception:
+            logger.exception("Pipeline reconcile failed (non-fatal)")
+
     def _start_maintenance_loop(self, interval_seconds: float = 3600.0):
         """Start the hourly trash-sweep + WAL-checkpoint background thread."""
         if self._maintenance_thread and self._maintenance_thread.is_alive():
