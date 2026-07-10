@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch, call, mock_open
 
 import pytest
 
-from backend.download_service import DownloadService
+from backend.download_service import DownloadService, compute_package_name
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -48,6 +48,26 @@ def download_service(db_manager):
     (see tests/conftest.py) rather than a MagicMock — for tests that need
     genuine adopt-or-insert / delete-by-id database behavior."""
     return _make_service(db=db_manager)
+
+
+class TestComputePackageName:
+    def test_compute_package_name_title_year_resolution(self):
+        assert compute_package_name("The Matrix", 1999, "1080p") == "The Matrix (1999) [1080p]"
+
+    def test_compute_package_name_no_year(self):
+        assert compute_package_name("Some Show S01", None, "1080p") == "Some Show S01 [1080p]"
+
+    def test_compute_package_name_no_resolution(self):
+        assert compute_package_name("The Matrix", 1999, "") == "The Matrix (1999)"
+
+    def test_compute_package_name_empty_title_falls_back(self):
+        assert compute_package_name("", 1999, "1080p") == "ScanHound Download"
+
+    def test_compute_package_name_truncates_at_50(self):
+        long_title = "The Lord of the Rings: The Return of the King"
+        name = compute_package_name(long_title, 2003, "2160p")
+        assert len(name) <= 50
+        assert name == f"{long_title} (2003) [2160p]"[:50]
 
 
 class TestDownloadFolderRouting:

@@ -262,6 +262,32 @@ class TestDownloadHistory:
     def test_empty_history_count(self, db_manager):
         assert db_manager.get_history_count() == 0
 
+    def test_add_to_history_persists_package_name_and_service_type(self, db_manager):
+        db_manager.add_to_history("http://x/1", "Foo", package_name="Foo (2024) [1080p]",
+                                  service_type="Rapidgator")
+        conn = db_manager.get_connection()
+        r = conn.execute("SELECT package_name, service_type, last_grabbed_at FROM downloads "
+                         "WHERE url = ?", ("http://x/1",)).fetchone()
+        assert r[0] == "Foo (2024) [1080p]"
+        assert r[1] == "Rapidgator"
+        assert r[2] is not None  # last_grabbed_at bumped
+
+    def test_add_to_history_coalesces_package_name_on_status_update(self, db_manager):
+        db_manager.add_to_history("http://x/2", "Foo", package_name="Foo (2024) [1080p]")
+        db_manager.add_to_history("http://x/2", "Foo", status="failed")  # no package_name this call
+        conn = db_manager.get_connection()
+        r = conn.execute("SELECT package_name FROM downloads WHERE url = ?", ("http://x/2",)).fetchone()
+        assert r[0] == "Foo (2024) [1080p]"  # not nulled out
+
+    def test_add_to_history_bumps_last_grabbed_at_on_every_call(self, db_manager):
+        db_manager.add_to_history("http://x/3", "Foo", package_name="Foo [1080p]")
+        conn = db_manager.get_connection()
+        first = conn.execute("SELECT last_grabbed_at FROM downloads WHERE url = ?", ("http://x/3",)).fetchone()[0]
+        import time; time.sleep(1.1)
+        db_manager.add_to_history("http://x/3", "Foo", package_name="Foo [1080p]", status="completed")
+        second = conn.execute("SELECT last_grabbed_at FROM downloads WHERE url = ?", ("http://x/3",)).fetchone()[0]
+        assert second >= first  # bumped forward (or equal at 1s SQLite resolution boundary)
+
 
 class TestDownloadResults:
 

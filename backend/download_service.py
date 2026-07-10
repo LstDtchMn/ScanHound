@@ -22,6 +22,21 @@ from backend.sources.ddlbase import decode_ddlbase_link
 
 logger = logging.getLogger(__name__)
 
+
+def compute_package_name(title: str, year: Optional[int], resolution: str) -> str:
+    """Canonical JDownloader package-name string — the join key used by the
+    pipeline tracker across downloads/download_results/rename_jobs. Must match
+    send_to_jdownloader's truncation exactly (both its delivery paths truncate
+    to 50 chars before JD ever sees the name) — this is the single place that
+    string is computed, so the persisted value and the sent value can never
+    drift apart."""
+    if not title:
+        return "ScanHound Download"[:50]
+    name = f"{title} ({year})" if year else title
+    package_name = f"{name} [{resolution}]" if resolution else name
+    return package_name[:50]
+
+
 # Lazy imports for optional heavy dependencies
 _uc = None
 _By = None
@@ -204,14 +219,22 @@ class DownloadService:
     def save_to_history(self, url: str, title: str, season: Optional[int],
                         resolution: str, size: str, status: str = "completed",
                         hdr: str = "", dovi: bool = False,
-                        year: Optional[int] = None):
+                        year: Optional[int] = None,
+                        package_name: Optional[str] = None,
+                        service_type: Optional[str] = None):
         """Save a downloaded item to history."""
         try:
             normalized = normalize_title(title)
+            extra = {}
+            if package_name is not None:
+                extra["package_name"] = package_name
+            if service_type is not None:
+                extra["service_type"] = service_type
             self.db.add_to_history(
                 url=url, title=title, normalized_title=normalized,
                 season=season, resolution=resolution, size=size,
                 status=status, hdr=hdr or None, dovi=dovi, year=year,
+                **extra,
             )
             with self._history_lock:
                 self.download_history.add(url)
@@ -1973,11 +1996,7 @@ class DownloadService:
         # Step 2: Try JDownloader first
         jd_folder = self.config.get("jd_folder", "")
         jd_method = self.config.get("jd_method", "folder")
-        if title:
-            name = f"{title} ({year})" if year else title
-            package_name = f"{name} [{resolution}]" if resolution else name
-        else:
-            package_name = "ScanHound Download"
+        package_name = compute_package_name(title, year, resolution)
 
         # Per-type download folder: TV (has a season) vs movies, when
         # configured. 4K movies get their OWN folder when set, so they can be
@@ -1999,7 +2018,8 @@ class DownloadService:
                 result["message"] = f"Sent {len(links)} links to JDownloader"
                 result["history_saved"] = self.save_to_history(
                     url, title, season, resolution, size, status="completed",
-                    hdr=hdr, dovi=dovi, year=year
+                    hdr=hdr, dovi=dovi, year=year,
+                    package_name=package_name, service_type=service_type
                 )
                 self._log(
                     f"[Download] {title}: delivered to JDownloader "
@@ -2019,7 +2039,8 @@ class DownloadService:
             result["message"] = f"Copied {len(links)} links to clipboard"
             result["history_saved"] = self.save_to_history(
                 url, title, season, resolution, size, status="clipboard",
-                hdr=hdr, dovi=dovi, year=year
+                hdr=hdr, dovi=dovi, year=year,
+                package_name=package_name, service_type=service_type
             )
             self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
             return result
@@ -2033,7 +2054,8 @@ class DownloadService:
             result["message"] = "Opened URL in browser"
             result["history_saved"] = self.save_to_history(
                 url, title, season, resolution, size, status="browser",
-                hdr=hdr, dovi=dovi, year=year
+                hdr=hdr, dovi=dovi, year=year,
+                package_name=package_name, service_type=service_type
             )
             self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
             return result
@@ -2046,7 +2068,8 @@ class DownloadService:
         self._log(f"[Download] {title}: {result['message']}", "warning")
         try:
             self.save_to_history(url, title, season, resolution, size,
-                                 status="failed", hdr=hdr, dovi=dovi, year=year)
+                                 status="failed", hdr=hdr, dovi=dovi, year=year,
+                                 package_name=package_name, service_type=service_type)
         except Exception:
             pass
         self._progress("download:failed", {"title": title, "url": url, "message": result["message"]}, _cb=_cb)

@@ -555,6 +555,14 @@ class DatabaseManager:
                     # for send-time duplicate protection + the read-time overlay,
                     # so a 2021 remake never blocks/marks the 1984 original.
                     'ALTER TABLE downloads ADD COLUMN year INTEGER',
+                    # Pipeline tracker join key + bookkeeping — the canonical
+                    # JDownloader package-name string (see compute_package_name
+                    # in download_service.py), the timestamp of the most recent
+                    # grab attempt (bumped on every add_to_history call, success
+                    # or not), and the source host used for that attempt.
+                    'ALTER TABLE downloads ADD COLUMN package_name TEXT',
+                    'ALTER TABLE downloads ADD COLUMN last_grabbed_at TIMESTAMP',
+                    'ALTER TABLE downloads ADD COLUMN service_type TEXT',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -910,14 +918,21 @@ class DatabaseManager:
 
     def add_to_history(self, url, title, normalized_title=None, season=None,
                        resolution=None, size=None, status="completed",
-                       hdr=None, dovi=False, year=None):
+                       hdr=None, dovi=False, year=None, package_name=None,
+                       service_type=None):
         """Record a downloaded URL with optional metadata for title-based matching.
 
         Uses ON CONFLICT to preserve the original date_added when re-downloading.
+        ``package_name``/``service_type`` are COALESCEd so a later status-only
+        update never nulls out an already-known value. ``last_grabbed_at`` is
+        bumped unconditionally on every call — every call that reaches this
+        method (success, clipboard, browser, failed-send) is a genuine new
+        attempt, and this is what the pipeline reconcile's matching window
+        keys off for a regrab.
         """
         return self._mutate('''
-            INSERT INTO downloads (url, title, normalized_title, season, resolution, size, status, hdr, dovi, year)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO downloads (url, title, normalized_title, season, resolution, size, status, hdr, dovi, year, package_name, service_type, last_grabbed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 normalized_title = excluded.normalized_title,
@@ -927,9 +942,12 @@ class DatabaseManager:
                 status = excluded.status,
                 hdr = excluded.hdr,
                 dovi = excluded.dovi,
-                year = COALESCE(excluded.year, downloads.year)
+                year = COALESCE(excluded.year, downloads.year),
+                package_name = COALESCE(excluded.package_name, downloads.package_name),
+                service_type = COALESCE(excluded.service_type, downloads.service_type),
+                last_grabbed_at = CURRENT_TIMESTAMP
         ''', (url, title, normalized_title, season, resolution, size, status,
-              hdr or None, 1 if dovi else 0, year),
+              hdr or None, 1 if dovi else 0, year, package_name, service_type),
             label="add_history")
 
     def get_downloaded_title_quality(self):
