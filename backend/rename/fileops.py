@@ -213,6 +213,20 @@ def _trash_root_for(path: str) -> str:
         return _TRASH_ROOT
 
 
+def trash_roots(path: str) -> list:
+    """Trash roots worth checking for a file trashed FROM ``path``'s volume.
+
+    ``_trash(path)`` sites its bucket on ``path``'s own volume (see
+    :func:`_trash_root_for`), falling back to the app-data ``_TRASH_ROOT``
+    only if that volume's trash root couldn't be created. Callers looking
+    for an entry previously trashed from ``path`` (e.g. undo restoring an
+    overwrite-displaced original) need to check both — this is the small,
+    single-path counterpart to :func:`all_trash_roots`, which sweeps every
+    known drive instead of just the one relevant to ``path``.
+    """
+    return [_trash_root_for(path), _TRASH_ROOT]
+
+
 def _trash(path: str) -> str:
     """Move ``path`` into ``<source volume>/.scanhound-trash/<YYYYMMDD-HHMMSS>/<name>``.
 

@@ -96,6 +96,29 @@ class TestOverwrite:
         assert os.path.isfile(trashed_file)
         assert open(trashed_file, "rb").read() == b"OLD"
 
+    def test_undo_of_overwrite_restores_original(self, db, tmp_path, monkeypatch):
+        """undo() of an overwrite-applied job must be symmetric: it frees
+        dst (moving the placed NEW file back to src) AND restores the OLD
+        file that the overwrite displaced into trash — never stranding it
+        there."""
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+
+        svc = _service(db)
+        jid, src, existing = _make_conflict(db, tmp_path)
+
+        svc.apply(jid, conflict_strategy="overwrite")
+        assert open(existing, "rb").read() == b"NEW"
+
+        out = svc.undo(jid)
+
+        assert out["ok"] is True
+        assert open(existing, "rb").read() == b"OLD"  # original restored from trash
+        assert os.path.exists(str(src))  # placed file moved back to src
+        assert db.get_rename_job(jid)["status"] == "reverted"
+        # Trash bucket is empty again (nothing left stranded).
+        assert fileops.list_trash_entries([str(trash_root)]) == []
+
     def test_overwrite_same_inode_reapply_is_noop_not_trashed(self, db, tmp_path, monkeypatch):
         """Re-applying a job whose src/dst are already the same file (e.g. a
         prior hardlink apply) must be treated as a no-op success — never

@@ -1353,6 +1353,22 @@ class RenameService:
             _fileops.undo_place(src, dst, job.get("move_method") or "move")
         except Exception as e:
             return {"ok": False, "error": str(e)}
+        # After undo_place removes the placed file, dst is free — if this apply
+        # overwrote a prior file (captured in trash), restore it so undo is
+        # symmetric and no data is stranded. Best-effort: a normal undo (no
+        # overwrite ever happened) simply finds no matching trash entry.
+        try:
+            dst_key = os.path.normcase(os.path.abspath(dst))
+            roots = _fileops.trash_roots(dst)
+            cands = [e for e in _fileops.list_trash_entries(roots)
+                     if e.get("original_path")
+                     and os.path.normcase(os.path.abspath(e["original_path"])) == dst_key
+                     and e.get("restorable")]
+            cands.sort(key=lambda e: e.get("trashed_at") or "", reverse=True)
+            if cands:
+                _fileops.restore_trash_entry(cands[0]["bucket"], cands[0]["name"], roots)
+        except Exception:
+            logger.exception("undo: overwrite-original restore best-effort failed")
         db.update_rename_job(job_id, status="reverted", reverted_at=_now())
         self._broadcast(job_id)
         return {"ok": True}
