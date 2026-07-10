@@ -7,6 +7,19 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.24.0",
+    date: "2026-07-09",
+    summary: "Mobile Renames: one-at-a-time review + real conflict resolution",
+    changes: [
+      "The Renames screen on your phone is now a focused review instead of a cramped list: a summary shows how many matches are ready (100% confident) vs. how many need a look, 'Apply all' clears the confident ones in a tap, and 'Review' opens a full-screen deck that walks you through the uncertain ones one at a time — with the match percentage, the reason, and the full before → after name finally readable.",
+      "Swipe or tap through the deck; applying, skipping, or removing an item advances automatically. A scope toggle switches between reviewing only the under-100% items or all of them.",
+      "'A file already exists' is now resolvable, not just a warning. The card compares the existing file and the incoming one side by side — resolution, HDR/Dolby Vision, video and audio codecs, bitrate, size, duration — recommends which to keep (judged on the files' actual specs, so it won't tell you to overwrite a 2160p DV remux with a tag-heavy 1080p), and offers Overwrite, Keep both, or Skip.",
+      "Overwrite is safe: the file it replaces is moved to the recoverable Trash (never deleted), and Undo restores it.",
+      "When a Dolby Vision file's FEL vs MEL layer isn't known yet, a 'Scan DV layers' button detects it in the background and fills it into the comparison.",
+      "The desktop Renames page is unchanged.",
+    ],
+  },
+  {
     version: "2.23.2",
     date: "2026-07-09",
     summary: "Fix: bottom navigation was unreachable on phones",
