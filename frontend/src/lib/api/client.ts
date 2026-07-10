@@ -473,7 +473,11 @@ export const api = {
   // (backend/api/routes/pipeline.py) — send just that subset rather than the
   // full AlternativeRelease, which also carries source-only metadata
   // (imdb_id, tmdb_id, codec, audio, search_key, ...) the endpoint ignores.
-  grabAlternative: (release: AlternativeRelease) =>
+  // originalUrl is a separate param (not a field on AlternativeRelease,
+  // which models a search result and has no notion of "the grab this
+  // alternative is replacing") — when present, the backend dismisses the
+  // original grab's pipeline verdict once the alternative starts grabbing.
+  grabAlternative: (release: AlternativeRelease, originalUrl?: string) =>
     request<{ status: string }>('/pipeline/grab-alternative', {
       method: 'POST',
       body: JSON.stringify({
@@ -484,7 +488,8 @@ export const api = {
         size: release.size,
         dovi: release.dovi,
         hdr: release.hdr,
-        season: release.season
+        season: release.season,
+        original_url: originalUrl
       })
     }),
 };

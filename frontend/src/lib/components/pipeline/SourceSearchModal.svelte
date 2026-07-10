@@ -29,7 +29,7 @@
     if (grabbing) return;
     grabbing = rel.url;
     try {
-      await api.grabAlternative(rel);
+      await api.grabAlternative(rel, url);
       addToast('Grabbing', rel.display_title);
       onClose();
     } catch (e) {

@@ -130,6 +130,14 @@ class AlternativeReleaseRequest(BaseModel):
     dovi: bool = False
     hdr: str = ""
     season: Optional[int] = None
+    # URL of the original failed/stalled grab this alternative replaces, if
+    # any (the pipeline tracker's "Search sources" flow always supplies it;
+    # left optional for any future caller that grabs an alternative without
+    # an original grab to resolve). When present, its pipeline verdict is
+    # dismissed once the alternative grab is backgrounded — see the
+    # dismiss vs. clear distinction on dismiss_pipeline_verdict/
+    # clear_pipeline_verdict in backend/database.py.
+    original_url: Optional[str] = None
 
 
 @router.post("/grab-alternative")
@@ -143,4 +151,21 @@ def grab_alternative(req: AlternativeReleaseRequest, background_tasks: Backgroun
         resolution=req.res, size=req.size, hdr=req.hdr, dovi=req.dovi,
     )
     background_tasks.add_task(_run_grab, dl, reg, dl_req, True)
+    if req.original_url and reg.db:
+        # Dismiss (not clear) the original's verdict: the user has resolved
+        # the situation by grabbing a different release entirely, so the
+        # original grab attempt is done — not "pending re-evaluation" (which
+        # clear_pipeline_verdict would set it to, risking miscategorization
+        # of any partial evidence the original left behind). Swallow errors
+        # here (rather than letting them propagate) because add_task above
+        # already queued the real grab: an unhandled exception past this
+        # point would make FastAPI return an error response instead of the
+        # normal one, and background tasks only run when the response they
+        # were attached to actually gets sent — so a dismiss failure would
+        # silently cancel the grab we just backgrounded, not just the dismiss.
+        try:
+            reg.db.dismiss_pipeline_verdict(req.original_url)
+        except Exception:
+            logger.exception("grab-alternative: failed to dismiss original verdict for %s",
+                             req.original_url)
     return {"status": "started"}

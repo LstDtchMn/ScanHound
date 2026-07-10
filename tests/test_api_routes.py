@@ -1965,3 +1965,63 @@ class TestPipelineSearch:
         req = calls["args"][2]
         assert req.url == "http://alt/2" and req.resolution == "1080p"
         assert calls["args"][3] is True
+
+    def test_grab_alternative_dismisses_original_verdict_when_provided(self, client, db_manager, monkeypatch):
+        """Regression test for the post-review fix: grab-alternative must
+        resolve the ORIGINAL failed/stalled item's verdict once the user
+        grabs a different release for it, or the original stays stuck in
+        the failure list forever (re-derived as download_failed on every
+        reconcile pass). Verifies against real DB state (not a mock
+        assertion) that dismiss_pipeline_verdict actually ran against
+        req.original_url — dismissed=1, not cleared to category=NULL
+        (clear_pipeline_verdict would be the wrong call here; see the
+        docstring on clear_pipeline_verdict in backend/database.py)."""
+        db_manager.add_to_history("http://orig/1", "Foo", package_name="Foo [1080p]")
+        db_manager.upsert_pipeline_verdict("http://orig/1", "download_failed", package_uuid="999")
+
+        def fake_add_task(self, fn, *a, **kw):
+            pass  # same descriptor-protocol note as the test above
+        monkeypatch.setattr("fastapi.BackgroundTasks.add_task", fake_add_task)
+
+        resp = client.post("/pipeline/grab-alternative", json={
+            "display_title": "Foo", "url": "http://alt/3", "year": 2024,
+            "res": "1080p", "size": "5 GB", "dovi": False, "hdr": "",
+            "season": None, "original_url": "http://orig/1",
+        })
+        assert resp.status_code == 200
+
+        conn = db_manager.get_connection()
+        row = conn.execute(
+            "SELECT category, dismissed FROM pipeline_verdicts WHERE url = ?",
+            ("http://orig/1",)).fetchone()
+        assert row[1] == 1  # dismissed, not just re-flagged
+        assert row[0] == "download_failed"  # category untouched — NOT cleared to NULL
+        # Default get_pipeline_verdicts() excludes dismissed rows.
+        assert all(v["url"] != "http://orig/1" for v in db_manager.get_pipeline_verdicts())
+
+    def test_grab_alternative_without_original_url_touches_no_verdict(self, client, db_manager, monkeypatch):
+        """Backward-compat: original_url is optional (a hypothetical future
+        caller may grab an alternative with no original grab to resolve).
+        Omitting it must not error and must not touch any existing verdict —
+        proving the dismiss call is properly gated on req.original_url being
+        present, not unconditionally firing against some default/empty url."""
+        db_manager.add_to_history("http://orig/2", "Bar", package_name="Bar [1080p]")
+        db_manager.upsert_pipeline_verdict("http://orig/2", "not_in_plex")
+
+        def fake_add_task(self, fn, *a, **kw):
+            pass
+        monkeypatch.setattr("fastapi.BackgroundTasks.add_task", fake_add_task)
+
+        resp = client.post("/pipeline/grab-alternative", json={
+            "display_title": "Bar", "url": "http://alt/4", "year": 2024,
+            "res": "1080p", "size": "5 GB", "dovi": False, "hdr": "",
+            "season": None,
+        })
+        assert resp.status_code == 200
+
+        conn = db_manager.get_connection()
+        row = conn.execute(
+            "SELECT category, dismissed FROM pipeline_verdicts WHERE url = ?",
+            ("http://orig/2",)).fetchone()
+        assert row[0] == "not_in_plex"  # unchanged
+        assert row[1] == 0  # not dismissed

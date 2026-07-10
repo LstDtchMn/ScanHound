@@ -1026,11 +1026,29 @@ class DatabaseManager:
             (url,), label="dismiss_pipeline_verdict")
 
     def clear_pipeline_verdict(self, url):
-        """Called by regrab/grab-alternative: move any confirmed package_uuid
-        into excluded_uuid (accumulating — comma-joined, never overwritten, so
-        a second-in-a-row regrab can't un-exclude the first's stale package),
+        """Called by regrab only (grab-alternative does NOT call this — see
+        below): move any confirmed package_uuid into excluded_uuid
+        (accumulating — comma-joined, never overwritten, so a
+        second-in-a-row regrab can't un-exclude the first's stale package),
         clear package_uuid, and reset category to NULL ('pending
-        re-evaluation' — always reconcile-eligible)."""
+        re-evaluation' — always reconcile-eligible).
+
+        This is correct for regrab because it's re-grabbing the *same* url:
+        the existing verdict's evidence should be re-evaluated against the
+        new package once it lands.
+
+        grab-alternative is different: it grabs a *different* url, and the
+        original url's verdict needs to be resolved separately. Clearing it
+        (this method) would be wrong there — resetting to NULL leaves it
+        'pending re-evaluation', so the reconcile pass could re-examine the
+        original's own (unrelated) download_results/rename_jobs evidence and
+        miscategorize it, e.g. as never_started if the original's package
+        never got a download_results row past its failure point. Since the
+        user has explicitly moved on by grabbing a different release, the
+        original grab is simply done, not pending — so grab-alternative
+        instead calls dismiss_pipeline_verdict(original_url) on the original
+        url once the alternative grab is backgrounded (see grab_alternative
+        in backend/api/routes/pipeline.py)."""
         try:
             with self._lock:
                 conn = self.get_connection()
