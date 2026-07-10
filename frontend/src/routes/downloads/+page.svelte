@@ -1,7 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { page } from '$app/stores';
+  import { goto } from '$app/navigation';
   import { api } from '$lib/api/client';
   import MobileDownloadsView from '$lib/components/mobile/MobileDownloadsView.svelte';
+  import PipelineList from '$lib/components/pipeline/PipelineList.svelte';
   import { mobile } from '$lib/stores/media';
   import Badge from '$lib/components/Badge.svelte';
   import Skeleton from '$lib/components/Skeleton.svelte';
@@ -345,6 +348,15 @@
     desktopTeardown = () => { clearInterval(id); offState(); offResults(); };
   }
 
+  // Mobile-only Queue/Pipeline segmented switch. Driven by a `?view=pipeline`
+  // query param (not a separate route) so MobileTabBar's exact-pathname
+  // active-tab highlighting (`$page.url.pathname === '/downloads'`) stays
+  // correct in both states — see MobileTabBar.svelte.
+  let mobileView = $derived($page.url.searchParams.get('view') === 'pipeline' ? 'pipeline' : 'queue');
+  function setMobileView(v: 'queue' | 'pipeline') {
+    goto(v === 'pipeline' ? '/downloads?view=pipeline' : '/downloads', { replaceState: true, noScroll: true, keepFocus: true });
+  }
+
   onMount(() => {
     // `mobile` is a live matchMedia store — subscribing (fires immediately with
     // the current value) means a window resized ACROSS the md breakpoint (a
@@ -357,7 +369,21 @@
 </script>
 
 {#if $mobile}
-  <MobileDownloadsView />
+  <div class="flex flex-col h-full min-h-0">
+    <div class="flex gap-1 p-2 shrink-0 border-b border-[var(--border)]">
+      <button class="flex-1 py-1.5 rounded-lg text-sm {mobileView === 'queue' ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-tertiary)]'}"
+        onclick={() => setMobileView('queue')}>Queue</button>
+      <button class="flex-1 py-1.5 rounded-lg text-sm {mobileView === 'pipeline' ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-tertiary)]'}"
+        onclick={() => setMobileView('pipeline')}>Pipeline</button>
+    </div>
+    <div class="flex-1 min-h-0 flex flex-col">
+      {#if mobileView === 'pipeline'}
+        <PipelineList />
+      {:else}
+        <MobileDownloadsView />
+      {/if}
+    </div>
+  </div>
 {:else}
 <div class="p-4 border-b border-[var(--border)]">
   <div class="flex items-center gap-3 flex-wrap">
