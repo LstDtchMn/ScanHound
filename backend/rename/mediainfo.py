@@ -14,40 +14,37 @@ import shutil
 import subprocess
 from typing import Optional
 
-_RES_LADDER = ((2160, "2160p"), (1440, "1440p"), (1080, "1080p"),
-               (720, "720p"), (480, "480p"), (0, None))
 _CODEC_LABEL = {"hevc": "HEVC", "h265": "HEVC", "avc": "H.264", "h264": "H.264",
                 "av1": "AV1", "vc1": "VC-1", "mpeg2video": "MPEG-2"}
 _AUDIO_LABEL = {"truehd": "TrueHD", "eac3": "EAC3", "ac3": "AC3", "dts": "DTS",
                 "aac": "AAC", "flac": "FLAC", "opus": "Opus"}
 
+# Per-axis tier thresholds (pixels → tier rank). A resolution tier is the
+# MAX of the width-derived and height-derived tier, so neither a horizontal
+# crop (2.39:1 scope: 3840x1600 → 2160p) nor a vertical/pillarbox crop
+# (4:3 in a UHD frame: 2880x2160 → 2160p; 4:3 HD 1440x1080 → 1080p) is
+# under-tiered by keying off a single shrunken axis.
+_WIDTH_TIERS = ((3000, 5), (2000, 4), (1600, 3), (1100, 2), (640, 1))
+_HEIGHT_TIERS = ((1700, 5), (1250, 4), (880, 3), (620, 2), (340, 1))
+_TIER_LABEL = {5: "2160p", 4: "1440p", 3: "1080p", 2: "720p", 1: "480p", 0: None}
+
+
+def _axis_tier(px: int, tiers) -> int:
+    for floor, rank in tiers:
+        if px >= floor:
+            return rank
+    return 0
+
 
 def _res_label(width: Optional[int], height: Optional[int]) -> Optional[str]:
-    """Classify a video's resolution tier primarily from WIDTH. An
-    aspect-ratio crop (2.39:1 scope masters etc.) shrinks HEIGHT without
-    changing the true resolution tier, so keying off height alone
-    misclassifies them: a cropped 4K release (3840x1600) would read as
-    "1440p" and a cropped 1080p rip (1920x800) would read as "720p". Height
-    is used only as a fallback when width is unavailable. Fail-safe: None
-    when neither dimension is known."""
-    w = width or 0
-    if w:
-        if w >= 3000:
-            return "2160p"
-        if w >= 2000:
-            return "1440p"
-        if w >= 1600:
-            return "1080p"
-        if w >= 1100:
-            return "720p"
-        if w >= 640:
-            return "480p"
-        return None
-    h = height or 0
-    for floor, label in _RES_LADDER:
-        if h >= floor:
-            return label
-    return None
+    """Classify a video's resolution tier from the MAX of its width- and
+    height-derived tiers. An aspect-ratio crop shrinks one axis without
+    changing the true tier (2.39:1 scope shrinks height; 4:3/pillarbox
+    shrinks width), so taking the max of both axes classifies either crop
+    direction correctly. Fail-safe: None when neither dimension is known."""
+    rank = max(_axis_tier(width or 0, _WIDTH_TIERS),
+               _axis_tier(height or 0, _HEIGHT_TIERS))
+    return _TIER_LABEL[rank]
 
 
 def _cached_dv_layer(path: str, mtime: Optional[float], size: Optional[int], db) -> Optional[str]:

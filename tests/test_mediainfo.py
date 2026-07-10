@@ -70,6 +70,16 @@ def test_res_label_falls_back_to_height_when_width_missing():
     assert mediainfo._res_label(None, None) is None
 
 
+def test_res_label_narrow_aspect_classified_by_max_axis():
+    # Pillarbox / 4:3 crops shrink WIDTH, not height — the max-of-both-axes
+    # tier keeps them correct (width alone would under-tier them).
+    assert mediainfo._res_label(2880, 2160) == "2160p"  # 4:3 in a UHD frame
+    assert mediainfo._res_label(1440, 1080) == "1080p"  # 4:3 HD (width 1440)
+    # Normal 16:9 tiers are unchanged.
+    assert mediainfo._res_label(2560, 1440) == "1440p"
+    assert mediainfo._res_label(1280, 720) == "720p"
+
+
 # ── FIX 3: a stale dv_scan row (signature mismatch — the file at this path
 #    was overwritten since it was scanned) must NOT be trusted as this file's
 #    DV layer ─────────────────────────────────────────────────────────────
