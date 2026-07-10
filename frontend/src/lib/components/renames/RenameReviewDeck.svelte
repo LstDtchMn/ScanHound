@@ -53,12 +53,15 @@
   }
 
   function prev() {
+    if (busyId !== null) return;
     if (index > 0) index -= 1;
   }
   function next() {
+    if (busyId !== null) return;
     if (index < queue.length - 1) index += 1;
   }
   function skip() {
+    if (busyId !== null) return;
     index = Math.min(index + 1, Math.max(queue.length - 1, 0));
   }
 
@@ -113,6 +116,14 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    if (rematchJob) return; // RematchModal is open — let it own the keyboard
+    const target = e.target as HTMLElement | null;
+    if (target) {
+      const tag = target.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) {
+        return;
+      }
+    }
     if (e.key === 'Escape') { onClose(); return; }
     if (e.key === 'ArrowLeft') prev();
     else if (e.key === 'ArrowRight') next();
@@ -141,15 +152,17 @@
       <button
         type="button"
         aria-pressed={scope === 'needsReview'}
-        onclick={() => (scope = 'needsReview')}
-        class="px-3 py-1 rounded-full text-xs font-medium transition-colors
+        disabled={busyId !== null}
+        onclick={() => { scope = 'needsReview'; index = 0; }}
+        class="px-3 py-1 rounded-full text-xs font-medium transition-colors disabled:opacity-40
           {scope === 'needsReview' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}"
       >Under 100% ({counts.needsReview.length})</button>
       <button
         type="button"
         aria-pressed={scope === 'all'}
-        onclick={() => (scope = 'all')}
-        class="px-3 py-1 rounded-full text-xs font-medium transition-colors
+        disabled={busyId !== null}
+        onclick={() => { scope = 'all'; index = 0; }}
+        class="px-3 py-1 rounded-full text-xs font-medium transition-colors disabled:opacity-40
           {scope === 'all' ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-secondary)]'}"
       >All ({counts.ready.length + counts.needsReview.length})</button>
     </div>
@@ -225,13 +238,13 @@
       <button
         type="button"
         onclick={prev}
-        disabled={index === 0}
+        disabled={index === 0 || busyId !== null}
         class="px-3 py-1.5 rounded-lg text-xs font-medium border border-[var(--border)] text-[var(--text-secondary)] disabled:opacity-40 hover:bg-[var(--bg-tertiary)] transition-colors"
       >‹ Prev</button>
       <button
         type="button"
         onclick={next}
-        disabled={index >= queue.length - 1}
+        disabled={index >= queue.length - 1 || busyId !== null}
         class="px-3 py-1.5 rounded-lg text-xs font-medium border border-[var(--border)] text-[var(--text-secondary)] disabled:opacity-40 hover:bg-[var(--bg-tertiary)] transition-colors"
       >Next ›</button>
     </div>
