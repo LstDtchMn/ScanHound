@@ -66,6 +66,10 @@
     } catch (e) {
       if (seq !== previewSeq) return;
       previewError = e instanceof Error ? e.message : String(e);
+    } finally {
+      // Only this card's own (latest) fetch clears its scan-in-progress
+      // button state — not a stale/superseded request.
+      if (seq === previewSeq) dvScanning = false;
     }
   }
 
@@ -90,11 +94,14 @@
       dvScanning = false;
     }
   }
-  // dv:conflict_scan_done bumps the shared dvScanTick; re-fetch this card's
-  // preview so a newly-detected FEL/MEL layer shows up.
+  // dv:conflict_scan_done bumps the shared dvScanTick (no job id on the
+  // event) — re-fetch this card's preview so a newly-detected FEL/MEL layer
+  // shows up. dvScanning is cleared inside loadPreview's finally, once THIS
+  // card's own re-fetch actually completes, not synchronously here — a tick
+  // from another job's scan finishing must not re-enable this card's button
+  // while its own scan is still in flight.
   $effect(() => {
     if ($dvScanTick && conflict) loadPreview();
-    dvScanning = false;
   });
 
   let showDvScanButton = $derived(
@@ -185,6 +192,14 @@
     <div class="rounded-lg border border-[var(--border)] p-2.5 flex flex-col gap-2">
       {#if previewError}
         <div class="text-xs text-[var(--error)]">Comparison failed: {previewError}</div>
+        <button
+          type="button"
+          class="self-start px-2.5 py-1 rounded-lg text-[11px] font-medium border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50"
+          disabled={busy}
+          onclick={loadPreview}
+        >
+          Retry
+        </button>
       {:else if !preview}
         <div class="text-xs text-[var(--text-secondary)]">Loading comparison…</div>
       {:else if !preview.incoming}
