@@ -1366,7 +1366,13 @@ class RenameService:
                      and e.get("restorable")]
             cands.sort(key=lambda e: e.get("trashed_at") or "", reverse=True)
             if cands:
-                _fileops.restore_trash_entry(cands[0]["bucket"], cands[0]["name"], roots)
+                restore_result = _fileops.restore_trash_entry(
+                    cands[0]["bucket"], cands[0]["name"], roots)
+                if not restore_result.get("ok"):
+                    logger.warning(
+                        "undo: overwrite-original restore failed for job %s, "
+                        "destination %s left stranded in trash: %s",
+                        job_id, dst, restore_result.get("error"))
         except Exception:
             logger.exception("undo: overwrite-original restore best-effort failed")
         db.update_rename_job(job_id, status="reverted", reverted_at=_now())
