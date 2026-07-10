@@ -403,7 +403,10 @@ class DatabaseManager:
                         cursor.execute("ALTER TABLE download_results_new RENAME TO download_results")
                         conn.commit()
                     except Exception as e:
-                        conn.rollback()
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
                         logger.exception("download_results rebuild failed")
                         raise RuntimeError("download_results migration failed") from e
 

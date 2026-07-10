@@ -128,7 +128,7 @@
             {/if}
           </div>
         {/if}
-        {#each g.items as r (r.id)}
+        {#each g.items as r (r.id ?? r.package_uuid ?? r.name)}
           <div class="py-1.5 {g.isDuplicate ? 'pl-2 border-l-2 border-[var(--border)]' : ''}">
             <div class="flex items-center gap-2">
               {#if !g.isDuplicate}<span class="text-sm font-medium truncate">{r.title || r.name}</span>{/if}
