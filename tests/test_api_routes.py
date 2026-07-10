@@ -830,14 +830,35 @@ class TestJdControlsAndResults:
         mock_dl = MagicMock()
         mock_dl.remove_package.return_value = {"ok": True, "removed": 1}
         registry._download_service = mock_dl
-        resp = client.post("/download/results/remove", json={"name": "Foo [1080p]"})
+        resp = client.post("/download/results/remove", json={"id": 42})
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "removed": 1}
-        mock_dl.remove_package.assert_called_once_with("Foo [1080p]")
+        mock_dl.remove_package.assert_called_once_with(42)
+
+    def test_remove_download_result_deletes_row(self, client):
+        """Route wired end-to-end against a real DownloadService + real DB
+        (JD connect mocked out): removing by id actually deletes that row."""
+        from backend.download_service import DownloadService
+        rid = registry.db.upsert_download_result("Foo [1080p]", package_uuid="111", state="downloading")
+        dl = DownloadService(config={}, db=registry.db)
+        dl._connect_jd_device = MagicMock(side_effect=Exception("no jd in tests"))
+        registry._download_service = dl
+        resp = client.post("/download/results/remove", json={"id": rid})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert registry.db.get_download_results() == []
+
+    def test_remove_download_result_unknown_id_returns_removed_zero(self, client):
+        from backend.download_service import DownloadService
+        dl = DownloadService(config={}, db=registry.db)
+        registry._download_service = dl
+        resp = client.post("/download/results/remove", json={"id": 999999})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "removed": 0}
 
     def test_remove_download_result_no_service_returns_503(self, client):
         registry._download_service = None
-        resp = client.post("/download/results/remove", json={"name": "Foo [1080p]"})
+        resp = client.post("/download/results/remove", json={"id": 1})
         assert resp.status_code == 503
 
 

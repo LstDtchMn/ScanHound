@@ -438,7 +438,7 @@ def clear_download_results(reg: ServiceRegistry = Depends(get_registry)):
 
 
 class RemoveResultRequest(BaseModel):
-    name: str
+    id: int
 
 
 @router.post("/results/remove")
@@ -447,4 +447,4 @@ def remove_download_result(req: RemoveResultRequest, reg: ServiceRegistry = Depe
     dl = reg.download
     if not dl:
         raise HTTPException(status_code=503, detail="Download service not available")
-    return dl.remove_package(req.name)
+    return dl.remove_package(req.id)
