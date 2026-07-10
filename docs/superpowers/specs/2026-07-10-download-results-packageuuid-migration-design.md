@@ -54,9 +54,11 @@ by uuid), SvelteKit 5 (runes). Deploy via `docker compose up -d --build` only.
   deletes by `id`, and its JD-removal is a no-op.
 - The desktop `/downloads` page keeps working across every WebSocket push and
   every action — only the row key + remove identifier change.
-- The frontend `DownloadResult` type matches the JSON emitted by BOTH the REST
-  endpoint and the WS broadcast, and `package_uuid` is the same JSON type (string)
-  in both.
+- `id` (number) and `package_uuid` (string | null) are present and the SAME JSON
+  type in BOTH the REST response and the WS broadcast for a given row. (The two
+  channels already differ on other fields — WS rows carry `save_to` and omit
+  `updated_at`, REST is the inverse; that's pre-existing, so mark `updated_at` and
+  `save_to` optional in `DownloadResult` rather than claiming exact parity.)
 - Tests accompany each unit; deploy only after the changed-module suites are green
   (`test_database.py`, `test_download_service.py`, `test_api_routes.py` scoped
   subset — the full file hangs on network tests).
@@ -101,6 +103,8 @@ CREATE TABLE IF NOT EXISTS download_results (
   if cols and "id" not in cols:            # old-shape table exists → rebuild
       try:
           cursor.execute("DROP TABLE IF EXISTS download_results_new")  # clear any aborted leftover
+          if conn.in_transaction:      # future-proof: BEGIN raises if a txn is already open
+              conn.commit()
           cursor.execute("BEGIN IMMEDIATE")
           cursor.execute("CREATE TABLE download_results_new (…new schema…)")
           cursor.execute(
@@ -112,35 +116,46 @@ CREATE TABLE IF NOT EXISTS download_results (
           cursor.execute("DROP TABLE download_results")
           cursor.execute("ALTER TABLE download_results_new RENAME TO download_results")
           conn.commit()
-      except Exception:
+      except Exception as e:
           conn.rollback()
           logger.exception("download_results rebuild failed")
-          raise RuntimeError("download_results migration failed")  # controlled, NOT the corruption path
+          raise RuntimeError("download_results migration failed") from e  # controlled, NOT the corruption path
   ```
   `DROP IF EXISTS …_new` is provably safe: the copy+drop+rename commit atomically,
   so a surviving `_new` is always an empty aborted leftover, never the only copy.
   Do NOT "fix" the orphan with `CREATE TABLE IF NOT EXISTS …_new` + re-copy — that
   reopens a row-duplication path. Indexes are (re)created afterward by the shared
   idempotent section, so the `DROP TABLE` discarding them is fine.
-- **Note on the actual init flow (verify at implementation):** confirm whether a
-  transaction is already open when this runs and whether `conn.commit()`/
-  `rollback()` here interferes with the surrounding `init_db` transaction; the
-  guarded `BEGIN IMMEDIATE`…`commit` must nest cleanly or be issued where no outer
-  txn is open. If the surrounding code holds one transaction for all of
-  `init_db`, do the rebuild as plain statements within it and let its
-  commit/rollback own the outcome — but STILL catch and convert the exception so
-  it can't reach the corruption handler.
+- **Init-flow transaction nesting (resolved — implement exactly this):** the
+  connection is `sqlite3.connect(db_path, check_same_thread=False)` with no
+  `isolation_level` → legacy transaction control. `init_db` runs only PRAGMA /
+  `CREATE TABLE IF NOT EXISTS` / guarded `ALTER TABLE` (all DDL/PRAGMA, no DML)
+  before this point, so `conn.in_transaction` is False here and `BEGIN IMMEDIATE`
+  is safe; the mid-init `conn.commit()` and the later `PRAGMA user_version` stamp
+  ([database.py:534](backend/database.py:534)) + final commit are unaffected.
+  The `integrity_check` at [database.py:247](backend/database.py:247) runs BEFORE
+  the rebuild, so a genuinely corrupt DB is already quarantined and can't be
+  masked here. Do NOT add the "do it as plain statements within an outer txn"
+  alternative — it's moot and less safe. The `if conn.in_transaction: conn.commit()`
+  line above future-proofs against someone later adding DML earlier in `init_db`
+  (without it, `BEGIN` would raise "cannot start a transaction within a
+  transaction" and needlessly fail startup).
 
 ### 2. `upsert_download_result` (adopt-or-insert, one lock hold)
 
 Signature gains `package_uuid`; returns the row `id`:
 `upsert_download_result(name, package_uuid=None, title=None, host=None, bytes_total=0, bytes_loaded=0, downloaded=0, extraction="na", state="queued", error=None) -> int`.
 
-- **Runs the whole lookup-then-write under ONE lock hold** (a single
-  `db.transaction()` / one `_lock` acquisition), not a `_query` + separate
-  `_mutate` — otherwise the poller thread and the remove endpoint race
-  (adopt-after-delete → lost update, TOCTOU). `_mutate` returns bool, so add a
-  helper that returns `cursor.lastrowid`.
+- **Runs the whole lookup-then-write under ONE lock hold** — do it inside the
+  existing `DatabaseManager.transaction()` context manager
+  ([database.py:52](backend/database.py:52), reentrant RLock) or a single
+  `with self._lock:` block (the pattern `delete_download_result` already uses at
+  [database.py:999](backend/database.py:999)), NOT a `_query` + separate `_mutate`
+  (which release the lock between statements → poller-vs-remove TOCTOU,
+  adopt-after-delete lost update). For the INSERT branch, reuse the existing
+  `_insert_returning_id` helper ([database.py:194](backend/database.py:194)) —
+  don't add a new one. (Note `_insert_returning_id` returns None on failure; the
+  caller in §5 must treat a None id as "write failed", see there.)
 - Resolution order:
   1. `package_uuid` not None and a row with it exists → UPDATE by id (**SET `name`
      too** — JD can rename a package; the old upsert never set name because it
@@ -151,8 +166,12 @@ Signature gains `package_uuid`; returns the row `id`:
   3. `package_uuid` is None → match by `name` (NULL-uuid rows first, else
      most-recently-updated, `LIMIT 1`) → UPDATE, else INSERT.
   4. uuid present, no uuid or NULL-uuid-name match → INSERT with the uuid.
-- Normalize `package_uuid = str(uuid)` at the boundary (myjdapi emits an int64;
-  SQLite TEXT affinity + JS-safe-integer are fine, but one type everywhere).
+- **Never let `package_uuid` become the string `"None"`.** The poller normalizes
+  `u = pkg.get("uuid"); package_uuid = str(u) if u is not None else None` (§5) —
+  a `str(None)` here would be a fake non-NULL uuid that collides every uuid-less
+  package onto one row via step 1, sits wrongly inside the partial UNIQUE index,
+  and never reaches step 3. So `upsert_download_result` receives either a real
+  stringified uuid or a genuine `None`; a `None` uuid takes resolution step 3.
 
 ### 3. Reads / deletes (`backend/database.py`)
 
@@ -163,23 +182,38 @@ Signature gains `package_uuid`; returns the row `id`:
 ### 4. `DownloadService.remove_package` → per-row by id (`backend/download_service.py`)
 
 `remove_package(id_)`: load the row's `package_uuid`; if present, JD
-`downloads.remove_links([], [uuid])` for **only that uuid**
-([download_service.py:648-651](backend/download_service.py:648) no longer
-removes "all packages matching this name"); then `delete_download_result(id_)`.
-Idempotent (missing row / already-gone package → `{ok: True}`).
+`downloads.remove_links([], [int(package_uuid)])` for **only that uuid** —
+**convert back to int** at the JD boundary (the column is TEXT but JD's API
+expects the native int64 uuid, as the current code passes at
+[download_service.py:648-651](backend/download_service.py:648); this no longer
+removes "all packages matching this name"). Then `delete_download_result(id_)`.
+The JD `remove_links` call is best-effort/try-except today, so a type mismatch
+would be **silently swallowed** while the DB row is deleted (UI says "removed",
+package keeps downloading) — hence the explicit `int()` and a test asserting the
+mocked device received an int. Idempotent (missing row / already-gone package →
+`{ok: True}`).
 
 ### 5. Poller: emit `id`, key caches by uuid (`backend/download_service.py`)
 
-- `poll_results` passes `package_uuid=str(pkg.get("uuid"))` to the upsert **and
-  must put the DB `id` into every returned `row`** (the row dict is what both the
-  REST response and the WS broadcast carry). The upsert is skipped when the
-  change-detection `change_key` is unchanged ([:776](backend/download_service.py:776)),
-  so keep a `uuid → id` map: update it from the upsert's returned id when a write
-  happens, and `SELECT id` once for a cache-suppressed row not yet in the map.
-  Emit `package_uuid` (stringified) in the row too.
-- `_results_cache` and `_best_titles` ([:776](backend/download_service.py:776),
-  [:792-793](backend/download_service.py:792)) → key by uuid; prune by the set of
-  live uuids.
+- **Normalize the uuid once:** `u = pkg.get("uuid"); package_uuid = str(u) if u
+  is not None else None`. Pass `package_uuid` to the upsert. (Never `str(None)`.)
+- `poll_results` **must put the DB `id` into every returned `row`** (the row dict
+  is what both the REST response and the WS broadcast carry). Keep a `uuid → id`
+  map, and **prime the change-detection cache only AFTER a successful write**:
+  the current code sets `_results_cache[key]` *before* the upsert
+  ([:776-783](backend/download_service.py:776)); with `_insert_returning_id`
+  returning None on failure, that order would permanently emit an id-less row
+  (map never learns the id, cache suppresses retries). Reorder to: call the
+  upsert → if it returns a non-None `id`, record `map[uuid]=id` and set the
+  cache; if it returns None (write failed), do NOT set the cache (so the next
+  poll retries). For a cache-suppressed row not yet in the map, `SELECT id` once;
+  if that also misses, re-run the upsert rather than emit an id-less row. A row
+  with a `None` uuid falls back to the existing name-keyed cache path.
+- Emit `id` + stringified `package_uuid` in every returned `row`.
+- `_results_cache`, `_best_titles`, and the new `uuid → id` map
+  ([:776](backend/download_service.py:776), [:792-793](backend/download_service.py:792))
+  → key by uuid (name for the rare None-uuid row); prune all three by the set of
+  live uuids each poll.
 
 ### 6. WebSocket broadcast + auto-rename hook (`backend/api/main.py`)
 
@@ -209,27 +243,51 @@ Idempotent (missing row / already-gone package → `{ok: True}`).
   ([:339](frontend/src/routes/downloads/+page.svelte:339)) now receives rows with
   `id`; change the `{#each}` key ([~:528](frontend/src/routes/downloads/+page.svelte:528))
   from `(r.name)` to `(r.id)` and every remove/compare to `id`.
-- **`MobileDownloadsView.svelte`:** move EVERY name comparison/filter to `id` —
-  the remove calls ([:82](frontend/src/lib/components/mobile/MobileDownloadsView.svelte:82),
+- **`MobileDownloadsView.svelte`:** move EVERY name-keying to `id` — the keyed
+  each **`{#each g.items as r (r.name)}`**
+  ([~:129](frontend/src/lib/components/mobile/MobileDownloadsView.svelte:129)) →
+  `(r.id)` (two same-name rows otherwise throw Svelte 5 `each_key_duplicate` /
+  corrupt list state — this is the feature's whole point), the remove calls
+  ([:82](frontend/src/lib/components/mobile/MobileDownloadsView.svelte:82),
   [:89](frontend/src/lib/components/mobile/MobileDownloadsView.svelte:89)), the
   optimistic filter `results.filter(x => x.name !== r.name)`
   ([~:90](frontend/src/lib/components/mobile/MobileDownloadsView.svelte:90)) → by
   `id`, and the keep-best comparison `r.name !== g.best.name`
   ([~:99](frontend/src/lib/components/mobile/MobileDownloadsView.svelte:99)) → by
-  `id`. (Without this, "Keep best" on exact-name duplicates cancels nothing and a
-  single-copy cancel visually removes both.)
+  `id`. Grep the desktop `+page.svelte` for the equivalent keyed each + name
+  compares and convert them too. (Without this, "Keep best" on exact-name
+  duplicates cancels nothing and a single-copy cancel visually removes both.)
 - **`dupes.ts`:** grouping stays title/name-based; each item carries a stable
   `id`. The exact-name duplicate branch now actually fires; keep-best/cancel-rest
   compares + removes by `id`.
 
 ### 9. Duplicate-resolution safety (`dupes.ts` / both views)
 
-- **Cancel-rest only touches rows in ACTIVE states** (`queued`/`downloading`/
-  `extracting`). A `download_results` row persists after JD clears the package, so
-  a re-grab a month later creates a second (new-uuid) row and the UI flags a
-  duplicate; "best = more-complete" would otherwise pick the finished historical
-  row and cancel the live re-download. Restricting cancel-rest to active rows
-  prevents killing a live download and cancelling a stale record.
+- **Keep-best/cancel-rest operate ONLY on the group's ACTIVE subset — both the
+  best-selection AND the cancel set.** Define `isActive(row)` = `row.state ∈
+  {'queued','downloading','extracting'}`. Then:
+  - Compute "best" among the ACTIVE rows only (reusing `dupes.ts`'s existing
+    resRank/bytes ordering, [dupes.ts:58-60](frontend/src/lib/downloads/dupes.ts:58)),
+    NOT over the whole group.
+  - Cancel the *other* active rows; **never auto-cancel a non-active row**
+    (`finished`/`failed`, or an already-extracted historical record).
+  - Only offer the "Keep best" action when the group has **≥2 active rows**.
+
+  This closes the real I2 hole: restricting only the cancel set (not the
+  best-selection) still lets a finished historical row be chosen as "best",
+  leaving the live re-grab as the "rest" → cancelled. A `download_results` row
+  persists after JD clears its package, so a re-grab weeks later legitimately
+  creates a second (new-uuid) row; confining the whole operation to active rows
+  means a lone live re-grab beside a historical record simply isn't offered
+  keep-best (nothing to auto-resolve), and the user removes the stale record
+  manually if they want.
+- **`downloaded` decision:** a live JD package can momentarily sit in the interim
+  `downloaded` flag between download-finish and extraction, but its `state`
+  reports one of the active values in that window, so `isActive` covers it. Rows
+  whose `state` is terminal (`finished`/`failed`) are intentionally excluded — a
+  double-grab where the loser already finished is resolvable only by manual
+  per-copy cancel (acceptable: nothing is downloading to waste, and auto-cancel
+  there risks killing a genuinely-wanted second copy).
 - Accept and document the uuid-churn tradeoff: if JD reassigns a package's uuid
   (merge/split, linkgrabber→downloads re-add, some restarts), one logical package
   can surface as a live row + a phantom stale row. The old name-PK silently
@@ -278,14 +336,22 @@ Idempotent (missing row / already-gone package → `{ok: True}`).
 - **`test_download_service.py`:** `poll_results` passes `str(uuid)` to the upsert,
   two same-name live packages persist as two rows, and the returned rows carry
   `id`; a cache-suppressed poll still emits the correct `id` (uuid→id map / SELECT
-  fallback); `remove_package(id)` calls JD `remove_links` with the single resolved
-  uuid (mocked device) and deletes only that row; caches/`handed_to_rename` keyed
-  by uuid don't collide across two same-name packages.
+  fallback); a **failed write does not prime the cache** and the row is retried
+  (not emitted id-less); a **None JD uuid** yields `package_uuid=None` (never the
+  string `"None"`); `remove_package(id)` calls JD `remove_links` with the single
+  resolved uuid **as an int** (assert the mocked device received an int) and
+  deletes only that row; caches/`handed_to_rename` keyed by uuid don't collide
+  across two same-name packages.
 - **`test_api_routes.py` (scoped):** `POST /download/results/remove {id}` happy
   path + missing id; `GET /download/results` includes `id`/`package_uuid`.
+- **Update existing name-based tests** to the id/uuid API (they will otherwise
+  fail): `test_api_routes.py` (the `remove_package`/remove-endpoint cases,
+  ~:831-836), `test_database.py` (the upsert-/`delete_download_result("…")`-by-name
+  cases, ~:272-336), `test_download_service.py` (~:1859-1890, ~:2058-2067).
 - **Frontend (vitest):** `dupes.ts` exact-name duplicate groups two same-name
-  rows, keep-best picks the more-complete ACTIVE row, and cancel-rest skips
-  non-active (finished/failed) rows; remove targets by `id`.
+  rows; keep-best is computed over the ACTIVE subset and picks the more-complete
+  ACTIVE row; cancel-rest never targets non-active (finished/failed/historical)
+  rows; "Keep best" is not offered with <2 active rows; remove targets by `id`.
 
 ## Out of Scope (deferred)
 
