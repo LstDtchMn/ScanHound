@@ -331,6 +331,56 @@ class TestMatchingAndReconcileBatch:
         n = reconcile_batch(db_manager)
         assert n == 0  # nothing eligible
 
+    def test_grace_margin_minutes_forwarded_to_categorize_changes_verdict(self, db_manager):
+        # Proves reconcile_batch's grace_margin_minutes parameter actually
+        # reaches categorize() and changes its verdict — not merely that the
+        # parameter exists. Same downloads/download_results/rename_jobs/
+        # plex_cache rows, same timestamps; the ONLY thing that differs
+        # between the two reconcile_batch calls is grace_margin_minutes.
+        db_manager.add_to_history("http://m/grace", "Grace", package_name="Grace [1080p]")
+        conn = db_manager.get_connection()
+        conn.execute("UPDATE downloads SET last_grabbed_at = datetime('now','-1 hour') "
+                     "WHERE url='http://m/grace'")
+        conn.execute("INSERT INTO download_results (package_uuid, name, state, updated_at) "
+                     "VALUES ('grace-uuid', 'Grace [1080p]', 'extracted', datetime('now'))")
+        # Rename applied 15 minutes ago.
+        processed_at = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, imdb_id, resolution, processed_at) VALUES (?, ?, 'applied', 'movie', "
+            "?, ?, ?, ?, ?)",
+            ("Grace [1080p]", "/x/Grace.mkv", "Grace", 2024, "tt_grace", "1080p", processed_at))
+        # Plex cache last refreshed "now" — only 15 minutes newer than the rename.
+        now_ts = datetime.now(timezone.utc).timestamp()
+        conn.execute(
+            """INSERT INTO plex_cache (
+                   key, title, original_title, year, res, size, imdb_id,
+                   rating_key, media_id, is_tv, season, episode_count,
+                   content_type, dovi, hdr, last_updated, library_name
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("rk_grace", "Grace", "Grace", 2024, "1080p", 10.0, "tt_grace",
+             "rk_grace", None, 0, None, None, "Movies", 0, 0, now_ts, "Test Library"))
+        conn.commit()
+
+        # 15 minutes of cache lag is well under the DEFAULT 30-minute grace
+        # margin -> categorize() must still consider the cache not-fresh-enough
+        # and report 'in_progress'.
+        reconcile_batch(db_manager, grace_margin_minutes=30)
+        rows = db_manager.get_pipeline_verdicts()
+        row = next(r for r in rows if r["url"] == "http://m/grace")
+        assert row["category"] == "in_progress"
+
+        # Same rows, same cache timestamp, second pass (non-terminal verdicts
+        # are re-picked-up per test_in_progress_verdict_reconsidered_on_second_pass
+        # above) — but with a small custom margin the SAME 15-minute lag now
+        # counts as fresh enough, flipping the verdict to a terminal category
+        # via a real find_plex_match() lookup against the plex_cache row above.
+        reconcile_batch(db_manager, grace_margin_minutes=1)
+        rows = db_manager.get_pipeline_verdicts()
+        row = next(r for r in rows if r["url"] == "http://m/grace")
+        assert row["category"] == "verified"
+        assert row["plex_rating_key"] == "rk_grace"
+
     def test_in_progress_verdict_reconsidered_on_second_pass(self, db_manager):
         # N1 regression: a non-terminal verdict must be re-picked-up even
         # though last_grabbed_at hasn't changed.

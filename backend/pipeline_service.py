@@ -196,7 +196,8 @@ def _match_rename_rows(conn, package_name: Optional[str]) -> list:
     return [dict(r) for r in cur.fetchall()]
 
 
-def reconcile_batch(db, limit: int = 500, jd_method: str = "api") -> int:
+def reconcile_batch(db, limit: int = 500, jd_method: str = "api",
+                    grace_margin_minutes: int = 30) -> int:
     """Reconcile up to `limit` eligible grabs and upsert their verdicts.
 
     Returns the count processed. Per-item failures are caught and categorized
@@ -205,6 +206,10 @@ def reconcile_batch(db, limit: int = 500, jd_method: str = "api") -> int:
     own try/except). `jd_method` is passed by the caller (Task 5's maintenance
     hook, which owns the live config) as `config.get("jd_method", "folder")`;
     it defaults to "api" here since DatabaseManager holds no config reference.
+    `grace_margin_minutes` is likewise forwarded from the caller's live config
+    (`pipeline_verify_grace_margin_minutes`, default 30) down to categorize()'s
+    Plex-cache-freshness gate; it defaults to 30 here to match categorize()'s
+    own default so existing callers that don't pass it are unaffected.
     """
     candidates = db.get_downloads_needing_reconcile(limit=limit)
     if not candidates:
@@ -220,7 +225,8 @@ def reconcile_batch(db, limit: int = 500, jd_method: str = "api") -> int:
             result_row = _match_download_results(conn, row)
             rename_rows = _match_rename_rows(conn, row.get("package_name"))
             category, detail, package_uuid, plex_rating_key = categorize(
-                row, result_row, rename_rows, plex_max_ts, jd_method=jd_method, db=db)
+                row, result_row, rename_rows, plex_max_ts, jd_method=jd_method,
+                grace_margin_minutes=grace_margin_minutes, db=db)
             if category is not None:
                 db.upsert_pipeline_verdict(row["url"], category, detail=detail,
                                            package_uuid=package_uuid,

@@ -595,7 +595,9 @@ class AppService:
             if self.db is not None and self.config.get("pipeline_reconcile_enabled", True):
                 from backend.pipeline_service import reconcile_batch
                 jd_method = self.config.get("jd_method", "folder")
-                n = reconcile_batch(self.db, jd_method=jd_method)
+                grace_margin_minutes = self.config.get("pipeline_verify_grace_margin_minutes", 30)
+                n = reconcile_batch(self.db, jd_method=jd_method,
+                                    grace_margin_minutes=grace_margin_minutes)
                 if n:
                     logger.info("Pipeline reconcile: checked %d grab(s)", n)
         except Exception:
