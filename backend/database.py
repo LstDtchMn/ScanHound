@@ -989,54 +989,57 @@ class DatabaseManager:
 
     # ── Download results (live JDownloader outcome tracking) ─────────────
 
-    def upsert_download_result(self, name, title=None, host=None,
+    def upsert_download_result(self, name, package_uuid=None, title=None, host=None,
                                bytes_total=0, bytes_loaded=0, downloaded=0,
                                extraction="na", state="queued", error=None):
-        """Insert or update the download/extraction outcome for a JD package.
-
-        Keyed by JD package name. Refreshes updated_at on every poll so the
-        list can be ordered by most-recent activity.
-
-        Implemented as an explicit lookup-then-write (rather than SQLite's
-        ON CONFLICT upsert) because `name` is no longer covered by a UNIQUE
-        constraint after the download_results rebuild (surrogate `id` PK +
-        nullable `package_uuid`, so the same name can legitimately appear on
-        multiple rows once callers start passing package_uuid). This keeps
-        the existing one-row-per-name contract intact for current callers;
-        uuid-based identity is a follow-up. The whole lookup+write happens
-        under one lock hold (RLock, reentrant) so it can't race with a
-        concurrent delete/insert for the same name.
-        """
+        """Insert/update a JD package's download outcome; returns the row id (int)
+        or None on failure. Identity is package_uuid when present, else the row is
+        adopted-by-name (a legacy NULL-uuid row) or inserted. Runs the whole
+        lookup-then-write under one lock hold to avoid poller-vs-remove races."""
         try:
             with self._lock:
                 conn = self.get_connection()
                 if not conn:
-                    return False
+                    return None
                 cur = conn.cursor()
-                cur.execute("SELECT id FROM download_results WHERE name = ?", (name,))
-                row = cur.fetchone()
-                if row is not None:
-                    cur.execute('''
-                        UPDATE download_results SET
-                            title = ?, host = ?, bytes_total = ?, bytes_loaded = ?,
-                            downloaded = ?, extraction = ?, state = ?, error = ?,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
-                    ''', (title, host, bytes_total, bytes_loaded, downloaded,
-                          extraction, state, error, row[0]))
+                row = None
+                if package_uuid is not None:
+                    cur.execute("SELECT id FROM download_results WHERE package_uuid = ?",
+                                (package_uuid,))
+                    row = cur.fetchone()
+                    if row is None:
+                        cur.execute("SELECT id FROM download_results "
+                                    "WHERE package_uuid IS NULL AND name = ? "
+                                    "ORDER BY updated_at DESC LIMIT 1", (name,))
+                        row = cur.fetchone()
                 else:
-                    cur.execute('''
-                        INSERT INTO download_results (
-                            name, title, host, bytes_total, bytes_loaded,
-                            downloaded, extraction, state, error, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    ''', (name, title, host, bytes_total, bytes_loaded,
-                          downloaded, extraction, state, error))
+                    cur.execute("SELECT id FROM download_results WHERE name = ? "
+                                "ORDER BY (package_uuid IS NULL) DESC, updated_at DESC LIMIT 1",
+                                (name,))
+                    row = cur.fetchone()
+                if row is not None:
+                    rid = row[0]
+                    cur.execute(
+                        "UPDATE download_results SET "
+                        "package_uuid = COALESCE(?, package_uuid), name = ?, title = ?, "
+                        "host = ?, bytes_total = ?, bytes_loaded = ?, downloaded = ?, "
+                        "extraction = ?, state = ?, error = ?, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ?",
+                        (package_uuid, name, title, host, bytes_total, bytes_loaded,
+                         downloaded, extraction, state, error, rid))
+                    conn.commit()
+                    return rid
+                cur.execute(
+                    "INSERT INTO download_results (package_uuid, name, title, host, "
+                    "bytes_total, bytes_loaded, downloaded, extraction, state, error, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    (package_uuid, name, title, host, bytes_total, bytes_loaded,
+                     downloaded, extraction, state, error))
                 conn.commit()
-            return True
+                return cur.lastrowid
         except Exception as e:
             logger.error("DB Error (upsert_download_result): %s", e)
-            return False
+            return None
 
     def get_download_results(self, limit=200):
         """Return tracked download/extraction outcomes, most recent first."""
@@ -1051,9 +1054,9 @@ class DatabaseManager:
         """Delete all tracked download/extraction outcomes."""
         return self._mutate("DELETE FROM download_results", label="clear_download_results")
 
-    def delete_download_result(self, name):
+    def delete_download_result(self, id_):
         """Delete the tracked download/extraction outcome for a single package
-        by its JDownloader package ``name``. Returns rows affected (0 if none).
+        by its row ``id``. Returns rows affected (0 if none).
 
         Unlike ``_mutate`` (which returns True/False), this needs the actual
         row count for the caller to distinguish "deleted" from "already gone",
@@ -1065,7 +1068,7 @@ class DatabaseManager:
                 if not conn:
                     return 0
                 cursor = conn.execute(
-                    "DELETE FROM download_results WHERE name = ?", (name,))
+                    "DELETE FROM download_results WHERE id = ?", (id_,))
                 conn.commit()
                 return cursor.rowcount
         except Exception as e:

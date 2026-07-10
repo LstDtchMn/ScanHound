@@ -321,19 +321,55 @@ class TestDownloadResults:
         assert rows[0]["error"] == "Extraction error"
 
     def test_delete_download_result_removes_only_named_row(self, db_manager):
-        db_manager.upsert_download_result(name="Foo [1080p]", title="Foo", host="rg.net",
-                                          bytes_total=100, bytes_loaded=50, downloaded=0,
-                                          extraction="na", state="downloading", error=None)
+        foo_id = db_manager.upsert_download_result(
+            name="Foo [1080p]", title="Foo", host="rg.net",
+            bytes_total=100, bytes_loaded=50, downloaded=0,
+            extraction="na", state="downloading", error=None)
         db_manager.upsert_download_result(name="Bar [4K]", title="Bar", host="rg.net",
                                           bytes_total=100, bytes_loaded=100, downloaded=1,
                                           extraction="success", state="extracted", error=None)
-        n = db_manager.delete_download_result("Foo [1080p]")
+        n = db_manager.delete_download_result(foo_id)
         assert n == 1
         names = {r["name"] for r in db_manager.get_download_results()}
         assert names == {"Bar [4K]"}
 
     def test_delete_download_result_missing_is_noop(self, db_manager):
-        assert db_manager.delete_download_result("nope") == 0
+        assert db_manager.delete_download_result(999999) == 0
+
+    def test_upsert_two_same_name_uuids_coexist(self, db_manager):
+        a = db_manager.upsert_download_result("Foo", package_uuid="111", state="downloading")
+        b = db_manager.upsert_download_result("Foo", package_uuid="222", state="downloading")
+        assert a != b
+        rows = db_manager.get_download_results()
+        assert {r["package_uuid"] for r in rows} == {"111", "222"}
+
+    def test_upsert_update_by_uuid_and_name_change(self, db_manager):
+        i = db_manager.upsert_download_result("Foo", package_uuid="111")
+        j = db_manager.upsert_download_result("Foo RENAMED", package_uuid="111")
+        assert i == j
+        row = [r for r in db_manager.get_download_results() if r["id"] == i][0]
+        assert row["name"] == "Foo RENAMED"
+
+    def test_upsert_adopts_legacy_null_uuid_row(self, db_manager):
+        # Legacy row (no uuid), then a live poll of the same name with a uuid -> adopts it.
+        legacy = db_manager.upsert_download_result("Foo", package_uuid=None)
+        adopted = db_manager.upsert_download_result("Foo", package_uuid="111")
+        assert adopted == legacy
+        rows = db_manager.get_download_results()
+        assert len(rows) == 1 and rows[0]["package_uuid"] == "111"
+
+    def test_unique_uuid_index_rejects_second_row(self, db_manager):
+        db_manager.upsert_download_result("A", package_uuid="111")
+        # A direct duplicate-uuid insert must be rejected by the partial unique index.
+        with pytest.raises(sqlite3.IntegrityError):
+            db_manager.get_connection().execute(
+                "INSERT INTO download_results (package_uuid, name) VALUES ('111','B')")
+
+    def test_delete_by_id_removes_one_of_two_same_name(self, db_manager):
+        a = db_manager.upsert_download_result("Foo", package_uuid="111")
+        db_manager.upsert_download_result("Foo", package_uuid="222")
+        assert db_manager.delete_download_result(a) == 1
+        assert {r["package_uuid"] for r in db_manager.get_download_results()} == {"222"}
 
 
 class TestDownloadResultsSchemaMigration:
