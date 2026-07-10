@@ -300,6 +300,16 @@ connection.on('dv:scan_done', (data) => {
   loadDvScans();
 });
 
+// ── On-demand conflict DV scan (RenameReviewCard's "Scan DV layers") ──
+// Distinct from the full-library scan above: scan-dv-conflict broadcasts its
+// own dv:conflict_scan_done so it never disturbs the DV-scan panel's state.
+// Consumers just watch this tick to know when to re-fetch their conflict
+// preview — no shared progress/result payload to model.
+export const dvScanTick = writable(0);
+connection.on('dv:conflict_scan_done', () => {
+  dvScanTick.update((n) => n + 1);
+});
+
 // ── Dolby Vision label sync (mirrors the DV scan stores above) ────────
 export interface DvSyncProgress { done: number; total: number; }
 export interface DvSyncResult {

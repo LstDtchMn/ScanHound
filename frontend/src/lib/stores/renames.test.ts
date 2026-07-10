@@ -57,4 +57,23 @@ describe('DV sync stores', () => {
     handlers['dv:sync_progress']({ done: 3, total: 10 });
     expect(get(mod.dvSyncProgress)).toEqual({ done: 3, total: 10 });
   });
+
+  it('registers a dv:conflict_scan_done handler distinct from dv:scan_done', async () => {
+    await import('./renames');
+    expect(typeof handlers['dv:conflict_scan_done']).toBe('function');
+  });
+
+  it('dv:conflict_scan_done bumps dvScanTick without touching the full-library DV scan stores', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.dvScanRunning.set(true);
+    expect(get(mod.dvScanTick)).toBe(0);
+    handlers['dv:conflict_scan_done']({ job_id: 1, scanned: 2 });
+    expect(get(mod.dvScanTick)).toBe(1);
+    handlers['dv:conflict_scan_done']({ job_id: 1, scanned: 2 });
+    expect(get(mod.dvScanTick)).toBe(2);
+    // Untouched — this event must never disturb the full-library scan panel.
+    expect(get(mod.dvScanRunning)).toBe(true);
+    expect(get(mod.dvScanResult)).toBeNull();
+  });
 });
