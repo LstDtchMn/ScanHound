@@ -53,7 +53,8 @@ const {
   computeStatusCounts,
   filteredStats,
   hiddenByFiltersCount,
-  clearAllFilters
+  clearAllFilters,
+  isResultsViewEmpty
 } = await import('./results');
 
 function item(overrides: Partial<ScanResult>): ScanResult {
@@ -1203,5 +1204,151 @@ describe('filteredStats / hiddenByFiltersCount (empty-state self-diagnosis)', ()
     });
     await loadResults(true);
     expect(get(hiddenByFiltersCount)).toBe(0);
+  });
+});
+
+describe('hiddenByFiltersCount does not conflate dismissed items with filter-hidden ones (live mode)', () => {
+  // Regression coverage for the finding: in live mode, `stats` was populated
+  // straight from the scanner (handleScanResult/handleScanComplete) and never
+  // dismissal-filtered, while filteredStats (via filteredResults) DOES exclude
+  // dismissed items. So swiping away every item matching the active tab used
+  // to leave `stats[key]` inflated relative to `filteredStats[key]` forever —
+  // a false "N hidden by filters" with a Clear filters button that can't fix
+  // it (clearAllFilters never touches dismissedUrls).
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('every item matching the active tab dismissed (not content-filtered): hiddenByFiltersCount is 0, not a false positive', () => {
+    results.set([
+      item({ status: 'missing', url: 'a' }),
+      item({ status: 'missing', url: 'b' })
+    ]);
+    stats.set({ total: 2, missing: 2, upgrade: 0, library: 0 });
+    statusFilter.set('missing');
+    // Nothing dismissed yet, no content filters — baseline sanity check.
+    expect(get(hiddenByFiltersCount)).toBe(0);
+
+    // Swipe-to-skip every item on this tab (normal triage, not a filter).
+    dismissedUrls.set(new Set(['a', 'b']));
+
+    expect(get(filteredResults)).toEqual([]); // dismissal really does hide them
+    // The old bug: this would read 2 (stats.missing=2 vs filteredStats.missing=0)
+    // even though no CONTENT filter is hiding anything — Clear filters is a no-op
+    // here, so the UI must not claim filters are the cause.
+    expect(get(hiddenByFiltersCount)).toBe(0);
+  });
+
+  it('a mix of dismissed AND content-filtered items: hiddenByFiltersCount reflects only the content-filtered portion', () => {
+    results.set([
+      item({ status: 'missing', url: 'a', season: 1, category: 'tv' }), // will be dismissed
+      item({ status: 'missing', url: 'b', season: 1, category: 'tv' })  // will be content-filtered
+    ]);
+    stats.set({ total: 2, missing: 2, upgrade: 0, library: 0 });
+    statusFilter.set('missing');
+    dismissedUrls.set(new Set(['a']));
+    resolutionFilter.set(['4K', '1080p']); // TV never keys as 4K/1080p — hides 'b'
+
+    expect(get(filteredResults)).toEqual([]);
+    // Only 'b' (content-filtered) should count as "hidden by filters" — 'a'
+    // (dismissed) must not inflate the figure or the count would overstate
+    // what Clear filters can actually resurrect.
+    expect(get(hiddenByFiltersCount)).toBe(1);
+
+    clearAllFilters();
+    // 'b' reappears once the content filter is cleared; 'a' stays gone (dismissed).
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['b']);
+    expect(get(hiddenByFiltersCount)).toBe(0);
+  });
+
+  it('restoring a dismissed item brings hiddenByFiltersCount back down correctly (no content filter involved)', () => {
+    results.set([item({ status: 'missing', url: 'a' })]);
+    stats.set({ total: 1, missing: 1, upgrade: 0, library: 0 });
+    statusFilter.set('missing');
+    dismissedUrls.set(new Set(['a']));
+    expect(get(hiddenByFiltersCount)).toBe(0); // dismissed, not filter-hidden
+
+    restoreItem('a');
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['a']);
+    expect(get(hiddenByFiltersCount)).toBe(0); // still 0 — it's visible again
+  });
+});
+
+describe('isResultsViewEmpty (empty-state gate) survives a paged-mode -> live-mode transition', () => {
+  // Regression coverage: filteredTotal is only written by loadResults() and
+  // the paged branches of dismissItem/restoreItem — never by
+  // handleScanResult/handleScanComplete/clearResults. A user browsing paged
+  // results (filteredTotal left at some prior value) who then starts a live
+  // scan used to keep filteredTotal stuck, so a gate of `filteredTotal === 0`
+  // could never become true again for the rest of that session — even when
+  // the live view was genuinely empty. isResultsViewEmpty must not consult
+  // filteredTotal at all once out of paged mode.
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('paged mode: gate is keyed on filteredTotal (matches old semantics)', async () => {
+    const { loadResults, pagedMode, filteredTotal: ft, filteredResults: fr } = await import('./results');
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'A', url: 'a' })], total: 340,
+      stats: { total: 340, missing: 340, upgrade: 0, library: 0 },
+      filtered_stats: { total: 340, missing: 340, upgrade: 0, library: 0 },
+      title_counts: {}
+    });
+    await loadResults(true);
+    expect(get(ft)).toBe(340);
+    expect(isResultsViewEmpty(get(pagedMode), get(fr).length, get(ft))).toBe(false);
+  });
+
+  it('paged -> live transition: a stale filteredTotal no longer wedges the gate shut', async () => {
+    const {
+      loadResults, pagedMode, filteredTotal: ft, filteredResults: fr,
+      handleScanResult: scanResult, handleScanComplete: scanComplete
+    } = await import('./results');
+
+    // 1. Browse paged results — filteredTotal picks up a large server total.
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [item({ title: 'Cached', url: 'cached' })], total: 340,
+      stats: { total: 340, missing: 340, upgrade: 0, library: 0 },
+      filtered_stats: { total: 340, missing: 340, upgrade: 0, library: 0 },
+      title_counts: {}
+    });
+    await loadResults(true);
+    expect(get(ft)).toBe(340);
+
+    // 2. Start a live scan that streams in a single result then completes.
+    scanResult(item({ title: 'Live', url: 'live', status: 'missing' }) as unknown as Record<string, unknown>);
+    expect(get(pagedMode)).toBe(false); // flips out of paged mode on first stream
+
+    // filteredTotal is untouched by the live path — still stuck at 340.
+    expect(get(ft)).toBe(340);
+    // But the live view genuinely has one item, so the gate must read "not empty".
+    expect(isResultsViewEmpty(get(pagedMode), get(fr).length, get(ft))).toBe(false);
+
+    // 3. Dismiss the only live item — the live view is now genuinely empty,
+    // and the OLD gate (`filteredTotal === 0`) could never detect this since
+    // filteredTotal is still 340. The fixed gate must catch it.
+    dismissedUrls.set(new Set(['live']));
+    expect(get(fr)).toEqual([]);
+    expect(get(ft)).toBe(340); // proves the staleness: still never reset
+    expect(isResultsViewEmpty(get(pagedMode), get(fr).length, get(ft))).toBe(true);
+
+    // Sanity: the OLD single-field check would have stayed stuck "not empty"
+    // here, which is exactly the bug this replaces.
+    expect(get(ft) === 0).toBe(false);
+
+    scanComplete({ stats: { total: 0, missing: 0, upgrade: 0, library: 0 } });
+  });
+
+  it('live mode with zero results and zero stale filteredTotal: gate reads empty (baseline, no regression)', () => {
+    expect(isResultsViewEmpty(false, 0, 0)).toBe(true);
+  });
+
+  it('paged mode with filteredTotal > 0 but no rows loaded yet: gate stays "not empty" (avoids a premature flash)', () => {
+    expect(isResultsViewEmpty(true, 0, 340)).toBe(false);
   });
 });

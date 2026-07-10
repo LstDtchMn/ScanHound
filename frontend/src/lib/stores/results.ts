@@ -500,15 +500,30 @@ export async function loadResults(reset: boolean): Promise<void> {
   }
 }
 
+/** Dismissal-only-filtered live-mode results: swiped-away ("skip") items
+ *  hidden, but no content filters (status/search/genre/resolution/date/etc.)
+ *  applied yet. Paged mode is a passthrough — the server-side query already
+ *  excludes dismissed rows (see backend _shape_results), so `results` there
+ *  is already dismissal-clean. This is the shared basis for both
+ *  `filteredResults` (dismissal + content filters) and, via
+ *  liveDismissalExcludedStats below, the live-mode "before" baseline for
+ *  hiddenByFiltersCount — so dismissing every item on a tab is never
+ *  mistaken for "hidden by filters" (dismissing isn't something Clear
+ *  Filters can undo). */
+const dismissalOnlyResults = derived(
+  [results, dismissedUrls, pagedMode],
+  ([$results, $dismissed, $paged]) => {
+    if ($paged || $dismissed.size === 0) return $results;
+    // Never dismiss items with an empty url (nothing to key the dismissal on).
+    return $results.filter((i) => !i.url || !$dismissed.has(i.url));
+  }
+);
+
 export const filteredResults = derived(
-  [results, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, dismissedUrls, categoryFilter, resolutionFilter, pagedMode, postedAfter, postedBefore],
-  ([$results, $filter, $search, $genre, $language, $sort, $quick, $dismissed, $category, $resolution, $paged, $postedAfter, $postedBefore]) => {
-    if ($paged) return $results; // server already filtered + sorted
-    let items = $results;
-    // Hide swiped-away ("skip") items everywhere they'd otherwise appear.
-    if ($dismissed.size > 0) {
-      items = items.filter((i) => !i.url || !$dismissed.has(i.url));
-    }
+  [dismissalOnlyResults, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, categoryFilter, resolutionFilter, pagedMode, postedAfter, postedBefore],
+  ([$items, $filter, $search, $genre, $language, $sort, $quick, $category, $resolution, $paged, $postedAfter, $postedBefore]) => {
+    if ($paged) return $items; // server already filtered + sorted (+ dismissal excluded)
+    let items = $items;
     // Source-category toggles (4K/Remux/TV). The backend tags each item with its
     // crawl category; for items predating that (legacy cache, site search) we
     // infer one — TV packs carry a season, everything else is treated as 4K
@@ -621,18 +636,58 @@ export const filteredStats = derived(
     $paged ? $serverFilteredStats : computeStatusCounts($filteredResults)
 );
 
+/** Live-mode dismissal-excluded, pre-content-filter status breakdown — the
+ *  live-mode counterpart to the server's `stats` field in paged mode (which
+ *  is already post-dismissal-filter; see filteredStats above). Used as the
+ *  "before" side of hiddenByFiltersCount in live mode instead of the raw
+ *  `stats` store, which is never dismissal-filtered there (handleScanResult/
+ *  handleScanComplete populate it straight from the scanner, and dismissing/
+ *  restoring never touches it). Without this, a tab where every match was
+ *  swiped away would stay permanently "hidden by filters" with a Clear
+ *  Filters button that does nothing, since clearAllFilters() never touches
+ *  dismissedUrls. */
+const liveDismissalExcludedStats = derived(dismissalOnlyResults, ($items) => computeStatusCounts($items));
+
 /** How many items for the ACTIVE status tab exist but are hidden by the
  *  current content filters (resolution/genre/language/date/search) — 0 both
  *  when filters aren't hiding anything and (correctly) when there's
- *  genuinely nothing to show. Drives the "0 shown — N hidden by filters"
+ *  genuinely nothing to show. In paged mode the baseline is the server's
+ *  (post-dismissal) `stats`; in live mode it's liveDismissalExcludedStats
+ *  above, for the same reason — either way, only content-filterable items
+ *  count, never dismissed ones. Drives the "0 shown — N hidden by filters"
  *  empty-state self-diagnosis; see clearAllFilters for the escape hatch. */
 export const hiddenByFiltersCount = derived(
-  [stats, filteredStats, statusFilter],
-  ([$stats, $filteredStats, $statusFilter]) => {
+  [stats, filteredStats, statusFilter, pagedMode, liveDismissalExcludedStats],
+  ([$stats, $filteredStats, $statusFilter, $paged, $liveStats]) => {
     const key: keyof ScanStats = $statusFilter === 'all' ? 'total' : $statusFilter;
-    return Math.max(0, $stats[key] - $filteredStats[key]);
+    const baseline = $paged ? $stats : $liveStats;
+    return Math.max(0, baseline[key] - $filteredStats[key]);
   }
 );
+
+/** True when the current results view (live or paged) has nothing to show —
+ *  the shared "is the view empty" check behind the self-diagnosing empty
+ *  state in both +page.svelte and MobileScanView.svelte. Exported as a pure
+ *  function (rather than left inline in each component) so both consumers
+ *  can never drift apart, and so the fix is directly unit-testable.
+ *
+ *  `filteredResultsLength` alone is authoritative in live mode: filteredResults
+ *  always holds the complete, currently-filtered set there. In paged mode it
+ *  may hold only the loaded page(s), so `filteredTotalValue` (the server's
+ *  full-match count) is also required — but ONLY in paged mode:
+ *  `filteredTotal` is never written by the live-scan handlers
+ *  (handleScanResult/handleScanComplete/clearResults), so after a paged→live
+ *  transition it can be stuck at a stale prior value (e.g. 340 from a prior
+ *  browse session) that would otherwise wedge this check permanently shut,
+ *  hiding the "0 shown — N hidden by filters" message even when the live
+ *  view is genuinely empty. */
+export function isResultsViewEmpty(
+  paged: boolean,
+  filteredResultsLength: number,
+  filteredTotalValue: number
+): boolean {
+  return filteredResultsLength === 0 && (!paged || filteredTotalValue === 0);
+}
 
 /** True for items the swipe deck should present — actionable (missing/upgrade)
  *  releases that have a source URL and aren't already selected. Selected items

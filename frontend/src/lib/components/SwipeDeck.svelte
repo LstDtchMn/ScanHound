@@ -2,7 +2,7 @@
   import {
     deckGroups, results, selectedKeys, selectedDetail,
     dismissItem, restoreItem, toggleSelect, deselectAll,
-    deckNeedsMore, loadResults
+    deckNeedsMore, loadResults, hiddenByFiltersCount, clearAllFilters
   } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
@@ -334,6 +334,19 @@
         <div class="text-4xl">🎉</div>
         <p class="text-sm font-medium text-[var(--text-primary)]">All caught up</p>
         <p class="text-xs text-[var(--text-secondary)] max-w-xs">No more items to triage. Run a scan or adjust filters to find more. Selected items are queued below.</p>
+        {#if $hiddenByFiltersCount > 0}
+          <!-- Same bug class as the list views' "0 shown — N hidden by
+               filters" self-diagnosis (results.ts), lighter touch: the deck
+               layers additional actionable-only/already-selected exclusion
+               on top of filteredResults, so an exact count here would often
+               be wrong — this is just a boolean-ish hint + the same escape
+               hatch. -->
+          <p class="text-xs text-[var(--text-secondary)] opacity-70">Some items may be hidden by your filters.</p>
+          <button
+            onclick={() => clearAllFilters()}
+            class="px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-[var(--accent)] hover:opacity-90 transition-opacity"
+          >Clear filters</button>
+        {/if}
       </div>
     {/if}
   </div>

@@ -9,7 +9,7 @@
   import ResultActionSheet from '$lib/components/ResultActionSheet.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
   import SwipeDeck from '$lib/components/SwipeDeck.svelte';
-  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS, loadResults, hasMore, loadingMore, loadError, filteredTotal, titleCounts, pagedMode, statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy, hiddenByFiltersCount, clearAllFilters } from '$lib/stores/results';
+  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS, loadResults, hasMore, loadingMore, loadError, filteredTotal, titleCounts, pagedMode, statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy, hiddenByFiltersCount, clearAllFilters, isResultsViewEmpty } from '$lib/stores/results';
   import { mobile } from '$lib/stores/media';
   import { addToast } from '$lib/stores/notifications';
   import { get } from 'svelte/store';
@@ -574,7 +574,10 @@
     </div>
   {/if}
 
-  {#if $filteredTotal === 0 && $filteredResults.length === 0 && $scanState === 'idle'}
+  <!-- See isResultsViewEmpty (results.ts) for why this isn't just
+       $filteredTotal === 0 — that alone can get stuck after a paged→live
+       transition and permanently hide this empty state. -->
+  {#if isResultsViewEmpty($pagedMode, $filteredResults.length, $filteredTotal) && $scanState === 'idle'}
     <div class="flex flex-col items-center justify-center min-h-[16rem] py-8 gap-4">
       {#if $results.length > 0}
         <!-- Had results but filter hides them all -->

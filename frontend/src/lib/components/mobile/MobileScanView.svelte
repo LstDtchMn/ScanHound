@@ -3,8 +3,9 @@
   import {
     filteredResults, filteredTotal, titleCounts, pagedMode, hasMore, loadingMore,
     loadResults, handleReconnectSnapshot, phoneColumns, mobileChromeCollapsed,
-    dismissItem, restoreItem, hiddenByFiltersCount, clearAllFilters
+    dismissItem, restoreItem, hiddenByFiltersCount, clearAllFilters, isResultsViewEmpty
   } from '$lib/stores/results';
+  import { scanState } from '$lib/stores/scanner';
   import { onMount } from 'svelte';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
@@ -139,7 +140,8 @@
       <div class="w-5 h-5 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin"></div>
     </div>
   {/if}
-  {#if $filteredTotal === 0}
+  <!-- Same gate as desktop (+page.svelte) — see isResultsViewEmpty (results.ts). -->
+  {#if isResultsViewEmpty($pagedMode, $filteredResults.length, $filteredTotal) && $scanState === 'idle'}
     {#if $hiddenByFiltersCount > 0}
       <!-- Self-diagnosis: matches exist for this tab, filters are hiding them
            all — see hiddenByFiltersCount / clearAllFilters (results.ts). -->
