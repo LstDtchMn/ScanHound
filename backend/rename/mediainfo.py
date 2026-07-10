@@ -23,19 +23,44 @@ _AUDIO_LABEL = {"truehd": "TrueHD", "eac3": "EAC3", "ac3": "AC3", "dts": "DTS",
 
 
 def _res_label(width: Optional[int], height: Optional[int]) -> Optional[str]:
-    h = height or 0
+    """Classify a video's resolution tier primarily from WIDTH. An
+    aspect-ratio crop (2.39:1 scope masters etc.) shrinks HEIGHT without
+    changing the true resolution tier, so keying off height alone
+    misclassifies them: a cropped 4K release (3840x1600) would read as
+    "1440p" and a cropped 1080p rip (1920x800) would read as "720p". Height
+    is used only as a fallback when width is unavailable. Fail-safe: None
+    when neither dimension is known."""
     w = width or 0
-    key = h if h else (w * 9 // 16 if w else 0)
+    if w:
+        if w >= 3000:
+            return "2160p"
+        if w >= 2000:
+            return "1440p"
+        if w >= 1600:
+            return "1080p"
+        if w >= 1100:
+            return "720p"
+        if w >= 640:
+            return "480p"
+        return None
+    h = height or 0
     for floor, label in _RES_LADDER:
-        if key >= floor:
+        if h >= floor:
             return label
     return None
 
 
-def _cached_dv_layer(path: str, size: Optional[int], db) -> Optional[str]:
-    if db is None:
+def _cached_dv_layer(path: str, mtime: Optional[float], size: Optional[int], db) -> Optional[str]:
+    """Return the cached DV layer for ``path`` ONLY if the cache's stored
+    (mtime, size) signature still matches the file on disk. Without this
+    check, a stale dv_scan row (keyed by path) would keep reporting the OLD
+    occupant's layer after that path is overwritten by a different file (e.g.
+    an Overwrite conflict-resolution) — silently mislabeling the new file."""
+    if db is None or mtime is None or size is None:
         return None
     try:
+        if not db.dv_scan_is_current(path, mtime, size):
+            return None
         row = db.get_dv_scan(path)
         if not row or not row.get("dv_layer"):
             return None
@@ -75,6 +100,15 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         size = int(fmt.get("size")) if fmt.get("size") else os.path.getsize(path)
     except (TypeError, ValueError, OSError):
         size = None
+    # On-disk (mtime, size) signature — used ONLY to validate the dv_scan
+    # cache (dv_scan_is_current), independent of the ffprobe-reported size
+    # above, so a stale cache entry from a since-overwritten file is detected
+    # even if ffprobe's container size happens to coincide.
+    try:
+        _st = os.stat(path)
+        disk_mtime, disk_size = _st.st_mtime, _st.st_size
+    except OSError:
+        disk_mtime, disk_size = None, None
     try:
         dur = float(fmt.get("duration")) if fmt.get("duration") else None
         duration_min = round(dur / 60) if dur and dur > 0 else None
@@ -113,5 +147,6 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         "container": (fmt.get("format_name") or None),
         "duration_min": duration_min, "bitrate": bitrate,
         "resolution": resolution, "video_codec": vcodec, "hdr": hdr,
-        "dv_layer": _cached_dv_layer(path, size, db), "audio": audio_label,
+        "dv_layer": _cached_dv_layer(path, disk_mtime, disk_size, db),
+        "audio": audio_label,
     }

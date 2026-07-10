@@ -58,13 +58,13 @@ def _quality_score(job: dict) -> tuple:
 
     res = str(job.get("resolution") or "").lower()
     if not res:  # fall back to filename if the column wasn't set
-        for r in ("2160p", "1080p", "720p", "480p"):
+        for r in ("2160p", "1440p", "1080p", "720p", "480p"):
             if r in name:
                 res = r
                 break
         if "2160" not in res and ("4k" in name or "uhd" in name):
             res = "2160p"
-    res_rank = {"2160p": 4, "1080p": 3, "720p": 2, "480p": 1}.get(res, 0)
+    res_rank = {"2160p": 5, "1440p": 4, "1080p": 3, "720p": 2, "480p": 1}.get(res, 0)
 
     # Explicit probed DV layer (from probe_specs) outranks the binary filename DV
     # bit; absent → 0 so pure-filename callers are unchanged.
@@ -80,10 +80,14 @@ def _quality_score(job: dict) -> tuple:
     if dv_layer_rank:
         dv = 1
     explicit_hdr = job.get("hdr")
-    if explicit_hdr:
-        hdr = 0 if explicit_hdr in (None,) else 1
-    else:
-        hdr = 1 if _re.search(r"\bhdr(10)?(\+|plus)?\b|\bhlg\b", name) else 0
+    # A probed hdr of "Dolby Vision" (ffprobe DOVI side_data) is real DV even
+    # when the file hasn't been dovi_tool-scanned yet (no cached dv_layer) —
+    # force the bit so an uncached-but-genuine-DV library file isn't outranked
+    # by a tag-rich but lower-quality rival on the dv bit alone.
+    if explicit_hdr == "Dolby Vision":
+        dv = 1
+    hdr = 1 if explicit_hdr else (
+        1 if _re.search(r"\bhdr(10)?(\+|plus)?\b|\bhlg\b", name) else 0)
 
     if _re.search(r"\bremux\b", name):
         source = 4
