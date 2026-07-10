@@ -26,6 +26,7 @@ from backend.rename import dv_detect as _dv
 from backend.rename import fileops as _fileops
 from backend.rename import llm_identify as _llm
 from backend.rename import naming as _naming
+from backend.rename.mediainfo import probe_specs
 # Re-exported for backwards compatibility — these were moved out of this
 # module (C5 decomposition) into their own pure, DB-free siblings, but
 # callers (backend/api/routes/rename.py, tests) still import them from
@@ -37,6 +38,7 @@ from backend.rename.conflicts import (  # noqa: F401
     recommend_keep,
     destination_conflict_ids,
     conflict_annotations,
+    rank_conflict,
 )
 from backend.rename.episodes import (  # noqa: F401
     _try_episode_rescan,
@@ -1477,6 +1479,40 @@ class RenameService:
                        f"Settings → Renaming before applying")
         return {"new_filename": fname, "destination_path": dest,
                 "library_configured": lib_set, "warning": warning}
+
+    def conflict_preview(self, job_id: int) -> dict:
+        """Two-file spec comparison for a destination conflict, WITHOUT
+        persisting anything (mirrors rematch_preview's no-commit pattern).
+
+        ``existing`` is the probed file already on disk at the job's would-be
+        destination (or a {present: False} spec if nothing's there yet);
+        ``incoming`` is the probed source file. The recommendation judges
+        probed technical specs (see rank_conflict) rather than filenames, so a
+        Plex-renamed library file (tags stripped) isn't unfairly beaten by a
+        tag-rich but lower-quality incoming release.
+        """
+        db = self._db
+        job = db.get_rename_job(job_id) if db else None
+        if not job:
+            return {"existing": None, "incoming": None,
+                    "recommended": None, "reason": "Job not found"}
+        dest_dir = job.get("destination_path") or ""
+        dst = (os.path.join(dest_dir, job.get("new_filename")
+                            or os.path.basename(job.get("original_path") or ""))
+               if dest_dir else None)
+        incoming = probe_specs(job.get("original_path"), db=db) or {
+            "present": os.path.exists(job.get("original_path") or ""),
+            "path": job.get("original_path")}
+        incoming["original_filename"] = job.get("original_filename")
+        incoming["resolution"] = incoming.get("resolution") or job.get("resolution")
+        if dst and os.path.lexists(dst):
+            existing = probe_specs(dst, db=db) or {"present": True, "path": dst}
+            existing["original_filename"] = os.path.basename(dst)
+        else:
+            existing = {"present": False, "path": dst}
+        rec = rank_conflict(existing, {**incoming, "id": job_id})
+        return {"existing": existing, "incoming": incoming,
+                "recommended": rec["recommended"], "reason": rec["reason"]}
 
     def backfill_posters(self, limit: int = 200) -> dict:
         """Fill poster_path on jobs that predate poster capture (2026-07-04).

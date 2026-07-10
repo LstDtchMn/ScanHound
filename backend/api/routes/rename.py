@@ -267,6 +267,14 @@ def rematch_preview(job_id: int, body: RematchPreviewRequest,
         season=body.season, episode=body.episode)
 
 
+@router.post("/jobs/{job_id}/conflict-preview")
+def conflict_preview(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
+    """Two-file spec comparison (existing on-disk file vs incoming) for a
+    destination conflict, with a recommendation. No body, no persistence —
+    mirrors rematch-preview's read-only pattern."""
+    return _service(reg).conflict_preview(job_id)
+
+
 @router.post("/jobs/{job_id}/accept-combined")
 def accept_combined(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
     """Accept a combined-episode detection proposal — promotes job to matched."""
