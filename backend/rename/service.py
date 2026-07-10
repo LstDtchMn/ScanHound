@@ -742,6 +742,38 @@ class RenameService:
         finally:
             self._bulk_lock.release()
 
+    def scan_conflict_dv(self, job_id: int) -> dict:
+        """Detect + cache the DV FEL/MEL layer of a conflict's two files (incoming
+        source + existing destination). Reuses dv_detect + the dv_scan cache.
+        Intended to run on a background thread (see the route)."""
+        db = self._db
+        job = db.get_rename_job(job_id) if db else None
+        if not job:
+            return {"error": "Job not found", "scanned": 0}
+        if not _dv.available():
+            return {"error": "dovi_tool is not installed in this build", "scanned": 0}
+        dest_dir = job.get("destination_path") or ""
+        dst = os.path.join(dest_dir, job.get("new_filename")
+                           or os.path.basename(job.get("original_path") or "")) \
+            if dest_dir else None
+        paths = [p for p in (job.get("original_path"), dst)
+                 if p and os.path.isfile(p)]
+        scanned = 0
+        for path in paths:
+            try:
+                st = os.stat(path)
+                if db.dv_scan_is_current(path, st.st_mtime, st.st_size):
+                    continue
+                layer = _dv.detect_layer(path).get("layer", _dv.LAYER_UNKNOWN)
+                title = parse_filename(os.path.basename(path)).get("title") or None
+                db.upsert_dv_scan(path, layer, title=title,
+                                  sig_mtime=st.st_mtime, sig_size=st.st_size,
+                                  source="scan")
+                scanned += 1
+            except Exception:
+                logger.exception("scan_conflict_dv failed on %s", path)
+        return {"job_id": job_id, "scanned": scanned}
+
     def reidentify(self, job_id: int) -> dict:
         """Re-run identification for an existing (not-yet-applied) job — re-matches
         the same source file with the current matcher and replaces the job. Lets

@@ -275,6 +275,25 @@ def conflict_preview(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
     return _service(reg).conflict_preview(job_id)
 
 
+@router.post("/jobs/{job_id}/scan-dv-conflict")
+def scan_dv_conflict(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
+    """On-demand Dolby Vision FEL/MEL scan of a conflict's two files (incoming
+    source + existing destination). Slow (an RPU walk per file), so it runs in
+    the background and broadcasts the result over the WebSocket — mirrors
+    dv-scan-folder's fire-and-forget pattern, scoped to one job's two files."""
+    svc = _service(reg)
+
+    def _run():
+        try:
+            result = svc.scan_conflict_dv(job_id)
+            ws_manager.broadcast_sync({"type": "dv:scan_done", "data": result})
+        except Exception:
+            logger.exception("scan-dv-conflict failed")
+
+    threading.Thread(target=_run, name="scan-dv-conflict", daemon=True).start()
+    return {"status": "scanning", "job_id": job_id}
+
+
 @router.post("/jobs/{job_id}/accept-combined")
 def accept_combined(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
     """Accept a combined-episode detection proposal — promotes job to matched."""
