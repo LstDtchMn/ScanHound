@@ -7,6 +7,18 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.25.0",
+    date: "2026-07-10",
+    summary: "Pipeline Tracker: see what never made it to Plex",
+    changes: [
+      "New Pipeline page tracks every grab all the way through download, extraction, and renaming to Plex — and flags the ones that stalled: never started, download failed, rename failed, or renamed but never showed up in Plex.",
+      "Each stalled item gets a 'Re-grab' button (retries the same links) and a 'Search sources' button that looks across your other configured sites for an alternative release to grab instead.",
+      "Verified items are marked done automatically once Plex actually has the file — checked hourly in the background, so nothing needs a manual refresh.",
+      "Dismiss hides an item for good; everything else keeps re-checking itself as your library changes.",
+      "On mobile, Pipeline is a tab inside Downloads (Queue / Pipeline switch) instead of a separate nav entry.",
+    ],
+  },
+  {
     version: "2.24.1",
     date: "2026-07-10",
     summary: "Duplicate downloads now coexist and cancel individually",
