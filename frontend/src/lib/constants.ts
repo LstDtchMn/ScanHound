@@ -141,7 +141,9 @@ export function resolutionLabel(res: string | null | undefined): string {
 /** Rank a resolution for "is this an upgrade?" comparisons (higher = better).
  *  Shared by the row-level and group-level owned-version comparison so they
  *  can't drift apart. */
-const RES_RANK: Record<string, number> = { '4k': 3, '2160p': 3, '1080p': 2, '720p': 1, '480p': 0 };
+const RES_RANK: Record<string, number> = {
+  '4k': 4, '2160p': 4, '1440p': 3, '1080p': 2, '720p': 1, '480p': 0,
+};
 export function resolutionRank(res: string | null | undefined): number {
   return RES_RANK[(res ?? '').toLowerCase()] ?? 0;
 }

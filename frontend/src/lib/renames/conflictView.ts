@@ -44,7 +44,7 @@ function hdrLabel(spec: FileSpec | null | undefined): string {
 }
 
 const HDR_RANK: Record<string, number> = {
-  'dolby vision': 3, 'hdr10+': 2, hdr10: 2, hdr: 1, sdr: 0,
+  'dolby vision': 4, 'hdr10+': 3, hdr10: 3, hlg: 2, hdr: 1, sdr: 0,
 };
 function hdrRank(spec: FileSpec | null | undefined): number | null {
   if (!spec || !spec.present) return null;

@@ -63,6 +63,23 @@ describe('specRows', () => {
     expect(row.better).toBe('existing');
   });
 
+  it('HDR / DV row: ranks HLG over SDR (not treated as SDR)', () => {
+    const hlg = spec({ resolution: '2160p', hdr: 'HLG' });
+    const sdr = spec({ resolution: '2160p', hdr: null });
+    const row = specRows(hlg, sdr)[1];
+    expect(row.existing).toBe('HLG');
+    expect(row.incoming).toBe('SDR');
+    expect(row.better).toBe('existing');
+  });
+
+  it('HDR / DV row: ranks Dolby Vision and HDR10 over HLG', () => {
+    const dv = spec({ hdr: 'Dolby Vision', dv_layer: 'p8' });
+    const hdr10 = spec({ hdr: 'HDR10' });
+    const hlg = spec({ hdr: 'HLG' });
+    expect(specRows(dv, hlg)[1].better).toBe('existing');
+    expect(specRows(hdr10, hlg)[1].better).toBe('existing');
+  });
+
   it('Video / Audio rows carry raw values with no better-side verdict', () => {
     const rows = specRows(existing, incoming);
     const video = rows.find((r) => r.label === 'Video')!;

@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { confidenceVariant, renameStatusVariant, renameStatusBorderColor, dvLayerVariant } from './constants';
+import { confidenceVariant, renameStatusVariant, renameStatusBorderColor, dvLayerVariant, resolutionRank } from './constants';
 
 describe('confidenceVariant', () => {
   it('is success at and above 95', () => {
@@ -51,6 +51,20 @@ describe('renameStatusBorderColor', () => {
   });
   it('returns border color for null (default branch)', () => {
     expect(renameStatusBorderColor(null)).toBe('var(--border)');
+  });
+});
+
+describe('resolutionRank', () => {
+  it('orders 480p < 720p < 1080p < 1440p < 2160p/4k', () => {
+    expect(resolutionRank('480p')).toBeLessThan(resolutionRank('720p'));
+    expect(resolutionRank('720p')).toBeLessThan(resolutionRank('1080p'));
+    expect(resolutionRank('1080p')).toBeLessThan(resolutionRank('1440p'));
+    expect(resolutionRank('1440p')).toBeLessThan(resolutionRank('2160p'));
+    expect(resolutionRank('2160p')).toBe(resolutionRank('4k'));
+  });
+  it('unknown/null resolution falls back to the lowest rank (0)', () => {
+    expect(resolutionRank(null)).toBe(0);
+    expect(resolutionRank('?')).toBe(0);
   });
 });
 
