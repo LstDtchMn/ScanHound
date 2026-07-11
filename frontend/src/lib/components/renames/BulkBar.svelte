@@ -1,11 +1,19 @@
 <script lang="ts">
   import {
-    selectedJobIds, selectAll, clearSelection, bulkBusy,
+    selectedJobIds, selectAll, clearSelection, bulkBusy, applyActive,
     bulkApply, bulkReidentify, bulkDelete, bulkSetDestination, applyConfident
   } from '$lib/stores/renames';
   import { settings } from '$lib/stores/settings';
 
   let { shownIds }: { shownIds: number[] } = $props();
+
+  // Disable every apply-triggering control while a bulk apply is already
+  // running ($applyActive), on top of the existing $bulkBusy gate (which
+  // only covers this component's own fire-and-forget POST) — otherwise a
+  // second bulk apply could be started from here while one is still in
+  // flight (the server now rejects the overlap as "busy", but the control
+  // shouldn't be clickable in the first place).
+  let controlsDisabled = $derived($bulkBusy || $applyActive);
 
   // Build root options from configured settings — send the ACTUAL path strings.
   let roots = $derived.by(() => {
@@ -66,20 +74,20 @@
     <div class="flex flex-wrap items-center gap-1 ml-auto">
       <button
         class="px-2 py-1 rounded text-[11px] font-medium bg-[var(--accent)] text-white disabled:opacity-50"
-        disabled={$bulkBusy}
+        disabled={controlsDisabled}
         onclick={bulkApply}
       >Apply</button>
 
       <button
         class="px-2 py-1 rounded text-[11px] font-medium bg-[var(--bg-tertiary)] disabled:opacity-50"
-        disabled={$bulkBusy}
+        disabled={controlsDisabled}
         onclick={bulkReidentify}
       >Re-identify</button>
 
       <div class="relative">
         <button
           class="px-2 py-1 rounded text-[11px] font-medium bg-[var(--bg-tertiary)] disabled:opacity-50"
-          disabled={$bulkBusy}
+          disabled={controlsDisabled}
           aria-label="Set destination"
           onclick={() => (destOpen = !destOpen)}
         >Set destination ▾</button>
@@ -99,7 +107,7 @@
               </select>
               <button
                 class="px-2 py-1 rounded text-[11px] font-medium bg-[var(--accent)] text-white"
-                disabled={$bulkBusy}
+                disabled={controlsDisabled}
                 onclick={applyDest}
               >Apply destination</button>
             {:else}
@@ -114,14 +122,14 @@
 
       <button
         class="px-2 py-1 rounded text-[11px] font-medium bg-[var(--success)]/15 text-[var(--success)] disabled:opacity-50"
-        disabled={$bulkBusy}
+        disabled={controlsDisabled}
         title="Applies only matched jobs with confidence ≥ 95%; needs_review / low-confidence are skipped"
         onclick={() => applyConfident([...$selectedJobIds])}
       >Apply confident</button>
 
       <button
         class="px-2 py-1 rounded text-[11px] font-medium bg-[var(--error)]/15 text-[var(--error)] disabled:opacity-50"
-        disabled={$bulkBusy}
+        disabled={controlsDisabled}
         onclick={confirmDelete}
       >Delete</button>
     </div>

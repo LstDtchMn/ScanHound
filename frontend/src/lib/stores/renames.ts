@@ -125,6 +125,14 @@ export function bulkApply() {
     // Applies are queued server-side (cross-device moves can take minutes);
     // each job reports back over the rename:job WS event as it lands.
     const r = await api.bulkApply(ids);
+    if (r.busy) {
+      // The apply-triggering controls are disabled while $applyActive is
+      // true, so this should be unreachable from a single tab — but stays
+      // as a clear fallback (e.g. a second tab) rather than a confusing
+      // "Applying 0 in background" toast.
+      addToast('Apply already running', 'Another apply is in progress — try again once it finishes.', 'warning');
+      return;
+    }
     addToast(
       `Applying ${r.queued ?? 0} in background`,
       r.skipped ? `${r.skipped} skipped (already applied/in progress)` : 'Progress updates live',
@@ -159,6 +167,13 @@ export async function applyConfident(ids?: number[]) {
   bulkBusy.set(true);
   try {
     const r = await api.applyConfident(ids);
+    if (r.busy) {
+      // Same fallback as bulkApply() above — the "Apply all confident"
+      // control is disabled while $applyActive is true, so this is
+      // normally unreachable from a single tab.
+      addToast('Apply already running', 'Another apply is in progress — try again once it finishes.', 'warning');
+      return;
+    }
     addToast(
       `Applying ${r.queued ?? 0} confident in background`,
       `${r.skipped ?? 0} skipped — progress updates live`,
@@ -216,11 +231,25 @@ export const renameProgress = writable<Map<number, RenameProgress>>(new Map());
 export interface RenameQueueProgress { done: number; total: number; current_title: string | null; }
 export const renameQueue = writable<RenameQueueProgress | null>(null);
 
+// True whenever a bulk apply run is active (renameQueue is non-null, including
+// the brief post-completion "100%" flash — see the rename:queue_progress
+// handler below). Drives the disabled state of every apply-triggering control
+// (BulkBar's Apply/Apply confident/Set destination/Re-identify/Delete,
+// StatusDashboard's "Apply all confident" link) so a second bulk-apply run can
+// never be started from the UI while one is already in flight. The backend
+// (RenameService.queue_apply) is the real, authoritative guard against
+// overlap — this is purely a UX nicety to keep the buttons from firing a
+// request that the server would just reject as busy.
+export const applyActive = derived(renameQueue, ($q) => $q !== null);
+
 // True from a "Stop applying" click until the queue actually clears — drives
 // the Stop button's disabled/"Stopping…" state. The cancel POST returns
 // immediately; the queue keeps running until its in-flight file finishes, so
-// this stays true until the queueClearTimer below fires (same "done" signal
-// the progress bar itself waits for).
+// this is reset the moment the queue's completion broadcast (active:false)
+// arrives — see the rename:queue_progress handler below. It does not wait on
+// the queueClearTimer's 1500ms "100%" flash, so the Stop button (and the
+// apply-triggering controls gated on applyActive above) can't be left stuck
+// disabled/"Stopping…" any longer than the run actually takes.
 export const applyCancelling = writable<boolean>(false);
 
 connection.on('rename:progress', (data) => {
@@ -242,11 +271,17 @@ connection.on('rename:queue_progress', (data) => {
   const active = !!data.active;
   clearTimeout(queueClearTimer);
   if (!active) {
+    // The run is over (normal completion or a cancel) — reset the Stop
+    // button/apply-triggering-controls gate immediately rather than waiting
+    // on the cosmetic flash timer below. The backend now allows only one
+    // bulk-apply run at a time (RenameService.queue_apply's _bulk_lock
+    // guard), so there's no second run left that could still need
+    // cancelling by the time this broadcast arrives.
+    applyCancelling.set(false);
     // Brief "100%" flash, then clear the queue bar.
     renameQueue.set({ done: (data.done as number) ?? 0, total: (data.total as number) ?? 0, current_title: null });
     queueClearTimer = setTimeout(() => {
       renameQueue.set(null);
-      applyCancelling.set(false);
     }, 1500);
     return;
   }

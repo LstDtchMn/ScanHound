@@ -181,6 +181,29 @@ class TestRenameApi:
     def test_apply_unknown_job_is_400(self, client):
         assert client.post("/rename/jobs/99999/apply").status_code == 400
 
+    def test_apply_cancel_endpoint_returns_ok(self, client):
+        # Idle case (nothing running) — cancel_apply() is harmless to call
+        # and always reports ok.
+        r = client.post("/rename/apply/cancel")
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+    def test_apply_cancel_endpoint_calls_service_cancel_apply(self, client, monkeypatch):
+        # Wiring check: the route must delegate to RenameService.cancel_apply,
+        # not reimplement flag-setting itself.
+        import backend.rename.service as svc_mod
+        calls = []
+
+        def _fake_cancel(self):
+            calls.append(True)
+            return {"ok": True}
+
+        monkeypatch.setattr(svc_mod.RenameService, "cancel_apply", _fake_cancel)
+        r = client.post("/rename/apply/cancel")
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+        assert calls == [True]
+
     def test_apply_then_undo_via_api(self, client, tmp_path):
         src = tmp_path / "src.mkv"; src.write_text("x")
         dest = tmp_path / "lib"

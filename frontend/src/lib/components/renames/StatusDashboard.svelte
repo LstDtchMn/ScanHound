@@ -1,6 +1,6 @@
 <script lang="ts">
   import StatCard from './StatCard.svelte';
-  import { renameStatus, dvCounts, applyConfident, loadDvScans } from '$lib/stores/renames';
+  import { renameStatus, dvCounts, applyConfident, loadDvScans, applyActive } from '$lib/stores/renames';
   import { dvLayerColor } from '$lib/constants';
   import { browser } from '$app/environment';
   import { onMount } from 'svelte';
@@ -49,7 +49,9 @@
       onclick={() => toggle('matched')}
     />
     <button
-      class="text-[11px] font-medium text-[var(--accent)] hover:underline px-1 text-left"
+      class="text-[11px] font-medium text-[var(--accent)] hover:underline px-1 text-left
+        disabled:opacity-50 disabled:no-underline disabled:cursor-not-allowed"
+      disabled={$applyActive}
       onclick={() => applyConfident()}
       title="Apply every matched job with confidence ≥ 95% across the page"
     >

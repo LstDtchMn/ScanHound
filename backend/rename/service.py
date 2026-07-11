@@ -1725,107 +1725,136 @@ class RenameService:
         finishes (never a partial move), and every job that hadn't started
         yet is reverted from 'applying' back to its prior status instead of
         being left stuck.
+
+        Only one bulk-apply run may be active at a time. ``_bulk_lock`` is
+        claimed right here, in the calling (request) thread, via a
+        non-blocking acquire — BEFORE the cancel flag is cleared or any job
+        is marked 'applying' — so a second call arriving while a run is
+        still active is atomically rejected with ``busy: True`` (the same
+        shape ``bulk_apply``/``bulk_reidentify``/etc. already return) and
+        never touches the first run's cancel flag or its jobs. Ownership of
+        the lock then passes to the background worker thread, which
+        releases it in a ``finally`` on every exit path (normal completion,
+        cancel-break, or a crash inside the loop) so the guard can never
+        wedge "busy" forever. (``_bulk_lock`` is a plain ``threading.Lock``,
+        not thread-owned, so handing it off across threads like this is
+        safe.)
         """
         db = self._db
         if db is None:
             return {"ok": False, "queued": 0, "skipped": 0,
                     "error": "Database unavailable"}
-        # A fresh apply run must never inherit a cancel flag left set by a
-        # previous (already-finished) run's "Stop applying" click.
-        self._apply_cancel.clear()
-        if ids is not None:
-            jobs = [db.get_rename_job(int(j)) for j in ids or []]
-            jobs = [j for j in jobs if j]
-        else:
-            jobs = db.list_rename_jobs(limit=100000) or []
+        if not self._bulk_lock.acquire(blocking=False):
+            return {"ok": False, "queued": 0, "skipped": 0, "busy": True}
+        release_lock = True
+        try:
+            # A fresh apply run must never inherit a cancel flag left set by
+            # a previous (already-finished) run's "Stop applying" click.
+            # Safe to clear only now that this run has exclusively claimed
+            # the guard — no other run is active to have its flag stolen.
+            self._apply_cancel.clear()
+            if ids is not None:
+                jobs = [db.get_rename_job(int(j)) for j in ids or []]
+                jobs = [j for j in jobs if j]
+            else:
+                jobs = db.list_rename_jobs(limit=100000) or []
 
-        eligible, skipped = [], 0
-        for job in jobs:
-            status = job.get("status")
-            conf = job.get("match_confidence") or 0.0
-            if status in ("applied", "applying"):
-                skipped += 1
-                continue
-            if confident_only and (status != "matched" or conf < 95):
-                skipped += 1
-                continue
-            if not confident_only and status not in ("matched", "needs_review"):
-                skipped += 1
-                continue
-            eligible.append(int(job["id"]))
+            eligible, skipped = [], 0
+            for job in jobs:
+                status = job.get("status")
+                conf = job.get("match_confidence") or 0.0
+                if status in ("applied", "applying"):
+                    skipped += 1
+                    continue
+                if confident_only and (status != "matched" or conf < 95):
+                    skipped += 1
+                    continue
+                if not confident_only and status not in ("matched", "needs_review"):
+                    skipped += 1
+                    continue
+                eligible.append(int(job["id"]))
 
-        if not eligible:
-            return {"ok": True, "queued": 0, "skipped": skipped}
+            if not eligible:
+                return {"ok": True, "queued": 0, "skipped": skipped}
 
-        for job in jobs:
-            if int(job["id"]) not in set(eligible):
-                continue
-            try:
-                # Remember the status we're leaving so crash recovery restores it
-                # (a needs_review job must not come back as auto-appliable 'matched').
-                db.update_rename_job(int(job["id"]), status="applying",
-                                     prior_status=job.get("status"))
-                self._broadcast(int(job["id"]))
-            except Exception:
-                logger.exception("queue_apply: could not mark job %s applying", job.get("id"))
+            for job in jobs:
+                if int(job["id"]) not in set(eligible):
+                    continue
+                try:
+                    # Remember the status we're leaving so crash recovery restores it
+                    # (a needs_review job must not come back as auto-appliable 'matched').
+                    db.update_rename_job(int(job["id"]), status="applying",
+                                         prior_status=job.get("status"))
+                    self._broadcast(int(job["id"]))
+                except Exception:
+                    logger.exception("queue_apply: could not mark job %s applying", job.get("id"))
 
-        def _worker(job_ids: list) -> None:
-            # Serialize with other bulk operations; blocking here is fine —
-            # we're on a daemon thread, not an HTTP request.
-            total = len(job_ids)
-            cancelled_at = None
-            with self._bulk_lock:
-                for idx, jid in enumerate(job_ids):
-                    # Checked BEFORE apply() so a "Stop applying" click never
-                    # interrupts an in-flight move — apply() is synchronous and
-                    # this is the only place between iterations where we look —
-                    # so whatever is currently being placed always finishes.
-                    if self._apply_cancel.is_set():
-                        cancelled_at = idx
-                        break
-                    job = db.get_rename_job(jid) if db else None
-                    self._broadcast_queue(idx, total,
-                                          (job or {}).get("title") if job else None)
-                    try:
-                        self.apply(jid, conflict_strategy=conflict_strategy)
-                    except Exception:
-                        logger.exception("queued apply failed for job %s", jid)
+            def _worker(job_ids: list) -> None:
+                try:
+                    total = len(job_ids)
+                    cancelled_at = None
+                    for idx, jid in enumerate(job_ids):
+                        # Checked BEFORE apply() so a "Stop applying" click never
+                        # interrupts an in-flight move — apply() is synchronous and
+                        # this is the only place between iterations where we look —
+                        # so whatever is currently being placed always finishes.
+                        if self._apply_cancel.is_set():
+                            cancelled_at = idx
+                            break
+                        job = db.get_rename_job(jid) if db else None
+                        self._broadcast_queue(idx, total,
+                                              (job or {}).get("title") if job else None)
                         try:
-                            db.update_rename_job(
-                                jid, status="failed",
-                                error_message="apply crashed — see server log")
-                            self._broadcast(jid)
+                            self.apply(jid, conflict_strategy=conflict_strategy)
                         except Exception:
-                            pass
-                if cancelled_at is not None:
-                    # Every job from here on was pre-marked 'applying' up front
-                    # but never actually started — revert each back to the
-                    # status it held before queue_apply touched it (fall back to
-                    # 'matched' for a legacy row with no prior_status) so none
-                    # of them are left stuck. Skip anything that isn't still
-                    # 'applying' — nothing here should be, since apply() always
-                    # moves a job off 'applying' before returning, but this
-                    # guards against ever clobbering a job that somehow already
-                    # settled.
-                    for remaining_jid in job_ids[cancelled_at:]:
-                        try:
-                            remaining = db.get_rename_job(remaining_jid) if db else None
-                            if not remaining or remaining.get("status") != "applying":
-                                continue
-                            prior = remaining.get("prior_status") or "matched"
-                            db.update_rename_job(remaining_jid, status=prior,
-                                                 prior_status=None)
-                            self._broadcast(remaining_jid)
-                        except Exception:
-                            logger.exception(
-                                "queue cancel: could not revert job %s", remaining_jid)
-                # Signal completion so the UI clears the queue bar (both a
-                # normal finish and a cancelled one land here the same way).
-                self._broadcast_queue(total, total, None)
+                            logger.exception("queued apply failed for job %s", jid)
+                            try:
+                                db.update_rename_job(
+                                    jid, status="failed",
+                                    error_message="apply crashed — see server log")
+                                self._broadcast(jid)
+                            except Exception:
+                                pass
+                    if cancelled_at is not None:
+                        # Every job from here on was pre-marked 'applying' up front
+                        # but never actually started — revert each back to the
+                        # status it held before queue_apply touched it (fall back to
+                        # 'matched' for a legacy row with no prior_status) so none
+                        # of them are left stuck. Skip anything that isn't still
+                        # 'applying' — nothing here should be, since apply() always
+                        # moves a job off 'applying' before returning, but this
+                        # guards against ever clobbering a job that somehow already
+                        # settled.
+                        for remaining_jid in job_ids[cancelled_at:]:
+                            try:
+                                remaining = db.get_rename_job(remaining_jid) if db else None
+                                if not remaining or remaining.get("status") != "applying":
+                                    continue
+                                prior = remaining.get("prior_status") or "matched"
+                                db.update_rename_job(remaining_jid, status=prior,
+                                                     prior_status=None)
+                                self._broadcast(remaining_jid)
+                            except Exception:
+                                logger.exception(
+                                    "queue cancel: could not revert job %s", remaining_jid)
+                    # Signal completion so the UI clears the queue bar (both a
+                    # normal finish and a cancelled one land here the same way).
+                    self._broadcast_queue(total, total, None)
+                finally:
+                    # Release the guard claimed by queue_apply above — on every
+                    # exit path, so a crashed worker can never wedge the next
+                    # apply run behind a permanently-held lock.
+                    self._bulk_lock.release()
 
-        threading.Thread(target=_worker, args=(eligible,), daemon=True,
-                         name="rename-apply").start()
-        return {"ok": True, "queued": len(eligible), "skipped": skipped}
+            t = threading.Thread(target=_worker, args=(eligible,), daemon=True,
+                                 name="rename-apply")
+            t.start()
+            # The worker now owns the lock; don't release it in our finally.
+            release_lock = False
+            return {"ok": True, "queued": len(eligible), "skipped": skipped}
+        finally:
+            if release_lock:
+                self._bulk_lock.release()
 
     def _broadcast_queue(self, done: int, total: int, current_title) -> None:
         """Emit overall apply-queue progress (job ``done`` of ``total``)."""
@@ -1879,6 +1908,13 @@ class RenameService:
         apply() returns. Candidates not yet reached were never mutated (this
         method doesn't pre-mark them 'applying' the way queue_apply does), so
         there's nothing to revert.
+
+        Note: no HTTP route calls this directly — ``POST
+        /rename/jobs/apply-confident`` goes through :meth:`queue_apply`
+        (``confident_only=True``). This method is exercised only by direct
+        unit tests today; it already claims ``_bulk_lock`` itself (own
+        non-blocking acquire/release), so it's naturally rejected as busy
+        whenever queue_apply's worker is holding the lock.
         """
         db = self._db
         if db is None:

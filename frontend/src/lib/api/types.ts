@@ -538,6 +538,9 @@ export interface BulkApplyResponse {
   ok?: boolean;
   queued?: number;
   skipped?: number;
+  // Set when another bulk-apply run is already active (RenameService's
+  // queue_apply guard rejects overlap) — this call queued nothing.
+  busy?: boolean;
   // Legacy synchronous fields (older servers):
   results?: BulkApplyResult[];
   applied?: number;
@@ -568,6 +571,9 @@ export interface ApplyConfidentResponse {
   ok?: boolean;
   queued?: number;
   skipped?: number;
+  // Set when another bulk-apply run is already active (RenameService's
+  // queue_apply guard rejects overlap) — this call queued nothing.
+  busy?: boolean;
   // Legacy synchronous fields (older servers):
   results?: BulkApplyResult[];
   applied?: number;

@@ -1105,6 +1105,62 @@ class TestQueueApplyCancel:
         assert db.get_rename_job(j0)["status"] == "applied"
         assert db.get_rename_job(j1)["status"] == "applied"
 
+    def test_second_queue_apply_while_active_is_rejected_as_busy(self, db, tmp_path):
+        """A second queue_apply() call made while the first run's worker is
+        still active must be atomically rejected as busy — and, critically,
+        must never clear the first run's cancel flag or touch the second
+        batch's jobs. This is the overlap race the "Stop applying" control
+        surface depended on: before the fix, the second call's unconditional
+        self._apply_cancel.clear() defeated a pending Stop on the first run."""
+        import threading as _threading
+
+        svc = _service(db, _weak_search)
+        j0, _src0 = _matched_job(db, tmp_path, "MovieOverlapA")
+        j1, _src1 = _matched_job(db, tmp_path, "MovieOverlapB")
+
+        # Block the worker thread inside apply() so it's guaranteed to still
+        # hold the guard when the second queue_apply() call arrives.
+        entered_apply = _threading.Event()
+        release_apply = _threading.Event()
+        real_apply = svc.apply
+
+        def _blocking_apply(job_id, *a, **k):
+            entered_apply.set()
+            assert release_apply.wait(timeout=5), "test deadlocked waiting for release"
+            return real_apply(job_id, *a, **k)
+
+        svc.apply = _blocking_apply
+
+        out1 = svc.queue_apply([j0])
+        assert out1 == {"ok": True, "queued": 1, "skipped": 0}
+        assert entered_apply.wait(timeout=5), "worker never reached apply()"
+
+        # Mirrors a real "Stop applying" click landing on the first (still
+        # active) run, made just before the second call races in.
+        svc.cancel_apply()
+        assert svc._apply_cancel.is_set()
+
+        out2 = svc.queue_apply([j1])
+        assert out2 == {"ok": False, "queued": 0, "skipped": 0, "busy": True}
+
+        # The rejected call must not have cleared the first run's cancel
+        # flag, and must not have marked the second batch's job 'applying'.
+        assert svc._apply_cancel.is_set()
+        assert db.get_rename_job(j1)["status"] == "matched"
+
+        # Let the first run's in-flight file finish; the worker must release
+        # the guard on completion so the queue never wedges "busy" forever.
+        release_apply.set()
+        self._wait_until_settled(db, [j0])
+        assert db.get_rename_job(j0)["status"] == "applied"
+
+        # Guard released — a fresh call now succeeds (and, per existing
+        # behavior, clears the now-stale cancel flag from the finished run).
+        out3 = svc.queue_apply([j1])
+        assert out3 == {"ok": True, "queued": 1, "skipped": 0}
+        self._wait_until_settled(db, [j1])
+        assert db.get_rename_job(j1)["status"] == "applied"
+
     def test_apply_confident_cancel_breaks_without_reverting(self, db, tmp_path):
         svc = _service(db, _weak_search)
         j0, _ = _matched_job(db, tmp_path, "MovieX")
