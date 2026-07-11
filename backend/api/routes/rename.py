@@ -11,8 +11,9 @@ from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.routes.scanner import TMDB_IMAGE_BASE  # same base+size as Scan posters (w500)
 from backend.api.ws import ws_manager
 from backend.rename import dv_detect, dv_labeler, fileops, llm_identify
+from backend.rename.conflict_analyzer import analyze_job_conflict, has_active_duplicate
+from backend.rename.conflicts import conflict_annotations, find_library_duplicate
 from backend.rename.dv_import import import_dv_host_db
-from backend.rename.service import conflict_annotations
 
 
 def _poster_url(poster_path):
@@ -26,6 +27,12 @@ def _poster_url(poster_path):
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/rename", tags=["rename"])
+
+# Jobs currently being background-analyzed — prevents the list route (polled
+# frequently) from spawning a redundant analysis thread for the same job on
+# every request while one's already running.
+_analyzing_job_ids: set = set()
+_analyzing_lock = threading.Lock()
 
 
 # ── Path confinement (A3) ────────────────────────────────────────────────
@@ -133,19 +140,27 @@ def list_jobs(status: Optional[str] = None, limit: int = 200,
     """List tracked rename jobs (optionally filtered by status) + status counts.
 
     Each job is annotated with ``destination_conflict`` (another job targets the
-    same destination file) and, for the best release in a duplicate group,
-    ``keep_recommended`` + ``keep_reason`` — so the UI can flag the duplicate and
-    suggest which copy to keep before either is applied."""
+    same destination file), ``library_duplicate`` (a same-title/year movie
+    already exists in Plex at a DIFFERENT path) and, for the best release in a
+    duplicate group, ``keep_recommended`` + ``keep_reason`` — so the UI can flag
+    the duplicate and suggest which copy to keep before either is applied.
+
+    A job newly flagged by either signal, with no conflict_analysis yet, gets a
+    background analysis thread fired (fire-and-forget, de-duplicated by
+    _analyzing_job_ids so rapid repeat polls don't pile up redundant threads)."""
     if reg.db is None:
         return {"jobs": [], "counts": {}}
     limit = max(1, min(int(limit), 2000))  # clamp: never let a client OOM the box
     jobs = reg.db.list_rename_jobs(status=status, limit=limit)
+    all_active_jobs = reg.db.list_rename_jobs(limit=100000) or []
     # Annotations are computed over ALL active jobs (not just this filtered page),
     # so a duplicate is still flagged when the two halves land on different pages
     # or under a status filter.
-    annotations = conflict_annotations(reg.db.list_rename_jobs(limit=100000) or [])
+    annotations = conflict_annotations(all_active_jobs)
+    plex_movie_rows = reg.db.list_plex_cache_movies()
     paths = [j.get("original_path") for j in jobs if j.get("original_path")]
     dv_map = reg.db.get_dv_scans_by_paths(paths)
+    to_analyze = []
     for j in jobs:
         ann = annotations.get(j.get("id")) or {}
         j["destination_conflict"] = ann.get("destination_conflict", False)
@@ -154,6 +169,35 @@ def list_jobs(status: Optional[str] = None, limit: int = 200,
         j["poster_url"] = _poster_url(j.get("poster_path"))
         dv = dv_map.get(j.get("original_path"))
         j["dv_layer"] = (dv or {}).get("dv_layer")
+        lib_dup = find_library_duplicate(j, plex_movie_rows) is not None
+        j["library_duplicate"] = lib_dup
+        # has_active_duplicate re-derives destination_conflict from
+        # `annotations` itself rather than reusing j["destination_conflict"]
+        # above — same source, just kept as the ONE shared definition of
+        # "active duplicate" also used by the maintenance-loop sweep
+        # (Task 6's analyze_pending_conflicts), so the two never drift.
+        if has_active_duplicate(j, annotations, plex_movie_rows) and not j.get("conflict_analysis"):
+            to_analyze.append(j["id"])
+
+    if to_analyze:
+        with _analyzing_lock:
+            fresh = [jid for jid in to_analyze if jid not in _analyzing_job_ids]
+            _analyzing_job_ids.update(fresh)
+        if fresh:
+            def _run(job_ids):
+                try:
+                    for jid in job_ids:
+                        try:
+                            job = reg.db.get_rename_job(jid)
+                            if job:
+                                analyze_job_conflict(reg.db, job, plex_cache_rows=plex_movie_rows)
+                        except Exception:
+                            logger.exception("list_jobs: background analysis failed for job %s", jid)
+                finally:
+                    with _analyzing_lock:
+                        _analyzing_job_ids.difference_update(job_ids)
+            threading.Thread(target=_run, args=(fresh,), name="conflict-analyze", daemon=True).start()
+
     return {
         "jobs": jobs,
         "counts": reg.db.count_rename_jobs_by_status(),

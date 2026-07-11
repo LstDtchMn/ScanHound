@@ -160,6 +160,27 @@ class TestRenameApi:
         assert "REMUX" in (keepers[0]["original_filename"] or "")
         assert keepers[0]["keep_reason"]
 
+    def test_list_jobs_annotates_library_duplicate(self, client, tmp_path):
+        # A movie job whose destination is free, but a same-title/year Plex row
+        # exists at a DIFFERENT path — must be flagged library_duplicate.
+        dm = DatabaseManager()
+        dm.save_plex_cache([{
+            "clean_title": "Dup Movie", "original_title": "Dup Movie", "year": 2021,
+            "res": "1080p", "size": 5.0, "imdb_id": "tt777", "rating_key": "5",
+            "media_id": "5", "key": "5_5_0", "file": "/library/movies/Dup Movie (2021)/f.mkv",
+        }], "Movies")
+        job_id = dm.create_rename_job({
+            "original_path": str(tmp_path / "src.mkv"), "original_filename": "src.mkv",
+            "status": "matched", "media_type": "movie", "title": "Dup Movie", "year": 2021,
+            "imdb_id": "tt777", "destination_path": "/library/movies-4k/Dup Movie (2021)",
+            "new_filename": "Dup Movie (2021) [2160p].mkv",
+        })
+        dm.close()
+        resp = client.get("/rename/jobs")
+        body = resp.json()
+        job = next(j for j in body["jobs"] if j["id"] == job_id)
+        assert job["library_duplicate"] is True
+
     def test_dv_scans_empty_and_shape(self, client):
         body = client.get("/rename/dv-scans").json()
         assert body["scans"] == [] and body["counts"] == {}

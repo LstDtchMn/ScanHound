@@ -603,6 +603,15 @@ class AppService:
         except Exception:
             logger.exception("Pipeline reconcile failed (non-fatal)")
 
+        try:
+            if self.db is not None:
+                from backend.rename.conflict_analyzer import analyze_pending_conflicts
+                n = analyze_pending_conflicts(self.db, limit=50)
+                if n:
+                    logger.info("Conflict analysis backfill: processed %d job(s)", n)
+        except Exception:
+            logger.exception("Conflict analysis backfill failed (non-fatal)")
+
     def _start_maintenance_loop(self, interval_seconds: float = 3600.0):
         """Start the hourly trash-sweep + WAL-checkpoint background thread."""
         if self._maintenance_thread and self._maintenance_thread.is_alive():
