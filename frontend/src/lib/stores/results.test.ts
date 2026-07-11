@@ -31,6 +31,7 @@ function triggerReconnect() {
 }
 const {
   results,
+  selectedDetail,
   selectedKeys,
   dismissedUrls,
   statusFilter,
@@ -100,6 +101,7 @@ function item(overrides: Partial<ScanResult>): ScanResult {
 
 function resetStores() {
   results.set([]);
+  selectedDetail.set(null);
   selectedKeys.set(new Set());
   dismissedUrls.set(new Set());
   statusFilter.set('all');
@@ -458,6 +460,28 @@ describe('updateResultFromRescan', () => {
     results.set([item({ url: 'https://x/1', title: 'Old' })]);
     updateResultFromRescan('https://x/999', { title: 'New' });
     expect(get(results)[0].title).toBe('Old');
+  });
+
+  it('also patches selectedDetail when it is showing the rescanned url', () => {
+    const original = item({ url: 'https://x/1', title: 'Old', rating: 0 });
+    results.set([original]);
+    selectedDetail.set(original);
+    updateResultFromRescan('https://x/1', { title: 'New', rating: 6.3 });
+    expect(get(selectedDetail)).toMatchObject({ url: 'https://x/1', title: 'New', rating: 6.3 });
+  });
+
+  it('leaves selectedDetail untouched when it is showing a different url', () => {
+    const other = item({ url: 'https://x/2', title: 'Other' });
+    results.set([item({ url: 'https://x/1', title: 'Old' }), other]);
+    selectedDetail.set(other);
+    updateResultFromRescan('https://x/1', { title: 'New' });
+    expect(get(selectedDetail)).toMatchObject({ url: 'https://x/2', title: 'Other' });
+  });
+
+  it('leaves selectedDetail as null when nothing is selected', () => {
+    results.set([item({ url: 'https://x/1', title: 'Old' })]);
+    updateResultFromRescan('https://x/1', { title: 'New' });
+    expect(get(selectedDetail)).toBeNull();
   });
 });
 

@@ -3,6 +3,7 @@
   import { api } from '$lib/api/client';
   import { downloadHost } from '$lib/stores/downloads';
   import { addToast } from '$lib/stores/notifications';
+  import { updateResultFromRescan } from '$lib/stores/results';
   import { copyResultLinks } from '$lib/resultActions';
   import { statusVariant, formatStatus, formatCount } from '$lib/constants';
   import Badge from '../Badge.svelte';
@@ -63,6 +64,21 @@
         onclose();
       })
       .catch(() => addToast('Error', 'Download failed', 'error'));
+  }
+
+  let rescanning = $state(false);
+  async function rescanItem() {
+    if (!item.url || rescanning) return;
+    rescanning = true;
+    try {
+      const { item: fresh } = await api.rescanItem(item.url);
+      updateResultFromRescan(item.url, fresh);
+      addToast('Rescanned', `Refreshed metadata for ${fresh.title || item.title}`);
+    } catch (e) {
+      addToast('Error', e instanceof Error ? e.message : 'Rescan failed', 'error');
+    } finally {
+      rescanning = false;
+    }
   }
 
   // Mount/unmount only — deliberately reads nothing reactive (not `item`) so
@@ -226,14 +242,23 @@
   </div>
 
   <!-- Pinned action -->
-  <div class="shrink-0 px-4 py-3 border-t border-[var(--border)]">
+  <div class="shrink-0 px-4 py-3 border-t border-[var(--border)] flex gap-2">
     {#if item.status === 'library'}
-      <button class="w-full py-2.5 rounded-xl bg-[var(--bg-tertiary)] text-sm font-semibold text-[var(--text-primary)]"
+      <button class="flex-1 py-2.5 rounded-xl bg-[var(--bg-tertiary)] text-sm font-semibold text-[var(--text-primary)]"
         onclick={() => { copyResultLinks(item, $downloadHost); onclose(); }}>Copy links</button>
     {:else}
-      <button class="w-full py-2.5 rounded-xl bg-[var(--accent)] text-sm font-semibold text-white" onclick={grab}>
+      <button class="flex-1 py-2.5 rounded-xl bg-[var(--accent)] text-sm font-semibold text-white" onclick={grab}>
         Grab{#if item.size}&nbsp;· {item.size}{/if}
       </button>
     {/if}
+    <button
+      onclick={rescanItem}
+      disabled={rescanning}
+      aria-label="Rescan this item"
+      title="Re-fetch this page and refresh its poster/rating/genres"
+      class="px-4 py-2.5 rounded-xl bg-[var(--bg-tertiary)] text-sm font-semibold text-[var(--text-primary)] disabled:opacity-50"
+    >
+      {rescanning ? 'Rescanning…' : 'Rescan'}
+    </button>
   </div>
 </div>

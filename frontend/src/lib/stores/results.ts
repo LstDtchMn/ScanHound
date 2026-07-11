@@ -1040,12 +1040,17 @@ export function markDownloaded(urls: Array<string | undefined | null>) {
 
 /** Merge a rescanned item's fresh fields (poster/rating/genres/imdb_id/etc.)
  *  into the matching row by url, in place — no-op if the url isn't present
- *  (e.g. it scrolled out of a paged view since the rescan started). */
+ *  (e.g. it scrolled out of a paged view since the rescan started). Also
+ *  patches `selectedDetail` when it's showing the same url: DetailPanel/
+ *  DetailSheet bind their `item` prop to `selectedDetail`, not to a row
+ *  looked up from `results`, so without this the open detail view would
+ *  keep showing stale (pre-rescan) data until closed and reopened. */
 export function updateResultFromRescan(url: string, patch: Partial<ScanResult>) {
   if (!url) return;
   results.update((items) =>
     items.map((it) => (it.url === url ? { ...it, ...patch } : it))
   );
+  selectedDetail.update((sel) => (sel && sel.url === url ? { ...sel, ...patch } : sel));
 }
 
 /** After a grab, optimistically tag the OTHER releases in the same group with a
