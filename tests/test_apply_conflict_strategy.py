@@ -249,7 +249,7 @@ class TestDefaultNone:
         out = svc.apply(jid)  # no strategy → today's behavior
 
         assert out["ok"] is False
-        assert "already exists" in out["error"]
+        assert "already in the library" in out["error"].lower()
         assert db.get_rename_job(jid)["status"] == "needs_review"
         assert open(existing, "rb").read() == b"OLD"
         assert os.path.exists(str(src))
