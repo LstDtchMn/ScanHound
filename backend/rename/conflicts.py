@@ -221,3 +221,49 @@ def rank_conflict(existing: Optional[dict], incoming: dict) -> dict:
     if se > si:
         return {"recommended": "existing", "reason": _quality_reason(existing) or None}
     return {"recommended": "tie", "reason": None}
+
+
+def _full_dest_path(job: dict) -> Optional[str]:
+    """Job's would-be full destination path, or None if not yet targeted."""
+    dest = (job.get("destination_path") or "").rstrip("/\\")
+    name = job.get("new_filename") or ""
+    if not dest or not name:
+        return None
+    return f"{dest}/{name}".replace("\\", "/").casefold()
+
+
+def find_library_duplicate(job: dict, plex_cache_rows: list) -> Optional[dict]:
+    """Match *job* against the Plex library by imdb_id (exact) or normalized
+    title+year (fallback), for movies only. Returns the matched plex_cache
+    row, or None if there's no match, the job is TV, the job isn't in an
+    ACTIVE status (an applied/failed/reverted job has nothing left to
+    resolve — matches _ACTIVE_STATUSES' semantics, same statuses
+    destination_conflict is restricted to), or the only match is at the
+    job's own destination path (that's the exact-path case, already covered
+    by destination_conflict — never double-flag it here).
+
+    Pure, DB-free — plex_cache_rows is whatever the caller already fetched."""
+    if (job.get("media_type") or "movie") != "movie":
+        return None
+    if job.get("status") not in _ACTIVE_STATUSES:
+        return None
+    imdb_id = job.get("imdb_id")
+    candidates = [r for r in plex_cache_rows if not r.get("is_tv")]
+    match = None
+    if imdb_id:
+        match = next((r for r in candidates if r.get("imdb_id") == imdb_id), None)
+    if not match:
+        from backend.app_service import normalize_title
+        job_key = (normalize_title(job.get("title") or ""), job.get("year"))
+        if job_key[0]:
+            match = next(
+                (r for r in candidates
+                 if (normalize_title(r.get("title") or ""), r.get("year")) == job_key),
+                None)
+    if not match:
+        return None
+    job_dest = _full_dest_path(job)
+    match_path = (match.get("file_path") or "").replace("\\", "/").casefold()
+    if job_dest and match_path and job_dest == match_path:
+        return None  # same-path — the exact-path collision case, not this one
+    return match

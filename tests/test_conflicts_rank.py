@@ -73,3 +73,55 @@ def test_uncached_dv_hdr_beats_tag_rich_dv_tagged_web_dl():
     incoming = {"id": 9, "resolution": "1080p", "hdr": None, "dv_layer": None,
                 "original_filename": "Movie.2024.1080p.WEB-DL.DV.DDP5.1.mkv"}
     assert conflicts.rank_conflict(existing, incoming)["recommended"] == "existing"
+
+
+def test_find_library_duplicate_matches_by_imdb_id():
+    job = {"id": 1, "status": "matched", "media_type": "movie", "imdb_id": "tt123", "title": "X", "year": 2020,
+           "destination_path": "/library/movies-4k/X (2020)", "new_filename": "X (2020).mkv"}
+    rows = [{"key": "k1", "imdb_id": "tt999", "title": "y", "year": 2019, "is_tv": 0, "file_path": "/a"},
+            {"key": "k2", "imdb_id": "tt123", "title": "x", "year": 2020, "is_tv": 0, "file_path": "/library/movies/X (2020)/X.mkv"}]
+    match = conflicts.find_library_duplicate(job, rows)
+    assert match is not None
+    assert match["key"] == "k2"
+
+
+def test_find_library_duplicate_falls_back_to_title_year_when_no_imdb_match():
+    job = {"id": 1, "status": "matched", "media_type": "movie", "imdb_id": None, "title": "The Movie", "year": 2020,
+           "destination_path": "/library/movies-4k/The Movie (2020)", "new_filename": "The Movie (2020).mkv"}
+    rows = [{"key": "k1", "imdb_id": None, "title": "the movie", "year": 2020, "is_tv": 0, "file_path": "/library/movies/The Movie (2020)/f.mkv"}]
+    match = conflicts.find_library_duplicate(job, rows)
+    assert match is not None and match["key"] == "k1"
+
+
+def test_find_library_duplicate_no_match_returns_none():
+    job = {"id": 1, "status": "matched", "media_type": "movie", "imdb_id": "tt1", "title": "X", "year": 2020,
+           "destination_path": "/library/movies-4k/X (2020)", "new_filename": "X (2020).mkv"}
+    rows = [{"key": "k1", "imdb_id": "tt2", "title": "y", "year": 2021, "is_tv": 0, "file_path": "/a"}]
+    assert conflicts.find_library_duplicate(job, rows) is None
+
+
+def test_find_library_duplicate_excludes_same_path_match():
+    # If the matched Plex row's file_path IS the job's own would-be
+    # destination, that's the exact-path case (already covered by
+    # destination_conflict) — not a library-wide duplicate.
+    job = {"id": 1, "status": "matched", "media_type": "movie", "imdb_id": "tt1", "title": "X", "year": 2020,
+           "destination_path": "/library/movies-4k/X (2020)", "new_filename": "X (2020).mkv"}
+    rows = [{"key": "k1", "imdb_id": "tt1", "title": "x", "year": 2020, "is_tv": 0,
+             "file_path": "/library/movies-4k/X (2020)/X (2020).mkv"}]
+    assert conflicts.find_library_duplicate(job, rows) is None
+
+
+def test_find_library_duplicate_tv_job_always_none():
+    job = {"id": 1, "status": "matched", "media_type": "tv", "imdb_id": "tt1", "title": "X", "year": 2020,
+           "destination_path": "/library/tv/X", "new_filename": "X S01E01.mkv"}
+    rows = [{"key": "k1", "imdb_id": "tt1", "title": "x", "year": 2020, "is_tv": 0, "file_path": "/a"}]
+    assert conflicts.find_library_duplicate(job, rows) is None
+
+
+def test_find_library_duplicate_applied_job_always_none():
+    # An already-applied job has nothing left to resolve — must never be
+    # flagged (would waste an analysis cycle on a completed job).
+    job = {"id": 1, "status": "applied", "media_type": "movie", "imdb_id": "tt1", "title": "X", "year": 2020,
+           "destination_path": "/library/movies-4k/X (2020)", "new_filename": "X (2020).mkv"}
+    rows = [{"key": "k1", "imdb_id": "tt1", "title": "x", "year": 2020, "is_tv": 0, "file_path": "/library/movies/X (2020)/X.mkv"}]
+    assert conflicts.find_library_duplicate(job, rows) is None
