@@ -164,6 +164,17 @@
     rematchJob = job;
   }
 
+  // Close the "More actions" dropdown on any click outside it — previously
+  // it only closed via its own toggle or after an action ran, so a click
+  // anywhere else on the page (another row, the header, empty space) left
+  // it open indefinitely.
+  function onWindowClick(e: MouseEvent) {
+    if (actionsOpenId === null) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('[data-actions-menu]')) return;
+    actionsOpenId = null;
+  }
+
   function onCompare(job: RenameJob) {
     conflictJob = job;
   }
@@ -225,6 +236,8 @@
   height so the container overflows and scrolls (same pattern as the Scan
   page). `space-y-4` replaces the old `gap-4`.
 -->
+<svelte:window onclick={onWindowClick} />
+
 <div class="flex-1 min-h-0 overflow-auto p-4 space-y-4">
   <RenamesHeader
     onDolbyVision={dolbyVision}
@@ -292,7 +305,7 @@
   {:else if $viewMode === 'grid'}
     <div class="grid {gridGapClass}" style={gridStyle}>
       {#each shown as job (job.id)}
-        <div class="relative min-w-0">
+        <div class="relative min-w-0" data-actions-menu>
           <RenameCard {job} {onRematch} />
           <button
             class="absolute top-1.5 right-1.5 z-10 px-1.5 py-0.5 rounded text-[11px] font-medium bg-[var(--bg-secondary)]/90 border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
@@ -337,7 +350,7 @@
     <ul class="divide-y divide-[var(--border)] rounded-lg border border-[var(--border)] overflow-hidden">
       {#each shown as job (job.id)}
         <RenameRow {job} {onRematch} {onCompare} />
-        <li class="px-3 py-1 bg-[var(--bg-tertiary)]/30">
+        <li class="px-3 py-1 bg-[var(--bg-tertiary)]/30" data-actions-menu>
             <button
               class="text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
               aria-label="More actions for {job.original_filename ?? job.title ?? `job ${job.id}`}"
