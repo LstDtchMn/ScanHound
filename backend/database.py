@@ -526,6 +526,21 @@ class DatabaseManager:
                     )
                 ''')
 
+                # ffprobe result cache, keyed by path with a (mtime, size)
+                # change-signal — mirrors dv_scan's invalidation shape exactly.
+                # A cache MISS or STALE row means re-probe; a probe FAILURE is
+                # never written here (the caller retries next time rather than
+                # wedging a file into permanent "unknown").
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS media_probe (
+                        path TEXT PRIMARY KEY,
+                        sig_mtime REAL,
+                        sig_size INTEGER,
+                        probe_json TEXT,
+                        probed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
                 # ── Performance indexes (idempotent) ─────────────────────
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_imdb_id ON plex_cache(imdb_id)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_title ON plex_cache(title)')
@@ -1897,6 +1912,42 @@ class DatabaseManager:
     def clear_dv_scans(self):
         """Remove all DV-scan rows (test/maintenance helper)."""
         return self._mutate('DELETE FROM dv_scan', label="clear_dv_scans")
+
+    # ── ffprobe result cache (media_probe) ─────────────────────────────
+
+    def upsert_media_probe(self, path, probe_json, *, sig_mtime=None, sig_size=None):
+        """Insert/update the cached ffprobe result for ``path``. Returns True on success."""
+        if not path:
+            return False
+        return self._mutate('''
+            INSERT INTO media_probe (path, sig_mtime, sig_size, probe_json, probed_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(path) DO UPDATE SET
+                sig_mtime = excluded.sig_mtime,
+                sig_size = excluded.sig_size,
+                probe_json = excluded.probe_json,
+                probed_at = CURRENT_TIMESTAMP
+        ''', (path, sig_mtime, sig_size, probe_json), label="upsert_media_probe") is not None
+
+    def get_media_probe(self, path):
+        """Return the cached probe row for ``path`` (dict, probe_json still a raw
+        JSON string) or None."""
+        rows = self._query_dicts(
+            'SELECT path, sig_mtime, sig_size, probe_json, probed_at '
+            'FROM media_probe WHERE path = ?', (path,))
+        return rows[0] if rows else None
+
+    def media_probe_is_current(self, path, sig_mtime, sig_size):
+        """Whether ``path``'s cached probe still matches the on-disk signature —
+        mirrors dv_scan_is_current's 1s mtime tolerance / exact size match."""
+        row = self.get_media_probe(path)
+        if not row or row.get("sig_mtime") is None or row.get("sig_size") is None:
+            return False
+        try:
+            return (abs(float(row["sig_mtime"]) - float(sig_mtime)) < 1.0
+                    and int(row["sig_size"]) == int(sig_size))
+        except (TypeError, ValueError):
+            return False
 
     def update_background_status(self, updates):
         """Update status + data JSON for cached rows WITHOUT touching last_seen,
