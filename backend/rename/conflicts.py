@@ -25,6 +25,9 @@ _CLAIMING_STATUSES = _ACTIVE_STATUSES | frozenset({"applied"})
 _DV_RE = _re.compile(r"\b(?:dovi|dolby[.\s-]?vision)\b|\bdv\b(?![.\s_-]?(?:cam|rip))",
                      _re.IGNORECASE)
 
+# Ranks for DV layer names as returned by dovi_tool. "fel" is the ceiling (3).
+_DV_LAYER_RANK = {"fel": 3, "mel": 2, "profile8": 1, "profile5": 1}
+
 
 def _dest_key(job: dict) -> Optional[str]:
     """Normalized full destination (dir + filename) for a job, or None if it has
@@ -68,7 +71,6 @@ def _quality_score(job: dict) -> tuple:
 
     # Explicit probed DV layer (from probe_specs) outranks the binary filename DV
     # bit; absent → 0 so pure-filename callers are unchanged.
-    _DV_LAYER_RANK = {"fel": 3, "mel": 2, "profile8": 1, "profile5": 1}
     dv_layer_rank = _DV_LAYER_RANK.get(str(job.get("dv_layer") or "").lower(), 0)
 
     # Dolby Vision is the headline upgrade (esp. for this user). Match DoVi /
@@ -276,21 +278,33 @@ def needs_dv_layer_scan(existing: dict, incoming: dict) -> bool:
 
     _quality_score()'s comparison tuple is (res_rank, dv, dv_layer_rank, hdr,
     source, audio, edition) — dv_layer_rank (index 2) is exactly the field a
-    scan would resolve. Recompute both tuples with index 2 forced to 0 (as if
-    unscanned): if those modified tuples are equal AND both sides are
-    Dolby Vision (dv == 1), the real tuples can only differ, if at all, on
-    dv_layer_rank — worth resolving. Any other outcome means some other tier
-    already decides it, or one/both sides aren't DV — skip the scan.
+    scan would resolve. Both sides must be Dolby Vision, and every OTHER tier
+    must already be tied (checked by forcing index 2 to 0 on both tuples and
+    comparing the rest) — otherwise something else already decides the
+    winner and dv_layer can't matter.
 
-    Also returns False if both sides already have dv_layer resolved: no point
-    running an expensive scan when the answer is already known."""
-    # If both sides already have dv_layer known, nothing left to gain by scanning
-    if existing.get("dv_layer") is not None and incoming.get("dv_layer") is not None:
-        return False
-
+    The known/unknown dv_layer status of each side needs its own guard,
+    separate from that tie check: if BOTH sides already have a known layer,
+    there's nothing left to learn either way (tied or not, re-scanning
+    can't change the answer) — skip. If exactly ONE side is known and that
+    known rank is already the ceiling (fel, rank 3 — nothing can beat it),
+    the comparison is already decided regardless of what the unscanned side
+    turns out to be — skip. Only when the known side's rank is BELOW the
+    ceiling does the unscanned side have a chance to flip the outcome, so
+    that case still needs the scan."""
     se = list(_quality_score(existing))
     si = list(_quality_score(incoming))
-    both_dv = se[1] == 1 and si[1] == 1
+    if se[1] != 1 or si[1] != 1:
+        return False  # not both Dolby Vision
+    e_known = bool(existing.get("dv_layer"))
+    i_known = bool(incoming.get("dv_layer"))
+    if e_known and i_known:
+        return False  # both already resolved — nothing left to learn
+    max_rank = max(_DV_LAYER_RANK.values())
+    if e_known and se[2] >= max_rank:
+        return False  # existing already unbeatable regardless of incoming's result
+    if i_known and si[2] >= max_rank:
+        return False  # incoming already unbeatable regardless of existing's result
     se[2] = 0
     si[2] = 0
-    return both_dv and tuple(se) == tuple(si)
+    return tuple(se) == tuple(si)

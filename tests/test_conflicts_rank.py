@@ -160,3 +160,25 @@ def test_needs_dv_layer_scan_false_when_dv_layer_already_known_on_both():
     existing = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "mel", "original_filename": "a.mkv"}
     incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "fel", "original_filename": "a.mkv"}
     assert conflicts.needs_dv_layer_scan(existing, incoming) is False
+
+
+def test_needs_dv_layer_scan_false_when_known_side_already_at_max_rank():
+    # ASYMMETRIC CASE: existing is known at max rank ("fel", rank 3), incoming unscanned.
+    # Existing already wins outright regardless of what the unscanned side reveals.
+    # No point scanning — the outcome is already decided.
+    existing = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "fel",
+                "original_filename": "a.mkv"}
+    incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": None,
+                "original_filename": "b.mkv"}
+    assert conflicts.needs_dv_layer_scan(existing, incoming) is False
+
+
+def test_needs_dv_layer_scan_true_when_known_side_below_max_rank_and_other_side_unscanned():
+    # ASYMMETRIC CASE: existing is known but below max ("mel", rank 2), incoming unscanned.
+    # Scanning could reveal incoming is "fel" (rank 3) and flip the winner.
+    # This genuinely warrants a scan.
+    existing = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "mel",
+                "original_filename": "a.mkv"}
+    incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": None,
+                "original_filename": "b.mkv"}
+    assert conflicts.needs_dv_layer_scan(existing, incoming) is True
