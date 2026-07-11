@@ -271,40 +271,72 @@ def find_library_duplicate(job: dict, plex_cache_rows: list) -> Optional[dict]:
     return match
 
 
+def _tuple_winner(a: tuple, b: tuple) -> str:
+    """Which side wins a full _quality_score() tuple comparison."""
+    if a > b:
+        return "existing"
+    if b > a:
+        return "incoming"
+    return "tie"
+
+
 def needs_dv_layer_scan(existing: dict, incoming: dict) -> bool:
-    """Whether the FEL/MEL layer is the SOLE remaining tiebreaker between two
-    probed specs, i.e. whether a dovi_tool scan is actually worth its
-    multi-minute cost.
+    """Whether resolving the Dolby Vision FEL/MEL layer via dovi_tool could
+    actually change rank_conflict()'s recommended winner between *existing*
+    and *incoming* — i.e. whether the scan's multi-minute cost buys anything.
 
-    _quality_score()'s comparison tuple is (res_rank, dv, dv_layer_rank, hdr,
-    source, audio, edition) — dv_layer_rank (index 2) is exactly the field a
-    scan would resolve. Both sides must be Dolby Vision, and every OTHER tier
-    must already be tied (checked by forcing index 2 to 0 on both tuples and
-    comparing the rest) — otherwise something else already decides the
-    winner and dv_layer can't matter.
+    Both sides must already be Dolby Vision (the ``dv`` bit set); otherwise
+    there's no layer to resolve. If BOTH sides already have a known
+    dv_layer, there's nothing left to learn either way — skip.
 
-    The known/unknown dv_layer status of each side needs its own guard,
-    separate from that tie check: if BOTH sides already have a known layer,
-    there's nothing left to learn either way (tied or not, re-scanning
-    can't change the answer) — skip. If exactly ONE side is known and that
-    known rank is already the ceiling (fel, rank 3 — nothing can beat it),
-    the comparison is already decided regardless of what the unscanned side
-    turns out to be — skip. Only when the known side's rank is BELOW the
-    ceiling does the unscanned side have a chance to flip the outcome, so
-    that case still needs the scan."""
-    se = list(_quality_score(existing))
-    si = list(_quality_score(incoming))
+    Otherwise, at least one side's true dv_layer_rank (tuple index 2) is
+    unknown and could turn out to be any of the values dovi_tool can report
+    (0 = no recognized layer, up to 3 = fel — see _DV_LAYER_RANK). This
+    checks whether the FULL _quality_score() tuple comparison — not index 2
+    in isolation — would produce the SAME winner (existing / incoming / tie)
+    for every one of those possible values. If the winner is invariant, the
+    scan changes nothing and is skipped; if it varies for even one possible
+    outcome — including a confident win degrading to a genuine tie, not
+    just a full reversal — the scan is worth running.
+
+    This must simulate the complete tuple, not just dv_layer_rank alone:
+    naively assuming "the known side is already at the ceiling rank, so it
+    always wins" is WRONG, because a tie at dv_layer_rank (the unscanned
+    side could also turn out to be the ceiling rank) falls through to later
+    tiers (hdr/source/audio/edition), which are independent of DV layer and
+    can already differ between the two files — a real winner reversal is
+    reachable through that fallthrough, not just a downgrade to tie."""
+    se = _quality_score(existing)
+    si = _quality_score(incoming)
     if se[1] != 1 or si[1] != 1:
-        return False  # not both Dolby Vision
+        return False  # not both Dolby Vision — no layer distinction applies
+
     e_known = bool(existing.get("dv_layer"))
     i_known = bool(incoming.get("dv_layer"))
     if e_known and i_known:
         return False  # both already resolved — nothing left to learn
-    max_rank = max(_DV_LAYER_RANK.values())
-    if e_known and se[2] >= max_rank:
-        return False  # existing already unbeatable regardless of incoming's result
-    if i_known and si[2] >= max_rank:
-        return False  # incoming already unbeatable regardless of existing's result
-    se[2] = 0
-    si[2] = 0
-    return tuple(se) == tuple(si)
+
+    possible_ranks = sorted(set(_DV_LAYER_RANK.values()) | {0})
+
+    def _with_rank(t: tuple, rank: int) -> tuple:
+        return t[:2] + (rank,) + t[3:]
+
+    outcomes = set()
+    if e_known:
+        for rank in possible_ranks:
+            outcomes.add(_tuple_winner(se, _with_rank(si, rank)))
+            if len(outcomes) > 1:
+                return True
+    elif i_known:
+        for rank in possible_ranks:
+            outcomes.add(_tuple_winner(_with_rank(se, rank), si))
+            if len(outcomes) > 1:
+                return True
+    else:
+        # Neither known — both vary independently over the full range.
+        for e_rank in possible_ranks:
+            for i_rank in possible_ranks:
+                outcomes.add(_tuple_winner(_with_rank(se, e_rank), _with_rank(si, i_rank)))
+                if len(outcomes) > 1:
+                    return True
+    return False

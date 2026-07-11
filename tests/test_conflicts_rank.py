@@ -162,15 +162,19 @@ def test_needs_dv_layer_scan_false_when_dv_layer_already_known_on_both():
     assert conflicts.needs_dv_layer_scan(existing, incoming) is False
 
 
-def test_needs_dv_layer_scan_false_when_known_side_already_at_max_rank():
-    # ASYMMETRIC CASE: existing is known at max rank ("fel", rank 3), incoming unscanned.
-    # Existing already wins outright regardless of what the unscanned side reveals.
-    # No point scanning — the outcome is already decided.
+def test_needs_dv_layer_scan_true_when_known_side_at_max_rank_could_still_tie():
+    # ASYMMETRIC CASE: existing is known at max rank ("fel", rank 3), incoming
+    # unscanned. A naive "existing already unbeatable, skip" analysis is WRONG:
+    # incoming could ALSO scan as "fel" (rank 3), producing a genuine TIE
+    # instead of existing's current confident win — a materially different,
+    # informative outcome the scan can still reveal. Everything else here is
+    # tied (no audio/source/edition tags in either filename), so this is pure
+    # win-vs-tie, not a full reversal (see the next test for that).
     existing = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "fel",
                 "original_filename": "a.mkv"}
     incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": None,
                 "original_filename": "b.mkv"}
-    assert conflicts.needs_dv_layer_scan(existing, incoming) is False
+    assert conflicts.needs_dv_layer_scan(existing, incoming) is True
 
 
 def test_needs_dv_layer_scan_true_when_known_side_below_max_rank_and_other_side_unscanned():
@@ -181,4 +185,20 @@ def test_needs_dv_layer_scan_true_when_known_side_below_max_rank_and_other_side_
                 "original_filename": "a.mkv"}
     incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": None,
                 "original_filename": "b.mkv"}
+    assert conflicts.needs_dv_layer_scan(existing, incoming) is True
+
+
+def test_needs_dv_layer_scan_true_when_a_dv_layer_tie_would_fall_through_to_a_real_reversal():
+    # The critical case a naive "index 2 alone" analysis misses: existing is
+    # known at max rank ("fel") and currently wins outright — BUT incoming
+    # carries an Atmos tag (audio tier, index 5), which existing lacks. If
+    # incoming's scan ALSO reveals "fel" (a tie at index 2, fully reachable
+    # since fel is achievable), the comparison falls through to index 5 —
+    # where incoming's Atmos tag wins outright. That's a full winner
+    # reversal (existing -> incoming), not just a downgrade to tie, and only
+    # the scan can reveal it.
+    existing = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "fel",
+                "original_filename": "Movie.2020.2160p.mkv"}
+    incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": None,
+                "original_filename": "Movie.2020.2160p.TrueHD.Atmos.mkv"}
     assert conflicts.needs_dv_layer_scan(existing, incoming) is True
