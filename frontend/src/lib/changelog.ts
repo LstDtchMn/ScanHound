@@ -7,6 +7,18 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.26.0",
+    date: "2026-07-11",
+    summary: "Duplicates are auto-analyzed so you can pick the better copy",
+    changes: [
+      "The \"already in the library\" conflict row now shows a concise, at-a-glance quality diff instead of a byte-count tooltip — only the things that actually differ (resolution, HDR/Dolby Vision including the FEL vs MEL layer, and file size), plus a \"keep Existing\" or \"keep Incoming ★\" recommendation so you can tell which copy is better without opening anything.",
+      "Duplicates are analyzed automatically in the background — both the copy already in Plex and the newly downloaded one are probed (via ffprobe) the moment a conflict is detected, so the comparison is ready and waiting on the row rather than computed when you click.",
+      "Now catches library-wide duplicates, not just same-path collisions: if the same movie already exists elsewhere in your Plex library (matched by IMDb id, or title + year) the row flags it even when the incoming file wouldn't land on top of it. For those, the Compare modal offers \"Apply anyway\" (keep both copies) instead of Overwrite/Keep-both, since there's no file at the destination to replace.",
+      "The recommendation is advice only — nothing is ever auto-overwritten or auto-deleted. Every conflict is still held for your review.",
+      "Dolby Vision FEL/MEL detection (which is comparatively expensive) now only runs when the DV layer is the single deciding factor between two otherwise-equal copies — never when resolution, HDR, or another difference already settles which is better.",
+    ],
+  },
+  {
     version: "2.25.2",
     date: "2026-07-10",
     summary: "TV shows no longer show as Missing; cleaner conflict row",
