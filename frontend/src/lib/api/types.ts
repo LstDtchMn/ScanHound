@@ -384,6 +384,7 @@ export interface Settings {
   auto_rename_template_tv?: string;
   auto_rename_path_mappings?: string;
   auto_rename_plex_sort_titles?: boolean;
+  auto_rename_movie_flat?: boolean;
   deletions_require_confirmation?: boolean;
   trash_retention_days?: number;
   auto_rename_llm_enabled?: boolean;
