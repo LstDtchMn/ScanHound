@@ -267,3 +267,30 @@ def find_library_duplicate(job: dict, plex_cache_rows: list) -> Optional[dict]:
     if job_dest and match_path and job_dest == match_path:
         return None  # same-path — the exact-path collision case, not this one
     return match
+
+
+def needs_dv_layer_scan(existing: dict, incoming: dict) -> bool:
+    """Whether the FEL/MEL layer is the SOLE remaining tiebreaker between two
+    probed specs, i.e. whether a dovi_tool scan is actually worth its
+    multi-minute cost.
+
+    _quality_score()'s comparison tuple is (res_rank, dv, dv_layer_rank, hdr,
+    source, audio, edition) — dv_layer_rank (index 2) is exactly the field a
+    scan would resolve. Recompute both tuples with index 2 forced to 0 (as if
+    unscanned): if those modified tuples are equal AND both sides are
+    Dolby Vision (dv == 1), the real tuples can only differ, if at all, on
+    dv_layer_rank — worth resolving. Any other outcome means some other tier
+    already decides it, or one/both sides aren't DV — skip the scan.
+
+    Also returns False if both sides already have dv_layer resolved: no point
+    running an expensive scan when the answer is already known."""
+    # If both sides already have dv_layer known, nothing left to gain by scanning
+    if existing.get("dv_layer") is not None and incoming.get("dv_layer") is not None:
+        return False
+
+    se = list(_quality_score(existing))
+    si = list(_quality_score(incoming))
+    both_dv = se[1] == 1 and si[1] == 1
+    se[2] = 0
+    si[2] = 0
+    return both_dv and tuple(se) == tuple(si)

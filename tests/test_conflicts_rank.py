@@ -125,3 +125,38 @@ def test_find_library_duplicate_applied_job_always_none():
            "destination_path": "/library/movies-4k/X (2020)", "new_filename": "X (2020).mkv"}
     rows = [{"key": "k1", "imdb_id": "tt1", "title": "x", "year": 2020, "is_tv": 0, "file_path": "/library/movies/X (2020)/X.mkv"}]
     assert conflicts.find_library_duplicate(job, rows) is None
+
+
+def test_needs_dv_layer_scan_true_when_both_dv_and_tied_on_everything_else():
+    existing = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": None,
+                "original_filename": "a.mkv"}
+    incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": None,
+                "original_filename": "a.mkv"}
+    assert conflicts.needs_dv_layer_scan(existing, incoming) is True
+
+
+def test_needs_dv_layer_scan_false_when_resolution_already_decides_it():
+    existing = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": None,
+                "original_filename": "a.mkv"}
+    incoming = {"resolution": "1080p", "hdr": "Dolby Vision", "dv_layer": None,
+                "original_filename": "a.mkv"}
+    assert conflicts.needs_dv_layer_scan(existing, incoming) is False
+
+
+def test_needs_dv_layer_scan_false_when_neither_side_is_dv():
+    existing = {"resolution": "2160p", "hdr": None, "dv_layer": None, "original_filename": "a.mkv"}
+    incoming = {"resolution": "2160p", "hdr": None, "dv_layer": None, "original_filename": "a.mkv"}
+    assert conflicts.needs_dv_layer_scan(existing, incoming) is False
+
+
+def test_needs_dv_layer_scan_false_when_only_one_side_is_dv():
+    existing = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": None, "original_filename": "a.mkv"}
+    incoming = {"resolution": "2160p", "hdr": None, "dv_layer": None, "original_filename": "b.mkv"}
+    assert conflicts.needs_dv_layer_scan(existing, incoming) is False
+
+
+def test_needs_dv_layer_scan_false_when_dv_layer_already_known_on_both():
+    # Already resolved (e.g. a prior scan) — nothing left to gain by re-scanning.
+    existing = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "mel", "original_filename": "a.mkv"}
+    incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "fel", "original_filename": "a.mkv"}
+    assert conflicts.needs_dv_layer_scan(existing, incoming) is False
