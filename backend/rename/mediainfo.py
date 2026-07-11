@@ -74,6 +74,22 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
                 "container": None, "duration_min": None, "bitrate": None,
                 "resolution": None, "video_codec": None, "hdr": None,
                 "dv_layer": None, "audio": None}
+    try:
+        _st = os.stat(path)
+        disk_mtime, disk_size = _st.st_mtime, _st.st_size
+    except OSError:
+        disk_mtime, disk_size = None, None
+    # Cache check: a signature-matching prior probe is reused verbatim,
+    # skipping the ffprobe subprocess entirely. A probe FAILURE (None) is
+    # never cached (see the bottom of this function), so there's nothing to
+    # hit here for a file that previously failed to probe.
+    if db is not None and disk_mtime is not None and db.media_probe_is_current(path, disk_mtime, disk_size):
+        cached_row = db.get_media_probe(path)
+        if cached_row and cached_row.get("probe_json"):
+            try:
+                return json.loads(cached_row["probe_json"])
+            except (json.JSONDecodeError, TypeError):
+                pass  # corrupt cache row — fall through and re-probe
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return None
@@ -97,15 +113,6 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         size = int(fmt.get("size")) if fmt.get("size") else os.path.getsize(path)
     except (TypeError, ValueError, OSError):
         size = None
-    # On-disk (mtime, size) signature — used ONLY to validate the dv_scan
-    # cache (dv_scan_is_current), independent of the ffprobe-reported size
-    # above, so a stale cache entry from a since-overwritten file is detected
-    # even if ffprobe's container size happens to coincide.
-    try:
-        _st = os.stat(path)
-        disk_mtime, disk_size = _st.st_mtime, _st.st_size
-    except OSError:
-        disk_mtime, disk_size = None, None
     try:
         dur = float(fmt.get("duration")) if fmt.get("duration") else None
         duration_min = round(dur / 60) if dur and dur > 0 else None
@@ -139,7 +146,7 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         f"{audio.get('channels')}ch" if audio.get("channels") else None)
     audio_label = f"{acodec} {chans}".strip() if acodec else None
 
-    return {
+    result = {
         "present": True, "path": path, "size_bytes": size,
         "container": (fmt.get("format_name") or None),
         "duration_min": duration_min, "bitrate": bitrate,
@@ -147,3 +154,10 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         "dv_layer": _cached_dv_layer(path, disk_mtime, disk_size, db),
         "audio": audio_label,
     }
+    if db is not None and disk_mtime is not None:
+        try:
+            db.upsert_media_probe(path, json.dumps(result),
+                                   sig_mtime=disk_mtime, sig_size=disk_size)
+        except Exception:
+            pass  # cache write failure must never fail the probe itself
+    return result

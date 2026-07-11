@@ -99,3 +99,60 @@ def test_probe_specs_stale_dv_cache_ignored_after_overwrite(tmp_path):
     assert s["dv_layer"] is None
     db.dv_scan_is_current.assert_called_once()
     db.get_dv_scan.assert_not_called()  # never even consults the stale row
+
+
+# ── Task 2: probe_specs() cache integration (media_probe) ─────────────────
+
+def test_probe_specs_cache_hit_skips_ffprobe(tmp_path):
+    f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+    st = f.stat()
+    db = MagicMock()
+    cached = {"present": True, "path": str(f), "size_bytes": 1, "container": "matroska",
+              "duration_min": 1, "bitrate": 1, "resolution": "2160p", "video_codec": "HEVC",
+              "hdr": None, "dv_layer": None, "audio": None}
+    db.media_probe_is_current.return_value = True
+    db.get_media_probe.return_value = {"probe_json": json.dumps(cached)}
+    with patch("subprocess.run") as run_spy:
+        s = mediainfo.probe_specs(str(f), db=db)
+    run_spy.assert_not_called()
+    assert s["resolution"] == "2160p"
+
+
+def test_probe_specs_cache_miss_probes_and_caches(tmp_path):
+    f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+    db = MagicMock()
+    db.media_probe_is_current.return_value = False
+    # No dv_scan cache entry for this fresh file — realistic first-probe
+    # state, and required so the write-through result dict is JSON-safe
+    # (an unconfigured MagicMock() here would make _cached_dv_layer return
+    # a non-serializable Mock, breaking json.dumps(result) below).
+    db.dv_scan_is_current.return_value = False
+    fake = MagicMock(returncode=0, stdout=FFPROBE_JSON)
+    with patch("shutil.which", return_value="/usr/bin/ffprobe"), \
+         patch("subprocess.run", return_value=fake) as run_spy:
+        s = mediainfo.probe_specs(str(f), db=db)
+    run_spy.assert_called_once()
+    assert s["present"] is True
+    db.upsert_media_probe.assert_called_once()
+    args, kwargs = db.upsert_media_probe.call_args
+    assert args[0] == str(f)
+    assert json.loads(args[1])["resolution"] == "2160p"
+
+
+def test_probe_specs_failed_probe_not_cached(tmp_path):
+    f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+    db = MagicMock()
+    db.media_probe_is_current.return_value = False
+    with patch("shutil.which", return_value=None):
+        s = mediainfo.probe_specs(str(f), db=db)
+    assert s is None
+    db.upsert_media_probe.assert_not_called()
+
+
+def test_probe_specs_no_db_still_works_uncached(tmp_path):
+    f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+    fake = MagicMock(returncode=0, stdout=FFPROBE_JSON)
+    with patch("shutil.which", return_value="/usr/bin/ffprobe"), \
+         patch("subprocess.run", return_value=fake):
+        s = mediainfo.probe_specs(str(f))  # db=None, existing default
+    assert s["present"] is True
