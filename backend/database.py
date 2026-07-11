@@ -788,10 +788,18 @@ class DatabaseManager:
                 # now delete any old rows for this content_type that weren't
                 # part of the fresh set (they have stale keys).
                 if full_replace:
-                    fresh_db_keys = {
-                        item.get('key') or f"{item.get('rating_key')}_{item.get('media_id')}"
-                        for item in items
-                    }
+                    # Must mirror the insert's is_tv-aware fallback formula
+                    # exactly (line ~752-755) so this "keep" set matches the
+                    # keys actually stored. Using the movie-only formula for
+                    # TV items here caused every fresh TV row to look stale
+                    # and get deleted in the same transaction.
+                    fresh_db_keys = set()
+                    for item in items:
+                        k = item.get('key')
+                        if not k:
+                            k = (f"{item.get('rating_key')}" if is_tv
+                                 else f"{item.get('rating_key')}_{item.get('media_id')}")
+                        fresh_db_keys.add(k)
                     # Delete in batches to avoid SQLite placeholder limits
                     all_existing = cursor.execute(
                         "SELECT key FROM plex_cache WHERE content_type = ?", (mode,)

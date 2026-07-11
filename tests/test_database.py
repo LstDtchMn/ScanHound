@@ -676,6 +676,91 @@ class TestPlexCache:
         sizes = {i["size"] for i in matches}
         assert sizes == {4.5, 4.3}
 
+    # -- full_replace=True: insert-then-prune key-formula mismatch (bug repro) --
+
+    def test_full_replace_tv_shows_survive(self, db_manager, sample_tv_items):
+        """Regression for the "every TV show shows Missing" bug.
+
+        save_plex_cache(full_replace=True) inserts fresh rows, then prunes rows
+        whose key isn't in a freshly-computed "keep" set. The insert path keys
+        TV rows by rating_key ALONE (no media_id). Previously, the prune path
+        recomputed its "keep" set with the MOVIE formula
+        (rating_key + "_" + media_id) for every content type, so for TV items
+        (no pre-set 'key', no media_id) the computed keep-key never matched the
+        actually-stored key -- every freshly-inserted TV row was classified
+        stale and deleted in the same transaction. sample_tv_items mirrors real
+        TV items: rating_key is set, 'key' and 'media_id' are absent.
+        """
+        db_manager.save_plex_cache(sample_tv_items, "TV Shows", full_replace=True)
+        loaded = db_manager.load_plex_cache("TV Shows")
+        assert len(loaded) == len(sample_tv_items), (
+            f"expected all {len(sample_tv_items)} TV rows to survive full_replace, "
+            f"got {len(loaded)}: {loaded}"
+        )
+
+    def test_full_replace_movies_still_survive(self, db_manager, sample_movie_items):
+        """Regression: movies must keep surviving full_replace=True. Their
+        insert and prune key formulas already agreed (both use
+        rating_key + "_" + media_id), so this must pass before and after the
+        TV fix.
+        """
+        db_manager.save_plex_cache(sample_movie_items, "Movies", full_replace=True)
+        loaded = db_manager.load_plex_cache("Movies")
+        assert len(loaded) == len(sample_movie_items)
+
+    def test_full_replace_movies_then_tv_both_survive(self, db_manager,
+                                                        sample_movie_items, sample_tv_items):
+        """Mirrors the real scan flow: Movies saved first with
+        full_replace=True, then TV Shows saved with full_replace=True. Both
+        content types must remain fully populated afterward -- the TV prune
+        step is scoped to content_type = 'TV Shows' so it must not touch the
+        Movies rows, and (post-fix) must not wipe out its own fresh TV rows.
+        """
+        db_manager.save_plex_cache(sample_movie_items, "Movies", full_replace=True)
+        db_manager.save_plex_cache(sample_tv_items, "TV Shows", full_replace=True)
+        assert len(db_manager.load_plex_cache("Movies")) == len(sample_movie_items)
+        assert len(db_manager.load_plex_cache("TV Shows")) == len(sample_tv_items)
+
+    def test_full_replace_prunes_genuinely_stale_tv_row(self, db_manager):
+        """The prune must still work: a TV row from a PRIOR full_replace whose
+        rating_key is absent from the new fresh set (e.g. the show was removed
+        from Plex) must be deleted, not just spared by the key-formula fix.
+        """
+        old_items = [{
+            "clean_title": "canceled show",
+            "original_title": "Canceled Show",
+            "year": 2015,
+            "res": "1080p",
+            "size": 20.0,
+            "imdb_id": "tt1111111",
+            "rating_key": "9001",
+            "season": 1,
+            "episode_count": 5,
+            "dovi": False,
+            "hdr": False,
+        }]
+        new_items = [{
+            "clean_title": "renewed show",
+            "original_title": "Renewed Show",
+            "year": 2020,
+            "res": "1080p",
+            "size": 22.0,
+            "imdb_id": "tt2222222",
+            "rating_key": "9002",
+            "season": 1,
+            "episode_count": 8,
+            "dovi": False,
+            "hdr": False,
+        }]
+        db_manager.save_plex_cache(old_items, "TV Shows", full_replace=True)
+        db_manager.save_plex_cache(new_items, "TV Shows", full_replace=True)
+
+        loaded = db_manager.load_plex_cache("TV Shows")
+        rating_keys = {i["rating_key"] for i in loaded}
+        assert rating_keys == {"9002"}, (
+            f"expected only the fresh rating_key to survive, got {rating_keys}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 5. Scan history
