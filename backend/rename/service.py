@@ -1293,7 +1293,8 @@ class RenameService:
             # actionable — clear it so a stale conflict badge doesn't survive
             # onto this failed job.
             db.update_rename_job(job_id, status="failed", error_message="Source file missing",
-                                 conflict_kind=None, conflict_same_size=None)
+                                 conflict_kind=None, conflict_same_size=None,
+                                 conflict_existing_size=None, conflict_incoming_size=None)
             self._broadcast(job_id)
             return {"ok": False, "error": "Source file missing"}
         # Destination guard: a job whose library isn't configured has an empty or
@@ -1308,7 +1309,8 @@ class RenameService:
             msg = ("Library not configured — set the destination in "
                    "Settings → Renaming before applying")
             db.update_rename_job(job_id, status="needs_review", warning_message=msg,
-                                 conflict_kind=None, conflict_same_size=None)
+                                 conflict_kind=None, conflict_same_size=None,
+                                 conflict_existing_size=None, conflict_incoming_size=None)
             self._broadcast(job_id)
             return {"ok": False, "error": msg}
         dst = os.path.join(dest_dir,
@@ -1328,7 +1330,8 @@ class RenameService:
             try:
                 if os.path.samefile(src, dst):
                     db.update_rename_job(job_id, status="applied", processed_at=_now(),
-                                         conflict_kind=None, conflict_same_size=None)
+                                         conflict_kind=None, conflict_same_size=None,
+                                         conflict_existing_size=None, conflict_incoming_size=None)
                     self._broadcast(job_id)
                     return {"ok": True, "already": True}
             except OSError:
@@ -1351,6 +1354,8 @@ class RenameService:
                 # explicit — either way the file at dst is left untouched and
                 # the job goes back to needs_review (never left 'applying').
                 same_size = None
+                existing_size = None
+                candidate_size = None
                 try:
                     existing_size = os.path.getsize(dst)
                     candidate_size = os.path.getsize(src)
@@ -1372,7 +1377,8 @@ class RenameService:
                 combined = f"{existing}; {msg}" if existing else msg
                 db.update_rename_job(
                     job_id, status="needs_review", warning_message=combined,
-                    conflict_kind="destination_exists", conflict_same_size=same_size)
+                    conflict_kind="destination_exists", conflict_same_size=same_size,
+                    conflict_existing_size=existing_size, conflict_incoming_size=candidate_size)
                 self._broadcast(job_id)
                 return {"ok": False, "error": msg}
         method = self._cfg.get("auto_rename_move_method", "hardlink")
@@ -1412,7 +1418,8 @@ class RenameService:
             # 'destination_exists' marker from before is stale, so clear it
             # rather than leaving it on this failed job.
             db.update_rename_job(job_id, status="failed", error_message=str(e),
-                                 conflict_kind=None, conflict_same_size=None)
+                                 conflict_kind=None, conflict_same_size=None,
+                                 conflict_existing_size=None, conflict_incoming_size=None)
             self._broadcast(job_id)
             return {"ok": False, "error": str(e)}
         rlog.info("move   | %s -> %s (%s)", src, dst, used)
@@ -1422,7 +1429,8 @@ class RenameService:
             db.update_rename_job(job_id, status="applied", move_method=used,
                                  processed_at=_now(), plex_sort_title=sort_title,
                                  error_message=None,
-                                 conflict_kind=None, conflict_same_size=None)
+                                 conflict_kind=None, conflict_same_size=None,
+                                 conflict_existing_size=None, conflict_incoming_size=None)
         except Exception as e:
             # The file is already placed but we couldn't record it. Leaving the
             # row as-is orphans the file (re-apply sees "source missing", undo
@@ -1529,7 +1537,8 @@ class RenameService:
                                  match_confidence=100.0, match_source="manual",
                                  match_reasons=[],  # manual pick — no uncertainty
                                  status="needs_review", warning_message=warning,
-                                 conflict_kind=None, conflict_same_size=None)
+                                 conflict_kind=None, conflict_same_size=None,
+                                 conflict_existing_size=None, conflict_incoming_size=None)
             self._broadcast(job_id)
             return {"ok": True, "status": "needs_review", "new_filename": None,
                     "destination_path": None, "warning": warning}
@@ -1543,7 +1552,8 @@ class RenameService:
                              destination_path=dest, match_confidence=100.0,
                              match_source="manual", match_reasons=[],
                              status="matched", warning_message=None,
-                             conflict_kind=None, conflict_same_size=None)
+                             conflict_kind=None, conflict_same_size=None,
+                             conflict_existing_size=None, conflict_incoming_size=None)
         self._broadcast(job_id)
         return {"ok": True, "status": "matched", "new_filename": fname,
                 "destination_path": dest, "warning": None}
@@ -1878,7 +1888,8 @@ class RenameService:
             db.update_rename_job(job_id, status="needs_review",
                                  destination_path=None,
                                  warning_message="Destination library not configured",
-                                 conflict_kind=None, conflict_same_size=None)
+                                 conflict_kind=None, conflict_same_size=None,
+                                 conflict_existing_size=None, conflict_incoming_size=None)
             self._broadcast(job_id)
             return {"id": int(job_id), "ok": False, "destination_path": None,
                     "error": "Destination library not configured"}
@@ -1894,7 +1905,8 @@ class RenameService:
                 template=self._template_for(mtype))
         db.update_rename_job(job_id, new_filename=fname, destination_path=dest,
                              status="matched", warning_message=None,
-                             conflict_kind=None, conflict_same_size=None)
+                             conflict_kind=None, conflict_same_size=None,
+                             conflict_existing_size=None, conflict_incoming_size=None)
         self._broadcast(job_id)
         return {"id": int(job_id), "ok": True, "destination_path": dest,
                 "error": None}
@@ -1993,7 +2005,8 @@ class RenameService:
             new_filename=fname, destination_path=dest,
             suggested_correction=None,
             status="matched", warning_message=None,
-            conflict_kind=None, conflict_same_size=None)
+            conflict_kind=None, conflict_same_size=None,
+            conflict_existing_size=None, conflict_incoming_size=None)
         self._broadcast(job_id)
         return {"ok": True, "new_filename": fname}
 

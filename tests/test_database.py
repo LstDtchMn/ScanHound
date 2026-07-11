@@ -220,6 +220,21 @@ class TestDismissedItems:
         assert job["conflict_kind"] is None
         assert job["conflict_same_size"] is None
 
+    def test_rename_job_conflict_size_columns_roundtrip(self, db_manager):
+        jid = db_manager.create_rename_job({
+            "original_path": "/src/e.mkv", "status": "needs_review",
+            "conflict_kind": "destination_exists", "conflict_same_size": False,
+            "conflict_existing_size": 1073741824, "conflict_incoming_size": 2147483648,
+        })
+        job = db_manager.get_rename_job(jid)
+        assert job["conflict_existing_size"] == 1073741824
+        assert job["conflict_incoming_size"] == 2147483648
+        jid_n = db_manager.create_rename_job({
+            "original_path": "/src/f.mkv", "status": "needs_review"})
+        j_n = db_manager.get_rename_job(jid_n)
+        assert j_n["conflict_existing_size"] is None
+        assert j_n["conflict_incoming_size"] is None
+
     def test_dismiss_records_title_quality(self, db_manager):
         # Rich tuple (url, title, group_key, resolution, dovi) powers title-level skip.
         db_manager.add_dismissed_items([("http://x/a", "Heat", "heat|1995", "1080p", False)])

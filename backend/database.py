@@ -589,6 +589,12 @@ class DatabaseManager:
                     # this into the free-text warning_message.
                     'ALTER TABLE rename_jobs ADD COLUMN conflict_kind TEXT',
                     'ALTER TABLE rename_jobs ADD COLUMN conflict_same_size INTEGER',
+                    # Raw byte sizes of the two files involved in a
+                    # 'destination_exists' collision — lets the desktop Renames
+                    # row render GB size chips instead of parsing them back out
+                    # of warning_message's free-text byte counts.
+                    'ALTER TABLE rename_jobs ADD COLUMN conflict_existing_size INTEGER',
+                    'ALTER TABLE rename_jobs ADD COLUMN conflict_incoming_size INTEGER',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -2005,6 +2011,7 @@ class DatabaseManager:
         "warning_message", "error_message", "processed_at", "reverted_at",
         "suggested_correction", "combined_episode", "split_file", "poster_path",
         "match_reasons", "prior_status", "conflict_kind", "conflict_same_size",
+        "conflict_existing_size", "conflict_incoming_size",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.

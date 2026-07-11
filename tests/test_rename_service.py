@@ -516,6 +516,25 @@ class TestConflictSignal:
         assert job["conflict_same_size"] is False
         assert "same size" not in job["warning_message"]
 
+    def test_collision_sets_existing_and_incoming_sizes(self, db, tmp_path):
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="x")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv", content="x")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+
+        svc.apply(jid2)
+        job = db.get_rename_job(jid2)
+        assert job["conflict_kind"] == "destination_exists"
+        assert job["conflict_existing_size"] == 1
+        assert job["conflict_incoming_size"] == 1
+        assert job["conflict_existing_size"] == job["conflict_incoming_size"]
+
     def test_overwrite_apply_clears_conflict_signal(self, db, tmp_path):
         second_root = tmp_path / "second"
         second_root.mkdir()
@@ -538,6 +557,30 @@ class TestConflictSignal:
         assert job["status"] == "applied"
         assert job["conflict_kind"] is None
         assert job["conflict_same_size"] is None
+
+    def test_overwrite_apply_clears_size_signal(self, db, tmp_path):
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="x")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv", content="x")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+
+        svc.apply(jid2)  # -> needs_review + signal set
+        job_before = db.get_rename_job(jid2)
+        assert job_before["conflict_existing_size"] == 1
+        assert job_before["conflict_incoming_size"] == 1
+
+        out = svc.apply(jid2, conflict_strategy="overwrite")
+        assert out["ok"] is True
+        job = db.get_rename_job(jid2)
+        assert job["status"] == "applied"
+        assert job["conflict_existing_size"] is None
+        assert job["conflict_incoming_size"] is None
 
     def test_keep_both_apply_clears_conflict_signal(self, db, tmp_path):
         second_root = tmp_path / "second"
