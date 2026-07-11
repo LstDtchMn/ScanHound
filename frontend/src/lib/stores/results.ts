@@ -973,6 +973,21 @@ export function restoreItem(url: string, item?: ScanResult): Promise<boolean> {
   );
 }
 
+/** Restore ALL dismissed items (clear the skip list). Optimistically empties
+ *  `dismissedUrls`; on API failure, restores the previous set. Restored items
+ *  reappear in results on the next refresh (paged) or immediately (live). */
+export function restoreAllDismissed(): Promise<boolean> {
+  const prev = get(dismissedUrls);
+  dismissedUrls.set(new Set());
+  return api.clearDismissed().then(
+    () => true,
+    () => {
+      dismissedUrls.set(prev);
+      return false;
+    }
+  );
+}
+
 /** Clears the current result set. Its only caller today is ScanControls'
  *  handleStart (the local Start-Scan button), so this also flips out of
  *  paged mode here: belt-and-braces for the pre-first-result window where the
