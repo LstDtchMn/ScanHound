@@ -13,7 +13,7 @@
   import { mobile } from '$lib/stores/media';
   import { addToast } from '$lib/stores/notifications';
   import { get } from 'svelte/store';
-  import { scanState, scanProgress, scanPhase } from '$lib/stores/scanner';
+  import { scanState, scanProgress, scanPhase, selectedScanSource, searchThisSite } from '$lib/stores/scanner';
   import { settings, settingsLoaded, loadSettings } from '$lib/stores/settings';
   import { plexConnected, plexMovieCount, plexTvCount, refreshPlexStatus } from '$lib/stores/plex';
   import { batchProgress } from '$lib/stores/downloads';
@@ -632,6 +632,12 @@
             onclick={() => clearAllFilters()}
             class="px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-[var(--accent)] hover:opacity-90 transition-opacity"
           >Clear filters</button>
+          {#if $searchFilter}
+            <button
+              onclick={() => searchThisSite($searchFilter, $selectedScanSource)}
+              class="px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-[var(--accent)] hover:opacity-90 transition-opacity"
+            >Search {$selectedScanSource} for "{$searchFilter}" &rarr;</button>
+          {/if}
         {:else}
           <p class="text-sm text-[var(--text-secondary)]">No results match your filter</p>
           <p class="text-xs text-[var(--text-secondary)] opacity-60">Try adjusting the status filter or search text.</p>

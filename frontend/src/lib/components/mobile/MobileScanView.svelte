@@ -4,9 +4,9 @@
     filteredResults, filteredTotal, titleCounts, pagedMode, hasMore, loadingMore,
     loadResults, handleReconnectSnapshot, phoneColumns, mobileChromeCollapsed,
     dismissItem, restoreItem, hiddenByFiltersCount, clearAllFilters, isResultsViewEmpty,
-    activeNarrowingFilters
+    activeNarrowingFilters, searchFilter
   } from '$lib/stores/results';
-  import { scanState } from '$lib/stores/scanner';
+  import { scanState, selectedScanSource, searchThisSite } from '$lib/stores/scanner';
   import { onMount } from 'svelte';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
@@ -159,6 +159,12 @@
           onclick={() => clearAllFilters()}
           class="px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-[var(--accent)] hover:opacity-90 transition-opacity"
         >Clear filters</button>
+        {#if $searchFilter}
+          <button
+            onclick={() => searchThisSite($searchFilter, $selectedScanSource)}
+            class="px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-[var(--accent)] hover:opacity-90 transition-opacity"
+          >Search {$selectedScanSource} for "{$searchFilter}" &rarr;</button>
+        {/if}
       </div>
     {:else}
       <p class="text-center text-sm text-[var(--text-secondary)] py-10">No results — pull to refresh or adjust filters.</p>
