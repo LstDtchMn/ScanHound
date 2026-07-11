@@ -268,6 +268,68 @@ describe('Apply progress: speed/ETA fields + staleness fixes', () => {
     expect(get(mod.applyCancelling)).toBe(false);
   });
 
+  it('resyncAfterReconnect does NOT clear the queue banner while the applying-filter snapshot proves a bulk run is still active', async () => {
+    // Regression test for a review finding: the previous unconditional
+    // renameQueue.set(null) fired even when this same function's own
+    // applying-filter fetch just proved a run is genuinely still going (e.g.
+    // mid-copy on one large file, between per-job queue_progress
+    // broadcasts) — hiding the Stop button and re-enabling every
+    // applyActive-gated control until the next broadcast, potentially
+    // minutes away.
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    const queueBefore = { done: 1, total: 3, current_title: 'Some Movie' };
+    mod.renameQueue.set(queueBefore);
+    mod.applyCancelling.set(true);
+    const allJobs = [{ id: 1, status: 'applying' }];
+    mockJobsByStatus(allJobs, allJobs);
+
+    await mod.resyncAfterReconnect();
+
+    expect(get(mod.renameQueue)).toEqual(queueBefore);
+    expect(get(mod.applyCancelling)).toBe(true);
+  });
+
+  it('resyncAfterReconnect never regresses a locally-known terminal job back to a stale non-terminal status from the REST snapshot', async () => {
+    // Regression test for review findings (Important): the two REST reads
+    // inside fetchResyncSnapshot (general + status=applying) are independent
+    // queries with no shared transaction, and the live WS socket is already
+    // dispatching while they're in flight. A job can go applying -> applied
+    // (via the live rename:job handler) entirely within that window, making
+    // the snapshot stale for that job. The merge must never let a stale
+    // snapshot clobber a locally-held terminal status back to 'applying'.
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    // The live WS handler already applied job 7's completion before the
+    // snapshot resolves (simulating the race window).
+    handlers['rename:job']({ id: 7, status: 'applied', title: 'Some Movie' });
+    expect(get(mod.renameJobs).find((j: { id: number }) => j.id === 7)).toMatchObject({ status: 'applied' });
+    // Both REST reads are stale for job 7 — read before its completion committed.
+    const allJobs = [{ id: 7, status: 'applying' }];
+    mockJobsByStatus(allJobs, allJobs);
+
+    await mod.resyncAfterReconnect();
+
+    const job7 = get(mod.renameJobs).find((j: { id: number }) => j.id === 7);
+    expect(job7).toMatchObject({ status: 'applied' });
+  });
+
+  it('resyncAfterReconnect still lets a genuinely-fresh snapshot move a job from applying to applied', async () => {
+    // Guards the previous test's fix from over-correcting: when the client
+    // has NO locally-known terminal status for a job (the ordinary "missed
+    // the broadcast entirely while offline" case this resync exists for),
+    // the snapshot must still be trusted normally.
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.renameJobs.set([{ id: 8, status: 'applying' }] as unknown as RenameJob[]);
+    const allJobs = [{ id: 8, status: 'applied' }];
+    mockJobsByStatus(allJobs, allJobs);
+
+    await mod.resyncAfterReconnect();
+
+    expect(get(mod.renameJobs).find((j) => j.id === 8)).toMatchObject({ status: 'applied' });
+  });
+
   it('the registered reconnect handler actually triggers a resync (end-to-end wiring)', async () => {
     const mod = await import('./renames');
     const { get } = await import('svelte/store');

@@ -430,6 +430,25 @@ export async function resyncAfterReconnect() {
   // job it missed (see comment above) isn't dropped from view.
   const byId = new Map(snapshot.jobs.map((j) => [j.id, j] as const));
   for (const j of snapshot.applyingJobs) byId.set(j.id, j);
+  // The three REST reads above are independent queries with no shared
+  // transaction, and the live WS socket is already open and dispatching
+  // during this whole async round-trip (reconnectHandlers fire in
+  // ws.onopen, before this function's fetches resolve). So a job can go
+  // 'applying' -> 'applied' entirely between two of these reads, or a
+  // terminal rename:job broadcast can land — and be applied by the handler
+  // above — while this fetch is still in flight. Either way this snapshot
+  // is then stale for that job, and blindly trusting it here would clobber
+  // the fresher, already-correct local state back to 'applying' — the
+  // exact bug this resync exists to fix, reintroduced as a race. Only a WS
+  // broadcast ever sets a terminal status (applied/failed), so a locally-
+  // held terminal status is always at least as fresh as anything these
+  // fetches could have read; never let this snapshot regress one.
+  const TERMINAL = new Set(['applied', 'failed']);
+  for (const local of get(renameJobs)) {
+    if (!TERMINAL.has(local.status)) continue;
+    const merged = byId.get(local.id);
+    if (!merged || !TERMINAL.has(merged.status)) byId.set(local.id, local);
+  }
   renameJobs.set([...byId.values()]);
   renameStatus.set(snapshot.status);
   const applyingIds = new Set(snapshot.applyingJobs.map((j) => j.id));
@@ -441,8 +460,17 @@ export async function resyncAfterReconnect() {
     }
     return next;
   });
-  renameQueue.set(null);
-  applyCancelling.set(false);
+  // Only clear the queue banner (and thus applyActive) when the snapshot's
+  // own authoritative applying-filter confirms nothing is actually still
+  // running — it was fetched moments ago in this same round-trip.
+  // Unconditionally nulling it, even while a bulk run is genuinely mid-copy
+  // between per-job queue_progress broadcasts (which for one large file can
+  // be minutes apart), would hide the Stop button and re-enable every
+  // applyActive-gated control for however long remains until the next one.
+  if (snapshot.applyingJobs.length === 0) {
+    renameQueue.set(null);
+    applyCancelling.set(false);
+  }
 }
 
 connection.onReconnect(() => {
