@@ -3,8 +3,9 @@
   import RenameReviewCard from './RenameReviewCard.svelte';
   import { api } from '$lib/api/client';
   import {
-    applyJob, deleteJob, acceptCombinedJob, acceptCorrectionJob, refreshRenames
+    applyJob, deleteJob, acceptCombinedJob, acceptCorrectionJob, refreshRenames, applyActive
   } from '$lib/stores/renames';
+  import { addToast } from '$lib/stores/notifications';
   import type { RenameJob } from '$lib/api/types';
 
   let { job, onClose }: { job: RenameJob; onClose: () => void } = $props();
@@ -20,6 +21,12 @@
     try {
       await fn();
       onClose();
+    } catch (e) {
+      // Previously uncaught: a failed action (e.g. Apply rejected because a
+      // bulk apply is already running) left the modal open with zero
+      // feedback. The card's buttons are also disabled while $applyActive is
+      // true (see below), so this is defense-in-depth, not the primary guard.
+      addToast('Rename', e instanceof Error ? e.message : 'Action failed', 'error');
     } finally {
       busy = false;
     }
@@ -31,7 +38,7 @@
        role="dialog" aria-modal="true" tabindex="-1">
     <RenameReviewCard
       {job}
-      {busy}
+      busy={busy || $applyActive}
       onApply={() => act(() => applyJob(job.id))}
       onOverwrite={() => act(() => applyJob(job.id, 'overwrite'))}
       onKeepBoth={() => act(() => applyJob(job.id, 'keep_both'))}

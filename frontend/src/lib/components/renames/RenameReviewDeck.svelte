@@ -4,7 +4,7 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import {
-    applyJob, deleteJob, acceptCombinedJob, acceptCorrectionJob, refreshRenames
+    applyJob, deleteJob, acceptCombinedJob, acceptCorrectionJob, refreshRenames, applyActive
   } from '$lib/stores/renames';
   import { deckQueue, partitionJobs, type ReviewScope } from '$lib/renames/review';
   import { createDragTracker } from '$lib/components/mobile/gestures';
@@ -71,6 +71,16 @@
     applyAllBusy = true;
     try {
       const r = await api.bulkApply(ids);
+      if (r.busy) {
+        // The button is disabled while $applyActive is true, so this should
+        // be unreachable from a single tab — but without this check, a busy
+        // rejection (r.queued === 0) would otherwise show the confusing
+        // "Applying 0 in background" instead of explaining why nothing
+        // happened (the same trap bulkApply()/applyConfident() in
+        // stores/renames.ts already guard against for their own callers).
+        addToast('Renames', 'Another apply is in progress — try again once it finishes.', 'warning');
+        return;
+      }
       addToast('Renames', `Applying ${r.queued ?? ids.length} in background`);
       await refreshRenames();
     } catch (e) {
@@ -193,7 +203,7 @@
         {#key current.id}
           <RenameReviewCard
             job={current}
-            busy={busyId === current.id}
+            busy={busyId === current.id || $applyActive}
             onApply={() => act(() => applyJob(current!.id), 'Applied')}
             onOverwrite={() => act(() => applyJob(current!.id, 'overwrite'), 'Overwriting…')}
             onKeepBoth={() => act(() => applyJob(current!.id, 'keep_both'), 'Keeping both')}
@@ -217,7 +227,8 @@
           <button
             type="button"
             onclick={applyAllReady}
-            disabled={applyAllBusy}
+            disabled={applyAllBusy || $applyActive}
+            title={$applyActive ? 'A bulk apply is in progress — try again once it finishes.' : undefined}
             class="px-4 py-2 rounded-lg text-sm font-semibold bg-[var(--accent)] text-white disabled:opacity-50 hover:brightness-110 transition-all"
           >
             {applyAllBusy ? 'Applying…' : `Apply all ${counts.ready.length} ready`}

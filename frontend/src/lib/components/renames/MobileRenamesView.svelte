@@ -2,7 +2,7 @@
   import RenameReviewDeck from './RenameReviewDeck.svelte';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
-  import { renameJobs, renameQuery, refreshRenames } from '$lib/stores/renames';
+  import { renameJobs, renameQuery, refreshRenames, applyActive } from '$lib/stores/renames';
   import { partitionJobs, matchesQuery, type ReviewScope } from '$lib/renames/review';
 
   let deckOpen = $state(false);
@@ -24,6 +24,16 @@
     try {
       const ids = parts.ready.map((j) => j.id);
       const r = await api.bulkApply(ids);
+      if (r.busy) {
+        // The button is disabled while $applyActive is true, so this should
+        // be unreachable from a single tab — but without this check, a busy
+        // rejection (r.queued === 0) would otherwise show the confusing
+        // "Applying 0 in background" instead of explaining why nothing
+        // happened (the same trap bulkApply()/applyConfident() in
+        // stores/renames.ts already guard against for their own callers).
+        addToast('Renames', 'Another apply is in progress — try again once it finishes.', 'warning');
+        return;
+      }
       addToast('Renames', `Applying ${r.queued ?? ids.length} in background`);
       await refreshRenames();
     } catch (e) {
@@ -60,7 +70,8 @@
         <button
           type="button"
           onclick={applyAllReady}
-          disabled={applyAllBusy || parts.ready.length === 0}
+          disabled={applyAllBusy || $applyActive || parts.ready.length === 0}
+          title={$applyActive ? 'A bulk apply is in progress — try again once it finishes.' : undefined}
           class="w-full px-4 py-3 rounded-lg text-sm font-semibold bg-[var(--accent)] text-white disabled:opacity-50 hover:brightness-110 transition-all"
         >
           {applyAllBusy ? 'Applying…' : 'Apply all'}
@@ -74,7 +85,8 @@
           <button
             type="button"
             onclick={applyAllReady}
-            disabled={applyAllBusy}
+            disabled={applyAllBusy || $applyActive}
+            title={$applyActive ? 'A bulk apply is in progress — try again once it finishes.' : undefined}
             class="w-full px-4 py-3 rounded-lg text-sm font-semibold bg-[var(--accent)] text-white disabled:opacity-50 hover:brightness-110 transition-all"
           >
             {applyAllBusy ? 'Applying…' : 'Apply all'}

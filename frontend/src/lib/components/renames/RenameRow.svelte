@@ -2,9 +2,10 @@
   import RenamePoster from './RenamePoster.svelte';
   import BadgeCluster from './BadgeCluster.svelte';
   import Badge from '$lib/components/Badge.svelte';
-  import { selectedJobIds, toggleSelect, applyJob, renameProgress } from '$lib/stores/renames';
+  import { selectedJobIds, toggleSelect, applyJob, renameProgress, applyActive } from '$lib/stores/renames';
   import { hasDestinationConflict } from '$lib/renames/review';
   import { formatBytes } from '$lib/renames/conflictView';
+  import { addToast } from '$lib/stores/notifications';
   import type { RenameJob } from '$lib/api/types';
 
   let {
@@ -33,6 +34,15 @@
     busy = true;
     try {
       await applyJob(job.id);
+    } catch (e) {
+      // The Apply button is disabled while $applyActive is true (see below),
+      // so a busy-queue rejection shouldn't normally reach here — but the
+      // single-job apply route folds "busy" into a generic 400 "Apply
+      // failed" (no distinguishable busy flag like the bulk routes have), so
+      // this is a defense-in-depth catch for that case and any other apply
+      // failure, not a busy-specific one. Previously uncaught: the click
+      // silently did nothing with zero feedback.
+      addToast('Apply failed', e instanceof Error ? e.message : 'Could not apply — try again.', 'error');
     } finally {
       busy = false;
     }
@@ -119,7 +129,8 @@
     {#if canApply}
       <button
         class="px-2 py-1 rounded text-[11px] font-medium bg-[var(--accent)] text-white disabled:opacity-50"
-        disabled={busy}
+        disabled={busy || $applyActive}
+        title={$applyActive ? 'A bulk apply is in progress — try again once it finishes.' : undefined}
         onclick={apply}
       >
         Apply
