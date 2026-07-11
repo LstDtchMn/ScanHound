@@ -65,3 +65,16 @@ def test_plex_cache_file_path_defaults_null_when_absent(tmp_path):
     }], "Movies")
     row = db._query_dicts("SELECT file_path FROM plex_cache WHERE key = ?", ("1_1_0",))
     assert row[0]["file_path"] is None
+
+
+def test_list_plex_cache_movies_returns_movie_rows_only(tmp_path):
+    db = _db(tmp_path)
+    db.save_plex_cache([{"clean_title": "M", "original_title": "M", "year": 2020,
+                          "res": "4K", "size": 1.0, "imdb_id": "tt1", "rating_key": "1",
+                          "media_id": "1", "key": "1_1_0", "file": "/m.mkv"}], "Movies")
+    db.save_plex_cache([{"clean_title": "S", "original_title": "S", "year": 2020,
+                          "res": "1080p", "size": 1.0, "imdb_id": "tt2",
+                          "rating_key": "2", "key": "s2", "season": 1}], "TV Shows")
+    rows = db.list_plex_cache_movies()
+    assert len(rows) == 1
+    assert rows[0]["imdb_id"] == "tt1"

@@ -866,6 +866,14 @@ class DatabaseManager:
                 logger.debug("Rollback failed: %s", rb_err)
             logger.error("DB Error (save_cache): %s", e)
 
+    def list_plex_cache_movies(self):
+        """Return every plex_cache row for content_type='Movies' (dicts) — the
+        candidate pool for find_library_duplicate()."""
+        return self._query_dicts(
+            "SELECT key, title, original_title, year, res, size, imdb_id, "
+            "rating_key, media_id, is_tv, dovi, hdr, file_path "
+            "FROM plex_cache WHERE content_type = 'Movies'", default=[])
+
     def load_plex_cache(self, mode):
         """Load cached Plex items for the given content type.
 
