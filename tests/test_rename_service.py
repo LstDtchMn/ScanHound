@@ -1004,6 +1004,146 @@ class TestApplyUndo:
         assert db.get_rename_job(jid)["status"] == "failed"
 
 
+# ── "Stop applying" — graceful cancel of the apply queue ───────────────
+
+def _matched_job(db, tmp_path, name):
+    """A ready-to-apply 'matched' job with a real source file, no conflict."""
+    d = tmp_path / "incoming"
+    d.mkdir(parents=True, exist_ok=True)
+    src = d / f"{name}.mkv"
+    src.write_bytes(b"DATA")
+    dst_dir = tmp_path / "lib"
+    dst_dir.mkdir(exist_ok=True)
+    jid = db.create_rename_job({
+        "original_path": str(src),
+        "original_filename": src.name,
+        "new_filename": f"{name}.mkv",
+        "destination_path": str(dst_dir),
+        "status": "matched",
+        "match_confidence": 100,
+        "package_name": "pkg",
+    })
+    return jid, src
+
+
+class TestQueueApplyCancel:
+    """cancel_apply() must let the in-flight file finish untouched, revert
+    the not-yet-started jobs back to their prior status (never stuck
+    'applying'), and never let a stale cancel from a previous run abort a
+    fresh apply."""
+
+    def _wait_until_settled(self, db, ids, timeout=5):
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if all(db.get_rename_job(j)["status"] != "applying" for j in ids):
+                return
+            time.sleep(0.05)
+
+    def test_cancel_finishes_inflight_and_reverts_remaining(self, db, tmp_path):
+        svc = _service(db, _weak_search)
+        j0, src0 = _matched_job(db, tmp_path, "Movie0")
+        j1, src1 = _matched_job(db, tmp_path, "Movie1")
+        j2, src2 = _matched_job(db, tmp_path, "Movie2")
+        ids = [j0, j1, j2]
+
+        # Wrap apply() so the moment the first (in-flight) job finishes, a
+        # "Stop applying" click happens concurrently — mirrors the real
+        # HTTP-triggered cancel_apply() racing the worker thread.
+        real_apply = svc.apply
+        applied_order = []
+
+        def _wrapped(job_id, *a, **k):
+            applied_order.append(job_id)
+            out = real_apply(job_id, *a, **k)
+            if len(applied_order) == 1:
+                svc.cancel_apply()
+            return out
+
+        svc.apply = _wrapped
+
+        out = svc.queue_apply(ids)
+        assert out["ok"] is True
+        assert out["queued"] == 3
+
+        self._wait_until_settled(db, ids)
+
+        # The worker broke before starting job 1 — apply() ran exactly once.
+        assert applied_order == [j0]
+
+        job0 = db.get_rename_job(j0)
+        assert job0["status"] == "applied"  # in-flight job always finishes cleanly
+        assert os.path.isfile(os.path.join(str(tmp_path / "lib"), "Movie0.mkv"))
+        assert not os.path.exists(src0)  # consumed by the (non-automatic) move
+
+        for jid, src in ((j1, src1), (j2, src2)):
+            job = db.get_rename_job(jid)
+            assert job["status"] == "matched"  # reverted, never stuck 'applying'
+            assert job["prior_status"] is None  # cleared, not left dangling
+            assert os.path.exists(src)  # apply() never ran — file untouched
+
+    def test_cancel_apply_sets_the_flag(self, db):
+        svc = _service(db, _weak_search)
+        assert not svc._apply_cancel.is_set()
+        result = svc.cancel_apply()
+        assert result.get("ok") is True
+        assert svc._apply_cancel.is_set()
+
+    def test_fresh_queue_apply_clears_a_stale_cancel_flag(self, db, tmp_path):
+        svc = _service(db, _weak_search)
+        svc._apply_cancel.set()  # a cancel left set by some earlier, finished run
+        j0, _ = _matched_job(db, tmp_path, "MovieA")
+        j1, _ = _matched_job(db, tmp_path, "MovieB")
+        ids = [j0, j1]
+
+        out = svc.queue_apply(ids)
+        assert out["queued"] == 2
+
+        self._wait_until_settled(db, ids)
+
+        # The stale flag must not have aborted this fresh run.
+        assert db.get_rename_job(j0)["status"] == "applied"
+        assert db.get_rename_job(j1)["status"] == "applied"
+
+    def test_apply_confident_cancel_breaks_without_reverting(self, db, tmp_path):
+        svc = _service(db, _weak_search)
+        j0, _ = _matched_job(db, tmp_path, "MovieX")
+        j1, _ = _matched_job(db, tmp_path, "MovieY")
+        j2, _ = _matched_job(db, tmp_path, "MovieZ")
+
+        real_apply = svc.apply
+        applied_order = []
+
+        def _wrapped(job_id, *a, **k):
+            applied_order.append(job_id)
+            out = real_apply(job_id, *a, **k)
+            if len(applied_order) == 1:
+                svc.cancel_apply()
+            return out
+
+        svc.apply = _wrapped
+
+        out = svc.apply_confident([j0, j1, j2])
+
+        assert applied_order == [j0]
+        assert out["applied"] == 1
+        assert db.get_rename_job(j0)["status"] == "applied"
+        # apply_confident never pre-marks candidates 'applying' — the
+        # untouched ones are simply still whatever they started as.
+        assert db.get_rename_job(j1)["status"] == "matched"
+        assert db.get_rename_job(j2)["status"] == "matched"
+
+    def test_apply_confident_clears_a_stale_cancel_flag(self, db, tmp_path):
+        svc = _service(db, _weak_search)
+        svc._apply_cancel.set()
+        j0, _ = _matched_job(db, tmp_path, "MovieQ")
+
+        out = svc.apply_confident([j0])
+
+        assert out["applied"] == 1
+        assert db.get_rename_job(j0)["status"] == "applied"
+
+
 # ── Ollama fallback ───────────────────────────────────────────────────
 
 class TestLlmFallback:

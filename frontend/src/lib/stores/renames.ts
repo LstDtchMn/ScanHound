@@ -177,6 +177,19 @@ export async function applyConfident(ids?: number[]) {
   }
 }
 
+/** "Stop applying" — gracefully halts the running apply queue after its
+ *  in-flight file finishes. Reverted jobs reappear as Matched via the
+ *  normal rename:job broadcast; no local state to reconcile here. */
+export async function cancelApply() {
+  applyCancelling.set(true);
+  try {
+    await api.cancelApply();
+  } catch (e) {
+    applyCancelling.set(false);
+    addToast('Stop applying failed', e instanceof Error ? e.message : String(e), 'error');
+  }
+}
+
 export async function acceptCombinedJob(id: number) {
   await api.acceptCombinedRename(id);
   await refresh();
@@ -203,6 +216,13 @@ export const renameProgress = writable<Map<number, RenameProgress>>(new Map());
 export interface RenameQueueProgress { done: number; total: number; current_title: string | null; }
 export const renameQueue = writable<RenameQueueProgress | null>(null);
 
+// True from a "Stop applying" click until the queue actually clears — drives
+// the Stop button's disabled/"Stopping…" state. The cancel POST returns
+// immediately; the queue keeps running until its in-flight file finishes, so
+// this stays true until the queueClearTimer below fires (same "done" signal
+// the progress bar itself waits for).
+export const applyCancelling = writable<boolean>(false);
+
 connection.on('rename:progress', (data) => {
   const id = data.id as number;
   if (!id) return;
@@ -224,7 +244,10 @@ connection.on('rename:queue_progress', (data) => {
   if (!active) {
     // Brief "100%" flash, then clear the queue bar.
     renameQueue.set({ done: (data.done as number) ?? 0, total: (data.total as number) ?? 0, current_title: null });
-    queueClearTimer = setTimeout(() => renameQueue.set(null), 1500);
+    queueClearTimer = setTimeout(() => {
+      renameQueue.set(null);
+      applyCancelling.set(false);
+    }, 1500);
     return;
   }
   renameQueue.set({

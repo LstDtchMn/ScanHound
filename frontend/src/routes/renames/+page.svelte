@@ -2,9 +2,9 @@
   import { onMount } from 'svelte';
   import {
     renameJobs, renameStatus, renameCategory, renameQuery, renameSort,
-    viewMode, renameQueue,
+    viewMode, renameQueue, applyCancelling,
     loadRenameJobs, loadRenameStatus, loadDvScans,
-    applyJob, undoJob, deleteJob,
+    applyJob, undoJob, deleteJob, cancelApply,
     acceptCombinedJob, acceptCorrectionJob,
     dvScanProgress, dvScanResult, dvScans, dvCounts, dvScanRunning,
     dvSyncRunning, dvSyncProgress, dvSyncResult
@@ -239,7 +239,17 @@
           Applying {Math.min($renameQueue.done + 1, $renameQueue.total)} of {$renameQueue.total}
           {#if $renameQueue.current_title}<span class="text-[var(--text-secondary)]"> — {$renameQueue.current_title}</span>{/if}
         </span>
-        <span class="text-[var(--text-secondary)]">{Math.round(($renameQueue.done / Math.max($renameQueue.total, 1)) * 100)}%</span>
+        <div class="flex items-center gap-2">
+          <span class="text-[var(--text-secondary)]">{Math.round(($renameQueue.done / Math.max($renameQueue.total, 1)) * 100)}%</span>
+          <button
+            type="button"
+            class="px-2 py-1 rounded text-[11px] font-medium bg-[var(--bg-tertiary)] disabled:opacity-50"
+            disabled={$applyCancelling}
+            onclick={() => cancelApply()}
+          >
+            {$applyCancelling ? 'Stopping…' : 'Stop'}
+          </button>
+        </div>
       </div>
       <div class="mt-1 h-1.5 rounded-full bg-[var(--bg-tertiary)] overflow-hidden">
         <div class="h-full bg-[var(--accent)] transition-[width] duration-300"

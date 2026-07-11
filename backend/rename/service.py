@@ -160,6 +160,14 @@ class RenameService:
         # Serializes bulk background ops (reidentify_all / process_folder) so two
         # concurrent runs can't race into duplicate jobs for the same path.
         self._bulk_lock = threading.Lock()
+        # Set by cancel_apply() (POST /rename/apply/cancel) to gracefully stop a
+        # running queue_apply/apply_confident after the file currently in flight
+        # finishes — checked at the top of each loop iteration in both. Cleared
+        # at the start of every fresh run so a stale cancel from a previous,
+        # already-finished batch can never abort a new one. threading.Event's
+        # set()/is_set()/clear() are each internally lock-protected, so the HTTP
+        # thread setting it and the worker thread reading it is race-free.
+        self._apply_cancel = threading.Event()
         # Paths currently being processed, with a lock, so the JD-webhook
         # process_package and a manual process_folder can't both pass the
         # check-then-create gate for the same file and double-create a job.
@@ -1711,11 +1719,20 @@ class RenameService:
         ``conflict_strategy`` is threaded through to every queued
         :meth:`apply` call — see its docstring for the overwrite/keep_both/
         skip semantics.
+
+        A "Stop applying" click (:meth:`cancel_apply`) is checked at the top
+        of each worker iteration: the file currently in flight always
+        finishes (never a partial move), and every job that hadn't started
+        yet is reverted from 'applying' back to its prior status instead of
+        being left stuck.
         """
         db = self._db
         if db is None:
             return {"ok": False, "queued": 0, "skipped": 0,
                     "error": "Database unavailable"}
+        # A fresh apply run must never inherit a cancel flag left set by a
+        # previous (already-finished) run's "Stop applying" click.
+        self._apply_cancel.clear()
         if ids is not None:
             jobs = [db.get_rename_job(int(j)) for j in ids or []]
             jobs = [j for j in jobs if j]
@@ -1756,8 +1773,16 @@ class RenameService:
             # Serialize with other bulk operations; blocking here is fine —
             # we're on a daemon thread, not an HTTP request.
             total = len(job_ids)
+            cancelled_at = None
             with self._bulk_lock:
                 for idx, jid in enumerate(job_ids):
+                    # Checked BEFORE apply() so a "Stop applying" click never
+                    # interrupts an in-flight move — apply() is synchronous and
+                    # this is the only place between iterations where we look —
+                    # so whatever is currently being placed always finishes.
+                    if self._apply_cancel.is_set():
+                        cancelled_at = idx
+                        break
                     job = db.get_rename_job(jid) if db else None
                     self._broadcast_queue(idx, total,
                                           (job or {}).get("title") if job else None)
@@ -1772,7 +1797,30 @@ class RenameService:
                             self._broadcast(jid)
                         except Exception:
                             pass
-                # Signal completion so the UI clears the queue bar.
+                if cancelled_at is not None:
+                    # Every job from here on was pre-marked 'applying' up front
+                    # but never actually started — revert each back to the
+                    # status it held before queue_apply touched it (fall back to
+                    # 'matched' for a legacy row with no prior_status) so none
+                    # of them are left stuck. Skip anything that isn't still
+                    # 'applying' — nothing here should be, since apply() always
+                    # moves a job off 'applying' before returning, but this
+                    # guards against ever clobbering a job that somehow already
+                    # settled.
+                    for remaining_jid in job_ids[cancelled_at:]:
+                        try:
+                            remaining = db.get_rename_job(remaining_jid) if db else None
+                            if not remaining or remaining.get("status") != "applying":
+                                continue
+                            prior = remaining.get("prior_status") or "matched"
+                            db.update_rename_job(remaining_jid, status=prior,
+                                                 prior_status=None)
+                            self._broadcast(remaining_jid)
+                        except Exception:
+                            logger.exception(
+                                "queue cancel: could not revert job %s", remaining_jid)
+                # Signal completion so the UI clears the queue bar (both a
+                # normal finish and a cancelled one land here the same way).
                 self._broadcast_queue(total, total, None)
 
         threading.Thread(target=_worker, args=(eligible,), daemon=True,
@@ -1790,6 +1838,18 @@ class RenameService:
                          "active": done < total}})
         except Exception:
             pass
+
+    def cancel_apply(self) -> dict:
+        """Request the running apply queue ("Stop applying") to gracefully
+        halt after its in-flight file finishes.
+
+        Sets the flag that :meth:`queue_apply`'s worker and
+        :meth:`apply_confident` each check at the top of their loop. Harmless
+        to call when nothing is running (the flag is cleared again at the
+        start of the next apply).
+        """
+        self._apply_cancel.set()
+        return {"ok": True}
 
     def bulk_apply(self, ids: list) -> dict:
         if not self._bulk_lock.acquire(blocking=False):
@@ -1811,10 +1871,21 @@ class RenameService:
             self._bulk_lock.release()
 
     def apply_confident(self, ids: Optional[list] = None) -> dict:
-        """Apply only matched jobs at confidence >= 95. Server-enforced gate."""
+        """Apply only matched jobs at confidence >= 95. Server-enforced gate.
+
+        Runs synchronously in the request thread (unlike queue_apply), one
+        job at a time — so a "Stop applying" click (:meth:`cancel_apply`),
+        checked at the top of the loop, simply breaks after the in-flight
+        apply() returns. Candidates not yet reached were never mutated (this
+        method doesn't pre-mark them 'applying' the way queue_apply does), so
+        there's nothing to revert.
+        """
         db = self._db
         if db is None:
             return {"results": [], "applied": 0, "skipped": 0, "failed": 0}
+        # A fresh run must never inherit a cancel flag left set by a
+        # previous (already-finished) run's "Stop applying" click.
+        self._apply_cancel.clear()
         if ids is not None:
             candidates = []
             for jid in ids:
@@ -1829,6 +1900,8 @@ class RenameService:
         try:
             results, applied, skipped, failed = [], 0, 0, 0
             for job in candidates:
+                if self._apply_cancel.is_set():
+                    break
                 conf = job.get("match_confidence") or 0.0
                 if job.get("status") != "matched" or conf < 95:
                     skipped += 1

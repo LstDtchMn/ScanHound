@@ -199,6 +199,15 @@ def bulk_apply(body: BulkIdsRequest, reg: ServiceRegistry = Depends(get_registry
     return _service(reg).queue_apply(body.ids)
 
 
+@router.post("/apply/cancel")
+def cancel_apply(reg: ServiceRegistry = Depends(get_registry)):
+    """Gracefully halt a running bulk apply ("Stop applying") — queue_apply
+    or apply-confident — after its in-flight file finishes. Jobs that hadn't
+    started yet revert to their prior status instead of being left stuck
+    'applying'; the per-job WS broadcast brings the UI back in sync live."""
+    return _service(reg).cancel_apply()
+
+
 @router.post("/jobs/bulk/reidentify")
 def bulk_reidentify(body: BulkIdsRequest,
                     reg: ServiceRegistry = Depends(get_registry)):

@@ -389,6 +389,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(ids ? { ids } : {})
     }),
+  cancelApply: () =>
+    request<{ ok: boolean }>('/rename/apply/cancel', { method: 'POST' }),
   searchTmdb: (query: string, mediaType: string) => {
     const qs = '?' + new URLSearchParams({ query, media_type: mediaType }).toString();
     return request<{ results: TmdbSearchResult[] }>(`/rename/search-tmdb${qs}`);
