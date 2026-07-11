@@ -202,7 +202,14 @@ def build_target(meta: dict, *, movie_root: str = "", tv_root: str = "",
         fname += ext
     else:
         folder = f"{title} ({year})" if year else title
-        fname = (f"{folder} [{resolution}]" if resolution else folder) + ext
+        fname = f"{folder} [{resolution}]" if resolution else folder
+        # Disambiguate split parts (CD1/CD2 → part=1/part=2) so the two files
+        # don't render to the identical colliding name — mirrors the TV and
+        # custom-template branches above.
+        part = meta.get("part")
+        if part:
+            fname += f" - Part {part}"
+        fname += ext
 
     dest = _destination(meta, movie_root=movie_root, tv_root=tv_root, title=title, year=year, flat=flat)
     return fname, dest

@@ -139,17 +139,15 @@ def test_flat_single_movie_goes_to_library_root():
 
 
 def test_flat_split_movie_keeps_subfolder():
-    # NOTE: the default (non-template) movie filename branch does not append
-    # a "- Part N" suffix for a truthy `part` (unlike the TV and
-    # custom-template branches, which do) — that's a pre-existing gap in
-    # naming.py, out of scope for this flat-folder task (destination-only
-    # change). This test asserts what Task 1 actually guarantees: a split
-    # movie keeps its own subfolder even with flat=True.
+    # A split movie keeps its own subfolder even with flat=True, AND (since the
+    # part-suffix fix) the default movie filename branch appends "- Part N" so
+    # the two parts don't collide inside that subfolder.
     meta = {"media_type": "movie", "title": "Sinners", "year": 2025,
             "resolution": "1080p", "part": 2, "original_filename": "Sinners.2025.CD2.mkv"}
     fname, dest = build_target(meta, movie_root="/lib/movies", tv_root="/lib/tv", flat=True)
     import os
     assert dest == os.path.join("/lib/movies", "Sinners (2025)")
+    assert "Part 2" in fname
 
 
 def test_flat_off_movie_keeps_subfolder():
@@ -158,6 +156,19 @@ def test_flat_off_movie_keeps_subfolder():
     import os
     fname, dest = build_target(meta, movie_root="/lib/movies", tv_root="/lib/tv")  # flat defaults False
     assert dest == os.path.join("/lib/movies", "Sinners (2025)")
+
+
+def test_movie_split_parts_get_distinct_filenames():
+    """A split movie with NO custom template must still get a per-part suffix so
+    the two parts don't render to the identical colliding filename (previously
+    both CD1 and CD2 became 'Sinners (2025) [1080p].mkv')."""
+    base = {"media_type": "movie", "title": "Sinners", "year": 2025,
+            "resolution": "1080p", "original_filename": "Sinners.2025.mkv"}
+    f1, _ = build_target({**base, "part": 1}, movie_root="/movies")
+    f2, _ = build_target({**base, "part": 2}, movie_root="/movies")
+    assert "Part 1" in f1
+    assert "Part 2" in f2
+    assert f1 != f2
 
 
 def test_flat_does_not_affect_tv():
