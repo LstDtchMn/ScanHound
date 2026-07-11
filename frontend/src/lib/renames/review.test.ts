@@ -40,6 +40,9 @@ describe('hasDestinationConflict', () => {
     expect(hasDestinationConflict(job({ warning_message: 'A file already exists at /d/y' }))).toBe(true));
   it('true on destination_conflict flag', () =>
     expect(hasDestinationConflict(job({ destination_conflict: true } as Partial<RenameJob>))).toBe(true));
+  it('true on library_duplicate flag', () => {
+    expect(hasDestinationConflict(job({ library_duplicate: true } as Partial<RenameJob>))).toBe(true);
+  });
   it('false otherwise', () => expect(hasDestinationConflict(job({}))).toBe(false));
   it('detects a conflict via the structured conflict_kind signal', () =>
     expect(hasDestinationConflict(job({ conflict_kind: 'destination_exists' }))).toBe(true));

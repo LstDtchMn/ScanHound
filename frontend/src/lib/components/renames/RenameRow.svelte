@@ -109,7 +109,7 @@
       <div class="flex items-center gap-1.5 text-xs" title="Click Compare for full details">
         <Badge variant="warning" label="⚠ Already in library" />
         {#if job.conflict_analysis}
-          <span class="text-[var(--text-secondary)] truncate">{conflictSummary(job.conflict_analysis)}</span>
+          <span class="text-[var(--text-secondary)] truncate min-w-0 flex-1">{conflictSummary(job.conflict_analysis)}</span>
         {/if}
         <button
           type="button"

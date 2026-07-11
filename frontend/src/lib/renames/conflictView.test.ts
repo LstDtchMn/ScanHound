@@ -173,7 +173,7 @@ describe('conflictSummary', () => {
       recommended: 'incoming',
     });
     const s = conflictSummary(a);
-    expect(s).not.toContain('2160p → 2160p');
+    expect(s).not.toContain('2160p');
     // See binary-vs-decimal GB note above: 22e9/26e9 bytes -> 20.5/24.2 GB.
     expect(s).toContain('20.5 GB');
     expect(s).toContain('24.2 GB');
