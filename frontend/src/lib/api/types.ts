@@ -610,6 +610,7 @@ export interface ConflictComparison {
   incoming: FileSpec | null;
   recommended: 'existing' | 'incoming' | 'tie' | null;
   reason: string | null;
+  kind: 'same_path' | 'library_duplicate' | null;
 }
 
 export interface RematchPreviewResponse {

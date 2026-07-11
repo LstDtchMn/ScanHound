@@ -200,13 +200,92 @@ def test_conflict_preview_probe_failure_on_incoming_yields_no_recommendation(
     assert out["existing"]["present"] is False
 
 
+# ── kind: same-path collision vs. a library-wide duplicate elsewhere ────
+#    (Task 9 — drives the mobile Compare modal's Overwrite/Keep-both vs.
+#    Apply-anyway button set) ──────────────────────────────────────────────
+
+def test_conflict_preview_kind_same_path_when_dest_occupied(db, tmp_path, monkeypatch):
+    svc = _service(db)
+    jid, src, dst = _make_job(
+        db, tmp_path, src_name="New.Movie.2026.1080p.mkv",
+        dst_name="Movie (2026).mkv", create_dst=True)
+
+    specs = {src: {"present": True, "resolution": "1080p", "hdr": None,
+                    "dv_layer": None, "video_codec": "HEVC"},
+             dst: {"present": True, "resolution": "2160p", "hdr": None,
+                    "dv_layer": None, "video_codec": "HEVC"}}
+    monkeypatch.setattr(svcmod, "probe_specs",
+                        lambda p, **k: specs.get(p, {"present": False, "path": p}))
+
+    out = svc.conflict_preview(jid)
+
+    assert out["kind"] == "same_path"
+
+
+def test_conflict_preview_kind_library_duplicate(db, tmp_path, monkeypatch):
+    """Nothing sits at the job's own destination, but the same title (by
+    imdb_id) already exists elsewhere in the Plex library — conflict_preview
+    should fall back to find_library_duplicate() and report kind =
+    'library_duplicate' with `existing` pointed at that other file, not the
+    (empty) destination."""
+    svc = _service(db)
+    other = tmp_path / "elsewhere" / "Dup Movie (2020).mkv"
+    other.parent.mkdir(parents=True, exist_ok=True)
+    other.write_bytes(b"x")
+    db.save_plex_cache([{
+        "clean_title": "Dup Movie", "original_title": "Dup Movie", "year": 2020,
+        "res": "1080p", "size": 1.0, "imdb_id": "tt55", "rating_key": "5",
+        "media_id": "5", "file": str(other),
+    }], "Movies")
+
+    jid, src, dst = _make_job(
+        db, tmp_path, src_name="Dup.Movie.2020.1080p.mkv",
+        dst_name="Dup Movie (2020).mkv", create_dst=False)
+    db.update_rename_job(jid, imdb_id="tt55", title="Dup Movie", year=2020,
+                          media_type="movie")
+
+    specs = {src: {"present": True, "resolution": "1080p", "hdr": None,
+                    "dv_layer": None, "video_codec": "HEVC", "path": src},
+             str(other): {"present": True, "resolution": "1080p", "hdr": None,
+                    "dv_layer": None, "video_codec": "HEVC", "path": str(other)}}
+    monkeypatch.setattr(svcmod, "probe_specs",
+                        lambda p, **k: specs.get(p, {"present": False, "path": p}))
+
+    out = svc.conflict_preview(jid)
+
+    assert out["kind"] == "library_duplicate"
+    assert out["existing"]["present"] is True
+    assert out["existing"]["path"] == str(other)
+
+
+def test_conflict_preview_kind_same_path_when_no_library_duplicate_either(
+        db, tmp_path, monkeypatch):
+    """Destination free AND no duplicate elsewhere in the library — kind
+    stays the 'same_path' default (harmless: the frontend's free-destination
+    branch renders a single Apply button regardless of kind)."""
+    svc = _service(db)
+    jid, src, dst = _make_job(
+        db, tmp_path, src_name="New.Movie.2026.1080p.mkv",
+        dst_name="Movie (2026).mkv", create_dst=False)
+
+    specs = {src: {"present": True, "resolution": "1080p", "hdr": None,
+                    "dv_layer": None, "video_codec": "HEVC"}}
+    monkeypatch.setattr(svcmod, "probe_specs",
+                        lambda p, **k: specs.get(p, {"present": False, "path": p}))
+
+    out = svc.conflict_preview(jid)
+
+    assert out["kind"] == "same_path"
+    assert out["existing"]["present"] is False
+
+
 # ── job not found: clean dict, never raises ──────────────────────────────
 
 def test_conflict_preview_job_not_found(db):
     svc = _service(db)
     out = svc.conflict_preview(999999)
     assert out == {"existing": None, "incoming": None,
-                   "recommended": None, "reason": "Job not found"}
+                   "recommended": None, "reason": "Job not found", "kind": None}
 
 
 # ── route-level: the endpoint wires through to the service, bodyless POST ──
@@ -232,7 +311,7 @@ def test_conflict_preview_route_returns_service_output(client, db, tmp_path, mon
 
     assert r.status_code == 200
     body = r.json()
-    assert set(body.keys()) == {"existing", "incoming", "recommended", "reason"}
+    assert set(body.keys()) == {"existing", "incoming", "recommended", "reason", "kind"}
     assert body["recommended"] == "incoming"
 
 

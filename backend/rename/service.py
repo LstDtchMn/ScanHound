@@ -1696,7 +1696,7 @@ class RenameService:
         job = db.get_rename_job(job_id) if db else None
         if not job:
             return {"existing": None, "incoming": None,
-                    "recommended": None, "reason": "Job not found"}
+                    "recommended": None, "reason": "Job not found", "kind": None}
         dest_dir = job.get("destination_path") or ""
         dst = (os.path.join(dest_dir, job.get("new_filename")
                             or os.path.basename(job.get("original_path") or ""))
@@ -1708,18 +1708,28 @@ class RenameService:
         incoming["original_filename"] = job.get("original_filename")
         incoming["resolution"] = incoming.get("resolution") or job.get("resolution")
         existing_probe_failed = False
+        kind = "same_path"
         if dst and os.path.lexists(dst):
             existing_probe = probe_specs(dst, db=db)
             existing = existing_probe or {"present": True, "path": dst}
             existing["original_filename"] = os.path.basename(dst)
             existing_probe_failed = existing_probe is None
         else:
-            existing = {"present": False, "path": dst}
+            from backend.rename.conflicts import find_library_duplicate
+            match = find_library_duplicate(job, db.list_plex_cache_movies()) if db else None
+            if match and match.get("file_path"):
+                kind = "library_duplicate"
+                existing_probe = probe_specs(match["file_path"], db=db)
+                existing = existing_probe or {"present": True, "path": match["file_path"]}
+                existing["original_filename"] = os.path.basename(match["file_path"])
+                existing_probe_failed = existing_probe is None
+            else:
+                existing = {"present": False, "path": dst}
         rec = rank_conflict(existing, {**incoming, "id": job_id})
         if incoming_probe is None or existing_probe_failed:
             rec = {"recommended": None, "reason": None}
         return {"existing": existing, "incoming": incoming,
-                "recommended": rec["recommended"], "reason": rec["reason"]}
+                "recommended": rec["recommended"], "reason": rec["reason"], "kind": kind}
 
     def backfill_posters(self, limit: int = 200) -> dict:
         """Fill poster_path on jobs that predate poster capture (2026-07-04).

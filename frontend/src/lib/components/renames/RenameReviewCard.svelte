@@ -3,7 +3,7 @@
   import Badge from '$lib/components/Badge.svelte';
   import { confidenceVariant, dvLayerVariant, formatStatus, renameStatusVariant } from '$lib/constants';
   import { hasDestinationConflict } from '$lib/renames/review';
-  import { specRows, needsDvScan } from '$lib/renames/conflictView';
+  import { specRows, needsDvScan, actionsForKind } from '$lib/renames/conflictView';
   import { api } from '$lib/api/client';
   import { dvScanTick } from '$lib/stores/renames';
   import type { RenameJob, ConflictComparison } from '$lib/api/types';
@@ -107,6 +107,8 @@
   let showDvScanButton = $derived(
     !!preview && (needsDvScan(preview.existing) || needsDvScan(preview.incoming))
   );
+
+  let actions = $derived(actionsForKind(preview?.kind ?? undefined));
 </script>
 
 <div class="rounded-xl border border-[var(--border)] bg-[var(--bg-secondary)] p-3 flex flex-col gap-3">
@@ -260,20 +262,34 @@
         {/if}
 
         <div class="flex flex-wrap gap-2 pt-1">
-          <button
-            class="flex-1 py-2 rounded-lg bg-[var(--error)] text-white text-xs font-semibold disabled:opacity-50 hover:brightness-110 transition-all"
-            disabled={busy}
-            onclick={onOverwrite}
-          >
-            Overwrite
-          </button>
-          <button
-            class="flex-1 py-2 rounded-lg bg-[var(--accent)] text-white text-xs font-semibold disabled:opacity-50 hover:brightness-110 transition-all"
-            disabled={busy}
-            onclick={onKeepBoth}
-          >
-            Keep both
-          </button>
+          {#if actions.overwrite}
+            <button
+              class="flex-1 py-2 rounded-lg bg-[var(--error)] text-white text-xs font-semibold disabled:opacity-50 hover:brightness-110 transition-all"
+              disabled={busy}
+              onclick={onOverwrite}
+            >
+              Overwrite
+            </button>
+          {/if}
+          {#if actions.keepBoth}
+            <button
+              class="flex-1 py-2 rounded-lg bg-[var(--accent)] text-white text-xs font-semibold disabled:opacity-50 hover:brightness-110 transition-all"
+              disabled={busy}
+              onclick={onKeepBoth}
+            >
+              Keep both
+            </button>
+          {/if}
+          {#if actions.applyAnyway}
+            <button
+              class="flex-1 py-2 rounded-lg bg-[var(--accent)] text-white text-xs font-semibold disabled:opacity-50 hover:brightness-110 transition-all"
+              disabled={busy}
+              onclick={onApply}
+              title="This title already exists elsewhere in the library — apply anyway to keep both copies"
+            >
+              Apply anyway
+            </button>
+          {/if}
           <button
             class="flex-1 py-2 rounded-lg border border-[var(--border)] text-[var(--text-secondary)] text-xs font-semibold hover:bg-[var(--bg-tertiary)] disabled:opacity-50"
             disabled={busy}

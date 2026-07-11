@@ -167,3 +167,20 @@ export function conflictSummary(analysis: ConflictAnalysis | null | undefined): 
   }
   return summary;
 }
+
+/** Which resolution buttons apply for a duplicate's analysis kind.
+ *  library_duplicate has no file AT the incoming destination to overwrite,
+ *  and no dedupe-naming decision to make (the incoming file was never going
+ *  to collide with the existing file's actual name) — so Overwrite/Keep-both
+ *  don't apply; Apply-anyway (accept two copies) replaces them. Skip always
+ *  applies for both kinds (handled separately by the caller). Undefined
+ *  (analysis not loaded yet) defaults to the same_path shape, matching
+ *  today's behavior until the real kind is known. */
+export function actionsForKind(kind: ConflictAnalysis['kind'] | undefined): {
+  overwrite: boolean; keepBoth: boolean; applyAnyway: boolean;
+} {
+  if (kind === 'library_duplicate') {
+    return { overwrite: false, keepBoth: false, applyAnyway: true };
+  }
+  return { overwrite: true, keepBoth: true, applyAnyway: false };
+}

@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { formatBytes, formatMbps, specRows, needsDvScan, conflictSummary } from './conflictView';
+import { formatBytes, formatMbps, specRows, needsDvScan, conflictSummary, actionsForKind } from './conflictView';
 import type { FileSpec, ConflictAnalysis } from '$lib/api/types';
 
 const spec = (o: Partial<FileSpec>): FileSpec => ({
@@ -190,5 +190,19 @@ describe('conflictSummary', () => {
       recommended: null, degraded: true,
     });
     expect(conflictSummary(a)).not.toContain('keep');
+  });
+});
+
+describe('actionsForKind', () => {
+  it('same_path shows Overwrite + Keep both (today\'s behavior)', () => {
+    expect(actionsForKind('same_path')).toEqual({ overwrite: true, keepBoth: true, applyAnyway: false });
+  });
+
+  it('library_duplicate shows Apply anyway, not Overwrite/Keep both', () => {
+    expect(actionsForKind('library_duplicate')).toEqual({ overwrite: false, keepBoth: false, applyAnyway: true });
+  });
+
+  it('undefined kind defaults to same_path shape (no analysis yet)', () => {
+    expect(actionsForKind(undefined)).toEqual({ overwrite: true, keepBoth: true, applyAnyway: false });
   });
 });
