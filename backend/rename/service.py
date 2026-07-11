@@ -59,6 +59,20 @@ rlog.setLevel(logging.INFO)
 VIDEO_EXTS = _naming.VIDEO_EXTENSIONS
 
 
+def _fmt_size(n: int) -> str:
+    """Human file size — mirrors the frontend conflictView.formatBytes
+    (KB/MB/GB/TB, 1 decimal) so the two never disagree."""
+    if n < 1024:
+        return f"{n} B"
+    units = ["KB", "MB", "GB", "TB"]
+    v = n / 1024.0
+    i = 0
+    while v >= 1024 and i < len(units) - 1:
+        v /= 1024.0
+        i += 1
+    return f"{v:.1f} {units[i]}"
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1301,7 +1315,8 @@ class RenameService:
             # itself.
             try:
                 if os.path.samefile(src, dst):
-                    db.update_rename_job(job_id, status="applied", processed_at=_now())
+                    db.update_rename_job(job_id, status="applied", processed_at=_now(),
+                                         conflict_kind=None, conflict_same_size=None)
                     self._broadcast(job_id)
                     return {"ok": True, "already": True}
             except OSError:
@@ -1323,21 +1338,29 @@ class RenameService:
                 # None → hold for review (existing behavior); 'skip' → same,
                 # explicit — either way the file at dst is left untouched and
                 # the job goes back to needs_review (never left 'applying').
-                msg = f"A file already exists at the destination: {dst}"
+                same_size = None
                 try:
                     existing_size = os.path.getsize(dst)
                     candidate_size = os.path.getsize(src)
-                    msg += (f" (existing {existing_size} bytes vs. candidate "
-                            f"{candidate_size} bytes)")
+                    same_size = existing_size == candidate_size
+                    if same_size:
+                        msg = (f"A copy is already in the library at the same size "
+                               f"({_fmt_size(existing_size)}) — likely a duplicate. "
+                               f"Review to replace or keep.")
+                    else:
+                        msg = (f"A copy is already in the library "
+                               f"(existing {_fmt_size(existing_size)} vs. new "
+                               f"{_fmt_size(candidate_size)}). Review to replace or keep.")
                 except OSError:
-                    pass
-                msg += " — review to replace or keep the existing file."
+                    msg = "A copy is already in the library. Review to replace or keep."
                 # Append to (never clobber) a warning already on the job — e.g. a
                 # year-mismatch note set at creation time — so the collision guard
                 # never silently discards an earlier reason the file needs review.
                 existing = job.get("warning_message")
                 combined = f"{existing}; {msg}" if existing else msg
-                db.update_rename_job(job_id, status="needs_review", warning_message=combined)
+                db.update_rename_job(
+                    job_id, status="needs_review", warning_message=combined,
+                    conflict_kind="destination_exists", conflict_same_size=same_size)
                 self._broadcast(job_id)
                 return {"ok": False, "error": msg}
         method = self._cfg.get("auto_rename_move_method", "hardlink")
@@ -1380,7 +1403,8 @@ class RenameService:
         try:
             db.update_rename_job(job_id, status="applied", move_method=used,
                                  processed_at=_now(), plex_sort_title=sort_title,
-                                 error_message=None)
+                                 error_message=None,
+                                 conflict_kind=None, conflict_same_size=None)
         except Exception as e:
             # The file is already placed but we couldn't record it. Leaving the
             # row as-is orphans the file (re-apply sees "source missing", undo
@@ -1486,7 +1510,8 @@ class RenameService:
                                  poster_path=poster_path, destination_path=None,
                                  match_confidence=100.0, match_source="manual",
                                  match_reasons=[],  # manual pick — no uncertainty
-                                 status="needs_review", warning_message=warning)
+                                 status="needs_review", warning_message=warning,
+                                 conflict_kind=None, conflict_same_size=None)
             self._broadcast(job_id)
             return {"ok": True, "status": "needs_review", "new_filename": None,
                     "destination_path": None, "warning": warning}
@@ -1499,7 +1524,8 @@ class RenameService:
                              poster_path=poster_path, new_filename=fname,
                              destination_path=dest, match_confidence=100.0,
                              match_source="manual", match_reasons=[],
-                             status="matched", warning_message=None)
+                             status="matched", warning_message=None,
+                             conflict_kind=None, conflict_same_size=None)
         self._broadcast(job_id)
         return {"ok": True, "status": "matched", "new_filename": fname,
                 "destination_path": dest, "warning": None}
@@ -1833,7 +1859,8 @@ class RenameService:
         if not root or not str(root).strip():
             db.update_rename_job(job_id, status="needs_review",
                                  destination_path=None,
-                                 warning_message="Destination library not configured")
+                                 warning_message="Destination library not configured",
+                                 conflict_kind=None, conflict_same_size=None)
             self._broadcast(job_id)
             return {"id": int(job_id), "ok": False, "destination_path": None,
                     "error": "Destination library not configured"}
@@ -1848,7 +1875,8 @@ class RenameService:
                 meta, movie_root=root, tv_root=self._cfg.get("auto_rename_tv_library", ""),
                 template=self._template_for(mtype))
         db.update_rename_job(job_id, new_filename=fname, destination_path=dest,
-                             status="matched", warning_message=None)
+                             status="matched", warning_message=None,
+                             conflict_kind=None, conflict_same_size=None)
         self._broadcast(job_id)
         return {"id": int(job_id), "ok": True, "destination_path": dest,
                 "error": None}
@@ -1946,7 +1974,8 @@ class RenameService:
             season=meta["season"], episode=meta["episode"],
             new_filename=fname, destination_path=dest,
             suggested_correction=None,
-            status="matched", warning_message=None)
+            status="matched", warning_message=None,
+            conflict_kind=None, conflict_same_size=None)
         self._broadcast(job_id)
         return {"ok": True, "new_filename": fname}
 

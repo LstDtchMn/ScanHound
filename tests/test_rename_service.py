@@ -8,7 +8,7 @@ import pytest
 
 from backend.database import DatabaseManager
 from backend.rename import llm_identify
-from backend.rename.service import RenameService, compute_sort_title
+from backend.rename.service import RenameService, compute_sort_title, _fmt_size
 
 
 @pytest.fixture(autouse=True)
@@ -446,7 +446,152 @@ class TestYearMismatchWarning:
         # Original year-mismatch text must survive...
         assert "2025" in combined and "2026" in combined
         # ...alongside the new collision text.
-        assert "already exists" in combined.lower()
+        assert "already in the library" in combined.lower()
+
+
+# ── human-readable conflict message + structured conflict signal ──────
+
+class TestFmtSize:
+    def test_fmt_size_units(self):
+        assert _fmt_size(0) == "0 B"
+        assert _fmt_size(512) == "512 B"
+        assert _fmt_size(1024) == "1.0 KB"
+        assert _fmt_size(14359773138) == "13.4 GB"
+        assert _fmt_size(1024 ** 4) == "1.0 TB"
+
+
+class TestConflictSignal:
+    """conflict_kind/conflict_same_size set at collision, cleared on every
+    legitimate exit from needs_review-conflict (overwrite/keep_both apply,
+    same-file no-op, rematch)."""
+
+    def test_collision_same_size_sets_signal_and_message(self, db, tmp_path):
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="x")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv", content="x")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+
+        out = svc.apply(jid2)
+        assert out["ok"] is False
+        job = db.get_rename_job(jid2)
+        assert job["status"] == "needs_review"
+        assert job["conflict_kind"] == "destination_exists"
+        assert job["conflict_same_size"] is True
+        assert "same size" in job["warning_message"]
+        assert "likely a duplicate" in job["warning_message"]
+        assert "already in the library" in job["warning_message"].lower()
+        assert "bytes" not in job["warning_message"]
+
+    def test_collision_different_size_sets_false(self, db, tmp_path):
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="x")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv",
+            content="xxxxxxxxxx")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+
+        svc.apply(jid2)
+        job = db.get_rename_job(jid2)
+        assert job["conflict_kind"] == "destination_exists"
+        assert job["conflict_same_size"] is False
+        assert "same size" not in job["warning_message"]
+
+    def test_overwrite_apply_clears_conflict_signal(self, db, tmp_path):
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="x")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv", content="x")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+
+        svc.apply(jid2)  # -> needs_review + signal set
+        job_before = db.get_rename_job(jid2)
+        assert job_before["conflict_kind"] == "destination_exists"
+
+        out = svc.apply(jid2, conflict_strategy="overwrite")
+        assert out["ok"] is True
+        job = db.get_rename_job(jid2)
+        assert job["status"] == "applied"
+        assert job["conflict_kind"] is None
+        assert job["conflict_same_size"] is None
+
+    def test_keep_both_apply_clears_conflict_signal(self, db, tmp_path):
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="x")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv", content="x")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+        svc.apply(jid2)  # -> needs_review + signal set
+
+        out = svc.apply(jid2, conflict_strategy="keep_both")
+        assert out["ok"] is True
+        job = db.get_rename_job(jid2)
+        assert job["status"] == "applied"
+        assert job["conflict_kind"] is None
+        assert job["conflict_same_size"] is None
+
+    def test_samefile_reapply_clears_conflict_signal(self, db, tmp_path):
+        """Re-applying a job whose source is already hardlinked at dst is a
+        no-op success (never a conflict) — a stale marker from an earlier
+        collision must not survive it."""
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        # hardlink (not move) so src survives the first apply and remains the
+        # same inode as dst -> the second apply hits the samefile branch
+        # instead of "source file missing".
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_move_method="hardlink")
+        jid = svc.process_package("pkg", save_to)[0]
+        assert svc.apply(jid)["ok"] is True
+        # apply() short-circuits to a no-op {"ok": True} for an already-
+        # "applied" job before it ever reaches the samefile check, so reset
+        # status to reach that branch (e.g. a stale in-flight state after a
+        # crash) and stamp a stale conflict marker, as if an earlier
+        # collision had been recorded on this job before it was resolved.
+        db.update_rename_job(jid, status="matched",
+                             conflict_kind="destination_exists",
+                             conflict_same_size=True)
+        out = svc.apply(jid)  # same src already at dst -> samefile no-op
+        assert out.get("already") is True
+        job = db.get_rename_job(jid)
+        assert job["conflict_kind"] is None
+        assert job["conflict_same_size"] is None
+
+    def test_rematch_to_new_destination_clears_conflict_signal(self, db, monkeypatch):
+        svc = _service(db, _matrix_search, movie_lib="/lib")
+        jid = db.create_rename_job({
+            "original_path": "/x/film.mkv", "original_filename": "film.mkv",
+            "status": "needs_review", "media_type": "movie",
+            "conflict_kind": "destination_exists", "conflict_same_size": True})
+        monkeypatch.setattr(svc, "_tmdb_client",
+            lambda: _FakeTmdb({"title": "The Matrix", "release_date": "1999-03-30",
+                               "poster_path": "/matrix.jpg"}))
+        out = svc.rematch(jid, 603, media_type="movie")
+        assert out["ok"] is True
+        job = db.get_rename_job(jid)
+        assert job["status"] == "matched"
+        assert job["conflict_kind"] is None
+        assert job["conflict_same_size"] is None
 
 
 # ── duplicate-destination conflict detection ──────────────────────────
@@ -671,7 +816,9 @@ class TestApplyUndo:
         job2_after = db.get_rename_job(jid2)
         assert job2_after["status"] == "needs_review"
         assert job2_after["status"] != "failed"
-        assert "already exists" in (job2_after["warning_message"] or "").lower()
+        assert "already in the library" in (job2_after["warning_message"] or "").lower()
+        assert job2_after["conflict_kind"] == "destination_exists"
+        assert job2_after["conflict_same_size"] is True
         # The first job/file must be untouched by the second's failed apply.
         assert db.get_rename_job(jid1)["status"] == "applied"
         assert os.path.isfile(dst)
