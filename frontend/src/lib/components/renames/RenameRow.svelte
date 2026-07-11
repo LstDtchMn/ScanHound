@@ -147,7 +147,7 @@
               Moving… {prog.pct}% ({gb(prog.bytes_done)} / {gb(prog.bytes_total)} GB)
               {#if prog.bytes_per_sec}
                 · {formatBytes(prog.bytes_per_sec)}/s
-                {#if prog.eta_seconds}· {formatEta(prog.eta_seconds)} left{/if}
+                {#if prog.eta_seconds != null}· {formatEta(prog.eta_seconds)} left{/if}
               {/if}
               {#if stalled}
                 · No update in a while — may be stalled

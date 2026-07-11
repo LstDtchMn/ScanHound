@@ -277,6 +277,18 @@ export const applyCancelling = writable<boolean>(false);
 connection.on('rename:progress', (data) => {
   const id = data.id as number;
   if (!id) return;
+  // A late/reordered tick for a job that's already left 'applying' (e.g. its
+  // terminal rename:job broadcast already arrived and cleared this map) must
+  // not resurrect a stale bar — broadcast_sync (backend/api/ws.py) has no
+  // per-connection send serialization, so two back-to-back broadcasts (a
+  // final progress tick, then the terminal status change) have no hard
+  // wire-order guarantee once they're actually being written to the socket.
+  // Trust the job's last-known status (kept current by the rename:job
+  // handler below) over tick arrival order. A job not yet known locally
+  // (e.g. its very first tick arrives before any rename:job snapshot) is
+  // let through — there's nothing to contradict it yet.
+  const knownJob = get(renameJobs).find((j) => j.id === id);
+  if (knownJob && knownJob.status !== 'applying') return;
   renameProgress.update((m) => {
     const next = new Map(m);
     next.set(id, {
@@ -355,20 +367,72 @@ connection.on('rename:job', (data) => {
 // event for a job that's already finished, so nothing would ever correct it
 // short of a hard page reload (which re-mounts and re-fetches from scratch).
 //
-// On reconnect, trust a fresh GET over any locally-held progress state:
-// re-fetch jobs/status (corrects each job's `status`, which is what actually
-// gates the "Moving…" row/bar), then drop renameProgress entries for any job
-// the server no longer reports as 'applying'. renameQueue/applyCancelling
-// have no REST-backed snapshot to reconcile against (there's no endpoint for
-// "job N of M of the last bulk run") — clear them outright rather than keep
-// showing a possibly-stale number; a bulk apply that's still genuinely
-// running will simply re-broadcast fresh queue progress as its next job
-// starts.
+// On reconnect, trust a fresh GET over any locally-held progress state — but
+// the *general* jobs page (GET /rename/jobs, no status filter) is capped
+// (backend default limit=200) and ordered by `detected_at DESC` — a job's
+// original detection time, not its apply time. A job that sat in a large
+// needs_review/matched backlog before finally being applied can be
+// genuinely still mid-copy yet absent from that page entirely once a
+// background scanner has detected 200+ newer items since. Treating "absent
+// from the general page" as "confirmed not applying" would incorrectly wipe
+// that *live* job's progress and let its row vanish from the UI until its
+// next broadcast. Query the `status=applying` filter specifically as the
+// authoritative source for "which jobs are actually still applying" — the
+// backend serializes bulk/single applies through one `_bulk_lock`
+// (RenameService), so this is at most a handful of rows regardless of
+// backlog depth — and use it both to restore/keep that job's row and to
+// decide which renameProgress entries survive.
+const RESYNC_RETRY_DELAY_MS = 2000;
+
+interface ResyncSnapshot {
+  jobs: RenameJob[];
+  status: RenameStatus;
+  applyingJobs: RenameJob[];
+}
+
+async function fetchResyncSnapshot(): Promise<ResyncSnapshot | null> {
+  try {
+    const [{ jobs }, status, { jobs: applyingJobs }] = await Promise.all([
+      api.getRenameJobs(),
+      api.getRenameStatus(),
+      api.getRenameJobs('applying'),
+    ]);
+    return { jobs, status, applyingJobs };
+  } catch {
+    return null;
+  }
+}
+
 export async function resyncAfterReconnect() {
-  await refresh();
-  const applyingIds = new Set(
-    get(renameJobs).filter((j) => j.status === 'applying').map((j) => j.id)
-  );
+  let snapshot = await fetchResyncSnapshot();
+  if (!snapshot) {
+    // A transient blip right at reconnect (e.g. a backend restart where the
+    // WS upgrade path and the plain HTTP routes behind a reverse proxy don't
+    // become available in perfect lockstep) shouldn't leave the exact stale
+    // state this function exists to correct — retry once before giving up.
+    await new Promise((r) => setTimeout(r, RESYNC_RETRY_DELAY_MS));
+    snapshot = await fetchResyncSnapshot();
+  }
+  if (!snapshot) {
+    // Both attempts failed — surface this rather than silently no-op'ing on
+    // exactly the state this function exists to fix. Local state (including
+    // any stale progress) is left untouched; the next reconnect (or a
+    // manual refresh) gets another chance.
+    console.warn('resyncAfterReconnect: REST refresh failed after reconnect + 1 retry');
+    addToast(
+      'Reconnected, but refresh failed',
+      'Move progress may be stale until the next successful refresh.',
+      'warning'
+    );
+    return;
+  }
+  // Merge: start from the general page, then make sure any still-applying
+  // job it missed (see comment above) isn't dropped from view.
+  const byId = new Map(snapshot.jobs.map((j) => [j.id, j] as const));
+  for (const j of snapshot.applyingJobs) byId.set(j.id, j);
+  renameJobs.set([...byId.values()]);
+  renameStatus.set(snapshot.status);
+  const applyingIds = new Set(snapshot.applyingJobs.map((j) => j.id));
   renameProgress.update((m) => {
     if (m.size === 0) return m;
     const next = new Map(m);
