@@ -723,6 +723,23 @@ class DatabaseManager:
         """Delete all entries from the Plex cache table."""
         return self._mutate("DELETE FROM plex_cache", label="clear_cache")
 
+    @staticmethod
+    def _plex_cache_key(item, is_tv):
+        """The cache primary key for a Plex item. Insert and full_replace-prune
+        MUST agree on this or the prune deletes freshly-inserted rows (the TV
+        "all shows Missing" bug, fixed 2026-07-10). Kept as one helper so the
+        two call sites in save_plex_cache can never drift apart again.
+
+        Honors a pre-set item['key'] (e.g. movies' per-part key from
+        plex_service.py) if truthy; otherwise falls back to rating_key alone
+        for TV, or rating_key + "_" + media_id for movies.
+        """
+        k = item.get('key')
+        if k:
+            return k
+        return (f"{item.get('rating_key')}" if is_tv
+                else f"{item.get('rating_key')}_{item.get('media_id')}")
+
     def save_plex_cache(self, items, mode, library_name=None, full_replace=False):
         """Upsert Plex library items into the cache for the given mode.
 
@@ -748,14 +765,7 @@ class DatabaseManager:
 
                 for item in items:
                     item = dict(item)  # Shallow copy to avoid mutating caller's dict
-                    # Generate a stable fallback key from rating_key + media_id
-                    if is_tv:
-                        fallback_key = f"{item.get('rating_key')}"
-                    else:
-                        fallback_key = f"{item.get('rating_key')}_{item.get('media_id')}"
-
-                    if not item.get('key'):
-                        item['key'] = fallback_key
+                    item['key'] = self._plex_cache_key(item, is_tv)
 
                     cursor.execute('''
                         INSERT OR REPLACE INTO plex_cache (
@@ -764,7 +774,7 @@ class DatabaseManager:
                             content_type, dovi, hdr, last_updated, library_name
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        item.get('key', fallback_key),
+                        item['key'],
                         item.get('clean_title'),
                         item.get('original_title'),
                         item.get('year'),
@@ -788,18 +798,11 @@ class DatabaseManager:
                 # now delete any old rows for this content_type that weren't
                 # part of the fresh set (they have stale keys).
                 if full_replace:
-                    # Must mirror the insert's is_tv-aware fallback formula
-                    # exactly (line ~752-755) so this "keep" set matches the
-                    # keys actually stored. Using the movie-only formula for
-                    # TV items here caused every fresh TV row to look stale
-                    # and get deleted in the same transaction.
-                    fresh_db_keys = set()
-                    for item in items:
-                        k = item.get('key')
-                        if not k:
-                            k = (f"{item.get('rating_key')}" if is_tv
-                                 else f"{item.get('rating_key')}_{item.get('media_id')}")
-                        fresh_db_keys.add(k)
+                    # Built with the SAME _plex_cache_key() helper the insert
+                    # loop used above, so this "keep" set is structurally
+                    # guaranteed to match the keys actually stored -- see the
+                    # helper's docstring for the bug this prevents.
+                    fresh_db_keys = {self._plex_cache_key(item, is_tv) for item in items}
                     # Delete in batches to avoid SQLite placeholder limits
                     all_existing = cursor.execute(
                         "SELECT key FROM plex_cache WHERE content_type = ?", (mode,)

@@ -761,6 +761,127 @@ class TestPlexCache:
             f"expected only the fresh rating_key to survive, got {rating_keys}"
         )
 
+    # -- full_replace=True + pre-set key: production's most-executed path
+    # (2026-07-10 hardening finding #2). Every full_replace test above uses
+    # items with NO pre-set 'key', but real movies ALWAYS carry one
+    # (plex_service._extract_movie_data: 'key': f"{rating_key}_{media_id}_{part_idx}")
+    # and are saved with full_replace=True -- so the pre-set-key branch of the
+    # prune's "keep" set is production's most-executed path through this
+    # code, yet until now nothing exercised it under full_replace. These
+    # tests lock in that it already behaves correctly (they pass before and
+    # after the _plex_cache_key() extraction) and stays correct going forward.
+
+    def test_full_replace_movies_with_preset_key_survive(self, db_manager):
+        """The production path: movies carrying a pre-set 'key' (as
+        plex_service._extract_movie_data always sets) must survive
+        full_replace=True, not just movies relying on the fallback formula.
+        """
+        items = [
+            {
+                "clean_title": "the matrix",
+                "original_title": "The Matrix",
+                "year": 1999,
+                "res": "1080p",
+                "size": 15.0,
+                "imdb_id": "tt0133093",
+                "rating_key": "1001",
+                "media_id": "m1001",
+                "dovi": True,
+                "hdr": False,
+                "key": "1001_m1001_0",
+            },
+            {
+                "clean_title": "inception",
+                "original_title": "Inception",
+                "year": 2010,
+                "res": "4K",
+                "size": 55.0,
+                "imdb_id": "tt1375666",
+                "rating_key": "1002",
+                "media_id": "m1002",
+                "dovi": False,
+                "hdr": True,
+                "key": "1002_m1002_0",
+            },
+        ]
+        db_manager.save_plex_cache(items, "Movies", full_replace=True)
+        loaded = db_manager.load_plex_cache("Movies")
+        assert len(loaded) == 2, (
+            f"expected both pre-keyed movie rows to survive full_replace, "
+            f"got {len(loaded)}: {loaded}"
+        )
+        keys = {i["key"] for i in loaded}
+        assert keys == {"1001_m1001_0", "1002_m1002_0"}
+
+    def test_full_replace_tv_with_preset_key_survives(self, db_manager):
+        """TV items normally have no pre-set 'key' (see
+        test_full_replace_tv_shows_survive), but the pre-set-key branch must
+        be honored for TV too if one is ever present, not just for movies.
+        """
+        items = [{
+            "clean_title": "breaking bad",
+            "original_title": "Breaking Bad",
+            "year": 2008,
+            "res": "1080p",
+            "size": 45.0,
+            "imdb_id": "tt0903747",
+            "rating_key": "2001",
+            "season": 1,
+            "episode_count": 7,
+            "dovi": False,
+            "hdr": False,
+            "key": "2001_s1",
+        }]
+        db_manager.save_plex_cache(items, "TV Shows", full_replace=True)
+        loaded = db_manager.load_plex_cache("TV Shows")
+        assert len(loaded) == 1, (
+            f"expected the pre-keyed TV row to survive full_replace, got {loaded}"
+        )
+        assert loaded[0]["key"] == "2001_s1"
+
+    def test_full_replace_prunes_genuinely_stale_preset_key_row(self, db_manager):
+        """Mirrors test_full_replace_prunes_genuinely_stale_tv_row, but for
+        the pre-set-key branch (production movies always have a pre-set
+        'key'): a movie row from a PRIOR full_replace whose key is absent
+        from the new fresh set (e.g. removed from Plex, or a stale part
+        index) must still be pruned -- the prune-still-prunes property must
+        hold for pre-keyed items too, not just fallback-keyed ones.
+        """
+        old_items = [{
+            "clean_title": "old movie",
+            "original_title": "Old Movie",
+            "year": 2000,
+            "res": "1080p",
+            "size": 10.0,
+            "imdb_id": "tt3333333",
+            "rating_key": "8001",
+            "media_id": "m8001",
+            "dovi": False,
+            "hdr": False,
+            "key": "8001_m8001_0",
+        }]
+        new_items = [{
+            "clean_title": "new movie",
+            "original_title": "New Movie",
+            "year": 2021,
+            "res": "4K",
+            "size": 40.0,
+            "imdb_id": "tt4444444",
+            "rating_key": "8002",
+            "media_id": "m8002",
+            "dovi": True,
+            "hdr": True,
+            "key": "8002_m8002_0",
+        }]
+        db_manager.save_plex_cache(old_items, "Movies", full_replace=True)
+        db_manager.save_plex_cache(new_items, "Movies", full_replace=True)
+
+        loaded = db_manager.load_plex_cache("Movies")
+        keys = {i["key"] for i in loaded}
+        assert keys == {"8002_m8002_0"}, (
+            f"expected only the fresh pre-set key to survive, got {keys}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 5. Scan history
