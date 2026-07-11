@@ -7,6 +7,17 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.25.1",
+    date: "2026-07-10",
+    summary: "Rename conflicts: readable message + side-by-side compare",
+    changes: [
+      "When a rename would land on a file that already exists, the Renames list now shows a plain-language summary (e.g. \"Already in the library at the same size (13.4 GB) — likely a duplicate\") instead of a raw path with two 11-digit byte counts.",
+      "A same-size conflict is flagged as a likely duplicate so it's a one-glance skip.",
+      "A new Compare button opens the existing side-by-side file comparison (resolution, HDR/DV, codec, audio, bitrate, size, duration) with a recommendation and Overwrite / Keep both / Skip actions — previously only available on mobile.",
+      "Same-size and different-size files are still always held for review — nothing is ever auto-replaced or silently dropped.",
+    ],
+  },
+  {
     version: "2.25.0",
     date: "2026-07-10",
     summary: "Pipeline Tracker: see what never made it to Plex",
