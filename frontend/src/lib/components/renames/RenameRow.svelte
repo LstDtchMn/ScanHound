@@ -1,13 +1,18 @@
 <script lang="ts">
   import RenamePoster from './RenamePoster.svelte';
   import BadgeCluster from './BadgeCluster.svelte';
+  import Badge from '$lib/components/Badge.svelte';
+  import ConflictModal from './ConflictModal.svelte';
   import { selectedJobIds, toggleSelect, applyJob, renameProgress } from '$lib/stores/renames';
+  import { hasDestinationConflict } from '$lib/renames/review';
   import type { RenameJob } from '$lib/api/types';
 
   let { job, onRematch }: { job: RenameJob; onRematch: (job: RenameJob) => void } = $props();
 
   let selected = $derived($selectedJobIds.has(job.id));
   let busy = $state(false);
+  let showConflict = $state(false);
+  let isConflict = $derived(hasDestinationConflict(job));
   let titleLine = $derived(
     [job.title ?? job.package_name ?? job.original_filename ?? `Job ${job.id}`, job.year ? `(${job.year})` : null]
       .filter(Boolean)
@@ -58,6 +63,21 @@
       <div class="text-xs text-[var(--error)] truncate" title={job.error_message}>
         {job.error_message}
       </div>
+    {:else if isConflict}
+      <div class="flex items-center gap-1.5 text-xs">
+        <Badge variant="warning" label="⚠ Conflict" />
+        {#if job.conflict_same_size}
+          <Badge variant="default" label="likely duplicate" />
+        {/if}
+        <span class="text-[var(--text-secondary)] truncate" title={job.warning_message}>{job.warning_message}</span>
+        <button
+          type="button"
+          class="ml-auto shrink-0 px-2 py-0.5 rounded text-[11px] font-medium bg-[var(--accent)] text-white hover:brightness-110"
+          onclick={() => (showConflict = true)}
+        >
+          Compare
+        </button>
+      </div>
     {:else if job.warning_message}
       <div class="text-xs text-[var(--warning)] truncate" title={job.warning_message}>
         {job.warning_message}
@@ -107,3 +127,7 @@
     </button>
   </div>
 </li>
+
+{#if showConflict}
+  <ConflictModal {job} onClose={() => (showConflict = false)} />
+{/if}
