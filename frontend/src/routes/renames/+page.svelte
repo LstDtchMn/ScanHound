@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import {
     renameJobs, renameStatus, renameCategory, renameQuery, renameSort,
-    viewMode, renameQueue, applyCancelling,
+    viewMode, renameQueue, applyCancelling, applyActive,
     loadRenameJobs, loadRenameStatus, loadDvScans,
     applyJob, undoJob, deleteJob, cancelApply,
     acceptCombinedJob, acceptCorrectionJob,
@@ -303,7 +303,8 @@
           {#if actionsOpenId === job.id}
             <div class="absolute top-7 right-1.5 z-20 flex flex-col gap-1 p-2 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] shadow">
               {#if job.status === 'matched' || job.status === 'needs_review'}
-                <button onclick={() => run(job.id, applyJob, 'Applied')} disabled={busy === job.id}
+                <button onclick={() => run(job.id, applyJob, 'Applied')} disabled={busy === job.id || $applyActive}
+                  title={$applyActive ? 'A bulk apply is in progress — try again once it finishes.' : undefined}
                   class="px-2.5 py-1 text-xs rounded-lg bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50 text-left">Apply</button>
               {/if}
               {#if job.status === 'needs_review' || job.status === 'failed'}
@@ -346,7 +347,8 @@
             {#if actionsOpenId === job.id}
               <div class="mt-1 flex flex-wrap items-center gap-1">
                 {#if job.status === 'matched' || job.status === 'needs_review'}
-                  <button onclick={() => run(job.id, applyJob, 'Applied')} disabled={busy === job.id}
+                  <button onclick={() => run(job.id, applyJob, 'Applied')} disabled={busy === job.id || $applyActive}
+                    title={$applyActive ? 'A bulk apply is in progress — try again once it finishes.' : undefined}
                     class="px-2.5 py-1 text-xs rounded-lg bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50">Apply</button>
                 {/if}
                 {#if job.status === 'needs_review' || job.status === 'failed'}
