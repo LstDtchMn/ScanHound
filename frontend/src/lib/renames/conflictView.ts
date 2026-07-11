@@ -3,7 +3,7 @@
  *  Svelte so it's unit-testable under plain jsdom vitest — see
  *  conflictView.test.ts. */
 import { resolutionRank } from '$lib/constants';
-import type { FileSpec } from '$lib/api/types';
+import type { FileSpec, ConflictAnalysis } from '$lib/api/types';
 
 const EM_DASH = '—';
 
@@ -133,4 +133,37 @@ export function specRows(
 export function needsDvScan(spec: FileSpec | null | undefined): boolean {
   if (!spec) return false;
   return spec.hdr === 'Dolby Vision' && !spec.dv_layer;
+}
+
+/** Concise one-line row diff, showing only the axes that DIFFER between
+ *  existing and incoming — replaces the old raw-byte warning_message
+ *  tooltip. Pure, never throws on missing/degraded input. */
+export function conflictSummary(analysis: ConflictAnalysis | null | undefined): string {
+  if (!analysis) return '';
+  const e = analysis.existing?.present ? analysis.existing : null;
+  const i = analysis.incoming?.present ? analysis.incoming : null;
+  const parts: string[] = [];
+
+  const eRes = e?.resolution ?? EM_DASH;
+  const iRes = i?.resolution ?? EM_DASH;
+  const eHdr = hdrLabel(e);
+  const iHdr = hdrLabel(i);
+  const eSize = formatBytes(e?.size_bytes ?? null);
+  const iSize = formatBytes(i?.size_bytes ?? null);
+
+  const axisDiffers = eRes !== iRes || eHdr !== iHdr;
+  const existingBits = [axisDiffers ? eRes : null, axisDiffers ? eHdr : null, eSize]
+    .filter((v): v is string => !!v && v !== EM_DASH);
+  const incomingBits = [axisDiffers ? iRes : null, axisDiffers ? iHdr : null, iSize]
+    .filter((v): v is string => !!v && v !== EM_DASH);
+
+  parts.push(`Existing ${existingBits.join('·') || EM_DASH}`);
+  parts.push(`→ Incoming ${incomingBits.join('·') || EM_DASH}`);
+
+  let summary = parts.join(' ');
+  if (!analysis.degraded && analysis.recommended && analysis.recommended !== 'tie') {
+    const who = analysis.recommended === 'existing' ? 'Existing' : 'Incoming';
+    summary += ` · keep ${who} ★`;
+  }
+  return summary;
 }

@@ -1,11 +1,18 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { formatBytes, formatMbps, specRows, needsDvScan } from './conflictView';
-import type { FileSpec } from '$lib/api/types';
+import { formatBytes, formatMbps, specRows, needsDvScan, conflictSummary } from './conflictView';
+import type { FileSpec, ConflictAnalysis } from '$lib/api/types';
 
 const spec = (o: Partial<FileSpec>): FileSpec => ({
   present: true, path: '/x', size_bytes: null, resolution: null, video_codec: null,
   hdr: null, dv_layer: null, audio: null, duration_min: null, bitrate: null, ...o,
+});
+
+const analysis = (o: Partial<ConflictAnalysis>): ConflictAnalysis => ({
+  kind: 'same_path',
+  existing: spec({}), incoming: spec({}),
+  recommended: null, reason: null, degraded: false, analyzed_at: '2026-07-11T00:00:00Z',
+  ...o,
 });
 
 describe('formatBytes', () => {
@@ -138,5 +145,50 @@ describe('needsDvScan', () => {
   it('false for a null/undefined spec', () => {
     expect(needsDvScan(null)).toBe(false);
     expect(needsDvScan(undefined)).toBe(false);
+  });
+});
+
+describe('conflictSummary', () => {
+  it('shows only differing axes', () => {
+    const a = analysis({
+      existing: spec({ resolution: '2160p', hdr: 'Dolby Vision', dv_layer: 'mel', size_bytes: 25e9 }),
+      incoming: spec({ resolution: '2160p', hdr: 'Dolby Vision', dv_layer: 'fel', size_bytes: 29e9 }),
+      recommended: 'incoming',
+    });
+    const s = conflictSummary(a);
+    expect(s).toContain('MEL');
+    expect(s).toContain('FEL');
+    // formatBytes is binary (1024^3) GB, not decimal 1e9 — see formatBytes
+    // tests above (e.g. 40e9 -> "37.3 GB"), so 25e9/29e9 bytes render as
+    // 23.3/27.0 GB, not a literal "25.0"/"29.0".
+    expect(s).toContain('23.3 GB');
+    expect(s).toContain('27.0 GB');
+    expect(s).toContain('keep Incoming');
+  });
+
+  it('identical-except-size renders no redundant repeated axis', () => {
+    const a = analysis({
+      existing: spec({ resolution: '2160p', hdr: null, dv_layer: null, size_bytes: 22e9 }),
+      incoming: spec({ resolution: '2160p', hdr: null, dv_layer: null, size_bytes: 26e9 }),
+      recommended: 'incoming',
+    });
+    const s = conflictSummary(a);
+    expect(s).not.toContain('2160p → 2160p');
+    // See binary-vs-decimal GB note above: 22e9/26e9 bytes -> 20.5/24.2 GB.
+    expect(s).toContain('20.5 GB');
+    expect(s).toContain('24.2 GB');
+  });
+
+  it('missing analysis returns empty string, never throws', () => {
+    expect(conflictSummary(null)).toBe('');
+    expect(conflictSummary(undefined)).toBe('');
+  });
+
+  it('degraded analysis omits the keep-recommendation clause', () => {
+    const a = analysis({
+      existing: spec({ resolution: '2160p' }), incoming: spec({ present: false }),
+      recommended: null, degraded: true,
+    });
+    expect(conflictSummary(a)).not.toContain('keep');
   });
 });

@@ -127,6 +127,14 @@ export interface RenameJob {
   poster_url?: string | null;
   /** Read-only DV layer joined from dv_scan by path at serialize time (FEL/MEL/P8/P5). Null = unknown. */
   dv_layer?: string | null;
+  // True when a same-title/year movie already exists in Plex at a DIFFERENT
+  // path than this job's own destination. Computed server-side on the jobs
+  // list, same as destination_conflict.
+  library_duplicate?: boolean;
+  // The full background-analyzed quality comparison for this job's active
+  // duplicate (either kind). Null until the analyzer has run. Sole read path
+  // for the row's diff summary — never live-probed on the frontend.
+  conflict_analysis?: ConflictAnalysis | null;
 }
 
 export interface DvScan {
@@ -585,6 +593,15 @@ export interface FileSpec {
   resolution: string | null; video_codec: string | null; hdr: string | null;
   dv_layer: string | null; audio: string | null;
   duration_min: number | null; bitrate: number | null;
+}
+export interface ConflictAnalysis {
+  kind: 'same_path' | 'library_duplicate';
+  existing: FileSpec;
+  incoming: FileSpec;
+  recommended: 'existing' | 'incoming' | 'tie' | null;
+  reason: string | null;
+  degraded: boolean;
+  analyzed_at: string;
 }
 export interface ConflictComparison {
   existing: FileSpec | null;
