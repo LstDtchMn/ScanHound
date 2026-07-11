@@ -3,6 +3,7 @@
   import BadgeCluster from './BadgeCluster.svelte';
   import { tileShowMeta } from '$lib/stores/results';
   import { selectedJobIds, toggleSelect, renameProgress } from '$lib/stores/renames';
+  import { formatBytes } from '$lib/renames/conflictView';
   import type { RenameJob } from '$lib/api/types';
 
   let { job, onRematch }: { job: RenameJob; onRematch: (job: RenameJob) => void } = $props();
@@ -13,6 +14,16 @@
       .filter(Boolean)
       .join(' ')
   );
+  // Grid view has no room for a text progress line — surface the same
+  // speed/state signal RenameRow shows inline as a hover tooltip instead.
+  let progTitle = $derived.by(() => {
+    const prog = $renameProgress.get(job.id);
+    if (!prog) return 'Applying…';
+    if (prog.pct >= 100) return 'Verifying…';
+    const parts = [`Moving… ${prog.pct}%`];
+    if (prog.bytes_per_sec) parts.push(`${formatBytes(prog.bytes_per_sec)}/s`);
+    return parts.join(' · ');
+  });
 </script>
 
 <div
@@ -47,7 +58,7 @@
         </div>
       {/if}
       {#if job.status === 'applying'}
-        <div class="mt-1 h-1 rounded-full bg-[var(--bg-tertiary)] overflow-hidden">
+        <div class="mt-1 h-1 rounded-full bg-[var(--bg-tertiary)] overflow-hidden" title={progTitle}>
           {#if $renameProgress.get(job.id)}
             <div class="h-full bg-[var(--accent)] transition-[width] duration-200"
                  style="width: {$renameProgress.get(job.id)?.pct ?? 0}%"></div>

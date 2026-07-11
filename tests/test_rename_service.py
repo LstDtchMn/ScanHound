@@ -8,7 +8,9 @@ import pytest
 
 from backend.database import DatabaseManager
 from backend.rename import llm_identify
-from backend.rename.service import RenameService, compute_sort_title, _fmt_size
+from backend.rename.service import (
+    RenameService, compute_sort_title, _fmt_size, TransferRateEstimator,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1002,6 +1004,193 @@ class TestApplyUndo:
         assert not os.path.exists(dst)
         # And the row is recorded as failed, not stuck on its old status.
         assert db.get_rename_job(jid)["status"] == "failed"
+
+
+# ── Transfer speed indicator ────────────────────────────────────────────
+
+class TestTransferRateEstimator:
+    """Pure EMA rate/ETA estimator fed synthetic (bytes_done, monotonic_now)
+    sequences — no filesystem, DB, or WS involved."""
+
+    def test_first_sample_reports_no_rate(self):
+        est = TransferRateEstimator()
+        rate, eta = est.sample(1_000_000, 10_000_000, now=0.0)
+        assert rate is None
+        assert eta is None
+
+    def test_single_sample_at_completion_never_spikes(self):
+        """A small file's first (and only) progress_cb call can already have
+        done == total, forcing an unconditional emit that bypasses the
+        throttle. If a rate were naively computed as bytes/elapsed-since-
+        job-start, a near-zero elapsed time would spike toward infinity.
+        With only one sample ever fed, no rate must be reported at all."""
+        est = TransferRateEstimator()
+        rate, eta = est.sample(5_000_000, 5_000_000, now=0.0001)
+        assert rate is None
+        assert eta is None
+
+    def test_second_sample_computes_windowed_rate(self):
+        est = TransferRateEstimator()
+        est.sample(0, 100_000_000, now=0.0)
+        rate, eta = est.sample(50_000_000, 100_000_000, now=1.0)
+        # First real EMA sample equals the raw windowed rate exactly.
+        assert rate == pytest.approx(50_000_000.0)
+        assert eta == pytest.approx(1.0)  # 50MB left at 50MB/s
+
+    def test_eta_is_none_once_done_reaches_total(self):
+        est = TransferRateEstimator()
+        est.sample(0, 100, now=0.0)
+        rate, eta = est.sample(100, 100, now=1.0)
+        assert rate is not None
+        assert eta is None
+
+    def test_ema_smooths_a_burst_sample_rather_than_jumping_to_it(self):
+        """A sudden burst window (e.g. a final forced 100% tick arriving
+        shortly after a throttled emit) must not make the reported rate jump
+        straight to that single window's raw value."""
+        est = TransferRateEstimator(alpha=0.3)
+        est.sample(0, 1_000_000_000, now=0.0)
+        rate1, _ = est.sample(40_000_000, 1_000_000_000, now=1.0)  # 40MB/s steady
+        assert rate1 == pytest.approx(40_000_000.0)
+        # A short, fast burst window: 20MB in 0.05s = 400MB/s raw.
+        rate2, _ = est.sample(60_000_000, 1_000_000_000, now=1.05)
+        raw_burst = 20_000_000 / 0.05
+        assert rate2 is not None
+        # Damped: strictly between the prior steady rate and the raw burst,
+        # not equal to (or beyond) the raw instantaneous value.
+        assert rate1 < rate2 < raw_burst
+        # And it's the exact EMA blend, not some other ad-hoc damping.
+        assert rate2 == pytest.approx(0.3 * raw_burst + 0.7 * rate1)
+
+    def test_throttle_gap_windowed_rate_matches_real_throughput(self):
+        """Simulates the real cadence: samples only arrive roughly every
+        ~0.4s (RenameService.apply's throttle gate), not per raw chunk. A
+        rate computed only across those emitted samples must reflect the
+        actual sustained throughput, not an inflated per-chunk figure."""
+        est = TransferRateEstimator()
+        total = 200_000_000
+        # ~50 MB/s sustained, sampled every 0.4s.
+        samples = [(0, 0.0), (20_000_000, 0.4), (40_000_000, 0.8),
+                   (60_000_000, 1.2), (80_000_000, 1.6)]
+        rate = None
+        for done, now in samples:
+            rate, _ = est.sample(done, total, now=now)
+        assert rate == pytest.approx(50_000_000.0, rel=0.05)
+
+    def test_zero_or_negative_time_delta_does_not_raise_or_corrupt(self):
+        """A degenerate window (clock didn't advance) must not raise
+        (division by zero) and must not corrupt/blank a previously-known
+        rate."""
+        est = TransferRateEstimator()
+        est.sample(0, 100_000_000, now=0.0)
+        good_rate, _ = est.sample(10_000_000, 100_000_000, now=1.0)
+        assert good_rate is not None
+        # Same timestamp as the previous sample (dt == 0) — must not blow up
+        # and must keep reporting the last good rate rather than None.
+        rate, _ = est.sample(10_000_100, 100_000_000, now=1.0)
+        assert rate == pytest.approx(good_rate)
+        # A timestamp that goes backwards (dt < 0) — same guarantee.
+        rate2, _ = est.sample(10_000_200, 100_000_000, now=0.5)
+        assert rate2 == pytest.approx(good_rate)
+
+    def test_negative_byte_delta_does_not_raise_or_corrupt(self):
+        """done going backwards (never expected in a real transfer) must be
+        ignored rather than producing a negative/nonsensical rate."""
+        est = TransferRateEstimator()
+        est.sample(10_000_000, 100_000_000, now=0.0)
+        good_rate, _ = est.sample(20_000_000, 100_000_000, now=1.0)
+        assert good_rate is not None
+        rate, _ = est.sample(5_000_000, 100_000_000, now=2.0)
+        assert rate == pytest.approx(good_rate)
+
+    def test_rate_never_negative_nan_or_infinite_across_a_long_sequence(self):
+        import math
+        import random
+        rnd = random.Random(42)
+        est = TransferRateEstimator()
+        now = 0.0
+        done = 0
+        total = 5_000_000_000
+        for _ in range(500):
+            now += rnd.choice([0.0, 0.01, 0.4, 0.9])  # includes degenerate 0-dt gaps
+            done = min(total, done + rnd.randint(0, 50_000_000))
+            rate, eta = est.sample(done, total, now=now)
+            if rate is not None:
+                assert rate >= 0
+                assert not math.isnan(rate) and not math.isinf(rate)
+            if eta is not None:
+                assert eta >= 0
+                assert not math.isnan(eta) and not math.isinf(eta)
+
+
+class TestApplyProgressBroadcast:
+    """Integration: RenameService.apply()'s real _progress closure, wired
+    through TransferRateEstimator, over a genuine cross-device COPY."""
+
+    def test_cross_device_copy_broadcasts_speed_and_eta(self, db, tmp_path, monkeypatch):
+        import itertools
+        import backend.api.ws as ws_mod
+        from backend.rename import fileops as _fo
+
+        # Small, deterministic chunking so a 10-byte file produces several
+        # progress_cb calls (real transfers use 8 MiB chunks).
+        monkeypatch.setattr(_fo, "_COPY_CHUNK", 2)
+        # Force the cross-device (EXDEV) branch so _copy_verify_atomic (and
+        # thus progress_cb) actually runs — a same-device 'move' is an
+        # instant os.rename with no byte-streaming.
+        def _exdev(a, b):
+            import errno
+            raise OSError(errno.EXDEV, "cross-device")
+        monkeypatch.setattr(_fo.os, "rename", _exdev)
+
+        captured = []
+        monkeypatch.setattr(ws_mod.ws_manager, "broadcast_sync", captured.append)
+
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="1234567890")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+
+        # Deterministic monotonic clock, installed only for the apply() call
+        # itself (identification above may legitimately call time.monotonic
+        # for unrelated rate-limiting). Baseline offset by 1000s (never 0.0
+        # in any real deployment either) so the first tick lands clear of
+        # the `_last_emit = [0.0]` sentinel and is unconditionally emitted,
+        # same as it would be against a real wall clock: chunk1 emits
+        # (first-ever tick), chunks 2-3 land inside the 0.4s throttle window
+        # (suppressed), chunk4 crosses it (windowed sample), chunk5 is the
+        # forced 100% tick shortly after (burst window, EMA-blended).
+        times = itertools.chain(
+            [1000.0, 1000.1, 1000.2, 1000.5, 1000.9], itertools.repeat(1000.9))
+        monkeypatch.setattr("time.monotonic", lambda: next(times))
+
+        out = svc.apply(jid)
+        assert out["ok"] is True
+
+        progress_msgs = [m["data"] for m in captured
+                          if m["type"] == "rename:progress" and m["data"]["id"] == jid]
+        # Two of the five raw chunk callbacks are throttle-suppressed —
+        # only 3 actually broadcast (first tick, the throttle-crossing tick,
+        # and the forced final 100% tick).
+        assert len(progress_msgs) == 3
+
+        first = progress_msgs[0]
+        assert first["pct"] == 20
+        assert first["bytes_per_sec"] is None
+        assert first["eta_seconds"] is None
+
+        windowed = progress_msgs[1]
+        assert windowed["pct"] == 80
+        assert windowed["bytes_per_sec"] == pytest.approx(12.0)
+        assert windowed["eta_seconds"] == pytest.approx(2 / 12.0)
+
+        final = progress_msgs[2]
+        assert final["pct"] == 100
+        assert final["bytes_per_sec"] == pytest.approx(0.3 * 5.0 + 0.7 * 12.0)
+        # Nothing left to wait for once done reaches total.
+        assert final["eta_seconds"] is None
+        # And never an absurd spike from the short/fast final window.
+        assert final["bytes_per_sec"] < 100  # sane for a 10-byte fixture
 
 
 # ── "Stop applying" — graceful cancel of the apply queue ───────────────

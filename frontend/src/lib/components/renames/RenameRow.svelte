@@ -2,11 +2,20 @@
   import RenamePoster from './RenamePoster.svelte';
   import BadgeCluster from './BadgeCluster.svelte';
   import Badge from '$lib/components/Badge.svelte';
-  import { selectedJobIds, toggleSelect, applyJob, renameProgress, applyActive } from '$lib/stores/renames';
+  import {
+    selectedJobIds, toggleSelect, applyJob, renameProgress, applyActive, progressClock
+  } from '$lib/stores/renames';
   import { hasDestinationConflict } from '$lib/renames/review';
   import { formatBytes } from '$lib/renames/conflictView';
   import { addToast } from '$lib/stores/notifications';
   import type { RenameJob } from '$lib/api/types';
+
+  /** No progress update for this long while still 'applying' (and not past
+   *  100%, which has its own "Verifying…" state below) reads as possibly
+   *  stalled. Set generously above the worst-case healthy chunk-read time
+   *  (a single 8 MiB chunk on an extremely slow drive) so a genuinely slow
+   *  transfer isn't flagged, while a job frozen for minutes/hours clearly is. */
+  const STALL_MS = 30_000;
 
   let {
     job,
@@ -25,9 +34,29 @@
   let canApply = $derived(job.status === 'matched' || job.status === 'needs_review');
   let applying = $derived(job.status === 'applying');
   let prog = $derived($renameProgress.get(job.id));
+  // pct reaching 100 doesn't mean the job is done — the post-copy cold-cache
+  // hash re-verify (backend/rename/fileops.py's _copy_verify_atomic) reads
+  // the whole file back with no progress callback at all, so the bar sits at
+  // 100% for a real (if usually short) stretch before the job's status
+  // actually flips off 'applying'. Label that "Verifying…" rather than
+  // freezing on "100%" with no explanation, and never treat it as stalled.
+  let verifying = $derived(applying && !!prog && prog.pct >= 100);
+  let stalled = $derived(
+    applying && !!prog && prog.pct < 100 && $progressClock - prog.updatedAt > STALL_MS
+  );
 
   function gb(bytes: number): string {
     return (bytes / 1024 ** 3).toFixed(1);
+  }
+
+  function formatEta(seconds: number): string {
+    if (seconds < 60) return `${Math.ceil(seconds)}s`;
+    const totalMin = Math.floor(seconds / 60);
+    const secs = Math.round(seconds % 60);
+    if (totalMin < 60) return secs > 0 ? `${totalMin}m ${secs}s` : `${totalMin}m`;
+    const hours = Math.floor(totalMin / 60);
+    const min = totalMin % 60;
+    return min > 0 ? `${hours}h ${min}m` : `${hours}h`;
   }
 
   async function apply() {
@@ -103,16 +132,27 @@
       <div class="mt-1">
         <div class="h-1.5 rounded-full bg-[var(--bg-tertiary)] overflow-hidden">
           {#if prog}
-            <div class="h-full bg-[var(--accent)] transition-[width] duration-200"
+            <div class="h-full transition-[width] duration-200 {stalled ? 'bg-[var(--warning)]' : 'bg-[var(--accent)]'}"
                  style="width: {prog.pct}%"></div>
           {:else}
             <!-- No byte progress yet: instant same-drive move, or just starting -->
             <div class="h-full w-1/3 bg-[var(--accent)]/70 animate-pulse"></div>
           {/if}
         </div>
-        <div class="mt-0.5 text-[11px] text-[var(--text-secondary)]">
+        <div class="mt-0.5 text-[11px] {stalled ? 'text-[var(--warning)]' : 'text-[var(--text-secondary)]'}">
           {#if prog}
-            Moving… {prog.pct}% ({gb(prog.bytes_done)} / {gb(prog.bytes_total)} GB)
+            {#if verifying}
+              Verifying… ({gb(prog.bytes_total)} GB)
+            {:else}
+              Moving… {prog.pct}% ({gb(prog.bytes_done)} / {gb(prog.bytes_total)} GB)
+              {#if prog.bytes_per_sec}
+                · {formatBytes(prog.bytes_per_sec)}/s
+                {#if prog.eta_seconds}· {formatEta(prog.eta_seconds)} left{/if}
+              {/if}
+              {#if stalled}
+                · No update in a while — may be stalled
+              {/if}
+            {/if}
           {:else}
             Applying…
           {/if}

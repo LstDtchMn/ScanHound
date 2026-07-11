@@ -224,8 +224,30 @@ export async function deleteJob(id: number) {
 // ── Apply progress ───────────────────────────────────────────────────
 // Per-job byte progress for an in-flight move (only a cross-device COPY emits
 // this; same-device renames finish instantly). Keyed by job id.
-export interface RenameProgress { pct: number; bytes_done: number; bytes_total: number; }
+export interface RenameProgress {
+  pct: number;
+  bytes_done: number;
+  bytes_total: number;
+  /** EMA-smoothed transfer rate from the server, or null until the first
+   *  windowed sample exists (see TransferRateEstimator, backend/rename/service.py). */
+  bytes_per_sec: number | null;
+  /** Derived from the same EMA rate; null once pct reaches 100 (nothing left
+   *  to wait for — the post-copy hash-verify has no byte-level progress). */
+  eta_seconds: number | null;
+  /** Client-side receipt time (Date.now()), NOT from the server — drives the
+   *  "stalled" (no update for a while) heuristic below. */
+  updatedAt: number;
+}
 export const renameProgress = writable<Map<number, RenameProgress>>(new Map());
+
+/** Ticks once a second so components deriving off `renameProgress[id].updatedAt`
+ *  (i.e. "has this job gone quiet?") re-evaluate without needing their own
+ *  interval. Started lazily so importing this module in a non-browser test
+ *  environment (jsdom/vitest, SSR) never leaves a live timer running. */
+export const progressClock = writable<number>(Date.now());
+if (typeof window !== 'undefined') {
+  setInterval(() => progressClock.set(Date.now()), 1000);
+}
 
 // Overall apply-queue progress ("job X of N"). null when nothing is applying.
 export interface RenameQueueProgress { done: number; total: number; current_title: string | null; }
@@ -261,6 +283,9 @@ connection.on('rename:progress', (data) => {
       pct: (data.pct as number) ?? 0,
       bytes_done: (data.bytes_done as number) ?? 0,
       bytes_total: (data.bytes_total as number) ?? 0,
+      bytes_per_sec: (data.bytes_per_sec as number | null) ?? null,
+      eta_seconds: (data.eta_seconds as number | null) ?? null,
+      updatedAt: Date.now(),
     });
     return next;
   });
@@ -316,6 +341,48 @@ connection.on('rename:job', (data) => {
     });
   }
   loadRenameStatus();
+});
+
+// ── Reconnect resync ────────────────────────────────────────────────
+// A WS disconnect (laptop sleep, network blip — connection.ts has no
+// heartbeat, so a half-dead socket can sit undetected for a while before
+// onclose fires) can silently swallow a job's terminal rename:job broadcast
+// or the apply-queue's terminal rename:queue_progress(active:false)
+// broadcast: broadcast_sync (backend/api/ws.py) is fire-and-forget with no
+// redelivery, so whatever this client missed while disconnected is gone for
+// good. Left uncorrected, a completed job's row stays frozen on a stale
+// 'applying' status / progress bar forever — nothing will ever emit another
+// event for a job that's already finished, so nothing would ever correct it
+// short of a hard page reload (which re-mounts and re-fetches from scratch).
+//
+// On reconnect, trust a fresh GET over any locally-held progress state:
+// re-fetch jobs/status (corrects each job's `status`, which is what actually
+// gates the "Moving…" row/bar), then drop renameProgress entries for any job
+// the server no longer reports as 'applying'. renameQueue/applyCancelling
+// have no REST-backed snapshot to reconcile against (there's no endpoint for
+// "job N of M of the last bulk run") — clear them outright rather than keep
+// showing a possibly-stale number; a bulk apply that's still genuinely
+// running will simply re-broadcast fresh queue progress as its next job
+// starts.
+export async function resyncAfterReconnect() {
+  await refresh();
+  const applyingIds = new Set(
+    get(renameJobs).filter((j) => j.status === 'applying').map((j) => j.id)
+  );
+  renameProgress.update((m) => {
+    if (m.size === 0) return m;
+    const next = new Map(m);
+    for (const id of next.keys()) {
+      if (!applyingIds.has(id)) next.delete(id);
+    }
+    return next;
+  });
+  renameQueue.set(null);
+  applyCancelling.set(false);
+}
+
+connection.onReconnect(() => {
+  resyncAfterReconnect();
 });
 
 // Dry-run preview result (no jobs are created for a preview).

@@ -82,6 +82,59 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class TransferRateEstimator:
+    """EMA-smoothed bytes/sec estimator fed one sample per *emitted*
+    ``rename:progress`` tick (i.e. already at the ~2.5 Hz throttle cadence
+    used by :meth:`RenameService.apply`'s ``_progress`` closure, not per raw
+    8 MiB chunk — averaging across emitted samples already smooths over
+    several chunks, and sampling every raw chunk would be pointless since
+    most never reach an emit).
+
+    A light EMA (default ``alpha=0.3``) further damps the windowed
+    bytes-since-last-sample / time-since-last-sample rate against
+    OS-write-buffering/seek-stall jitter between consecutive windows,
+    without adding real lag.
+
+    No rate is reported until a *second* valid sample arrives — this is what
+    keeps a same-instant first-and-only sample (e.g. a small file whose
+    first chunk is already ``done == total``, forcing an unconditional emit
+    that bypasses the throttle) from ever computing a bytes/~0s "infinite"
+    spike: a rate/ETA needs at least two samples spanning a positive amount
+    of wall-clock time to exist at all. A degenerate window (clock didn't
+    advance, or ``done`` went backwards — never expected in a real transfer,
+    but guarded rather than trusted) is skipped without corrupting the EMA;
+    whatever rate was already known keeps being reported instead of
+    blanking out over one bad sample.
+    """
+
+    def __init__(self, alpha: float = 0.3):
+        self._alpha = alpha
+        self._last_done: Optional[int] = None
+        self._last_time: Optional[float] = None
+        self._ema: Optional[float] = None
+
+    def sample(self, done: int, total: int, now: float):
+        """Feed one ``(bytes_done, monotonic_now)`` sample.
+
+        Returns ``(bytes_per_sec, eta_seconds)`` — both ``None`` until a rate
+        can be computed, and ``eta_seconds`` stays ``None`` once ``done >=
+        total`` (nothing left to wait for)."""
+        if self._last_time is not None:
+            dt = now - self._last_time
+            dbytes = done - self._last_done
+            if dt > 0 and dbytes >= 0:
+                raw = dbytes / dt
+                self._ema = raw if self._ema is None else (
+                    self._alpha * raw + (1 - self._alpha) * self._ema)
+        self._last_done = done
+        self._last_time = now
+        rate = self._ema
+        eta = None
+        if rate and rate > 0 and total > done:
+            eta = (total - done) / rate
+        return rate, eta
+
+
 def compute_sort_title(title: Optional[str]) -> Optional[str]:
     """Plex-style sort title: move a leading article to the end."""
     if not title:
@@ -1397,8 +1450,12 @@ class RenameService:
         # Per-item progress: only a genuine cross-device COPY streams bytes and
         # fires this; a same-device rename/hardlink completes instantly and
         # never calls it. Throttled to ~2.5 Hz so a big remux doesn't flood the
-        # socket, but always emits the final 100%.
+        # socket, but always emits the final 100%. `_rate` is fed only the
+        # samples that actually get emitted (post-throttle), which is also
+        # the cadence a windowed rate should be computed over — see
+        # TransferRateEstimator's docstring.
         _last_emit = [0.0]
+        _rate = TransferRateEstimator()
 
         def _progress(done: int, total: int) -> None:
             import time as _t
@@ -1406,13 +1463,16 @@ class RenameService:
             if done < total and (now - _last_emit[0]) < 0.4:
                 return
             _last_emit[0] = now
+            bytes_per_sec, eta_seconds = _rate.sample(done, total, now)
             try:
                 from backend.api.ws import ws_manager
                 pct = int(done * 100 / total) if total else 0
                 ws_manager.broadcast_sync({
                     "type": "rename:progress",
                     "data": {"id": job_id, "bytes_done": done,
-                             "bytes_total": total, "pct": pct}})
+                             "bytes_total": total, "pct": pct,
+                             "bytes_per_sec": bytes_per_sec,
+                             "eta_seconds": eta_seconds}})
             except Exception:
                 pass
         try:
