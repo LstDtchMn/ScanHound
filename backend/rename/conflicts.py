@@ -311,8 +311,16 @@ def needs_dv_layer_scan(existing: dict, incoming: dict) -> bool:
     if se[1] != 1 or si[1] != 1:
         return False  # not both Dolby Vision — no layer distinction applies
 
-    e_known = bool(existing.get("dv_layer"))
-    i_known = bool(incoming.get("dv_layer"))
+    # "unknown" is a real, load-bearing sentinel (dv_detect.LAYER_UNKNOWN) —
+    # detection ran but couldn't determine a layer (missing tool/error), NOT
+    # a settled "no DV layer" result like LAYER_NONE. The host detector's own
+    # dv_host_scan.py deliberately stores a NULL signature for "unknown" so
+    # the next scan retries it. Treating it as "known" here would skip a
+    # scan that could still resolve to something conclusive — a plain
+    # bool(dv_layer) check can't tell "unknown" apart from a real value.
+    from backend.rename.dv_detect import LAYER_UNKNOWN as _LAYER_UNKNOWN
+    e_known = bool(existing.get("dv_layer")) and existing.get("dv_layer") != _LAYER_UNKNOWN
+    i_known = bool(incoming.get("dv_layer")) and incoming.get("dv_layer") != _LAYER_UNKNOWN
     if e_known and i_known:
         return False  # both already resolved — nothing left to learn
 

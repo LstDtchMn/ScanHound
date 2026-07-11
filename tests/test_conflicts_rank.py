@@ -202,3 +202,30 @@ def test_needs_dv_layer_scan_true_when_a_dv_layer_tie_would_fall_through_to_a_re
     incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": None,
                 "original_filename": "Movie.2020.2160p.TrueHD.Atmos.mkv"}
     assert conflicts.needs_dv_layer_scan(existing, incoming) is True
+
+
+def test_needs_dv_layer_scan_true_when_known_side_is_the_unknown_sentinel():
+    # "unknown" (dv_detect.LAYER_UNKNOWN) means detection ran but couldn't
+    # determine a layer -- NOT a settled result like "none". A plain
+    # bool(dv_layer) check wrongly treats it as "known/resolved" and skips a
+    # scan that could still produce a real answer. Everything else tied, so
+    # this isolates the sentinel-handling bug specifically.
+    existing = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "unknown",
+                "original_filename": "a.mkv"}
+    incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "fel",
+                "original_filename": "a.mkv"}
+    assert conflicts.needs_dv_layer_scan(existing, incoming) is True
+    # Mirror direction -- same bug, either side could carry the sentinel.
+    assert conflicts.needs_dv_layer_scan(incoming, existing) is True
+
+
+def test_needs_dv_layer_scan_false_when_known_side_is_the_settled_none_sentinel():
+    # Contrast with the sentinel above: "none" (dv_detect.LAYER_NONE) IS a
+    # genuinely settled result (detection ran, found no DV layer) -- treating
+    # it as "known" is correct, not a gap. _DV_LAYER_RANK has no "none" entry
+    # so it ranks 0, same as an outright-absent layer.
+    existing = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "none",
+                "original_filename": "a.mkv"}
+    incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "fel",
+                "original_filename": "a.mkv"}
+    assert conflicts.needs_dv_layer_scan(existing, incoming) is False
