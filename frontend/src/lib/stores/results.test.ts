@@ -54,6 +54,7 @@ const {
   toggleCategoryFilter,
   activeNarrowingFilters,
   CATEGORY_KEYS,
+  flagsFor,
   computeStatusCounts,
   filteredStats,
   hiddenByFiltersCount,
@@ -1393,6 +1394,42 @@ describe('toggleCategoryFilter', () => {
     toggleCategoryFilter('remux');
     toggleCategoryFilter('tv');
     expect(get(categoryFilter)).toEqual([]);
+  });
+});
+
+describe('flagsFor (per-source scan-toggle projection of categoryFilter)', () => {
+  // Regression coverage for the Critical bug this suite exists to close:
+  // ScanControls' `flags` became `$derived(flagsFor(selectedSource,
+  // $categoryFilter))`, re-running on every categoryFilter change. flagsFor
+  // used to special-case an empty filter back to the source's `default`
+  // flags — harmless when flags was only seeded once at mount, but wrong
+  // once it re-derives live: toggling every category chip off (a state the
+  // test above proves categoryFilter can reach) would silently re-enable the
+  // source's default categories in both the checkbox UI and what
+  // handleStart() passes to startScan(), scraping categories the user had
+  // just turned off. flagsFor is pure (no store reads), so no resetStores()/
+  // beforeEach is needed here.
+
+  it('an explicitly empty categoryFilter yields every flag false — NOT the source defaults — for all three sources', () => {
+    expect(flagsFor('HDEncode', [])).toEqual({ '4k': false, remux: false, tv: false });
+    expect(flagsFor('DDLBase', [])).toEqual({ '4k_webdl': false, '4k_remux': false, '1080p_remux': false });
+    expect(flagsFor('Adit-HD', [])).toEqual({ '4k': false, remux: false, tv: false });
+  });
+
+  it('all three normalized categories selected turns every per-source key on', () => {
+    expect(flagsFor('HDEncode', ['4k', 'remux', 'tv'])).toEqual({ '4k': true, remux: true, tv: true });
+  });
+
+  it('DDLBase: both remux sub-keys (4k_remux, 1080p_remux) derive from the single normalized "remux" category; DDLBase has no tv key', () => {
+    expect(flagsFor('DDLBase', ['4k', 'remux'])).toEqual({
+      '4k_webdl': true,
+      '4k_remux': true,
+      '1080p_remux': true
+    });
+  });
+
+  it('only "4k" selected leaves remux/tv off', () => {
+    expect(flagsFor('HDEncode', ['4k'])).toEqual({ '4k': true, remux: false, tv: false });
   });
 });
 

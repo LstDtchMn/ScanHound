@@ -1,7 +1,7 @@
 <script lang="ts">
   import { scanState, scanProgress, scanPhase, scanItemCount, startScan, stopScan } from '$lib/stores/scanner';
   import type { ScanType } from '$lib/stores/scanner';
-  import { clearResults, categoryFilter, toggleCategoryFilter, type CategoryKey, mobileChromeCollapsed } from '$lib/stores/results';
+  import { clearResults, categoryFilter, toggleCategoryFilter, sourceCategories, normCat, flagsFor, type ScanSource, mobileChromeCollapsed } from '$lib/stores/results';
   import BottomSheet from './BottomSheet.svelte';
 
   let scanSheet = $state(false);
@@ -13,58 +13,23 @@
     { value: 'search', label: 'Site Search' }
   ];
 
-  type Source = 'HDEncode' | 'DDLBase' | 'Adit-HD';
-
-  export const sourceCategories: Record<Source, { key: string; label: string; default: boolean }[]> = {
-    'HDEncode': [
-      { key: '4k', label: '4K', default: true },
-      { key: 'remux', label: 'Remux', default: false },
-      { key: 'tv', label: 'TV', default: false }
-    ],
-    'DDLBase': [
-      { key: '4k_webdl', label: '4K', default: true },
-      { key: '4k_remux', label: '4K Remux', default: true },
-      { key: '1080p_remux', label: '1080p Remux', default: true }
-    ],
-    'Adit-HD': [
-      { key: '4k', label: '4K', default: true },
-      { key: 'remux', label: 'Remux', default: false },
-      { key: 'tv', label: 'TV', default: false }
-    ]
-  };
+  type Source = ScanSource;
 
   let selectedType = $state<ScanType>('deep');
   let selectedSource = $state<Source>('HDEncode');
   let query = $state('');
   let pages = $state(1);
 
-  // Map a per-source category key to its normalized display category.
-  function normCat(key: string): CategoryKey {
-    if (key === 'tv') return 'tv';
-    return key.includes('remux') ? 'remux' : '4k';
-  }
-
-  // Derive the toggle flags for a source from the persisted display filter, so
-  // the saved 4K/Remux/TV choice survives a reload AND stays in sync with any
-  // OTHER writer of categoryFilter — e.g. FilterBar's mobile Category row,
-  // which calls toggleCategoryFilter directly (results.ts' single writer for
-  // categoryFilter; see its doc comment there). Falls back to source defaults
-  // when nothing is persisted (an empty filter would hide everything — see
-  // filteredResults' categoryFilter handling in results.ts).
-  function flagsFor(src: Source, filter: string[]): Record<string, boolean> {
-    const cats = sourceCategories[src];
-    if (!filter || filter.length === 0) {
-      return Object.fromEntries(cats.map((c) => [c.key, c.default]));
-    }
-    return Object.fromEntries(cats.map((c) => [c.key, filter.includes(normCat(c.key))]));
-  }
-
   // Category flags — a READ-ONLY mirror of categoryFilter (mapped onto the
-  // current source's per-source keys), not local state. This is what makes
+  // current source's per-source keys via flagsFor/normCat, both co-located
+  // with categoryFilter in results.ts), not local state. This is what makes
   // categoryFilter a true single source of truth: there's no local copy here
   // for an external write (FilterBar's chips) to go stale against, and
   // nothing here writes categoryFilter except toggleCategoryFilter calls
   // below (no $effect mirroring flags back out — that write path is gone).
+  // An explicitly empty categoryFilter (every chip toggled off) correctly
+  // yields every flag false here — see flagsFor's doc comment in results.ts
+  // for why that must NOT fall back to the source's defaults.
   // Switching source re-maps the SAME normalized preference onto the new
   // source's keys (e.g. a "remux only" choice survives HDEncode -> DDLBase as
   // both 4k_remux AND 1080p_remux turning on together, since categoryFilter
@@ -84,6 +49,14 @@
   // Auto-hide the mobile bar per scroll direction (set by MobileScanView), but
   // never while a scan is actually running/stopping — progress must stay pinned.
   let hideMobileBar = $derived($mobileChromeCollapsed && $scanState === 'idle');
+
+  // True when no category is selected for a category-driven scan (every chip
+  // toggled off) — starting a scan in this state would silently diverge from
+  // what the (all-unchecked) checkboxes show, either scraping nothing useful
+  // or falling back to some default set server-side. 'search' doesn't use
+  // categories at all, so it's never gated by this. See flagsFor (results.ts)
+  // for why categoryFilter=[] must project to all-false rather than defaults.
+  let noCategorySelected = $derived(selectedType !== 'search' && $categoryFilter.length === 0);
 
   function handleStart() {
     hasInteracted = true;
@@ -150,7 +123,7 @@
           <label class="flex items-center gap-1 cursor-pointer px-1.5 py-0.5 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] hover:border-[var(--accent)] transition-colors">
             <input
               type="checkbox"
-              checked={flags[cat.key] ?? cat.default}
+              checked={flags[cat.key]}
               onchange={() => toggleCategoryFilter(normCat(cat.key))}
               class="accent-[var(--accent)] w-3 h-3"
             />
@@ -171,7 +144,9 @@
   {#if $scanState === 'idle'}
     <button
       onclick={handleStart}
-      class="px-3 py-1 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded text-xs font-medium transition-colors {!hasInteracted ? 'animate-pulse-once' : ''}"
+      disabled={noCategorySelected}
+      title={noCategorySelected ? 'Select at least one category' : undefined}
+      class="px-3 py-1 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded text-xs font-medium transition-colors disabled:opacity-50 {!hasInteracted ? 'animate-pulse-once' : ''}"
     >
       Start Scan
     </button>
@@ -220,7 +195,9 @@
     </button>
     <button
       onclick={handleStart}
-      class="shrink-0 px-4 py-2 bg-[var(--accent)] text-white rounded-lg text-sm font-semibold"
+      disabled={noCategorySelected}
+      title={noCategorySelected ? 'Select at least one category' : undefined}
+      class="shrink-0 px-4 py-2 bg-[var(--accent)] text-white rounded-lg text-sm font-semibold disabled:opacity-50"
     >Scan</button>
   {:else}
     <div class="flex-1 min-w-0">
@@ -275,7 +252,7 @@
           {#each categories as cat (cat.key)}
             <button
               onclick={() => toggleCategoryFilter(normCat(cat.key))}
-              class="px-3 py-1.5 rounded-full text-sm border transition-colors {(flags[cat.key] ?? cat.default) ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
+              class="px-3 py-1.5 rounded-full text-sm border transition-colors {flags[cat.key] ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
             >{cat.label}</button>
           {/each}
         </div>
@@ -287,7 +264,12 @@
       </div>
     {/if}
 
-    <button onclick={mobileStart} class="w-full py-3 bg-[var(--accent)] text-white rounded-lg text-sm font-semibold">Start Scan</button>
+    <button
+      onclick={mobileStart}
+      disabled={noCategorySelected}
+      title={noCategorySelected ? 'Select at least one category' : undefined}
+      class="w-full py-3 bg-[var(--accent)] text-white rounded-lg text-sm font-semibold disabled:opacity-50"
+    >Start Scan</button>
   </div>
 </BottomSheet>
 

@@ -20,6 +20,10 @@
     ($languageFilter.length > 0 ? 1 : 0) +
     $quickFilters.length +
     $resolutionFilter.length +
+    // A hidden category (chip toggled off in either sheet — see the Category
+    // row below) is exactly the kind of narrowing this badge exists to
+    // surface; count it same as the other "narrowed from show-everything" terms above.
+    ($categoryFilter.length < CATEGORY_KEYS.length ? 1 : 0) +
     ($postedAfter || $postedBefore ? 1 : 0)
   );
 

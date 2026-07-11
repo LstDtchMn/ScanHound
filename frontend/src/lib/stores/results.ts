@@ -185,7 +185,7 @@ export const CATEGORY_LABELS: Record<CategoryKey, string> = { '4k': '4K', remux:
  *  two UIs could clobber each other. ScanControls used to mirror this into a
  *  local `flags` $state and write it back out via a $effect; that's gone
  *  now — ScanControls derives its per-source `flags` FROM this store instead
- *  (see ScanControls.svelte's `flagsFor`), so there's exactly one writer. */
+ *  (see `flagsFor` below), so there's exactly one writer. */
 export const categoryFilter = persisted<string[]>('sh-category-filter', [...CATEGORY_KEYS]);
 
 /** Toggle a normalized category key in/out of categoryFilter. The ONLY writer
@@ -194,6 +194,60 @@ export const categoryFilter = persisted<string[]>('sh-category-filter', [...CATE
  *  map their per-source key to its normalized form via normCat first). */
 export function toggleCategoryFilter(key: CategoryKey) {
   categoryFilter.update((c) => (c.includes(key) ? c.filter((x) => x !== key) : [...c, key]));
+}
+
+/** Per-source scan-category definitions for ScanControls' checkboxes/chips.
+ *  Each source's raw keys differ (DDLBase splits "remux" into two separate
+ *  scan sub-targets) but all normalize onto CATEGORY_KEYS via normCat below —
+ *  the mapping that lets the single categoryFilter store above drive every
+ *  source's UI. `default` is each key's pre-single-source-of-truth baseline;
+ *  flagsFor no longer consults it (see its doc comment) but it's kept here as
+ *  per-source metadata this table already carries (alongside `label`). */
+export type ScanSource = 'HDEncode' | 'DDLBase' | 'Adit-HD';
+
+export const sourceCategories: Record<ScanSource, { key: string; label: string; default: boolean }[]> = {
+  'HDEncode': [
+    { key: '4k', label: '4K', default: true },
+    { key: 'remux', label: 'Remux', default: false },
+    { key: 'tv', label: 'TV', default: false }
+  ],
+  'DDLBase': [
+    { key: '4k_webdl', label: '4K', default: true },
+    { key: '4k_remux', label: '4K Remux', default: true },
+    { key: '1080p_remux', label: '1080p Remux', default: true }
+  ],
+  'Adit-HD': [
+    { key: '4k', label: '4K', default: true },
+    { key: 'remux', label: 'Remux', default: false },
+    { key: 'tv', label: 'TV', default: false }
+  ]
+};
+
+/** Map a per-source category key to its normalized CATEGORY_KEYS form. */
+export function normCat(key: string): CategoryKey {
+  if (key === 'tv') return 'tv';
+  return key.includes('remux') ? 'remux' : '4k';
+}
+
+/** Derive a source's scan-toggle flags from categoryFilter — the pure
+ *  projection behind ScanControls' `flags` $derived (and, via handleStart,
+ *  exactly what startScan receives). An explicitly empty categoryFilter means
+ *  "every category is off" — the same thing filteredResults' [] means (see
+ *  its categoryFilter handling above) — and MUST yield all-false here too.
+ *
+ *  A prior version special-cased `filter.length === 0` back to the source's
+ *  `default` flags. That was harmless when `flags` was only seeded once at
+ *  mount, but once it became `$derived(flagsFor(...))` re-running on every
+ *  categoryFilter change, toggling every chip off silently re-enabled the
+ *  source's default categories underneath the user — both in the checkbox UI
+ *  (which then disagreed with the correctly-empty result list) and in what
+ *  handleStart passed to startScan (a scan silently scraping categories the
+ *  user had just turned off). `filter.includes(...)` already evaluates to
+ *  false for every key when filter is `[]`, so no special case is needed at
+ *  all — the one-liner below is correct for every filter state. */
+export function flagsFor(src: ScanSource, filter: string[]): Record<string, boolean> {
+  const cats = sourceCategories[src];
+  return Object.fromEntries(cats.map((c) => [c.key, filter.includes(normCat(c.key))]));
 }
 
 const QUICK_FILTER_LABELS: Record<string, string> = { '4k': '4K', hdrdv: 'HDR/DV', inplex: 'In Plex' };
