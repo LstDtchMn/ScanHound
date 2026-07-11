@@ -190,6 +190,36 @@ class TestDismissedItems:
         # prior_status is cleared so a later real apply can't re-stash a stale value.
         assert not db_manager.get_rename_job(gated).get("prior_status")
 
+    def test_rename_job_conflict_columns_roundtrip(self, db_manager):
+        jid = db_manager.create_rename_job({
+            "original_path": "/src/a.mkv", "status": "needs_review",
+            "conflict_kind": "destination_exists", "conflict_same_size": True,
+        })
+        job = db_manager.get_rename_job(jid)
+        assert job["conflict_kind"] == "destination_exists"
+        assert job["conflict_same_size"] is True  # coerced to bool, not 1
+
+    def test_rename_job_conflict_same_size_false_and_null(self, db_manager):
+        jid_f = db_manager.create_rename_job({
+            "original_path": "/src/b.mkv", "status": "needs_review",
+            "conflict_kind": "destination_exists", "conflict_same_size": False})
+        jid_n = db_manager.create_rename_job({
+            "original_path": "/src/c.mkv", "status": "needs_review"})
+        assert db_manager.get_rename_job(jid_f)["conflict_same_size"] is False
+        j_n = db_manager.get_rename_job(jid_n)
+        assert j_n["conflict_kind"] is None
+        assert j_n["conflict_same_size"] is None
+
+    def test_update_rename_job_clears_conflict_columns(self, db_manager):
+        jid = db_manager.create_rename_job({
+            "original_path": "/src/d.mkv", "status": "needs_review",
+            "conflict_kind": "destination_exists", "conflict_same_size": True})
+        db_manager.update_rename_job(jid, status="applied",
+                                     conflict_kind=None, conflict_same_size=None)
+        job = db_manager.get_rename_job(jid)
+        assert job["conflict_kind"] is None
+        assert job["conflict_same_size"] is None
+
     def test_dismiss_records_title_quality(self, db_manager):
         # Rich tuple (url, title, group_key, resolution, dovi) powers title-level skip.
         db_manager.add_dismissed_items([("http://x/a", "Heat", "heat|1995", "1080p", False)])

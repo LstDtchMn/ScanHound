@@ -582,6 +582,13 @@ class DatabaseManager:
                     'ALTER TABLE downloads ADD COLUMN package_name TEXT',
                     'ALTER TABLE downloads ADD COLUMN last_grabbed_at TIMESTAMP',
                     'ALTER TABLE downloads ADD COLUMN service_type TEXT',
+                    # Structured conflict info for the desktop Renames "file
+                    # already exists" resolution UI — kind of conflict
+                    # detected and whether source/destination are same-size
+                    # (drives the recommended action), instead of stuffing
+                    # this into the free-text warning_message.
+                    'ALTER TABLE rename_jobs ADD COLUMN conflict_kind TEXT',
+                    'ALTER TABLE rename_jobs ADD COLUMN conflict_same_size INTEGER',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -1986,7 +1993,7 @@ class DatabaseManager:
         "match_source", "move_method", "proposed_match", "plex_sort_title",
         "warning_message", "error_message", "processed_at", "reverted_at",
         "suggested_correction", "combined_episode", "split_file", "poster_path",
-        "match_reasons", "prior_status",
+        "match_reasons", "prior_status", "conflict_kind", "conflict_same_size",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.
@@ -2012,6 +2019,8 @@ class DatabaseManager:
                     row[field] = json.loads(raw)
                 except (json.JSONDecodeError, TypeError):
                     row[field] = None
+        if row.get("conflict_same_size") is not None:
+            row["conflict_same_size"] = bool(row["conflict_same_size"])
         return row
 
     def create_rename_job(self, job):
