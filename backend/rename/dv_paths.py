@@ -9,9 +9,22 @@ it stored. normalize_path() collapses both into one comparable string.
 from typing import List, Optional, Tuple
 
 # (drive_root, unc_root) pairs, e.g. ("Y:", r"\\SRV\Share"). Both roots must
-# point at the SAME physical storage. Empty by default — populated from
-# dv_label_vocab/config or the dry-run sampling gate (design §7.4).
-DEFAULT_DV_MAPPINGS: List[Tuple[str, str]] = []
+# point at the SAME physical storage. Populated per the design's §7.4
+# "mandatory de-risk gate": run a dry-run, diff real Plex part.file values
+# against dv_scan.path, and codify the observed drive<->UNC pairs.
+#
+# TurtleLandSRVR's Y: is a persistent SMB mapping to \\TURTLELANDSRV2\4K HDR
+# Geronimo (confirmed via `net use` / Get-SmbMapping on the host) — the
+# dv_library_roots config's three "Y:/Movie N (...)" entries are subfolders of
+# this one share. dovi_tool (host-side) records paths under the Y: drive
+# letter; Plex serves the identical files under the UNC form. Without this
+# entry, a 2026-07-11 dry-run against the 463-file real host-detector import
+# matched only the 92 files whose dv_library_roots entry was ALREADY UNC
+# (//TURTLELANDSRV2/4K Magellan/DV) — all 371 Y:-drive files silently failed
+# to match and would have gotten no label.
+DEFAULT_DV_MAPPINGS: List[Tuple[str, str]] = [
+    (r"Y:", r"\\TURTLELANDSRV2\4K HDR Geronimo"),
+]
 
 
 def _unify(s: str) -> str:

@@ -1,5 +1,5 @@
 import pytest
-from backend.rename.dv_paths import normalize_path, same_target
+from backend.rename.dv_paths import normalize_path, same_target, DEFAULT_DV_MAPPINGS
 
 MAP = [
     (r"Y:", r"\\TURTLELANDSRV2\Share"),
@@ -48,3 +48,18 @@ def test_same_target_guard():
                        r"\\TURTLELANDSRV2\Share\Movies\A\f.mkv", MAP) is True
     assert same_target(r"Y:\Movies\A\f.mkv",
                        r"Z:\Movies\A\f.mkv", MAP) is False
+
+
+def test_default_mappings_resolve_turtlelandsrvr_y_drive():
+    """Regression test for the real 2026-07-11 dry-run gate finding: without
+    this default entry, all Y:-drive host-detector paths (371 of 463 in the
+    real import) silently failed to match Plex's UNC-served paths and would
+    never have gotten a label. Verified against `net use` / Get-SmbMapping on
+    the actual host — Y: is a persistent mapping to
+    \\\\TURTLELANDSRV2\\4K HDR Geronimo, and dv_library_roots' three
+    "Y:/Movie N (...)" entries are subfolders of that one share."""
+    assert same_target(
+        r"Y:\Movie 1 (14TB)\4K DV\28 Years Later (2025).mkv",
+        r"\\TURTLELANDSRV2\4K HDR Geronimo\Movie 1 (14TB)\4K DV\28 Years Later (2025).mkv",
+        DEFAULT_DV_MAPPINGS,
+    ) is True
