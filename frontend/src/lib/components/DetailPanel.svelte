@@ -3,7 +3,7 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import { downloadQueue, activeDownload, downloadHost } from '$lib/stores/downloads';
-  import { results, markDownloaded } from '$lib/stores/results';
+  import { results, markDownloaded, updateResultFromRescan } from '$lib/stores/results';
   import { statusVariant, formatStatus, DOWNLOAD_HOSTS } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
   import { fly } from 'svelte/transition';
@@ -127,6 +127,21 @@
       addToast('Error', e instanceof Error ? e.message : 'Failed to scrape links', 'error');
     } finally {
       copyingLinks = false;
+    }
+  }
+
+  let rescanning = $state(false);
+  async function rescanItem() {
+    if (!item.url || rescanning) return;
+    rescanning = true;
+    try {
+      const { item: fresh } = await api.rescanItem(item.url);
+      updateResultFromRescan(item.url, fresh);
+      addToast('Rescanned', `Refreshed metadata for ${fresh.title || item.title}`);
+    } catch (e) {
+      addToast('Error', e instanceof Error ? e.message : 'Rescan failed', 'error');
+    } finally {
+      rescanning = false;
     }
   }
 
@@ -400,6 +415,15 @@
             class="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors disabled:opacity-50"
           >
             {copyingLinks ? 'Copying…' : 'Copy Links'}
+          </button>
+          <button
+            onclick={rescanItem}
+            disabled={rescanning}
+            aria-label="Rescan this item"
+            title="Re-fetch this page and refresh its poster/rating/genres"
+            class="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors disabled:opacity-50"
+          >
+            {rescanning ? 'Rescanning…' : 'Rescan'}
           </button>
           <button
             onclick={copyUrl}

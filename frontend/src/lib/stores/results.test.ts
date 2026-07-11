@@ -44,6 +44,7 @@ const {
   dismissItem,
   restoreItem,
   markGrabbedSiblings,
+  updateResultFromRescan,
   stats,
   filteredTotal,
   pagedMode,
@@ -433,6 +434,30 @@ describe('markGrabbedSiblings', () => {
     expect(hi.status).toBe('missing');       // higher res stays grabbable
     expect(hi.prior_grab).toBeTruthy();       // but annotated with what you have
     expect(get(stats).missing).toBe(3);       // unchanged
+  });
+});
+
+describe('updateResultFromRescan', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('merges the patch into the matching item by url', () => {
+    results.set([
+      item({ url: 'https://x/1', title: 'Old', imdb_id: null, poster_url: '', rating: 0 }),
+      item({ url: 'https://x/2', title: 'Other' })
+    ]);
+    updateResultFromRescan('https://x/1', { title: 'New', imdb_id: 'tt0064519', rating: 6.3 });
+    const items = get(results);
+    expect(items[0]).toMatchObject({ url: 'https://x/1', title: 'New', imdb_id: 'tt0064519', rating: 6.3 });
+    expect(items[1]).toMatchObject({ url: 'https://x/2', title: 'Other' });
+  });
+
+  it('no-ops when the url is not present', () => {
+    results.set([item({ url: 'https://x/1', title: 'Old' })]);
+    updateResultFromRescan('https://x/999', { title: 'New' });
+    expect(get(results)[0].title).toBe('Old');
   });
 });
 

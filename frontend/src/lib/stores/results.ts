@@ -1038,6 +1038,16 @@ export function markDownloaded(urls: Array<string | undefined | null>) {
   }
 }
 
+/** Merge a rescanned item's fresh fields (poster/rating/genres/imdb_id/etc.)
+ *  into the matching row by url, in place — no-op if the url isn't present
+ *  (e.g. it scrolled out of a paged view since the rescan started). */
+export function updateResultFromRescan(url: string, patch: Partial<ScanResult>) {
+  if (!url) return;
+  results.update((items) =>
+    items.map((it) => (it.url === url ? { ...it, ...patch } : it))
+  );
+}
+
 /** After a grab, optimistically tag the OTHER releases in the same group with a
  *  "grabbed similar" note showing the grabbed specs — so siblings update the
  *  instant the grab lands, before the backend cache re-match persists it. The
