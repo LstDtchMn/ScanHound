@@ -15,6 +15,7 @@ export const changelog: ChangelogEntry[] = [
       "Redesigned the \"already in the library\" conflict row on the Renames page: instead of a long, cut-off line with raw byte counts, it now shows a compact badge plus a GB size chip — \"same size · 13.4 GB\" for a likely duplicate, or \"22.1 GB → 28.7 GB\" when the incoming file differs — with the full comparison one click away on Compare.",
       "Mobile: the Remux category is now selectable from the \"View & filters\" sheet (previously it was buried in the scan-options menu, so the phone only showed a look-alike resolution filter). The empty-state hint now names which filters are hiding items, \"Clear filters\" also resets the category, and a scan can't be started with every category turned off.",
       "Renames: an item being applied no longer vanishes from a filtered tab mid-move — it stays visible with its progress bar while the rename/move runs, then settles into Applied when done.",
+      "Renames: a bulk apply can now be stopped. A Stop button on the progress bar halts the queue gracefully — the file currently moving finishes cleanly, and the rest go back to Matched so you can resume later. Apply buttons are disabled while an apply is already running.",
     ],
   },
   {
