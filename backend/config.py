@@ -126,6 +126,7 @@ class AppConfig(TypedDict, total=False):
     auto_rename_template_movie: str
     auto_rename_template_tv: str
     auto_rename_plex_sort_titles: bool
+    auto_rename_movie_flat: bool
     auto_rename_llm_enabled: bool
     ollama_base_url: str
     ollama_model: str
@@ -469,6 +470,7 @@ _DEFAULT_CONFIG: AppConfig = {
     "auto_rename_template_movie": "",
     "auto_rename_template_tv": "",
     "auto_rename_plex_sort_titles": False,
+    "auto_rename_movie_flat": False,
     "auto_rename_llm_enabled": False,
     "ollama_base_url": "http://ollama:11434",
     "ollama_model": "",

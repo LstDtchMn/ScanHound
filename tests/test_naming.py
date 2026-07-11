@@ -126,3 +126,43 @@ class TestRenderTemplateOverCollapse:
         out = render_template("{{title}} - {{episode_title}}",
                                {"title": "Show", "episode_title": "Pilot"})
         assert out == "Show - Pilot"
+
+
+# ── Flat movie folders (opt-in): single-file movies land in library root ──
+
+def test_flat_single_movie_goes_to_library_root():
+    meta = {"media_type": "movie", "title": "Sinners", "year": 2025,
+            "resolution": "1080p", "original_filename": "Sinners.2025.1080p.mkv"}
+    fname, dest = build_target(meta, movie_root="/lib/movies", tv_root="/lib/tv", flat=True)
+    assert dest == "/lib/movies"
+    assert fname == "Sinners (2025) [1080p].mkv"
+
+
+def test_flat_split_movie_keeps_subfolder():
+    # NOTE: the default (non-template) movie filename branch does not append
+    # a "- Part N" suffix for a truthy `part` (unlike the TV and
+    # custom-template branches, which do) — that's a pre-existing gap in
+    # naming.py, out of scope for this flat-folder task (destination-only
+    # change). This test asserts what Task 1 actually guarantees: a split
+    # movie keeps its own subfolder even with flat=True.
+    meta = {"media_type": "movie", "title": "Sinners", "year": 2025,
+            "resolution": "1080p", "part": 2, "original_filename": "Sinners.2025.CD2.mkv"}
+    fname, dest = build_target(meta, movie_root="/lib/movies", tv_root="/lib/tv", flat=True)
+    import os
+    assert dest == os.path.join("/lib/movies", "Sinners (2025)")
+
+
+def test_flat_off_movie_keeps_subfolder():
+    meta = {"media_type": "movie", "title": "Sinners", "year": 2025,
+            "resolution": "1080p", "original_filename": "Sinners.2025.1080p.mkv"}
+    import os
+    fname, dest = build_target(meta, movie_root="/lib/movies", tv_root="/lib/tv")  # flat defaults False
+    assert dest == os.path.join("/lib/movies", "Sinners (2025)")
+
+
+def test_flat_does_not_affect_tv():
+    meta = {"media_type": "tv", "title": "Severance", "year": 2022, "season": 2,
+            "episode": 1, "original_filename": "Severance.S02E01.mkv"}
+    import os
+    fname, dest = build_target(meta, movie_root="/lib/movies", tv_root="/lib/tv", flat=True)
+    assert dest == os.path.join("/lib/tv", "Severance (2022)", "Season 02")

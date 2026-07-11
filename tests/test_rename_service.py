@@ -104,6 +104,20 @@ class TestProcessPackage:
         assert job["match_confidence"] >= 70
         assert job["new_filename"] == "The Matrix (1999) [1080p].mkv"
 
+    def test_flat_movie_routes_to_library_root(self, db, tmp_path):
+        """auto_rename_movie_flat=True: a matched single-file movie's computed
+        destination is the movie library root itself, not a Title (Year)
+        subfolder (Task 1 of the flat-movie-folders feature)."""
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.BluRay.x264.mkv")
+        lib = str(tmp_path / "lib")
+        ids = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_movie_flat=True).process_package("pkg-flat", save_to)
+        assert len(ids) == 1
+        job = db.get_rename_job(ids[0])
+        assert job["status"] == "matched"
+        assert job["new_filename"] == "The Matrix (1999) [1080p].mkv"
+        assert job["destination_path"] == lib
+
     def test_low_confidence_needs_review(self, db, tmp_path):
         save_to, _ = _extracted(tmp_path, "Some.Obscure.Thing.2022.1080p.mkv")
         ids = _service(db, _weak_search).process_package("pkg2", save_to)

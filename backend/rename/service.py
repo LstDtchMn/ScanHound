@@ -736,7 +736,8 @@ class RenameService:
                         {**match, "original_filename": filename},
                         movie_root=self._movie_root(match.get("resolution")),
                         tv_root=self._cfg.get("auto_rename_tv_library", ""),
-                        template=self._template_for(match.get("media_type")))
+                        template=self._template_for(match.get("media_type")),
+                        flat=self._cfg.get("auto_rename_movie_flat", False))
                     entry["new_filename"] = fname
                 except Exception:
                     logger.exception("preview: build_target failed for %s", filename)
@@ -1190,7 +1191,8 @@ class RenameService:
             {**match, "original_filename": filename},
             movie_root=self._movie_root(match.get("resolution")),
             tv_root=self._cfg.get("auto_rename_tv_library", ""),
-            template=self._template_for(match.get("media_type")))
+            template=self._template_for(match.get("media_type")),
+            flat=self._cfg.get("auto_rename_movie_flat", False))
         conf = match.get("confidence") or 0.0
         job.update(
             media_type=match.get("media_type"), title=match.get("title"),
@@ -1615,7 +1617,8 @@ class RenameService:
         fname, dest = _naming.build_target(
             meta, movie_root=self._movie_root(job.get("resolution")),
             tv_root=self._cfg.get("auto_rename_tv_library", ""),
-            template=self._template_for(mtype))
+            template=self._template_for(mtype),
+            flat=self._cfg.get("auto_rename_movie_flat", False))
         db.update_rename_job(job_id, title=title, year=year, tmdb_id=int(tmdb_id),
                              media_type=mtype, season=sea, episode=epi,
                              poster_path=poster_path, new_filename=fname,
@@ -1662,7 +1665,8 @@ class RenameService:
             fname, dest = _naming.build_target(
                 meta, movie_root=self._movie_root(job.get("resolution")),
                 tv_root=self._cfg.get("auto_rename_tv_library", ""),
-                template=self._template_for(mtype))
+                template=self._template_for(mtype),
+                flat=self._cfg.get("auto_rename_movie_flat", False))
         except Exception:
             return {"new_filename": None, "destination_path": None,
                     "library_configured": False,
@@ -2091,11 +2095,13 @@ class RenameService:
         if mtype == "tv":
             fname, dest = _naming.build_target(
                 meta, tv_root=root, movie_root=self._movie_root(job.get("resolution")),
-                template=self._template_for(mtype))
+                template=self._template_for(mtype),
+                flat=self._cfg.get("auto_rename_movie_flat", False))
         else:
             fname, dest = _naming.build_target(
                 meta, movie_root=root, tv_root=self._cfg.get("auto_rename_tv_library", ""),
-                template=self._template_for(mtype))
+                template=self._template_for(mtype),
+                flat=self._cfg.get("auto_rename_movie_flat", False))
         db.update_rename_job(job_id, new_filename=fname, destination_path=dest,
                              status="matched", warning_message=None,
                              conflict_kind=None, conflict_same_size=None,
@@ -2191,7 +2197,8 @@ class RenameService:
             meta,
             movie_root=self._movie_root(meta.get("resolution")),
             tv_root=self._cfg.get("auto_rename_tv_library", ""),
-            template=self._template_for("tv"))
+            template=self._template_for("tv"),
+            flat=self._cfg.get("auto_rename_movie_flat", False))
         db.update_rename_job(
             job_id,
             season=meta["season"], episode=meta["episode"],

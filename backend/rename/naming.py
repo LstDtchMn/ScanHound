@@ -145,17 +145,22 @@ def _tokens(meta: dict) -> dict:
     }
 
 
-def _destination(meta, *, movie_root, tv_root, title, year) -> str:
+def _destination(meta, *, movie_root, tv_root, title, year, flat=False) -> str:
     if meta.get("media_type") == "tv":
         show = f"{title} ({year})" if year else title
         season = int(meta.get("season") or 1)
         return os.path.join(tv_root, show, f"Season {season:02d}")
+    # Flat movie placement (opt-in): a single-file movie goes straight into the
+    # library root. A split/multi-file movie (truthy `part`) keeps its own
+    # folder so the parts stay grouped.
+    if flat and not meta.get("part"):
+        return movie_root
     folder = f"{title} ({year})" if year else title
     return os.path.join(movie_root, folder)
 
 
 def build_target(meta: dict, *, movie_root: str = "", tv_root: str = "",
-                 template: Optional[str] = None) -> tuple[str, str]:
+                 template: Optional[str] = None, flat: bool = False) -> tuple[str, str]:
     """Return ``(new_filename, destination_dir)`` for a media item, Plex-style.
 
     ``meta`` keys: media_type ('movie'|'tv'), title, year, season, episode,
@@ -199,5 +204,5 @@ def build_target(meta: dict, *, movie_root: str = "", tv_root: str = "",
         folder = f"{title} ({year})" if year else title
         fname = (f"{folder} [{resolution}]" if resolution else folder) + ext
 
-    dest = _destination(meta, movie_root=movie_root, tv_root=tv_root, title=title, year=year)
+    dest = _destination(meta, movie_root=movie_root, tv_root=tv_root, title=title, year=year, flat=flat)
     return fname, dest
