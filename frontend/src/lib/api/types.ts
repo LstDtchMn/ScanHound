@@ -117,6 +117,8 @@ export interface RenameJob {
   // (Task 2). Prefer this over string-sniffing warning_message.
   conflict_kind?: 'destination_exists' | null;
   conflict_same_size?: boolean | null;
+  conflict_existing_size?: number | null;
+  conflict_incoming_size?: number | null;
   // Within a duplicate group, the best-quality release to keep (with a short
   // reason like "2160p · Dolby Vision · Remux"). Computed server-side.
   keep_recommended?: boolean;

@@ -4,6 +4,7 @@
   import Badge from '$lib/components/Badge.svelte';
   import { selectedJobIds, toggleSelect, applyJob, renameProgress } from '$lib/stores/renames';
   import { hasDestinationConflict } from '$lib/renames/review';
+  import { formatBytes } from '$lib/renames/conflictView';
   import type { RenameJob } from '$lib/api/types';
 
   let {
@@ -66,12 +67,15 @@
         {job.error_message}
       </div>
     {:else if isConflict}
-      <div class="flex items-center gap-1.5 text-xs">
-        <Badge variant="warning" label="⚠ Conflict" />
-        {#if job.conflict_same_size}
-          <Badge variant="default" label="likely duplicate" />
+      <div class="flex items-center gap-1.5 text-xs" title={job.warning_message}>
+        <Badge variant="warning" label="⚠ Already in library" />
+        {#if job.conflict_existing_size != null && job.conflict_incoming_size != null}
+          {#if job.conflict_same_size === true}
+            <Badge variant="accent" label={`same size · ${formatBytes(job.conflict_existing_size)}`} />
+          {:else}
+            <Badge variant="default" label={`${formatBytes(job.conflict_existing_size)} → ${formatBytes(job.conflict_incoming_size)}`} />
+          {/if}
         {/if}
-        <span class="text-[var(--text-secondary)] truncate" title={job.warning_message}>{job.warning_message}</span>
         <button
           type="button"
           class="ml-auto shrink-0 px-2 py-0.5 rounded text-[11px] font-medium bg-[var(--accent)] text-white hover:brightness-110"
