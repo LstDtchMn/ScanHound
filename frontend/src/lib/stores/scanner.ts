@@ -2,6 +2,7 @@ import { writable } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { connection } from './connection';
 import { addToast } from './notifications';
+import { clearResults, type ScanSource } from '$lib/stores/results';
 
 export type ScanState = 'idle' | 'running' | 'stopping';
 export type ScanType = 'deep' | 'incremental' | 'loaded' | 'search';
@@ -10,6 +11,12 @@ export const scanState = writable<ScanState>('idle');
 export const scanProgress = writable<number>(0);
 export const scanPhase = writable<string>('');
 export const scanItemCount = writable<number>(0);
+
+/** The scan source currently selected in the toolbar (ScanControls) — lifted
+ *  out of that component so other UI (the empty-state search fallback) can
+ *  read "what source would a scan run against right now" without a prop
+ *  drill. ScanControls reads/writes this instead of local state. */
+export const selectedScanSource = writable<ScanSource>('HDEncode');
 
 connection.on('scan:progress', (data) => {
   scanProgress.set(data.progress as number);
@@ -79,6 +86,15 @@ export async function startScan(
     scanPhase.set('');
     addToast('Scan Error', e instanceof Error ? e.message : 'Failed to start scan', 'error');
   }
+}
+
+/** Run a live Site Search for `query` against `source`, replacing the
+ *  current browse view — the same action as manually switching ScanControls
+ *  to "Site Search" mode and hitting Scan. Flags are irrelevant for Site
+ *  Search (the backend's _build_sources never reads them for that mode). */
+export function searchThisSite(query: string, source: ScanSource) {
+  clearResults();
+  startScan('search', query, 1, source);
 }
 
 export async function stopScan() {

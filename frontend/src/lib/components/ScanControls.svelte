@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { scanState, scanProgress, scanPhase, scanItemCount, startScan, stopScan } from '$lib/stores/scanner';
+  import { scanState, scanProgress, scanPhase, scanItemCount, startScan, stopScan, selectedScanSource } from '$lib/stores/scanner';
   import type { ScanType } from '$lib/stores/scanner';
   import { clearResults, categoryFilter, toggleCategoryFilter, sourceCategories, normCat, flagsFor, type ScanSource, mobileChromeCollapsed } from '$lib/stores/results';
   import BottomSheet from './BottomSheet.svelte';
@@ -16,7 +16,6 @@
   type Source = ScanSource;
 
   let selectedType = $state<ScanType>('deep');
-  let selectedSource = $state<Source>('HDEncode');
   let query = $state('');
   let pages = $state(1);
 
@@ -35,13 +34,13 @@
   // both 4k_remux AND 1080p_remux turning on together, since categoryFilter
   // only ever tracks the normalized 'remux' category, not per-source
   // sub-keys — a deliberate simplification, see the commit message).
-  let flags = $derived(flagsFor(selectedSource, $categoryFilter));
+  let flags = $derived(flagsFor($selectedScanSource, $categoryFilter));
 
   function onSourceChange(src: Source) {
-    selectedSource = src;
+    selectedScanSource.set(src);
   }
 
-  let categories = $derived(sourceCategories[selectedSource]);
+  let categories = $derived(sourceCategories[$selectedScanSource]);
   let hasInteracted = $state(false);
 
   let scanTypeLabel = $derived(scanTypes.find((t) => t.value === selectedType)?.label ?? 'Scan');
@@ -61,7 +60,7 @@
   function handleStart() {
     hasInteracted = true;
     clearResults();
-    startScan(selectedType, query, pages, selectedSource, flags);
+    startScan(selectedType, query, pages, $selectedScanSource, flags);
   }
 
   function mobileStart() {
@@ -89,7 +88,7 @@
 
   {#if selectedType !== 'search'}
     <select
-      value={selectedSource}
+      value={$selectedScanSource}
       onchange={(e) => onSourceChange(e.currentTarget.value as Source)}
       disabled={$scanState !== 'idle'}
       class="bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-2 py-1 rounded border border-[var(--border)] text-xs focus:outline-none focus:border-[var(--accent)]"
@@ -190,7 +189,7 @@
       aria-label="Scan options"
       class="flex-1 min-w-0 flex items-center gap-2 px-3 py-2 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-sm text-[var(--text-primary)]"
     >
-      <span class="truncate">{scanTypeLabel}{#if selectedType !== 'search'} · {selectedSource}{/if}</span>
+      <span class="truncate">{scanTypeLabel}{#if selectedType !== 'search'} · {$selectedScanSource}{/if}</span>
       <svg class="w-4 h-4 ml-auto shrink-0 text-[var(--text-secondary)]" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
     </button>
     <button
@@ -230,7 +229,7 @@
     {#if selectedType !== 'search'}
       <div>
         <label for="sc-source" class="text-xs font-medium text-[var(--text-secondary)] mb-1.5 block">Source</label>
-        <select id="sc-source" value={selectedSource} onchange={(e) => onSourceChange(e.currentTarget.value as Source)} class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm">
+        <select id="sc-source" value={$selectedScanSource} onchange={(e) => onSourceChange(e.currentTarget.value as Source)} class="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] px-3 py-2.5 rounded-lg border border-[var(--border)] text-sm">
           <option value="HDEncode">HDEncode</option>
           <option value="DDLBase">DDLBase</option>
           <option value="Adit-HD">Adit-HD</option>
