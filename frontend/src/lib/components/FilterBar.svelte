@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, resolutionFilter, toggleResolutionFilter, RESOLUTION_KEYS, tileSize, posterAspect, tileShowMeta, gridGap, gridColumns, GRID_COLUMN_CHOICES, postedAfter, postedBefore, pagedMode, filteredTotal, mobileChromeCollapsed, type TileSize, type PosterAspect, type GridGap } from '$lib/stores/results';
+  import { statusFilter, searchFilter, genreFilter, languageFilter, toggleGenreFilter, toggleLanguageFilter, viewMode, setViewMode, stats, selectedKeys, selectAll, deselectAll, filteredResults, sortBy, availableGenres, availableLanguages, density, quickFilters, toggleQuickFilter, resolutionFilter, toggleResolutionFilter, RESOLUTION_KEYS, categoryFilter, toggleCategoryFilter, CATEGORY_KEYS, CATEGORY_LABELS, tileSize, posterAspect, tileShowMeta, gridGap, gridColumns, GRID_COLUMN_CHOICES, postedAfter, postedBefore, pagedMode, filteredTotal, mobileChromeCollapsed, type TileSize, type PosterAspect, type GridGap } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -545,6 +545,27 @@
             class="px-3 py-1.5 rounded-full text-sm border transition-colors
               {$quickFilters.includes(chip.key) ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
           >{chip.label}</button>
+        {/each}
+      </div>
+    </div>
+
+    <!-- Category filter (4K / Remux / TV) — the SAME categoryFilter store
+         ScanControls' Scan-options sheet chips write to (via
+         toggleCategoryFilter, results.ts' single writer for this store — see
+         its doc comment). Surfaced here too since this sheet is where users
+         look for it on mobile: the always-visible row above only shows the
+         near-identical *resolution* facet (4K/1080p/TV), and Scan options is
+         about what to SCAN next, not what's currently shown. -->
+    <div>
+      <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Category</p>
+      <div class="flex flex-wrap gap-2">
+        {#each CATEGORY_KEYS as key}
+          <button
+            onclick={() => toggleCategoryFilter(key)}
+            aria-pressed={$categoryFilter.includes(key)}
+            class="px-3 py-1.5 rounded-full text-sm border transition-colors
+              {$categoryFilter.includes(key) ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
+          >{CATEGORY_LABELS[key]}</button>
         {/each}
       </div>
     </div>

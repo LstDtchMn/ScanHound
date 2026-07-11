@@ -9,7 +9,7 @@
   import ResultActionSheet from '$lib/components/ResultActionSheet.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
   import SwipeDeck from '$lib/components/SwipeDeck.svelte';
-  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS, loadResults, hasMore, loadingMore, loadError, filteredTotal, titleCounts, pagedMode, statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy, hiddenByFiltersCount, clearAllFilters, isResultsViewEmpty } from '$lib/stores/results';
+  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS, loadResults, hasMore, loadingMore, loadError, filteredTotal, titleCounts, pagedMode, statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy, hiddenByFiltersCount, clearAllFilters, isResultsViewEmpty, activeNarrowingFilters } from '$lib/stores/results';
   import { mobile } from '$lib/stores/media';
   import { addToast } from '$lib/stores/notifications';
   import { get } from 'svelte/store';
@@ -590,9 +590,17 @@
                what's hiding them, not an empty library. See resolutionFilter's
                history (frontend/src/lib/stores/results.ts) for why this matters:
                a filter that quietly narrows content and outlives the session
-               (or is just easy to forget about) can silently zero out a tab. -->
+               (or is just easy to forget about) can silently zero out a tab.
+               activeNarrowingFilters names WHICH filter(s), falling back to
+               the old generic guess if it's somehow empty. -->
           <p class="text-sm text-[var(--text-secondary)]">0 shown &mdash; {$hiddenByFiltersCount} hidden by filters</p>
-          <p class="text-xs text-[var(--text-secondary)] opacity-60">Your resolution, genre, language, date, or search filter is hiding every matching item.</p>
+          <p class="text-xs text-[var(--text-secondary)] opacity-60">
+            {#if $activeNarrowingFilters.length > 0}
+              Hidden by: {$activeNarrowingFilters.join(', ')}
+            {:else}
+              Your resolution, genre, language, date, or search filter is hiding every matching item.
+            {/if}
+          </p>
           <button
             onclick={() => clearAllFilters()}
             class="px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-[var(--accent)] hover:opacity-90 transition-opacity"

@@ -74,10 +74,18 @@ export const postedBefore = writable<string>('');
 
 /** Reset every content-narrowing filter that can silently hide items with no
  *  obvious indicator — the escape hatch for the empty-state self-diagnosis
- *  (see hiddenByFiltersCount below). Deliberately excludes statusFilter/
- *  quickFilters/categoryFilter: those are coarse view toggles the user just
- *  set on purpose (their state is visibly reflected in pressed tabs/chips),
- *  not the "narrowed once, forgot about it" trap this exists to escape. */
+ *  (see hiddenByFiltersCount below) and the swipe deck's "hidden by your
+ *  filters" hint. Deliberately excludes statusFilter/quickFilters: those are
+ *  coarse view toggles the user just set on purpose, and stay visibly
+ *  reflected in pressed tabs/chips in every view that can hide items because
+ *  of them. categoryFilter used to be excluded for the same reason (a
+ *  deliberate toggle, visible in ScanControls' chips) — but it's reset here
+ *  now, because its chips live inside the Scan-options sheet or the FilterBar
+ *  Category row, neither of which is visible from the full-screen swipe deck.
+ *  A narrowed categoryFilter with no on-screen indicator is exactly the
+ *  "narrowed once, forgot about it" trap this function exists to escape, so
+ *  it's treated like resolution/genre/etc. now rather than like
+ *  statusFilter/quickFilters. */
 export function clearAllFilters() {
   resolutionFilter.set([]);
   genreFilter.set([]);
@@ -85,6 +93,7 @@ export function clearAllFilters() {
   postedAfter.set('');
   postedBefore.set('');
   searchFilter.set('');
+  categoryFilter.set([...CATEGORY_KEYS]);
 }
 
 export const viewMode = persisted<ViewMode>('sh-view-mode', 'grid');
@@ -158,10 +167,74 @@ export function toggleQuickFilter(key: string) {
   quickFilters.update((q) => (q.includes(key) ? q.filter((k) => k !== key) : [...q, key]));
 }
 
-/** Source categories ('4k' | 'remux' | 'tv') currently shown in the list — driven
- *  by the ScanControls 4K/Remux/TV toggles so they filter the (pre-cached) results
- *  instantly. Items with an unknown/empty category always show. */
-export const categoryFilter = persisted<string[]>('sh-category-filter', ['4k', 'remux', 'tv']);
+/** The 3 normalized source-category keys, and the "show everything" value for
+ *  categoryFilter below (used both as its persisted default and as
+ *  clearAllFilters' reset target). */
+export const CATEGORY_KEYS = ['4k', 'remux', 'tv'] as const;
+export type CategoryKey = (typeof CATEGORY_KEYS)[number];
+export const CATEGORY_LABELS: Record<CategoryKey, string> = { '4k': '4K', remux: 'Remux', tv: 'TV' };
+
+/** Source categories ('4k' | 'remux' | 'tv') currently shown in the list —
+ *  filters the (pre-cached) results instantly. Items with an unknown/empty
+ *  category always show.
+ *
+ *  Single source of truth for the category filter: both ScanControls' 4K/
+ *  Remux/TV chips (desktop inline row + mobile Scan-options sheet) and
+ *  FilterBar's mobile Category row write here directly via
+ *  toggleCategoryFilter below — nothing else may write this store, or the
+ *  two UIs could clobber each other. ScanControls used to mirror this into a
+ *  local `flags` $state and write it back out via a $effect; that's gone
+ *  now — ScanControls derives its per-source `flags` FROM this store instead
+ *  (see ScanControls.svelte's `flagsFor`), so there's exactly one writer. */
+export const categoryFilter = persisted<string[]>('sh-category-filter', [...CATEGORY_KEYS]);
+
+/** Toggle a normalized category key in/out of categoryFilter. The ONLY writer
+ *  of categoryFilter (see its doc comment above) — called directly by
+ *  FilterBar's Category chips, and by ScanControls' category chips (which
+ *  map their per-source key to its normalized form via normCat first). */
+export function toggleCategoryFilter(key: CategoryKey) {
+  categoryFilter.update((c) => (c.includes(key) ? c.filter((x) => x !== key) : [...c, key]));
+}
+
+const QUICK_FILTER_LABELS: Record<string, string> = { '4k': '4K', hdrdv: 'HDR/DV', inplex: 'In Plex' };
+
+/** Join short lists as-is; summarize longer ones as a count, so a filter with
+ *  many active selections (e.g. 8 genres) still renders as one short phrase. */
+function joinOrCount(values: string[], noun: string): string {
+  return values.length <= 3 ? values.join(', ') : `${values.length} ${noun}s`;
+}
+
+/** Short, human-readable list of the filters actively narrowing the current
+ *  view (i.e. away from their "show everything" default) — e.g. ["Remux, TV
+ *  hidden (category)", "1080p (resolution)"]. Powers the "Hidden by: ..."
+ *  hint in the swipe deck's "All caught up" state and the list views'
+ *  self-diagnosing empty state (see hiddenByFiltersCount below), so a user
+ *  who can't see the category chips right now — the full-screen deck shows
+ *  none — can still tell WHAT is hiding items, instead of a generic guess.
+ *  Pure/derived so every caller reads the same list and it's directly
+ *  unit-testable. Roughly mirrors clearAllFilters' set of resettable
+ *  filters, plus quickFilters — which that function deliberately leaves
+ *  alone (visibly reflected in its own pressed chips) but which can still
+ *  legitimately be the reason nothing shows, so it's worth naming here. */
+export const activeNarrowingFilters = derived(
+  [categoryFilter, resolutionFilter, genreFilter, languageFilter, quickFilters, postedAfter, postedBefore, searchFilter],
+  ([$category, $resolution, $genre, $language, $quick, $postedAfter, $postedBefore, $search]) => {
+    const parts: string[] = [];
+    const off = CATEGORY_KEYS.filter((k) => !$category.includes(k));
+    if (off.length > 0) {
+      parts.push(`${off.map((k) => CATEGORY_LABELS[k]).join(', ')} hidden (category)`);
+    }
+    if ($resolution.length > 0) parts.push(`${joinOrCount($resolution, 'resolution')} (resolution)`);
+    if ($genre.length > 0) parts.push(`${joinOrCount($genre, 'genre')} (genre)`);
+    if ($language.length > 0) parts.push(`${joinOrCount($language, 'language')} (language)`);
+    if ($quick.length > 0) {
+      parts.push(`${joinOrCount($quick.map((k) => QUICK_FILTER_LABELS[k] ?? k), 'quick filter')} (quick filter)`);
+    }
+    if ($postedAfter || $postedBefore) parts.push('date range');
+    if ($search) parts.push('search text');
+    return parts;
+  }
+);
 
 export const selectedKeys = writable<Set<string>>(new Set());
 
@@ -530,7 +603,7 @@ export const filteredResults = derived(
     // (the old cache only held 4K movies). An item shows only when its category
     // is enabled.
     {
-      const known = new Set(['4k', 'remux', 'tv']);
+      const known = new Set<string>(CATEGORY_KEYS);
       const enabled = new Set($category);
       const effCategory = (i: ScanResult) => i.category || (i.season != null ? 'tv' : '4k');
       // Known categories obey the toggles; anything else (e.g. explicit Site

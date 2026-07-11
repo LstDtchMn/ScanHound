@@ -3,7 +3,8 @@
   import {
     filteredResults, filteredTotal, titleCounts, pagedMode, hasMore, loadingMore,
     loadResults, handleReconnectSnapshot, phoneColumns, mobileChromeCollapsed,
-    dismissItem, restoreItem, hiddenByFiltersCount, clearAllFilters, isResultsViewEmpty
+    dismissItem, restoreItem, hiddenByFiltersCount, clearAllFilters, isResultsViewEmpty,
+    activeNarrowingFilters
   } from '$lib/stores/results';
   import { scanState } from '$lib/stores/scanner';
   import { onMount } from 'svelte';
@@ -144,9 +145,13 @@
   {#if isResultsViewEmpty($pagedMode, $filteredResults.length, $filteredTotal) && $scanState === 'idle'}
     {#if $hiddenByFiltersCount > 0}
       <!-- Self-diagnosis: matches exist for this tab, filters are hiding them
-           all — see hiddenByFiltersCount / clearAllFilters (results.ts). -->
+           all — see hiddenByFiltersCount / clearAllFilters (results.ts).
+           activeNarrowingFilters names WHICH filter(s) below. -->
       <div class="flex flex-col items-center gap-2 py-10 px-6 text-center">
         <p class="text-sm text-[var(--text-secondary)]">0 shown &mdash; {$hiddenByFiltersCount} hidden by filters</p>
+        {#if $activeNarrowingFilters.length > 0}
+          <p class="text-xs text-[var(--text-secondary)] opacity-60">Hidden by: {$activeNarrowingFilters.join(', ')}</p>
+        {/if}
         <button
           onclick={() => clearAllFilters()}
           class="px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-[var(--accent)] hover:opacity-90 transition-opacity"

@@ -2,7 +2,7 @@
   import {
     deckGroups, results, selectedKeys, selectedDetail,
     dismissItem, restoreItem, toggleSelect, deselectAll,
-    deckNeedsMore, loadResults, hiddenByFiltersCount, clearAllFilters
+    deckNeedsMore, loadResults, hiddenByFiltersCount, clearAllFilters, activeNarrowingFilters
   } from '$lib/stores/results';
   import { downloadHost } from '$lib/stores/downloads';
   import { api } from '$lib/api/client';
@@ -340,8 +340,14 @@
                layers additional actionable-only/already-selected exclusion
                on top of filteredResults, so an exact count here would often
                be wrong — this is just a boolean-ish hint + the same escape
-               hatch. -->
-          <p class="text-xs text-[var(--text-secondary)] opacity-70">Some items may be hidden by your filters.</p>
+               hatch. activeNarrowingFilters names WHICH filter(s) are set
+               (falling back to the old generic wording if it's ever empty —
+               shouldn't happen since hiddenByFiltersCount > 0 implies some
+               content filter is active, but the two are computed
+               independently, so don't assume). -->
+          <p class="text-xs text-[var(--text-secondary)] opacity-70">
+            {$activeNarrowingFilters.length > 0 ? `Hidden by: ${$activeNarrowingFilters.join(', ')}` : 'Some items may be hidden by your filters.'}
+          </p>
           <button
             onclick={() => clearAllFilters()}
             class="px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-[var(--accent)] hover:opacity-90 transition-opacity"

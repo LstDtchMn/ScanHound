@@ -50,6 +50,10 @@ const {
   postedAfter,
   postedBefore,
   resolutionFilter,
+  categoryFilter,
+  toggleCategoryFilter,
+  activeNarrowingFilters,
+  CATEGORY_KEYS,
   computeStatusCounts,
   filteredStats,
   hiddenByFiltersCount,
@@ -104,6 +108,7 @@ function resetStores() {
   resolutionFilter.set([]);
   postedAfter.set('');
   postedBefore.set('');
+  categoryFilter.set([...CATEGORY_KEYS]);
   // These suites exercise the legacy client-side filter+sort pipeline
   // directly; paged mode (server-side filtering) is covered separately below.
   pagedMode.set(false);
@@ -1350,5 +1355,126 @@ describe('isResultsViewEmpty (empty-state gate) survives a paged-mode -> live-mo
 
   it('paged mode with filteredTotal > 0 but no rows loaded yet: gate stays "not empty" (avoids a premature flash)', () => {
     expect(isResultsViewEmpty(true, 0, 340)).toBe(false);
+  });
+});
+
+describe('toggleCategoryFilter', () => {
+  // Regression coverage for the mobile "can't find Remux" fix: categoryFilter
+  // is now written from two places (ScanControls' chips AND FilterBar's
+  // Category row), both exclusively through this function — see its doc
+  // comment in results.ts for why that matters (single writer, no clobber).
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('removes a key that is present', () => {
+    categoryFilter.set(['4k', 'remux', 'tv']);
+    toggleCategoryFilter('remux');
+    expect(get(categoryFilter).sort()).toEqual(['4k', 'tv']);
+  });
+
+  it('adds a key that is absent', () => {
+    categoryFilter.set(['4k']);
+    toggleCategoryFilter('remux');
+    expect(get(categoryFilter).sort()).toEqual(['4k', 'remux']);
+  });
+
+  it('applying it twice is a no-op (pure toggle)', () => {
+    const start = [...get(categoryFilter)].sort();
+    toggleCategoryFilter('tv');
+    toggleCategoryFilter('tv');
+    expect(get(categoryFilter).sort()).toEqual(start);
+  });
+
+  it('can narrow all the way down to an empty array by toggling off every category', () => {
+    categoryFilter.set(['4k', 'remux', 'tv']);
+    toggleCategoryFilter('4k');
+    toggleCategoryFilter('remux');
+    toggleCategoryFilter('tv');
+    expect(get(categoryFilter)).toEqual([]);
+  });
+});
+
+describe('clearAllFilters resets categoryFilter to show-all', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('resets a narrowed categoryFilter back to all three categories', () => {
+    categoryFilter.set(['4k']);
+    clearAllFilters();
+    expect(get(categoryFilter).sort()).toEqual(['4k', 'remux', 'tv']);
+  });
+
+  it('the reset value actually shows every known-category item again (not [], which filteredResults treats as "hide everything known")', () => {
+    results.set([
+      item({ url: 'a', category: '4k' }),
+      item({ url: 'b', category: 'remux' }),
+      item({ url: 'c', category: 'tv', season: 1 })
+    ]);
+    categoryFilter.set(['4k']); // narrowed — only 'a' should show
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['a']);
+
+    clearAllFilters();
+
+    expect(get(filteredResults).map((r) => r.url).sort()).toEqual(['a', 'b', 'c']);
+  });
+});
+
+describe('activeNarrowingFilters (names the "Hidden by: ..." culprits)', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('is empty when every filter is at its "show everything" default', () => {
+    expect(get(activeNarrowingFilters)).toEqual([]);
+  });
+
+  it('names the OFF categories when categoryFilter is narrowed', () => {
+    categoryFilter.set(['4k']); // remux + tv turned off
+    expect(get(activeNarrowingFilters)).toEqual(['Remux, TV hidden (category)']);
+  });
+
+  it('names the selected keys when resolutionFilter is set', () => {
+    resolutionFilter.set(['1080p']);
+    expect(get(activeNarrowingFilters)).toEqual(['1080p (resolution)']);
+  });
+
+  it('names category and resolution together, in that order', () => {
+    categoryFilter.set(['4k', 'remux']); // tv off
+    resolutionFilter.set(['4K', '1080p']);
+    expect(get(activeNarrowingFilters)).toEqual([
+      'TV hidden (category)',
+      '4K, 1080p (resolution)'
+    ]);
+  });
+
+  it('names genre/language/quick/date/search when set, summarizing lists over 3 as a count', () => {
+    genreFilter.set(['Horror', 'Comedy']);
+    languageFilter.set(['French', 'German', 'Japanese', 'Korean']); // > 3 -> count form
+    quickFilters.set(['4k']);
+    postedAfter.set('2026-01-01');
+    searchFilter.set('dune');
+
+    expect(get(activeNarrowingFilters)).toEqual([
+      'Horror, Comedy (genre)',
+      '4 languages (language)',
+      '4K (quick filter)',
+      'date range',
+      'search text'
+    ]);
+  });
+
+  it('goes back to empty after clearAllFilters', () => {
+    categoryFilter.set(['4k']);
+    resolutionFilter.set(['1080p']);
+    expect(get(activeNarrowingFilters).length).toBeGreaterThan(0);
+
+    clearAllFilters();
+
+    expect(get(activeNarrowingFilters)).toEqual([]);
   });
 });

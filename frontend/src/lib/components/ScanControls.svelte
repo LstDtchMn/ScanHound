@@ -1,8 +1,7 @@
 <script lang="ts">
   import { scanState, scanProgress, scanPhase, scanItemCount, startScan, stopScan } from '$lib/stores/scanner';
   import type { ScanType } from '$lib/stores/scanner';
-  import { clearResults, categoryFilter, mobileChromeCollapsed } from '$lib/stores/results';
-  import { get } from 'svelte/store';
+  import { clearResults, categoryFilter, toggleCategoryFilter, type CategoryKey, mobileChromeCollapsed } from '$lib/stores/results';
   import BottomSheet from './BottomSheet.svelte';
 
   let scanSheet = $state(false);
@@ -40,14 +39,18 @@
   let pages = $state(1);
 
   // Map a per-source category key to its normalized display category.
-  function normCat(key: string): string {
+  function normCat(key: string): CategoryKey {
     if (key === 'tv') return 'tv';
     return key.includes('remux') ? 'remux' : '4k';
   }
 
   // Derive the toggle flags for a source from the persisted display filter, so
-  // the saved 4K/Remux/TV choice survives a reload. Falls back to source
-  // defaults when nothing is persisted (an empty filter would hide everything).
+  // the saved 4K/Remux/TV choice survives a reload AND stays in sync with any
+  // OTHER writer of categoryFilter — e.g. FilterBar's mobile Category row,
+  // which calls toggleCategoryFilter directly (results.ts' single writer for
+  // categoryFilter; see its doc comment there). Falls back to source defaults
+  // when nothing is persisted (an empty filter would hide everything — see
+  // filteredResults' categoryFilter handling in results.ts).
   function flagsFor(src: Source, filter: string[]): Record<string, boolean> {
     const cats = sourceCategories[src];
     if (!filter || filter.length === 0) {
@@ -56,29 +59,26 @@
     return Object.fromEntries(cats.map((c) => [c.key, filter.includes(normCat(c.key))]));
   }
 
-  // Category flags — seeded from the persisted filter (not blind defaults) so
-  // the $effect below writes back the same value on mount instead of clobbering
-  // the user's saved choice. Reset to defaults when the source changes.
-  let flags = $state<Record<string, boolean>>(flagsFor('HDEncode', get(categoryFilter)));
+  // Category flags — a READ-ONLY mirror of categoryFilter (mapped onto the
+  // current source's per-source keys), not local state. This is what makes
+  // categoryFilter a true single source of truth: there's no local copy here
+  // for an external write (FilterBar's chips) to go stale against, and
+  // nothing here writes categoryFilter except toggleCategoryFilter calls
+  // below (no $effect mirroring flags back out — that write path is gone).
+  // Switching source re-maps the SAME normalized preference onto the new
+  // source's keys (e.g. a "remux only" choice survives HDEncode -> DDLBase as
+  // both 4k_remux AND 1080p_remux turning on together, since categoryFilter
+  // only ever tracks the normalized 'remux' category, not per-source
+  // sub-keys — a deliberate simplification, see the commit message).
+  let flags = $derived(flagsFor(selectedSource, $categoryFilter));
 
   function onSourceChange(src: Source) {
     selectedSource = src;
-    flags = Object.fromEntries(sourceCategories[src].map((c) => [c.key, c.default]));
   }
 
   let categories = $derived(sourceCategories[selectedSource]);
   let hasInteracted = $state(false);
 
-  // Drive the instant display filter from the 4K/Remux/TV toggles. The cache is
-  // pre-scanned with every category, so toggling here filters the loaded list
-  // immediately (keeping the others) instead of needing a re-scan.
-  $effect(() => {
-    const cats: string[] = [];
-    if (flags['4k'] || flags['4k_webdl']) cats.push('4k');
-    if (flags['remux'] || flags['4k_remux'] || flags['1080p_remux']) cats.push('remux');
-    if (flags['tv']) cats.push('tv');
-    categoryFilter.set(cats);
-  });
   let scanTypeLabel = $derived(scanTypes.find((t) => t.value === selectedType)?.label ?? 'Scan');
 
   // Auto-hide the mobile bar per scroll direction (set by MobileScanView), but
@@ -151,7 +151,7 @@
             <input
               type="checkbox"
               checked={flags[cat.key] ?? cat.default}
-              onchange={(e) => { flags[cat.key] = e.currentTarget.checked; }}
+              onchange={() => toggleCategoryFilter(normCat(cat.key))}
               class="accent-[var(--accent)] w-3 h-3"
             />
             <span class="text-[10px] text-[var(--text-secondary)]">{cat.label}</span>
@@ -274,7 +274,7 @@
         <div class="flex flex-wrap gap-2">
           {#each categories as cat (cat.key)}
             <button
-              onclick={() => { flags[cat.key] = !(flags[cat.key] ?? cat.default); }}
+              onclick={() => toggleCategoryFilter(normCat(cat.key))}
               class="px-3 py-1.5 rounded-full text-sm border transition-colors {(flags[cat.key] ?? cat.default) ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
             >{cat.label}</button>
           {/each}
