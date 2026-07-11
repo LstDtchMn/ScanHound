@@ -1648,6 +1648,26 @@ class TestAcceptProposals:
         assert job["new_filename"] == "Show - S01E01E02.mkv"
 
 
+# ── conflict_analysis: JSON round-trip for duplicate quality comparison ──
+
+def test_conflict_analysis_round_trips_as_dict(db, tmp_path):
+    svc = _service(db, _weak_search)
+    jid, _ = _matched_job(db, tmp_path, "MovieCA")
+    analysis = {"kind": "same_path", "existing": {"resolution": "1080p"},
+                "incoming": {"resolution": "2160p"}, "recommended": "incoming",
+                "reason": "2160p", "degraded": False, "analyzed_at": "2026-07-11T00:00:00+00:00"}
+    db.update_rename_job(jid, conflict_analysis=analysis)
+    job = db.get_rename_job(jid)
+    assert job["conflict_analysis"] == analysis
+
+
+def test_conflict_analysis_null_by_default(db, tmp_path):
+    svc = _service(db, _weak_search)
+    jid, _ = _matched_job(db, tmp_path, "MovieCA2")
+    job = db.get_rename_job(jid)
+    assert job["conflict_analysis"] is None
+
+
 # ── rematch: library guard + poster_path + season/episode overrides ────
 
 class _FakeTmdb:

@@ -301,7 +301,8 @@ class DatabaseManager:
                         dovi BOOLEAN,
                         hdr BOOLEAN,
                         last_updated TIMESTAMP,
-                        library_name TEXT
+                        library_name TEXT,
+                        file_path TEXT
                     )
                 ''')
 
@@ -610,6 +611,19 @@ class DatabaseManager:
                     # of warning_message's free-text byte counts.
                     'ALTER TABLE rename_jobs ADD COLUMN conflict_existing_size INTEGER',
                     'ALTER TABLE rename_jobs ADD COLUMN conflict_incoming_size INTEGER',
+                    # Duplicate-quality-comparison feature: the full computed
+                    # diff (existing vs incoming specs, recommendation) for
+                    # BOTH same-path and library-wide duplicates — supersedes
+                    # the three conflict_*_size columns above for row display
+                    # (they're still written by service.py's execution-time
+                    # collision handling, just no longer read by the UI).
+                    'ALTER TABLE rename_jobs ADD COLUMN conflict_analysis TEXT',
+                    # The served path Plex reports for a movie (part.file) —
+                    # plex_service.py already computes this per item; this
+                    # column just stops discarding it, so a library-wide
+                    # duplicate match (a different path than the incoming
+                    # job's own destination) can be ffprobed directly.
+                    'ALTER TABLE plex_cache ADD COLUMN file_path TEXT',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -792,8 +806,9 @@ class DatabaseManager:
                         INSERT OR REPLACE INTO plex_cache (
                             key, title, original_title, year, res, size, imdb_id,
                             rating_key, media_id, is_tv, season, episode_count,
-                            content_type, dovi, hdr, last_updated, library_name
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            content_type, dovi, hdr, last_updated, library_name,
+                            file_path
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         item['key'],
                         item.get('clean_title'),
@@ -812,6 +827,7 @@ class DatabaseManager:
                         1 if item.get('hdr') else 0,
                         timestamp,
                         item.get('library_name') or library_name,
+                        item.get('file'),
                     ))
 
                 # Remove stale rows when doing a full library refresh.
@@ -2062,12 +2078,12 @@ class DatabaseManager:
         "warning_message", "error_message", "processed_at", "reverted_at",
         "suggested_correction", "combined_episode", "split_file", "poster_path",
         "match_reasons", "prior_status", "conflict_kind", "conflict_same_size",
-        "conflict_existing_size", "conflict_incoming_size",
+        "conflict_existing_size", "conflict_incoming_size", "conflict_analysis",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.
     _JSON_RENAME_FIELDS = frozenset({"suggested_correction", "combined_episode",
-                                     "split_file", "match_reasons"})
+                                     "split_file", "match_reasons", "conflict_analysis"})
 
     def _serialize_rename_row(self, row: dict) -> dict:
         """JSON-encode dict/list values for _JSON_RENAME_FIELDS before DB write."""

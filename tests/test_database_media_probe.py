@@ -42,3 +42,26 @@ def test_upsert_media_probe_overwrites_on_reprobe(tmp_path):
     row = db.get_media_probe("/m.mkv")
     assert json.loads(row["probe_json"]) == {"v": 2}
     assert row["sig_mtime"] == 2.0
+
+
+def test_plex_cache_stores_file_path(tmp_path):
+    db = _db(tmp_path)
+    db.save_plex_cache([{
+        "clean_title": "Movie", "original_title": "Movie", "year": 2024,
+        "res": "4K", "size": 40.0, "imdb_id": "tt1", "rating_key": "1",
+        "media_id": "1", "file": "/library/movies/Movie (2024)/Movie.mkv",
+        "key": "1_1_0",
+    }], "Movies")
+    row = db._query_dicts("SELECT file_path FROM plex_cache WHERE key = ?", ("1_1_0",))
+    assert row[0]["file_path"] == "/library/movies/Movie (2024)/Movie.mkv"
+
+
+def test_plex_cache_file_path_defaults_null_when_absent(tmp_path):
+    db = _db(tmp_path)
+    db.save_plex_cache([{
+        "clean_title": "Movie", "original_title": "Movie", "year": 2024,
+        "res": "4K", "size": 40.0, "imdb_id": "tt1", "rating_key": "1",
+        "media_id": "1", "key": "1_1_0",
+    }], "Movies")
+    row = db._query_dicts("SELECT file_path FROM plex_cache WHERE key = ?", ("1_1_0",))
+    assert row[0]["file_path"] is None
