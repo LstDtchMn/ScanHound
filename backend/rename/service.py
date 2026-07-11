@@ -1370,6 +1370,8 @@ class RenameService:
                                f"{_fmt_size(candidate_size)}). Review to replace or keep.")
                 except OSError:
                     msg = "A copy is already in the library. Review to replace or keep."
+                    existing_size = None
+                    candidate_size = None
                 # Append to (never clobber) a warning already on the job — e.g. a
                 # year-mismatch note set at creation time — so the collision guard
                 # never silently discards an earlier reason the file needs review.

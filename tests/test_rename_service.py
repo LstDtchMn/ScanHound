@@ -515,6 +515,13 @@ class TestConflictSignal:
         assert job["conflict_kind"] == "destination_exists"
         assert job["conflict_same_size"] is False
         assert "same size" not in job["warning_message"]
+        # Pin the two size fields to their correct, distinct sides (not just
+        # "both set" — the equal-size test elsewhere can't tell existing/
+        # incoming apart, so a kwarg transposition in the service must fail
+        # here): jid1's applied file occupies dst (1 byte, "x"), jid2's
+        # source is src (10 bytes, "xxxxxxxxxx").
+        assert job["conflict_existing_size"] == 1
+        assert job["conflict_incoming_size"] == 10
 
     def test_collision_sets_existing_and_incoming_sizes(self, db, tmp_path):
         second_root = tmp_path / "second"
