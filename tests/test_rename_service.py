@@ -459,6 +459,15 @@ class TestFmtSize:
         assert _fmt_size(14359773138) == "13.4 GB"
         assert _fmt_size(1024 ** 4) == "1.0 TB"
 
+    def test_fmt_size_half_tie_rounds_away_from_zero(self):
+        # 1280 / 1024 = 1.25 KB, a value whose first-decimal representation
+        # (1.25 -> round to 1 decimal) is an exact .x5 tie. Python's default
+        # f"{v:.1f}" formatting rounds half-to-even -> "1.2 KB", but JS's
+        # (1280/1024).toFixed(1) rounds half-away-from-zero -> "1.3 KB". The
+        # spec requires the two to render identically, so _fmt_size must
+        # match the JS behavior, not Python's default.
+        assert _fmt_size(1280) == "1.3 KB"
+
 
 class TestConflictSignal:
     """conflict_kind/conflict_same_size set at collision, cleared on every
@@ -590,6 +599,83 @@ class TestConflictSignal:
         assert out["ok"] is True
         job = db.get_rename_job(jid)
         assert job["status"] == "matched"
+        assert job["conflict_kind"] is None
+        assert job["conflict_same_size"] is None
+
+    def test_library_not_configured_guard_clears_stale_conflict_signal(
+            self, db, tmp_path):
+        """The 'Library not configured' guard in apply() (an empty/relative
+        destination_path) must clear conflict_kind/conflict_same_size just
+        like the structurally identical guard in set_destination() does —
+        otherwise a job that once held a real destination_exists conflict
+        can carry that stale marker into an unrelated needs_review state."""
+        src = tmp_path / "Movie.2020.1080p.mkv"; src.write_text("data")
+        svc = _service(db, _matrix_search)  # search fn unused; apply() called directly
+        jid = db.create_rename_job({
+            "original_path": str(src), "status": "matched",
+            "destination_path": "",  # library not configured -> guard fires
+            "new_filename": "Movie (2020).mkv",
+            "conflict_kind": "destination_exists", "conflict_same_size": True})
+        out = svc.apply(jid)
+        assert out["ok"] is False
+        job = db.get_rename_job(jid)
+        assert job["status"] == "needs_review"
+        assert job["conflict_kind"] is None
+        assert job["conflict_same_size"] is None
+
+    def test_source_missing_failure_clears_stale_conflict_signal(
+            self, db, tmp_path):
+        """If the source file vanishes while a job is sitting on a real
+        destination_exists conflict (e.g. the user deletes it from the
+        extracted folder before resolving), the 'Source file missing'
+        failure path must clear the now-unrelated conflict marker rather
+        than leaving it on the resulting 'failed' job."""
+        missing_src = str(tmp_path / "gone.mkv")  # never created
+        svc = _service(db, _matrix_search)  # search fn unused; apply() called directly
+        jid = db.create_rename_job({
+            "original_path": missing_src, "status": "needs_review",
+            "destination_path": str(tmp_path / "lib" / "Movie (2020)"),
+            "new_filename": "Movie (2020).mkv",
+            "conflict_kind": "destination_exists", "conflict_same_size": False})
+        out = svc.apply(jid)
+        assert out["ok"] is False
+        assert out["error"] == "Source file missing"
+        job = db.get_rename_job(jid)
+        assert job["status"] == "failed"
+        assert job["conflict_kind"] is None
+        assert job["conflict_same_size"] is None
+
+    def test_overwrite_apply_place_file_failure_clears_stale_conflict_signal(
+            self, db, tmp_path, monkeypatch):
+        """conflict_strategy='overwrite' trashes the occupant at dst BEFORE
+        calling place_file(). If place_file() then raises for some other
+        reason, dst is genuinely free (the old occupant is gone) even though
+        the job ends up 'failed' — the 'destination_exists' marker from the
+        original collision is stale and must be cleared, not left on the
+        failed job."""
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="x")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv", content="x")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+
+        svc.apply(jid2)  # -> needs_review + destination_exists signal set
+        job_before = db.get_rename_job(jid2)
+        assert job_before["conflict_kind"] == "destination_exists"
+
+        def _boom(*a, **kw):
+            raise OSError("simulated place_file failure after trash")
+        monkeypatch.setattr("backend.rename.service._fileops.place_file", _boom)
+
+        out = svc.apply(jid2, conflict_strategy="overwrite")
+        assert out["ok"] is False
+        job = db.get_rename_job(jid2)
+        assert job["status"] == "failed"
         assert job["conflict_kind"] is None
         assert job["conflict_same_size"] is None
 

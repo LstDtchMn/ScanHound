@@ -2,16 +2,18 @@
   import RenamePoster from './RenamePoster.svelte';
   import BadgeCluster from './BadgeCluster.svelte';
   import Badge from '$lib/components/Badge.svelte';
-  import ConflictModal from './ConflictModal.svelte';
   import { selectedJobIds, toggleSelect, applyJob, renameProgress } from '$lib/stores/renames';
   import { hasDestinationConflict } from '$lib/renames/review';
   import type { RenameJob } from '$lib/api/types';
 
-  let { job, onRematch }: { job: RenameJob; onRematch: (job: RenameJob) => void } = $props();
+  let {
+    job,
+    onRematch,
+    onCompare
+  }: { job: RenameJob; onRematch: (job: RenameJob) => void; onCompare: (job: RenameJob) => void } = $props();
 
   let selected = $derived($selectedJobIds.has(job.id));
   let busy = $state(false);
-  let showConflict = $state(false);
   let isConflict = $derived(hasDestinationConflict(job));
   let titleLine = $derived(
     [job.title ?? job.package_name ?? job.original_filename ?? `Job ${job.id}`, job.year ? `(${job.year})` : null]
@@ -73,7 +75,7 @@
         <button
           type="button"
           class="ml-auto shrink-0 px-2 py-0.5 rounded text-[11px] font-medium bg-[var(--accent)] text-white hover:brightness-110"
-          onclick={() => (showConflict = true)}
+          onclick={() => onCompare(job)}
         >
           Compare
         </button>
@@ -127,7 +129,3 @@
     </button>
   </div>
 </li>
-
-{#if showConflict}
-  <ConflictModal {job} onClose={() => (showConflict = false)} />
-{/if}

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re as _re
 import threading
@@ -70,7 +71,11 @@ def _fmt_size(n: int) -> str:
     while v >= 1024 and i < len(units) - 1:
         v /= 1024.0
         i += 1
-    return f"{v:.1f} {units[i]}"
+    # Round half away from zero (matches JS toFixed), not Python's format
+    # default (round half to even) — so exact .x5 ties render identically
+    # to the frontend's formatBytes.
+    rounded = math.floor(v * 10 + 0.5) / 10
+    return f"{rounded:.1f} {units[i]}"
 
 
 def _now() -> str:
@@ -1282,7 +1287,13 @@ class RenameService:
             return {"ok": True}
         src = job.get("original_path")
         if not src or not os.path.isfile(src):
-            db.update_rename_job(job_id, status="failed", error_message="Source file missing")
+            # The job may have been left holding a conflict_kind marker from a
+            # prior apply() attempt (e.g. destination_exists). If the source
+            # vanished since then, that marker no longer describes anything
+            # actionable — clear it so a stale conflict badge doesn't survive
+            # onto this failed job.
+            db.update_rename_job(job_id, status="failed", error_message="Source file missing",
+                                 conflict_kind=None, conflict_same_size=None)
             self._broadcast(job_id)
             return {"ok": False, "error": "Source file missing"}
         # Destination guard: a job whose library isn't configured has an empty or
@@ -1296,7 +1307,8 @@ class RenameService:
         if not dest_dir or not os.path.isabs(dest_dir):
             msg = ("Library not configured — set the destination in "
                    "Settings → Renaming before applying")
-            db.update_rename_job(job_id, status="needs_review", warning_message=msg)
+            db.update_rename_job(job_id, status="needs_review", warning_message=msg,
+                                 conflict_kind=None, conflict_same_size=None)
             self._broadcast(job_id)
             return {"ok": False, "error": msg}
         dst = os.path.join(dest_dir,
@@ -1394,7 +1406,13 @@ class RenameService:
                 progress_cb=_progress)
         except Exception as e:
             rlog.warning("move   | FAILED %s -> %s (%s): %s", src, dst, method, e)
-            db.update_rename_job(job_id, status="failed", error_message=str(e))
+            # If conflict_strategy="overwrite" already trashed the prior
+            # occupant of dst above, the destination is now free even though
+            # place_file() failed for some other reason — the
+            # 'destination_exists' marker from before is stale, so clear it
+            # rather than leaving it on this failed job.
+            db.update_rename_job(job_id, status="failed", error_message=str(e),
+                                 conflict_kind=None, conflict_same_size=None)
             self._broadcast(job_id)
             return {"ok": False, "error": str(e)}
         rlog.info("move   | %s -> %s (%s)", src, dst, used)

@@ -27,6 +27,7 @@
   import RenameRow from '$lib/components/renames/RenameRow.svelte';
   import RenameCard from '$lib/components/renames/RenameCard.svelte';
   import RematchModal from '$lib/components/renames/RematchModal.svelte';
+  import ConflictModal from '$lib/components/renames/ConflictModal.svelte';
   import TrashPanel from '$lib/components/renames/TrashPanel.svelte';
   import MobileRenamesView from '$lib/components/renames/MobileRenamesView.svelte';
 
@@ -36,6 +37,10 @@
   // Controlled RematchModal — rows/cards call onRematch(job) → set this; modal
   // renders only while set.
   let rematchJob = $state<RenameJob | null>(null);
+  // Controlled ConflictModal — same pattern as rematchJob: RenameRow calls
+  // onCompare(job) → set this; modal renders only while set, at page root
+  // (outside the <ul>) so it's never an invalid non-<li> child of it.
+  let conflictJob = $state<RenameJob | null>(null);
   // The job whose legacy per-job action menu (Undo / Re-identify / Accept… /
   // Remove) is open. One at a time.
   let actionsOpenId = $state<number | null>(null);
@@ -157,6 +162,10 @@
   function onRematch(job: RenameJob) {
     actionsOpenId = null;
     rematchJob = job;
+  }
+
+  function onCompare(job: RenameJob) {
+    conflictJob = job;
   }
 
   // --- Derived visible set: status → category → query → sort ---
@@ -312,7 +321,7 @@
   {:else}
     <ul class="divide-y divide-[var(--border)] rounded-lg border border-[var(--border)] overflow-hidden">
       {#each shown as job (job.id)}
-        <RenameRow {job} {onRematch} />
+        <RenameRow {job} {onRematch} {onCompare} />
         <li class="px-3 py-1 bg-[var(--bg-tertiary)]/30">
             <button
               class="text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
@@ -456,4 +465,7 @@
 
 {#if rematchJob}
   <RematchModal job={rematchJob} onClose={() => (rematchJob = null)} />
+{/if}
+{#if conflictJob}
+  <ConflictModal job={conflictJob} onClose={() => (conflictJob = null)} />
 {/if}
