@@ -196,7 +196,16 @@ def list_jobs(status: Optional[str] = None, limit: int = 200,
                 finally:
                     with _analyzing_lock:
                         _analyzing_job_ids.difference_update(job_ids)
-            threading.Thread(target=_run, args=(fresh,), name="conflict-analyze", daemon=True).start()
+            try:
+                threading.Thread(target=_run, args=(fresh,), name="conflict-analyze", daemon=True).start()
+            except RuntimeError:
+                # Thread creation itself failed (e.g. OS thread exhaustion). The
+                # _run() finally that releases these ids never runs, so release
+                # them here or they'd stay pinned "in flight" (never re-analyzed)
+                # until process restart.
+                logger.exception("list_jobs: failed to start conflict-analyze thread")
+                with _analyzing_lock:
+                    _analyzing_job_ids.difference_update(fresh)
 
     return {
         "jobs": jobs,

@@ -77,6 +77,36 @@ def test_analyze_job_conflict_degraded_when_probe_fails():
         "bitrate", "resolution", "video_codec", "hdr", "dv_layer", "audio"}
 
 
+def test_analyze_job_conflict_degraded_when_incoming_vanished():
+    # Both sides probe successfully (probe_specs returns full dicts, NOT
+    # None) but report present: False -- a TOCTOU race where the file(s)
+    # vanished between detection and analysis. rank_conflict() would
+    # otherwise happily recommend "incoming" here (it only special-cases
+    # a None/absent `existing`), which would be a phantom "keep Incoming"
+    # recommendation for a file that isn't actually there. The guard in
+    # analyze_job_conflict must force degraded=True and suppress advice.
+    db = MagicMock()
+    with patch("os.path.lexists", return_value=True), \
+         patch("backend.rename.conflict_analyzer.probe_specs") as probe_mock:
+        probe_mock.side_effect = [
+            {"present": False, "path": "/library/movies/X (2020)/X (2020).mkv",
+             "size_bytes": None, "container": None, "duration_min": None,
+             "bitrate": None, "resolution": None, "video_codec": None,
+             "hdr": None, "dv_layer": None, "audio": None},
+            {"present": False, "path": "/incoming/X.mkv",
+             "size_bytes": None, "container": None, "duration_min": None,
+             "bitrate": None, "resolution": None, "video_codec": None,
+             "hdr": None, "dv_layer": None, "audio": None},
+        ]
+        result = conflict_analyzer.analyze_job_conflict(db, _job(), plex_cache_rows=[])
+    assert result["degraded"] is True
+    assert result["recommended"] is None
+    db.update_rename_job.assert_called_once()
+    args, kwargs = db.update_rename_job.call_args
+    assert kwargs["conflict_analysis"]["degraded"] is True
+    assert kwargs["conflict_analysis"]["recommended"] is None
+
+
 def test_analyze_job_conflict_fires_detect_layer_when_gate_says_yes():
     db = MagicMock()
     with patch("os.path.lexists", return_value=True), \

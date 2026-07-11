@@ -100,6 +100,15 @@ def analyze_job_conflict(db, job: dict, plex_cache_rows: Optional[list] = None) 
     existing = existing or _absent_spec(existing_path)
     incoming = incoming or _absent_spec(incoming_path)
 
+    # A genuinely not-present incoming (source file vanished between detection
+    # and analysis) must not yield a recommendation. rank_conflict() returns
+    # "incoming" whenever `existing` is absent, WITHOUT verifying `incoming`
+    # exists, so a both-files-vanished TOCTOU race would otherwise render a
+    # misleading "keep Incoming ★" for a file that isn't there. Treat it as
+    # degraded so advice is suppressed (the analysis blob is still written).
+    if not incoming.get("present"):
+        degraded = True
+
     if not degraded and existing.get("present") and incoming.get("present") \
             and _dv.available() and needs_dv_layer_scan(existing, incoming):
         try:

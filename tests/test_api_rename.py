@@ -181,6 +181,31 @@ class TestRenameApi:
         job = next(j for j in body["jobs"] if j["id"] == job_id)
         assert job["library_duplicate"] is True
 
+    def test_jobs_releases_analyzing_ids_when_thread_start_fails(self, client, monkeypatch):
+        # If threading.Thread(...).start() itself raises (e.g. OS thread
+        # exhaustion), the background _run()'s `finally` that would normally
+        # release _analyzing_job_ids never gets a chance to run. The route
+        # must release the just-reserved ids itself in that except branch, or
+        # those job ids stay pinned "in flight" forever (never re-analyzed).
+        import backend.api.routes.rename as rename_routes
+
+        class _BoomThread:
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(rename_routes.threading, "Thread", _BoomThread)
+        dest, name = "/lib/movies", "Dup (2020) [2160p].mkv"
+        _seed_job(status="matched", title="Dup", destination_path=dest, new_filename=name)
+        _seed_job(status="matched", title="Dup", destination_path=dest, new_filename=name)
+        assert rename_routes._analyzing_job_ids == set()
+        body = client.get("/rename/jobs").json()
+        assert len(body["jobs"]) == 2
+        # The except RuntimeError branch must have released the reserved ids.
+        assert rename_routes._analyzing_job_ids == set()
+
     def test_dv_scans_empty_and_shape(self, client):
         body = client.get("/rename/dv-scans").json()
         assert body["scans"] == [] and body["counts"] == {}
