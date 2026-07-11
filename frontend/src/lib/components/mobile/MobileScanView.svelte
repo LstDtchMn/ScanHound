@@ -21,9 +21,12 @@
   import PullToRefresh from './PullToRefresh.svelte';
   import SwipeableTile from './SwipeableTile.svelte';
   import MobileToolbar from './MobileToolbar.svelte';
+  import BottomSheet from '$lib/components/BottomSheet.svelte';
+  import SkippedManager from '$lib/components/SkippedManager.svelte';
   import { success } from './haptics';
 
   let filterSheetOpen = $state(false);
+  let skippedOpen = $state(false);
   let deckOpen = $state(false);       // LOCAL deck overlay — deliberately NOT viewMode
                                        // ('sh-view-mode' is persisted and shared with desktop;
                                        // entering the deck on the phone must not flip it).
@@ -163,7 +166,11 @@
   {/if}
 </PullToRefresh>
 
-<MobileToolbar onfilters={() => (filterSheetOpen = true)} ondeck={() => (deckOpen = true)} />
+<MobileToolbar onfilters={() => (filterSheetOpen = true)} ondeck={() => (deckOpen = true)} onskipped={() => (skippedOpen = true)} />
+
+<BottomSheet open={skippedOpen} onclose={() => (skippedOpen = false)}>
+  <SkippedManager onclose={() => (skippedOpen = false)} />
+</BottomSheet>
 
 {#if deckOpen}
   <div class="fixed inset-0 z-40 bg-[var(--bg-primary)] flex flex-col md:hidden">

@@ -9,8 +9,9 @@
   interface Props {
     onfilters: () => void;
     ondeck: () => void;
+    onskipped?: () => void;
   }
-  let { onfilters, ondeck }: Props = $props();
+  let { onfilters, ondeck, onskipped }: Props = $props();
 
   let searchOpen = $state(false);
   let searchEl: HTMLInputElement | undefined = $state();
@@ -81,6 +82,9 @@
     <button class="flex-1 flex items-center justify-center gap-1.5 py-2 text-xs text-[var(--text-secondary)]" onclick={ondeck} aria-label="Triage deck">
       <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14-4H5m14 8H5m14 4H5"/></svg>
       Deck
+    </button>
+    <button class="flex-1 flex items-center justify-center gap-1.5 py-2 text-xs text-[var(--text-secondary)]" onclick={onskipped} aria-label="Skipped items">
+      Skipped
     </button>
     <button
       class="shrink-0 p-2 text-[var(--text-secondary)] active:text-[var(--accent)]"

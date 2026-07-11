@@ -9,7 +9,7 @@
   import ResultActionSheet from '$lib/components/ResultActionSheet.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
   import SwipeDeck from '$lib/components/SwipeDeck.svelte';
-  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS, loadResults, hasMore, loadingMore, loadError, filteredTotal, titleCounts, pagedMode, statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy, hiddenByFiltersCount, clearAllFilters, isResultsViewEmpty, activeNarrowingFilters } from '$lib/stores/results';
+  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS, loadResults, hasMore, loadingMore, loadError, filteredTotal, titleCounts, pagedMode, statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy, hiddenByFiltersCount, clearAllFilters, isResultsViewEmpty, activeNarrowingFilters, dismissedUrls } from '$lib/stores/results';
   import { mobile } from '$lib/stores/media';
   import { addToast } from '$lib/stores/notifications';
   import { get } from 'svelte/store';
@@ -22,7 +22,7 @@
   import { jdConnection, refreshJdConnection } from '$lib/stores/jdownloader';
   import { api } from '$lib/api/client';
   import { onMount } from 'svelte';
-  import { slide } from 'svelte/transition';
+  import { slide, fly } from 'svelte/transition';
   import type { ScanResult } from '$lib/api/types';
   import {
     groupResults, computeSiblingCounts, isDuplicateGroup as isDupGroup,
@@ -32,6 +32,8 @@
   import { isPhone } from '$lib/stores/viewport';
   import MobileScanView from '$lib/components/mobile/MobileScanView.svelte';
   import DetailSheet from '$lib/components/mobile/DetailSheet.svelte';
+  import ModalOverlay from '$lib/components/ModalOverlay.svelte';
+  import SkippedManager from '$lib/components/SkippedManager.svelte';
 
   let tmdbKeyMissing = $state(false);
   let tmdbBannerDismissed = $state(
@@ -100,6 +102,7 @@
 
   let contextMenu = $state<{ item: ScanResult; x: number; y: number } | null>(null);
   let mobileActionItem = $state<ScanResult | null>(null);
+  let skippedOpen = $state(false);
   // Track which multi-item groups the user has explicitly expanded; all others start collapsed
   let expandedGroups = $state<Set<string>>(new Set());
   let resultsContainer: HTMLDivElement | undefined = $state();
@@ -361,6 +364,30 @@
   <MobileScanView />
 {:else}
 <FilterBar />
+
+{#if $dismissedUrls.size > 0}
+  <div class="flex justify-end px-1">
+    <button
+      class="text-xs px-2 py-1 rounded border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]"
+      onclick={() => (skippedOpen = true)}
+    >Skipped ({$dismissedUrls.size})</button>
+  </div>
+{/if}
+
+{#if skippedOpen}
+  <ModalOverlay onclose={() => (skippedOpen = false)}>
+    <div
+      transition:fly={{ y: -20, duration: 200 }}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Skipped items"
+      tabindex="-1"
+      class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl shadow-2xl w-[min(32rem,92vw)] max-h-[85vh] overflow-auto p-4"
+    >
+      <SkippedManager onclose={() => (skippedOpen = false)} />
+    </div>
+  </ModalOverlay>
+{/if}
 
 {#if $fromCache}
   <div class="px-4 py-1.5 flex items-center gap-2 text-xs text-[var(--text-secondary)] border-b border-[var(--border)] bg-[color-mix(in_srgb,var(--accent)_4%,var(--bg-primary))]">
