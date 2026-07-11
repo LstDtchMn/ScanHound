@@ -1766,6 +1766,14 @@ class DatabaseManager:
             'scraped_at, last_seen_at FROM background_scan_cache '
             'ORDER BY last_seen_at DESC LIMIT ?', (limit,), default=[])
 
+    def get_background_cache_by_url(self, url):
+        """Return one cached background-scan row by URL, or None."""
+        rows = self._query_dicts(
+            'SELECT url, title, year, status, source_category, data, '
+            'scraped_at, last_seen_at FROM background_scan_cache '
+            'WHERE url = ? LIMIT 1', (url,), default=[])
+        return rows[0] if rows else None
+
     def enrich_downloads_from_cache(self):
         """Backfill empty resolution/size/hdr/dovi on download-history rows from
         the background scan cache, matched by URL.

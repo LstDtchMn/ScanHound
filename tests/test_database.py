@@ -1087,6 +1087,24 @@ class TestBackgroundCacheVersion:
         assert after[2] > before[2]
 
 
+class TestGetBackgroundCacheByUrl:
+    """get_background_cache_by_url() — single-row lookup backing the
+    rescan-item endpoint (which needs one cached row's source_category
+    without pulling the whole cache)."""
+
+    def test_get_background_cache_by_url_found_and_missing(self, db_manager):
+        db_manager.upsert_background_cache([{
+            "url": "https://hdencode.org/example/",
+            "title": "Example", "year": 2020, "status": "missing",
+            "source_category": "hdencode", "data": '{"title": "Example"}',
+        }])
+        row = db_manager.get_background_cache_by_url("https://hdencode.org/example/")
+        assert row is not None
+        assert row["title"] == "Example"
+        assert row["source_category"] == "hdencode"
+        assert db_manager.get_background_cache_by_url("https://hdencode.org/nope/") is None
+
+
 # ---------------------------------------------------------------------------
 # 7. Transaction context manager
 # ---------------------------------------------------------------------------

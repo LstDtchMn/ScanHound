@@ -1,6 +1,8 @@
 """Scanner endpoints: start, stop, status."""
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import threading
 import time
@@ -54,6 +56,10 @@ class ScanRequest(BaseModel):
     search_query: str = ""
     pages: int = 1
     flags: Optional[Dict[str, bool]] = None
+
+
+class RescanItemRequest(BaseModel):
+    url: str
 
 
 # Map frontend shorthand to backend scan_type values
@@ -335,3 +341,56 @@ def scan_stop(reg: ServiceRegistry = Depends(get_registry)):
     with _scan_lock:
         _scan_state["state"] = "stopping"
     return {"status": "stopping"}
+
+
+@router.post("/rescan-item")
+def rescan_item(
+    req: RescanItemRequest,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    """Force-refresh a single cached scan result: re-fetch its detail page
+    and re-run TMDB/OMDb/RT enrichment, bypassing the normal scan's
+    skip-already-cached-URLs optimization. Reuses the exact same scraping/
+    enrichment pipeline the bulk scan uses — no new matching logic."""
+    if not req.url:
+        raise HTTPException(status_code=400, detail="No URL provided")
+    db = reg.db
+    scanner = reg.scanner
+    if not db or not scanner:
+        raise HTTPException(status_code=503, detail="Scanner not available")
+
+    existing = db.get_background_cache_by_url(req.url)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Item not found in cache")
+
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    try:
+        details = scanner.scrapers.scrape_details(req.url, headers)
+    except Exception as e:
+        logger.exception("Rescan failed for %s", req.url)
+        raise HTTPException(status_code=502, detail=f"Rescan failed: {e}")
+    if not details:
+        raise HTTPException(status_code=502, detail="Could not fetch a fresh copy of this page")
+
+    post_source = existing.get("source_category") or "hdencode"
+    details['source'] = post_source
+    details['category'] = existing.get("source_category") or ""
+
+    item = scanner._create_media_item({
+        'details': details, 'is_tv': details.get('is_tv', False), 'url': req.url,
+    })
+    if not item:
+        raise HTTPException(status_code=502, detail="Could not parse the refreshed page")
+
+    asyncio.run(scanner._enricher.enrich([item]))
+
+    d = _media_item_to_dict(item)
+    db.upsert_background_cache([{
+        "url": req.url,
+        "title": d.get("title"),
+        "year": d.get("year"),
+        "status": str(d.get("status", "")),
+        "source_category": post_source,
+        "data": json.dumps(d, default=str),
+    }])
+    return {"status": "ok", "item": d}
