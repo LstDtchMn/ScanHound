@@ -113,6 +113,10 @@ export interface RenameJob {
   // True when another active job targets the same destination file (e.g. two
   // releases of the same movie). Computed server-side on the jobs list.
   destination_conflict?: boolean;
+  // Structured signal for an on-disk destination collision, set at apply time
+  // (Task 2). Prefer this over string-sniffing warning_message.
+  conflict_kind?: 'destination_exists' | null;
+  conflict_same_size?: boolean | null;
   // Within a duplicate group, the best-quality release to keep (with a short
   // reason like "2160p · Dolby Vision · Remux"). Computed server-side.
   keep_recommended?: boolean;

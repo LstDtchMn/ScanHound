@@ -44,6 +44,7 @@ export function deckQueue(jobs: RenameJob[], scope: ReviewScope): RenameJob[] {
 }
 
 export function hasDestinationConflict(job: RenameJob): boolean {
+  if (job.conflict_kind === 'destination_exists') return true;
   if (job.destination_conflict) return true;
   return /already exists/i.test(job.warning_message ?? '');
 }

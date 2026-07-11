@@ -41,6 +41,13 @@ describe('hasDestinationConflict', () => {
   it('true on destination_conflict flag', () =>
     expect(hasDestinationConflict(job({ destination_conflict: true } as Partial<RenameJob>))).toBe(true));
   it('false otherwise', () => expect(hasDestinationConflict(job({}))).toBe(false));
+  it('detects a conflict via the structured conflict_kind signal', () =>
+    expect(hasDestinationConflict(job({ conflict_kind: 'destination_exists' }))).toBe(true));
+  it('is false for a non-conflict needs-review job', () =>
+    expect(hasDestinationConflict(job({
+      status: 'needs_review',
+      warning_message: 'Year mismatch: parsed 2024 vs TMDB 2023',
+    }))).toBe(false));
 });
 
 describe('deckQueue', () => {
