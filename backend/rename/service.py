@@ -1861,10 +1861,16 @@ class RenameService:
                         if self._apply_cancel.is_set():
                             cancelled_at = idx
                             break
-                        job = db.get_rename_job(jid) if db else None
-                        self._broadcast_queue(idx, total,
-                                              (job or {}).get("title") if job else None)
                         try:
+                            # db.get_rename_job and _broadcast_queue share this
+                            # try with apply() itself — a DB hiccup fetching the
+                            # job's title for the queue banner must not crash
+                            # the whole worker thread and strand every
+                            # remaining pre-marked 'applying' job with nothing
+                            # left running to ever move it off that status.
+                            job = db.get_rename_job(jid) if db else None
+                            self._broadcast_queue(idx, total,
+                                                  (job or {}).get("title") if job else None)
                             self.apply(jid, conflict_strategy=conflict_strategy)
                         except Exception:
                             logger.exception("queued apply failed for job %s", jid)
@@ -1979,21 +1985,27 @@ class RenameService:
         db = self._db
         if db is None:
             return {"results": [], "applied": 0, "skipped": 0, "failed": 0}
-        # A fresh run must never inherit a cancel flag left set by a
-        # previous (already-finished) run's "Stop applying" click.
-        self._apply_cancel.clear()
-        if ids is not None:
-            candidates = []
-            for jid in ids:
-                job = db.get_rename_job(int(jid))
-                if job:
-                    candidates.append(job)
-        else:
-            candidates = db.list_rename_jobs(limit=100000) or []
         if not self._bulk_lock.acquire(blocking=False):
             return {"results": [], "applied": 0, "skipped": 0, "failed": 0,
                     "busy": True}
         try:
+            # A fresh run must never inherit a cancel flag left set by a
+            # previous (already-finished) run's "Stop applying" click. Safe
+            # to clear only now that this run has exclusively claimed the
+            # guard — mirrors queue_apply's fix (cf4b3b5) for the identical
+            # overlap class: clearing before winning the lock could wipe a
+            # concurrently-running queue_apply's pending cancellation out
+            # from under it (this method would then lose the lock race,
+            # return busy, and leave the other run's Stop silently defeated).
+            self._apply_cancel.clear()
+            if ids is not None:
+                candidates = []
+                for jid in ids:
+                    job = db.get_rename_job(int(jid))
+                    if job:
+                        candidates.append(job)
+            else:
+                candidates = db.list_rename_jobs(limit=100000) or []
             results, applied, skipped, failed = [], 0, 0, 0
             for job in candidates:
                 if self._apply_cancel.is_set():

@@ -1294,6 +1294,103 @@ class TestQueueApplyCancel:
         assert db.get_rename_job(j0)["status"] == "applied"
         assert db.get_rename_job(j1)["status"] == "applied"
 
+    def test_worker_survives_a_db_read_exception_mid_loop_and_keeps_processing(self, db, tmp_path):
+        """Regression test for a review finding: db.get_rename_job(jid) sat
+        outside the per-job try/except, so a transient DB hiccup fetching
+        one job's title (for the queue banner) crashed the whole worker
+        thread — stranding every remaining pre-marked 'applying' job with
+        nothing left running to ever move it off that status. A single
+        flaky read must now fail only that job (marked 'failed', matching
+        the existing apply()-raised handling) and the loop must continue
+        on to the rest of the batch."""
+        svc = _service(db, _weak_search)
+        j0, _src0 = _matched_job(db, tmp_path, "MovieFlakyA")
+        j1, _src1 = _matched_job(db, tmp_path, "MovieFlakyB")
+        j2, _src2 = _matched_job(db, tmp_path, "MovieFlakyC")
+        ids = [j0, j1, j2]
+
+        # get_rename_job(jid) for j1 is read several times before the worker
+        # loop's own read even happens — once for queue_apply's upfront
+        # eligibility list (request thread), again inside self._broadcast()
+        # from the "mark applying" loop (also request thread) — so counting
+        # calls is fragile. Target the worker thread specifically instead
+        # (named "rename-apply", see the threading.Thread(...) call below in
+        # queue_apply): the first read to run there is exactly the fixed
+        # line (job = db.get_rename_job(jid) if db else None), strictly
+        # before apply() — whose own internal read also runs in this same
+        # thread — is ever reached for this job.
+        import threading as _threading
+
+        real_get = db.get_rename_job
+        raised = {"n": 0}
+
+        def _flaky_get(jid, *a, **k):
+            if (jid == j1 and raised["n"] == 0
+                    and _threading.current_thread().name == "rename-apply"):
+                raised["n"] += 1
+                raise RuntimeError("simulated transient db error")
+            return real_get(jid, *a, **k)
+
+        db.get_rename_job = _flaky_get
+
+        out = svc.queue_apply(ids)
+        assert out["ok"] is True
+        assert out["queued"] == 3
+
+        self._wait_until_settled(db, ids)
+
+        assert db.get_rename_job(j0)["status"] == "applied"  # before the flaky read — unaffected
+        job1 = db.get_rename_job(j1)
+        assert job1["status"] == "failed"  # the flaky read — caught, not stuck 'applying'
+        assert job1["error_message"]
+        assert db.get_rename_job(j2)["status"] == "applied"  # loop continued past the failure
+
+    def test_apply_confident_does_not_clear_a_concurrent_queue_apply_cancel_flag(self, db, tmp_path):
+        """Mirrors test_second_queue_apply_while_active_is_rejected_as_busy
+        for the analogous apply_confident-vs-queue_apply overlap (a review
+        finding): apply_confident must not clear self._apply_cancel until
+        it has actually won _bulk_lock, or it can silently defeat a
+        pending 'Stop applying' click on a concurrently-running
+        queue_apply worker even while apply_confident itself gets
+        rejected as busy and applies nothing."""
+        import threading as _threading
+
+        svc = _service(db, _weak_search)
+        j0, _src0 = _matched_job(db, tmp_path, "MovieConfOverlapA")
+        j1, _src1 = _matched_job(db, tmp_path, "MovieConfOverlapB")
+
+        entered_apply = _threading.Event()
+        release_apply = _threading.Event()
+        real_apply = svc.apply
+
+        def _blocking_apply(job_id, *a, **k):
+            entered_apply.set()
+            assert release_apply.wait(timeout=5), "test deadlocked waiting for release"
+            return real_apply(job_id, *a, **k)
+
+        svc.apply = _blocking_apply
+
+        out1 = svc.queue_apply([j0])
+        assert out1 == {"ok": True, "queued": 1, "skipped": 0}
+        assert entered_apply.wait(timeout=5), "worker never reached apply()"
+
+        # Mirrors a real "Stop applying" click landing on the active queue_apply run.
+        svc.cancel_apply()
+        assert svc._apply_cancel.is_set()
+
+        # apply_confident races in while queue_apply's worker still holds the
+        # lock — must be rejected as busy AND must not have cleared the flag
+        # (before the fix, it cleared self._apply_cancel as its very first
+        # statement, before ever attempting the lock).
+        out2 = svc.apply_confident([j1])
+        assert out2.get("busy") is True
+        assert svc._apply_cancel.is_set()  # the pending Stop must survive
+        assert db.get_rename_job(j1)["status"] == "matched"  # untouched
+
+        release_apply.set()
+        self._wait_until_settled(db, [j0])
+        assert db.get_rename_job(j0)["status"] == "applied"
+
     def test_second_queue_apply_while_active_is_rejected_as_busy(self, db, tmp_path):
         """A second queue_apply() call made while the first run's worker is
         still active must be atomically rejected as busy — and, critically,
