@@ -181,7 +181,11 @@
   let shown = $derived(
     sortJobs(
       $renameJobs
-        .filter((j) => statusFilter === 'all' || j.status === statusFilter)
+        // Keep an in-flight ('applying') item visible on whatever tab you're on
+        // while its move/overwrite runs — otherwise it drops into a limbo that
+        // matches no status tab and vanishes mid-apply. It settles into Applied
+        // (or Failed) when done and then follows the normal tab rules.
+        .filter((j) => statusFilter === 'all' || j.status === statusFilter || j.status === 'applying')
         .filter((j) => $renameCategory === 'all' || categoryOf(j).has($renameCategory))
         .filter((j) => matchesQuery(j, $renameQuery)),
       $renameSort

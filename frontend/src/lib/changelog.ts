@@ -14,6 +14,7 @@ export const changelog: ChangelogEntry[] = [
       "Fixed a bug where every TV show in your Plex library was flagged as \"Missing\" in scans. The Plex cache was silently discarding all TV entries every refresh (a key-matching bug that deleted TV rows the moment they were written), so nothing on the TV side ever had anything to match against. TV rows now persist — after this update, the next Plex cache refresh repopulates them.",
       "Redesigned the \"already in the library\" conflict row on the Renames page: instead of a long, cut-off line with raw byte counts, it now shows a compact badge plus a GB size chip — \"same size · 13.4 GB\" for a likely duplicate, or \"22.1 GB → 28.7 GB\" when the incoming file differs — with the full comparison one click away on Compare.",
       "Mobile: the Remux category is now selectable from the \"View & filters\" sheet (previously it was buried in the scan-options menu, so the phone only showed a look-alike resolution filter). The empty-state hint now names which filters are hiding items, \"Clear filters\" also resets the category, and a scan can't be started with every category turned off.",
+      "Renames: an item being applied no longer vanishes from a filtered tab mid-move — it stays visible with its progress bar while the rename/move runs, then settles into Applied when done.",
     ],
   },
   {
