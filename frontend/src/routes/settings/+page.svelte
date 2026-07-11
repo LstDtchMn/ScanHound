@@ -1453,23 +1453,23 @@
             </select>
           </label>
 
-          <label class=”flex items-center gap-3”>
-            <input type=”checkbox” checked={$settings.auto_rename_plex_sort_titles ?? false}
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.auto_rename_plex_sort_titles ?? false}
               onchange={(e) => settings.update((s) => ({ ...s, auto_rename_plex_sort_titles: e.currentTarget.checked }))}
-              class=”accent-[var(--accent)]” />
-            <span class=”text-sm”>Compute Plex sort titles (e.g. “Matrix, The”)</span>
+              class="accent-[var(--accent)]" />
+            <span class="text-sm">Compute Plex sort titles (e.g. “Matrix, The”)</span>
           </label>
 
-          <label class=”flex items-center gap-3”>
-            <input type=”checkbox” checked={$settings.auto_rename_movie_flat ?? false}
+          <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.auto_rename_movie_flat ?? false}
               onchange={(e) => settings.update((s) => ({ ...s, auto_rename_movie_flat: e.currentTarget.checked }))}
-              class=”accent-[var(--accent)]” />
-            <Tooltip text=”When on, a single-file movie is placed directly in the library folder (no per-movie subfolder). Split (multi-part) movies still get their own folder. TV shows are unaffected.”>
-              <span class=”text-sm cursor-help underline decoration-dotted”>Place movies directly in the library folder ⓘ</span>
+              class="accent-[var(--accent)]" />
+            <Tooltip text="When on, a single-file movie is placed directly in the library folder (no per-movie subfolder). Split (multi-part) movies still get their own folder. TV shows are unaffected.">
+              <span class="text-sm cursor-help underline decoration-dotted">Place movies directly in the library folder ⓘ</span>
             </Tooltip>
           </label>
 
-          <label class=”flex items-center gap-3”>
+          <label class="flex items-center gap-3">
             <input type="checkbox" checked={$settings.deletions_require_confirmation ?? true}
               onchange={(e) => settings.update((s) => ({ ...s, deletions_require_confirmation: e.currentTarget.checked }))}
               class="accent-[var(--accent)]" />
