@@ -112,6 +112,39 @@ def test_genre_filter_keeps_only_intersecting_items():
     assert {i["title"] for i in out} == {"A"}
 
 
+def test_filter_and_sort_genre_exclude_hides_matching_items():
+    a = _it(title="A", genres=["Comedy"])
+    b = _it(title="B", genres=["Reality"])
+    c = _it(title="C", genres=["Reality", "Comedy"])
+    d = _it(title="D", genres=[])
+    out = _filter_and_sort([a, b, c, d], genre_exclude=["Reality"])
+    assert {i["title"] for i in out} == {"A", "D"}
+
+
+def test_filter_and_sort_genre_include_and_exclude_combined():
+    a = _it(title="A", genres=["Comedy"])
+    b = _it(title="B", genres=["Comedy", "Reality"])
+    c = _it(title="C", genres=["Drama"])
+    out = _filter_and_sort([a, b, c], genre=["Comedy"], genre_exclude=["Reality"])
+    assert {i["title"] for i in out} == {"A"}
+
+
+def test_filter_and_sort_genre_exclude_never_hides_genre_less_items():
+    no_genres = _it(title="NoGenres", genres=[])
+    no_genres_key = _it(title="NoGenresKey")
+    del no_genres_key["genres"]
+    out = _filter_and_sort([no_genres, no_genres_key], genre_exclude=["Reality"])
+    assert {i["title"] for i in out} == {"NoGenres", "NoGenresKey"}
+
+
+def test_filter_and_sort_genre_include_only_regression_unchanged():
+    """Existing include-only behavior must be byte-identical."""
+    a = _it(title="A", genres=["Comedy"])
+    b = _it(title="B", genres=["Drama"])
+    out = _filter_and_sort([a, b], genre=["Comedy"])
+    assert [i["title"] for i in out] == ["A"]
+
+
 def test_language_filter_keeps_only_matching_language():
     fr = _it(title="F", language="French")
     en = _it(title="E", language="English")

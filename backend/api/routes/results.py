@@ -228,7 +228,7 @@ _SORT_KEYS = {
 
 
 def _filter_and_sort(items, *, filter=None, search=None, category=None,
-                     genre=None, language=None, quick=None, resolution=None,
+                     genre=None, genre_exclude=None, language=None, quick=None, resolution=None,
                      posted_after=None, posted_before=None,
                      sort="title", order="asc"):
     """Filter and sort items server-side.
@@ -239,6 +239,7 @@ def _filter_and_sort(items, *, filter=None, search=None, category=None,
         search: search in title
         category: list of enabled categories; shows unknowns + enabled
         genre: list of genres; item must have at least one
+        genre_exclude: list of genres; item must have NONE of these
         language: list of languages; item must match
         quick: list of quick filters ('4k', 'hdrdv', 'inplex')
         posted_after: "YYYY-MM-DD" string; inclusive lower bound on posted_date
@@ -272,6 +273,10 @@ def _filter_and_sort(items, *, filter=None, search=None, category=None,
     if genre:
         gset = set(genre)
         result = [i for i in result if any(g in gset for g in (i.get("genres") or []))]
+
+    if genre_exclude:
+        gxset = set(genre_exclude)
+        result = [i for i in result if not any(g in gxset for g in (i.get("genres") or []))]
 
     if language:
         lset = set(language)
@@ -367,6 +372,7 @@ class SelectAllRequest(BaseModel):
     search: Optional[str] = None
     category: Optional[str] = None
     genre: Optional[str] = None
+    genre_exclude: Optional[str] = None
     language: Optional[str] = None
     quick: Optional[str] = None
     resolution: Optional[str] = None
@@ -441,6 +447,7 @@ def _shape_results(
     reg: ServiceRegistry,
     category: Optional[List[str]] = None,
     genre: Optional[List[str]] = None,
+    genre_exclude: Optional[List[str]] = None,
     language: Optional[List[str]] = None,
     quick: Optional[List[str]] = None,
     resolution: Optional[List[str]] = None,
@@ -510,6 +517,7 @@ def _shape_results(
 
     items = _filter_and_sort(
         items, filter=filter, search=search, category=category, genre=genre,
+        genre_exclude=genre_exclude,
         language=language, quick=quick, resolution=resolution,
         posted_after=posted_after,
         posted_before=posted_before, sort=sort, order=order,
@@ -641,6 +649,7 @@ def get_results(
     per_page: int = Query(100, ge=1, le=500),
     category: Optional[str] = Query(None),
     genre: Optional[str] = Query(None),
+    genre_exclude: Optional[str] = Query(None),
     language: Optional[str] = Query(None),
     quick: Optional[str] = Query(None),
     resolution: Optional[str] = Query(None, description="Resolution/type facet CSV: 4K,1080p,TV (OR)"),
@@ -655,7 +664,7 @@ def get_results(
     return _shape_results(
         items, filter=filter, search=search, sort=sort, order=order,
         page=page, per_page=per_page, include_dismissed=include_dismissed, reg=reg,
-        category=_csv(category), genre=_csv(genre), language=_csv(language),
+        category=_csv(category), genre=_csv(genre), genre_exclude=_csv(genre_exclude), language=_csv(language),
         quick=_csv(quick), resolution=_csv(resolution), posted_after=posted_after, posted_before=posted_before,
     )
 
@@ -670,6 +679,7 @@ def get_cached_results(
     per_page: int = Query(100, ge=1, le=500),
     category: Optional[str] = Query(None),
     genre: Optional[str] = Query(None),
+    genre_exclude: Optional[str] = Query(None),
     language: Optional[str] = Query(None),
     quick: Optional[str] = Query(None),
     resolution: Optional[str] = Query(None, description="Resolution/type facet CSV: 4K,1080p,TV (OR)"),
@@ -690,7 +700,7 @@ def get_cached_results(
     return _shape_results(
         items, filter=filter, search=search, sort=sort, order=order,
         page=page, per_page=per_page, include_dismissed=include_dismissed, reg=reg,
-        category=_csv(category), genre=_csv(genre), language=_csv(language),
+        category=_csv(category), genre=_csv(genre), genre_exclude=_csv(genre_exclude), language=_csv(language),
         quick=_csv(quick), resolution=_csv(resolution), posted_after=posted_after, posted_before=posted_before,
         extra={"source": "cache", "last_updated": last_updated},
         include_facets=True,
@@ -727,7 +737,7 @@ def select_all(req: Optional[SelectAllRequest] = None,
     items, _ = _load_items("cache" if req.source == "cache" else "live", reg)
     matched = _filter_and_sort(
         items, filter=req.filter, search=req.search, category=_csv(req.category),
-        genre=_csv(req.genre), language=_csv(req.language), quick=_csv(req.quick),
+        genre=_csv(req.genre), genre_exclude=_csv(req.genre_exclude), language=_csv(req.language), quick=_csv(req.quick),
         resolution=_csv(req.resolution),
         posted_after=posted_after, posted_before=posted_before,
     )
