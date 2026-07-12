@@ -108,6 +108,7 @@ class ServiceRegistry:
     _background_scanner: Any = None
     _rename_service: Any = None
     _plex_metadata_scan_job: Any = None
+    _plex_metadata_scan_job_lock: threading.Lock = field(default_factory=threading.Lock)
     _shutdown_event: threading.Event = field(default_factory=threading.Event)
     # Auth nonce — generated on startup, validated by middleware.
     # If SCANHOUND_AUTH_NONCE env var is set, use that (Tauri passes it).
@@ -152,17 +153,29 @@ class ServiceRegistry:
 
     @property
     def plex_metadata_scan_job(self):
+        """Normally constructed eagerly in ``_init_services`` (backend.api.main),
+        alongside every sibling service, precisely so this property never has
+        to build one on the fly under concurrent request threads. The
+        lock-guarded lazy fallback below only matters for callers that build a
+        ``ServiceRegistry`` without going through ``_init_services`` (e.g.
+        ad-hoc scripts/tests) — it double-checks under a dedicated lock so two
+        threads racing a true first-ever access can't each construct their own
+        instance (which would defeat both the max-2-worker concurrency cap and
+        the job's own start() re-entrancy lock, since those live per-instance).
+        """
         if self._plex_metadata_scan_job is None:
-            from backend.plex_metadata_scan import PlexMetadataScanJob
-            from backend.api.ws import ws_manager
+            with self._plex_metadata_scan_job_lock:
+                if self._plex_metadata_scan_job is None:
+                    from backend.plex_metadata_scan import PlexMetadataScanJob
+                    from backend.api.ws import ws_manager
 
-            def _broadcast(status_dict):
-                ws_manager.broadcast_sync({
-                    "type": "plex:metadata_scan_progress",
-                    "data": status_dict,
-                })
+                    def _broadcast(status_dict):
+                        ws_manager.broadcast_sync({
+                            "type": "plex:metadata_scan_progress",
+                            "data": status_dict,
+                        })
 
-            self._plex_metadata_scan_job = PlexMetadataScanJob(self.db, progress_cb=_broadcast)
+                    self._plex_metadata_scan_job = PlexMetadataScanJob(self.db, progress_cb=_broadcast)
         return self._plex_metadata_scan_job
 
     def request_shutdown(self):

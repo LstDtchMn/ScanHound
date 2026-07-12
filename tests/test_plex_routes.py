@@ -9,12 +9,13 @@ from backend.api.dependencies import registry
 
 @pytest.fixture(autouse=True)
 def _reset_metadata_scan_job():
-    """Reset the module-level registry's lazily-built scan job between tests.
+    """Reset the module-level registry's scan job between tests.
 
     The registry is a module-level singleton; each test's `client` fixture
-    creates a fresh app (and therefore a fresh reg.db), but a previously
-    constructed `_plex_metadata_scan_job` would keep pointing at a stale db
-    and stale in-progress state unless cleared here.
+    creates a fresh app (and therefore a fresh reg.db) via `create_app`,
+    which eagerly (re)constructs `_plex_metadata_scan_job` in `_init_services`
+    -- but a previously constructed instance would keep pointing at a stale
+    db and stale in-progress state unless cleared here first.
     """
     yield
     registry._plex_metadata_scan_job = None

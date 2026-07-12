@@ -204,7 +204,11 @@ def plex_scan_metadata(
     job = reg.plex_metadata_scan_job
     started = job.start(targets)
     if not started:
-        return {"status": "already_running", **job.status_dict()}
+        # job.status_dict() carries its own "status" key (e.g. "running") —
+        # it must be spread first so the "already_running" sentinel below
+        # wins in the merged dict, letting callers tell "this POST was a
+        # no-op" apart from a normal in-progress status poll.
+        return {**job.status_dict(), "status": "already_running"}
     return {"status": "starting", "total": len(targets)}
 
 

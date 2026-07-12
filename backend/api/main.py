@@ -199,6 +199,25 @@ def _init_services(
     from backend.rename.service import RenameService
     reg._rename_service = RenameService(reg)
 
+    # Plex library metadata scan job — constructed eagerly (like every other
+    # service above) rather than lazily on first property access. The lazy
+    # form raced: two concurrent sync-route requests hitting the property for
+    # the very first time could both pass the "is None" check before either
+    # assignment landed, yielding two independent job instances (each with
+    # its own bounded ThreadPoolExecutor) and defeating both the max-2-worker
+    # concurrency cap and the job's own start() re-entrancy lock.
+    from backend.plex_metadata_scan import PlexMetadataScanJob
+    from backend.api.ws import ws_manager as _ws_manager
+
+    def _broadcast_metadata_scan_progress(status_dict):
+        _ws_manager.broadcast_sync({
+            "type": "plex:metadata_scan_progress",
+            "data": status_dict,
+        })
+
+    reg._plex_metadata_scan_job = PlexMetadataScanJob(
+        reg.db, progress_cb=_broadcast_metadata_scan_progress)
+
     # Crash recovery: any job left in the transient 'applying' state (process
     # died mid-move) is reset to 'matched' so it can be retried. The move is
     # crash-safe, so this never risks a half-applied file.
