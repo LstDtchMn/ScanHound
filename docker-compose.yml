@@ -63,33 +63,29 @@ services:
       - "R:/:/library/plex-source/r-4k-rickover:ro"
       - "U:/:/library/plex-source/u-4k-ulysses-yuri-gagarin-bu:ro"
       - "W:/:/library/plex-source/w-1080p-walter-white:ro"
-      # NAS shares (\\TURTLELANDSRV2\...) are NOT mounted -- confirmed by
-      # direct testing (2026-07-12) that Docker Desktop cannot bind-mount
-      # them via any compose route tried: raw UNC in short-form syntax
-      # ("...is not a valid Windows path"), raw UNC in long-form `type: bind`
-      # syntax (same error, same validator), and even an EXISTING persistent
-      # net-use drive-letter mapping to one of these shares (Y: ->
-      # \\TURTLELANDSRV2\4K HDR Geronimo, mapped and working from an
-      # interactive session) -- Docker's backend service runs in a different
-      # session context and can't resolve it ("mkdir Y:\: cannot find path").
-      # Reaching these 8 shares (~6,084 movies, ~37.8% of the library) needs
-      # either explicitly allow-listing them in Docker Desktop's file-sharing
-      # settings, or mounting them natively inside the WSL2 VM (e.g. a CIFS
-      # mount) and bind-mounting that WSL2-native path instead -- both are
-      # real host-configuration changes beyond docker-compose itself.
-      # Covers: \\TURTLELANDSRV2\1080p John Paul Jones, 1080p Lincoln,
-      # 1080p Faraday, 1080p Icarus, 1080p Nathan Hale,
-      # 1080p Picasso aka Newton, 4K HDR Geronimo, 4K Magellan.
       - "G:/Movies 1:/library/plex-source/g-movies-1:ro"
-      # NAS shares (\\TURTLELANDSRV2\...) are NOT mounted here -- Docker
-      # Desktop's compose short-form volume syntax rejected the raw UNC path
-      # ("...is not a valid Windows path", a Docker Desktop path-validator
-      # limitation, not a syntax typo). These need the share mapped to a
-      # local drive letter on the host first, then mounted like the entries
-      # above. Deferred pending that host-side step. Covers (when added):
-      # \\TURTLELANDSRV2\1080p John Paul Jones, 1080p Lincoln, 1080p Faraday,
-      # 1080p Icarus, 1080p Nathan Hale, 1080p Picasso aka Newton,
-      # 4K HDR Geronimo, 4K Magellan.
+      # NAS shares (\\TURTLELANDSRV2\...). Docker Desktop cannot bind-mount a
+      # raw UNC path directly (confirmed 2026-07-12: rejected in both compose
+      # short-form and long-form syntax, "...is not a valid Windows path" --
+      # a real validator bug/limitation, not a syntax issue -- and even an
+      # EXISTING working net-use drive-letter mapping fails too, since
+      # Docker's backend runs in a different session context than net-use
+      # mappings live in). Workaround: each share is mounted directly inside
+      # the docker-desktop WSL2 distro itself via `mount -t drvfs`, which
+      # uses the same transparent Windows auth Explorer already has (no
+      # credentials needed) and produces a plain Linux path Docker CAN bind
+      # from, since it never goes through the broken Windows-path validator.
+      # NOT PERSISTENT ACROSS A DOCKER DESKTOP / HOST RESTART on its own --
+      # see scripts/host-detector/mount-nas-shares.ps1 and the matching
+      # Scheduled Task that re-establishes these on startup/logon.
+      - "/mnt/nas/nas-1080p-john-paul-jones:/library/plex-source/nas-1080p-john-paul-jones:ro"
+      - "/mnt/nas/nas-1080p-lincoln:/library/plex-source/nas-1080p-lincoln:ro"
+      - "/mnt/nas/nas-1080p-faraday:/library/plex-source/nas-1080p-faraday:ro"
+      - "/mnt/nas/nas-1080p-icarus:/library/plex-source/nas-1080p-icarus:ro"
+      - "/mnt/nas/nas-1080p-nathan-hale:/library/plex-source/nas-1080p-nathan-hale:ro"
+      - "/mnt/nas/nas-1080p-picasso-aka-newton:/library/plex-source/nas-1080p-picasso-aka-newton:ro"
+      - "/mnt/nas/nas-4k-hdr-geronimo:/library/plex-source/nas-4k-hdr-geronimo:ro"
+      - "/mnt/nas/nas-4k-magellan:/library/plex-source/nas-4k-magellan:ro"
       # crawler.db lives on a Docker-managed named volume (native VM ext4), NOT
       # the ./data bind mount: SQLite WAL's shared-memory index cannot be
       # mmap'd correctly across the Docker-for-Windows bind-mount proxy, which
