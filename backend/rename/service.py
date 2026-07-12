@@ -1393,6 +1393,7 @@ class RenameService:
             try:
                 if os.path.samefile(src, dst):
                     db.update_rename_job(job_id, status="applied", processed_at=_now(),
+                                         archived_at=_now(),
                                          conflict_kind=None, conflict_same_size=None,
                                          conflict_existing_size=None, conflict_incoming_size=None)
                     self._broadcast(job_id)
@@ -1500,7 +1501,7 @@ class RenameService:
         try:
             db.update_rename_job(job_id, status="applied", move_method=used,
                                  processed_at=_now(), plex_sort_title=sort_title,
-                                 error_message=None,
+                                 error_message=None, archived_at=_now(),
                                  conflict_kind=None, conflict_same_size=None,
                                  conflict_existing_size=None, conflict_incoming_size=None)
         except Exception as e:

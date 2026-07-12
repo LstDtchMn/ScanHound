@@ -647,6 +647,12 @@ class DatabaseManager:
                     # duplicate match (a different path than the incoming
                     # job's own destination) can be ffprobed directly.
                     'ALTER TABLE plex_cache ADD COLUMN file_path TEXT',
+                    # Archiving is orthogonal to status: a nullable timestamp,
+                    # not a new status value. NULL = active (default,
+                    # excluded-by-default list_rename_jobs behavior); non-NULL
+                    # = archived (set automatically on apply success, or
+                    # manually via bulk archive/unarchive).
+                    'ALTER TABLE rename_jobs ADD COLUMN archived_at TIMESTAMP',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -2190,6 +2196,7 @@ class DatabaseManager:
         "suggested_correction", "combined_episode", "split_file", "poster_path",
         "match_reasons", "prior_status", "conflict_kind", "conflict_same_size",
         "conflict_existing_size", "conflict_incoming_size", "conflict_analysis",
+        "archived_at",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.
@@ -2277,16 +2284,25 @@ class DatabaseManager:
             "SELECT * FROM rename_jobs WHERE id = ?", (job_id,), default=[])
         return self._deserialize_rename_row(rows[0]) if rows else None
 
-    def list_rename_jobs(self, status=None, limit=200):
-        """Return rename jobs (optionally filtered by status), newest first."""
+    def list_rename_jobs(self, status=None, limit=200, archived=False):
+        """Return rename jobs (optionally filtered by status), newest first.
+
+        ``archived`` defaults to False so every existing/not-yet-updated
+        caller keeps excluding archived rows exactly as before this column
+        existed. Archiving is orthogonal to status: archived=True returns
+        archived rows of ANY status when no status filter is also given.
+        """
+        conditions = []
+        params = []
         if status:
-            rows = self._query_dicts(
-                "SELECT * FROM rename_jobs WHERE status = ? "
-                "ORDER BY detected_at DESC LIMIT ?", (status, limit), default=[])
-        else:
-            rows = self._query_dicts(
-                "SELECT * FROM rename_jobs ORDER BY detected_at DESC LIMIT ?",
-                (limit,), default=[])
+            conditions.append("status = ?")
+            params.append(status)
+        conditions.append("archived_at IS NOT NULL" if archived else "archived_at IS NULL")
+        where = " WHERE " + " AND ".join(conditions)
+        params.append(limit)
+        rows = self._query_dicts(
+            f"SELECT * FROM rename_jobs{where} ORDER BY detected_at DESC LIMIT ?",
+            tuple(params), default=[])
         return [self._deserialize_rename_row(r) for r in (rows or [])]
 
     def reset_applying_rename_jobs(self):
@@ -2336,6 +2352,70 @@ class DatabaseManager:
             "SELECT 1 FROM rename_jobs WHERE original_path = ? LIMIT 1",
             (original_path,), one=True, default=None)
         return row is not None
+
+    def archive_rename_jobs(self, job_ids):
+        """Archive the given jobs (set archived_at to now), skipping any job
+        whose status is 'applying' (the transient mid-move state) and any
+        already-archived job. One in-flight job in the batch never blocks
+        archiving the rest. Returns the number of rows actually archived."""
+        ids = [int(i) for i in (job_ids or []) if i is not None]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return 0
+                cur = conn.cursor()
+                cur.execute(
+                    f"UPDATE rename_jobs SET archived_at = ? "
+                    f"WHERE id IN ({placeholders}) AND status != 'applying' "
+                    f"AND archived_at IS NULL",
+                    (now, *ids))
+                archived = cur.rowcount
+                conn.commit()
+            return archived
+        except Exception as e:
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            logger.error("DB Error (archive_rename_jobs): %s", e)
+            return 0
+
+    def unarchive_rename_jobs(self, job_ids):
+        """Clear archived_at for the given jobs. Returns the number of rows
+        actually unarchived."""
+        ids = [int(i) for i in (job_ids or []) if i is not None]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return 0
+                cur = conn.cursor()
+                cur.execute(
+                    f"UPDATE rename_jobs SET archived_at = NULL "
+                    f"WHERE id IN ({placeholders}) AND archived_at IS NOT NULL",
+                    tuple(ids))
+                unarchived = cur.rowcount
+                conn.commit()
+            return unarchived
+        except Exception as e:
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            logger.error("DB Error (unarchive_rename_jobs): %s", e)
+            return 0
 
     def delete_rename_job(self, job_id):
         """Delete a rename job row."""

@@ -1019,6 +1019,46 @@ class TestApplyUndo:
         # And the row is recorded as failed, not stuck on its old status.
         assert db.get_rename_job(jid)["status"] == "failed"
 
+    def test_apply_sets_archived_at_on_success(self, db, tmp_path):
+        """Guards the main move-success path (service.py ~line 1501): every
+        job that reaches status='applied' via the normal move must be
+        auto-archived in the same update, unconditionally."""
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+        out = svc.apply(jid)
+        assert out["ok"] is True
+        job = db.get_rename_job(jid)
+        assert job["status"] == "applied"
+        assert job["archived_at"] is not None
+
+    def test_apply_sets_archived_at_on_already_applied_samefile_noop(self, db, tmp_path):
+        """Guards the OTHER success path (service.py ~line 1395): re-applying
+        a job whose file is already hardlinked/placed at the exact
+        destination (os.path.samefile(src, dst) is True) is a no-op success,
+        not a conflict -- that path sets status='applied' independently of
+        the main move path and must independently set archived_at too."""
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        # hardlink (not move) so src survives the first apply and remains the
+        # same inode as dst -> the second apply hits the samefile branch
+        # instead of "source file missing".
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_move_method="hardlink")
+        jid = svc.process_package("pkg", save_to)[0]
+        assert svc.apply(jid)["ok"] is True
+        # apply() short-circuits to a no-op {"ok": True} for an already-
+        # "applied" job before it ever reaches the samefile check, so reset
+        # status to reach that branch (e.g. a stale in-flight state after a
+        # crash), as if the job hadn't been recorded applied yet.
+        db.update_rename_job(jid, status="matched")
+        out = svc.apply(jid)  # same src already at dst -> samefile no-op
+        assert out.get("already") is True
+        job = db.get_rename_job(jid)
+        assert job["status"] == "applied"
+        assert job["archived_at"] is not None
+
 
 # ── Transfer speed indicator ────────────────────────────────────────────
 

@@ -253,6 +253,69 @@ class TestDismissedItems:
         assert [tuple(r) for r in db_manager.get_dismissed_title_quality()] == [("heat|1995", "4K", 1)]
 
 
+class TestArchiveRenameJobs:
+    """archived_at is orthogonal to status: a nullable column, not a new
+    status value. list_rename_jobs() defaults to excluding archived rows."""
+
+    def _make_job(self, db_manager, **overrides):
+        job = {
+            "original_path": overrides.get("original_path", "/downloads/Movie.mkv"),
+            "status": overrides.get("status", "matched"),
+            "title": "Movie",
+        }
+        return db_manager.create_rename_job(job)
+
+    def test_list_rename_jobs_default_excludes_archived(self, db_manager):
+        jid = self._make_job(db_manager)
+        db_manager.archive_rename_jobs([jid])
+        assert db_manager.list_rename_jobs() == []
+
+    def test_list_rename_jobs_archived_true_returns_only_archived(self, db_manager):
+        active_id = self._make_job(db_manager, original_path="/downloads/Active.mkv")
+        archived_id = self._make_job(db_manager, original_path="/downloads/Archived.mkv")
+        db_manager.archive_rename_jobs([archived_id])
+        archived_jobs = db_manager.list_rename_jobs(archived=True)
+        assert [j["id"] for j in archived_jobs] == [archived_id]
+
+    def test_archive_rename_jobs_sets_archived_at(self, db_manager):
+        jid = self._make_job(db_manager)
+        count = db_manager.archive_rename_jobs([jid])
+        assert count == 1
+        job = db_manager.get_rename_job(jid)
+        assert job["archived_at"] is not None
+
+    def test_archive_rename_jobs_skips_applying_status(self, db_manager):
+        jid = self._make_job(db_manager, status="applying")
+        count = db_manager.archive_rename_jobs([jid])
+        assert count == 0
+        job = db_manager.get_rename_job(jid)
+        assert job["archived_at"] is None
+
+    def test_archive_rename_jobs_mixed_batch_archives_the_rest(self, db_manager):
+        applying_id = self._make_job(db_manager, original_path="/downloads/A.mkv", status="applying")
+        matched_id = self._make_job(db_manager, original_path="/downloads/B.mkv", status="matched")
+        count = db_manager.archive_rename_jobs([applying_id, matched_id])
+        assert count == 1
+        assert db_manager.get_rename_job(applying_id)["archived_at"] is None
+        assert db_manager.get_rename_job(matched_id)["archived_at"] is not None
+
+    def test_unarchive_rename_jobs_clears_archived_at(self, db_manager):
+        jid = self._make_job(db_manager)
+        db_manager.archive_rename_jobs([jid])
+        count = db_manager.unarchive_rename_jobs([jid])
+        assert count == 1
+        assert db_manager.get_rename_job(jid)["archived_at"] is None
+
+    def test_archive_rename_jobs_empty_list_is_a_noop(self, db_manager):
+        assert db_manager.archive_rename_jobs([]) == 0
+        assert db_manager.unarchive_rename_jobs([]) == 0
+
+    def test_path_has_rename_job_still_matches_archived_rows(self, db_manager):
+        jid = self._make_job(db_manager, original_path="/downloads/Kept.mkv")
+        db_manager.archive_rename_jobs([jid])
+        assert db_manager.path_has_rename_job("/downloads/Kept.mkv") is True
+
+
 class TestDownloadHistory:
 
     def test_add_and_check_history(self, db_manager):
