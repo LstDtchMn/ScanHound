@@ -8,6 +8,7 @@
   import ServerConnection from '$lib/components/ServerConnection.svelte';
   import ChangePassword from '$lib/components/ChangePassword.svelte';
   import Tooltip from '$lib/components/Tooltip.svelte';
+  import PlexMetadataScanPanel from '$lib/components/settings/PlexMetadataScanPanel.svelte';
   import { serverUrl } from '$lib/stores/server';
   import { onMount } from 'svelte';
   import type { BackgroundStatus } from '$lib/api/types';
@@ -570,6 +571,9 @@
             </button>
           </div>
         </div>
+
+        <!-- Library Metadata Scan card -->
+        <PlexMetadataScanPanel />
 
         <!-- Library Assignment card -->
         <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">

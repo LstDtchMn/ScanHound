@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, PlexMetadataScanStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -183,6 +183,15 @@ export const api = {
     }),
   plexStats: () => request<Record<string, number>>('/plex/stats'),
   plexRefresh: () => request('/plex/refresh', { method: 'POST' }),
+  // Bulk library metadata scan (probe_specs + DV FEL/MEL) -- movies only.
+  plexScanMetadata: (scope: 'all' | 'selected', ids?: string[]) =>
+    request<{ status: string; total?: number }>('/plex/scan-metadata', {
+      method: 'POST',
+      body: JSON.stringify({ scope, ids: ids ?? null })
+    }),
+  plexScanMetadataCancel: () =>
+    request<{ status: string }>('/plex/scan-metadata/cancel', { method: 'POST' }),
+  plexScanMetadataStatus: () => request<PlexMetadataScanStatus>('/plex/scan-metadata/status'),
 
   // Downloads
   download: (url: string, title: string, serviceType = 'Rapidgator', year?: number | null,

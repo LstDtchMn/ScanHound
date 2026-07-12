@@ -178,6 +178,19 @@ export interface PlexStatus {
   tv_count: number;
 }
 
+/** Live status of the bulk Plex-library metadata scan job
+ *  (backend/plex_metadata_scan.py). Polled via GET /plex/scan-metadata/status
+ *  and pushed on every state change over the plex:metadata_scan_progress WS event. */
+export interface PlexMetadataScanStatus {
+  status: 'idle' | 'running' | 'cancelled' | 'done' | 'error';
+  processed: number;
+  total: number;
+  current_files: string[];
+  elapsed_seconds: number;
+  eta_seconds: number | null;
+  error: string | null;
+}
+
 export interface HealthResponse {
   status: string;
   version: string;
