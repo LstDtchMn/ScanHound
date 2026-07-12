@@ -156,3 +156,118 @@ def test_probe_specs_no_db_still_works_uncached(tmp_path):
          patch("subprocess.run", return_value=fake):
         s = mediainfo.probe_specs(str(f))  # db=None, existing default
     assert s["present"] is True
+
+
+# ── Task 1: richer audio profile detection + HDR10+ frame probe ───────────
+
+def test_probe_specs_detects_atmos_from_track_title(tmp_path):
+    f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+    stream_json = json.dumps({
+        "format": {"format_name": "matroska", "size": "1000", "duration": "60", "bit_rate": "1000"},
+        "streams": [
+            {"codec_type": "video", "codec_name": "hevc", "width": 3840, "height": 2160,
+             "color_transfer": "bt709"},
+            {"codec_type": "audio", "codec_name": "truehd", "channels": 8,
+             "channel_layout": "7.1", "tags": {"title": "TrueHD 7.1 Atmos"}},
+        ],
+    })
+    fake_stream = MagicMock(returncode=0, stdout=stream_json)
+    with patch("shutil.which", return_value="/usr/bin/ffprobe"), \
+         patch("subprocess.run", return_value=fake_stream):
+        s = mediainfo.probe_specs(str(f))
+    assert s["audio_profile"] == "TrueHD 7.1 Atmos"
+
+def test_probe_specs_detects_dts_hd_profile(tmp_path):
+    f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+    stream_json = json.dumps({
+        "format": {"format_name": "matroska", "size": "1000", "duration": "60", "bit_rate": "1000"},
+        "streams": [
+            {"codec_type": "video", "codec_name": "hevc", "width": 1920, "height": 1080},
+            {"codec_type": "audio", "codec_name": "dts", "channels": 6,
+             "channel_layout": "5.1", "profile": "DTS-HD MA"},
+        ],
+    })
+    fake_stream = MagicMock(returncode=0, stdout=stream_json)
+    with patch("shutil.which", return_value="/usr/bin/ffprobe"), \
+         patch("subprocess.run", return_value=fake_stream):
+        s = mediainfo.probe_specs(str(f))
+    assert "DTS-HD MA" in (s["audio_profile"] or "")
+
+def test_probe_specs_no_atmos_no_special_profile_returns_none_audio_profile(tmp_path):
+    f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+    stream_json = json.dumps({
+        "format": {"format_name": "matroska", "size": "1000", "duration": "60", "bit_rate": "1000"},
+        "streams": [
+            {"codec_type": "video", "codec_name": "hevc", "width": 1920, "height": 1080},
+            {"codec_type": "audio", "codec_name": "aac", "channels": 2, "channel_layout": "stereo"},
+        ],
+    })
+    fake_stream = MagicMock(returncode=0, stdout=stream_json)
+    with patch("shutil.which", return_value="/usr/bin/ffprobe"), \
+         patch("subprocess.run", return_value=fake_stream):
+        s = mediainfo.probe_specs(str(f))
+    assert s["audio_profile"] is None
+
+def test_probe_specs_detects_hdr10_plus_via_frame_probe(tmp_path):
+    f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+    stream_json = json.dumps({
+        "format": {"format_name": "matroska", "size": "1000", "duration": "60", "bit_rate": "1000"},
+        "streams": [
+            {"codec_type": "video", "codec_name": "hevc", "width": 3840, "height": 2160,
+             "color_transfer": "smpte2084"},
+            {"codec_type": "audio", "codec_name": "eac3", "channels": 6, "channel_layout": "5.1"},
+        ],
+    })
+    frame_json = json.dumps({
+        "frames": [{"side_data_list": [
+            {"side_data_type": "Mastering display metadata"},
+            {"side_data_type": "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"},
+        ]}]
+    })
+    fake_stream = MagicMock(returncode=0, stdout=stream_json)
+    fake_frame = MagicMock(returncode=0, stdout=frame_json)
+    with patch("shutil.which", return_value="/usr/bin/ffprobe"), \
+         patch("subprocess.run", side_effect=[fake_stream, fake_frame]):
+        s = mediainfo.probe_specs(str(f))
+    assert s["hdr"] == "HDR10+"
+
+def test_probe_specs_plain_hdr10_stays_hdr10_when_no_hdr10_plus_metadata(tmp_path):
+    f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+    stream_json = json.dumps({
+        "format": {"format_name": "matroska", "size": "1000", "duration": "60", "bit_rate": "1000"},
+        "streams": [
+            {"codec_type": "video", "codec_name": "hevc", "width": 3840, "height": 2160,
+             "color_transfer": "smpte2084"},
+            {"codec_type": "audio", "codec_name": "eac3", "channels": 6, "channel_layout": "5.1"},
+        ],
+    })
+    frame_json = json.dumps({"frames": [{"side_data_list": []}]})
+    fake_stream = MagicMock(returncode=0, stdout=stream_json)
+    fake_frame = MagicMock(returncode=0, stdout=frame_json)
+    with patch("shutil.which", return_value="/usr/bin/ffprobe"), \
+         patch("subprocess.run", side_effect=[fake_stream, fake_frame]):
+        s = mediainfo.probe_specs(str(f))
+    assert s["hdr"] == "HDR10"
+
+def test_probe_specs_dolby_vision_skips_frame_probe_entirely(tmp_path):
+    """DV outranks/precludes an HDR10+ frame-probe call — only ONE subprocess.run
+    should fire when the stream-level probe already found DOVI side_data."""
+    f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+    fake_stream = MagicMock(returncode=0, stdout=FFPROBE_JSON)  # existing DV fixture
+    with patch("shutil.which", return_value="/usr/bin/ffprobe"), \
+         patch("subprocess.run", return_value=fake_stream) as mock_run:
+        s = mediainfo.probe_specs(str(f))
+    assert s["hdr"] == "Dolby Vision"
+    assert mock_run.call_count == 1  # frame probe was skipped
+
+def test_probe_specs_parses_ffprobe_still_passes_with_frame_probe_added(tmp_path):
+    """Regression: the ORIGINAL fixture/test (single-mock, no 'frames' key) must
+    keep passing once a second subprocess.run call exists in probe_specs — the
+    frame-probe path must tolerate a stream-shaped mock gracefully."""
+    f = tmp_path / "movie.mkv"; f.write_bytes(b"x")
+    fake = MagicMock(returncode=0, stdout=FFPROBE_JSON)
+    with patch("shutil.which", return_value="/usr/bin/ffprobe"), \
+         patch("subprocess.run", return_value=fake):
+        s = mediainfo.probe_specs(str(f))
+    assert s["present"] is True
+    assert s["hdr"] == "Dolby Vision"  # DV path — frame probe skipped, no crash

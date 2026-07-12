@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from typing import Optional
@@ -18,6 +19,9 @@ _CODEC_LABEL = {"hevc": "HEVC", "h265": "HEVC", "avc": "H.264", "h264": "H.264",
                 "av1": "AV1", "vc1": "VC-1", "mpeg2video": "MPEG-2"}
 _AUDIO_LABEL = {"truehd": "TrueHD", "eac3": "EAC3", "ac3": "AC3", "dts": "DTS",
                 "aac": "AAC", "flac": "FLAC", "opus": "Opus"}
+
+_ATMOS_RE = re.compile(r"atmos", re.IGNORECASE)
+_DTS_HD_RE = re.compile(r"dts[-\s]?hd|dts[:\s]?x", re.IGNORECASE)
 
 # Per-axis tier thresholds (pixels → tier rank). A resolution tier is the
 # MAX of the width-derived and height-derived tier, so neither a horizontal
@@ -73,7 +77,7 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         return {"present": False, "path": path, "size_bytes": None,
                 "container": None, "duration_min": None, "bitrate": None,
                 "resolution": None, "video_codec": None, "hdr": None,
-                "dv_layer": None, "audio": None}
+                "dv_layer": None, "audio": None, "audio_profile": None}
     try:
         _st = os.stat(path)
         disk_mtime, disk_size = _st.st_mtime, _st.st_size
@@ -140,11 +144,52 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         elif ct in ("arib-std-b67", "bt2020-10", "bt2020-12"):
             hdr = "HLG"
 
+    # HDR10+ requires a SEPARATE frame-level probe — the stream-level probe
+    # never surfaces it (it's a per-frame dynamic-metadata side_data, not a
+    # stream-level field). Only run it when the stream-level probe already
+    # found plain HDR10 (PQ transfer) and DV wasn't already detected — a DV
+    # file's hdr stays "Dolby Vision" and never needs this extra call.
+    if hdr == "HDR10":
+        try:
+            fr = subprocess.run(
+                [ffprobe, "-v", "quiet", "-print_format", "json",
+                 "-show_frames", "-read_intervals", "%+#1",
+                 "-select_streams", "v:0", path],
+                capture_output=True, text=True, timeout=timeout)
+            if fr.returncode == 0:
+                frame_data = json.loads(fr.stdout)
+                frames = frame_data.get("frames") or []
+                for fr_entry in frames:
+                    for sd in (fr_entry.get("side_data_list") or []):
+                        sdt = str(sd.get("side_data_type", ""))
+                        if "HDR10+" in sdt or "SMPTE2094-40" in sdt:
+                            hdr = "HDR10+"
+                            break
+                    if hdr == "HDR10+":
+                        break
+        except Exception:
+            pass  # frame probe failure must never fail the whole probe — stays plain HDR10
+
     acodec = _AUDIO_LABEL.get(str(audio.get("codec_name") or "").lower(),
                               (audio.get("codec_name") or None))
     chans = audio.get("channel_layout") or (
         f"{audio.get('channels')}ch" if audio.get("channels") else None)
     audio_label = f"{acodec} {chans}".strip() if acodec else None
+
+    # Richer audio-profile detection: Atmos/DTS-HD sub-profile signal lives
+    # in the audio stream's tags.title (e.g. "TrueHD 7.1 Atmos") and
+    # sometimes the profile field — NOT reliably in codec_name alone.
+    audio_signal = f"{acodec or ''} {(audio.get('profile') or '')} {((audio.get('tags') or {}).get('title') or '')}"
+    audio_profile = None
+    if _ATMOS_RE.search(audio_signal):
+        base = acodec or "Audio"
+        audio_profile = f"{base} {chans} Atmos".strip() if chans else f"{base} Atmos"
+    elif _DTS_HD_RE.search(audio_signal):
+        # Prefer the real profile string when ffprobe supplied one (e.g. "DTS-HD MA");
+        # otherwise fall back to a generic label.
+        audio_profile = (audio.get("profile") or "DTS-HD").strip()
+        if chans:
+            audio_profile = f"{audio_profile} {chans}"
 
     result = {
         "present": True, "path": path, "size_bytes": size,
@@ -152,7 +197,7 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         "duration_min": duration_min, "bitrate": bitrate,
         "resolution": resolution, "video_codec": vcodec, "hdr": hdr,
         "dv_layer": _cached_dv_layer(path, disk_mtime, disk_size, db),
-        "audio": audio_label,
+        "audio": audio_label, "audio_profile": audio_profile,
     }
     if db is not None and disk_mtime is not None:
         try:
