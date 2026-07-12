@@ -31,7 +31,16 @@
       .filter(Boolean)
       .join(' ')
   );
-  let canApply = $derived(job.status === 'matched' || job.status === 'needs_review');
+  // An archived job (job.archived_at set) is read-only in the active-queue
+  // sense -- the only intended path back into an actionable state is
+  // BulkBar's Unarchive. Without this guard, RenameRow renders identically
+  // whether it's fed by $renameJobs (active) or $archivedRenameJobs (the
+  // Archived tab -- see +page.svelte's `shown`), so this same "Apply"
+  // button would otherwise stay live for an archived 'matched'/'needs_review'
+  // row and genuinely move the file with no refresh of the Archived store.
+  let canApply = $derived(
+    (job.status === 'matched' || job.status === 'needs_review') && !job.archived_at
+  );
   let applying = $derived(job.status === 'applying');
   let prog = $derived($renameProgress.get(job.id));
   // pct reaching 100 doesn't mean the job is done — the post-copy cold-cache

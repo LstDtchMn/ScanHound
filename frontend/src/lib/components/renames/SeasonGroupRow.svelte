@@ -14,11 +14,18 @@
 
   let expanded = $state(false);
   let summary = $derived(seasonSummary(jobs));
-  let applyDisabled = $derived($bulkBusy || $applyActive || summary.matched === 0);
+  // `jobs` here is always homogenous in archived-ness -- +page.svelte's
+  // `shown` sources exclusively from either $archivedRenameJobs or
+  // $renameJobs, never a mix -- but check per-job defensively rather than
+  // lean on that invariant: an archived season (all its jobs archived_at
+  // set) must not offer a live "Apply all" that bypasses the Archived tab's
+  // read-only-until-Unarchive design.
+  let allArchived = $derived(jobs.length > 0 && jobs.every((j) => j.archived_at));
+  let applyDisabled = $derived($bulkBusy || $applyActive || summary.matched === 0 || allArchived);
 
   function applyAll() {
     if (applyDisabled) return;
-    const ids = jobs.filter((j) => j.status === 'matched').map((j) => j.id);
+    const ids = jobs.filter((j) => j.status === 'matched' && !j.archived_at).map((j) => j.id);
     if (ids.length > 0) applyConfident(ids);
   }
 </script>

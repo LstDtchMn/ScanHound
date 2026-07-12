@@ -336,6 +336,9 @@
       {#each shown as job (job.id)}
         <div class="relative min-w-0" data-actions-menu>
           <RenameCard {job} {onRematch} />
+          {#if !job.archived_at}
+          <!-- Skipped for archived jobs -- see the matching comment on the
+               list-view "More actions" block below for why. -->
           <button
             class="absolute top-1.5 right-1.5 z-10 px-1.5 py-0.5 rounded text-[11px] font-medium bg-[var(--bg-secondary)]/90 border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
             aria-label="More actions for {job.original_filename ?? job.title ?? `job ${job.id}`}"
@@ -372,6 +375,7 @@
                 class="px-2.5 py-1 text-xs rounded-lg text-[var(--error)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50 text-left">Remove</button>
             </div>
           {/if}
+          {/if}
         </div>
       {/each}
     </div>
@@ -383,6 +387,16 @@
         {:else}
           {@const job = entry.job}
           <RenameRow {job} {onRematch} {onCompare} />
+          {#if !job.archived_at}
+          <!-- This whole "More actions" row is skipped for archived jobs: every
+               action it offers (Apply/Re-identify/Accept.../Undo/Remove) is a
+               mutation gated only on job.status, none of them archived-aware,
+               and none of their handlers (stores/renames.ts) refresh
+               archivedRenameJobs -- so acting on one here while viewing the
+               Archived tab would succeed server-side while that row silently
+               went stale until the tab was re-entered. Matches BulkBar's own
+               design for the Archived tab: the only supported action there is
+               bulk Unarchive. -->
           <li class="px-3 py-1 bg-[var(--bg-tertiary)]/30" data-actions-menu>
               <button
                 class="text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
@@ -421,6 +435,7 @@
                 </div>
               {/if}
             </li>
+          {/if}
         {/if}
       {/each}
     </ul>
