@@ -1346,3 +1346,53 @@ class TestPipelineVerdicts:
         count = conn.execute("SELECT COUNT(*) FROM pipeline_verdicts").fetchone()[0]
         assert count == 0
 
+
+# ---------------------------------------------------------------------------
+# Bookmarks (per-title, distinct from watchlist)
+# ---------------------------------------------------------------------------
+
+class TestBookmarks:
+
+    def test_add_bookmark_with_imdb_id_then_list(self, db_manager):
+        assert db_manager.add_bookmark("tt1234567", "Dune: Part Two", 2024, "movie") is True
+        bookmarks = db_manager.list_bookmarks()
+        assert len(bookmarks) == 1
+        assert bookmarks[0]["imdb_id"] == "tt1234567"
+        assert bookmarks[0]["title"] == "Dune: Part Two"
+
+    def test_add_bookmark_without_imdb_id_uses_title_key_fallback(self, db_manager):
+        assert db_manager.add_bookmark(None, "Some Obscure Show", 2020, "tv") is True
+        bookmarks = db_manager.list_bookmarks()
+        assert len(bookmarks) == 1
+        assert bookmarks[0]["imdb_id"] is None
+
+    def test_add_bookmark_same_imdb_id_twice_is_idempotent(self, db_manager):
+        db_manager.add_bookmark("tt1234567", "Dune: Part Two", 2024, "movie")
+        db_manager.add_bookmark("tt1234567", "Dune: Part Two (Remux)", 2024, "movie")
+        assert len(db_manager.list_bookmarks()) == 1
+
+    def test_add_bookmark_same_title_key_twice_is_idempotent(self, db_manager):
+        db_manager.add_bookmark(None, "Some Obscure Show", 2020, "tv")
+        db_manager.add_bookmark(None, "some obscure show", 2020, "tv")
+        assert len(db_manager.list_bookmarks()) == 1
+
+    def test_remove_bookmark_by_imdb_id(self, db_manager):
+        db_manager.add_bookmark("tt1234567", "Dune: Part Two", 2024, "movie")
+        assert db_manager.remove_bookmark("tt1234567", "Dune: Part Two", 2024, "movie") is True
+        assert db_manager.list_bookmarks() == []
+
+    def test_remove_bookmark_by_title_key_fallback(self, db_manager):
+        db_manager.add_bookmark(None, "Some Obscure Show", 2020, "tv")
+        assert db_manager.remove_bookmark(None, "Some Obscure Show", 2020, "tv") is True
+        assert db_manager.list_bookmarks() == []
+
+    def test_list_bookmark_keys_shape(self, db_manager):
+        db_manager.add_bookmark("tt1234567", "Dune: Part Two", 2024, "movie")
+        db_manager.add_bookmark(None, "Some Obscure Show", 2020, "tv")
+        keys = db_manager.list_bookmark_keys()
+        assert ("imdb", "tt1234567") in keys
+        assert any(k[0] == "title" and k[2] == 2020 and k[3] == "tv" for k in keys)
+
+    def test_remove_bookmark_nonexistent_returns_false(self, db_manager):
+        assert db_manager.remove_bookmark("tt9999999", "Nothing", 2000, "movie") is False
+

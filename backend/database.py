@@ -542,6 +542,29 @@ class DatabaseManager:
                     )
                 ''')
 
+                # Per-title bookmarks (distinct from watchlist -- this is for
+                # titles the user HAS already found and wants to remember, not
+                # titles being searched-for). title_key is normalize_title(title),
+                # stored so the fallback unique index doesn't need SQLite
+                # expression-index support across all deployed versions.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS bookmarks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        imdb_id TEXT,
+                        title TEXT NOT NULL,
+                        title_key TEXT NOT NULL,
+                        year INTEGER,
+                        media_type TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                cursor.execute(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS idx_bookmarks_imdb '
+                    'ON bookmarks(imdb_id) WHERE imdb_id IS NOT NULL')
+                cursor.execute(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS idx_bookmarks_title_key '
+                    'ON bookmarks(title_key, year, media_type) WHERE imdb_id IS NULL')
+
                 # ── Performance indexes (idempotent) ─────────────────────
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_imdb_id ON plex_cache(imdb_id)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_plex_cache_title ON plex_cache(title)')
@@ -1635,6 +1658,78 @@ class DatabaseManager:
         """Return the total number of dismissed items."""
         row = self._query('SELECT COUNT(*) FROM dismissed_items', one=True, default=None)
         return row[0] if row else 0
+
+    # ── Bookmarks (per-title, distinct from watchlist) ────────────────────
+
+    def add_bookmark(self, imdb_id, title, year, media_type):
+        """Add a per-title bookmark. Idempotent: bookmarking the same
+        identity (imdb_id, or normalized-title+year+media_type when no
+        imdb_id) twice is a no-op, not a duplicate row. Returns True on
+        success."""
+        from backend.app_service import normalize_title
+        title_key = normalize_title(title or "")
+        if imdb_id:
+            return self._mutate('''
+                INSERT INTO bookmarks (imdb_id, title, title_key, year, media_type)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(imdb_id) WHERE imdb_id IS NOT NULL DO NOTHING
+            ''', (imdb_id, title, title_key, year, media_type), label="add_bookmark")
+        return self._mutate('''
+            INSERT INTO bookmarks (imdb_id, title, title_key, year, media_type)
+            VALUES (NULL, ?, ?, ?, ?)
+            ON CONFLICT(title_key, year, media_type) WHERE imdb_id IS NULL DO NOTHING
+        ''', (title, title_key, year, media_type), label="add_bookmark")
+
+    def remove_bookmark(self, imdb_id, title, year, media_type):
+        """Remove a bookmark by the same identity resolution add_bookmark uses.
+        Returns True if a row was actually deleted, False if nothing matched."""
+        from backend.app_service import normalize_title
+        title_key = normalize_title(title or "")
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                cur = conn.cursor()
+                if imdb_id:
+                    cur.execute('DELETE FROM bookmarks WHERE imdb_id = ?', (imdb_id,))
+                else:
+                    cur.execute(
+                        'DELETE FROM bookmarks WHERE imdb_id IS NULL '
+                        'AND title_key = ? AND year IS ? AND media_type = ?',
+                        (title_key, year, media_type))
+                deleted = cur.rowcount > 0
+                conn.commit()
+            return deleted
+        except Exception as e:
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            logger.error("DB Error (remove_bookmark): %s", e)
+            return False
+
+    def list_bookmarks(self):
+        """Return every bookmark row (dicts), newest first."""
+        return self._query_dicts(
+            'SELECT id, imdb_id, title, year, media_type, created_at '
+            'FROM bookmarks ORDER BY created_at DESC', default=[])
+
+    def list_bookmark_keys(self):
+        """Return the full set of bookmark identity keys in one query, for
+        bulk per-item matching (avoids an N+1 query per result row). Each key
+        is ('imdb', imdb_id) or ('title', title_key, year, media_type)."""
+        rows = self._query_dicts(
+            'SELECT imdb_id, title_key, year, media_type FROM bookmarks', default=[])
+        keys = set()
+        for r in rows:
+            if r.get("imdb_id"):
+                keys.add(("imdb", r["imdb_id"]))
+            else:
+                keys.add(("title", r.get("title_key"), r.get("year"), r.get("media_type")))
+        return keys
 
     # ── Auth: admin password (single row) ─────────────────────────────
 
