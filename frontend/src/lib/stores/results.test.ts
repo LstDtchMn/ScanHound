@@ -260,6 +260,30 @@ describe('filteredResults', () => {
     ]);
     expect(get(filteredResults).map((r) => r.url).sort()).toEqual(['dated', 'dateless']);
   });
+
+  it('the bookmarked quick filter keeps only items whose identity key is in bookmarkedTitles', () => {
+    results.set([
+      item({ url: 'a', imdb_id: 'tt1111111', bookmarked: false }),
+      item({ url: 'b', imdb_id: 'tt2222222', bookmarked: false })
+    ]);
+    bookmarkedTitles.set(new Set(['imdb:tt1111111']));
+    quickFilters.set(['bookmarked']);
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['a']);
+  });
+
+  it('the bookmarked quick filter reflects a bookmark toggled mid-session, not the stale item.bookmarked snapshot', () => {
+    // item.bookmarked here is frozen at false (as if fetched before the user
+    // starred it) -- toggleBookmark only ever updates bookmarkedTitles (see
+    // its own doc comment), never patches the results array in place, so this
+    // filter must read bookmarkedTitles directly or a freshly-starred item
+    // would incorrectly stay hidden until the next refetch.
+    results.set([item({ url: 'a', imdb_id: 'tt1111111', bookmarked: false })]);
+    quickFilters.set(['bookmarked']);
+    expect(get(filteredResults).map((r) => r.url)).toEqual([]);
+
+    bookmarkedTitles.set(new Set(['imdb:tt1111111']));
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['a']);
+  });
 });
 
 describe('genreFilter 3-state toggle', () => {

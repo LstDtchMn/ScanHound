@@ -736,8 +736,8 @@ const dismissalOnlyResults = derived(
 );
 
 export const filteredResults = derived(
-  [dismissalOnlyResults, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, categoryFilter, resolutionFilter, pagedMode, postedAfter, postedBefore],
-  ([$items, $filter, $search, $genre, $language, $sort, $quick, $category, $resolution, $paged, $postedAfter, $postedBefore]) => {
+  [dismissalOnlyResults, statusFilter, searchFilter, genreFilter, languageFilter, sortBy, quickFilters, categoryFilter, resolutionFilter, pagedMode, postedAfter, postedBefore, bookmarkedTitles],
+  ([$items, $filter, $search, $genre, $language, $sort, $quick, $category, $resolution, $paged, $postedAfter, $postedBefore, $bookmarked]) => {
     if ($paged) return $items; // server already filtered + sorted (+ dismissal excluded)
     let items = $items;
     // Source-category toggles (4K/Remux/TV). The backend tags each item with its
@@ -787,7 +787,12 @@ export const filteredResults = derived(
     if ($quick.includes('4k')) items = items.filter((i) => i.resolution === '4K');
     if ($quick.includes('hdrdv')) items = items.filter((i) => i.dovi || (!!i.hdr && i.hdr !== 'SDR'));
     if ($quick.includes('inplex')) items = items.filter(hasPlexCopy);
-    if ($quick.includes('bookmarked')) items = items.filter((i) => i.bookmarked);
+    // Read from the live bookmarkedTitles set, not the item's server-snapshotted
+    // `bookmarked` field: toggleBookmark only updates bookmarkedTitles (see its
+    // doc comment above), so a star clicked mid-session would never match here
+    // otherwise until the underlying results array is refetched. Mirrors how
+    // ResultRow.svelte itself derives the displayed star state.
+    if ($quick.includes('bookmarked')) items = items.filter((i) => $bookmarked.has(bookmarkIdentityKey(i)));
     // Sort
     items = [...items].sort((a, b) => {
       switch ($sort) {
