@@ -162,3 +162,58 @@ def plex_stats(reg: ServiceRegistry = Depends(get_registry)):
     if not plex:
         return {}
     return getattr(plex, "stats", {})
+
+
+def _movie_targets_for_scope(reg: ServiceRegistry, scope: str, ids: Optional[List[str]]) -> list:
+    """Resolve a scan scope into a list of {path, title, rating_key, imdb_id}
+    dicts, movies only, skipping rows with no known file_path."""
+    movies = reg.db.list_plex_cache_movies() if reg.db else []
+    if scope == "selected":
+        wanted = set(ids or [])
+        movies = [m for m in movies if m.get("key") in wanted]
+    targets = []
+    for m in movies:
+        path = m.get("file_path")
+        if not path:
+            continue
+        targets.append({
+            "path": path,
+            "title": m.get("title"),
+            "rating_key": m.get("rating_key"),
+            "imdb_id": m.get("imdb_id"),
+        })
+    return targets
+
+
+class ScanMetadataRequest(BaseModel):
+    scope: str
+    ids: Optional[List[str]] = None
+
+
+@router.post("/scan-metadata")
+def plex_scan_metadata(
+    body: ScanMetadataRequest,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    if body.scope not in ("all", "selected"):
+        raise HTTPException(status_code=400, detail="scope must be 'all' or 'selected'")
+    if body.scope == "selected" and not body.ids:
+        raise HTTPException(status_code=400, detail="ids required when scope is 'selected'")
+
+    targets = _movie_targets_for_scope(reg, body.scope, body.ids)
+    job = reg.plex_metadata_scan_job
+    started = job.start(targets)
+    if not started:
+        return {"status": "already_running", **job.status_dict()}
+    return {"status": "starting", "total": len(targets)}
+
+
+@router.post("/scan-metadata/cancel")
+def plex_scan_metadata_cancel(reg: ServiceRegistry = Depends(get_registry)):
+    reg.plex_metadata_scan_job.cancel()
+    return {"status": "cancelling"}
+
+
+@router.get("/scan-metadata/status")
+def plex_scan_metadata_status(reg: ServiceRegistry = Depends(get_registry)):
+    return reg.plex_metadata_scan_job.status_dict()

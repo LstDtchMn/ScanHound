@@ -107,6 +107,7 @@ class ServiceRegistry:
     _analytics_dashboard: Any = None
     _background_scanner: Any = None
     _rename_service: Any = None
+    _plex_metadata_scan_job: Any = None
     _shutdown_event: threading.Event = field(default_factory=threading.Event)
     # Auth nonce — generated on startup, validated by middleware.
     # If SCANHOUND_AUTH_NONCE env var is set, use that (Tauri passes it).
@@ -148,6 +149,21 @@ class ServiceRegistry:
     @property
     def rename_service(self):
         return self._rename_service
+
+    @property
+    def plex_metadata_scan_job(self):
+        if self._plex_metadata_scan_job is None:
+            from backend.plex_metadata_scan import PlexMetadataScanJob
+            from backend.api.ws import ws_manager
+
+            def _broadcast(status_dict):
+                ws_manager.broadcast_sync({
+                    "type": "plex:metadata_scan_progress",
+                    "data": status_dict,
+                })
+
+            self._plex_metadata_scan_job = PlexMetadataScanJob(self.db, progress_cb=_broadcast)
+        return self._plex_metadata_scan_job
 
     def request_shutdown(self):
         self._shutdown_event.set()
