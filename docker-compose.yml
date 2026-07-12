@@ -23,10 +23,13 @@ services:
       - ./data:/data
       # Library/download folders for auto-rename. JDownloader (on the Windows
       # host) downloads to F:\Downloads; renamed 1080p stays there, 4K goes to
-      # G:\Downloads. The container sees them as /library/movies + /movies-4k;
+      # G:\Downloads. TV downloads/extracts/renames land directly in F:\TV
+      # Shows (no separate download-vs-library split like movies have). The
+      # container sees them as /library/movies + /movies-4k + /library/tv;
       # JD's Windows saveTo paths are translated to these (Settings → Renaming).
       - "F:/Downloads:/library/movies"
       - "G:/Downloads:/library/movies-4k"
+      - "F:/TV Shows:/library/tv"
       # crawler.db lives on a Docker-managed named volume (native VM ext4), NOT
       # the ./data bind mount: SQLite WAL's shared-memory index cannot be
       # mmap'd correctly across the Docker-for-Windows bind-mount proxy, which
