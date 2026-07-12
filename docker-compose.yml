@@ -63,6 +63,23 @@ services:
       - "R:/:/library/plex-source/r-4k-rickover:ro"
       - "U:/:/library/plex-source/u-4k-ulysses-yuri-gagarin-bu:ro"
       - "W:/:/library/plex-source/w-1080p-walter-white:ro"
+      # NAS shares (\\TURTLELANDSRV2\...) are NOT mounted -- confirmed by
+      # direct testing (2026-07-12) that Docker Desktop cannot bind-mount
+      # them via any compose route tried: raw UNC in short-form syntax
+      # ("...is not a valid Windows path"), raw UNC in long-form `type: bind`
+      # syntax (same error, same validator), and even an EXISTING persistent
+      # net-use drive-letter mapping to one of these shares (Y: ->
+      # \\TURTLELANDSRV2\4K HDR Geronimo, mapped and working from an
+      # interactive session) -- Docker's backend service runs in a different
+      # session context and can't resolve it ("mkdir Y:\: cannot find path").
+      # Reaching these 8 shares (~6,084 movies, ~37.8% of the library) needs
+      # either explicitly allow-listing them in Docker Desktop's file-sharing
+      # settings, or mounting them natively inside the WSL2 VM (e.g. a CIFS
+      # mount) and bind-mounting that WSL2-native path instead -- both are
+      # real host-configuration changes beyond docker-compose itself.
+      # Covers: \\TURTLELANDSRV2\1080p John Paul Jones, 1080p Lincoln,
+      # 1080p Faraday, 1080p Icarus, 1080p Nathan Hale,
+      # 1080p Picasso aka Newton, 4K HDR Geronimo, 4K Magellan.
       - "G:/Movies 1:/library/plex-source/g-movies-1:ro"
       # NAS shares (\\TURTLELANDSRV2\...) are NOT mounted here -- Docker
       # Desktop's compose short-form volume syntax rejected the raw UNC path
