@@ -16,7 +16,7 @@
   let activeFilterCount = $derived(
     ($statusFilter !== 'all' ? 1 : 0) +
     ($searchFilter ? 1 : 0) +
-    ($genreFilter.length > 0 ? 1 : 0) +
+    (($genreFilter.include.length + $genreFilter.exclude.length) > 0 ? 1 : 0) +
     ($languageFilter.length > 0 ? 1 : 0) +
     $quickFilters.length +
     $resolutionFilter.length +
@@ -258,21 +258,28 @@
   {#if $availableGenres.length > 0}
     <details class="relative">
       <summary class="list-none cursor-pointer px-2 py-1 rounded text-[11px] text-[var(--text-secondary)] bg-[var(--bg-tertiary)] border border-[var(--border)] hover:border-[var(--accent)] select-none">
-        Genres{#if $genreFilter.length > 0}<span class="ml-0.5 text-[var(--accent)]">({$genreFilter.length})</span>{/if} &#9662;
+        Genres{#if ($genreFilter.include.length + $genreFilter.exclude.length) > 0}<span class="ml-0.5 text-[var(--accent)]">({$genreFilter.include.length + $genreFilter.exclude.length})</span>{/if} &#9662;
       </summary>
       <div class="absolute right-0 mt-1 z-20 w-44 max-h-72 overflow-y-auto bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg shadow-lg p-1.5">
         <button
-          onclick={() => genreFilter.set([])}
+          onclick={() => genreFilter.set({ include: [], exclude: [] })}
           class="w-full text-left px-2 py-1 rounded text-xs font-medium mb-1
-            {$genreFilter.length === 0 ? 'bg-[var(--accent)]/15 text-[var(--accent)]' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'}"
+            {($genreFilter.include.length === 0 && $genreFilter.exclude.length === 0) ? 'bg-[var(--accent)]/15 text-[var(--accent)]' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'}"
         >
           All genres
         </button>
         {#each $availableGenres as genre}
-          <label class="flex items-center gap-2 px-2 py-1 rounded text-xs cursor-pointer hover:bg-[var(--bg-tertiary)]">
-            <input type="checkbox" checked={$genreFilter.includes(genre)} onchange={() => toggleGenreFilter(genre)} class="accent-[var(--accent)]" />
+          {@const state = $genreFilter.include.includes(genre) ? 'include' : $genreFilter.exclude.includes(genre) ? 'exclude' : 'neutral'}
+          <button
+            type="button"
+            onclick={() => toggleGenreFilter(genre)}
+            class="flex items-center gap-2 w-full text-left px-2 py-1 rounded text-xs cursor-pointer
+              {state === 'include' ? 'bg-[var(--accent)]/15 text-[var(--accent)]' : ''}
+              {state === 'exclude' ? 'bg-red-500/15 text-red-500 line-through' : ''}
+              {state === 'neutral' ? 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]' : ''}"
+          >
             {genre}
-          </label>
+          </button>
         {/each}
       </div>
     </details>
@@ -580,15 +587,18 @@
         <p class="text-xs font-medium text-[var(--text-secondary)] mb-1.5">Genre</p>
         <div class="flex flex-wrap gap-2">
           <button
-            onclick={() => genreFilter.set([])}
+            onclick={() => genreFilter.set({ include: [], exclude: [] })}
             class="px-3 py-1.5 rounded-full text-sm border transition-colors
-              {$genreFilter.length === 0 ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
+              {$genreFilter.include.length === 0 && $genreFilter.exclude.length === 0 ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
           >All</button>
           {#each $availableGenres as g}
+            {@const state = $genreFilter.include.includes(g) ? 'include' : $genreFilter.exclude.includes(g) ? 'exclude' : 'neutral'}
             <button
               onclick={() => toggleGenreFilter(g)}
               class="px-3 py-1.5 rounded-full text-sm border transition-colors
-                {$genreFilter.includes(g) ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : 'border-[var(--border)] text-[var(--text-secondary)]'}"
+                {state === 'include' ? 'bg-[var(--accent)]/15 border-[var(--accent)] text-[var(--accent)]' : ''}
+                {state === 'exclude' ? 'bg-red-500/15 border-red-500 text-red-500 line-through' : ''}
+                {state === 'neutral' ? 'border-[var(--border)] text-[var(--text-secondary)]' : ''}"
             >{g}</button>
           {/each}
         </div>
