@@ -9,10 +9,13 @@
   import { addToast } from '$lib/stores/notifications';
   import { formatEta } from './plexMetadataScanFormat';
 
-  // "Scan all movies" + cancel + live progress only -- the scope: 'selected'
-  // route already exists server-side (Task 2) but its UI entry point is a
-  // separate, later task; this panel deliberately covers scan-all only.
   let busy = $state(false);
+  // Minimal selected-scope entry point (Task 4) -- no Plex-library item
+  // picker/checklist component exists elsewhere in this codebase to reuse,
+  // so this is a deliberate YAGNI textarea fallback: paste plex_cache keys
+  // (one per line) to scan just those titles. The scope: 'selected' route
+  // itself already existed server-side since Task 2.
+  let selectedIdsRaw = $state('');
 
   const isRunning = $derived($plexMetadataScanStatus.status === 'running');
   const progressPct = $derived(
@@ -42,6 +45,22 @@
       await cancelPlexMetadataScan();
     } catch (e) {
       addToast('Metadata Scan', e instanceof Error ? e.message : 'Failed to cancel scan', 'error');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function scanSelected() {
+    const ids = selectedIdsRaw
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (ids.length === 0) return;
+    busy = true;
+    try {
+      await startPlexMetadataScan('selected', ids);
+    } catch (e) {
+      addToast('Metadata Scan', e instanceof Error ? e.message : 'Failed to start scan', 'error');
     } finally {
       busy = false;
     }
@@ -101,5 +120,31 @@
     {:else if $plexMetadataScanStatus.status === 'error'}
       <p class="text-xs text-[var(--error)]">Last scan failed: {$plexMetadataScanStatus.error}</p>
     {/if}
+
+    <details class="relative">
+      <summary
+        class="list-none cursor-pointer px-2 py-1 rounded text-[11px] text-[var(--text-secondary)] bg-[var(--bg-tertiary)] border border-[var(--border)] hover:border-[var(--accent)] select-none w-fit"
+      >
+        Scan specific titles
+      </summary>
+      <div class="mt-2 space-y-2">
+        <p class="text-xs text-[var(--text-secondary)]">
+          Paste one Plex item key per line (found via the library API or an existing conflict/compare view).
+        </p>
+        <textarea
+          bind:value={selectedIdsRaw}
+          rows="3"
+          placeholder={'key1\nkey2'}
+          class="w-full text-xs rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-[var(--text-primary)] p-2 font-mono"
+        ></textarea>
+        <button
+          onclick={scanSelected}
+          disabled={busy || !selectedIdsRaw.trim()}
+          class="px-4 py-2 text-sm rounded-lg bg-[var(--bg-tertiary)] hover:bg-[var(--border)] text-[var(--text-primary)] border border-[var(--border)] transition-colors disabled:opacity-50"
+        >
+          {busy ? 'Starting...' : 'Scan These Titles'}
+        </button>
+      </div>
+    </details>
   {/if}
 </div>
