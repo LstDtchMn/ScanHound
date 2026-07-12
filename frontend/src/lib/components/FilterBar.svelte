@@ -41,6 +41,7 @@
     { key: '4k', label: '4K' },
     { key: 'hdrdv', label: 'HDR/DV' },
     { key: 'inplex', label: 'In Plex' },
+    { key: 'bookmarked', label: 'Bookmarked' },
   ];
 
   const sortOptions: { value: SortOption; label: string }[] = [

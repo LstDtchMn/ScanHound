@@ -787,6 +787,7 @@ export const filteredResults = derived(
     if ($quick.includes('4k')) items = items.filter((i) => i.resolution === '4K');
     if ($quick.includes('hdrdv')) items = items.filter((i) => i.dovi || (!!i.hdr && i.hdr !== 'SDR'));
     if ($quick.includes('inplex')) items = items.filter(hasPlexCopy);
+    if ($quick.includes('bookmarked')) items = items.filter((i) => i.bookmarked);
     // Sort
     items = [...items].sort((a, b) => {
       switch ($sort) {
