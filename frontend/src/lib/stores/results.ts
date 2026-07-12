@@ -36,12 +36,29 @@ export function persisted<T>(key: string, fallback: T) {
 export const results = writable<ScanResult[]>([]);
 export const statusFilter = writable<StatusFilter>('all');
 export const searchFilter = writable<string>('');
-/** Selected genres/languages to show; empty array means "All" (no filter). */
-export const genreFilter = writable<string[]>([]);
-export const languageFilter = writable<string[]>([]);
-export function toggleGenreFilter(genre: string) {
-  genreFilter.update((g) => (g.includes(genre) ? g.filter((x) => x !== genre) : [...g, genre]));
+/** Selected genres to include/exclude; both empty means "All" (no filter).
+ *  Session-only (never persisted) -- a filter that narrows *content* must
+ *  never silently outlive the session (see resolutionFilter's comment for
+ *  the same rule applied there). */
+export interface GenreFilterState {
+  include: string[];
+  exclude: string[];
 }
+export const genreFilter = writable<GenreFilterState>({ include: [], exclude: [] });
+/** Cycles one genre through neutral -> include -> exclude -> neutral. */
+export function toggleGenreFilter(genre: string) {
+  genreFilter.update(({ include, exclude }) => {
+    if (include.includes(genre)) {
+      return { include: include.filter((g) => g !== genre), exclude: [...exclude, genre] };
+    }
+    if (exclude.includes(genre)) {
+      return { include, exclude: exclude.filter((g) => g !== genre) };
+    }
+    return { include: [...include, genre], exclude };
+  });
+}
+/** Selected languages to show; empty array means "All" (no filter). */
+export const languageFilter = writable<string[]>([]);
 export function toggleLanguageFilter(lang: string) {
   languageFilter.update((l) => (l.includes(lang) ? l.filter((x) => x !== lang) : [...l, lang]));
 }
@@ -88,7 +105,7 @@ export const postedBefore = writable<string>('');
  *  statusFilter/quickFilters. */
 export function clearAllFilters() {
   resolutionFilter.set([]);
-  genreFilter.set([]);
+  genreFilter.set({ include: [], exclude: [] });
   languageFilter.set([]);
   postedAfter.set('');
   postedBefore.set('');
@@ -279,7 +296,8 @@ export const activeNarrowingFilters = derived(
       parts.push(`${off.map((k) => CATEGORY_LABELS[k]).join(', ')} hidden (category)`);
     }
     if ($resolution.length > 0) parts.push(`${joinOrCount($resolution, 'resolution')} (resolution)`);
-    if ($genre.length > 0) parts.push(`${joinOrCount($genre, 'genre')} (genre)`);
+    if ($genre.include.length > 0) parts.push(`${joinOrCount($genre.include, 'genre')} (genre)`);
+    if ($genre.exclude.length > 0) parts.push(`${joinOrCount($genre.exclude, 'genre')} excluded (genre)`);
     if ($language.length > 0) parts.push(`${joinOrCount($language, 'language')} (language)`);
     if ($quick.length > 0) {
       parts.push(`${joinOrCount($quick.map((k) => QUICK_FILTER_LABELS[k] ?? k), 'quick filter')} (quick filter)`);
@@ -532,7 +550,9 @@ function buildResultParams(page: number): Record<string, string> {
   const s = get(statusFilter); if (s !== 'all') p.filter = s;
   const q = get(searchFilter); if (q) p.search = q;
   const cats = get(categoryFilter); if (cats.length) p.category = cats.join(',');
-  const g = get(genreFilter); if (g.length) p.genre = g.join(',');
+  const g = get(genreFilter);
+  if (g.include.length) p.genre = g.include.join(',');
+  if (g.exclude.length) p.genre_exclude = g.exclude.join(',');
   const l = get(languageFilter); if (l.length) p.language = l.join(',');
   const qf = get(quickFilters); if (qf.length) p.quick = qf.join(',');
   const rf = get(resolutionFilter); if (rf.length) p.resolution = rf.join(',');
@@ -676,8 +696,11 @@ export const filteredResults = derived(
       const q = $search.toLowerCase();
       items = items.filter((i) => i.title.toLowerCase().includes(q));
     }
-    if ($genre.length > 0) {
-      items = items.filter((i) => i.genres?.some((g) => $genre.includes(g)));
+    if ($genre.include.length > 0) {
+      items = items.filter((i) => i.genres?.some((g) => $genre.include.includes(g)));
+    }
+    if ($genre.exclude.length > 0) {
+      items = items.filter((i) => !i.genres?.some((g) => $genre.exclude.includes(g)));
     }
     if ($language.length > 0) {
       items = items.filter((i) => $language.includes(i.language));

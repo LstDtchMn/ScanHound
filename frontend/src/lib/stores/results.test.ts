@@ -37,6 +37,7 @@ const {
   statusFilter,
   searchFilter,
   genreFilter,
+  toggleGenreFilter,
   languageFilter,
   quickFilters,
   filteredResults,
@@ -106,7 +107,7 @@ function resetStores() {
   dismissedUrls.set(new Set());
   statusFilter.set('all');
   searchFilter.set('');
-  genreFilter.set([]);
+  genreFilter.set({ include: [], exclude: [] });
   languageFilter.set([]);
   quickFilters.set([]);
   resolutionFilter.set([]);
@@ -158,14 +159,35 @@ describe('filteredResults', () => {
       item({ url: 'b', genres: ['Comedy'] }),
       item({ url: 'c', genres: ['Drama'] })
     ]);
-    genreFilter.set(['Sci-Fi', 'Drama']);
+    genreFilter.set({ include: ['Sci-Fi', 'Drama'], exclude: [] });
     expect(get(filteredResults).map((r) => r.url)).toEqual(['a', 'c']);
   });
 
   it('treats an empty genre selection as "All" (no filter)', () => {
     results.set([item({ url: 'a', genres: ['Action'] }), item({ url: 'b', genres: ['Comedy'] })]);
-    genreFilter.set([]);
+    genreFilter.set({ include: [], exclude: [] });
     expect(get(filteredResults).map((r) => r.url)).toEqual(['a', 'b']);
+  });
+
+  it('excludes items that have any of the excluded genres', () => {
+    results.set([
+      item({ url: 'a', genres: ['Comedy'] }),
+      item({ url: 'b', genres: ['Reality'] }),
+      item({ url: 'c', genres: ['Reality', 'Comedy'] }),
+      item({ url: 'd', genres: [] })
+    ]);
+    genreFilter.set({ include: [], exclude: ['Reality'] });
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['a', 'd']);
+  });
+
+  it('combines include and exclude (item must satisfy include AND not match exclude)', () => {
+    results.set([
+      item({ url: 'a', genres: ['Comedy'] }),
+      item({ url: 'b', genres: ['Comedy', 'Reality'] }),
+      item({ url: 'c', genres: ['Drama'] })
+    ]);
+    genreFilter.set({ include: ['Comedy'], exclude: ['Reality'] });
+    expect(get(filteredResults).map((r) => r.url)).toEqual(['a']);
   });
 
   it('filters by one or more selected languages', () => {
@@ -229,6 +251,36 @@ describe('filteredResults', () => {
       item({ url: 'dated', posted_date: 'June 8, 2026 at 12:00 AM' })
     ]);
     expect(get(filteredResults).map((r) => r.url).sort()).toEqual(['dated', 'dateless']);
+  });
+});
+
+describe('genreFilter 3-state toggle', () => {
+  beforeEach(() => {
+    genreFilter.set({ include: [], exclude: [] });
+  });
+
+  it('starts neutral, first toggle includes', () => {
+    toggleGenreFilter('Comedy');
+    expect(get(genreFilter)).toEqual({ include: ['Comedy'], exclude: [] });
+  });
+
+  it('second toggle moves from include to exclude', () => {
+    toggleGenreFilter('Comedy');
+    toggleGenreFilter('Comedy');
+    expect(get(genreFilter)).toEqual({ include: [], exclude: ['Comedy'] });
+  });
+
+  it('third toggle returns to neutral', () => {
+    toggleGenreFilter('Comedy');
+    toggleGenreFilter('Comedy');
+    toggleGenreFilter('Comedy');
+    expect(get(genreFilter)).toEqual({ include: [], exclude: [] });
+  });
+
+  it('toggling one genre does not affect another', () => {
+    genreFilter.set({ include: ['Drama'], exclude: ['Reality'] });
+    toggleGenreFilter('Comedy');
+    expect(get(genreFilter)).toEqual({ include: ['Drama', 'Comedy'], exclude: ['Reality'] });
   });
 });
 
@@ -1211,7 +1263,7 @@ describe('filteredStats / hiddenByFiltersCount (empty-state self-diagnosis)', ()
     st.set({ total: 1, missing: 1, upgrade: 0, library: 0 });
     sf.set('missing');
     rf.set(['4K', '1080p']);
-    gf.set(['Horror']);
+    gf.set({ include: ['Horror'], exclude: [] });
     lf.set(['French']);
     pa.set('2020-01-01');
     pb.set('2020-12-31');
@@ -1222,7 +1274,7 @@ describe('filteredStats / hiddenByFiltersCount (empty-state self-diagnosis)', ()
     clearAllFilters();
 
     expect(get(rf)).toEqual([]);
-    expect(get(gf)).toEqual([]);
+    expect(get(gf)).toEqual({ include: [], exclude: [] });
     expect(get(lf)).toEqual([]);
     expect(get(pa)).toBe('');
     expect(get(pb)).toBe('');
@@ -1539,7 +1591,7 @@ describe('activeNarrowingFilters (names the "Hidden by: ..." culprits)', () => {
   });
 
   it('names genre/language/quick/date/search when set, summarizing lists over 3 as a count', () => {
-    genreFilter.set(['Horror', 'Comedy']);
+    genreFilter.set({ include: ['Horror', 'Comedy'], exclude: [] });
     languageFilter.set(['French', 'German', 'Japanese', 'Korean']); // > 3 -> count form
     quickFilters.set(['4k']);
     postedAfter.set('2026-01-01');
@@ -1551,6 +1603,15 @@ describe('activeNarrowingFilters (names the "Hidden by: ..." culprits)', () => {
       '4K (quick filter)',
       'date range',
       'search text'
+    ]);
+  });
+
+  it('names excluded genres distinctly from included ones', () => {
+    genreFilter.set({ include: ['Comedy'], exclude: ['Reality'] });
+
+    expect(get(activeNarrowingFilters)).toEqual([
+      'Comedy (genre)',
+      'Reality excluded (genre)'
     ]);
   });
 
