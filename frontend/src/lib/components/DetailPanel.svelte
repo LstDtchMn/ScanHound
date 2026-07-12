@@ -3,10 +3,13 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import { downloadQueue, activeDownload, downloadHost } from '$lib/stores/downloads';
-  import { results, markDownloaded, updateResultFromRescan } from '$lib/stores/results';
+  import { results, markDownloaded, updateResultFromRescan, selectedDetail } from '$lib/stores/results';
   import { statusVariant, formatStatus, DOWNLOAD_HOSTS } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
   import { fly } from 'svelte/transition';
+  import { findCachedAlternative, targetResolution, seasonSearchQuery } from '$lib/resultActions/findOtherResolution';
+  import { searchThisSite, selectedScanSource } from '$lib/stores/scanner';
+  import { get } from 'svelte/store';
 
   interface Props {
     item: ScanResult;
@@ -143,6 +146,27 @@
     } finally {
       rescanning = false;
     }
+  }
+
+  /** Cache-first: look for an already-loaded same-show/season item at the
+   *  other resolution before falling back to a live Site Search. TV only
+   *  (item.season != null, enforced by the button's own guard). */
+  function findOtherResolution() {
+    if (item.season == null) return;
+    const wanted = targetResolution(item.resolution);
+    const cached = findCachedAlternative(get(results), {
+      imdbId: item.imdb_id,
+      title: item.title,
+      season: item.season,
+      excludeResolution: item.resolution
+    });
+    if (cached) {
+      selectedDetail.set(cached);
+      addToast('Found locally', `${wanted} version already in your cached results.`);
+      return;
+    }
+    searchThisSite(seasonSearchQuery(item.title, item.season), get(selectedScanSource));
+    addToast('Searching', `Searching ${get(selectedScanSource)} for ${wanted} version...`);
   }
 
   function openImdb() {
@@ -425,6 +449,16 @@
           >
             {rescanning ? 'Rescanning…' : 'Rescan'}
           </button>
+          {#if item.season != null}
+            <button
+              onclick={findOtherResolution}
+              aria-label="Find other resolution"
+              title="Find the same show and season at a different resolution"
+              class="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+            >
+              Find {targetResolution(item.resolution)}
+            </button>
+          {/if}
           <button
             onclick={copyUrl}
             aria-label="Copy URL"

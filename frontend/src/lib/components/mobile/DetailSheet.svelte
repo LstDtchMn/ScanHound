@@ -3,13 +3,16 @@
   import { api } from '$lib/api/client';
   import { downloadHost } from '$lib/stores/downloads';
   import { addToast } from '$lib/stores/notifications';
-  import { updateResultFromRescan } from '$lib/stores/results';
+  import { results, updateResultFromRescan } from '$lib/stores/results';
   import { copyResultLinks } from '$lib/resultActions';
+  import { findCachedAlternative, targetResolution, seasonSearchQuery } from '$lib/resultActions/findOtherResolution';
+  import { searchThisSite, selectedScanSource } from '$lib/stores/scanner';
   import { statusVariant, formatStatus, formatCount } from '$lib/constants';
   import Badge from '../Badge.svelte';
   import RtBadge from '../RtBadge.svelte';
   import { createDragTracker } from './gestures';
   import { success } from './haptics';
+  import { get } from 'svelte/store';
 
   interface Props {
     item: ScanResult;
@@ -79,6 +82,30 @@
     } finally {
       rescanning = false;
     }
+  }
+
+  /** Cache-first: look for an already-loaded same-show/season item at the
+   *  other resolution before falling back to a live Site Search. TV only
+   *  (item.season != null, enforced by the button's own guard). Navigation
+   *  to a found item goes through the same `onselect` callback the sibling
+   *  list below uses, not a direct store import -- this file doesn't own
+   *  `selectedDetail`, the parent wires it in via `onselect`. */
+  function findOtherResolution() {
+    if (item.season == null) return;
+    const wanted = targetResolution(item.resolution);
+    const cached = findCachedAlternative(get(results), {
+      imdbId: item.imdb_id,
+      title: item.title,
+      season: item.season,
+      excludeResolution: item.resolution
+    });
+    if (cached) {
+      onselect?.(cached);
+      addToast('Found locally', `${wanted} version already in your cached results.`);
+      return;
+    }
+    searchThisSite(seasonSearchQuery(item.title, item.season), get(selectedScanSource));
+    addToast('Searching', `Searching ${get(selectedScanSource)} for ${wanted} version...`);
   }
 
   // Mount/unmount only — deliberately reads nothing reactive (not `item`) so
@@ -260,5 +287,15 @@
     >
       {rescanning ? 'Rescanning…' : 'Rescan'}
     </button>
+    {#if item.season != null}
+      <button
+        onclick={findOtherResolution}
+        aria-label="Find other resolution"
+        title="Find the same show and season at a different resolution"
+        class="px-4 py-2.5 rounded-xl bg-[var(--bg-tertiary)] text-sm font-semibold text-[var(--text-primary)]"
+      >
+        Find {targetResolution(item.resolution)}
+      </button>
+    {/if}
   </div>
 </div>
