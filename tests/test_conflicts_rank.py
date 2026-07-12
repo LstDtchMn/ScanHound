@@ -315,6 +315,46 @@ def test_conflict_annotations_path_collision_across_different_films_no_keeper():
     assert ann[2]["keep_reason"] is None
 
 
+# ── Task 2 (audio/HDR metadata): probed-first hdr/audio ranking tiers ────────
+
+def test_quality_score_hdr10_plus_outranks_plain_hdr10():
+    base = {"original_filename": "Movie.2024.2160p.mkv", "resolution": "2160p"}
+    hdr10 = {**base, "hdr": "HDR10"}
+    hdr10_plus = {**base, "hdr": "HDR10+"}
+    assert conflicts._quality_score(hdr10_plus) > conflicts._quality_score(hdr10)
+
+
+def test_quality_score_dolby_vision_hdr_value_unchanged():
+    dv = {"original_filename": "Movie.2024.2160p.DV.mkv", "resolution": "2160p",
+          "hdr": "Dolby Vision"}
+    # hdr tier itself must be 1, not double-counted with the separate dv/dv_layer_rank fields.
+    assert conflicts._quality_score(dv)[3] == 1
+
+
+def test_quality_score_probed_atmos_outranks_non_atmos_same_base_codec():
+    base = {"original_filename": "Movie.2024.1080p.mkv", "resolution": "1080p"}
+    plain = {**base, "audio_profile": None}
+    atmos = {**base, "audio_profile": "TrueHD 7.1 Atmos"}
+    assert conflicts._quality_score(atmos) > conflicts._quality_score(plain)
+
+
+def test_quality_score_probed_dts_hd_ranks_between_ddp_and_atmos():
+    base = {"original_filename": "Movie.2024.1080p.mkv", "resolution": "1080p"}
+    ddp = {**base, "audio_profile": None}  # filename has no audio hint -> tier 0
+    dts_hd = {**base, "audio_profile": "DTS-HD MA 5.1"}
+    atmos = {**base, "audio_profile": "TrueHD 7.1 Atmos"}
+    assert conflicts._quality_score(atmos) > conflicts._quality_score(dts_hd) > conflicts._quality_score(ddp)
+
+
+def test_quality_score_no_probed_data_falls_back_to_filename_regex_unchanged():
+    """Regression: a job with NO audio_profile/hdr probed fields must score
+    byte-identically to today's pure-filename behavior."""
+    truehd_filename = {"original_filename": "Movie.2024.1080p.TrueHD.7.1.mkv", "resolution": "1080p"}
+    hdr_filename = {"original_filename": "Movie.2024.2160p.HDR.mkv", "resolution": "2160p"}
+    assert conflicts._quality_score(truehd_filename)[5] == 3  # audio tier, filename-only path
+    assert conflicts._quality_score(hdr_filename)[3] == 1     # hdr tier, filename-only path
+
+
 def test_conflict_annotations_same_path_same_movie_still_recommends_keeper():
     # Regression guard for the classic case this logic was built for: two active
     # jobs, SAME identity, SAME destination path -> still a real keeper winner.

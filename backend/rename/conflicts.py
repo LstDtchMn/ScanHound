@@ -152,8 +152,23 @@ def _quality_score(job: dict) -> tuple:
     # by a tag-rich but lower-quality rival on the dv bit alone.
     if explicit_hdr == "Dolby Vision":
         dv = 1
-    hdr = 1 if explicit_hdr else (
-        1 if _re.search(r"\bhdr(10)?(\+|plus)?\b|\bhlg\b", name) else 0)
+    # HDR tier is probed-data-first: an explicit probed "HDR10+" (ffprobe
+    # SMPTE2094-40 side_data) is the top tier (2); any other explicit hdr —
+    # including "Dolby Vision", whose own precedence is carried by the separate
+    # dv/dv_layer_rank fields ahead of this — stays tier 1, never double-counted.
+    # With no probed hdr, fall back to the exact filename-regex logic, with an
+    # HDR10+/HDR10plus filename tag now also promoted to tier 2 (checked first,
+    # since the generic regex below matches "hdr10+" as plain HDR10 otherwise).
+    if explicit_hdr == "HDR10+":
+        hdr = 2
+    elif explicit_hdr:
+        hdr = 1
+    elif _re.search(r"\bhdr10\+|\bhdr10plus\b", name):
+        hdr = 2
+    elif _re.search(r"\bhdr(10)?(\+|plus)?\b|\bhlg\b", name):
+        hdr = 1
+    else:
+        hdr = 0
 
     if _re.search(r"\bremux\b", name):
         source = 4
@@ -166,7 +181,22 @@ def _quality_score(job: dict) -> tuple:
     else:
         source = 0
 
-    if _re.search(r"\b(truehd|atmos)\b", name):
+    # Audio tier is probed-data-first: a probed audio_profile (from probe_specs —
+    # e.g. "TrueHD 7.1 Atmos", "DTS-HD MA 5.1") decides the tier when present, so a
+    # tag-stripped library file whose codec-buried Atmos/DTS-HD only ffprobe can
+    # see isn't beaten by a filename. With no probed profile, fall back to the
+    # exact filename-regex logic (byte-identical to prior behavior).
+    audio_profile = str(job.get("audio_profile") or "").lower()
+    if audio_profile:
+        if "atmos" in audio_profile or "truehd" in audio_profile:
+            audio = 3
+        elif "dts-hd" in audio_profile or "dts:x" in audio_profile or "dts hd" in audio_profile:
+            audio = 2
+        elif "ddp" in audio_profile or "eac3" in audio_profile or "dd+" in audio_profile:
+            audio = 1
+        else:
+            audio = 0
+    elif _re.search(r"\b(truehd|atmos)\b", name):
         audio = 3
     elif _re.search(r"\bdts[.\s-]?hd\b|\bdts[.\s-]?x\b", name):
         audio = 2
