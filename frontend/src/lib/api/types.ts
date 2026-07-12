@@ -28,6 +28,7 @@ export interface ScanResult {
   posted_date: string | null;
   host_pref: string;
   is_duplicate_group: boolean;
+  bookmarked: boolean;
   prior_grab?: { resolution: string; size: string; downloaded_at: string; hdr?: string; dovi?: boolean } | null;
   category?: string; // crawl category: '4k' | 'remux' | 'tv' | '' (unknown)
 }

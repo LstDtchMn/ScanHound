@@ -3,7 +3,7 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import { downloadQueue, activeDownload, downloadHost } from '$lib/stores/downloads';
-  import { results, markDownloaded, updateResultFromRescan, selectedDetail } from '$lib/stores/results';
+  import { results, markDownloaded, updateResultFromRescan, selectedDetail, bookmarkedTitles, bookmarkIdentityKey, toggleBookmark } from '$lib/stores/results';
   import { statusVariant, formatStatus, DOWNLOAD_HOSTS } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
   import { fly } from 'svelte/transition';
@@ -16,6 +16,11 @@
     onclose: () => void;
   }
   let { item, onclose }: Props = $props();
+
+  // Per-title bookmark state -- mirrors ResultRow.svelte's derivation
+  // (bookmarkedTitles keyed by bookmarkIdentityKey, not item.bookmarked, so
+  // a toggle reflects instantly without waiting on a refetch).
+  let bookmarked = $derived($bookmarkedTitles.has(bookmarkIdentityKey(item)));
 
   let panelEl = $state<HTMLDivElement>();
   let triggerEl: Element | null = null;
@@ -413,6 +418,15 @@
 
       <!-- Actions -->
       <div class="flex flex-wrap gap-2 pt-2 border-t border-[var(--border)]">
+        <button
+          onclick={() => toggleBookmark(item)}
+          aria-label={bookmarked ? 'Remove bookmark' : 'Bookmark this title'}
+          title={bookmarked ? 'Remove bookmark' : 'Bookmark this title'}
+          class="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium transition-colors
+            {bookmarked ? 'bg-[var(--accent)]/15 text-[var(--accent)]' : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'}"
+        >
+          {bookmarked ? '★ Bookmarked' : '☆ Bookmark'}
+        </button>
         {#if item.url}
           <!-- Host selector + Download (synced with global FilterBar selector) -->
           <div class="flex items-center gap-0">

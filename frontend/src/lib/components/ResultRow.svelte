@@ -1,6 +1,6 @@
 <script lang="ts">
   import Badge from './Badge.svelte';
-  import { toggleSelect, selectedKeys, selectedDetail, markDownloaded, results } from '$lib/stores/results';
+  import { toggleSelect, selectedKeys, selectedDetail, markDownloaded, results, bookmarkedTitles, bookmarkIdentityKey, toggleBookmark } from '$lib/stores/results';
   import { settings } from '$lib/stores/settings';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -66,6 +66,13 @@
 
   // Select by unique url, not group_key (same-title releases share group_key)
   let selected = $derived($selectedKeys.has(item.url));
+
+  // Per-title bookmark state, keyed by bookmarkIdentityKey (imdb_id first,
+  // normalized-title+year+media_type fallback) so the same title shows the
+  // same starred state across every release/resolution row. Mirrors the
+  // `selected`/selectedKeys pattern above rather than item.bookmarked, so a
+  // toggle click reflects instantly without waiting on a refetch.
+  let bookmarked = $derived($bookmarkedTitles.has(bookmarkIdentityKey(item)));
 
   // Per-item host override (defaults to global)
   let itemHost = $state('');
@@ -328,6 +335,14 @@
   <!-- rating/res/size/status now live in the title-cell stat line above -->
   <td class="{cellPad}">
     <div class="flex items-center gap-0.5">
+      <button
+        type="button"
+        onclick={(e) => { e.stopPropagation(); toggleBookmark(item); }}
+        aria-label={bookmarked ? 'Remove bookmark' : 'Bookmark this title'}
+        title={bookmarked ? 'Remove bookmark' : 'Bookmark this title'}
+        class="w-6 h-6 rounded hover:bg-[var(--bg-tertiary)] flex items-center justify-center text-sm transition-colors
+          {bookmarked ? 'text-[var(--accent)]' : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'}"
+      >{bookmarked ? '★' : '☆'}</button>
       {#if item.url}
         <!-- Per-item host selector -->
         <select

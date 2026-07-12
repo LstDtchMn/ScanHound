@@ -17,7 +17,9 @@ vi.mock('$lib/api/client', () => ({
     selectAll: vi.fn().mockResolvedValue({}),
     deselectAll: vi.fn().mockResolvedValue({}),
     getCachedResults: vi.fn(),
-    getResults: vi.fn()
+    getResults: vi.fn(),
+    setBookmark: vi.fn().mockResolvedValue({ status: 'ok', bookmarked: true }),
+    getBookmarks: vi.fn().mockResolvedValue({ items: [], count: 0 })
   }
 }));
 
@@ -45,6 +47,10 @@ const {
   deckGroups,
   dismissItem,
   restoreItem,
+  bookmarkedTitles,
+  bookmarkIdentityKey,
+  toggleBookmark,
+  hydrateBookmarks,
   markGrabbedSiblings,
   updateResultFromRescan,
   stats,
@@ -96,6 +102,7 @@ function item(overrides: Partial<ScanResult>): ScanResult {
     posted_date: null,
     host_pref: '',
     is_duplicate_group: false,
+    bookmarked: false,
     ...overrides
   };
 }
@@ -105,6 +112,7 @@ function resetStores() {
   selectedDetail.set(null);
   selectedKeys.set(new Set());
   dismissedUrls.set(new Set());
+  bookmarkedTitles.set(new Set());
   statusFilter.set('all');
   searchFilter.set('');
   genreFilter.set({ include: [], exclude: [] });
@@ -344,6 +352,83 @@ describe('deckGroups', () => {
     const groups = get(deckGroups);
     expect(groups.length).toBe(1);
     expect(groups[0].releases.map((r) => r.url)).toEqual(['b']); // only the still-missing one
+  });
+});
+
+describe('bookmarkIdentityKey', () => {
+  it('uses imdb_id when present', () => {
+    const key = bookmarkIdentityKey({ imdb_id: 'tt1234567', title: 'Dune', year: 2024, season: null } as any);
+    expect(key).toBe('imdb:tt1234567');
+  });
+
+  it('falls back to normalized title + year + media type when imdb_id is absent', () => {
+    const key = bookmarkIdentityKey({ imdb_id: null, title: 'Some Show!', year: 2020, season: 1 } as any);
+    expect(key).toBe('title:some show:2020:tv');
+  });
+
+  it('movies (no season) key as media type movie', () => {
+    const key = bookmarkIdentityKey({ imdb_id: null, title: 'Some Movie', year: 2020, season: null } as any);
+    expect(key).toBe('title:some movie:2020:movie');
+  });
+});
+
+describe('toggleBookmark', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('optimistically adds to bookmarkedTitles and calls the API', async () => {
+    const i = item({ imdb_id: 'tt1234567', title: 'Dune', year: 2024, bookmarked: false });
+    const p = toggleBookmark(i);
+    expect(get(bookmarkedTitles).has('imdb:tt1234567')).toBe(true);
+    await p;
+    expect(api.setBookmark).toHaveBeenCalledWith('tt1234567', 'Dune', 2024, 'movie', true);
+  });
+
+  it('toggles off (removes) when the item is already bookmarked', async () => {
+    bookmarkedTitles.set(new Set(['imdb:tt1234567']));
+    const i = item({ imdb_id: 'tt1234567', title: 'Dune', year: 2024, bookmarked: true });
+    const p = toggleBookmark(i);
+    expect(get(bookmarkedTitles).has('imdb:tt1234567')).toBe(false);
+    await p;
+    expect(api.setBookmark).toHaveBeenCalledWith('tt1234567', 'Dune', 2024, 'movie', false);
+  });
+
+  it('reverts the optimistic update if the API call fails', async () => {
+    vi.mocked(api.setBookmark).mockRejectedValueOnce(new Error('network'));
+    const i = item({ imdb_id: 'tt1234567', title: 'Dune', year: 2024, bookmarked: false });
+    const ok = await toggleBookmark(i);
+    expect(ok).toBe(false);
+    expect(get(bookmarkedTitles).has('imdb:tt1234567')).toBe(false);
+  });
+
+  it('falls back to the title key for items without an imdb_id', async () => {
+    const i = item({ imdb_id: null, title: 'Some Obscure Show', year: 2020, season: 1, bookmarked: false });
+    await toggleBookmark(i);
+    expect(api.setBookmark).toHaveBeenCalledWith(null, 'Some Obscure Show', 2020, 'tv', true);
+    expect(get(bookmarkedTitles).has('title:some obscure show:2020:tv')).toBe(true);
+  });
+});
+
+describe('hydrateBookmarks', () => {
+  beforeEach(() => {
+    resetStores();
+    vi.clearAllMocks();
+  });
+
+  it('populates bookmarkedTitles from the server list', async () => {
+    vi.mocked(api.getBookmarks).mockResolvedValueOnce({
+      items: [
+        { id: 1, imdb_id: 'tt1234567', title: 'Dune', year: 2024, media_type: 'movie', created_at: '' },
+        { id: 2, imdb_id: null, title: 'Some Show', year: 2020, media_type: 'tv', created_at: '' }
+      ],
+      count: 2
+    });
+    await hydrateBookmarks();
+    const keys = get(bookmarkedTitles);
+    expect(keys.has('imdb:tt1234567')).toBe(true);
+    expect(keys.has('title:some show:2020:tv')).toBe(true);
   });
 });
 

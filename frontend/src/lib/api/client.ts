@@ -152,6 +152,22 @@ export const api = {
     ),
   clearDismissed: () =>
     request<{ status: string; dismissed_count: number }>('/results/dismissed', { method: 'DELETE' }),
+  setBookmark: (
+    imdbId: string | null,
+    title: string,
+    year: number | null,
+    mediaType: string,
+    bookmarked: boolean
+  ) =>
+    request<{ status: string; bookmarked: boolean }>('/results/bookmark', {
+      method: 'POST',
+      body: JSON.stringify({ imdb_id: imdbId, title, year, media_type: mediaType, bookmarked })
+    }),
+  getBookmarks: () =>
+    request<{
+      items: { id: number; imdb_id: string | null; title: string; year: number | null; media_type: string; created_at: string }[];
+      count: number;
+    }>('/results/bookmarks'),
 
   // Plex
   plexConnect: () => request('/plex/connect', { method: 'POST' }),

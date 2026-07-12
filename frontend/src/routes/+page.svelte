@@ -9,7 +9,7 @@
   import ResultActionSheet from '$lib/components/ResultActionSheet.svelte';
   import DetailPanel from '$lib/components/DetailPanel.svelte';
   import SwipeDeck from '$lib/components/SwipeDeck.svelte';
-  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, fromCache, cacheUpdatedAt, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS, loadResults, hasMore, loadingMore, loadError, filteredTotal, titleCounts, pagedMode, statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy, hiddenByFiltersCount, clearAllFilters, isResultsViewEmpty, activeNarrowingFilters, dismissedUrls } from '$lib/stores/results';
+  import { filteredResults, viewMode, viewModeExplicit, results, stats, selectedDetail, focusedIndex, toggleSelect, hydrateDismissed, hydrateBookmarks, fromCache, cacheUpdatedAt, tileSize, gridGap, gridColumns, TILE_MIN_PX, GRID_GAP_CLASS, loadResults, hasMore, loadingMore, loadError, filteredTotal, titleCounts, pagedMode, statusFilter, searchFilter, genreFilter, languageFilter, quickFilters, categoryFilter, sortBy, hiddenByFiltersCount, clearAllFilters, isResultsViewEmpty, activeNarrowingFilters, dismissedUrls } from '$lib/stores/results';
   import { mobile } from '$lib/stores/media';
   import { addToast } from '$lib/stores/notifications';
   import { get } from 'svelte/store';
@@ -208,6 +208,10 @@
       // awaited alongside results so the deck never briefly shows cards the
       // user already swiped away in an earlier session.
       hydrateDismissed(),
+      // Pull the persisted bookmark set so star toggles reflect prior session
+      // state immediately (bookmarkedTitles, not any per-item field — mirrors
+      // hydrateDismissed's dismissedUrls).
+      hydrateBookmarks(),
       refreshPlexStatus().finally(() => { plexChecking = false; }),
       loadSettings(),
       (async () => {

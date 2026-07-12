@@ -2,6 +2,7 @@ import { writable, derived, get } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { connection } from './connection';
 import { resolutionRank, sizeToGB } from '$lib/constants';
+import { addToast } from './notifications';
 import type { ScanResult, ScanStats } from '$lib/api/types';
 
 export type StatusFilter = 'all' | 'missing' | 'upgrade' | 'library';
@@ -313,6 +314,70 @@ export const selectedKeys = writable<Set<string>>(new Set());
 /** Release URLs the user swiped away ("skip"); persisted server-side so the
  *  deck only surfaces fresh items across scans. Hydrated on app load. */
 export const dismissedUrls = writable<Set<string>>(new Set());
+
+/** Bookmarked titles, keyed the same way the backend does (imdb_id first,
+ *  normalized-title+year+media_type fallback) -- mirrors dismissedUrls's
+ *  shape/hydration so a row can check membership without a round-trip. */
+export const bookmarkedTitles = writable<Set<string>>(new Set());
+
+function normalizeTitleClient(title: string): string {
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+/** Per-title bookmark identity key, mirroring the backend's imdb_id-first /
+ *  normalized-title+year+media_type-fallback identity (backend/database.py,
+ *  backend/api/routes/results.py's _item_bookmark_key). Exported for testing. */
+export function bookmarkIdentityKey(item: Pick<ScanResult, 'imdb_id' | 'title' | 'year' | 'season'>): string {
+  if (item.imdb_id) return `imdb:${item.imdb_id}`;
+  const mediaType = item.season != null ? 'tv' : 'movie';
+  return `title:${normalizeTitleClient(item.title)}:${item.year ?? ''}:${mediaType}`;
+}
+
+/** Toggle a title's bookmark (optimistic), persisting it server-side.
+ *  Resolves false if the server call failed and the optimistic update was
+ *  reverted -- mirrors dismissItem's optimistic-update-then-revert shape. */
+export function toggleBookmark(item: ScanResult): Promise<boolean> {
+  const key = bookmarkIdentityKey(item);
+  const wasBookmarked = item.bookmarked;
+  const nextBookmarked = !wasBookmarked;
+  bookmarkedTitles.update((s) => {
+    const next = new Set(s);
+    if (nextBookmarked) next.add(key);
+    else next.delete(key);
+    return next;
+  });
+  const mediaType = item.season != null ? 'tv' : 'movie';
+  return api
+    .setBookmark(item.imdb_id, item.title, item.year, mediaType, nextBookmarked)
+    .then(() => true)
+    .catch((e) => {
+      // Revert on failure so the UI reflects the server's truth.
+      bookmarkedTitles.update((s) => {
+        const next = new Set(s);
+        if (wasBookmarked) next.add(key);
+        else next.delete(key);
+        return next;
+      });
+      addToast('Error', e instanceof Error ? e.message : 'Failed to update bookmark', 'error');
+      return false;
+    });
+}
+
+/** Load the persisted bookmark set from the server (call once on app start,
+ *  alongside hydrateDismissed). */
+export async function hydrateBookmarks(): Promise<void> {
+  try {
+    const { items } = await api.getBookmarks();
+    const keys = new Set(
+      items.map((b) =>
+        b.imdb_id ? `imdb:${b.imdb_id}` : `title:${normalizeTitleClient(b.title)}:${b.year ?? ''}:${b.media_type}`
+      )
+    );
+    bookmarkedTitles.set(keys);
+  } catch {
+    /* offline / no server — leave empty */
+  }
+}
 
 /** Whether the shown results came from the background pre-cache (no live scan
  *  this session). Drives a subtle "showing cached results" banner; cleared the

@@ -33,6 +33,7 @@ function makeItem(overrides: Partial<ScanResult> = {}): ScanResult {
     posted_date: null,
     host_pref: '',
     is_duplicate_group: false,
+    bookmarked: false,
     ...overrides
   } as ScanResult;
 }

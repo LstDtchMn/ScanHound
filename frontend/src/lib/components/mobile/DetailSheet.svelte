@@ -3,7 +3,7 @@
   import { api } from '$lib/api/client';
   import { downloadHost } from '$lib/stores/downloads';
   import { addToast } from '$lib/stores/notifications';
-  import { results, updateResultFromRescan } from '$lib/stores/results';
+  import { results, updateResultFromRescan, bookmarkedTitles, bookmarkIdentityKey, toggleBookmark } from '$lib/stores/results';
   import { copyResultLinks } from '$lib/resultActions';
   import { findCachedAlternative, targetResolution, seasonSearchQuery } from '$lib/resultActions/findOtherResolution';
   import { searchThisSite, selectedScanSource } from '$lib/stores/scanner';
@@ -21,6 +21,11 @@
     onselect?: (s: ScanResult) => void;
   }
   let { item, siblings = [], onclose, onselect }: Props = $props();
+
+  // Per-title bookmark state -- mirrors DetailPanel.svelte/ResultRow.svelte's
+  // derivation (bookmarkedTitles keyed by bookmarkIdentityKey, not
+  // item.bookmarked, so a toggle reflects instantly without a refetch).
+  let bookmarked = $derived($bookmarkedTitles.has(bookmarkIdentityKey(item)));
 
   /** Existing library copies, parsed from the same plex_versions JSON the
    *  desktop DetailPanel renders — [{res, dovi, hdr, size(GB)}]. This is the
@@ -278,6 +283,14 @@
         Grab{#if item.size}&nbsp;· {item.size}{/if}
       </button>
     {/if}
+    <button
+      onclick={() => toggleBookmark(item)}
+      aria-label={bookmarked ? 'Remove bookmark' : 'Bookmark this title'}
+      title={bookmarked ? 'Remove bookmark' : 'Bookmark this title'}
+      class="px-4 py-2.5 rounded-xl text-sm font-semibold {bookmarked ? 'bg-[var(--accent)]/15 text-[var(--accent)]' : 'bg-[var(--bg-tertiary)] text-[var(--text-primary)]'}"
+    >
+      {bookmarked ? '★' : '☆'}
+    </button>
     <button
       onclick={rescanItem}
       disabled={rescanning}
