@@ -105,4 +105,23 @@ describe('findCachedAlternative', () => {
     const items = [makeItem({ imdb_id: null, resolution: '1080p' })];
     expect(findCachedAlternative(items, target)).toBeNull();
   });
+
+  it('excludes a same-tier candidate labeled differently (2160p vs 4K)', () => {
+    const target = { imdbId: 'tt1234567', title: 'Show Name', season: 2, excludeResolution: '4K' };
+    const items = [makeItem({ resolution: '2160p' })];
+    expect(findCachedAlternative(items, target)).toBeNull();
+  });
+
+  it('excludes a same-tier candidate labeled differently (4K vs 2160p)', () => {
+    const target = { imdbId: 'tt1234567', title: 'Show Name', season: 2, excludeResolution: '2160p' };
+    const items = [makeItem({ resolution: '4K' })];
+    expect(findCachedAlternative(items, target)).toBeNull();
+  });
+
+  it('still matches a genuinely different tier when the excluded resolution is 2160p', () => {
+    const target = { imdbId: 'tt1234567', title: 'Show Name', season: 2, excludeResolution: '2160p' };
+    const alt = makeItem({ resolution: '1080p' });
+    const items = [alt];
+    expect(findCachedAlternative(items, target)).toBe(alt);
+  });
 });

@@ -1,4 +1,5 @@
 import type { ScanResult } from '$lib/api/types';
+import { resolutionRank } from '$lib/constants';
 
 export interface FindAlternativeTarget {
   imdbId: string | null;
@@ -35,7 +36,12 @@ export function findCachedAlternative(
   if (!targetKey) return null;
   for (const item of items) {
     if (item.season !== target.season) continue;
-    if (item.resolution === target.excludeResolution) continue;
+    // Compare by resolution TIER, not raw label -- "4K" and "2160p" (and any
+    // other label sharing a resolutionRank bucket) are the same real tier,
+    // just different site-tagging conventions (see constants.ts RES_RANK /
+    // backend _RES_RANK). A raw string comparison here would let a same-tier,
+    // differently-labeled cache item slip through as a false "alternative".
+    if (resolutionRank(item.resolution) === resolutionRank(target.excludeResolution)) continue;
     const itemKey = identityKey(item.imdb_id, item.title);
     if (itemKey === targetKey) return item;
   }
