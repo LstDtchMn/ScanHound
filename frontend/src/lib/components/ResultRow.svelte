@@ -1,6 +1,6 @@
 <script lang="ts">
   import Badge from './Badge.svelte';
-  import { toggleSelect, selectedKeys, selectedDetail, markDownloaded } from '$lib/stores/results';
+  import { toggleSelect, selectedKeys, selectedDetail, markDownloaded, results } from '$lib/stores/results';
   import { settings } from '$lib/stores/settings';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
@@ -8,6 +8,9 @@
   import { density } from '$lib/stores/results';
   import { statusVariant, statusBorderColor, statusBarStyle, formatStatus, formatCount, resolutionRank, sizeToGB, DOWNLOAD_HOSTS } from '$lib/constants';
   import type { ScanResult } from '$lib/api/types';
+  import { findCachedAlternative, targetResolution, seasonSearchQuery } from '$lib/resultActions/findOtherResolution';
+  import { searchThisSite, selectedScanSource } from '$lib/stores/scanner';
+  import { get } from 'svelte/store';
 
   let showRating = $derived($settings.show_rating ?? true);
   let showVotes = $derived($settings.show_votes ?? true);
@@ -156,6 +159,27 @@
       copyingLinks = false;
     }
   }
+
+  /** Cache-first: look for an already-loaded same-show/season item at the
+   *  other resolution before falling back to a live Site Search. TV only
+   *  (item.season != null, enforced by the button's own guard). */
+  function findOtherResolution() {
+    if (item.season == null) return;
+    const wanted = targetResolution(item.resolution);
+    const cached = findCachedAlternative(get(results), {
+      imdbId: item.imdb_id,
+      title: item.title,
+      season: item.season,
+      excludeResolution: item.resolution
+    });
+    if (cached) {
+      selectedDetail.set(cached);
+      addToast('Found locally', `${wanted} version already in your cached results.`);
+      return;
+    }
+    searchThisSite(seasonSearchQuery(item.title, item.season), get(selectedScanSource));
+    addToast('Searching', `Searching ${get(selectedScanSource)} for ${wanted} version...`);
+  }
 </script>
 
 <tr
@@ -259,6 +283,15 @@
     <div class="flex items-center gap-1.5 text-[11px] text-[var(--text-secondary)] truncate mt-0.5">
       {#if item.season != null}
         <span class="whitespace-nowrap font-medium text-[var(--text-primary)]">S{String(item.season).padStart(2, '0')}</span>
+        <button
+          type="button"
+          onclick={(e) => { e.stopPropagation(); findOtherResolution(); }}
+          aria-label="Find other resolution"
+          title="Find {targetResolution(item.resolution)} version of this season"
+          class="shrink-0 w-4 h-4 flex items-center justify-center rounded text-[10px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-tertiary)]"
+        >
+          &#8635;
+        </button>
         {#if item.episodes != null}<span class="opacity-75 whitespace-nowrap">&middot; {item.episodes} ep{item.episodes !== 1 ? 's' : ''}</span>{/if}
       {/if}
       {#if showGenres && item.genres?.length}<span class="truncate {item.season != null ? 'opacity-75' : ''}">{item.genres.slice(0, 3).join(', ')}</span>{/if}
