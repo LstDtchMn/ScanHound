@@ -9,6 +9,21 @@ import type { RenameCategory } from '$lib/renames/category';
 export const renameJobs = writable<RenameJob[]>([]);
 export const renameStatus = writable<RenameStatus | null>(null);
 
+/** Archived rename jobs — a SEPARATE store from renameJobs, since the
+ *  default (non-archived) load never includes them. Fetched fresh each
+ *  time the Archived tab is selected, not filtered client-side from
+ *  renameJobs. */
+export const archivedRenameJobs = writable<RenameJob[]>([]);
+
+export async function loadArchivedRenameJobs() {
+  try {
+    const { jobs } = await api.getRenameJobs(undefined, true);
+    archivedRenameJobs.set(jobs);
+  } catch {
+    /* offline / no server */
+  }
+}
+
 // --- Multi-select ---
 export const selectedJobIds = writable<Set<number>>(new Set());
 export function toggleSelect(id: number) {
@@ -152,6 +167,26 @@ export function bulkDelete() {
   return runBulk('Delete', async (ids) => {
     const r = await api.bulkDelete(ids);
     addToast('Deleted', `Deleted ${r.deleted}`, 'success');
+  });
+}
+
+export function bulkArchive() {
+  return runBulk('Archive', async (ids) => {
+    const r = await api.bulkArchive(ids);
+    addToast('Archived', `Archived ${r.archived} job(s).`, 'success');
+  });
+}
+
+export function bulkUnarchive() {
+  return runBulk('Unarchive', async (ids) => {
+    const r = await api.bulkUnarchive(ids);
+    addToast('Restored', `Restored ${r.unarchived} job(s) to the queue.`, 'success');
+    // runBulk's own finally block calls refresh(), which only reloads
+    // renameJobs/renameStatus — not this separate archivedRenameJobs store.
+    // Unarchiving must also refresh the Archived tab the user is currently
+    // viewing, or the just-restored jobs would appear to linger there until
+    // the next manual reload.
+    await loadArchivedRenameJobs();
   });
 }
 

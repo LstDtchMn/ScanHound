@@ -16,13 +16,17 @@ vi.mock('$lib/stores/connection', () => ({
 const getRenameJobs = vi.fn().mockResolvedValue({ jobs: [] });
 const getRenameStatus = vi.fn().mockResolvedValue({
   enabled: true, require_confirmation: true, confidence_threshold: 70,
-  move_method: 'move', llm_enabled: false, counts: {}, needs_review: 0,
+  move_method: 'move', llm_enabled: false, counts: {}, needs_review: 0, archived: 0,
 });
+const bulkArchive = vi.fn();
+const bulkUnarchive = vi.fn();
 vi.mock('$lib/api/client', () => ({
   api: {
     getDvScans: vi.fn().mockResolvedValue({ scans: [], counts: {} }),
     getRenameJobs,
     getRenameStatus,
+    bulkArchive,
+    bulkUnarchive,
   }
 }));
 
@@ -420,5 +424,74 @@ describe('Apply progress: speed/ETA fields + staleness fixes', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('Archived rename jobs', () => {
+  beforeEach(() => {
+    for (const k of Object.keys(handlers)) delete handlers[k];
+    reconnectHandlers.length = 0;
+    getRenameJobs.mockReset().mockResolvedValue({ jobs: [] });
+    getRenameStatus.mockReset().mockResolvedValue({
+      enabled: true, require_confirmation: true, confidence_threshold: 70,
+      move_method: 'move', llm_enabled: false, counts: {}, needs_review: 0, archived: 0,
+    });
+    bulkArchive.mockReset();
+    bulkUnarchive.mockReset();
+    vi.resetModules();
+  });
+
+  it('loadArchivedRenameJobs fetches archived=true jobs into a separate store', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    const fakeJob = { id: 1, status: 'applied', archived_at: '2026-07-12T00:00:00Z' } as unknown as RenameJob;
+    getRenameJobs.mockImplementation((status?: string, archived?: boolean) =>
+      Promise.resolve({ jobs: archived ? [fakeJob] : [] })
+    );
+
+    await mod.loadArchivedRenameJobs();
+
+    expect(getRenameJobs).toHaveBeenCalledWith(undefined, true);
+    expect(get(mod.archivedRenameJobs)).toEqual([fakeJob]);
+    // The default (non-archived) renameJobs store must be untouched.
+    expect(get(mod.renameJobs)).toEqual([]);
+  });
+
+  it('bulkArchive calls the archive endpoint with selected ids, toasts, and clears selection', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    const { toasts } = await import('./notifications');
+    mod.selectedJobIds.set(new Set([1, 2]));
+    bulkArchive.mockResolvedValue({ archived: 2 });
+
+    await mod.bulkArchive();
+
+    expect(bulkArchive).toHaveBeenCalledWith([1, 2]);
+    expect(get(mod.selectedJobIds).size).toBe(0);
+    expect(get(toasts)[0]).toMatchObject({ title: 'Archived', body: 'Archived 2 job(s).' });
+    // runBulk's finally block refreshes the active queue.
+    expect(getRenameJobs).toHaveBeenCalled();
+    expect(getRenameStatus).toHaveBeenCalled();
+  });
+
+  it('bulkUnarchive calls the unarchive endpoint with selected ids and refreshes the Archived store', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    const { toasts } = await import('./notifications');
+    mod.selectedJobIds.set(new Set([3]));
+    bulkUnarchive.mockResolvedValue({ unarchived: 1 });
+    const fakeArchivedAfter = [{ id: 99, status: 'applied' }] as unknown as RenameJob[];
+    getRenameJobs.mockImplementation((status?: string, archived?: boolean) =>
+      Promise.resolve({ jobs: archived ? fakeArchivedAfter : [] })
+    );
+
+    await mod.bulkUnarchive();
+
+    expect(bulkUnarchive).toHaveBeenCalledWith([3]);
+    expect(get(toasts)[0]).toMatchObject({ title: 'Restored', body: 'Restored 1 job(s) to the queue.' });
+    // bulkUnarchive must explicitly refresh archivedRenameJobs — runBulk's own
+    // finally-block refresh() only touches renameJobs/renameStatus, not the
+    // separate Archived-tab store the user is currently viewing.
+    expect(get(mod.archivedRenameJobs)).toEqual(fakeArchivedAfter);
   });
 });

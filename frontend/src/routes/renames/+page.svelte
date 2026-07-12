@@ -7,7 +7,8 @@
     applyJob, undoJob, deleteJob, cancelApply,
     acceptCombinedJob, acceptCorrectionJob,
     dvScanProgress, dvScanResult, dvScans, dvCounts, dvScanRunning,
-    dvSyncRunning, dvSyncProgress, dvSyncResult
+    dvSyncRunning, dvSyncProgress, dvSyncResult,
+    archivedRenameJobs, loadArchivedRenameJobs
   } from '$lib/stores/renames';
   import { categoryOf } from '$lib/renames/category';
   import { matchesQuery } from '$lib/renames/review';
@@ -52,6 +53,14 @@
     loadRenameJobs();
     loadRenameStatus();
     loadDvScans();
+  });
+
+  // Archived jobs are excluded from the default (non-archived) load above —
+  // fetch them fresh each time the Archived tab is selected.
+  $effect(() => {
+    if (statusFilter === 'archived') {
+      loadArchivedRenameJobs();
+    }
   });
 
   // --- Re-identify all (ported verbatim from the old page) ---
@@ -191,18 +200,28 @@
       default: return a.sort((x, y) => (y.detected_at ?? '').localeCompare(x.detected_at ?? ''));
     }
   }
+  // Archived jobs are excluded from the default (non-archived) load entirely,
+  // so the Archived tab renders from the separate $archivedRenameJobs store
+  // (already archived-only) instead of filtering $renameJobs by status.
   let shown = $derived(
-    sortJobs(
-      $renameJobs
-        // Keep an in-flight ('applying') item visible on whatever tab you're on
-        // while its move/overwrite runs — otherwise it drops into a limbo that
-        // matches no status tab and vanishes mid-apply. It settles into Applied
-        // (or Failed) when done and then follows the normal tab rules.
-        .filter((j) => statusFilter === 'all' || j.status === statusFilter || j.status === 'applying')
-        .filter((j) => $renameCategory === 'all' || categoryOf(j).has($renameCategory))
-        .filter((j) => matchesQuery(j, $renameQuery)),
-      $renameSort
-    )
+    statusFilter === 'archived'
+      ? sortJobs(
+          $archivedRenameJobs
+            .filter((j) => $renameCategory === 'all' || categoryOf(j).has($renameCategory))
+            .filter((j) => matchesQuery(j, $renameQuery)),
+          $renameSort
+        )
+      : sortJobs(
+          $renameJobs
+            // Keep an in-flight ('applying') item visible on whatever tab you're on
+            // while its move/overwrite runs — otherwise it drops into a limbo that
+            // matches no status tab and vanishes mid-apply. It settles into Applied
+            // (or Failed) when done and then follows the normal tab rules.
+            .filter((j) => statusFilter === 'all' || j.status === statusFilter || j.status === 'applying')
+            .filter((j) => $renameCategory === 'all' || categoryOf(j).has($renameCategory))
+            .filter((j) => matchesQuery(j, $renameQuery)),
+          $renameSort
+        )
   );
   let shownIds = $derived(shown.map((j) => j.id));
   let hasFilters = $derived(
@@ -288,11 +307,13 @@
 
   <RenameFilterBar />
 
-  <BulkBar {shownIds} />
+  <BulkBar {shownIds} viewingArchived={statusFilter === 'archived'} />
 
   {#if shown.length === 0}
     <div class="text-center py-12 text-[var(--text-secondary)]">
-      {#if $renameJobs.length === 0}
+      {#if statusFilter === 'archived'}
+        <p>Nothing archived yet — jobs land here automatically when applied, or when you archive them from the queue.</p>
+      {:else if $renameJobs.length === 0}
         <p>No rename jobs yet. Use <strong>Process ▾</strong> to scan a folder.</p>
       {:else if hasFilters}
         <p>No jobs match these filters.</p>

@@ -97,6 +97,7 @@ export interface RenameJob {
   detected_at: string | null;
   processed_at: string | null;
   reverted_at: string | null;
+  archived_at: string | null;
   suggested_correction?: {
     original: { season: number; episode: number; title?: string };
     proposed: { season: number; episode: number; title?: string };
@@ -164,6 +165,7 @@ export interface RenameStatus {
   llm_enabled: boolean;
   counts: Record<string, number>;
   needs_review: number;
+  archived: number;
 }
 
 export interface WsMessage {

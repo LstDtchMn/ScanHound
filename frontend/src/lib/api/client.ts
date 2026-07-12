@@ -364,8 +364,11 @@ export const api = {
     request<{ status: string }>('/background/scan-now', { method: 'POST' }),
 
   // Auto-rename
-  getRenameJobs: (status?: string) => {
-    const qs = status ? `?status=${encodeURIComponent(status)}` : '';
+  getRenameJobs: (status?: string, archived?: boolean) => {
+    const params = new URLSearchParams();
+    if (status) params.set('status', status);
+    if (archived) params.set('archived', 'true');
+    const qs = params.toString() ? `?${params.toString()}` : '';
     return request<{ jobs: RenameJob[]; counts: Record<string, number> }>(`/rename/jobs${qs}`);
   },
   getRenameStatus: () => request<RenameStatus>('/rename/status'),
@@ -406,6 +409,16 @@ export const api = {
     }),
   bulkDelete: (ids: number[]) =>
     request<BulkDeleteResponse>('/rename/jobs/bulk/delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids })
+    }),
+  bulkArchive: (ids: number[]) =>
+    request<{ archived: number }>('/rename/jobs/bulk/archive', {
+      method: 'POST',
+      body: JSON.stringify({ ids })
+    }),
+  bulkUnarchive: (ids: number[]) =>
+    request<{ unarchived: number }>('/rename/jobs/bulk/unarchive', {
       method: 'POST',
       body: JSON.stringify({ ids })
     }),

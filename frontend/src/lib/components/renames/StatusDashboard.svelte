@@ -14,6 +14,10 @@
     return typeof v === 'number' ? v : 0;
   }
 
+  // Archiving is orthogonal to status — sourced from renameStatus.archived,
+  // not the status→count map above.
+  let archivedCount = $derived($renameStatus?.archived ?? 0);
+
   // dvCounts is Record<string, number> keyed by layer (fel, mel, p8, p5, etc.)
   let fel = $derived(($dvCounts as Record<string, number>)?.fel ?? 0);
   let mel = $derived(($dvCounts as Record<string, number>)?.mel ?? 0);
@@ -74,6 +78,14 @@
     borderStatus="failed"
     active={statusFilter === 'failed'}
     onclick={() => toggle('failed')}
+  />
+  <StatCard
+    label="Archived"
+    count={archivedCount}
+    variant="default"
+    borderStatus="archived"
+    active={statusFilter === 'archived'}
+    onclick={() => toggle('archived')}
   />
 
   <button
