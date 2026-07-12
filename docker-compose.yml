@@ -30,6 +30,49 @@ services:
       - "F:/Downloads:/library/movies"
       - "G:/Downloads:/library/movies-4k"
       - "F:/TV Shows:/library/tv"
+      # Read-only mounts of the ACTUAL organized Plex library (as opposed to
+      # the JD download/output folders above) so the technical-metadata probe
+      # (probe_specs()/dovi_tool -- resolution/audio-profile/HDR10+/DV FEL-MEL)
+      # can reach files that predate or live outside ScanHound's own
+      # rename/apply pipeline. Verified 2026-07-12: without these, the
+      # container could see only ~1.4% of plex_cache's movie file_paths.
+      # Each drive is mounted directly by letter -- Plex's own file_paths use
+      # NTFS junction aliases (C:\1080p Drives\<name>, C:\4K Drives\<name>)
+      # for these SAME volumes, but Docker Desktop's drvfs bridge does not
+      # follow those junctions (they resolve to a WSL2-internal symlink target
+      # invisible to the container), so the underlying drive letter is the
+      # only path that actually works. G:\Movies 1 is a second, distinct
+      # folder on the already-mounted G: drive (separate from G:\Downloads).
+      # Read-only: ScanHound only ever needs to READ these to probe them.
+      - "A:/:/library/plex-source/a-4k-gambino:ro"
+      - "B:/:/library/plex-source/b-1080p-eastwood-gengis-khan:ro"
+      - "E:/:/library/plex-source/e-4k-hdr-columbo:ro"
+      - "H:/:/library/plex-source/h-1080p-zepplin:ro"
+      - "I:/:/library/plex-source/i-4k-hdr-arnold:ro"
+      - "J:/:/library/plex-source/j-4k-jefferson-truman-bu:ro"
+      - "K:/:/library/plex-source/k-1080p-kennedy-van-buren:ro"
+      - "L:/:/library/plex-source/l-1080p-bismark:ro"
+      - "M:/:/library/plex-source/m-1080p-nixon-maclom:ro"
+      # F: is already mounted above for JD's own Downloads/TV-Shows staging,
+      # but F:\1080p Tony Montana's actual movie folder ("Movies 1 1080p")
+      # sits outside those two narrow subfolders -- a separate, broader
+      # root-of-drive mount is needed to reach it. Confirmed safe: Docker
+      # allows overlapping bind mounts at different container paths.
+      - "F:/:/library/plex-source/f-1080p-tony-montana:ro"
+      - "Q:/:/library/plex-source/q-4k-quantum:ro"
+      - "R:/:/library/plex-source/r-4k-rickover:ro"
+      - "U:/:/library/plex-source/u-4k-ulysses-yuri-gagarin-bu:ro"
+      - "W:/:/library/plex-source/w-1080p-walter-white:ro"
+      - "G:/Movies 1:/library/plex-source/g-movies-1:ro"
+      # NAS shares (\\TURTLELANDSRV2\...) are NOT mounted here -- Docker
+      # Desktop's compose short-form volume syntax rejected the raw UNC path
+      # ("...is not a valid Windows path", a Docker Desktop path-validator
+      # limitation, not a syntax typo). These need the share mapped to a
+      # local drive letter on the host first, then mounted like the entries
+      # above. Deferred pending that host-side step. Covers (when added):
+      # \\TURTLELANDSRV2\1080p John Paul Jones, 1080p Lincoln, 1080p Faraday,
+      # 1080p Icarus, 1080p Nathan Hale, 1080p Picasso aka Newton,
+      # 4K HDR Geronimo, 4K Magellan.
       # crawler.db lives on a Docker-managed named volume (native VM ext4), NOT
       # the ./data bind mount: SQLite WAL's shared-memory index cannot be
       # mmap'd correctly across the Docker-for-Windows bind-mount proxy, which
