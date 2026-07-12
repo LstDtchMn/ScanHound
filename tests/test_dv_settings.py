@@ -91,6 +91,41 @@ def test_defaults_have_dv_keys():
     assert isinstance(_DEFAULT_CONFIG["dv_label_vocab"], str)
 
 
+def test_plex_library_path_mappings_has_seeded_default():
+    # Regression: plex_cache.file_path comes back in Plex's own terms (drive
+    # letters, NTFS junction-folder aliases, or NAS UNC paths) which aren't
+    # directly readable in the container. Seed the 23 mappings verified
+    # working end-to-end this session so probing works out of the box.
+    from backend.config import DEFAULT_CONFIG
+    assert "plex_library_path_mappings" in DEFAULT_CONFIG
+    seeded = DEFAULT_CONFIG["plex_library_path_mappings"]
+    assert "C:\\1080p Drives\\1080p Bismark => /library/plex-source/l-1080p-bismark" in seeded
+    assert "\\\\TURTLELANDSRV2\\4K Magellan => /library/plex-source/nas-4k-magellan" in seeded
+
+
+def test_settings_model_accepts_plex_library_path_mappings():
+    m = SettingsUpdate(plex_library_path_mappings="A: => /library/plex-source/a")
+    dumped = m.model_dump(exclude_unset=True)
+    assert dumped["plex_library_path_mappings"] == "A: => /library/plex-source/a"
+
+
+def test_put_settings_accepts_plex_library_path_mappings(client):
+    from backend.api.dependencies import registry
+    registry.config = {}
+
+    class _Backend:
+        _cleared_keys = set()
+        def save_config(self):  # no-op; config isolated by conftest
+            pass
+    registry.backend = _Backend()
+
+    payload = {"plex_library_path_mappings": "A: => /library/plex-source/a"}
+    r = client.put("/settings", json=payload)
+    assert r.status_code == 200, r.text
+    assert "plex_library_path_mappings" in set(r.json()["updated_keys"])
+    assert registry.config["plex_library_path_mappings"] == "A: => /library/plex-source/a"
+
+
 def test_put_settings_round_trips_dv_and_4k(client):
     from backend.api.dependencies import registry
     registry.config = {}

@@ -483,6 +483,37 @@ _DEFAULT_CONFIG: AppConfig = {
     "dv_detection": False,
     "dv_file_tagging": False,
     "dv_label_vocab": '{"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}',
+    # Plex reports library file paths using ITS OWN path form (a drive letter,
+    # an NTFS junction-folder alias, or a NAS UNC share path), which usually
+    # differs from where ScanHound's own docker-compose mounts expose that
+    # same file inside the container. Maps host => container, one per line;
+    # seeded with the 23 mappings verified end-to-end this session (every
+    # one resolves to a real, readable file across a 16,091-movie plex_cache).
+    "plex_library_path_mappings": (
+        "C:\\1080p Drives\\1080p Bismark => /library/plex-source/l-1080p-bismark\n"
+        "C:\\1080p Drives\\1080p Eastwood & Gengis Khan => /library/plex-source/b-1080p-eastwood-gengis-khan\n"
+        "C:\\1080p Drives\\1080p Kennedy & Van Buren => /library/plex-source/k-1080p-kennedy-van-buren\n"
+        "C:\\1080p Drives\\1080p Nixon & Maclom => /library/plex-source/m-1080p-nixon-maclom\n"
+        "C:\\1080p Drives\\1080p Tony Montana => /library/plex-source/f-1080p-tony-montana\n"
+        "C:\\1080p Drives\\1080p Walter White => /library/plex-source/w-1080p-walter-white\n"
+        "C:\\1080p Drives\\1080p Zepplin => /library/plex-source/h-1080p-zepplin\n"
+        "C:\\4K Drives\\4K Columbo => /library/plex-source/e-4k-hdr-columbo\n"
+        "C:\\4K Drives\\4K Gambino => /library/plex-source/a-4k-gambino\n"
+        "C:\\4K Drives\\4K Jefferson & Truman BU => /library/plex-source/j-4k-jefferson-truman-bu\n"
+        "C:\\4K Drives\\4K Quantum => /library/plex-source/q-4k-quantum\n"
+        "C:\\4K Drives\\4K Rickover => /library/plex-source/r-4k-rickover\n"
+        "C:\\4K Drives\\4K Ulysses & Yuri Gagarin BU => /library/plex-source/u-4k-ulysses-yuri-gagarin-bu\n"
+        "C:\\4K Drives\\4k HDR Arnold => /library/plex-source/i-4k-hdr-arnold\n"
+        "G:\\Movies 1 => /library/plex-source/g-movies-1\n"
+        "\\\\TURTLELANDSRV2\\1080p John Paul Jones => /library/plex-source/nas-1080p-john-paul-jones\n"
+        "\\\\TURTLELANDSRV2\\1080p Lincoln => /library/plex-source/nas-1080p-lincoln\n"
+        "\\\\TURTLELANDSRV2\\1080p Faraday => /library/plex-source/nas-1080p-faraday\n"
+        "\\\\TURTLELANDSRV2\\1080p Icarus => /library/plex-source/nas-1080p-icarus\n"
+        "\\\\TURTLELANDSRV2\\1080p Nathan Hale => /library/plex-source/nas-1080p-nathan-hale\n"
+        "\\\\TURTLELANDSRV2\\1080p Picasso aka Newton => /library/plex-source/nas-1080p-picasso-aka-newton\n"
+        "\\\\TURTLELANDSRV2\\4K HDR Geronimo => /library/plex-source/nas-4k-hdr-geronimo\n"
+        "\\\\TURTLELANDSRV2\\4K Magellan => /library/plex-source/nas-4k-magellan"
+    ),
     "clear_logs_startup": False,
     "scan_threads": 10,
     "tv_match_threshold": 90,

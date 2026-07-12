@@ -1524,6 +1524,14 @@
               oninput={(e) => settings.update((s) => ({ ...s, auto_rename_path_mappings: e.currentTarget.value }))}
               placeholder={'F:\\Downloads => /library/movies'} class="{inputClass} font-mono text-xs"></textarea>
           </label>
+          <label class="block">
+            <Tooltip text={'Plex reports library files using ITS OWN path form (a drive letter, an NTFS junction-folder alias, or a NAS share path) which is usually different from where ScanHound sees that same file mounted in its own container. Map each Plex-reported path prefix to its container path, one per line, as: host => container. Seeded with the mappings already confirmed working for this library -- edit if a drive is renamed or a new one is added (needs a matching docker-compose mount too).'}>
+              <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Plex library path mappings (host ⇒ container) ⓘ</span>
+            </Tooltip>
+            <textarea rows="6" value={$settings.plex_library_path_mappings ?? ''}
+              oninput={(e) => settings.update((s) => ({ ...s, plex_library_path_mappings: e.currentTarget.value }))}
+              placeholder={'C:\\1080p Drives\\Example => /library/plex-source/example'} class="{inputClass} font-mono text-xs"></textarea>
+          </label>
           <p class="text-xs text-[var(--text-secondary)]">Leave the templates blank for the Plex default naming convention.</p>
           <label class="block">
             <Tooltip text={'Tokens: {{title}} {{year}} {{resolution}} {{imdb_id}} {{tmdb_id}}. Sections in [ ] are omitted when the token is empty. Default (blank): Title (Year) [resolution].mkv'}>

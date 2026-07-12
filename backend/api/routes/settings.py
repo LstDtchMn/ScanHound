@@ -122,6 +122,11 @@ class SettingsUpdate(BaseModel):
     # save paths into the container's mounted view. Editable in the UI but was
     # missing here, so saving it 422'd under extra="forbid".
     auto_rename_path_mappings: Optional[str] = None
+    # Plex reports library file paths using its own path form (drive letter,
+    # NTFS junction-folder alias, or NAS UNC share path); maps each to the
+    # container path where ScanHound's own docker-compose mounts expose the
+    # same file, one per line, as: host => container.
+    plex_library_path_mappings: Optional[str] = None
     auto_rename_template_movie: Optional[str] = None
     auto_rename_template_tv: Optional[str] = None
     auto_rename_plex_sort_titles: Optional[bool] = None
