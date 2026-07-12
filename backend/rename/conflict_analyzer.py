@@ -19,6 +19,7 @@ from backend.rename.conflicts import (
     conflict_annotations, find_library_duplicate, needs_dv_layer_scan, rank_conflict,
 )
 from backend.rename.mediainfo import probe_specs
+from backend.rename.path_translation import translate_plex_path
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,8 @@ def has_active_duplicate(job: dict, annotations: dict, plex_cache_rows: list) ->
     return find_library_duplicate(job, plex_cache_rows) is not None
 
 
-def analyze_job_conflict(db, job: dict, plex_cache_rows: Optional[list] = None) -> Optional[dict]:
+def analyze_job_conflict(db, job: dict, plex_cache_rows: Optional[list] = None,
+                          path_mappings: Optional[str] = None) -> Optional[dict]:
     """Analyze one job's active duplicate (if any) and persist the result.
 
     Resolution order: an exact-destination-path collision (a file already on
@@ -84,7 +86,7 @@ def analyze_job_conflict(db, job: dict, plex_cache_rows: Optional[list] = None) 
         match = find_library_duplicate(job, rows)
         if match and match.get("file_path"):
             kind = "library_duplicate"
-            existing_path = match["file_path"]
+            existing_path = translate_plex_path(match["file_path"], path_mappings)
 
     if kind is None:
         return None
@@ -144,7 +146,7 @@ def analyze_job_conflict(db, job: dict, plex_cache_rows: Optional[list] = None) 
     return analysis
 
 
-def analyze_pending_conflicts(db, limit: int = 50) -> int:
+def analyze_pending_conflicts(db, limit: int = 50, path_mappings: Optional[str] = None) -> int:
     """Maintenance-loop sweep: find active jobs that ACTUALLY have a duplicate
     (has_active_duplicate) with missing/stale conflict_analysis (older than
     detected_at — a duplicate that only became detectable after the job's
@@ -173,7 +175,7 @@ def analyze_pending_conflicts(db, limit: int = 50) -> int:
     n = 0
     for job in candidates:
         try:
-            analyze_job_conflict(db, job, plex_cache_rows=plex_rows)
+            analyze_job_conflict(db, job, plex_cache_rows=plex_rows, path_mappings=path_mappings)
         except Exception:
             logger.exception("analyze_pending_conflicts: job %s failed", job.get("id"))
         n += 1

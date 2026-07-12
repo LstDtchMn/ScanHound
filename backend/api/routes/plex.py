@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.ws import ws_manager
+from backend.rename.path_translation import translate_plex_path
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/plex", tags=["plex"])
@@ -166,18 +167,21 @@ def plex_stats(reg: ServiceRegistry = Depends(get_registry)):
 
 def _movie_targets_for_scope(reg: ServiceRegistry, scope: str, ids: Optional[List[str]]) -> list:
     """Resolve a scan scope into a list of {path, title, rating_key, imdb_id}
-    dicts, movies only, skipping rows with no known file_path."""
+    dicts, movies only, skipping rows with no known file_path. Each path is
+    translated from Plex's own reported form into the container-local path
+    the docker-compose mounts actually expose."""
     movies = reg.db.list_plex_cache_movies() if reg.db else []
     if scope == "selected":
         wanted = set(ids or [])
         movies = [m for m in movies if m.get("key") in wanted]
+    mappings = reg.config.get("plex_library_path_mappings") if reg.config else None
     targets = []
     for m in movies:
         path = m.get("file_path")
         if not path:
             continue
         targets.append({
-            "path": path,
+            "path": translate_plex_path(path, mappings),
             "title": m.get("title"),
             "rating_key": m.get("rating_key"),
             "imdb_id": m.get("imdb_id"),

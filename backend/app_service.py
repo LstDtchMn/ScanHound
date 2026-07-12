@@ -606,7 +606,9 @@ class AppService:
         try:
             if self.db is not None:
                 from backend.rename.conflict_analyzer import analyze_pending_conflicts
-                n = analyze_pending_conflicts(self.db, limit=50)
+                n = analyze_pending_conflicts(
+                    self.db, limit=50,
+                    path_mappings=self.config.get("plex_library_path_mappings"))
                 if n:
                     logger.info("Conflict analysis backfill: processed %d job(s)", n)
         except Exception:

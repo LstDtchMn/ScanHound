@@ -173,3 +173,42 @@ def test_analyze_pending_conflicts_respects_limit_within_the_filtered_set():
         n = conflict_analyzer.analyze_pending_conflicts(db, limit=2)
     assert analyze_mock.call_count == 2
     assert n == 2
+
+
+def test_analyze_job_conflict_translates_existing_path_before_probing():
+    # Regression test: existing_path comes straight from plex_cache.file_path
+    # (Plex's own reported path, e.g. a Windows drive/junction path) and must
+    # be translated to a container-local path before reaching probe_specs(),
+    # or every library-side probe silently fails to find the file.
+    db = MagicMock()
+    path_mappings = "C:\\1080p Drives\\1080p Bismark => /library/plex-source/l-1080p-bismark"
+    plex_rows = [{"key": "k1", "imdb_id": "tt1", "title": "x", "year": 2020, "is_tv": 0,
+                  "file_path": "C:\\1080p Drives\\1080p Bismark\\X (2020).mkv", "rating_key": "99"}]
+    with patch("os.path.lexists", return_value=False), \
+         patch("backend.rename.conflict_analyzer.probe_specs") as probe_mock:
+        probe_mock.return_value = {"present": False, "path": None, "size_bytes": None,
+                                    "container": None, "duration_min": None, "bitrate": None,
+                                    "resolution": None, "video_codec": None, "hdr": None,
+                                    "dv_layer": None, "audio": None, "audio_profile": None}
+        conflict_analyzer.analyze_job_conflict(
+            db, _job(), plex_cache_rows=plex_rows, path_mappings=path_mappings)
+        existing_call = probe_mock.call_args_list[0]
+        assert existing_call.args[0] == "/library/plex-source/l-1080p-bismark/X (2020).mkv"
+
+
+def test_analyze_job_conflict_no_path_mappings_uses_raw_path():
+    # Backward-compat: path_mappings defaults to None, so an existing caller
+    # that doesn't pass it still works exactly as before (raw path through,
+    # same as translate_plex_path's own no-mapping passthrough behavior).
+    db = MagicMock()
+    plex_rows = [{"key": "k1", "imdb_id": "tt1", "title": "x", "year": 2020, "is_tv": 0,
+                  "file_path": "C:\\1080p Drives\\1080p Bismark\\X (2020).mkv", "rating_key": "99"}]
+    with patch("os.path.lexists", return_value=False), \
+         patch("backend.rename.conflict_analyzer.probe_specs") as probe_mock:
+        probe_mock.return_value = {"present": False, "path": None, "size_bytes": None,
+                                    "container": None, "duration_min": None, "bitrate": None,
+                                    "resolution": None, "video_codec": None, "hdr": None,
+                                    "dv_layer": None, "audio": None, "audio_profile": None}
+        conflict_analyzer.analyze_job_conflict(db, _job(), plex_cache_rows=plex_rows)
+        existing_call = probe_mock.call_args_list[0]
+        assert existing_call.args[0] == "C:\\1080p Drives\\1080p Bismark\\X (2020).mkv"

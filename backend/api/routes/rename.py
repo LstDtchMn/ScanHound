@@ -200,7 +200,9 @@ def list_jobs(status: Optional[str] = None, limit: int = 200, archived: bool = F
                         try:
                             job = reg.db.get_rename_job(jid)
                             if job:
-                                analyze_job_conflict(reg.db, job, plex_cache_rows=plex_movie_rows)
+                                analyze_job_conflict(
+                                    reg.db, job, plex_cache_rows=plex_movie_rows,
+                                    path_mappings=reg.config.get("plex_library_path_mappings"))
                         except Exception:
                             logger.exception("list_jobs: background analysis failed for job %s", jid)
                 finally:
