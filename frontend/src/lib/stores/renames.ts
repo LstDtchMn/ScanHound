@@ -368,6 +368,24 @@ connection.on('rename:queue_progress', (data) => {
 connection.on('rename:job', (data) => {
   const job = data as unknown as RenameJob;
   if (!job || !job.id) return;
+  if (job.archived_at) {
+    // Auto-archive-on-apply (backend/rename/service.py's two apply() success
+    // paths set archived_at in the same update_rename_job() call that sets
+    // status="applied") lands here, not via a separate event — this is the
+    // ONLY signal a live session gets that a job just left the active queue.
+    // renameJobs models the non-archived queue (loadRenameJobs's default
+    // archived=false), so an archived job must be evicted, not upserted, or
+    // it visibly lingers in the active list until a full page reload.
+    renameJobs.update((jobs) => jobs.filter((j) => j.id !== job.id));
+    renameProgress.update((m) => {
+      if (!m.has(job.id)) return m;
+      const next = new Map(m);
+      next.delete(job.id);
+      return next;
+    });
+    loadRenameStatus();
+    return;
+  }
   renameJobs.update((jobs) => {
     const idx = jobs.findIndex((j) => j.id === job.id);
     if (idx >= 0) {
@@ -481,6 +499,14 @@ export async function resyncAfterReconnect() {
   const TERMINAL = new Set(['applied', 'failed']);
   for (const local of get(renameJobs)) {
     if (!TERMINAL.has(local.status)) continue;
+    // A locally-known-archived job must never be replanted into the active
+    // queue just because these archived-excluding snapshot reads don't
+    // include it — that would defeat the whole point of archiving it. (In
+    // practice the live rename:job handler above already evicts an archived
+    // job from renameJobs the instant it learns archived_at, so this is
+    // belt-and-suspenders — but it's the exact scenario a prior review
+    // flagged this merge as blind to, so keep the guard explicit.)
+    if (local.archived_at) continue;
     const merged = byId.get(local.id);
     if (!merged || !TERMINAL.has(merged.status)) byId.set(local.id, local);
   }

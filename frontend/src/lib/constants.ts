@@ -174,7 +174,12 @@ export const DOWNLOAD_HOSTS: DownloadHostOption[] = [
   { value: '1Fichier', short: '1F' },
 ];
 
-/** Rename-pipeline status → Badge variant (distinct from scan STATUS_VARIANTS). */
+/** Rename-pipeline status → Badge variant (distinct from scan STATUS_VARIANTS).
+ *  `archived` is not a real job status (archiving is orthogonal to status —
+ *  see backend/database.py's archived_at column) but StatusDashboard's
+ *  Archived StatCard reuses this same lookup via borderStatus="archived", so
+ *  it's mapped here explicitly to a deliberately neutral/muted color rather
+ *  than relying on the unmapped-key fallback in renameStatusVariant() below. */
 export const RENAME_STATUS_VARIANTS: Record<string, BadgeVariant> = {
   needs_review: 'warning',
   matched: 'accent',
@@ -182,6 +187,7 @@ export const RENAME_STATUS_VARIANTS: Record<string, BadgeVariant> = {
   reverted: 'default',
   failed: 'error',
   pending: 'info',
+  archived: 'default',
 };
 
 /** Dolby Vision layer → Badge variant. */

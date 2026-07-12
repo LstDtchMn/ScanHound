@@ -8,7 +8,7 @@
     acceptCombinedJob, acceptCorrectionJob,
     dvScanProgress, dvScanResult, dvScans, dvCounts, dvScanRunning,
     dvSyncRunning, dvSyncProgress, dvSyncResult,
-    archivedRenameJobs, loadArchivedRenameJobs
+    archivedRenameJobs, loadArchivedRenameJobs, clearSelection
   } from '$lib/stores/renames';
   import { categoryOf } from '$lib/renames/category';
   import { matchesQuery } from '$lib/renames/review';
@@ -56,8 +56,14 @@
   });
 
   // Archived jobs are excluded from the default (non-archived) load above —
-  // fetch them fresh each time the Archived tab is selected.
+  // fetch them fresh each time the Archived tab is selected. A selection
+  // held from whatever tab was previously showing is cleared on every switch
+  // too: the selected ids generally aren't even present in the newly-shown
+  // list, so leaving them selected would show a stale "N selected" count in
+  // BulkBar and — for Archived's Restore button specifically — a confusing
+  // "Restored 0 job(s)…" toast if clicked against ids that aren't archived.
   $effect(() => {
+    clearSelection();
     if (statusFilter === 'archived') {
       loadArchivedRenameJobs();
     }

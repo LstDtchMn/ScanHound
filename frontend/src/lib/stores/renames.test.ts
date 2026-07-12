@@ -494,4 +494,56 @@ describe('Archived rename jobs', () => {
     // separate Archived-tab store the user is currently viewing.
     expect(get(mod.archivedRenameJobs)).toEqual(fakeArchivedAfter);
   });
+
+  it('a rename:job broadcast carrying archived_at evicts the job from renameJobs instead of upserting it (live auto-archive-on-apply)', async () => {
+    // Regression test for review finding (Important): both apply() success
+    // paths set archived_at server-side in the very same update that sets
+    // status="applied", and queue_apply runs the actual move on a background
+    // thread — so the ONLY signal a live session gets that a job just left
+    // the active (non-archived) queue is this broadcast. Previously the
+    // handler unconditionally upserted, leaving the job visibly stuck in the
+    // active list (e.g. the Applied/All tab) until a full page reload.
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.renameJobs.set([{ id: 5, status: 'applying' }] as unknown as RenameJob[]);
+    mod.renameProgress.set(new Map([
+      [5, { pct: 60, bytes_done: 600, bytes_total: 1000, bytes_per_sec: 100, eta_seconds: 4, updatedAt: Date.now() }],
+    ]));
+
+    handlers['rename:job']({ id: 5, status: 'applied', archived_at: '2026-07-12T00:00:00Z' });
+
+    expect(get(mod.renameJobs).find((j: { id: number }) => j.id === 5)).toBeUndefined();
+    expect(get(mod.renameProgress).has(5)).toBe(false);
+    // The Archived StatCard's count is still sourced from renameStatus, so
+    // eviction must not skip the status reload.
+    expect(getRenameStatus).toHaveBeenCalled();
+  });
+
+  it('a rename:job broadcast without archived_at still upserts normally (not archived)', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.renameJobs.set([{ id: 6, status: 'applying' }] as unknown as RenameJob[]);
+
+    handlers['rename:job']({ id: 6, status: 'failed' });
+
+    expect(get(mod.renameJobs).find((j: { id: number }) => j.id === 6)).toMatchObject({ status: 'failed' });
+  });
+
+  it('resyncAfterReconnect never resurrects a locally-known-archived job into the active queue', async () => {
+    // Regression test for review finding (Important): the merge loop that
+    // protects a locally-known TERMINAL (applied/failed) job from a stale/
+    // paginated-out snapshot must not also replant a job the client already
+    // knows is archived — the archived-excluding snapshot correctly omits
+    // it, and that omission must be trusted, not overridden.
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.renameJobs.set([
+      { id: 42, status: 'applied', archived_at: '2026-07-12T00:00:00Z' },
+    ] as unknown as RenameJob[]);
+    mockJobsByStatus([], []); // fresh snapshot correctly omits the archived job
+
+    await mod.resyncAfterReconnect();
+
+    expect(get(mod.renameJobs).find((j) => j.id === 42)).toBeUndefined();
+  });
 });
