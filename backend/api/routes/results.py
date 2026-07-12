@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.routes.scanner import get_last_scan_items, _media_item_to_dict
+from backend.app_service import normalize_title
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/results", tags=["results"])
@@ -241,7 +242,7 @@ def _filter_and_sort(items, *, filter=None, search=None, category=None,
         genre: list of genres; item must have at least one
         genre_exclude: list of genres; item must have NONE of these
         language: list of languages; item must match
-        quick: list of quick filters ('4k', 'hdrdv', 'inplex')
+        quick: list of quick filters ('4k', 'hdrdv', 'inplex', 'bookmarked')
         posted_after: "YYYY-MM-DD" string; inclusive lower bound on posted_date
             (start of that day). Items with a missing/unparseable posted_date
             are excluded whenever either bound is set.
@@ -295,6 +296,8 @@ def _filter_and_sort(items, *, filter=None, search=None, category=None,
                       if i.get("dovi") or (i.get("hdr") and i.get("hdr") != "SDR")]
         if "inplex" in q:
             result = [i for i in result if _has_plex_copy(i)]
+        if "bookmarked" in q:
+            result = [i for i in result if i.get("bookmarked")]
 
     if posted_after or posted_before:
         after_ts = _parse_bound_date(posted_after).timestamp() if posted_after else None
@@ -390,6 +393,16 @@ class DismissRequest(BaseModel):
     meta: Optional[Dict[str, Dict[str, Any]]] = None
     # True = dismiss (skip), False = un-dismiss (restore).
     dismissed: bool = True
+
+
+class BookmarkRequest(BaseModel):
+    imdb_id: Optional[str] = None
+    title: str
+    year: Optional[int] = None
+    media_type: str
+    # True = bookmark, False = un-bookmark (mirrors DismissRequest's explicit
+    # boolean-flag shape rather than an implicit toggle).
+    bookmarked: bool = True
 
 
 def _csv(param: Optional[str]) -> Optional[List[str]]:
@@ -509,6 +522,24 @@ def _shape_results(
                 s = skipped_titles.get(i.get("group_key")) if skipped_titles else None
                 return s is None or _is_better_grab(i, s)
             items = [i for i in items if _keep(i)]
+
+    # Bulk-annotate every item with its bookmarked state, ONE query per
+    # request (list_bookmark_keys) instead of one per item -- mirrors the
+    # dismissed/skipped_titles bulk-set pattern just above. Computed BEFORE
+    # status/search/category/genre/language/quick filtering (and before the
+    # stats snapshot) so the 'bookmarked' quick filter has something to
+    # filter on and stats/facets see the flag too.
+    bookmark_keys = reg.db.list_bookmark_keys() if reg.db is not None else set()
+
+    def _item_bookmark_key(i):
+        imdb = i.get("imdb_id")
+        if imdb:
+            return ("imdb", imdb)
+        media_type = "tv" if i.get("season") is not None else "movie"
+        return ("title", normalize_title(str(i.get("title", ""))), i.get("year"), media_type)
+
+    for i in items:
+        i["bookmarked"] = _item_bookmark_key(i) in bookmark_keys
 
     # Snapshot of all visible (non-dismissed) items for the overall stats,
     # before status/search/category/genre/language/quick filtering narrows
@@ -816,6 +847,31 @@ def clear_dismissed(reg: ServiceRegistry = Depends(get_registry)):
         raise HTTPException(status_code=503, detail="Database not available")
     db.clear_dismissed_items()
     return {"status": "ok", "dismissed_count": 0}
+
+
+@router.post("/bookmark")
+def bookmark_item(req: BookmarkRequest, reg: ServiceRegistry = Depends(get_registry)):
+    """Bookmark (or un-bookmark) a title, independent of which release the
+    user was looking at when they clicked it. Per-title identity: imdb_id
+    when present, else normalized-title+year+media_type."""
+    db = reg.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    if req.bookmarked:
+        db.add_bookmark(req.imdb_id, req.title, req.year, req.media_type)
+    else:
+        db.remove_bookmark(req.imdb_id, req.title, req.year, req.media_type)
+    return {"status": "ok", "bookmarked": req.bookmarked}
+
+
+@router.get("/bookmarks")
+def list_bookmarks(reg: ServiceRegistry = Depends(get_registry)):
+    """List every bookmarked title (for a 'show bookmarks' / manage view)."""
+    db = reg.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    items = db.list_bookmarks()
+    return {"items": items, "count": len(items)}
 
 
 @router.post("/export")

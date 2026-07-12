@@ -216,6 +216,7 @@ def _client_with_cache(rows, version=None):
     registry.db.get_downloaded_urls.return_value = set()
     registry.db.get_downloaded_title_quality.return_value = []
     registry.db.get_downloaded_titles.return_value = []
+    registry.db.list_bookmark_keys.return_value = set()
     # A real (count, max_last_seen_at)-shaped version by default so the B2
     # parse-cache in results.py behaves like it would against a real
     # DatabaseManager (unchanged rows -> unchanged version -> cache hit).
@@ -265,6 +266,26 @@ def test_grabbed_sibling_versions_are_reclassified():
     assert by_url["d/720"]["prior_grab"]["resolution"] == "1080p"
     # Downloaded/similar leave the deck; the better 4K stays counted as missing.
     assert data["stats"]["upgrade"] == 0
+
+
+def test_shape_results_annotates_bookmarked_flag():
+    # One item matches a bookmark by imdb_id, one by the title/year/media_type
+    # fallback key, one is not bookmarked at all.
+    rows = [
+        _row("Dune: Part Two", url="u/imdb", group_key="dune2-2020", imdb_id="tt1234567"),
+        _row("Some Obscure Show", url="u/title", group_key="show-2020", imdb_id=None, season=1),
+        _row("Not Bookmarked", url="u/plain", group_key="plain-2020"),
+    ]
+    c = _client_with_cache(rows)
+    registry.db.list_bookmark_keys.return_value = {
+        ("imdb", "tt1234567"),
+        ("title", "some obscure show", 2020, "tv"),
+    }
+    data = c.get("/results/cached", params={"per_page": 100}).json()
+    by_title = {i["title"]: i for i in data["items"]}
+    assert by_title["Dune: Part Two"]["bookmarked"] is True
+    assert by_title["Some Obscure Show"]["bookmarked"] is True
+    assert by_title["Not Bookmarked"]["bookmarked"] is False
 
 
 def test_sibling_match_is_year_aware_no_remake_contamination():

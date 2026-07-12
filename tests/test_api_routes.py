@@ -53,6 +53,23 @@ def _reset_dismissed():
 
 
 @pytest.fixture(autouse=True)
+def _reset_bookmarks():
+    """Clear persisted bookmarks between tests (the DB path is shared)."""
+    def _clear():
+        try:
+            from backend.database import DatabaseManager
+            dm = DatabaseManager()
+            for b in dm.list_bookmarks():
+                dm.remove_bookmark(b["imdb_id"], b["title"], b["year"], b["media_type"])
+            dm.close()
+        except Exception:
+            pass
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_scan_state():
     """Reset scan state between tests."""
     from backend.api.routes.scanner import _scan_state, _scan_lock, _items_lock
@@ -549,6 +566,30 @@ class TestDismiss:
         assert resp.status_code == 200
         assert resp.json()["dismissed_count"] == 0
         assert client.get("/results/dismissed").json()["count"] == 0
+
+
+class TestBookmarks:
+    def test_bookmark_endpoint_adds_and_lists(self, client):
+        resp = client.post("/results/bookmark", json={
+            "imdb_id": "tt1234567", "title": "Dune: Part Two", "year": 2024,
+            "media_type": "movie", "bookmarked": True,
+        })
+        assert resp.status_code == 200
+        listed = client.get("/results/bookmarks").json()
+        assert listed["count"] == 1
+        assert listed["items"][0]["imdb_id"] == "tt1234567"
+
+    def test_bookmark_endpoint_removes(self, client):
+        client.post("/results/bookmark", json={
+            "imdb_id": "tt1234567", "title": "Dune: Part Two", "year": 2024,
+            "media_type": "movie", "bookmarked": True,
+        })
+        resp = client.post("/results/bookmark", json={
+            "imdb_id": "tt1234567", "title": "Dune: Part Two", "year": 2024,
+            "media_type": "movie", "bookmarked": False,
+        })
+        assert resp.status_code == 200
+        assert client.get("/results/bookmarks").json()["count"] == 0
 
 
 # ── Downloads ─────────────────────────────────────────────────────────
