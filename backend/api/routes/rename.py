@@ -135,9 +135,16 @@ class ApplyRequest(BaseModel):
 
 
 @router.get("/jobs")
-def list_jobs(status: Optional[str] = None, limit: int = 200,
+def list_jobs(status: Optional[str] = None, limit: int = 200, archived: bool = False,
               reg: ServiceRegistry = Depends(get_registry)):
     """List tracked rename jobs (optionally filtered by status) + status counts.
+
+    ``archived`` defaults to False (active jobs only). apply() now archives a
+    job the instant it succeeds, so callers that need to see applied/archived
+    jobs must pass ``archived=true`` explicitly — this is the minimal slice of
+    Task 2's route change pulled forward into Task 1's fix commit, since
+    without it a just-applied job is invisible to every consumer of this
+    endpoint the moment archiving landed (see Task 1 review finding).
 
     Each job is annotated with ``destination_conflict`` (another job targets the
     same destination file), ``library_duplicate`` (a same-title/year movie
@@ -151,7 +158,10 @@ def list_jobs(status: Optional[str] = None, limit: int = 200,
     if reg.db is None:
         return {"jobs": [], "counts": {}}
     limit = max(1, min(int(limit), 2000))  # clamp: never let a client OOM the box
-    jobs = reg.db.list_rename_jobs(status=status, limit=limit)
+    jobs = reg.db.list_rename_jobs(status=status, limit=limit, archived=archived)
+    # Conflict/duplicate annotations are deliberately scoped to ACTIVE jobs only
+    # (archived=False default, unaffected by the `archived` param above) — an
+    # applied-and-archived job shouldn't flag as a live duplicate/conflict.
     all_active_jobs = reg.db.list_rename_jobs(limit=100000) or []
     # Annotations are computed over ALL active jobs (not just this filtered page),
     # so a duplicate is still flagged when the two halves land on different pages

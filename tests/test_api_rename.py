@@ -43,6 +43,11 @@ def _wait_settled(client, jid, timeout=8.0):
 
     Applies now run on a background worker (the HTTP response only queues),
     so tests must wait for the terminal status before asserting on files.
+
+    A successful apply also archives the job instantly (auto-archive-on-apply),
+    which drops it out of the default (non-archived) /rename/jobs listing — so
+    if the id isn't found there, check the archived listing too before
+    concluding the job doesn't exist.
     """
     import time as _t
     deadline = _t.monotonic() + timeout
@@ -50,6 +55,9 @@ def _wait_settled(client, jid, timeout=8.0):
     while _t.monotonic() < deadline:
         jobs = client.get("/rename/jobs").json()["jobs"]
         job = next((j for j in jobs if j["id"] == jid), None)
+        if job is None:
+            archived_jobs = client.get("/rename/jobs?archived=true").json()["jobs"]
+            job = next((j for j in archived_jobs if j["id"] == jid), None)
         status = job and job.get("status")
         if status not in ("applying", "matched"):
             return status
