@@ -5,7 +5,8 @@ import type { FileSpec, ConflictAnalysis } from '$lib/api/types';
 
 const spec = (o: Partial<FileSpec>): FileSpec => ({
   present: true, path: '/x', size_bytes: null, resolution: null, video_codec: null,
-  hdr: null, dv_layer: null, audio: null, duration_min: null, bitrate: null, ...o,
+  hdr: null, dv_layer: null, audio: null, audio_profile: null, duration_min: null,
+  bitrate: null, ...o,
 });
 
 const analysis = (o: Partial<ConflictAnalysis>): ConflictAnalysis => ({
@@ -87,12 +88,42 @@ describe('specRows', () => {
     expect(specRows(hdr10, hlg)[1].better).toBe('existing');
   });
 
+  it('HDR / DV row: HDR10+ displays distinctly (not collapsed into "HDR10") and ranks over plain HDR10', () => {
+    const hdr10Plus = spec({ hdr: 'HDR10+' });
+    const hdr10 = spec({ hdr: 'HDR10' });
+    const row = specRows(hdr10Plus, hdr10)[1];
+    expect(row.existing).toBe('HDR10+');
+    expect(row.incoming).toBe('HDR10');
+    expect(row.better).toBe('tie'); // both rank at tier 3 today — HDR10+ shows distinctly, ranking parity is a conflicts.py-side concern
+  });
+
   it('Video / Audio rows carry raw values with no better-side verdict', () => {
     const rows = specRows(existing, incoming);
     const video = rows.find((r) => r.label === 'Video')!;
     const audio = rows.find((r) => r.label === 'Audio')!;
     expect(video).toMatchObject({ existing: 'HEVC', incoming: 'H.264', better: null });
     expect(audio).toMatchObject({ existing: 'TrueHD 7.1', incoming: 'EAC3 5.1', better: null });
+  });
+
+  it('omits the Audio Profile row when neither side has probed audio_profile data', () => {
+    const rows = specRows(existing, incoming); // fixture specs above have no audio_profile set
+    expect(rows.find((r) => r.label === 'Audio Profile')).toBeUndefined();
+  });
+
+  it('adds an Audio Profile row when at least one side has probed audio_profile data', () => {
+    const atmos = spec({ resolution: '2160p', audio_profile: 'TrueHD 7.1 Atmos' });
+    const plain = spec({ resolution: '2160p', audio_profile: null });
+    const rows = specRows(atmos, plain);
+    const row = rows.find((r) => r.label === 'Audio Profile');
+    expect(row).toBeDefined();
+    expect(row).toMatchObject({ existing: 'TrueHD 7.1 Atmos', incoming: '—', better: null });
+  });
+
+  it('Audio Profile row shows on the incoming side alone too', () => {
+    const plain = spec({ resolution: '1080p', audio_profile: null });
+    const dtsHd = spec({ resolution: '1080p', audio_profile: 'DTS-HD MA 5.1' });
+    const row = specRows(plain, dtsHd).find((r) => r.label === 'Audio Profile');
+    expect(row).toMatchObject({ existing: '—', incoming: 'DTS-HD MA 5.1', better: null });
   });
 
   it('Bitrate row: formats Mbps and ranks the higher bitrate better', () => {

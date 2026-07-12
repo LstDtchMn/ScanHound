@@ -592,7 +592,7 @@ export interface ApplyConfidentResponse {
 export interface FileSpec {
   present: boolean; path: string | null; size_bytes: number | null;
   resolution: string | null; video_codec: string | null; hdr: string | null;
-  dv_layer: string | null; audio: string | null;
+  dv_layer: string | null; audio: string | null; audio_profile: string | null;
   duration_min: number | null; bitrate: number | null;
 }
 export interface ConflictAnalysis {

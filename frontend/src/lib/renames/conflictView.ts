@@ -82,7 +82,7 @@ export function specRows(
   const e = existing?.present ? existing : null;
   const i = incoming?.present ? incoming : null;
 
-  return [
+  const rows: SpecRow[] = [
     {
       label: 'Resolution',
       existing: e?.resolution ?? EM_DASH,
@@ -107,6 +107,21 @@ export function specRows(
       incoming: i?.audio ?? EM_DASH,
       better: null,
     },
+  ];
+
+  // Only shown when at least one side actually has probed audio-profile data
+  // (e.g. "TrueHD 7.1 Atmos", "DTS-HD MA 5.1") — most files have none, so the
+  // row would otherwise be a wall of em dashes.
+  if (e?.audio_profile || i?.audio_profile) {
+    rows.push({
+      label: 'Audio Profile',
+      existing: e?.audio_profile ?? EM_DASH,
+      incoming: i?.audio_profile ?? EM_DASH,
+      better: null,
+    });
+  }
+
+  rows.push(
     {
       label: 'Bitrate',
       existing: formatMbps(e?.bitrate ?? null),
@@ -125,7 +140,9 @@ export function specRows(
       incoming: formatDuration(i?.duration_min ?? null),
       better: null,
     },
-  ];
+  );
+
+  return rows;
 }
 
 /** True when this side is Dolby Vision but the FEL/MEL/P8/P5 layer hasn't
