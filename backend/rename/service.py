@@ -570,27 +570,8 @@ class RenameService:
         line). JDownloader runs on the host and reports e.g. ``F:\\Downloads\\X``;
         the container sees that bind-mounted at ``/library/movies/X``. Longest
         host prefix wins. Returns the path unchanged if nothing matches."""
-        if not path:
-            return path
-        raw = self._cfg.get("auto_rename_path_mappings") or ""
-        norm = path.replace("\\", "/")
-        best = None  # (host_prefix_len, translated)
-        for line in str(raw).splitlines():
-            if "=>" not in line:
-                continue
-            host, container = (p.strip() for p in line.split("=>", 1))
-            if not host or not container:
-                continue
-            hp = host.replace("\\", "/").rstrip("/")
-            # Require a path boundary (exact match or next char is '/') so a
-            # mapping for 'F:/Downloads' doesn't also capture 'F:/Downloads2/…'.
-            nl, hl = norm.lower(), hp.lower()
-            if hp and (nl == hl or nl.startswith(hl + "/")):
-                rest = norm[len(hp):].lstrip("/")
-                translated = container.rstrip("/") + ("/" + rest if rest else "")
-                if best is None or len(hp) > best[0]:
-                    best = (len(hp), translated)
-        return best[1] if best else path
+        from backend.rename.path_translation import translate_plex_path
+        return translate_plex_path(path, self._cfg.get("auto_rename_path_mappings"))
 
     def process_package(self, package_name: str, save_to: str) -> List[int]:
         """Identify + record (and maybe apply) renames for an extracted package.
