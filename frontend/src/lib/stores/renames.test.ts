@@ -529,6 +529,50 @@ describe('Archived rename jobs', () => {
     expect(get(mod.renameJobs).find((j: { id: number }) => j.id === 6)).toMatchObject({ status: 'failed' });
   });
 
+  it('a rename:job broadcast carrying archived_at upserts into archivedRenameJobs too (rematching an archived job stays live)', async () => {
+    // Regression test for the Minor finding left open by Task 3's second fix
+    // round: rematch() changes title/tmdb_id/season/episode/status without
+    // touching archived_at, and its broadcast lands on this same handler —
+    // previously the archived branch only evicted renameJobs, leaving an open
+    // Archived tab showing the job's pre-rematch title/filename until the tab
+    // was left and re-entered.
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.archivedRenameJobs.set([
+      { id: 8, status: 'applied', title: 'Old Title', archived_at: '2026-07-12T00:00:00Z' },
+    ] as unknown as RenameJob[]);
+
+    handlers['rename:job']({
+      id: 8, status: 'needs_review', title: 'New Title', archived_at: '2026-07-12T00:00:00Z',
+    });
+
+    expect(get(mod.archivedRenameJobs).find((j: { id: number }) => j.id === 8)).toMatchObject({
+      title: 'New Title', status: 'needs_review',
+    });
+  });
+
+  it('a rename:job broadcast carrying archived_at inserts a not-yet-known job into archivedRenameJobs', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.archivedRenameJobs.set([]);
+
+    handlers['rename:job']({ id: 9, status: 'applied', archived_at: '2026-07-12T00:00:00Z' });
+
+    expect(get(mod.archivedRenameJobs).find((j: { id: number }) => j.id === 9)).toBeDefined();
+  });
+
+  it('a rename:job broadcast WITHOUT archived_at evicts the job from archivedRenameJobs (live unarchive elsewhere)', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.archivedRenameJobs.set([
+      { id: 10, status: 'matched', archived_at: '2026-07-12T00:00:00Z' },
+    ] as unknown as RenameJob[]);
+
+    handlers['rename:job']({ id: 10, status: 'matched' });
+
+    expect(get(mod.archivedRenameJobs).find((j: { id: number }) => j.id === 10)).toBeUndefined();
+  });
+
   it('resyncAfterReconnect never resurrects a locally-known-archived job into the active queue', async () => {
     // Regression test for review finding (Important): the merge loop that
     // protects a locally-known TERMINAL (applied/failed) job from a stale/

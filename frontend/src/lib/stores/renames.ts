@@ -383,6 +383,18 @@ connection.on('rename:job', (data) => {
       next.delete(job.id);
       return next;
     });
+    // Keep an open Archived tab live too -- a job can be updated (e.g.
+    // rematched) while already archived; upsert here so the row doesn't
+    // show stale data until the tab is left and re-entered.
+    archivedRenameJobs.update((jobs) => {
+      const idx = jobs.findIndex((j) => j.id === job.id);
+      if (idx >= 0) {
+        const next = [...jobs];
+        next[idx] = job;
+        return next;
+      }
+      return [job, ...jobs];
+    });
     loadRenameStatus();
     return;
   }
@@ -395,6 +407,9 @@ connection.on('rename:job', (data) => {
     }
     return [job, ...jobs];
   });
+  // Symmetric case: a job that WAS archived and no longer is (e.g.
+  // unarchived) must leave the Archived view too, or a stale copy lingers.
+  archivedRenameJobs.update((jobs) => jobs.filter((j) => j.id !== job.id));
   // Once a job leaves 'applying' (applied/failed/needs_review), drop its
   // per-item progress so the bar disappears.
   if (job.status !== 'applying') {
