@@ -2089,6 +2089,16 @@ class RenameService:
                 logger.exception("bulk_delete: job %s failed", jid)
         return {"deleted": deleted}
 
+    def bulk_archive(self, ids: list) -> dict:
+        db = self._db
+        archived = db.archive_rename_jobs(ids) if db else 0
+        return {"archived": archived}
+
+    def bulk_unarchive(self, ids: list) -> dict:
+        db = self._db
+        unarchived = db.unarchive_rename_jobs(ids) if db else 0
+        return {"unarchived": unarchived}
+
     def set_destination(self, job_id: int, root: str) -> dict:
         """Rebuild one job's destination_path under ``root``; re-run guard."""
         db = self._db

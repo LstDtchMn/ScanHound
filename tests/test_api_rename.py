@@ -130,6 +130,7 @@ class TestRenameApi:
         assert body["confidence_threshold"] == 70
         assert body["counts"] == {}
         assert body["needs_review"] == 0
+        assert body["archived"] == 0
 
     def test_list_and_status_filter(self, client):
         _seed_job(status="needs_review", title="A")
@@ -505,6 +506,59 @@ class TestRenameApi:
         r = client.post("/rename/jobs/bulk/reidentify", json={"ids": [a, b]}).json()
         assert r["ok"] is True
         assert r["queued"] == 1  # only the first (ok:True) is counted
+
+    # ------------------------------------------------------------------
+    # Task 2: POST /rename/jobs/bulk/archive, /unarchive + archived filter
+    # ------------------------------------------------------------------
+
+    def test_bulk_archive_archives_jobs(self, client):
+        jid = _seed_job(status="matched", title="M")
+        r = client.post("/rename/jobs/bulk/archive", json={"ids": [jid]}).json()
+        assert r["archived"] == 1
+        # Archived jobs drop out of the default (non-archived) listing.
+        assert client.get("/rename/jobs").json()["jobs"] == []
+        archived_jobs = client.get("/rename/jobs?archived=true").json()["jobs"]
+        assert [j["id"] for j in archived_jobs] == [jid]
+        assert archived_jobs[0]["archived_at"] is not None
+
+    def test_bulk_archive_skips_applying_status(self, client):
+        # The transient 'applying' state must never be archived by a manual
+        # bulk action -- guards the same skip rule Task 1 baked into the SQL.
+        jid = _seed_job(status="applying", title="M")
+        r = client.post("/rename/jobs/bulk/archive", json={"ids": [jid]}).json()
+        assert r["archived"] == 0
+        jobs = client.get("/rename/jobs").json()["jobs"]
+        assert jobs and jobs[0]["archived_at"] is None
+
+    def test_bulk_unarchive_restores_jobs(self, client):
+        jid = _seed_job(status="matched", title="M")
+        client.post("/rename/jobs/bulk/archive", json={"ids": [jid]})
+        r = client.post("/rename/jobs/bulk/unarchive", json={"ids": [jid]}).json()
+        assert r["unarchived"] == 1
+        jobs = client.get("/rename/jobs").json()["jobs"]
+        assert [j["id"] for j in jobs] == [jid]
+        assert jobs[0]["archived_at"] is None
+
+    def test_list_jobs_default_excludes_archived(self, client):
+        jid = _seed_job(status="matched", title="M")
+        client.post("/rename/jobs/bulk/archive", json={"ids": [jid]})
+        resp = client.get("/rename/jobs")
+        assert resp.status_code == 200
+        assert jid not in [j["id"] for j in resp.json()["jobs"]]
+
+    def test_list_jobs_archived_true_returns_archived(self, client):
+        jid = _seed_job(status="matched", title="M")
+        client.post("/rename/jobs/bulk/archive", json={"ids": [jid]})
+        resp = client.get("/rename/jobs?archived=true")
+        assert resp.status_code == 200
+        assert jid in [j["id"] for j in resp.json()["jobs"]]
+
+    def test_rename_status_reports_archived_count(self, client):
+        jid = _seed_job(status="matched", title="M")
+        client.post("/rename/jobs/bulk/archive", json={"ids": [jid]})
+        resp = client.get("/rename/status")
+        assert resp.status_code == 200
+        assert resp.json()["archived"] == 1
 
     def test_bulk_set_destination_applied_job_not_regressed(self, tmp_path):
         # An already-applied job must not have its status changed back to matched.

@@ -228,6 +228,7 @@ def rename_status(reg: ServiceRegistry = Depends(get_registry)):
     """Config + counts for the Renames tab / settings card."""
     cfg = reg.config or {}
     counts = reg.db.count_rename_jobs_by_status() if reg.db else {}
+    archived_count = len(reg.db.list_rename_jobs(archived=True, limit=100000)) if reg.db else 0
     return {
         "enabled": bool(cfg.get("auto_rename_enabled")),
         "require_confirmation": bool(cfg.get("auto_rename_require_confirmation", True)),
@@ -236,6 +237,7 @@ def rename_status(reg: ServiceRegistry = Depends(get_registry)):
         "llm_enabled": bool(cfg.get("auto_rename_llm_enabled")),
         "counts": counts,
         "needs_review": counts.get("needs_review", 0),
+        "archived": archived_count,
     }
 
 
@@ -282,6 +284,20 @@ def bulk_delete(body: BulkIdsRequest, reg: ServiceRegistry = Depends(get_registr
     if reg.db is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
     return _service(reg).bulk_delete(body.ids)
+
+
+@router.post("/jobs/bulk/archive")
+def bulk_archive(body: BulkIdsRequest, reg: ServiceRegistry = Depends(get_registry)):
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return _service(reg).bulk_archive(body.ids)
+
+
+@router.post("/jobs/bulk/unarchive")
+def bulk_unarchive(body: BulkIdsRequest, reg: ServiceRegistry = Depends(get_registry)):
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return _service(reg).bulk_unarchive(body.ids)
 
 
 @router.post("/jobs/bulk/set-destination")
