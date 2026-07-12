@@ -1461,7 +1461,7 @@
             <input type="checkbox" checked={$settings.auto_rename_plex_sort_titles ?? false}
               onchange={(e) => settings.update((s) => ({ ...s, auto_rename_plex_sort_titles: e.currentTarget.checked }))}
               class="accent-[var(--accent)]" />
-            <span class="text-sm">Compute Plex sort titles (e.g. “Matrix, The”)</span>
+            <span class="text-sm">Compute Plex sort titles (e.g. "Matrix, The")</span>
           </label>
 
           <label class="flex items-center gap-3">
@@ -1517,7 +1517,7 @@
               placeholder="/library/TV" class={inputClass} />
           </label>
           <label class="block">
-            <Tooltip text={'JDownloader runs on the host and reports Windows paths (e.g. F:\\Downloads\\Movie), but ScanHound runs in a container that sees those folders bind-mounted at a different path. Map each host download folder to its container path, one per line, as: host => container. Example: F:\\Downloads => /library/movies. Update this if JDownloader’s download folder changes (and add a matching volume mount in docker-compose).'}>
+            <Tooltip text={'JDownloader runs on the host and reports Windows paths (e.g. F:\\Downloads\\Movie), but ScanHound runs in a container that sees those folders bind-mounted at a different path. Map each host download folder to its container path, one per line, as: host => container. Example: F:\\Downloads => /library/movies. Update this if JDownloader\'s download folder changes (and add a matching volume mount in docker-compose).'}>
               <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Download path mappings (host ⇒ container) ⓘ</span>
             </Tooltip>
             <textarea rows="2" value={$settings.auto_rename_path_mappings ?? ''}

@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 # key present, unknowns as null) regardless of which branch produced it.
 # Never abbreviate this dict — the frontend's FileSpec type expects every key.
 _ABSENT_SPEC_FIELDS = ("size_bytes", "container", "duration_min", "bitrate",
-                       "resolution", "video_codec", "hdr", "dv_layer", "audio")
+                       "resolution", "video_codec", "hdr", "dv_layer", "audio",
+                       "audio_profile")
 
 
 def _absent_spec(path: Optional[str]) -> dict:

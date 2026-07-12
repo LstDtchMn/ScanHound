@@ -74,7 +74,8 @@ def test_analyze_job_conflict_degraded_when_probe_fails():
     # so the frontend's FileSpec type never sees a field silently missing.
     assert set(result["existing"].keys()) == {
         "present", "path", "size_bytes", "container", "duration_min",
-        "bitrate", "resolution", "video_codec", "hdr", "dv_layer", "audio"}
+        "bitrate", "resolution", "video_codec", "hdr", "dv_layer", "audio",
+        "audio_profile"}
 
 
 def test_analyze_job_conflict_degraded_when_incoming_vanished():
