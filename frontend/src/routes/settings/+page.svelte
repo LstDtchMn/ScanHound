@@ -29,6 +29,18 @@
   let bgScanning = $state(false);
   let ollamaTest = $state<{ ok: boolean; models?: string[]; error?: string } | null>(null);
   let ollamaTesting = $state(false);
+  let unmappedPaths = $state<string[] | null>(null);
+  let checkingUnmapped = $state(false);
+
+  async function checkUnmappedPaths() {
+    checkingUnmapped = true;
+    try {
+      const r = await api.getUnmappedPlexPaths();
+      unmappedPaths = r.prefixes;
+    } finally {
+      checkingUnmapped = false;
+    }
+  }
 
   async function testOllamaConnection() {
     ollamaTesting = true;
@@ -1532,6 +1544,17 @@
               oninput={(e) => settings.update((s) => ({ ...s, plex_library_path_mappings: e.currentTarget.value }))}
               placeholder={'C:\\1080p Drives\\Example => /library/plex-source/example'} class="{inputClass} font-mono text-xs"></textarea>
           </label>
+          <button type="button" onclick={checkUnmappedPaths} disabled={checkingUnmapped}
+            class="text-xs px-2 py-1 rounded bg-[var(--bg-tertiary)] disabled:opacity-50">
+            {checkingUnmapped ? 'Checking...' : 'Check for unmapped paths'}
+          </button>
+          {#if unmappedPaths !== null}
+            {#if unmappedPaths.length === 0}
+              <p class="text-xs text-[var(--success)]">All Plex library paths are mapped.</p>
+            {:else}
+              <p class="text-xs text-[var(--error)]">Unmapped: {unmappedPaths.join(', ')}</p>
+            {/if}
+          {/if}
           <p class="text-xs text-[var(--text-secondary)]">Leave the templates blank for the Plex default naming convention.</p>
           <label class="block">
             <Tooltip text={'Tokens: {{title}} {{year}} {{resolution}} {{imdb_id}} {{tmdb_id}}. Sections in [ ] are omitted when the token is empty. Default (blank): Title (Year) [resolution].mkv'}>

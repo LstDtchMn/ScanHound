@@ -614,6 +614,27 @@ class AppService:
         except Exception:
             logger.exception("Conflict analysis backfill failed (non-fatal)")
 
+        try:
+            if self.db is not None:
+                import time as _time
+                last_check = getattr(self, "_last_unmapped_path_check", 0.0)
+                if _time.time() - last_check >= 86400.0:  # once per day, not every maintenance tick
+                    self._last_unmapped_path_check = _time.time()
+                    from backend.rename.path_translation import find_unmapped_plex_path_prefixes
+                    movies = self.db.list_plex_cache_movies()
+                    mappings = self.config.get("plex_library_path_mappings")
+                    unmapped = find_unmapped_plex_path_prefixes(movies, mappings)
+                    if unmapped:
+                        from backend.api.ws import ws_manager
+                        preview = ", ".join(unmapped[:3]) + ("..." if len(unmapped) > 3 else "")
+                        ws_manager.broadcast_sync({"type": "notification", "data": {
+                            "title": "Unmapped Plex library paths",
+                            "body": f"{len(unmapped)} path prefix(es) have no mapping and won't be scanned: {preview}",
+                            "priority": "normal"}})
+                        logger.info("Unmapped Plex path check: %d prefix(es) found", len(unmapped))
+        except Exception:
+            logger.exception("Unmapped Plex path check failed (non-fatal)")
+
     def _start_maintenance_loop(self, interval_seconds: float = 3600.0):
         """Start the hourly trash-sweep + WAL-checkpoint background thread."""
         if self._maintenance_thread and self._maintenance_thread.is_alive():

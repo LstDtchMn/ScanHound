@@ -225,3 +225,14 @@ def plex_scan_metadata_cancel(reg: ServiceRegistry = Depends(get_registry)):
 @router.get("/scan-metadata/status")
 def plex_scan_metadata_status(reg: ServiceRegistry = Depends(get_registry)):
     return reg.plex_metadata_scan_job.status_dict()
+
+
+@router.get("/unmapped-paths")
+def unmapped_plex_paths(reg: ServiceRegistry = Depends(get_registry)):
+    """Distinct plex_cache path prefixes with no configured
+    plex_library_path_mappings entry -- surfaces a gap before it silently
+    means those files never get probed."""
+    from backend.rename.path_translation import find_unmapped_plex_path_prefixes
+    movies = reg.db.list_plex_cache_movies() if reg.db else []
+    mappings = reg.config.get("plex_library_path_mappings") if reg.config else None
+    return {"prefixes": find_unmapped_plex_path_prefixes(movies, mappings)}

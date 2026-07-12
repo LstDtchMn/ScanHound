@@ -192,6 +192,7 @@ export const api = {
   plexScanMetadataCancel: () =>
     request<{ status: string }>('/plex/scan-metadata/cancel', { method: 'POST' }),
   plexScanMetadataStatus: () => request<PlexMetadataScanStatus>('/plex/scan-metadata/status'),
+  getUnmappedPlexPaths: () => request<{ prefixes: string[] }>('/plex/unmapped-paths'),
 
   // Downloads
   download: (url: string, title: string, serviceType = 'Rapidgator', year?: number | null,

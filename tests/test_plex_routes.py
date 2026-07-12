@@ -67,3 +67,17 @@ def test_movie_targets_translates_file_path():
     }]
     targets = _movie_targets_for_scope(reg, "all", None)
     assert targets[0]["path"] == "/library/plex-source/g-movies-1/X.mkv"
+
+
+def test_unmapped_paths_endpoint_returns_prefixes(client, monkeypatch):
+    from backend.api.dependencies import registry
+    mock_db = MagicMock()
+    mock_db.has_password.return_value = False
+    mock_db.list_plex_cache_movies.return_value = [
+        {"file_path": "Z:\\Something\\Movie.mkv"},
+    ]
+    monkeypatch.setattr(registry, "db", mock_db)
+    monkeypatch.setitem(registry.config, "plex_library_path_mappings", "")
+    resp = client.get("/plex/unmapped-paths")
+    assert resp.status_code == 200
+    assert resp.json()["prefixes"] == ["Z:\\"]

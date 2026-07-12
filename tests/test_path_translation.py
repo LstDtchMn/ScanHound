@@ -1,4 +1,7 @@
-from backend.rename.path_translation import translate_plex_path
+from backend.rename.path_translation import (
+    find_unmapped_plex_path_prefixes,
+    translate_plex_path,
+)
 
 
 def test_exact_match_translates():
@@ -60,3 +63,40 @@ def test_unc_share_mapping_translates():
     mappings = "\\\\TURTLELANDSRV2\\1080p Lincoln => /library/plex-source/nas-1080p-lincoln"
     raw = "\\\\TURTLELANDSRV2\\1080p Lincoln\\Movie.mkv"
     assert translate_plex_path(raw, mappings) == "/library/plex-source/nas-1080p-lincoln/Movie.mkv"
+
+
+def test_finds_local_prefix_with_no_mapping():
+    rows = [{"file_path": "Z:\\Something\\Movie.mkv"}]
+    result = find_unmapped_plex_path_prefixes(rows, "")
+    assert result == ["Z:\\"]
+
+
+def test_finds_junction_alias_prefix_with_no_mapping():
+    rows = [{"file_path": "C:\\1080p Drives\\1080p New Drive\\Movie.mkv"}]
+    result = find_unmapped_plex_path_prefixes(rows, "")
+    assert result == ["C:\\1080p Drives\\1080p New Drive"]
+
+
+def test_finds_unc_share_prefix_with_no_mapping():
+    rows = [{"file_path": "\\\\TURTLELANDSRV2\\New Share\\Movie.mkv"}]
+    result = find_unmapped_plex_path_prefixes(rows, "")
+    assert result == ["\\\\TURTLELANDSRV2\\New Share"]
+
+
+def test_mapped_prefix_is_not_flagged():
+    rows = [{"file_path": "G:\\Movies 1\\Movie.mkv"}]
+    mappings = "G:\\Movies 1 => /library/plex-source/g-movies-1"
+    assert find_unmapped_plex_path_prefixes(rows, mappings) == []
+
+
+def test_returns_distinct_prefixes_only():
+    rows = [
+        {"file_path": "Z:\\Something\\A.mkv"},
+        {"file_path": "Z:\\Something\\B.mkv"},
+    ]
+    assert find_unmapped_plex_path_prefixes(rows, "") == ["Z:\\"]
+
+
+def test_rows_with_no_file_path_are_skipped():
+    rows = [{"file_path": None}, {"file_path": ""}, {}]
+    assert find_unmapped_plex_path_prefixes(rows, "") == []
