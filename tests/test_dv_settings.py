@@ -59,6 +59,17 @@ def test_settings_model_accepts_jd_4k_folder_and_path_mappings():
     assert "movies-4k" in dumped["auto_rename_path_mappings"]
 
 
+def test_settings_model_accepts_auto_rename_movie_flat():
+    # Regression: auto_rename_movie_flat was added to the Settings UI and to
+    # AppConfig/_DEFAULT_CONFIG but never added to SettingsUpdate (which uses
+    # extra="forbid"). Toggling the flat-folders checkbox and saving would
+    # 422 the ENTIRE settings PUT, silently dropping every other changed key
+    # in that same save alongside the flat toggle.
+    m = SettingsUpdate(auto_rename_movie_flat=True)
+    dumped = m.model_dump(exclude_unset=True)
+    assert dumped["auto_rename_movie_flat"] is True
+
+
 def test_all_frontend_editable_settings_keys_are_in_model():
     # Guard against the whole class of bug: any settings key editable in the UI
     # but absent from SettingsUpdate silently 422s the user's entire save

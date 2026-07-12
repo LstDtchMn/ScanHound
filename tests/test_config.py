@@ -91,7 +91,7 @@ EXPECTED_DEFAULT_KEYS = {
     # Auto-rename + Plex sort + Ollama
     "auto_rename_enabled", "auto_rename_confidence_threshold",
     "auto_rename_require_confirmation", "auto_rename_move_method",
-    "auto_rename_movie_library", "auto_rename_movie_library_4k", "auto_rename_tv_library",
+    "auto_rename_movie_library", "auto_rename_movie_library_4k", "auto_rename_movie_flat", "auto_rename_tv_library",
     "auto_rename_template_movie", "auto_rename_template_tv",
     "auto_rename_plex_sort_titles", "auto_rename_llm_enabled",
     "ollama_base_url", "ollama_model", "ollama_vision_model", "deletions_require_confirmation",

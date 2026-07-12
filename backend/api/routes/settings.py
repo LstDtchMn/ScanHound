@@ -116,6 +116,7 @@ class SettingsUpdate(BaseModel):
     auto_rename_move_method: Optional[str] = None
     auto_rename_movie_library: Optional[str] = None
     auto_rename_movie_library_4k: Optional[str] = None
+    auto_rename_movie_flat: Optional[bool] = None
     auto_rename_tv_library: Optional[str] = None
     # host => container path mappings (one per line); maps JDownloader's Windows
     # save paths into the container's mounted view. Editable in the UI but was
