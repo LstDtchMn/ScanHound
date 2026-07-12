@@ -1833,6 +1833,20 @@ class RenameService:
             else:
                 jobs = db.list_rename_jobs(limit=100000) or []
 
+            # When auto-applying confident matches, never blindly apply a job
+            # that has an ACTIVE duplicate conflict (same destination path OR
+            # same movie identity as another active/claiming job) — those need
+            # a human decision on the Renames page, not a silent back-to-back
+            # apply that lands a duplicate on disk (e.g. two grabs of one film
+            # that a mid-session auto_rename_movie_flat toggle froze onto two
+            # different paths). Computed over the FULL active job list, not just
+            # this batch, since the colliding rival may not be in ``ids``.
+            conflict_ids: set = set()
+            if confident_only:
+                all_active_jobs = jobs if ids is None else (
+                    db.list_rename_jobs(limit=100000) or [])
+                conflict_ids = destination_conflict_ids(all_active_jobs)
+
             eligible, skipped = [], 0
             for job in jobs:
                 status = job.get("status")
@@ -1841,6 +1855,10 @@ class RenameService:
                     skipped += 1
                     continue
                 if confident_only and (status != "matched" or conf < 95):
+                    skipped += 1
+                    continue
+                if confident_only and int(job["id"]) in conflict_ids:
+                    # Held for manual review — do not auto-apply a duplicate.
                     skipped += 1
                     continue
                 if not confident_only and status not in ("matched", "needs_review"):

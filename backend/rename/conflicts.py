@@ -41,6 +41,70 @@ def _dest_key(job: dict) -> Optional[str]:
     return full.replace("\\", "/").casefold()
 
 
+def _identity_key(job: dict) -> Optional[tuple]:
+    """Movie-*identity* signal for a job — what film it IS, independent of the
+    raw destination path a mid-session ``auto_rename_movie_flat`` toggle happened
+    to freeze onto (nested ``Title (Year)/`` subfolder vs flat library root).
+
+    imdb_id is authoritative; else normalized title + year; else None (no
+    identity signal — group on path alone, the historical behavior). TV jobs
+    return None (movies-only, matching ``find_library_duplicate``'s own scope).
+
+    Pure and DB-free. ``normalize_title`` is imported locally (as
+    ``find_library_duplicate`` does) to avoid a module-level import cycle."""
+    if (job.get("media_type") or "movie") == "tv":
+        return None
+    imdb_id = job.get("imdb_id")
+    if imdb_id:
+        return ("imdb", imdb_id)
+    from backend.app_service import normalize_title
+    title = normalize_title(job.get("title") or "")
+    if title:
+        return ("title", title, job.get("year"))
+    return None
+
+
+def _conflict_groups(jobs) -> list:
+    """Cluster the claiming jobs into conflict groups. Two jobs share a group if
+    they share EITHER a destination path (:func:`_dest_key`) OR a movie identity
+    (:func:`_identity_key`) — so a duplicate is caught whether the two copies
+    collide on the same path OR are the same film frozen onto two different
+    paths. Returns a list of job-dict lists.
+
+    Pure in-memory union-find over the (small) jobs list — no I/O. Path grouping
+    (the historical behavior) is one of the two keys, so this only ever ADDS
+    connections, never drops one; every job appears in exactly one group."""
+    claiming = [j for j in jobs if j.get("status") in _CLAIMING_STATUSES]
+    parent = list(range(len(claiming)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for key_fn in (_dest_key, _identity_key):
+        first_seen: dict = {}
+        for idx, j in enumerate(claiming):
+            k = key_fn(j)
+            if k is None:
+                continue
+            if k in first_seen:
+                union(idx, first_seen[k])
+            else:
+                first_seen[k] = idx
+
+    groups: dict = {}
+    for idx in range(len(claiming)):
+        groups.setdefault(find(idx), []).append(claiming[idx])
+    return list(groups.values())
+
+
 def _quality_score(job: dict) -> tuple:
     """Rank a release by desirability from its filename + parsed resolution, so a
     duplicate-target group can recommend which copy to keep. Higher is better.
@@ -152,23 +216,18 @@ def recommend_keep(group) -> Optional[int]:
 
 
 def destination_conflict_ids(jobs) -> set:
-    """Return the ids of ACTIVE jobs whose destination is also claimed by another
-    job (active or already applied) — i.e. a duplicate-target conflict such as two
-    releases of one movie, or a new grab landing on a file already in the library.
+    """Return the ids of ACTIVE jobs that conflict with another claiming job —
+    a duplicate-target conflict. Two jobs conflict when they share a destination
+    path OR the same movie identity (imdb / title+year), so this catches both a
+    same-path collision (two releases landing on one path, or a new grab hitting
+    a library file) AND the same film frozen onto two DIFFERENT paths by a
+    mid-session ``auto_rename_movie_flat`` toggle.
 
-    A settled ``applied`` job counts toward a destination's claim (so its active
-    rival is flagged) but is never itself flagged — it's done. Pure and
-    DB-free, so it drives the jobs-list 'duplicate' badge and unit-tests cleanly."""
-    by_key: dict = {}
-    for j in jobs:
-        if j.get("status") not in _CLAIMING_STATUSES:
-            continue
-        k = _dest_key(j)
-        if not k:
-            continue
-        by_key.setdefault(k, []).append(j)
+    A settled ``applied`` job counts toward a claim (so its active rival is
+    flagged) but is never itself flagged — it's done. Pure and DB-free, so it
+    drives the jobs-list 'duplicate' badge and unit-tests cleanly."""
     out: set = set()
-    for group in by_key.values():
+    for group in _conflict_groups(jobs):
         if len(group) < 2:
             continue
         for j in group:
@@ -179,27 +238,33 @@ def destination_conflict_ids(jobs) -> set:
 
 def conflict_annotations(jobs) -> dict:
     """Map job-id -> {destination_conflict, keep_recommended, keep_reason} for the
-    jobs list. For each duplicate-target group with an active conflict, flags all
-    active members and marks the single best-quality active release as the
-    recommended keeper (with a short reason). Pure, DB-free."""
-    by_key: dict = {}
-    for j in jobs:
-        if j.get("status") not in _CLAIMING_STATUSES:
-            continue
-        k = _dest_key(j)
-        if not k:
-            continue
-        by_key.setdefault(k, []).append(j)
+    jobs list. For each conflict group with an active member, flags all active
+    members with ``destination_conflict`` and — only when the group is genuinely
+    the SAME film — marks the single best-quality active release as the
+    recommended keeper (with a short reason). Pure, DB-free.
+
+    A group that shares only a raw-path collision across DIFFERENT identities
+    (e.g. two unrelated films rendered to one flat path by a ``{{year}}``-less
+    custom template) is a real filesystem conflict a human must resolve, so it's
+    still flagged ``destination_conflict`` — but same-movie quality guidance
+    (``recommend_keep``) is NOT applied across two different movies. Distinct
+    non-None identities ⇒ not the same movie; all-None (no identity signal at
+    all) falls back to the historical path-only behavior and still recommends."""
     out: dict = {}
-    for group in by_key.values():
+    for group in _conflict_groups(jobs):
         active = [j for j in group
                   if j.get("status") in _ACTIVE_STATUSES and j.get("id") is not None]
         if len(group) < 2 or not active:
             continue
+        identities = {_identity_key(j) for j in group}
+        identities.discard(None)
+        same_movie = len(identities) <= 1
         # Recommend over the WHOLE group (incl. applied): if an already-applied
         # copy is the best, keep_id is its id — which isn't in `active`, so no
         # active rival is wrongly flagged "keep" over the better library copy.
-        keep_id = recommend_keep(group)
+        # Suppressed entirely for a cross-identity path collision (different
+        # films) — those get the filesystem-conflict flag but no keeper.
+        keep_id = recommend_keep(group) if same_movie else None
         for j in active:
             ann = out.setdefault(j["id"], {"destination_conflict": True,
                                            "keep_recommended": False,

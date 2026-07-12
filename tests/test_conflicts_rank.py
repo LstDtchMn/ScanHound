@@ -229,3 +229,106 @@ def test_needs_dv_layer_scan_false_when_known_side_is_the_settled_none_sentinel(
     incoming = {"resolution": "2160p", "hdr": "Dolby Vision", "dv_layer": "fel",
                 "original_filename": "a.mkv"}
     assert conflicts.needs_dv_layer_scan(existing, incoming) is False
+
+
+# ── Task 3: duplicate detection keys on movie IDENTITY, not just the raw,
+#    frozen destination PATH. Two opposite failures, one root cause. ──────────
+
+def test_identity_key_prefers_imdb_then_title_year_else_none():
+    # imdb_id is authoritative when present.
+    assert conflicts._identity_key(
+        {"media_type": "movie", "imdb_id": "tt7", "title": "X", "year": 2020}) == ("imdb", "tt7")
+    # Falls back to normalized title + year.
+    ident = conflicts._identity_key(
+        {"media_type": "movie", "imdb_id": None, "title": "The Film", "year": 2020})
+    assert ident[0] == "title" and ident[2] == 2020
+    # TV jobs carry no movie identity (movies-only, like find_library_duplicate).
+    assert conflicts._identity_key({"media_type": "tv", "imdb_id": "tt7"}) is None
+    # No imdb and no title => no identity signal at all.
+    assert conflicts._identity_key(
+        {"media_type": "movie", "imdb_id": None, "title": ""}) is None
+
+
+# Bug A (false negative): a mid-session auto_rename_movie_flat toggle freezes two
+# grabs of the SAME movie onto DIFFERENT destination paths (one nested in a
+# Title (Year) subfolder, one flat at the library root). Path-only grouping
+# misses the duplicate entirely — no badge, no warning. Identity grouping catches
+# it.
+
+def test_destination_conflict_ids_flags_same_movie_across_different_paths():
+    nested = {"id": 1, "status": "matched", "media_type": "movie", "imdb_id": "tt100",
+              "title": "The Film", "year": 2020,
+              "destination_path": "/library/movies/The Film (2020)",
+              "new_filename": "The Film (2020) [2160p].mkv"}
+    flat = {"id": 2, "status": "matched", "media_type": "movie", "imdb_id": "tt100",
+            "title": "The Film", "year": 2020,
+            "destination_path": "/library/movies",
+            "new_filename": "The Film (2020) [1080p].mkv"}
+    assert conflicts.destination_conflict_ids([nested, flat]) == {1, 2}
+
+
+def test_conflict_annotations_flags_same_movie_across_different_paths_with_keeper():
+    nested = {"id": 1, "status": "matched", "media_type": "movie", "imdb_id": "tt100",
+              "title": "The Film", "year": 2020, "resolution": "1080p",
+              "original_filename": "The.Film.2020.1080p.WEB-DL.mkv",
+              "destination_path": "/library/movies/The Film (2020)",
+              "new_filename": "The Film (2020) [1080p].mkv"}
+    flat = {"id": 2, "status": "matched", "media_type": "movie", "imdb_id": "tt100",
+            "title": "The Film", "year": 2020, "resolution": "2160p",
+            "original_filename": "The.Film.2020.2160p.BluRay.REMUX.DV.HDR.TrueHD.mkv",
+            "destination_path": "/library/movies",
+            "new_filename": "The Film (2020) [2160p].mkv"}
+    ann = conflicts.conflict_annotations([nested, flat])
+    assert ann[1]["destination_conflict"] is True
+    assert ann[2]["destination_conflict"] is True
+    # Genuinely the same film -> a real keeper recommendation (2160p REMUX DV wins).
+    assert ann[2]["keep_recommended"] is True
+    assert ann[1]["keep_recommended"] is False
+    assert ann[2]["keep_reason"]  # non-empty reason
+
+
+# Bug B (false positive): with auto_rename_movie_flat=True AND a custom
+# auto_rename_template_movie that omits {{year}}, two ENTIRELY DIFFERENT films
+# sharing a title render to the IDENTICAL flat path. The path collision is real
+# (a human must resolve it) but same-movie quality guidance must NOT be applied
+# across two unrelated films.
+
+def test_conflict_annotations_path_collision_across_different_films_no_keeper():
+    thing82 = {"id": 1, "status": "matched", "media_type": "movie", "imdb_id": "tt0084787",
+               "title": "The Thing", "year": 1982, "resolution": "2160p",
+               "original_filename": "The.Thing.1982.2160p.BluRay.REMUX.DV.HDR.TrueHD.mkv",
+               "destination_path": "/library/movies",
+               "new_filename": "The Thing.mkv"}
+    thing11 = {"id": 2, "status": "matched", "media_type": "movie", "imdb_id": "tt0905372",
+               "title": "The Thing", "year": 2011, "resolution": "1080p",
+               "original_filename": "The.Thing.2011.1080p.WEB-DL.mkv",
+               "destination_path": "/library/movies",
+               "new_filename": "The Thing.mkv"}
+    ann = conflicts.conflict_annotations([thing82, thing11])
+    # The filesystem collision IS real -> flag both for a human decision.
+    assert ann[1]["destination_conflict"] is True
+    assert ann[2]["destination_conflict"] is True
+    # ...but never a "keep this, discard that" between two DIFFERENT films.
+    assert ann[1]["keep_recommended"] is False
+    assert ann[2]["keep_recommended"] is False
+    assert ann[1]["keep_reason"] is None
+    assert ann[2]["keep_reason"] is None
+
+
+def test_conflict_annotations_same_path_same_movie_still_recommends_keeper():
+    # Regression guard for the classic case this logic was built for: two active
+    # jobs, SAME identity, SAME destination path -> still a real keeper winner.
+    a = {"id": 1, "status": "matched", "media_type": "movie", "imdb_id": "tt100",
+         "title": "The Film", "year": 2020, "resolution": "2160p",
+         "original_filename": "The.Film.2020.2160p.WEB-DL.mkv",
+         "destination_path": "/library/movies/The Film (2020)",
+         "new_filename": "The Film (2020) [2160p].mkv"}
+    b = {"id": 2, "status": "matched", "media_type": "movie", "imdb_id": "tt100",
+         "title": "The Film", "year": 2020, "resolution": "2160p",
+         "original_filename": "The.Film.2020.2160p.BluRay.REMUX.DV.HDR.TrueHD.mkv",
+         "destination_path": "/library/movies/The Film (2020)",
+         "new_filename": "The Film (2020) [2160p].mkv"}
+    ann = conflicts.conflict_annotations([a, b])
+    assert ann[1]["destination_conflict"] and ann[2]["destination_conflict"]
+    assert ann[2]["keep_recommended"] is True
+    assert ann[1]["keep_recommended"] is False

@@ -1500,6 +1500,75 @@ class TestQueueApplyCancel:
         assert db.get_rename_job(j0)["status"] == "applied"
 
 
+# ── confident-apply must not auto-apply active duplicate conflicts ────────
+
+class TestQueueApplyConflictGuard:
+    """Bug A end-to-end: two active grabs of the SAME movie with DIFFERENT
+    frozen destinations (a mid-session auto_rename_movie_flat toggle) must NOT
+    both auto-apply under confident_only — that lands a silent duplicate on
+    disk. queue_apply must skip active-conflict jobs so they fall through to
+    manual review on the Renames page."""
+
+    def _wait_until_settled(self, db, ids, timeout=5):
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if all(db.get_rename_job(j)["status"] != "applying" for j in ids):
+                return
+            time.sleep(0.05)
+
+    def _dup_movie_job(self, db, tmp_path, fname, dest_sub):
+        d = tmp_path / "incoming"
+        d.mkdir(parents=True, exist_ok=True)
+        src = d / fname
+        src.write_bytes(b"DATA")
+        dst_dir = tmp_path / "lib" / dest_sub if dest_sub else tmp_path / "lib"
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        jid = db.create_rename_job({
+            "original_path": str(src),
+            "original_filename": fname,
+            "new_filename": fname,
+            "destination_path": str(dst_dir),
+            "status": "matched",
+            "media_type": "movie",
+            "imdb_id": "tt424242",     # SAME film
+            "title": "The Same Film",
+            "year": 2020,
+            "match_confidence": 100,
+            "package_name": "pkg",
+        })
+        return jid, src
+
+    def test_confident_apply_skips_active_same_movie_duplicates(self, db, tmp_path):
+        svc = _service(db, _weak_search)
+        # Same movie (imdb tt424242), two DIFFERENT frozen destinations: one
+        # nested in a Title (Year) folder, one flat at the library root.
+        j0, _ = self._dup_movie_job(db, tmp_path, "The Same Film [2160p].mkv",
+                                    "The Same Film (2020)")
+        j1, _ = self._dup_movie_job(db, tmp_path, "The Same Film [1080p].mkv", "")
+
+        out = svc.queue_apply(None, confident_only=True)
+        self._wait_until_settled(db, [j0, j1])
+
+        # Neither is auto-applied blind — both held for manual review.
+        assert out["queued"] == 0
+        assert out["skipped"] >= 2
+        applied = [j for j in (j0, j1)
+                   if db.get_rename_job(j)["status"] == "applied"]
+        assert len(applied) <= 1  # never BOTH copies on disk
+
+    def test_confident_apply_still_applies_a_lone_confident_match(self, db, tmp_path):
+        # Guard must not over-block: a solo confident match with no active
+        # rival still auto-applies as before.
+        svc = _service(db, _weak_search)
+        j0, _ = self._dup_movie_job(db, tmp_path, "Solo Film [2160p].mkv",
+                                    "Solo Film (2020)")
+        out = svc.queue_apply(None, confident_only=True)
+        self._wait_until_settled(db, [j0])
+        assert out["queued"] == 1
+        assert db.get_rename_job(j0)["status"] == "applied"
+
+
 # ── Ollama fallback ───────────────────────────────────────────────────
 
 class TestLlmFallback:
