@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.ws import ws_manager
+from backend.scanner_service import ScanStatus, STATUS_COLORS, STATUS_TEXTS
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/scan", tags=["scanner"])
@@ -383,6 +384,34 @@ def rescan_item(
         raise HTTPException(status_code=502, detail="Could not parse the refreshed page")
 
     asyncio.run(scanner._enricher.enrich([item]))
+
+    # Rescanning never consults Plex (see the docstring above) -- it only
+    # re-fetches the detail page + re-runs TMDB/OMDb enrichment. That means
+    # _create_media_item() just derived `item`'s status from download history
+    # alone (never IN_LIBRARY/UPGRADE/DV_UPGRADE) and left plex_info/
+    # plex_versions/plex_rating_key at their MediaItem dataclass defaults.
+    # If the row we're about to overwrite already had a known Plex match,
+    # carry it forward so a rescan can't wipe it out -- same rule
+    # rematch_cache() applies for its "no Plex this run" branch: never
+    # downgrade a cached IN_LIBRARY/UPGRADE/DV_UPGRADE row to Missing.
+    library_states = {"in_library", "upgrade", "dv_upgrade"}
+    try:
+        existing_data = json.loads(existing.get("data") or "{}")
+    except (TypeError, ValueError):
+        existing_data = {}
+    existing_status = str(existing_data.get("status", ""))
+    if existing_status in library_states:
+        try:
+            status_enum = ScanStatus(existing_status)
+        except ValueError:
+            status_enum = None
+        if status_enum is not None:
+            item.status = status_enum
+            item.status_text = STATUS_TEXTS.get(status_enum, item.status_text)
+            item.color = STATUS_COLORS.get(status_enum, item.color)
+            item.plex_info = existing_data.get("plex_info", item.plex_info)
+            item.plex_versions = existing_data.get("plex_versions", item.plex_versions)
+            item.plex_rating_key = existing_data.get("plex_rating_key", item.plex_rating_key)
 
     d = _media_item_to_dict(item)
     db.upsert_background_cache([{
