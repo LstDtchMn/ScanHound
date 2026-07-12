@@ -11,6 +11,7 @@
   } from '$lib/stores/renames';
   import { categoryOf } from '$lib/renames/category';
   import { matchesQuery } from '$lib/renames/review';
+  import { groupJobsBySeason } from '$lib/renames/seasonGroups';
   import {
     tileSize, gridColumns, gridGap, TILE_MIN_PX, GRID_GAP_CLASS
   } from '$lib/stores/results';
@@ -25,6 +26,7 @@
   import RenameFilterBar from '$lib/components/renames/RenameFilterBar.svelte';
   import BulkBar from '$lib/components/renames/BulkBar.svelte';
   import RenameRow from '$lib/components/renames/RenameRow.svelte';
+  import SeasonGroupRow from '$lib/components/renames/SeasonGroupRow.svelte';
   import RenameCard from '$lib/components/renames/RenameCard.svelte';
   import RematchModal from '$lib/components/renames/RematchModal.svelte';
   import ConflictModal from '$lib/components/renames/ConflictModal.svelte';
@@ -348,46 +350,51 @@
     </div>
   {:else}
     <ul class="divide-y divide-[var(--border)] rounded-lg border border-[var(--border)] overflow-hidden">
-      {#each shown as job (job.id)}
-        <RenameRow {job} {onRematch} {onCompare} />
-        <li class="px-3 py-1 bg-[var(--bg-tertiary)]/30" data-actions-menu>
-            <button
-              class="text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-              aria-label="More actions for {job.original_filename ?? job.title ?? `job ${job.id}`}"
-              aria-expanded={actionsOpenId === job.id}
-              onclick={() => (actionsOpenId = actionsOpenId === job.id ? null : job.id)}
-            >{actionsOpenId === job.id ? 'Hide actions ▴' : 'More actions ▾'}</button>
-            {#if actionsOpenId === job.id}
-              <div class="mt-1 flex flex-wrap items-center gap-1">
-                {#if job.status === 'matched' || job.status === 'needs_review'}
-                  <button onclick={() => run(job.id, applyJob, 'Applied')} disabled={busy === job.id || $applyActive}
-                    title={$applyActive ? 'A bulk apply is in progress — try again once it finishes.' : undefined}
-                    class="px-2.5 py-1 text-xs rounded-lg bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50">Apply</button>
-                {/if}
-                {#if job.status === 'needs_review' || job.status === 'failed'}
-                  <button onclick={() => reidentify(job.id)} disabled={busy === job.id}
-                    class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50"
-                    title="Re-run automatic identification with the current matcher">Re-identify</button>
-                {/if}
-                {#if job.status === 'needs_review' && job.combined_episode}
-                  <button onclick={() => run(job.id, acceptCombinedJob, 'Accepted as combined')} disabled={busy === job.id}
-                    class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
-                    title="Confirm this is a combined double-episode file">Accept {job.combined_episode.proposed_code}</button>
-                {/if}
-                {#if job.status === 'needs_review' && job.suggested_correction}
-                  <button onclick={() => run(job.id, acceptCorrectionJob, 'Correction applied')} disabled={busy === job.id}
-                    class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
-                    title="Use the proposed episode correction">Accept S{String(job.suggested_correction.proposed.season).padStart(2,'0')}E{String(job.suggested_correction.proposed.episode).padStart(2,'0')}</button>
-                {/if}
-                {#if job.status === 'applied'}
-                  <button onclick={() => run(job.id, undoJob, 'Reverted')} disabled={busy === job.id}
-                    class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50">Undo</button>
-                {/if}
-                <button onclick={() => run(job.id, deleteJob, 'Removed')} disabled={busy === job.id}
-                  class="px-2.5 py-1 text-xs rounded-lg text-[var(--error)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50">Remove</button>
-              </div>
-            {/if}
-          </li>
+      {#each groupJobsBySeason(shown) as entry (entry.type === 'season' ? entry.key : entry.job.id)}
+        {#if entry.type === 'season'}
+          <SeasonGroupRow jobs={entry.jobs} show={entry.show} season={entry.season} {onRematch} {onCompare} />
+        {:else}
+          {@const job = entry.job}
+          <RenameRow {job} {onRematch} {onCompare} />
+          <li class="px-3 py-1 bg-[var(--bg-tertiary)]/30" data-actions-menu>
+              <button
+                class="text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                aria-label="More actions for {job.original_filename ?? job.title ?? `job ${job.id}`}"
+                aria-expanded={actionsOpenId === job.id}
+                onclick={() => (actionsOpenId = actionsOpenId === job.id ? null : job.id)}
+              >{actionsOpenId === job.id ? 'Hide actions ▴' : 'More actions ▾'}</button>
+              {#if actionsOpenId === job.id}
+                <div class="mt-1 flex flex-wrap items-center gap-1">
+                  {#if job.status === 'matched' || job.status === 'needs_review'}
+                    <button onclick={() => run(job.id, applyJob, 'Applied')} disabled={busy === job.id || $applyActive}
+                      title={$applyActive ? 'A bulk apply is in progress — try again once it finishes.' : undefined}
+                      class="px-2.5 py-1 text-xs rounded-lg bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50">Apply</button>
+                  {/if}
+                  {#if job.status === 'needs_review' || job.status === 'failed'}
+                    <button onclick={() => reidentify(job.id)} disabled={busy === job.id}
+                      class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50"
+                      title="Re-run automatic identification with the current matcher">Re-identify</button>
+                  {/if}
+                  {#if job.status === 'needs_review' && job.combined_episode}
+                    <button onclick={() => run(job.id, acceptCombinedJob, 'Accepted as combined')} disabled={busy === job.id}
+                      class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
+                      title="Confirm this is a combined double-episode file">Accept {job.combined_episode.proposed_code}</button>
+                  {/if}
+                  {#if job.status === 'needs_review' && job.suggested_correction}
+                    <button onclick={() => run(job.id, acceptCorrectionJob, 'Correction applied')} disabled={busy === job.id}
+                      class="px-2.5 py-1 text-xs rounded-lg bg-amber-500/20 text-amber-700 dark:text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
+                      title="Use the proposed episode correction">Accept S{String(job.suggested_correction.proposed.season).padStart(2,'0')}E{String(job.suggested_correction.proposed.episode).padStart(2,'0')}</button>
+                  {/if}
+                  {#if job.status === 'applied'}
+                    <button onclick={() => run(job.id, undoJob, 'Reverted')} disabled={busy === job.id}
+                      class="px-2.5 py-1 text-xs rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50">Undo</button>
+                  {/if}
+                  <button onclick={() => run(job.id, deleteJob, 'Removed')} disabled={busy === job.id}
+                    class="px-2.5 py-1 text-xs rounded-lg text-[var(--error)] hover:bg-[var(--bg-tertiary)] disabled:opacity-50">Remove</button>
+                </div>
+              {/if}
+            </li>
+        {/if}
       {/each}
     </ul>
   {/if}
