@@ -403,6 +403,21 @@ describe('toggleBookmark', () => {
     expect(get(bookmarkedTitles).has('imdb:tt1234567')).toBe(false);
   });
 
+  it('a second toggle on the SAME still-mounted item object actually flips it back off (does not re-read the stale item.bookmarked flag)', async () => {
+    // Rows/panels render off bookmarkedTitles, not item.bookmarked (see
+    // ResultRow.svelte's `bookmarked` derivation) -- toggleBookmark must
+    // agree, or clicking a star twice in a row (same item reference, no
+    // refetch in between) would just re-send "bookmarked: true" both times.
+    const i = item({ imdb_id: 'tt1234567', title: 'Dune', year: 2024, bookmarked: false });
+    await toggleBookmark(i);
+    expect(get(bookmarkedTitles).has('imdb:tt1234567')).toBe(true);
+    expect(api.setBookmark).toHaveBeenLastCalledWith('tt1234567', 'Dune', 2024, 'movie', true);
+
+    await toggleBookmark(i); // same object, item.bookmarked is still false
+    expect(get(bookmarkedTitles).has('imdb:tt1234567')).toBe(false);
+    expect(api.setBookmark).toHaveBeenLastCalledWith('tt1234567', 'Dune', 2024, 'movie', false);
+  });
+
   it('falls back to the title key for items without an imdb_id', async () => {
     const i = item({ imdb_id: null, title: 'Some Obscure Show', year: 2020, season: 1, bookmarked: false });
     await toggleBookmark(i);

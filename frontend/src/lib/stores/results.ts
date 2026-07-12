@@ -338,7 +338,11 @@ export function bookmarkIdentityKey(item: Pick<ScanResult, 'imdb_id' | 'title' |
  *  reverted -- mirrors dismissItem's optimistic-update-then-revert shape. */
 export function toggleBookmark(item: ScanResult): Promise<boolean> {
   const key = bookmarkIdentityKey(item);
-  const wasBookmarked = item.bookmarked;
+  // Read the live bookmarkedTitles set, not item.bookmarked: rows/panels
+  // render off bookmarkedTitles (see ResultRow.svelte etc.) so a second click
+  // on the same still-mounted item object must see the FIRST click's result,
+  // not the stale flag captured whenever this item was originally fetched.
+  const wasBookmarked = get(bookmarkedTitles).has(key);
   const nextBookmarked = !wasBookmarked;
   bookmarkedTitles.update((s) => {
     const next = new Set(s);
