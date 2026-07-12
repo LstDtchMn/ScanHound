@@ -17,4 +17,4 @@ def test_maintenance_pass_calls_analyze_pending_conflicts():
          patch("backend.pipeline_service.reconcile_batch", return_value=0), \
          patch("backend.rename.conflict_analyzer.analyze_pending_conflicts", return_value=3) as analyze_mock:
         svc._run_maintenance_pass()
-    analyze_mock.assert_called_once_with(svc.db, limit=50)
+    analyze_mock.assert_called_once_with(svc.db, limit=50, path_mappings=None)
