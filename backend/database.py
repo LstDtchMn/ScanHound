@@ -1125,10 +1125,15 @@ class DatabaseManager:
             SELECT v.url, v.category, v.detail, v.package_uuid, v.excluded_uuid,
                    v.plex_rating_key, v.checked_at, v.dismissed,
                    d.title, d.year, d.season, d.resolution, d.package_name,
-                   (SELECT r.poster_path FROM rename_jobs r
-                     WHERE r.package_name = COALESCE(d.jd_confirmed_name, d.package_name)
-                       AND r.poster_path IS NOT NULL
-                     ORDER BY r.id DESC LIMIT 1) AS poster_path
+                   CASE
+                     WHEN v.category IN ('pending_rename', 'rename_failed', 'awaiting_plex_refresh', 'verified', 'not_in_plex')
+                     THEN (SELECT r.poster_path FROM rename_jobs r
+                           WHERE r.package_name = COALESCE(d.jd_confirmed_name, d.package_name)
+                             AND r.status = 'applied'
+                             AND r.poster_path IS NOT NULL
+                           ORDER BY r.id DESC LIMIT 1)
+                     ELSE NULL
+                   END AS poster_path
             FROM pipeline_verdicts v
             JOIN downloads d ON d.url = v.url
             {where}

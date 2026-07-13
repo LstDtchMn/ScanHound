@@ -1678,7 +1678,10 @@
               min="0"
               max="1440"
               value={$settings.pipeline_verify_grace_margin_minutes as number ?? 30}
-              oninput={(e) => settings.update((s) => ({ ...s, pipeline_verify_grace_margin_minutes: parseInt(e.currentTarget.value) || 30 }))}
+              oninput={(e) => {
+                const val = parseInt(e.currentTarget.value, 10);
+                settings.update((s) => ({ ...s, pipeline_verify_grace_margin_minutes: isNaN(val) ? 30 : val }));
+              }}
               class={inputSmClass}
             />
           </label>
