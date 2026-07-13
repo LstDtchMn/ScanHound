@@ -654,3 +654,80 @@ class TestPipelineVerdictsPosterPath:
         rows = db_manager.get_pipeline_verdicts()
         assert rows
         assert rows[0]["poster_path"] == "/posters/abc.jpg"
+
+    def test_pending_rename_poster_from_matching_status_not_stale_sibling(self, db_manager):
+        # Bug reproduction: multiple rename_jobs rows sharing package_name but
+        # with different statuses. An older 'reverted' row has a poster_path;
+        # a newer 'pending' row (actual current state) has no poster. The query
+        # must NOT leak the stale poster from the reverted sibling.
+        #
+        # Scenario: user applied a rename with wrong match, then reverted it.
+        # Now the file is rescanned, creating a new 'pending' rename_job for
+        # the same package_name. The old reverted row still holds the wrong
+        # poster; the new row has none (matching not done yet).
+        db_manager.add_to_history("http://example.com/dune", "Dune (2021) [1080p]",
+                                  year=None, resolution="1080p",
+                                  package_name="Dune (2021) [1080p]")
+
+        # Insert two rename_jobs rows: older 'reverted' with poster, newer 'pending' without.
+        conn = db_manager.get_connection()
+        # Older reverted job
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, resolution, poster_path, processed_at) "
+            "VALUES (?, ?, 'reverted', 'movie', ?, ?, ?, ?, datetime('now', '-1 hour'))",
+            ("Dune (2021) [1080p]", "/old/Dune.mkv", "Dune", 2021, "1080p", "/posters/dune_STALE.jpg"))
+        # Newer pending job (no poster yet, no processed_at)
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, resolution, poster_path, processed_at) "
+            "VALUES (?, ?, 'pending', 'movie', ?, ?, ?, NULL, NULL)",
+            ("Dune (2021) [1080p]", "/new/Dune.mkv", "Dune", 2021, "1080p"))
+        conn.commit()
+
+        # Record verdict as pending_rename (matches 'pending' status)
+        db_manager.upsert_pipeline_verdict("http://example.com/dune", "pending_rename",
+                                           package_uuid="uuid1")
+
+        # Bug: query returns the stale poster from the reverted row instead of NULL
+        rows = db_manager.get_pipeline_verdicts()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["category"] == "pending_rename"
+        # FIX: poster_path should be NULL (no poster in the 'pending' row)
+        # BUG: poster_path was "/posters/dune_STALE.jpg" (from reverted row)
+        assert row["poster_path"] is None
+
+    def test_rename_failed_poster_from_matching_status_not_applied_sibling(self, db_manager):
+        # Symmetrical case: rename_failed category should get poster from a
+        # 'failed' or 'reverted' row, NOT from an 'applied' sibling (which would
+        # be associated with a different, past attempt).
+        db_manager.add_to_history("http://example.com/other", "Other (2023) [1080p]",
+                                  year=None, resolution="1080p",
+                                  package_name="Other (2023) [1080p]")
+
+        conn = db_manager.get_connection()
+        # Older applied job (successfully finished this grab in the past)
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, resolution, poster_path, processed_at) "
+            "VALUES (?, ?, 'applied', 'movie', ?, ?, ?, ?, datetime('now', '-2 hours'))",
+            ("Other (2023) [1080p]", "/past/Other.mkv", "Other", 2023, "1080p", "/posters/old_good.jpg"))
+        # Newer failed job (current attempt, no poster)
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, resolution, poster_path, processed_at) "
+            "VALUES (?, ?, 'failed', 'movie', ?, ?, ?, NULL, datetime('now', '-10 minutes'))",
+            ("Other (2023) [1080p]", "/current/Other.mkv", "Other", 2023, "1080p"))
+        conn.commit()
+
+        db_manager.upsert_pipeline_verdict("http://example.com/other", "rename_failed",
+                                           package_uuid="uuid2")
+
+        rows = db_manager.get_pipeline_verdicts()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["category"] == "rename_failed"
+        # FIX: should be NULL (failed row has no poster)
+        # BUG: would return the old applied row's poster
+        assert row["poster_path"] is None

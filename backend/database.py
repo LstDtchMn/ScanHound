@@ -1126,9 +1126,16 @@ class DatabaseManager:
                    v.plex_rating_key, v.checked_at, v.dismissed,
                    d.title, d.year, d.season, d.resolution, d.package_name,
                    CASE
-                     WHEN v.category IN ('pending_rename', 'rename_failed')
+                     WHEN v.category = 'pending_rename'
                      THEN (SELECT r.poster_path FROM rename_jobs r
                            WHERE r.package_name = COALESCE(d.jd_confirmed_name, d.package_name)
+                             AND r.status IN ('pending', 'matched', 'applying')
+                             AND r.poster_path IS NOT NULL
+                           ORDER BY r.id DESC LIMIT 1)
+                     WHEN v.category = 'rename_failed'
+                     THEN (SELECT r.poster_path FROM rename_jobs r
+                           WHERE r.package_name = COALESCE(d.jd_confirmed_name, d.package_name)
+                             AND r.status IN ('failed', 'needs_review', 'reverted')
                              AND r.poster_path IS NOT NULL
                            ORDER BY r.id DESC LIMIT 1)
                      WHEN v.category IN ('awaiting_plex_refresh', 'verified', 'not_in_plex')
