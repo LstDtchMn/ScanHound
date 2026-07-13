@@ -5,17 +5,33 @@
   import type { PipelineItem, PipelineCounts } from '$lib/api/types';
   import SourceSearchModal from '$lib/components/pipeline/SourceSearchModal.svelte';
   import ErrorCard from '$lib/components/ErrorCard.svelte';
+  import StatCard from '$lib/components/renames/StatCard.svelte';
+  import RenamePoster from '$lib/components/renames/RenamePoster.svelte';
+  import { CATEGORY_VARIANT, POSTER_CATEGORIES, checkedAgo, categoryColor } from './pipelineDisplay';
 
+  // CATEGORY_LABELS / EMPTY_STATES: Fable-drafted copy (Task 4 Step 1).
   const CATEGORY_LABELS: Record<string, string> = {
-    never_started: 'Never started',
-    download_failed: 'Download failed',
+    never_started: 'Never Started',
+    download_failed: 'Download Failed',
     downloading: 'Downloading',
-    pending_rename: 'Pending rename',
-    rename_failed: 'Rename failed',
-    awaiting_plex_refresh: 'Waiting on Plex',
+    pending_rename: 'Pending Rename',
+    rename_failed: 'Rename Failed',
+    awaiting_plex_refresh: 'Awaiting Plex',
     not_in_plex: 'Not in Plex',
     verified: 'Verified',
     unknown: 'Unknown',
+  };
+  const EMPTY_STATES: Record<string, string> = {
+    never_started: 'No grabs are stuck before download.',
+    download_failed: 'No downloads have failed.',
+    downloading: 'Nothing is downloading right now.',
+    pending_rename: 'No files are waiting to be renamed.',
+    rename_failed: 'No renames have failed.',
+    awaiting_plex_refresh: 'Nothing is waiting on a Plex refresh.',
+    not_in_plex: 'Nothing is missing from Plex.',
+    verified: 'Nothing has been verified yet.',
+    unknown: 'No items need a closer look.',
+    all: 'The pipeline is clear.',
   };
   const ACTIONABLE = ['never_started', 'download_failed', 'rename_failed', 'not_in_plex', 'unknown'];
 
@@ -92,18 +108,13 @@
 <div class="flex-1 min-h-0 overflow-auto p-4 space-y-4">
   <h1 class="text-lg font-semibold">Pipeline</h1>
 
-  <div class="flex flex-wrap gap-2">
-    <button
-      class="px-3 py-1.5 rounded-lg text-sm {activeCategory === null ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-tertiary)]'}"
-      onclick={() => selectCategory(null)}
-    >All ({Object.values(counts).reduce((a, b) => a + b, 0)})</button>
+  <!-- Stat cards: every category always renders (stable layout), plus All -->
+  <div class="flex flex-wrap gap-3">
+    <StatCard label="All" count={Object.values(counts).reduce((a, b) => a + b, 0)}
+      variant="default" active={activeCategory === null} onclick={() => selectCategory(null)} />
     {#each Object.entries(CATEGORY_LABELS) as [cat, label]}
-      {#if counts[cat]}
-        <button
-          class="px-3 py-1.5 rounded-lg text-sm {activeCategory === cat ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-tertiary)]'}"
-          onclick={() => selectCategory(cat)}
-        >{label} ({counts[cat]})</button>
-      {/if}
+      <StatCard {label} count={counts[cat] ?? 0} variant={CATEGORY_VARIANT[cat] ?? 'default'}
+        active={activeCategory === cat} onclick={() => selectCategory(cat)} />
     {/each}
   </div>
 
@@ -112,17 +123,30 @@
   {:else if loadError}
     <ErrorCard message={loadError} onretry={load} />
   {:else if items.length === 0}
-    <p class="text-center text-[var(--text-secondary)] py-12">Nothing to review.</p>
+    <p class="text-center text-[var(--text-secondary)] py-12">
+      {EMPTY_STATES[activeCategory ?? 'all'] ?? EMPTY_STATES.all}
+    </p>
   {:else}
     <ul class="divide-y divide-[var(--border)] rounded-lg border border-[var(--border)] overflow-hidden">
       {#each items as item (item.url)}
         <li class="p-3 flex items-center gap-3">
+          {#if item.category && POSTER_CATEGORIES.has(item.category)}
+            <RenamePoster posterUrl={item.poster_path} alt={item.title ?? ''} class="w-10 rounded" />
+          {/if}
           <div class="flex-1 min-w-0">
-            <div class="font-medium truncate">{item.title || item.package_name || item.url}</div>
-            <div class="text-xs text-[var(--text-secondary)]">
-              {categoryLabel(item.category)}
-              {#if item.detail}<span class="text-[var(--error)]"> — {item.detail}</span>{/if}
+            <div class="font-medium truncate">
+              {item.title || item.package_name || item.url}
+              {#if item.year}<span class="text-[var(--text-secondary)] font-normal"> ({item.year})</span>{/if}
             </div>
+            <div class="text-xs text-[var(--text-secondary)] flex flex-wrap gap-x-2">
+              <span style="color: {categoryColor(item.category)}">{categoryLabel(item.category)}</span>
+              {#if item.season != null}<span>S{String(item.season).padStart(2, '0')}</span>{/if}
+              {#if item.resolution}<span>{item.resolution}</span>{/if}
+              <span>checked {checkedAgo(item.checked_at)}</span>
+            </div>
+            {#if item.detail}
+              <div class="text-xs text-[var(--error)] truncate" title={item.detail}>{item.detail}</div>
+            {/if}
           </div>
           {#if item.category && ACTIONABLE.includes(item.category)}
             <button class="px-2 py-1 text-xs rounded bg-[var(--accent)] text-white disabled:opacity-50"

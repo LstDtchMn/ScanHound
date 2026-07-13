@@ -117,7 +117,7 @@ def categorize(download_row: dict, result_row: Optional[dict], rename_rows: list
             if last_grabbed and _minutes_since(last_grabbed) > 30:
                 return ("never_started",
                         "Grabbed over 30 minutes ago but never appeared in "
-                        "JDownloader's queue — the links may have failed to send.",
+                        "JDownloader's queue — the links may not have been delivered.",
                         None, None)
             return (None, None, None, None)  # too soon to judge
 
