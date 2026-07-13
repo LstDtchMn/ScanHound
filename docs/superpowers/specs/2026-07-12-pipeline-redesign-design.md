@@ -41,11 +41,14 @@ v2.25.0 decision.
 
 **Season-aware package name.** `compute_package_name(title, year, resolution)` gains a
 `season: Optional[int] = None` parameter. When `season is not None`, the season is
-embedded in the name (format: `{title} ({year}) S{season:02d} [{resolution}]`, then the
-existing 50-char truncation). The docstring's invariant stands: this remains the single
-place the string is computed, so persisted and sent values cannot drift. The one
-production call site (`backend/download_service.py:2003`, where `season` is already in
-scope) passes it through. Tests updated/added for TV vs movie.
+embedded in the name (format: `{title} ({year}) S{season:02d} [{resolution}]`). The
+50-char cap is preserved, but truncation now trims the *title* portion and keeps the
+year/season/resolution suffix intact — a plain tail-truncation could chop `S{nn}` off a
+long title and silently recreate the collision this fix exists to prevent. The
+docstring's invariant stands: this remains the single place the string is computed, so
+persisted and sent values cannot drift. The one production call site
+(`backend/download_service.py:2003`, where `season` is already in scope) passes it
+through. Tests updated/added for TV vs movie and long-title truncation.
 
 **JD-confirmed name capture (Approach C — empirical, chosen by user over guessing JD's
 sanitization rules).** New nullable TEXT column `jd_confirmed_name` on the `downloads`
@@ -63,12 +66,20 @@ folding, not URL — `poll_results()` rows carry no URL.
 `package_name`. This makes matching immune to JD-side name transformations while
 remaining correct for grabs that never appeared in JD's queue.
 
-**One-time backfill.** A schema migration (following `backend/database.py`'s existing
-migration pattern) adds the column, then recomputes `package_name` for every existing
-`downloads` row via the now-season-aware `compute_package_name()` (the table already
-stores `title`, `year`, `season`, `resolution`). The startup reconcile pass that already
-runs (`app_service.py:566`) then re-categorizes everything — this is what un-sticks the
-currently collided/stuck rows; without it the fix would only help future grabs.
+**One-time backfill (capture-side only — corrected at plan time).** A schema migration
+(following `backend/database.py`'s existing guarded-ALTER pattern) adds the column, then
+best-effort backfills `jd_confirmed_name`: for each `downloads` row, fold-match its
+`package_name` against existing `download_results.name` values and capture only when the
+fold-match is UNIQUE. Ambiguous matches (the collided multi-season rows — JD-side names
+carry no season either, so they are genuinely indistinguishable retroactively) are
+skipped, left NULL. Deliberately do NOT recompute `package_name` for existing rows: the
+old computed value is the live join key to `download_results.name` and
+`rename_jobs.package_name` (both store JD-side names from the old format), and rewriting
+it would orphan every healthy old grab. New grabs get season-aware names naturally at
+send time (`save_to_history` persists `package_name` on every grab), so **Re-grab is the
+working fix for currently-collided rows** — after this change it sends a unique
+season-aware name that the poller then captures and matches. The startup reconcile pass
+(`app_service.py:566`) re-categorizes whatever the backfill un-stuck.
 
 ### 2. Category model & settings plumbing
 
