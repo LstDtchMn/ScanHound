@@ -1240,6 +1240,7 @@ class DatabaseManager:
         return self._query_dicts('''
             SELECT d.url, d.title, d.year, d.season, d.resolution, d.size, d.hdr, d.dovi,
                    d.package_name, d.jd_confirmed_name, d.service_type, d.last_grabbed_at,
+                   d.status,
                    v.category AS verdict_category, v.dismissed AS verdict_dismissed,
                    v.package_uuid, v.excluded_uuid
             FROM downloads d

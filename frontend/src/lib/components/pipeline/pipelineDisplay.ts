@@ -19,9 +19,14 @@ export const POSTER_CATEGORIES = new Set([
   'pending_rename', 'rename_failed', 'awaiting_plex_refresh', 'verified', 'not_in_plex',
 ]);
 
-/** "5m ago" / "3h ago" / "2d ago" from a sqlite UTC timestamp. */
+/** "5m ago" / "3h ago" / "2d ago" from a sqlite UTC timestamp. Returns '' for
+ *  an empty/malformed timestamp so callers render nothing instead of "NaNd
+ *  ago" — unreachable with current data (every checked_at write is a sqlite
+ *  CURRENT_TIMESTAMP), guarded for robustness only. */
 export function checkedAgo(sqliteTs: string, now: Date = new Date()): string {
+  if (!sqliteTs) return '';
   const dt = new Date(sqliteTs.replace(' ', 'T') + 'Z');
+  if (Number.isNaN(dt.getTime())) return '';
   const mins = Math.max(0, Math.floor((now.getTime() - dt.getTime()) / 60000));
   if (mins < 60) return `${mins}m ago`;
   const hours = Math.floor(mins / 60);

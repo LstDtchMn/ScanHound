@@ -32,6 +32,11 @@ describe('checkedAgo', () => {
   it('hours', () => expect(checkedAgo('2026-07-12 09:00:00', now)).toBe('3h ago'));
   it('days', () => expect(checkedAgo('2026-07-10 12:00:00', now)).toBe('2d ago'));
   it('clamps future skew to 0m', () => expect(checkedAgo('2026-07-12 12:05:00', now)).toBe('0m ago'));
+  it('empty timestamp renders nothing, not NaN', () => expect(checkedAgo('', now)).toBe(''));
+  it('malformed timestamp renders nothing, not NaN', () => {
+    expect(checkedAgo('garbage', now)).toBe('');
+    expect(checkedAgo('2026-7-12 11:59:00', now)).toBe(''); // non-zero-padded month
+  });
 });
 
 describe('categoryColor', () => {

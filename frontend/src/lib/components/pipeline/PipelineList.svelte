@@ -129,6 +129,7 @@
   {:else}
     <ul class="divide-y divide-[var(--border)] rounded-lg border border-[var(--border)] overflow-hidden">
       {#each items as item (item.url)}
+        {@const ago = checkedAgo(item.checked_at)}
         <li class="p-3 flex items-center gap-3">
           {#if item.category && POSTER_CATEGORIES.has(item.category)}
             <RenamePoster posterUrl={item.poster_url} alt={item.title ?? ''} class="w-10 rounded" />
@@ -142,7 +143,7 @@
               <span style="color: {categoryColor(item.category)}">{categoryLabel(item.category)}</span>
               {#if item.season != null}<span>S{String(item.season).padStart(2, '0')}</span>{/if}
               {#if item.resolution}<span>{item.resolution}</span>{/if}
-              <span>checked {checkedAgo(item.checked_at)}</span>
+              {#if ago}<span>checked {ago}</span>{/if}
             </div>
             {#if item.detail}
               <div class="text-xs text-[var(--error)] truncate" title={item.detail}>{item.detail}</div>

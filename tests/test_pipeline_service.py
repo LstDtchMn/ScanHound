@@ -221,10 +221,50 @@ class TestNeverStartedDetail:
         assert cat == "never_started"
         assert detail  # non-empty explanation
 
+    def test_never_started_send_failed_gets_send_failure_detail(self):
+        # downloads.status == 'failed' is written only when the links were
+        # never delivered to JD at all (download_service.py's final honest-
+        # failure path) — the detail must say so, not blame JD's queue.
+        d = _download_row(last_grabbed_at="2020-01-01 00:00:00", status="failed")
+        cat, detail, *_ = categorize(d, None, [], {}, jd_method="api")
+        assert cat == "never_started"
+        assert "never sent" in detail
+        assert "queue" not in detail
+
+    def test_never_started_sent_ok_gets_queue_detail(self):
+        # A successful send (status 'completed') that still never showed up
+        # in JD's queue is the OTHER case — details must differ.
+        d_sent = _download_row(last_grabbed_at="2020-01-01 00:00:00", status="completed")
+        d_failed = _download_row(last_grabbed_at="2020-01-01 00:00:00", status="failed")
+        _, detail_sent, *_ = categorize(d_sent, None, [], {}, jd_method="api")
+        _, detail_failed, *_ = categorize(d_failed, None, [], {}, jd_method="api")
+        assert "queue" in detail_sent
+        assert detail_sent != detail_failed
+
 
 class TestFindPlexMatchErrorNarrowing:
-    def test_db_error_yields_unknown_not_not_in_plex(self, monkeypatch):
-        # find_plex_match raising must surface as 'unknown', never 'not_in_plex'
+    def test_plex_lookup_error_yields_unknown_with_retry_detail(self, monkeypatch):
+        # The narrowing branch itself: _PlexLookupError must be caught at the
+        # find_plex_match call site (pipeline_service's except _PlexLookupError)
+        # and produce the retry detail — NOT fall through to the outer
+        # catch-all's generic "categorize error".
+        import backend.pipeline_service as ps
+
+        def boom(*a, **k):
+            raise ps._PlexLookupError()
+        monkeypatch.setattr(ps, "find_plex_match", boom)
+        r = {"state": "extracted", "error": None, "package_uuid": "p1"}
+        rows = [_rename_row(status="applied", processed_at="2020-01-01T00:00:00",
+                            media_type="movie", title="Heat", year=1995)]
+        cat, detail, *_ = ps.categorize(_download_row(resolution="1080p"), r, rows,
+                                        {"Movies": 9999999999}, jd_method="api")
+        assert cat == "unknown"
+        assert detail == "Plex lookup failed — will retry next pass"
+
+    def test_unexpected_error_still_yields_unknown_via_outer_catch_all(self, monkeypatch):
+        # Fail-safe regression guard: an exception type nobody anticipated
+        # must still surface as 'unknown' (outer catch-all), never as a
+        # confident 'not_in_plex'.
         import backend.pipeline_service as ps
 
         def boom(*a, **k):
@@ -233,9 +273,10 @@ class TestFindPlexMatchErrorNarrowing:
         r = {"state": "extracted", "error": None, "package_uuid": "p1"}
         rows = [_rename_row(status="applied", processed_at="2020-01-01T00:00:00",
                             media_type="movie", title="Heat", year=1995)]
-        cat, *_ = ps.categorize(_download_row(resolution="1080p"), r, rows,
-                                {"Movies": 9999999999}, jd_method="api")
+        cat, detail, *_ = ps.categorize(_download_row(resolution="1080p"), r, rows,
+                                        {"Movies": 9999999999}, jd_method="api")
         assert cat == "unknown"
+        assert detail == "categorize error"
 
 
 def _insert_plex_row(conn, *, key, rating_key, imdb_id=None, title=None, year=None,

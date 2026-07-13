@@ -115,10 +115,19 @@ def categorize(download_row: dict, result_row: Optional[dict], rename_rows: list
                     package_uuid=None, grace_margin_minutes=grace_margin_minutes, db=db)
             last_grabbed = download_row.get("last_grabbed_at")
             if last_grabbed and _minutes_since(last_grabbed) > 30:
-                return ("never_started",
-                        "Grabbed over 30 minutes ago but never appeared in "
-                        "JDownloader's queue — the links may not have been delivered.",
-                        None, None)
+                # Two distinct causes (per the design spec): downloads.status
+                # is written 'failed' ONLY by download_service's final
+                # honest-failure path (links never delivered to JD at all);
+                # any other status means the send reported success but the
+                # package never surfaced in JD's queue.
+                if download_row.get("status") == "failed":
+                    detail = ("The links were never sent to JDownloader — "
+                              "the send failed.")
+                else:
+                    detail = ("Grabbed over 30 minutes ago but never appeared in "
+                              "JDownloader's queue — the links may not have been "
+                              "delivered.")
+                return ("never_started", detail, None, None)
             return (None, None, None, None)  # too soon to judge
 
         state = result_row.get("state")
