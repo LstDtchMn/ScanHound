@@ -9,9 +9,10 @@
   const CATEGORY_LABELS: Record<string, string> = {
     never_started: 'Never started',
     download_failed: 'Download failed',
-    in_progress: 'In progress',
+    downloading: 'Downloading',
     pending_rename: 'Pending rename',
     rename_failed: 'Rename failed',
+    awaiting_plex_refresh: 'Waiting on Plex',
     not_in_plex: 'Not in Plex',
     verified: 'Verified',
     unknown: 'Unknown',

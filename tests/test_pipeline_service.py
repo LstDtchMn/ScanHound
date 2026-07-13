@@ -1,4 +1,5 @@
 from datetime import datetime, timezone, timedelta
+import pytest
 from backend.pipeline_service import (
     categorize, find_plex_match, reconcile_batch,
     _match_download_results, _match_rename_rows,
@@ -45,11 +46,11 @@ class TestDownloadStates:
         cat, detail, uuid, rk = categorize(_download_row(), r, [], {}, jd_method="api")
         assert cat == "download_failed" and detail == "Link offline" and uuid == "111"
 
-    def test_queued_downloading_extracting_are_in_progress(self):
+    def test_queued_downloading_extracting_are_downloading(self):
         for state in ("queued", "downloading", "extracting", "downloaded"):
             r = {"state": state, "error": None, "package_uuid": "111"}
             cat, *_ = categorize(_download_row(), r, [], {}, jd_method="api")
-            assert cat == "in_progress", state
+            assert cat == "downloading", state
 
     def test_extracted_with_no_rename_rows_is_pending_rename(self):
         r = {"state": "extracted", "error": None, "package_uuid": "111"}
@@ -82,14 +83,14 @@ class TestPlexGate:
     def _extracted_result(self):
         return {"state": "extracted", "error": None, "package_uuid": "111"}
 
-    def test_cache_stale_relative_to_rename_stays_in_progress(self):
+    def test_cache_stale_relative_to_rename_stays_awaiting_plex_refresh(self):
         # rename applied "now"; plex cache max timestamp is from BEFORE that,
         # even though wall-clock time since the rename is large.
         processed = datetime.now(timezone.utc).isoformat()
         rows = [_rename_row(status="applied", processed_at=processed)]
         stale_cache = {"Movies": (datetime.now(timezone.utc) - timedelta(days=2)).timestamp()}
         cat, *_ = categorize(_download_row(), self._extracted_result(), rows, stale_cache, jd_method="api")
-        assert cat == "in_progress"
+        assert cat == "awaiting_plex_refresh"
 
     def test_cache_fresh_after_rename_plus_margin_runs_real_check(self, monkeypatch):
         processed = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
@@ -191,6 +192,52 @@ class TestMalformed:
         assert cat == "unknown"
 
 
+class TestCategorySplit:
+    def test_active_download_state_is_downloading(self):
+        r = {"state": "downloading", "error": None, "package_uuid": "p1"}
+        cat, *_ = categorize(_download_row(), r, [], {}, jd_method="api")
+        assert cat == "downloading"
+
+    def test_applied_inside_grace_window_is_awaiting_plex_refresh(self):
+        # rename_rows all applied, plex cache max older than processed+grace
+        r = {"state": "extracted", "error": None, "package_uuid": "p1"}
+        rows = [_rename_row(status="applied", processed_at="2026-07-12T10:00:00",
+                            media_type="movie", title="Heat", year=1995)]
+        cat, *_ = categorize(_download_row(resolution="1080p"), r, rows,
+                             {"Movies": 0}, jd_method="api")
+        assert cat == "awaiting_plex_refresh"
+
+    def test_in_progress_never_returned(self):
+        # guard against regression: the old label must be gone
+        import backend.pipeline_service as ps
+        import inspect
+        assert '"in_progress"' not in inspect.getsource(ps)
+
+
+class TestNeverStartedDetail:
+    def test_never_started_has_detail_text(self):
+        d = _download_row(last_grabbed_at="2020-01-01 00:00:00")
+        cat, detail, *_ = categorize(d, None, [], {}, jd_method="api")
+        assert cat == "never_started"
+        assert detail  # non-empty explanation
+
+
+class TestFindPlexMatchErrorNarrowing:
+    def test_db_error_yields_unknown_not_not_in_plex(self, monkeypatch):
+        # find_plex_match raising must surface as 'unknown', never 'not_in_plex'
+        import backend.pipeline_service as ps
+
+        def boom(*a, **k):
+            raise RuntimeError("db exploded")
+        monkeypatch.setattr(ps, "find_plex_match", boom)
+        r = {"state": "extracted", "error": None, "package_uuid": "p1"}
+        rows = [_rename_row(status="applied", processed_at="2020-01-01T00:00:00",
+                            media_type="movie", title="Heat", year=1995)]
+        cat, *_ = ps.categorize(_download_row(resolution="1080p"), r, rows,
+                                {"Movies": 9999999999}, jd_method="api")
+        assert cat == "unknown"
+
+
 def _insert_plex_row(conn, *, key, rating_key, imdb_id=None, title=None, year=None,
                      res=None, season=None, is_tv=0):
     """Insert a row directly into the real plex_cache table (schema per
@@ -283,14 +330,22 @@ class TestFindPlexMatch:
                 return None
         assert find_plex_match(NoneConnDB(), "tt1", "Title", 2020, None, "1080p") is None
 
-    def test_db_is_none_does_not_raise(self):
-        assert find_plex_match(None, "tt1", "Title", 2020, None, "1080p") is None
+    def test_db_is_none_raises_plex_lookup_error(self):
+        # Contract (Task 2): a genuine failure (vs. a clean no-match) now
+        # raises _PlexLookupError so categorize() can distinguish it from an
+        # honest 'not_in_plex' and map it to 'unknown' instead.
+        import backend.pipeline_service as ps
+        with pytest.raises(ps._PlexLookupError):
+            find_plex_match(None, "tt1", "Title", 2020, None, "1080p")
 
-    def test_malformed_db_handle_does_not_raise(self):
+    def test_malformed_db_handle_raises_plex_lookup_error(self):
+        import backend.pipeline_service as ps
+
         class BadDB:
             def get_connection(self):
                 return "not-a-real-connection"  # .cursor() will raise AttributeError
-        assert find_plex_match(BadDB(), "tt1", "Title", 2020, None, "1080p") is None
+        with pytest.raises(ps._PlexLookupError):
+            find_plex_match(BadDB(), "tt1", "Title", 2020, None, "1080p")
 
 
 class TestMatchingAndReconcileBatch:
@@ -433,14 +488,14 @@ class TestMatchingAndReconcileBatch:
 
         # 15 minutes of cache lag is well under the DEFAULT 30-minute grace
         # margin -> categorize() must still consider the cache not-fresh-enough
-        # and report 'in_progress'.
+        # and report 'awaiting_plex_refresh'.
         reconcile_batch(db_manager, grace_margin_minutes=30)
         rows = db_manager.get_pipeline_verdicts()
         row = next(r for r in rows if r["url"] == "http://m/grace")
-        assert row["category"] == "in_progress"
+        assert row["category"] == "awaiting_plex_refresh"
 
         # Same rows, same cache timestamp, second pass (non-terminal verdicts
-        # are re-picked-up per test_in_progress_verdict_reconsidered_on_second_pass
+        # are re-picked-up per test_downloading_verdict_reconsidered_on_second_pass
         # above) — but with a small custom margin the SAME 15-minute lag now
         # counts as fresh enough, flipping the verdict to a terminal category
         # via a real find_plex_match() lookup against the plex_cache row above.
@@ -450,7 +505,7 @@ class TestMatchingAndReconcileBatch:
         assert row["category"] == "verified"
         assert row["plex_rating_key"] == "rk_grace"
 
-    def test_in_progress_verdict_reconsidered_on_second_pass(self, db_manager):
+    def test_downloading_verdict_reconsidered_on_second_pass(self, db_manager):
         # N1 regression: a non-terminal verdict must be re-picked-up even
         # though last_grabbed_at hasn't changed.
         db_manager.add_to_history("http://m/prog", "P", package_name="P [1080p]")
@@ -460,7 +515,7 @@ class TestMatchingAndReconcileBatch:
         conn.execute("INSERT INTO download_results (package_uuid, name, state, updated_at) "
                      "VALUES ('p-uuid', 'P [1080p]', 'downloading', datetime('now'))")
         conn.commit()
-        reconcile_batch(db_manager)  # pass 1: writes in_progress
+        reconcile_batch(db_manager)  # pass 1: writes downloading
         n2 = reconcile_batch(db_manager)  # pass 2: must still pick it up
         assert n2 >= 1
 

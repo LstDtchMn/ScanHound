@@ -19,6 +19,12 @@ _FAILED_RENAME_STATUSES = {"failed", "needs_review"}
 _RES_EQUIV = {"2160p": "4k", "4k": "4k", "1080p": "1080p", "720p": "720p"}
 
 
+class _PlexLookupError(Exception):
+    """find_plex_match hit a real error (DB failure, bad data) — distinct from
+    a clean no-match (None). Callers map this to 'unknown' rather than letting
+    it masquerade as a confirmed 'not_in_plex'."""
+
+
 def _normalize_res(res: Optional[str]) -> Optional[str]:
     if not res:
         return None
@@ -71,7 +77,7 @@ def find_plex_match(db, imdb_id: Optional[str], title: Optional[str],
         return None
     except Exception:
         logger.exception("find_plex_match failed")
-        return None
+        raise _PlexLookupError()
 
 
 def categorize(download_row: dict, result_row: Optional[dict], rename_rows: list,
@@ -109,7 +115,10 @@ def categorize(download_row: dict, result_row: Optional[dict], rename_rows: list
                     package_uuid=None, grace_margin_minutes=grace_margin_minutes, db=db)
             last_grabbed = download_row.get("last_grabbed_at")
             if last_grabbed and _minutes_since(last_grabbed) > 30:
-                return ("never_started", None, None, None)
+                return ("never_started",
+                        "Grabbed over 30 minutes ago but never appeared in "
+                        "JDownloader's queue — the links may have failed to send.",
+                        None, None)
             return (None, None, None, None)  # too soon to judge
 
         state = result_row.get("state")
@@ -118,7 +127,7 @@ def categorize(download_row: dict, result_row: Optional[dict], rename_rows: list
         if state == "failed":
             return ("download_failed", result_row.get("error"), package_uuid, None)
         if state in _ACTIVE_DOWNLOAD_STATES:
-            return ("in_progress", None, package_uuid, None)
+            return ("downloading", None, package_uuid, None)
         if state == "extracted" and not rename_rows:
             return ("pending_rename", None, package_uuid, None)
 
@@ -162,10 +171,13 @@ def _categorize_from_rename_rows(download_row: dict, rename_rows: list,
         content_type = "TV Shows" if latest.get("media_type") == "tv" else "Movies"
         cache_max = plex_max_ts.get(content_type, 0)
         if cache_max < dt.timestamp() + grace_margin_minutes * 60:
-            return ("in_progress", None, package_uuid, None)
+            return ("awaiting_plex_refresh", None, package_uuid, None)
         resolution = latest.get("resolution") or download_row.get("resolution")
-        match = find_plex_match(db, latest.get("imdb_id"), latest.get("title"),
-                                latest.get("year"), latest.get("season"), resolution)
+        try:
+            match = find_plex_match(db, latest.get("imdb_id"), latest.get("title"),
+                                    latest.get("year"), latest.get("season"), resolution)
+        except _PlexLookupError:
+            return ("unknown", "Plex lookup failed — will retry next pass", package_uuid, None)
         if match:
             return ("verified", None, package_uuid, str(match.get("rating_key") or ""))
         return ("not_in_plex", None, package_uuid, None)
