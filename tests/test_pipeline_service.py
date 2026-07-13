@@ -1,5 +1,8 @@
 from datetime import datetime, timezone, timedelta
-from backend.pipeline_service import categorize, find_plex_match, reconcile_batch
+from backend.pipeline_service import (
+    categorize, find_plex_match, reconcile_batch,
+    _match_download_results, _match_rename_rows,
+)
 from backend.database import DatabaseManager
 
 
@@ -460,3 +463,115 @@ class TestMatchingAndReconcileBatch:
         reconcile_batch(db_manager)  # pass 1: writes in_progress
         n2 = reconcile_batch(db_manager)  # pass 2: must still pick it up
         assert n2 >= 1
+
+
+def _jd_confirmed_name(db_manager, url):
+    conn = db_manager.get_connection()
+    row = conn.execute(
+        "SELECT jd_confirmed_name FROM downloads WHERE url = ?", (url,)).fetchone()
+    return row["jd_confirmed_name"] if row else None
+
+
+class TestJdConfirmedNameCapture:
+    """capture_jd_confirmed_names persists JD's own reported package name
+    against the downloads row it empirically fold-matches — but only when
+    exactly one row matches (ambiguous legacy season-less names are left
+    NULL rather than guessed). add_to_history bumps last_grabbed_at to
+    CURRENT_TIMESTAMP, which satisfies the method's 7-day capture window."""
+
+    def test_capture_unique_fold_match(self, db_manager):
+        db_manager.add_to_history("u1", "Law & Order: LA", year=2010,
+                                  resolution="1080p",
+                                  package_name="Law & Order: LA (2010) [1080p]")
+        captured = db_manager.capture_jd_confirmed_names(["Law & Order; LA (2010) [1080p]"])
+        assert captured == 1
+        assert _jd_confirmed_name(db_manager, "u1") == "Law & Order; LA (2010) [1080p]"
+
+    def test_ambiguous_fold_match_skipped(self, db_manager):
+        # Two rows folding to the same key (season-less legacy names).
+        db_manager.add_to_history("u1", "Joey", year=2004, season=1,
+                                  resolution="1080p", package_name="Joey (2004) [1080p]")
+        db_manager.add_to_history("u2", "Joey", year=2004, season=2,
+                                  resolution="1080p", package_name="Joey (2004) [1080p]")
+        captured = db_manager.capture_jd_confirmed_names(["Joey (2004) [1080p]"])
+        assert captured == 0
+        assert _jd_confirmed_name(db_manager, "u1") is None
+        assert _jd_confirmed_name(db_manager, "u2") is None
+
+    def test_capture_is_once_per_row(self, db_manager):
+        db_manager.add_to_history("u1", "Heat", year=1995, resolution="1080p",
+                                  package_name="Heat (1995) [1080p]")
+        assert db_manager.capture_jd_confirmed_names(["Heat (1995) [1080p]"]) == 1
+        assert db_manager.capture_jd_confirmed_names(["Heat (1995) [1080p]"]) == 0
+
+
+class TestMatchingPrecedence:
+    """_match_download_results/reconcile_batch's effective-name lookup prefers
+    jd_confirmed_name (JD's own reported, punctuation-sanitized name) over the
+    computed package_name, since that confirmed string is what
+    download_results.name/rename_jobs.package_name actually carry."""
+
+    def test_download_results_matched_via_jd_confirmed_name(self, db_manager):
+        # download_results.name holds JD's sanitized name (";" not ":");
+        # computed package_name still has the colon. Must match via
+        # jd_confirmed_name, not package_name.
+        conn = db_manager.get_connection()
+        conn.execute(
+            "INSERT INTO download_results (package_uuid, name, state, updated_at) "
+            "VALUES ('uuid1', 'Law & Order; LA (2010) [1080p]', 'extracted', "
+            "'2026-07-12 10:05:00')")
+        conn.commit()
+        row = {"package_name": "Law & Order: LA (2010) [1080p]",
+               "jd_confirmed_name": "Law & Order; LA (2010) [1080p]",
+               "last_grabbed_at": "2026-07-12 10:00:00"}
+        result = _match_download_results(conn, row)
+        assert result is not None
+        assert result["package_uuid"] == "uuid1"
+
+    def test_falls_back_to_package_name_when_unconfirmed(self, db_manager):
+        conn = db_manager.get_connection()
+        conn.execute(
+            "INSERT INTO download_results (package_uuid, name, state, updated_at) "
+            "VALUES ('uuid2', 'Heat (1995) [1080p]', 'extracted', '2026-07-12 10:05:00')")
+        conn.commit()
+        row = {"package_name": "Heat (1995) [1080p]", "jd_confirmed_name": None,
+               "last_grabbed_at": "2026-07-12 10:00:00"}
+        result = _match_download_results(conn, row)
+        assert result is not None  # matched via package_name as before
+        assert result["package_uuid"] == "uuid2"
+
+    def test_rename_rows_matched_via_jd_confirmed_name(self, db_manager):
+        # rename_jobs.package_name stores JD's reported name too; the caller
+        # passes the effective (confirmed-first) name in.
+        conn = db_manager.get_connection()
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, imdb_id, resolution) VALUES (?, ?, 'applied', 'tv', "
+            "?, ?, ?, ?)",
+            ("Law & Order; LA (2010) [1080p]", "/x/LO.mkv", "Law & Order: LA",
+             2010, "tt_lo", "1080p"))
+        conn.commit()
+        rows = _match_rename_rows(conn, "Law & Order; LA (2010) [1080p]")
+        assert rows
+
+    def test_reconcile_batch_uses_jd_confirmed_name_end_to_end(self, db_manager):
+        # Full reconcile_batch wiring: downloads.package_name has the colon,
+        # jd_confirmed_name has the semicolon (as JD reports it), and both
+        # download_results and rename_jobs are keyed on the semicolon form.
+        # reconcile_batch must still find them via the effective name.
+        db_manager.add_to_history("http://m/lo", "Law & Order: LA", year=2010,
+                                  resolution="1080p",
+                                  package_name="Law & Order: LA (2010) [1080p]")
+        conn = db_manager.get_connection()
+        conn.execute("UPDATE downloads SET last_grabbed_at = datetime('now','-1 hour'), "
+                     "jd_confirmed_name = 'Law & Order; LA (2010) [1080p]' "
+                     "WHERE url='http://m/lo'")
+        conn.execute(
+            "INSERT INTO download_results (package_uuid, name, state, updated_at) "
+            "VALUES ('lo-uuid', 'Law & Order; LA (2010) [1080p]', 'extracted', datetime('now'))")
+        conn.commit()
+        n = reconcile_batch(db_manager)
+        assert n >= 1
+        rows = db_manager.get_pipeline_verdicts()
+        row = next(r for r in rows if r["url"] == "http://m/lo")
+        assert row["package_uuid"] == "lo-uuid"

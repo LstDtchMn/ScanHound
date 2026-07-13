@@ -296,6 +296,15 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                             "type": "download:results",
                             "data": {"results": results},
                         })
+                    # Empirical package-name capture: persist JD's own reported
+                    # name for any grab still awaiting confirmation, so pipeline
+                    # matching is immune to JD's punctuation sanitization.
+                    # Cheap no-op once every recent grab is captured.
+                    if results and reg.db:
+                        try:
+                            reg.db.capture_jd_confirmed_names([r["name"] for r in results])
+                        except Exception:
+                            logger.debug("jd_confirmed_name capture failed", exc_info=True)
                     # Auto-rename hook: hand each newly-extracted package's output
                     # folder to the rename service (it self-gates on the setting
                     # and dedups by package). Runs off-thread so the poller never

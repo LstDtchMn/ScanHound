@@ -663,6 +663,42 @@ class DatabaseManager:
                         else:
                             logger.warning("Migration failed: %s — %s", col_sql, e)
 
+                # jd_confirmed_name: own guarded block (not the shared list
+                # above) because its FIRST creation triggers a one-time
+                # best-effort backfill from download_results history. JD
+                # sanitizes punctuation (':' -> ';', etc.) before reporting a
+                # package name, so this — not our computed package_name — is
+                # the string download_results.name and rename_jobs.package_name
+                # actually carry; matching prefers it when present. Fold-match
+                # each legacy downloads row against download_results.name;
+                # capture only unique matches (ambiguous legacy season-less
+                # names are left NULL — they resolve via Re-grab, which now
+                # sends season-aware names). NULL until captured; captured at
+                # most once per row (see capture_jd_confirmed_names below,
+                # which handles ongoing/post-backfill capture).
+                try:
+                    cursor.execute('ALTER TABLE downloads ADD COLUMN jd_confirmed_name TEXT')
+                    from backend.download_service import fold_name
+                    cursor.execute("SELECT url, package_name FROM downloads "
+                                   "WHERE package_name IS NOT NULL")
+                    dl_rows = cursor.fetchall()
+                    cursor.execute("SELECT DISTINCT name FROM download_results "
+                                   "WHERE name IS NOT NULL")
+                    jd_names = [r[0] for r in cursor.fetchall()]
+                    by_fold = {}
+                    for url, pkg in dl_rows:
+                        by_fold.setdefault(fold_name(pkg), []).append(url)
+                    for jd_name in jd_names:
+                        hits = by_fold.get(fold_name(jd_name), [])
+                        if len(hits) == 1:
+                            cursor.execute(
+                                "UPDATE downloads SET jd_confirmed_name = ? "
+                                "WHERE url = ? AND jd_confirmed_name IS NULL",
+                                (jd_name, hits[0]))
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+
                 # ── Versioned migrations ─────────────────────────────────
                 if current_version < 2:
                     # v2: Drop legacy tables from removed subsystems
@@ -1182,7 +1218,7 @@ class DatabaseManager:
         backlog (NULLs — never checked — sort first)."""
         return self._query_dicts('''
             SELECT d.url, d.title, d.year, d.season, d.resolution, d.size, d.hdr, d.dovi,
-                   d.package_name, d.service_type, d.last_grabbed_at,
+                   d.package_name, d.jd_confirmed_name, d.service_type, d.last_grabbed_at,
                    v.category AS verdict_category, v.dismissed AS verdict_dismissed,
                    v.package_uuid, v.excluded_uuid
             FROM downloads d
@@ -1193,6 +1229,48 @@ class DatabaseManager:
             ORDER BY v.checked_at ASC
             LIMIT ?
         ''', (limit,))
+
+    def capture_jd_confirmed_names(self, jd_names):
+        """Empirical capture of JD's reported package names (pipeline matching).
+
+        For each name JD reports, find downloads rows still awaiting capture
+        (jd_confirmed_name IS NULL, grabbed within the last 7 days) whose
+        computed package_name FOLDS equal to it; persist only on a UNIQUE
+        match — an ambiguous fold (legacy season-less names) is skipped
+        rather than guessed. Returns the number of rows captured."""
+        from backend.download_service import fold_name
+        if not jd_names:
+            return 0
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return 0
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT url, package_name FROM downloads "
+                    "WHERE jd_confirmed_name IS NULL AND package_name IS NOT NULL "
+                    "AND last_grabbed_at >= datetime('now', '-7 days')")
+                pending = [(r[0], r[1]) for r in cur.fetchall()]
+                if not pending:
+                    return 0
+                captured = 0
+                for jd_name in set(jd_names):
+                    key = fold_name(jd_name)
+                    hits = [url for url, pkg in pending if fold_name(pkg) == key]
+                    if len(hits) != 1:
+                        continue  # 0 = unrelated package; >1 = ambiguous, skip
+                    cur.execute(
+                        "UPDATE downloads SET jd_confirmed_name = ? "
+                        "WHERE url = ? AND jd_confirmed_name IS NULL",
+                        (jd_name, hits[0]))
+                    captured += cur.rowcount
+                    pending = [(u, p) for u, p in pending if u != hits[0]]
+                conn.commit()
+                return captured
+        except Exception as e:
+            logger.error("DB Error (capture_jd_confirmed_names): %s", e)
+            return 0
 
     def get_downloaded_title_quality(self):
         """Per non-failed grab: (normalized_title, year, season, resolution, dovi).

@@ -206,7 +206,7 @@ def _match_download_results(conn, download_row: dict) -> Optional[dict]:
             return dict(row)
     excluded = (download_row.get("excluded_uuid") or "").split(",")
     excluded = [e for e in excluded if e]
-    name = download_row.get("package_name")
+    name = download_row.get("jd_confirmed_name") or download_row.get("package_name")
     last_grabbed = download_row.get("last_grabbed_at")
     if not name or not last_grabbed:
         return None
@@ -264,7 +264,8 @@ def reconcile_batch(db, limit: int = 500, jd_method: str = "api",
         try:
             row["verdict_package_uuid"] = row.get("package_uuid")
             result_row = _match_download_results(conn, row)
-            rename_rows = _match_rename_rows(conn, row.get("package_name"))
+            effective_name = row.get("jd_confirmed_name") or row.get("package_name")
+            rename_rows = _match_rename_rows(conn, effective_name)
             category, detail, package_uuid, plex_rating_key = categorize(
                 row, result_row, rename_rows, plex_max_ts, jd_method=jd_method,
                 grace_margin_minutes=grace_margin_minutes, db=db)

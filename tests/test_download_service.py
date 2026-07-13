@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch, call, mock_open
 
 import pytest
 
-from backend.download_service import DownloadService, compute_package_name
+from backend.download_service import DownloadService, compute_package_name, fold_name
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -64,10 +64,45 @@ class TestComputePackageName:
         assert compute_package_name("", 1999, "1080p") == "ScanHound Download"
 
     def test_compute_package_name_truncates_at_50(self):
+        # Truncation trims the TITLE, not the suffix — a tail-slice of the
+        # whole string could chop the year/resolution suffix off entirely
+        # for a long enough title, which is exactly the bug being fixed.
         long_title = "The Lord of the Rings: The Return of the King"
         name = compute_package_name(long_title, 2003, "2160p")
         assert len(name) <= 50
-        assert name == f"{long_title} (2003) [2160p]"[:50]
+        assert name.endswith("(2003) [2160p]")
+
+
+class TestSeasonAwarePackageName:
+    def test_movie_format_unchanged(self):
+        assert compute_package_name("Heat", 1995, "1080p") == "Heat (1995) [1080p]"
+
+    def test_tv_includes_season(self):
+        assert compute_package_name("Joey", 2004, "1080p", season=1) == "Joey (2004) S01 [1080p]"
+
+    def test_two_seasons_get_distinct_names(self):
+        s1 = compute_package_name("Joey", 2004, "1080p", season=1)
+        s2 = compute_package_name("Joey", 2004, "1080p", season=2)
+        assert s1 != s2
+
+    def test_long_title_truncates_title_not_suffix(self):
+        name = compute_package_name("X" * 60, 2010, "1080p", season=3)
+        assert len(name) <= 50
+        assert name.endswith("(2010) S03 [1080p]")
+
+    def test_no_title_fallback(self):
+        assert compute_package_name("", None, "") == "ScanHound Download"
+
+
+class TestFoldName:
+    def test_colon_vs_semicolon_fold_equal(self):
+        assert fold_name("Law & Order: LA (2010) [1080p]") == fold_name("Law & Order; LA (2010) [1080p]")
+
+    def test_different_titles_do_not_fold_equal(self):
+        assert fold_name("Joey (2004) S01 [1080p]") != fold_name("Joey (2004) S02 [1080p]")
+
+    def test_casefold(self):
+        assert fold_name("ABC") == fold_name("abc")
 
 
 class TestDownloadFolderRouting:

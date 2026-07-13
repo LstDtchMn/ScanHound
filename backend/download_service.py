@@ -23,18 +23,35 @@ from backend.sources.ddlbase import decode_ddlbase_link
 logger = logging.getLogger(__name__)
 
 
-def compute_package_name(title: str, year: Optional[int], resolution: str) -> str:
+def compute_package_name(title: str, year: Optional[int], resolution: str,
+                         season: Optional[int] = None) -> str:
     """Canonical JDownloader package-name string — the join key used by the
     pipeline tracker across downloads/download_results/rename_jobs. Must match
     send_to_jdownloader's truncation exactly (both its delivery paths truncate
     to 50 chars before JD ever sees the name) — this is the single place that
     string is computed, so the persisted value and the sent value can never
-    drift apart."""
+    drift apart. Season is embedded for TV so multiple seasons of one show
+    never collapse onto the same join key; the 50-char cap trims the TITLE,
+    never the year/season/resolution suffix (a tail-truncation could chop
+    'S03' off a long title and silently recreate the collision)."""
     if not title:
         return "ScanHound Download"[:50]
-    name = f"{title} ({year})" if year else title
-    package_name = f"{name} [{resolution}]" if resolution else name
-    return package_name[:50]
+    suffix = f" ({year})" if year else ""
+    if season is not None:
+        suffix += f" S{season:02d}"
+    if resolution:
+        suffix += f" [{resolution}]"
+    max_title = 50 - len(suffix)
+    return f"{title[:max_title]}{suffix}" if max_title > 0 else (title + suffix)[:50]
+
+
+def fold_name(name: str) -> str:
+    """Punctuation-folded comparison key: JDownloader sanitizes package names
+    character-for-character (':' -> ';', etc.) before reporting them back, so
+    exact comparison of our computed name against JD's reported name fails for
+    any title containing such a character. Folding both sides — drop every
+    non-alphanumeric, casefold — is immune to any substitution JD performs."""
+    return "".join(ch for ch in name if ch.isalnum()).casefold()
 
 
 # Lazy imports for optional heavy dependencies
@@ -2000,7 +2017,7 @@ class DownloadService:
         # Step 2: Try JDownloader first
         jd_folder = self.config.get("jd_folder", "")
         jd_method = self.config.get("jd_method", "folder")
-        package_name = compute_package_name(title, year, resolution)
+        package_name = compute_package_name(title, year, resolution, season=season)
 
         # Per-type download folder: TV (has a season) vs movies, when
         # configured. 4K movies get their OWN folder when set, so they can be
