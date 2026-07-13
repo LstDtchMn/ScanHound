@@ -1656,6 +1656,33 @@
               class={inputClass + ' font-mono'} />
           </label>
         </div>
+
+        <!-- Pipeline card -->
+        <div class="bg-[var(--bg-secondary)] rounded-lg p-5 border border-[var(--border)] space-y-4">
+          <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Pipeline</h3>
+
+          <label class="flex items-center gap-3">
+            <input
+              type="checkbox"
+              checked={$settings.pipeline_reconcile_enabled as boolean ?? true}
+              onchange={(e) => settings.update((s) => ({ ...s, pipeline_reconcile_enabled: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]"
+            />
+            <span class="text-sm">Reconcile grabs against Plex automatically</span>
+          </label>
+
+          <label class="block">
+            <span class="text-sm text-[var(--text-secondary)]">Plex verification grace window (minutes)</span>
+            <input
+              type="number"
+              min="0"
+              max="1440"
+              value={$settings.pipeline_verify_grace_margin_minutes as number ?? 30}
+              oninput={(e) => settings.update((s) => ({ ...s, pipeline_verify_grace_margin_minutes: parseInt(e.currentTarget.value) || 30 }))}
+              class={inputSmClass}
+            />
+          </label>
+        </div>
       </section>
 
     {:else if activeTab === 'notifications'}

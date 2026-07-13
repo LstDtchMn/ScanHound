@@ -147,3 +147,28 @@ def test_put_settings_round_trips_dv_and_4k(client):
     assert {"dv_library_roots", "dv_detection",
             "auto_rename_movie_library_4k"} <= updated
     assert registry.config["auto_rename_movie_library_4k"] == "Movies 4K"
+
+
+def test_settings_model_accepts_pipeline_keys():
+    upd = SettingsUpdate(pipeline_reconcile_enabled=False,
+                         pipeline_verify_grace_margin_minutes=45)
+    assert upd.pipeline_reconcile_enabled is False
+    assert upd.pipeline_verify_grace_margin_minutes == 45
+
+
+def test_put_settings_round_trips_pipeline_keys(client):
+    from backend.api.dependencies import registry
+    registry.config = {}
+
+    class _Backend:
+        _cleared_keys = set()
+        def save_config(self):  # no-op; config isolated by conftest
+            pass
+    registry.backend = _Backend()
+
+    resp = client.put("/settings", json={"pipeline_reconcile_enabled": False,
+                                         "pipeline_verify_grace_margin_minutes": 45})
+    assert resp.status_code == 200
+    got = client.get("/settings").json()
+    assert got["pipeline_reconcile_enabled"] is False
+    assert got["pipeline_verify_grace_margin_minutes"] == 45

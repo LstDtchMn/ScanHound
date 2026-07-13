@@ -630,3 +630,27 @@ class TestMatchingPrecedence:
         rows = db_manager.get_pipeline_verdicts()
         row = next(r for r in rows if r["url"] == "http://m/lo")
         assert row["package_uuid"] == "lo-uuid"
+
+
+class TestPipelineVerdictsPosterPath:
+    def test_pipeline_verdicts_include_poster_path(self, db_manager):
+        # downloads row + verdict + a rename_jobs row sharing the JD-side name,
+        # carrying poster_path
+        db_manager.add_to_history("http://example.com/movie", "Heat", year=1995,
+                                  resolution="1080p",
+                                  package_name="Heat (1995) [1080p]")
+        db_manager.upsert_pipeline_verdict("http://example.com/movie", "verified",
+                                           package_uuid="uuid1")
+        db_manager.create_rename_job({
+            "package_name": "Heat (1995) [1080p]",
+            "original_path": "/downloads/Heat.mkv",
+            "status": "applied",
+            "media_type": "movie",
+            "title": "Heat",
+            "year": 1995,
+            "resolution": "1080p",
+            "poster_path": "/posters/abc.jpg",
+        })
+        rows = db_manager.get_pipeline_verdicts()
+        assert rows
+        assert rows[0]["poster_path"] == "/posters/abc.jpg"

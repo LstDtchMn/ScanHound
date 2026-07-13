@@ -147,6 +147,13 @@ class SettingsUpdate(BaseModel):
     rule_dv: Optional[bool] = None
     strict_resolution: Optional[bool] = None
 
+    # Pipeline tracker: reconcile on/off switch + the Plex-cache grace window
+    # (minutes) used by the applied->verified gate. Both were read live by the
+    # maintenance loop but missing here, so saving them 422'd under
+    # extra="forbid" — the documented off switch didn't exist in the running app.
+    pipeline_reconcile_enabled: Optional[bool] = None
+    pipeline_verify_grace_margin_minutes: Optional[int] = None
+
     # Libraries
     movie_libs: Optional[List[str]] = None
     tv_libs: Optional[List[str]] = None

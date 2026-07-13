@@ -415,6 +415,10 @@ export interface Settings {
   dv_file_tagging?: boolean;
   dv_label_vocab?: string;
 
+  // Pipeline tracker
+  pipeline_reconcile_enabled?: boolean;
+  pipeline_verify_grace_margin_minutes?: number;
+
   // Debug & Logging
   debug_mode?: boolean;
   clear_logs_startup?: boolean;
@@ -692,6 +696,9 @@ export interface PipelineItem {
   season: number | null;
   resolution: string | null;
   package_name: string | null;
+  /** Poster from the newest matched rename job; null until a rename job
+   *  exists (downloading / never_started rows have no identified title). */
+  poster_path: string | null;
 }
 
 /** GET /pipeline/counts — count of non-dismissed items per category. */
