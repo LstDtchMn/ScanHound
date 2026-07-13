@@ -131,7 +131,7 @@
       {#each items as item (item.url)}
         <li class="p-3 flex items-center gap-3">
           {#if item.category && POSTER_CATEGORIES.has(item.category)}
-            <RenamePoster posterUrl={item.poster_path} alt={item.title ?? ''} class="w-10 rounded" />
+            <RenamePoster posterUrl={item.poster_url} alt={item.title ?? ''} class="w-10 rounded" />
           {/if}
           <div class="flex-1 min-w-0">
             <div class="font-medium truncate">

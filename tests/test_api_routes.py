@@ -1812,6 +1812,31 @@ class TestPipelineRoutes:
         items = resp.json()
         assert any(i["url"] == "http://pi/1" and i["category"] == "download_failed" for i in items)
 
+    def test_items_prefixes_poster_path_with_tmdb_base(self, client, db_manager):
+        """Review finding (Task 4, Critical): /pipeline/items must return a
+        fully-formed TMDB poster URL, not the raw poster_path the DB layer
+        stores -- mirrors the prefixing every other poster-bearing route
+        (rename.py's _poster_url, scanner.py, system.py) already does."""
+        db_manager.add_to_history("http://pi/poster", "Heat", year=1995,
+                                  resolution="1080p",
+                                  package_name="Heat (1995) [1080p]")
+        db_manager.upsert_pipeline_verdict("http://pi/poster", "verified",
+                                           package_uuid="uuid-poster")
+        db_manager.create_rename_job({
+            "package_name": "Heat (1995) [1080p]",
+            "original_path": "/downloads/Heat.mkv",
+            "status": "applied",
+            "media_type": "movie",
+            "title": "Heat",
+            "year": 1995,
+            "resolution": "1080p",
+            "poster_path": "/posters/abc.jpg",
+        })
+        resp = client.get("/pipeline/items")
+        assert resp.status_code == 200
+        item = next(i for i in resp.json() if i["url"] == "http://pi/poster")
+        assert item["poster_url"] == "https://image.tmdb.org/t/p/w500/posters/abc.jpg"
+
     def test_counts_excludes_dismissed(self, client, db_manager):
         db_manager.add_to_history("http://pi/2", "Bar", package_name="Bar [1080p]")
         db_manager.upsert_pipeline_verdict("http://pi/2", "rename_failed")

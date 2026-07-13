@@ -696,9 +696,10 @@ export interface PipelineItem {
   season: number | null;
   resolution: string | null;
   package_name: string | null;
-  /** Poster from the newest matched rename job; null until a rename job
-   *  exists (downloading / never_started rows have no identified title). */
-  poster_path: string | null;
+  /** Fully-formed TMDB poster URL (server-side prefixed from the newest
+   *  matched rename job's poster_path); null until a rename job exists
+   *  (downloading / never_started rows have no identified title). */
+  poster_url: string | null;
 }
 
 /** GET /pipeline/counts — count of non-dismissed items per category. */

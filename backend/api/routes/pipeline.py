@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.routes.downloads import _run_grab, DownloadRequest
+from backend.api.routes.rename import _poster_url
 from backend.sources.registry import SourceRegistry
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,15 @@ def get_items(category: Optional[str] = None, include_dismissed: bool = False,
              reg: ServiceRegistry = Depends(get_registry)):
     if not reg.db:
         return []
-    return reg.db.get_pipeline_verdicts(category=category, include_dismissed=include_dismissed)
+    rows = reg.db.get_pipeline_verdicts(category=category, include_dismissed=include_dismissed)
+    # get_pipeline_verdicts() returns the raw TMDB poster_path (e.g.
+    # "/abc123.jpg") as stored in rename_jobs -- not a browser-loadable URL.
+    # Every other poster-bearing route prefixes it with TMDB_IMAGE_BASE
+    # before it reaches the client (rename.py's _poster_url, scanner.py,
+    # system.py); do the same here rather than shipping the raw path.
+    for row in rows:
+        row["poster_url"] = _poster_url(row.pop("poster_path", None))
+    return rows
 
 
 @router.get("/counts")
