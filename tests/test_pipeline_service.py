@@ -843,3 +843,43 @@ class TestPipelineVerdictsPosterPath:
                                            package_uuid="uuid1")
         rows = db_manager.get_pipeline_verdicts()
         assert rows[0]["renamed_at"] == "2026-07-13 12:00:00"  # the current pending row's detected_at
+
+    def test_poster_path_and_renamed_at_resolve_to_the_same_row(self, db_manager):
+        # Adversarial case from code review: rename_failed's status set
+        # includes BOTH 'reverted' and 'needs_review', so two sibling rows
+        # can legitimately match the SAME category at once. The older
+        # 'reverted' row has a real poster_path; the newer 'needs_review'
+        # row (a fresh regrab attempt) has none. Before the fix, poster_path
+        # filtered on "poster_path IS NOT NULL" (picking the older row) while
+        # renamed_at had no such filter (picking the newer row) -- a stale
+        # poster paired with a mismatched, unrelated timestamp. poster_path
+        # and renamed_at must always resolve from the identical row.
+        db_manager.add_to_history("http://example.com/justice_mismatch", "Justice",
+                                  year=2022, resolution="1080p",
+                                  package_name="Justice (2022) [1080p]")
+        conn = db_manager.get_connection()
+        # Older reverted job: has a poster and an old processed_at.
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, resolution, poster_path, processed_at, detected_at) "
+            "VALUES (?, ?, 'reverted', 'movie', ?, ?, ?, ?, ?, ?)",
+            ("Justice (2022) [1080p]", "/old/Justice.mkv", "Justice", 2022, "1080p",
+             "/posters/old_poster.jpg", "2026-07-13 09:00:00", "2026-07-13 08:00:00"))
+        # Newer needs_review job: a fresh regrab attempt, no poster yet.
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, resolution, poster_path, processed_at, detected_at) "
+            "VALUES (?, ?, 'needs_review', 'movie', ?, ?, ?, NULL, NULL, ?)",
+            ("Justice (2022) [1080p]", "/new/Justice.mkv", "Justice", 2022, "1080p",
+             "2026-07-13 20:58:00"))
+        conn.commit()
+        db_manager.upsert_pipeline_verdict("http://example.com/justice_mismatch", "rename_failed",
+                                           package_uuid="uuid1")
+        rows = db_manager.get_pipeline_verdicts()
+        assert len(rows) == 1
+        row = rows[0]
+        # Both columns must come from the SAME row (the one with a poster) --
+        # not poster_path from the reverted row and renamed_at from the
+        # needs_review row.
+        assert row["poster_path"] == "/posters/old_poster.jpg"
+        assert row["renamed_at"] == "2026-07-13 09:00:00"
