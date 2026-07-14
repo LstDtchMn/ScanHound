@@ -1125,6 +1125,7 @@ class DatabaseManager:
             SELECT v.url, v.category, v.detail, v.package_uuid, v.excluded_uuid,
                    v.plex_rating_key, v.checked_at, v.dismissed,
                    d.title, d.year, d.season, d.resolution, d.package_name,
+                   d.last_grabbed_at AS grabbed_at,
                    CASE
                      WHEN v.category = 'pending_rename'
                      THEN (SELECT r.poster_path FROM rename_jobs r
@@ -1145,7 +1146,25 @@ class DatabaseManager:
                              AND r.poster_path IS NOT NULL
                            ORDER BY r.id DESC LIMIT 1)
                      ELSE NULL
-                   END AS poster_path
+                   END AS poster_path,
+                   CASE
+                     WHEN v.category = 'pending_rename'
+                     THEN (SELECT COALESCE(r.processed_at, r.detected_at) FROM rename_jobs r
+                           WHERE r.package_name = COALESCE(d.jd_confirmed_name, d.package_name)
+                             AND r.status IN ('pending', 'matched', 'applying')
+                           ORDER BY r.id DESC LIMIT 1)
+                     WHEN v.category = 'rename_failed'
+                     THEN (SELECT COALESCE(r.processed_at, r.detected_at) FROM rename_jobs r
+                           WHERE r.package_name = COALESCE(d.jd_confirmed_name, d.package_name)
+                             AND r.status IN ('failed', 'needs_review', 'reverted')
+                           ORDER BY r.id DESC LIMIT 1)
+                     WHEN v.category IN ('awaiting_plex_refresh', 'verified', 'not_in_plex')
+                     THEN (SELECT COALESCE(r.processed_at, r.detected_at) FROM rename_jobs r
+                           WHERE r.package_name = COALESCE(d.jd_confirmed_name, d.package_name)
+                             AND r.status = 'applied'
+                           ORDER BY r.id DESC LIMIT 1)
+                     ELSE NULL
+                   END AS renamed_at
             FROM pipeline_verdicts v
             JOIN downloads d ON d.url = v.url
             {where}

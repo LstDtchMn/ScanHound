@@ -772,3 +772,74 @@ class TestPipelineVerdictsPosterPath:
         # FIX: should be NULL (failed row has no poster)
         # BUG: would return the old applied row's poster
         assert row["poster_path"] is None
+
+    def test_verdicts_include_grabbed_at(self, db_manager):
+        db_manager.add_to_history("http://example.com/grabbed", "Heat", year=1995,
+                                  resolution="1080p",
+                                  package_name="Heat (1995) [1080p]")
+        db_manager.upsert_pipeline_verdict("http://example.com/grabbed", "downloading",
+                                           package_uuid="uuid1")
+        rows = db_manager.get_pipeline_verdicts()
+        assert rows
+        assert rows[0]["grabbed_at"] is not None  # add_to_history sets last_grabbed_at
+
+    def test_verdicts_include_renamed_at_from_processed_at(self, db_manager):
+        db_manager.add_to_history("http://example.com/renamed_movie", "Heat", year=1995,
+                                  resolution="1080p",
+                                  package_name="Heat (1995) [1080p]")
+        db_manager.upsert_pipeline_verdict("http://example.com/renamed_movie", "verified",
+                                           package_uuid="uuid1")
+        # create_rename_job's _RENAME_FIELDS allowlist doesn't include
+        # detected_at, so insert this row via raw SQL (same pattern as the
+        # stale-sibling tests above) to set both processed_at and detected_at.
+        conn = db_manager.get_connection()
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, resolution, processed_at, detected_at) "
+            "VALUES (?, ?, 'applied', 'movie', ?, ?, ?, ?, ?)",
+            ("Heat (1995) [1080p]", "/downloads/Heat.mkv", "Heat", 1995, "1080p",
+             "2026-07-13 10:00:00", "2026-07-13 09:00:00"))
+        conn.commit()
+        rows = db_manager.get_pipeline_verdicts()
+        assert rows[0]["renamed_at"] == "2026-07-13 10:00:00"  # processed_at wins over detected_at
+
+    def test_verdicts_renamed_at_falls_back_to_detected_at(self, db_manager):
+        db_manager.add_to_history("http://example.com/pending_renamed_at", "Dune",
+                                  year=2021, resolution="1080p",
+                                  package_name="Dune (2021) [1080p]")
+        db_manager.upsert_pipeline_verdict("http://example.com/pending_renamed_at",
+                                           "pending_rename", package_uuid="uuid1")
+        conn = db_manager.get_connection()
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, resolution, processed_at, detected_at) "
+            "VALUES (?, ?, 'pending', 'movie', ?, ?, ?, NULL, ?)",
+            ("Dune (2021) [1080p]", "/downloads/Dune.mkv", "Dune", 2021, "1080p",
+             "2026-07-13 08:00:00"))
+        conn.commit()
+        rows = db_manager.get_pipeline_verdicts()
+        assert rows[0]["renamed_at"] == "2026-07-13 08:00:00"  # no processed_at yet: falls back
+
+    def test_renamed_at_not_leaked_from_stale_sibling(self, db_manager):
+        # Same adversarial scenario as the poster_path regression test above,
+        # asserting renamed_at gets the same not-a-stale-sibling protection
+        # for free, because it is selected from the identical matched row.
+        db_manager.add_to_history("http://example.com/dune_stale_ts", "Dune",
+                                  year=2021, resolution="1080p",
+                                  package_name="Dune (2021) [1080p]")
+        conn = db_manager.get_connection()
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, resolution, processed_at, detected_at) "
+            "VALUES (?, ?, 'reverted', 'movie', ?, ?, ?, datetime('now', '-1 hour'), datetime('now', '-2 hour'))",
+            ("Dune (2021) [1080p]", "/old/Dune.mkv", "Dune", 2021, "1080p"))
+        conn.execute(
+            "INSERT INTO rename_jobs (package_name, original_path, status, media_type, "
+            "title, year, resolution, processed_at, detected_at) "
+            "VALUES (?, ?, 'pending', 'movie', ?, ?, ?, NULL, ?)",
+            ("Dune (2021) [1080p]", "/new/Dune.mkv", "Dune", 2021, "1080p", "2026-07-13 12:00:00"))
+        conn.commit()
+        db_manager.upsert_pipeline_verdict("http://example.com/dune_stale_ts", "pending_rename",
+                                           package_uuid="uuid1")
+        rows = db_manager.get_pipeline_verdicts()
+        assert rows[0]["renamed_at"] == "2026-07-13 12:00:00"  # the current pending row's detected_at

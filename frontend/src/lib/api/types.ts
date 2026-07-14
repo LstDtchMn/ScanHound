@@ -700,6 +700,11 @@ export interface PipelineItem {
    *  matched rename job's poster_path); null until a rename job exists
    *  (downloading / never_started rows have no identified title). */
   poster_url: string | null;
+  /** downloads.last_grabbed_at — when this grab was last sent. */
+  grabbed_at: string | null;
+  /** rename_jobs.processed_at if applied, else detected_at — when the file
+   *  was renamed or matched. Null until a rename job exists for this item. */
+  renamed_at: string | null;
 }
 
 /** GET /pipeline/counts — count of non-dismissed items per category. */

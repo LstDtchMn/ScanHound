@@ -130,19 +130,26 @@
     <ul class="divide-y divide-[var(--border)] rounded-lg border border-[var(--border)] overflow-hidden">
       {#each items as item (item.url)}
         {@const ago = checkedAgo(item.checked_at)}
+        {@const grabbedAgo = checkedAgo(item.grabbed_at ?? '')}
+        {@const renamedAgo = checkedAgo(item.renamed_at ?? '')}
         <li class="p-3 flex items-center gap-3">
           {#if item.category && POSTER_CATEGORIES.has(item.category)}
             <RenamePoster posterUrl={item.poster_url} alt={item.title ?? ''} class="w-10 rounded" />
           {/if}
           <div class="flex-1 min-w-0">
             <div class="font-medium truncate">
-              {item.title || item.package_name || item.url}
+              <a href={item.url} target="_blank" rel="noopener noreferrer"
+                class="hover:underline">
+                {item.title || item.package_name || item.url}
+                {#if item.season != null}<span> S{String(item.season).padStart(2, '0')}</span>{/if}
+              </a>
               {#if item.year}<span class="text-[var(--text-secondary)] font-normal"> ({item.year})</span>{/if}
             </div>
             <div class="text-xs text-[var(--text-secondary)] flex flex-wrap gap-x-2">
               <span style="color: {categoryColor(item.category)}">{categoryLabel(item.category)}</span>
-              {#if item.season != null}<span>S{String(item.season).padStart(2, '0')}</span>{/if}
               {#if item.resolution}<span>{item.resolution}</span>{/if}
+              {#if grabbedAgo}<span>grabbed {grabbedAgo}</span>{/if}
+              {#if renamedAgo}<span>renamed {renamedAgo}</span>{/if}
               {#if ago}<span>checked {ago}</span>{/if}
             </div>
             {#if item.detail}
