@@ -936,6 +936,32 @@ class TestMaintenancePass:
             svc._maintenance_stop.set()
             svc._maintenance_thread.join(timeout=2.0)
 
+    def test_maintenance_pass_calls_detect_moved_files_when_enabled(self):
+        """AppService has no direct RenameService reference of its own (unlike
+        the api/main.py download poller, which has `reg` in scope) -- the hook
+        reaches the singleton via backend.api.dependencies.registry, so the
+        spy is installed there rather than on the AppService instance."""
+        svc = self._make_service({"rename_detect_moved_files_enabled": True})
+        svc.db = MagicMock()
+        mock_rename_service = MagicMock()
+        mock_rename_service.detect_moved_source_files.return_value = {
+            "checked": 0, "confirmed_missing": 0}
+        with patch("backend.rename.fileops.sweep_trash",
+                  return_value={"files_deleted": 0, "bytes_freed": 0, "buckets_removed": 0}), \
+             patch("backend.api.dependencies.registry._rename_service", mock_rename_service):
+            svc._run_maintenance_pass()
+        mock_rename_service.detect_moved_source_files.assert_called_once()
+
+    def test_maintenance_pass_skips_detect_moved_files_when_disabled(self):
+        svc = self._make_service({"rename_detect_moved_files_enabled": False})
+        svc.db = MagicMock()
+        mock_rename_service = MagicMock()
+        with patch("backend.rename.fileops.sweep_trash",
+                  return_value={"files_deleted": 0, "bytes_freed": 0, "buckets_removed": 0}), \
+             patch("backend.api.dependencies.registry._rename_service", mock_rename_service):
+            svc._run_maintenance_pass()
+        mock_rename_service.detect_moved_source_files.assert_not_called()
+
 
 # ======================================================================
 # Application Metadata Constants Tests

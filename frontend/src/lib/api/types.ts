@@ -419,6 +419,9 @@ export interface Settings {
   pipeline_reconcile_enabled?: boolean;
   pipeline_verify_grace_margin_minutes?: number;
 
+  // Auto-archive rename_jobs whose source file was moved outside ScanHound
+  rename_detect_moved_files_enabled?: boolean;
+
   // Debug & Logging
   debug_mode?: boolean;
   clear_logs_startup?: boolean;

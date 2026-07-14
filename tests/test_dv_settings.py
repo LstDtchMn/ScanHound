@@ -172,3 +172,24 @@ def test_put_settings_round_trips_pipeline_keys(client):
     got = client.get("/settings").json()
     assert got["pipeline_reconcile_enabled"] is False
     assert got["pipeline_verify_grace_margin_minutes"] == 45
+
+
+def test_settings_model_accepts_rename_detect_moved_files_enabled():
+    upd = SettingsUpdate(rename_detect_moved_files_enabled=False)
+    assert upd.rename_detect_moved_files_enabled is False
+
+
+def test_put_settings_round_trips_rename_detect_moved_files_enabled(client):
+    from backend.api.dependencies import registry
+    registry.config = {}
+
+    class _Backend:
+        _cleared_keys = set()
+        def save_config(self):  # no-op; config isolated by conftest
+            pass
+    registry.backend = _Backend()
+
+    resp = client.put("/settings", json={"rename_detect_moved_files_enabled": False})
+    assert resp.status_code == 200
+    got = client.get("/settings").json()
+    assert got["rename_detect_moved_files_enabled"] is False

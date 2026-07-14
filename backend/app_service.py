@@ -604,6 +604,23 @@ class AppService:
             logger.exception("Pipeline reconcile failed (non-fatal)")
 
         try:
+            if (self.db is not None
+                    and self.config.get("rename_detect_moved_files_enabled", True)):
+                # AppService has no RenameService reference of its own (unlike
+                # the api/main.py download poller, which has the ServiceRegistry
+                # `reg` in scope) -- reach the singleton via the registry.
+                from backend.api.dependencies import registry
+                rename_service = registry._rename_service
+                if rename_service is not None:
+                    result = rename_service.detect_moved_source_files()
+                    if result.get("confirmed_missing"):
+                        logger.info(
+                            "Detected %d rename job(s) with a source file moved "
+                            "outside the app; archived", result["confirmed_missing"])
+        except Exception:
+            logger.exception("Detect-moved-source-files pass failed (non-fatal)")
+
+        try:
             if self.db is not None:
                 from backend.rename.conflict_analyzer import analyze_pending_conflicts
                 n = analyze_pending_conflicts(

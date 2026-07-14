@@ -479,6 +479,7 @@ _DEFAULT_CONFIG: AppConfig = {
     "trash_retention_days": 30,
     "pipeline_verify_grace_margin_minutes": 30,
     "pipeline_reconcile_enabled": True,
+    "rename_detect_moved_files_enabled": True,
     "dv_library_roots": "",
     "dv_detection": False,
     "dv_file_tagging": False,

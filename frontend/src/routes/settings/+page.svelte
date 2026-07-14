@@ -1446,6 +1446,16 @@
             <span class="text-sm">Require confirmation before moving files (recommended)</span>
           </label>
 
+          <label class="flex items-center gap-3">
+            <input
+              type="checkbox"
+              checked={$settings.rename_detect_moved_files_enabled as boolean ?? true}
+              onchange={(e) => settings.update((s) => ({ ...s, rename_detect_moved_files_enabled: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]"
+            />
+            <span class="text-sm">Auto-archive jobs whose file was moved outside ScanHound</span>
+          </label>
+
           <label class="block">
             <Tooltip text="Files identified with a confidence score below this number are held for manual review instead of being renamed automatically. 70 is a safe default — lower it to be more permissive, raise it to be stricter.">
               <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Low-confidence threshold ⓘ</span>

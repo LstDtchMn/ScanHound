@@ -154,6 +154,12 @@ class SettingsUpdate(BaseModel):
     pipeline_reconcile_enabled: Optional[bool] = None
     pipeline_verify_grace_margin_minutes: Optional[int] = None
 
+    # Proactively detect and auto-archive rename_jobs whose source file was
+    # moved/renamed/deleted directly in Windows (outside ScanHound's own
+    # apply flow) -- declutters the Renames page instead of leaving a
+    # permanently-stale needs_review/matched job.
+    rename_detect_moved_files_enabled: Optional[bool] = None
+
     # Libraries
     movie_libs: Optional[List[str]] = None
     tv_libs: Optional[List[str]] = None
