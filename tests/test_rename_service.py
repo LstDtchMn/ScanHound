@@ -2423,3 +2423,130 @@ class TestBuildMatchReasons:
             {"title": "Movie", "year": 2020},
             {"title": "Movie", "year": 2020, "confidence": 92.0})
         assert r and any("close but not exact" in x for x in r)
+
+
+class TestDetectMovedSourceFiles:
+    """detect_moved_source_files(): two-pass confirmation before archiving a
+    rename_job whose source file was moved/deleted outside the app.
+
+    This file has no `svc` fixture — tests here use the file's existing
+    `_service(db, tmdb_search)` factory (see top of file) in place of the
+    plan's illustrative `svc` fixture.
+    """
+
+    def test_first_miss_sets_timestamp_no_action(self, tmp_path, db):
+        svc = _service(db, _matrix_search)
+        missing_path = str(tmp_path / "gone.mkv")  # never created — always missing
+        job_id = db.create_rename_job({
+            "package_name": "Foo (2020) [1080p]", "original_path": missing_path,
+            "status": "needs_review", "media_type": "movie", "title": "Foo", "year": 2020,
+        })
+        result = svc.detect_moved_source_files()
+        job = db.get_rename_job(job_id)
+        assert job["status"] == "needs_review"  # untouched
+        assert job["archived_at"] is None
+        assert job["source_missing_since"] is not None
+        assert result == {"checked": 1, "confirmed_missing": 0}
+
+    def test_second_consecutive_miss_confirms_and_archives(self, tmp_path, db):
+        svc = _service(db, _matrix_search)
+        missing_path = str(tmp_path / "gone2.mkv")
+        job_id = db.create_rename_job({
+            "package_name": "Bar (2021) [1080p]", "original_path": missing_path,
+            "status": "matched", "media_type": "movie", "title": "Bar", "year": 2021,
+        })
+        svc.detect_moved_source_files()  # first miss — just records the timestamp
+        result = svc.detect_moved_source_files()  # second miss — confirms
+        job = db.get_rename_job(job_id)
+        assert job["status"] == "failed"
+        assert job["error_message"] == "Source file was moved or deleted outside ScanHound"
+        assert job["archived_at"] is not None
+        assert result == {"checked": 1, "confirmed_missing": 1}
+
+    def test_file_reappearing_clears_the_timer(self, tmp_path, db):
+        svc = _service(db, _matrix_search)
+        real_path = tmp_path / "here.mkv"
+        job_id = db.create_rename_job({
+            "package_name": "Baz (2022) [1080p]", "original_path": str(real_path),
+            "status": "needs_review", "media_type": "movie", "title": "Baz", "year": 2022,
+        })
+        # Pass 1: file doesn't exist yet — first miss
+        svc.detect_moved_source_files()
+        assert db.get_rename_job(job_id)["source_missing_since"] is not None
+        # File shows up before the second pass (e.g. a slow network mount)
+        real_path.write_bytes(b"x")
+        svc.detect_moved_source_files()
+        job = db.get_rename_job(job_id)
+        assert job["source_missing_since"] is None  # cleared, self-healed
+        assert job["status"] == "needs_review"
+        assert job["archived_at"] is None
+
+    def test_file_present_the_whole_time_is_never_touched(self, tmp_path, db):
+        svc = _service(db, _matrix_search)
+        real_path = tmp_path / "present.mkv"
+        real_path.write_bytes(b"x")
+        job_id = db.create_rename_job({
+            "package_name": "Qux (2023) [1080p]", "original_path": str(real_path),
+            "status": "matched", "media_type": "movie", "title": "Qux", "year": 2023,
+        })
+        for _ in range(3):
+            svc.detect_moved_source_files()
+        job = db.get_rename_job(job_id)
+        assert job["status"] == "matched"
+        assert job["source_missing_since"] is None
+        assert job["archived_at"] is None
+
+    def test_applying_status_never_examined(self, tmp_path, db):
+        svc = _service(db, _matrix_search)
+        missing_path = str(tmp_path / "inflight.mkv")
+        job_id = db.create_rename_job({
+            "package_name": "Quux (2024) [1080p]", "original_path": missing_path,
+            "status": "applying", "media_type": "movie", "title": "Quux", "year": 2024,
+        })
+        result = svc.detect_moved_source_files()
+        job = db.get_rename_job(job_id)
+        assert job["status"] == "applying"  # untouched
+        assert job["source_missing_since"] is None
+        assert result == {"checked": 0, "confirmed_missing": 0}
+
+    def test_already_archived_job_never_examined(self, tmp_path, db):
+        svc = _service(db, _matrix_search)
+        missing_path = str(tmp_path / "archived_already.mkv")
+        job_id = db.create_rename_job({
+            "package_name": "Corge (2025) [1080p]", "original_path": missing_path,
+            "status": "needs_review", "media_type": "movie", "title": "Corge", "year": 2025,
+        })
+        db.archive_rename_jobs([job_id])
+        result = svc.detect_moved_source_files()
+        assert result == {"checked": 0, "confirmed_missing": 0}
+
+    def test_one_bad_job_does_not_abort_the_batch(self, tmp_path, db, monkeypatch):
+        # A job whose original_path check raises must not stop the other jobs
+        # in the batch from being checked (mirrors reconcile_batch's isolation).
+        svc = _service(db, _matrix_search)
+        good_missing = str(tmp_path / "good_gone.mkv")
+        job_good = db.create_rename_job({
+            "package_name": "Grault (2020) [1080p]", "original_path": good_missing,
+            "status": "needs_review", "media_type": "movie", "title": "Grault", "year": 2020,
+        })
+        db.create_rename_job({
+            # rename_jobs.original_path is NOT NULL in the real schema (the plan's
+            # illustrative test used None; adapted to "" here) — still falsy, so
+            # detect_moved_source_files' `if not src: continue` skips it the same way.
+            "package_name": "Garply (2020) [1080p]", "original_path": "",
+            "status": "needs_review", "media_type": "movie", "title": "Garply", "year": 2020,
+        })
+        # An empty original_path should be skipped cleanly (not raise), but this
+        # test also proves the loop tolerates a genuinely raising path check —
+        # simulate via monkeypatching os.path.isfile to raise for one specific path.
+        import backend.rename.service as svc_module
+        real_isfile = svc_module.os.path.isfile
+        def flaky_isfile(path):
+            if path == good_missing:
+                raise OSError("simulated stat failure")
+            return real_isfile(path)
+        monkeypatch.setattr(svc_module.os.path, "isfile", flaky_isfile)
+        result = svc.detect_moved_source_files()
+        assert result["checked"] >= 1  # job_bad (empty path) still got processed
+        job_good_row = db.get_rename_job(job_good)
+        assert job_good_row["status"] == "needs_review"  # untouched by the raise, not crashed

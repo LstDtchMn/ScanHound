@@ -653,6 +653,14 @@ class DatabaseManager:
                     # = archived (set automatically on apply success, or
                     # manually via bulk archive/unarchive).
                     'ALTER TABLE rename_jobs ADD COLUMN archived_at TIMESTAMP',
+                    # Two-pass confirmation timer for detect_moved_source_files():
+                    # NULL normally; set to CURRENT_TIMESTAMP on the first
+                    # maintenance pass that finds a needs_review/matched job's
+                    # original_path missing, cleared if the file reappears, and
+                    # left permanently set (for audit) once a SECOND consecutive
+                    # miss confirms the file is genuinely gone and the job is
+                    # archived. See detect_moved_source_files in rename/service.py.
+                    'ALTER TABLE rename_jobs ADD COLUMN source_missing_since TIMESTAMP',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -2312,7 +2320,7 @@ class DatabaseManager:
         "suggested_correction", "combined_episode", "split_file", "poster_path",
         "match_reasons", "prior_status", "conflict_kind", "conflict_same_size",
         "conflict_existing_size", "conflict_incoming_size", "conflict_analysis",
-        "archived_at",
+        "archived_at", "source_missing_since",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.

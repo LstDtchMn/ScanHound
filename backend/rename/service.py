@@ -1506,6 +1506,56 @@ class RenameService:
         self._broadcast(job_id)
         return {"ok": True}
 
+    def detect_moved_source_files(self) -> dict:
+        """Two-pass confirmation: mark and archive rename_jobs whose source
+        file vanished outside the app (moved/renamed/deleted directly in
+        Windows), without acting on a single transient miss.
+
+        Scope: status IN (needs_review, matched) only — 'applying' is
+        in-flight/crash-recovery-handled, applied/failed/reverted are
+        terminal, archived jobs are excluded by list_rename_jobs' default.
+
+        A job's source_missing_since is NULL until the first maintenance
+        pass that finds original_path missing (sets it, takes no further
+        action). Only a SECOND pass that still finds it missing confirms —
+        marks the job failed with an honest, distinct error message and
+        archives it via the existing archive_rename_jobs(). If the file
+        reappears at any point before confirmation, source_missing_since is
+        cleared back to NULL (self-heals against a transient NAS/SMB blip —
+        this app's maintenance loop runs hourly, so two misses are ~1 hour
+        apart, ample margin against a momentary glitch).
+
+        Per-job failures are caught and skipped (retried next pass), never
+        aborting the batch — mirrors reconcile_batch's isolation.
+        """
+        db = self._db
+        checked = 0
+        confirmed_missing = 0
+        jobs = (db.list_rename_jobs(status="needs_review", limit=100000, archived=False) +
+                db.list_rename_jobs(status="matched", limit=100000, archived=False))
+        for job in jobs:
+            try:
+                src = job.get("original_path")
+                if not src:
+                    continue
+                checked += 1
+                if os.path.isfile(src):
+                    if job.get("source_missing_since"):
+                        db.update_rename_job(job["id"], source_missing_since=None)
+                    continue
+                if not job.get("source_missing_since"):
+                    db.update_rename_job(job["id"], source_missing_since=_now())
+                    continue
+                db.update_rename_job(
+                    job["id"], status="failed",
+                    error_message="Source file was moved or deleted outside ScanHound")
+                db.archive_rename_jobs([job["id"]])
+                self._broadcast(job["id"])
+                confirmed_missing += 1
+            except Exception:
+                logger.exception("detect_moved_source_files: job %s failed", job.get("id"))
+        return {"checked": checked, "confirmed_missing": confirmed_missing}
+
     def undo(self, job_id: int) -> dict:
         db = self._db
         job = db.get_rename_job(job_id) if db else None
