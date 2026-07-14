@@ -1932,6 +1932,75 @@ class TestTranslatePath:
         db.close()
 
 
+# ── conflict_preview library-duplicate path translation ──────────────
+
+class TestConflictPreviewPathTranslation:
+    """Regression: the live conflict_preview() (behind the Renames "Compare"
+    button) resolves the existing library file via find_library_duplicate,
+    whose file_path is Plex's OWN reported path (a Windows drive/junction/UNC
+    path, e.g. 'G:\\Movies 1\\X.mkv'). That path must be translated to the
+    container-local mount via plex_library_path_mappings BEFORE probe_specs(),
+    exactly as conflict_analyzer.py already does — otherwise the probe silently
+    can't find the file, existing.present is False, and the modal wrongly shows
+    'Destination is free' + a plain Apply for a title that IS already in the
+    library. This mirrors test_conflict_analyzer.py::
+    test_analyze_job_conflict_translates_existing_path_before_probing."""
+
+    def _matched_movie_job(self, db):
+        jid = db.create_rename_job({
+            "package_name": "Moving (1993) [2160p]",
+            "original_path": "/downloads/Moving.mkv",
+            "new_filename": "Moving (1993) [2160p].mkv",
+            "destination_path": "/library/movies-4k/Moving (1993)",
+            "status": "matched", "media_type": "movie",
+            "title": "Moving", "year": 1993, "imdb_id": "tt1", "resolution": "2160p",
+        })
+        return db.get_rename_job(jid)
+
+    def test_existing_library_path_is_translated_before_probing(self, tmp_path, monkeypatch):
+        from unittest.mock import patch
+        db = DatabaseManager()
+        job = self._matched_movie_job(db)
+        svc = _service(db, _matrix_search,
+                       plex_library_path_mappings="G:\\Movies 1 => /library/plex-source/g-movies-1")
+        absent = {"present": False, "path": None, "size_bytes": None, "container": None,
+                  "duration_min": None, "bitrate": None, "resolution": None,
+                  "video_codec": None, "hdr": None, "dv_layer": None, "audio": None,
+                  "audio_profile": None}
+        with patch("os.path.lexists", return_value=False), \
+             patch("backend.rename.conflicts.find_library_duplicate",
+                   return_value={"file_path": "G:\\Movies 1\\Moving (1993).mkv", "rating_key": "99"}), \
+             patch("backend.rename.service.probe_specs", return_value=absent) as probe_mock:
+            svc.conflict_preview(job["id"])
+        # probe_specs is called for incoming (original_path) first, then existing.
+        probed_paths = [c.args[0] for c in probe_mock.call_args_list]
+        assert "/library/plex-source/g-movies-1/Moving (1993).mkv" in probed_paths
+        assert "G:\\Movies 1\\Moving (1993).mkv" not in probed_paths  # never the raw path
+        db.close()
+
+    def test_no_plex_mapping_passes_raw_path_through(self, tmp_path):
+        # Backward-compat: with no plex_library_path_mappings configured,
+        # translate_plex_path is a no-op passthrough — the raw path is probed,
+        # exactly as before this fix (matches conflict_analyzer's own
+        # no-mapping behavior).
+        from unittest.mock import patch
+        db = DatabaseManager()
+        job = self._matched_movie_job(db)
+        svc = _service(db, _matrix_search)  # no plex_library_path_mappings
+        absent = {"present": False, "path": None, "size_bytes": None, "container": None,
+                  "duration_min": None, "bitrate": None, "resolution": None,
+                  "video_codec": None, "hdr": None, "dv_layer": None, "audio": None,
+                  "audio_profile": None}
+        with patch("os.path.lexists", return_value=False), \
+             patch("backend.rename.conflicts.find_library_duplicate",
+                   return_value={"file_path": "G:\\Movies 1\\Moving (1993).mkv", "rating_key": "99"}), \
+             patch("backend.rename.service.probe_specs", return_value=absent) as probe_mock:
+            svc.conflict_preview(job["id"])
+        probed_paths = [c.args[0] for c in probe_mock.call_args_list]
+        assert "G:\\Movies 1\\Moving (1993).mkv" in probed_paths  # unchanged passthrough
+        db.close()
+
+
 # ── process_folder (manual backlog processing) ───────────────────────
 
 class TestProcessFolder:

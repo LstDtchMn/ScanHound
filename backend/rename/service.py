@@ -1702,12 +1702,22 @@ class RenameService:
             existing_probe_failed = existing_probe is None
         else:
             from backend.rename.conflicts import find_library_duplicate
+            from backend.rename.path_translation import translate_plex_path
             match = find_library_duplicate(job, db.list_plex_cache_movies()) if db else None
             if match and match.get("file_path"):
                 kind = "library_duplicate"
-                existing_probe = probe_specs(match["file_path"], db=db)
-                existing = existing_probe or {"present": True, "path": match["file_path"]}
-                existing["original_filename"] = os.path.basename(match["file_path"])
+                # match["file_path"] is Plex's OWN reported path (a Windows
+                # drive/junction/UNC path). Translate it to the container-local
+                # mount before probing — same as conflict_analyzer.py does for
+                # the cached analysis. Without this the live probe silently
+                # can't find the file (existing.present=False) and the Compare
+                # modal wrongly shows "Destination is free" for a title that IS
+                # already in the library.
+                existing_path = translate_plex_path(
+                    match["file_path"], self._cfg.get("plex_library_path_mappings"))
+                existing_probe = probe_specs(existing_path, db=db)
+                existing = existing_probe or {"present": True, "path": existing_path}
+                existing["original_filename"] = os.path.basename(existing_path)
                 existing_probe_failed = existing_probe is None
             else:
                 existing = {"present": False, "path": dst}
