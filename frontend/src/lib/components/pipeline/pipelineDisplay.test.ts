@@ -37,6 +37,20 @@ describe('checkedAgo', () => {
     expect(checkedAgo('garbage', now)).toBe('');
     expect(checkedAgo('2026-7-12 11:59:00', now)).toBe(''); // non-zero-padded month
   });
+  it('parses ISO-8601 timestamps with a UTC offset (rename_jobs.processed_at '
+    + 'format, from Python\'s datetime.now(timezone.utc).isoformat())', () => {
+    expect(checkedAgo('2026-07-12T11:55:00.000000+00:00', now)).toBe('5m ago');
+    expect(checkedAgo('2026-07-12T09:00:00.000000+00:00', now)).toBe('3h ago');
+    // Real _now() output carries fractional seconds; confirm they don't break parsing.
+    expect(checkedAgo('2026-07-12T11:54:00.946949+00:00', now)).toBe('5m ago');
+  });
+  it('parses ISO-8601 timestamps with a Z suffix', () => {
+    expect(checkedAgo('2026-07-12T09:00:00Z', now)).toBe('3h ago');
+  });
+  it('parses ISO-8601 timestamps with a non-UTC offset', () => {
+    // 14:55:00+03:00 == 11:55:00Z == 5 minutes before `now`.
+    expect(checkedAgo('2026-07-12T14:55:00+03:00', now)).toBe('5m ago');
+  });
 });
 
 describe('categoryColor', () => {
