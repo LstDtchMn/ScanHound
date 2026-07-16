@@ -1361,6 +1361,38 @@ class RenameService:
 
     # ── UI-driven actions ─────────────────────────────────────────────
 
+    def _restore_overwritten_original(self, trashed_to, dst, job_id, base_error):
+        """Restore the prior occupant an overwrite trashed, when the apply then
+        failed (either place_file raised OR the post-placement DB write didn't
+        persist). Returns ``base_error`` unchanged when nothing was trashed this
+        call or the restore succeeds; otherwise returns ``base_error`` augmented
+        with a loud, stranded-file warning naming the now-empty slot and the
+        exact trash path (mirrors undo()'s restore_warning). Shared by both
+        apply-failure branches so the "never leave the library slot empty" rule
+        can't drift between them."""
+        if not trashed_to:
+            return base_error
+        bucket = os.path.basename(os.path.dirname(trashed_to))
+        name = os.path.basename(trashed_to)
+        try:
+            restore_result = _fileops.restore_trash_entry(
+                bucket, name, _fileops.all_trash_roots())
+        except Exception as re:
+            restore_result = {"ok": False, "error": str(re)}
+        if restore_result.get("ok"):
+            return base_error
+        logger.error(
+            "apply: overwrite failed AND restore of the trashed original failed "
+            "for job %s -- %s is now EMPTY, original stranded at %s: %s",
+            job_id, dst, trashed_to, restore_result.get("error"))
+        return (
+            f"{base_error}. Additionally, the original file that was overwritten "
+            f"could not be restored from trash "
+            f"({restore_result.get('error') or 'unknown error'}) -- the library "
+            f"slot at {dst} is now EMPTY. The original is stranded at {trashed_to} "
+            f"in trash bucket {bucket!r} (name {name!r}) and must be moved back "
+            f"manually.")
+
     def apply(self, job_id: int, automatic: bool = False,
              conflict_strategy: Optional[str] = None) -> dict:
         """Apply a matched job's placement.
@@ -1537,39 +1569,12 @@ class RenameService:
             # place_file() failed for some other reason — the
             # 'destination_exists' marker from before is stale, so clear it
             # rather than leaving it on this failed job.
-            error_message = str(e)
             # SH-H09: an overwrite that trashed the prior occupant of dst and
             # then failed to place the incoming file leaves dst genuinely
-            # empty — restore the trashed original (the same
-            # restore_trash_entry primitive undo() uses) so a failed apply is
-            # a no-op on disk, not a silent loss of the file that was already
-            # there.
-            if trashed_to:
-                bucket = os.path.basename(os.path.dirname(trashed_to))
-                name = os.path.basename(trashed_to)
-                restore_result = _fileops.restore_trash_entry(
-                    bucket, name, _fileops.all_trash_roots())
-                if not restore_result.get("ok"):
-                    # The restore ALSO failed — the library slot is now
-                    # genuinely empty and the original is stranded in trash.
-                    # Never swallow this: name the exact stranded path in the
-                    # job's error_message (mirrors undo()'s restore_warning
-                    # pattern) so the user can recover it manually.
-                    error_message = (
-                        f"{e}. Additionally, the original file that was "
-                        f"overwritten could not be restored from trash "
-                        f"({restore_result.get('error') or 'unknown error'}) "
-                        f"-- the library slot at {dst} is now EMPTY. The "
-                        f"original is stranded at {trashed_to} in trash "
-                        f"bucket {bucket!r} (name {name!r}) and must be moved "
-                        f"back manually."
-                    )
-                    logger.error(
-                        "apply: overwrite placement failed AND restore of "
-                        "trashed original failed for job %s -- %s is now "
-                        "EMPTY, original stranded at %s (moved to trash, "
-                        "restore failed): %s",
-                        job_id, dst, trashed_to, restore_result.get("error"))
+            # empty — restore the trashed original so a failed apply is a no-op
+            # on disk, not a silent loss of the file that was already there.
+            error_message = self._restore_overwritten_original(
+                trashed_to, dst, job_id, str(e))
             db.update_rename_job(job_id, status="failed", error_message=error_message,
                                  conflict_kind=None, conflict_same_size=None,
                                  conflict_existing_size=None, conflict_incoming_size=None)
@@ -1606,13 +1611,20 @@ class RenameService:
                 logger.exception(
                     "rename apply: DB write failed AND rollback of %s -> %s "
                     "failed; file may be orphaned (job %s)", src, dst, job_id)
+            # undo_place moved the incoming back to src, freeing dst. If this
+            # was an overwrite that trashed a prior occupant, restore it too --
+            # otherwise the DB-write-failure path (SH-H08) leaves the library
+            # slot empty, the exact loss the SH-H09 place-failure branch above
+            # already guards against. Same helper, so the two can't drift.
+            error_message = self._restore_overwritten_original(
+                trashed_to, dst, job_id, f"apply bookkeeping failed: {e}")
             try:
                 db.update_rename_job(job_id, status="failed",
-                                     error_message=f"apply bookkeeping failed: {e}")
+                                     error_message=error_message)
             except Exception:
                 pass
             self._broadcast(job_id)
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": error_message}
         self._broadcast(job_id)
         return {"ok": True}
 

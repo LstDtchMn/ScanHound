@@ -435,9 +435,12 @@ def _posix_mount_points() -> list:
 
 def all_trash_roots() -> list:
     """All trash roots worth scanning/sweeping: the app-data fallback root
-    (``_TRASH_ROOT``) plus every per-volume ``<volume>/.scanhound-trash`` root
-    implied by ``_trash_root_for`` for each drive letter currently known to
-    Windows (or ``/`` on POSIX).
+    (``_TRASH_ROOT``) plus every per-volume ``<volume>/.scanhound-trash`` root.
+    On Windows that's a candidate per known drive letter; on POSIX it's a
+    candidate per mount point from ``_posix_mount_points`` (``/proc`` mounts) —
+    since ``_trash`` sites a bucket on the trashed file's OWN mount, checking
+    only ``/`` used to miss trash on separately-mounted library/download
+    volumes, so list/restore/sweep couldn't see it.
 
     Single source of truth shared by the ``/rename/trash`` list/restore
     endpoints and the maintenance-pass retention sweep — a disposal on any

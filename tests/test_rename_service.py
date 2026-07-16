@@ -853,6 +853,43 @@ class TestConflictSignal:
         with open(dst, "r", encoding="utf-8") as f:
             assert f.read() == "original-bytes"
 
+    def test_overwrite_db_write_failure_also_restores_trashed_original(
+            self, db, tmp_path, monkeypatch):
+        """SH-H08 + SH-H09 symmetry: on an overwrite where place_file SUCCEEDS
+        but the final status='applied' DB write returns False (SH-H08), the
+        rollback must ALSO restore the trashed original -- otherwise that path
+        leaves the library slot empty, the exact loss the place-failure branch
+        already guards against."""
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="original-bytes")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv", content="incoming-bytes")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+        dst = os.path.join(db.get_rename_job(jid1)["destination_path"],
+                            db.get_rename_job(jid1)["new_filename"])
+        svc.apply(jid2)  # -> needs_review + destination_exists signal
+
+        real_update = db.update_rename_job
+
+        def _fail_on_applied(job_id, **kw):
+            if kw.get("status") == "applied":
+                return False  # SH-H08: silent DB-write failure, no exception
+            return real_update(job_id, **kw)
+        monkeypatch.setattr(db, "update_rename_job", _fail_on_applied)
+
+        out = svc.apply(jid2, conflict_strategy="overwrite")
+        assert out["ok"] is not True
+        # The original occupant must be restored at dst, byte-for-byte -- not
+        # stranded in trash with the slot left empty.
+        assert os.path.isfile(dst)
+        with open(dst, "r", encoding="utf-8") as f:
+            assert f.read() == "original-bytes"
+
     def test_overwrite_restore_failure_surfaces_loud_error(
             self, db, tmp_path, monkeypatch):
         """If the placement failure AND the restore-from-trash both fail, the
