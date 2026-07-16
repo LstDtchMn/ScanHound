@@ -181,14 +181,30 @@ def _categorize_from_rename_rows(download_row: dict, rename_rows: list,
         cache_max = plex_max_ts.get(content_type, 0)
         if cache_max < dt.timestamp() + grace_margin_minutes * 60:
             return ("awaiting_plex_refresh", None, package_uuid, None)
-        resolution = latest.get("resolution") or download_row.get("resolution")
-        try:
-            match = find_plex_match(db, latest.get("imdb_id"), latest.get("title"),
-                                    latest.get("year"), latest.get("season"), resolution)
-        except _PlexLookupError:
-            return ("unknown", "Plex lookup failed — will retry next pass", package_uuid, None)
-        if match:
-            return ("verified", None, package_uuid, str(match.get("rating_key") or ""))
+        # Verify EVERY applied row, not just the latest -- a multi-season TV
+        # pack or a multi-version movie grab is only truly 'verified' once
+        # all of its applied identities are confirmed present in Plex. A
+        # partial match must stay non-terminal (awaiting_plex_refresh) so
+        # the pipeline keeps reconciling it rather than declaring victory
+        # while some of the package's rows are still missing from Plex.
+        matched_count = 0
+        latest_rating_key = None
+        for row in rename_rows:
+            row_resolution = row.get("resolution") or download_row.get("resolution")
+            try:
+                match = find_plex_match(db, row.get("imdb_id"), row.get("title"),
+                                        row.get("year"), row.get("season"), row_resolution)
+            except _PlexLookupError:
+                return ("unknown", "Plex lookup failed — will retry next pass", package_uuid, None)
+            if match:
+                matched_count += 1
+                if row is latest:
+                    latest_rating_key = str(match.get("rating_key") or "")
+        total = len(rename_rows)
+        if matched_count == total:
+            return ("verified", None, package_uuid, latest_rating_key)
+        if matched_count > 0:
+            return ("awaiting_plex_refresh", f"{matched_count}/{total} in Plex", package_uuid, None)
         return ("not_in_plex", None, package_uuid, None)
 
     return ("unknown", None, package_uuid, None)

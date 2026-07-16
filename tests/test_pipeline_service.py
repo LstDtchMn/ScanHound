@@ -120,6 +120,54 @@ class TestPlexGate:
         assert cat == "verified" and rk == "rk1"
 
 
+class TestMultiRowPackageVerification:
+    """SH-H10: a package with several applied rename rows (multi-season TV
+    pack, or multiple media versions) must only be 'verified' when EVERY
+    applied row is actually confirmed present in Plex -- not just the most
+    recently processed one."""
+
+    def _extracted_result(self):
+        return {"state": "extracted", "error": None, "package_uuid": "111"}
+
+    def _fresh_cache(self):
+        return {"Movies": datetime.now(timezone.utc).timestamp()}
+
+    def _rows(self, n):
+        processed = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        return [_rename_row(status="applied", processed_at=processed,
+                            imdb_id="tt1", season=s) for s in range(1, n + 1)]
+
+    def test_all_rows_matched_is_verified(self, monkeypatch):
+        import backend.pipeline_service as ps
+        rows = self._rows(3)
+        monkeypatch.setattr(ps, "find_plex_match", lambda *a, **k: {"rating_key": "rk"})
+        cat, detail, uuid, rk = categorize(_download_row(), self._extracted_result(),
+                                           rows, self._fresh_cache(), jd_method="api")
+        assert cat == "verified"
+
+    def test_partial_match_is_awaiting_plex_refresh_with_ratio_detail(self, monkeypatch):
+        import backend.pipeline_service as ps
+        rows = self._rows(3)
+
+        def stub(db, imdb_id, title, year, season, resolution):
+            if season in (1, 2):
+                return {"rating_key": f"rk{season}"}
+            return None
+        monkeypatch.setattr(ps, "find_plex_match", stub)
+        cat, detail, uuid, rk = categorize(_download_row(), self._extracted_result(),
+                                           rows, self._fresh_cache(), jd_method="api")
+        assert cat == "awaiting_plex_refresh"
+        assert detail == "2/3 in Plex"
+
+    def test_single_row_package_still_verified(self, monkeypatch):
+        import backend.pipeline_service as ps
+        rows = self._rows(1)
+        monkeypatch.setattr(ps, "find_plex_match", lambda *a, **k: {"rating_key": "rk1"})
+        cat, detail, uuid, rk = categorize(_download_row(), self._extracted_result(),
+                                           rows, self._fresh_cache(), jd_method="api")
+        assert cat == "verified" and rk == "rk1"
+
+
 class TestResultRowDeletedFallthrough:
     """The download_results row is NOT permanent — the Downloads UI's per-item
     'remove' (removeDownloadResult) and 'clear all' (clearDownloadResults)
