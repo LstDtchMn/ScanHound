@@ -573,6 +573,33 @@ class RenameService:
         from backend.rename.path_translation import translate_plex_path
         return translate_plex_path(path, self._cfg.get("auto_rename_path_mappings"))
 
+    def _download_roots(self) -> List[str]:
+        """Configured JD download/extract folders (movie/4K-movie/TV/generic),
+        normalized and non-empty only. These are where JD's reported
+        ``save_to`` legitimately lives -- see :func:`_process_package_roots`.
+        """
+        candidates = [
+            self._cfg.get("jd_folder"),
+            self._cfg.get("jd_movies_folder"),
+            self._cfg.get("jd_movies_folder_4k"),
+            self._cfg.get("jd_tv_folder"),
+        ]
+        return [os.path.normpath(r) for r in candidates if r and str(r).strip()]
+
+    def _process_package_roots(self) -> List[str]:
+        """All roots ``process_package``'s translated ``save_to`` is allowed
+        to walk: the configured JD download/extract folders plus the library
+        roots renames land in. A service-side equivalent of
+        ``backend/api/routes/rename.py``'s ``_require_within_roots`` for this
+        JD poll-loop entry point, which (unlike the ``/process-folder`` HTTP
+        route) had no confinement at all."""
+        candidates = self._download_roots() + [
+            self._cfg.get("auto_rename_movie_library"),
+            self._cfg.get("auto_rename_movie_library_4k"),
+            self._cfg.get("auto_rename_tv_library"),
+        ]
+        return [os.path.normpath(r) for r in candidates if r and str(r).strip()]
+
     def process_package(self, package_name: str, save_to: str) -> List[int]:
         """Identify + record (and maybe apply) renames for an extracted package.
 
@@ -598,6 +625,23 @@ class RenameService:
         save_to = self._translate_path(save_to)
         if db is None or not save_to or not os.path.isdir(save_to):
             return []
+        # Path confinement (Codex path caveat): JD's reported save_to is
+        # admin/downloader-controlled, not attacker HTTP, so this only
+        # activates once a JD download folder is actually configured --
+        # there's nothing meaningful to confine against otherwise, and this
+        # is a background path (log-and-skip), never an HTTP 422. Once at
+        # least one JD download root IS configured, a resolved save_to
+        # outside every configured download/library root is skipped rather
+        # than walked.
+        download_roots = self._download_roots()
+        if download_roots:
+            resolved = os.path.normpath(save_to)
+            all_roots = self._process_package_roots()
+            if not any(resolved == r or resolved.startswith(r + os.sep) for r in all_roots):
+                logger.warning(
+                    "process_package %s: save_to %s is outside all configured "
+                    "download/library roots -- skipping", package_name, save_to)
+                return []
         created = []
         for path in self._video_files(save_to):
             if not self._claim_path(path):

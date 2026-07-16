@@ -216,6 +216,51 @@ class TestProcessPackage:
         job = db.get_rename_job(ids[0])
         assert job["poster_path"] is None
 
+    def test_save_to_outside_configured_roots_is_skipped(self, db, tmp_path):
+        """Codex path caveat: process_package is the JD poll-loop's entry
+        point and (unlike the /process-folder HTTP route's
+        _require_within_roots) applied no confinement at all to the
+        translated save_to -- an arbitrary path would be walked. Once a JD
+        download-folder root is configured (activating the check, the way a
+        real install would have it set up), a save_to that resolves outside
+        every configured JD-download/library root must be skipped -- no jobs
+        created, nothing walked -- rather than processed."""
+        jd_root = tmp_path / "jd_downloads"
+        jd_root.mkdir()
+        outside_root = tmp_path / "elsewhere"
+        save_to, _ = _extracted(outside_root, "The.Matrix.1999.1080p.mkv")
+        svc = _service(db, _matrix_search, movie_lib=str(tmp_path / "lib"),
+                       jd_movies_folder=str(jd_root))
+        ids = svc.process_package("pkg-outside", save_to)
+        assert ids == []
+        assert db.count_rename_jobs_by_status() == {}
+
+    def test_save_to_inside_configured_root_is_processed_normally(self, db, tmp_path):
+        """The confinement counterpart: once a JD download-folder root is
+        configured, a save_to that resolves INSIDE it must still be
+        processed exactly as before."""
+        jd_root = tmp_path / "jd_downloads"
+        save_to, _ = _extracted(jd_root, "The.Matrix.1999.1080p.mkv")
+        svc = _service(db, _matrix_search, movie_lib=str(tmp_path / "lib"),
+                       jd_movies_folder=str(jd_root))
+        ids = svc.process_package("pkg-inside", save_to)
+        assert len(ids) == 1
+        job = db.get_rename_job(ids[0])
+        assert job["title"] == "The Matrix"
+
+    def test_save_to_confinement_inactive_when_no_download_root_configured(
+            self, db, tmp_path):
+        """When no JD download-folder setting is configured at all (the
+        common case in this test suite and in installs that haven't set one
+        up), the confinement check must not activate -- process_package
+        keeps its pre-fix behavior of walking whatever save_to it's given,
+        library-configured or not. This is what every other TestProcessPackage
+        test in this file already relies on."""
+        save_to, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        svc = _service(db, _matrix_search, movie_lib=str(tmp_path / "lib"))
+        ids = svc.process_package("pkg-unconfigured", save_to)
+        assert len(ids) == 1
+
 
 # ── DV folder scan accounting ─────────────────────────────────────────
 
