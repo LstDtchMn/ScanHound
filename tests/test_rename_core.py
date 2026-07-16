@@ -573,6 +573,46 @@ class TestTrashListAndRestore:
         assert names == {"a.mkv", "b.mkv"}
 
 
+class TestAllTrashRoots:
+    """all_trash_roots() (POSIX) must enumerate every mount point, not just /."""
+
+    def test_includes_scanhound_trash_for_every_mount_point(self, monkeypatch):
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(
+            fileops, "_posix_mount_points",
+            lambda: ["/", "/library/movies", "/library/tv"],
+        )
+        roots = fileops.all_trash_roots()
+        assert os.path.join("/library/movies", ".scanhound-trash") in roots
+        assert os.path.join("/library/tv", ".scanhound-trash") in roots
+        assert os.path.join("/", ".scanhound-trash") in roots
+        assert os.path.abspath(fileops._TRASH_ROOT) in roots
+
+    def test_malformed_or_empty_mount_source_never_raises(self, monkeypatch):
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
+        roots = fileops.all_trash_roots()
+        assert os.path.abspath(fileops._TRASH_ROOT) in roots
+        assert os.path.join("/", ".scanhound-trash") in roots
+
+    def test_wiring_makes_trash_on_a_reported_mount_discoverable(self, tmp_path, monkeypatch):
+        """Regression for SH-H05: a file trashed under a mount point that
+        isn't '/' must be findable via list_trash_entries(all_trash_roots())."""
+        mount = tmp_path / "library_movies"
+        mount.mkdir()
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [str(mount)])
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(mount / ".scanhound-trash"))
+
+        src = mount / "movie.mkv"
+        src.write_text("x")
+        fileops._trash(str(src))
+
+        entries = fileops.list_trash_entries(fileops.all_trash_roots())
+        names = {e["name"] for e in entries}
+        assert "movie.mkv" in names
+
+
 class TestTrashRetentionSweep:
     """sweep_trash() — deletes only old buckets under the trash roots."""
 

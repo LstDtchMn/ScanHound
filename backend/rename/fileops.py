@@ -400,6 +400,39 @@ def restore_trash_entry(bucket: str, name: str, roots) -> dict:
     return {"ok": False, "error": "Trash entry not found"}
 
 
+def _posix_mount_points() -> list:
+    """Best-effort list of mount points on this POSIX host.
+
+    Reads ``/proc/self/mountinfo`` (field 5 is the mount point); falls back
+    to ``/proc/mounts`` (field 2) if that's unavailable/empty. Returns
+    ``["/"]`` on any error or if nothing could be parsed, so callers always
+    have at least the root to fall back on.
+    """
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+            points = []
+            for line in f:
+                fields = line.split(" ")
+                if len(fields) > 4 and fields[4]:
+                    points.append(fields[4])
+            if points:
+                return points
+    except OSError:
+        pass
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as f:
+            points = []
+            for line in f:
+                fields = line.split()
+                if len(fields) > 1 and fields[1]:
+                    points.append(fields[1])
+            if points:
+                return points
+    except OSError:
+        pass
+    return ["/"]
+
+
 def all_trash_roots() -> list:
     """All trash roots worth scanning/sweeping: the app-data fallback root
     (``_TRASH_ROOT``) plus every per-volume ``<volume>/.scanhound-trash`` root
@@ -422,6 +455,11 @@ def all_trash_roots() -> list:
             if os.path.isdir(drive):
                 roots.add(_trash_root_for(drive))
     else:
+        for mp in _posix_mount_points():
+            try:
+                roots.add(os.path.join(mp, ".scanhound-trash"))
+            except (TypeError, ValueError):
+                continue
         roots.add(_trash_root_for("/"))
     return sorted(roots)
 
