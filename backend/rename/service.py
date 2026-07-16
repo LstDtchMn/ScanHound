@@ -1359,6 +1359,11 @@ class RenameService:
             return {"ok": False, "error": msg}
         dst = os.path.join(dest_dir,
                            job.get("new_filename") or os.path.basename(src))
+        # Set (below) only when conflict_strategy='overwrite' actually trashes
+        # an occupant of dst this call — the exact path _fileops._trash()
+        # returned, so a subsequent placement failure can restore that exact
+        # entry rather than guessing. None means nothing was displaced.
+        trashed_to = None
         # Collision guard: a prior apply (or a file already present in the
         # library) may already occupy this destination — e.g. two different
         # releases of the same title resolve to the identical target path.
@@ -1384,8 +1389,11 @@ class RenameService:
             if conflict_strategy == "overwrite":
                 # Displace the occupant into the recoverable trash — never a
                 # hard delete — then fall through to the normal placement
-                # below (dst is now free).
-                _fileops._trash(dst)
+                # below (dst is now free). Capture the exact trashed
+                # destination (SH-H09): if place_file() below then fails, the
+                # except branch restores this exact entry back to dst rather
+                # than leaving the library slot permanently empty.
+                trashed_to = _fileops._trash(dst)
             elif conflict_strategy == "keep_both":
                 # Place the incoming file alongside the existing one under a
                 # deduped sibling name; the existing file is never touched.
@@ -1471,11 +1479,44 @@ class RenameService:
             # place_file() failed for some other reason — the
             # 'destination_exists' marker from before is stale, so clear it
             # rather than leaving it on this failed job.
-            db.update_rename_job(job_id, status="failed", error_message=str(e),
+            error_message = str(e)
+            # SH-H09: an overwrite that trashed the prior occupant of dst and
+            # then failed to place the incoming file leaves dst genuinely
+            # empty — restore the trashed original (the same
+            # restore_trash_entry primitive undo() uses) so a failed apply is
+            # a no-op on disk, not a silent loss of the file that was already
+            # there.
+            if trashed_to:
+                bucket = os.path.basename(os.path.dirname(trashed_to))
+                name = os.path.basename(trashed_to)
+                restore_result = _fileops.restore_trash_entry(
+                    bucket, name, _fileops.all_trash_roots())
+                if not restore_result.get("ok"):
+                    # The restore ALSO failed — the library slot is now
+                    # genuinely empty and the original is stranded in trash.
+                    # Never swallow this: name the exact stranded path in the
+                    # job's error_message (mirrors undo()'s restore_warning
+                    # pattern) so the user can recover it manually.
+                    error_message = (
+                        f"{e}. Additionally, the original file that was "
+                        f"overwritten could not be restored from trash "
+                        f"({restore_result.get('error') or 'unknown error'}) "
+                        f"-- the library slot at {dst} is now EMPTY. The "
+                        f"original is stranded at {trashed_to} in trash "
+                        f"bucket {bucket!r} (name {name!r}) and must be moved "
+                        f"back manually."
+                    )
+                    logger.error(
+                        "apply: overwrite placement failed AND restore of "
+                        "trashed original failed for job %s -- %s is now "
+                        "EMPTY, original stranded at %s (moved to trash, "
+                        "restore failed): %s",
+                        job_id, dst, trashed_to, restore_result.get("error"))
+            db.update_rename_job(job_id, status="failed", error_message=error_message,
                                  conflict_kind=None, conflict_same_size=None,
                                  conflict_existing_size=None, conflict_incoming_size=None)
             self._broadcast(job_id)
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": error_message}
         rlog.info("move   | %s -> %s (%s)", src, dst, used)
         sort_title = (compute_sort_title(job.get("title"))
                       if self._cfg.get("auto_rename_plex_sort_titles") else None)

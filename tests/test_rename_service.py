@@ -7,6 +7,7 @@ import os
 import pytest
 
 from backend.database import DatabaseManager
+from backend.rename import fileops as _fileops
 from backend.rename import llm_identify
 from backend.rename.service import (
     RenameService, compute_sort_title, _fmt_size, TransferRateEstimator,
@@ -744,6 +745,92 @@ class TestConflictSignal:
         assert job["status"] == "failed"
         assert job["conflict_kind"] is None
         assert job["conflict_same_size"] is None
+
+    def test_overwrite_restores_trashed_original_on_place_file_failure(
+            self, db, tmp_path, monkeypatch):
+        """SH-H09: conflict_strategy='overwrite' trashes the existing occupant
+        of dst BEFORE calling place_file(). If place_file() then raises, the
+        prior behavior left dst empty forever (the trashed original was never
+        restored) -- the library slot loses a file with no on-disk trace of
+        why. The original must be restored back to dst so the failed apply
+        is a no-op on disk, byte-for-byte."""
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="original-bytes")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv", content="incoming-bytes")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+        dst = os.path.join(db.get_rename_job(jid1)["destination_path"],
+                            db.get_rename_job(jid1)["new_filename"])
+        assert os.path.isfile(dst)
+
+        svc.apply(jid2)  # -> needs_review + destination_exists signal set
+
+        def _boom(*a, **kw):
+            raise OSError("simulated place_file failure after trash")
+        monkeypatch.setattr("backend.rename.service._fileops.place_file", _boom)
+
+        out = svc.apply(jid2, conflict_strategy="overwrite")
+        assert out["ok"] is False
+        job = db.get_rename_job(jid2)
+        assert job["status"] == "failed"
+        # The original occupant (job1's applied file) must be back at dst,
+        # byte-for-byte -- not stranded in .scanhound-trash.
+        assert os.path.isfile(dst)
+        with open(dst, "r", encoding="utf-8") as f:
+            assert f.read() == "original-bytes"
+
+    def test_overwrite_restore_failure_surfaces_loud_error(
+            self, db, tmp_path, monkeypatch):
+        """If the placement failure AND the restore-from-trash both fail, the
+        library slot is genuinely left empty -- silence here would be a
+        second, worse data-loss bug on top of the first. The job's
+        error_message must name the stranded trash path and say the slot is
+        now empty, loud enough for the user to notice and act."""
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="original-bytes")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv", content="incoming-bytes")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+        dst = os.path.join(db.get_rename_job(jid1)["destination_path"],
+                            db.get_rename_job(jid1)["new_filename"])
+
+        svc.apply(jid2)  # -> needs_review + destination_exists signal set
+
+        def _boom(*a, **kw):
+            raise OSError("simulated place_file failure after trash")
+        monkeypatch.setattr("backend.rename.service._fileops.place_file", _boom)
+
+        captured = {}
+        real_restore = _fileops.restore_trash_entry
+
+        def _restore_boom(bucket, name, roots):
+            captured["bucket"] = bucket
+            captured["name"] = name
+            return {"ok": False, "error": "simulated restore failure"}
+        monkeypatch.setattr("backend.rename.service._fileops.restore_trash_entry", _restore_boom)
+
+        out = svc.apply(jid2, conflict_strategy="overwrite")
+        assert out["ok"] is False
+        job = db.get_rename_job(jid2)
+        assert job["status"] == "failed"
+        assert not os.path.isfile(dst)
+        msg = job["error_message"] or ""
+        assert "empty" in msg.lower()
+        # Must name the exact stranded trash location so a human can recover
+        # it manually -- captured bucket/name from the (faked) restore call
+        # is the same trash entry _trash() actually created.
+        assert captured.get("bucket") and captured.get("name")
+        assert captured["bucket"] in msg and captured["name"] in msg
 
 
 # ── duplicate-destination conflict detection ──────────────────────────
