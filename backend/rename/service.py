@@ -577,12 +577,26 @@ class RenameService:
         """Configured JD download/extract folders (movie/4K-movie/TV/generic),
         normalized and non-empty only. These are where JD's reported
         ``save_to`` legitimately lives -- see :func:`_process_package_roots`.
+
+        ``jd_movies_folder``/``jd_movies_folder_4k``/``jd_tv_folder`` are the
+        ``downloadFolder`` JD itself is told to extract into -- a HOST path
+        (JD runs on the host), same as the raw ``save_to`` process_package
+        receives, so each needs the same ``auto_rename_path_mappings``
+        translation before it's comparable to a translated/resolved
+        container path (the config already documents this requirement on
+        ``jd_movies_folder_4k``). ``jd_folder`` is different: it's the
+        container-visible watch folder this container itself writes
+        ``.crawljob`` files into directly (see
+        ``download_service.py:send_to_jdownloader``'s untranslated
+        ``os.path.isdir(folder)`` check) -- already a container path, so it
+        is NOT translated here.
         """
-        candidates = [
-            self._cfg.get("jd_folder"),
-            self._cfg.get("jd_movies_folder"),
-            self._cfg.get("jd_movies_folder_4k"),
-            self._cfg.get("jd_tv_folder"),
+        candidates = [self._cfg.get("jd_folder")] + [
+            self._translate_path(v) for v in (
+                self._cfg.get("jd_movies_folder"),
+                self._cfg.get("jd_movies_folder_4k"),
+                self._cfg.get("jd_tv_folder"),
+            ) if v and str(v).strip()
         ]
         return [os.path.normpath(r) for r in candidates if r and str(r).strip()]
 

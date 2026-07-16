@@ -261,6 +261,30 @@ class TestProcessPackage:
         ids = svc.process_package("pkg-unconfigured", save_to)
         assert len(ids) == 1
 
+    def test_save_to_confinement_translates_jd_movies_folder_before_comparing(
+            self, db, tmp_path):
+        """jd_movies_folder/jd_movies_folder_4k/jd_tv_folder are HOST paths
+        (the downloadFolder JD -- which runs on the host -- is told to
+        extract into), exactly like the raw save_to process_package
+        receives; both need the same auto_rename_path_mappings translation
+        before they're comparable. Comparing an untranslated host-style
+        jd_movies_folder ("F:\\Downloads\\Movies") against the already
+        container-translated save_to would never match anything in a real
+        install and would silently skip every real package -- confinement
+        must translate the configured root the same way, not just the
+        incoming path."""
+        real = tmp_path / "container_downloads"
+        real.mkdir()
+        save_to, _ = _extracted(real, "The.Matrix.1999.1080p.mkv")
+        svc = _service(
+            db, _matrix_search, movie_lib=str(tmp_path / "lib"),
+            jd_movies_folder="F:\\Downloads\\Movies",
+            auto_rename_path_mappings="F:\\Downloads\\Movies => " + str(real))
+        ids = svc.process_package("pkg-host-mapped", save_to)
+        assert len(ids) == 1
+        job = db.get_rename_job(ids[0])
+        assert job["title"] == "The Matrix"
+
 
 # ── DV folder scan accounting ─────────────────────────────────────────
 
