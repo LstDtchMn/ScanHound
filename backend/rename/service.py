@@ -1521,11 +1521,22 @@ class RenameService:
         sort_title = (compute_sort_title(job.get("title"))
                       if self._cfg.get("auto_rename_plex_sort_titles") else None)
         try:
-            db.update_rename_job(job_id, status="applied", move_method=used,
-                                 processed_at=_now(), plex_sort_title=sort_title,
-                                 error_message=None, archived_at=_now(),
-                                 conflict_kind=None, conflict_same_size=None,
-                                 conflict_existing_size=None, conflict_incoming_size=None)
+            applied_ok = db.update_rename_job(
+                job_id, status="applied", move_method=used,
+                processed_at=_now(), plex_sort_title=sort_title,
+                error_message=None, archived_at=_now(),
+                conflict_kind=None, conflict_same_size=None,
+                conflict_existing_size=None, conflict_incoming_size=None)
+            if not applied_ok:
+                # SH-H08: DatabaseManager._mutate returns False on a DB
+                # failure and never raises -- a bare unchecked call here
+                # would let a silently-failed write fall straight through to
+                # 'return {"ok": True}' below with the file already placed
+                # but the job stuck 'applying' forever. Raise so this hits
+                # the exact same rollback + failed-status handling as a
+                # raised exception, just below.
+                raise RuntimeError(
+                    "Database write for status=applied did not persist")
         except Exception as e:
             # The file is already placed but we couldn't record it. Leaving the
             # row as-is orphans the file (re-apply sees "source missing", undo

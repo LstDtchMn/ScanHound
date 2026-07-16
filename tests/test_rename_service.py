@@ -1106,6 +1106,39 @@ class TestApplyUndo:
         # And the row is recorded as failed, not stuck on its old status.
         assert db.get_rename_job(jid)["status"] == "failed"
 
+    def test_apply_rolls_back_file_when_db_write_returns_false(self, db, tmp_path):
+        """SH-H08: DatabaseManager._mutate returns False on a DB failure and
+        never raises -- the prior code only rolled back on a RAISED
+        exception, so a False return from the final status='applied' write
+        was silently ignored: apply() returned {"ok": True} with the file
+        physically placed but the job stuck 'applying' forever (a lie to the
+        caller and an inconsistent DB row). A False return must be treated
+        exactly like the exception case above: roll back the placed file and
+        mark the job failed, never report success."""
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+        dst = os.path.join(lib, "The Matrix (1999)",
+                           db.get_rename_job(jid)["new_filename"])
+
+        real_update = db.update_rename_job
+
+        def _silently_fail(job_id, **fields):
+            if fields.get("status") == "applied":
+                return False
+            return real_update(job_id, **fields)
+
+        db.update_rename_job = _silently_fail
+        out = svc.apply(jid)
+
+        assert out.get("ok") is not True
+        # Disk rolled back: source restored, nothing orphaned in the library.
+        assert os.path.exists(src)
+        assert not os.path.exists(dst)
+        # And the row is recorded as failed, never left stuck 'applying'.
+        assert db.get_rename_job(jid)["status"] == "failed"
+
     def test_apply_sets_archived_at_on_success(self, db, tmp_path):
         """Guards the main move-success path (service.py ~line 1501): every
         job that reaches status='applied' via the normal move must be
