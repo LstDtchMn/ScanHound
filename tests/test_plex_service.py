@@ -665,6 +665,72 @@ class TestLoadLibraries:
         assert len(movie_saves) == 1
         assert movie_saves[0].kwargs.get("full_replace") is True
 
+    def test_single_movie_item_extract_failure_does_not_full_replace_cache(self):
+        # A single item's extraction failing (not a whole-library exception)
+        # must still mark the load incomplete — otherwise full_replace=True
+        # prunes that item's still-owned cache row (SH-H07).
+        pm = MagicMock()
+        pm.is_connected = True
+        db = MagicMock()
+
+        good_movies = [_make_mock_movie(title=f"Movie {i}", rating_key=i) for i in range(1, 10)]
+
+        class ExplodingPart:
+            @property
+            def size(self):
+                raise RuntimeError("part read failed")
+
+        bad_media = MagicMock()
+        bad_media.videoResolution = "1080"
+        bad_media.parts = [ExplodingPart()]
+        bad_movie = _make_mock_movie(title="Bad Movie", rating_key=3, media_list=[bad_media])
+
+        items = good_movies[:2] + [bad_movie] + good_movies[2:]
+
+        mock_lib = MagicMock()
+        mock_lib.all.return_value = items
+        pm.get_library_section.return_value = mock_lib
+
+        config = {"movie_libs": ["Movies"], "tv_libs": []}
+        svc = _make_service(config=config, db=db, plex_manager=pm)
+        svc.load_libraries()
+
+        movie_saves = [c for c in db.save_plex_cache.call_args_list if c.args[1] == "Movies"]
+        assert not any(c.kwargs.get("full_replace") for c in movie_saves), (
+            "A single item extraction failure must not full_replace the cache"
+        )
+
+    def test_single_tv_show_extract_failure_does_not_full_replace_cache(self):
+        # Same guard, TV side: one show's .seasons() raising among otherwise
+        # successful shows must mark the TV load incomplete.
+        pm = MagicMock()
+        pm.is_connected = True
+        db = MagicMock()
+
+        good_show = _make_mock_show(
+            title="Good Show", rating_key=100,
+            seasons=[_make_mock_season(index=1, rating_key=201)],
+        )
+
+        bad_show = MagicMock()
+        bad_show.title = "Bad Show"
+        bad_show.ratingKey = 101
+        bad_show.seasons.side_effect = RuntimeError("seasons fail")
+
+        mock_lib = MagicMock()
+        mock_lib.all.return_value = [good_show, bad_show]
+        mock_lib.type = "show"
+        pm.get_library_section.return_value = mock_lib
+
+        config = {"movie_libs": [], "tv_libs": ["TV Shows"]}
+        svc = _make_service(config=config, db=db, plex_manager=pm)
+        svc.load_libraries()
+
+        tv_saves = [c for c in db.save_plex_cache.call_args_list if c.args[1] == "TV Shows"]
+        assert not any(c.kwargs.get("full_replace") for c in tv_saves), (
+            "A single show extraction failure must not full_replace the TV cache"
+        )
+
     def test_non_show_library_type_logs_error(self):
         pm = MagicMock()
         pm.is_connected = True

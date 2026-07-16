@@ -229,6 +229,11 @@ class PlexService:
             # incomplete — it must never full-replace a good existing cache.
             movies_load_incomplete = False
             tv_load_incomplete = False
+            # Item-level extraction failures (as opposed to a whole-library
+            # exception) also make the resulting list incomplete — an item
+            # that legitimately had media data but failed to extract must
+            # not be treated as "successfully absent" (SH-H07).
+            movie_extract_fail = 0
 
             # ── Movies ────────────────────────────────────────────────
             for lib_name in movie_libs:
@@ -272,11 +277,20 @@ class PlexService:
                                     seen_4k.add(uid)
                                 elif mv.get('res') == '1080p':
                                     seen_1080.add(uid)
+                        elif movie.media:
+                            # Had media data but extraction returned None —
+                            # a real per-item failure, not a legitimately
+                            # media-less item.
+                            movie_extract_fail += 1
                 except Exception as e:
                     self._log(f"Error loading movie library '{lib_name}': {e}", "error")
                     movies_load_incomplete = True
 
                 current_lib_idx += 1
+
+            if movie_extract_fail:
+                self._log(f"{movie_extract_fail} movie item(s) failed extraction", "warning")
+                movies_load_incomplete = True
 
             # ── TV Shows ──────────────────────────────────────────────
             for lib_name in tv_libs:
@@ -362,6 +376,14 @@ class PlexService:
                         )
                     else:
                         self._log(f"Loaded {tv_seasons} seasons from {total_items} shows in '{lib_name}'{specials_note}", "success")
+
+                    # A per-show or per-season extraction failure makes this
+                    # content type's list incomplete, same as a whole-library
+                    # exception — the cache-save gate below must not
+                    # full_replace with a set that's missing owned items
+                    # (SH-H07).
+                    if tv_errors or tv_extract_fail:
+                        tv_load_incomplete = True
 
                 except Exception as e:
                     self._log(f"Error loading TV library '{lib_name}': {e}", "error")
