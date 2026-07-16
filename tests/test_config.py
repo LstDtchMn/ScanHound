@@ -52,6 +52,8 @@ EXPECTED_DEFAULT_KEYS = {
     # Plex connection
     "plex_url", "plex_token", "plex_server_id", "plex_connection_mode",
     "plex_username", "plex_password", "plex_server_name",
+    # Plex library mappings (Dolby Vision path support)
+    "plex_library_path_mappings",
     # API keys
     "tmdb_api_key", "omdb_api_key", "use_tmdb",
     # Size / resolution
@@ -94,10 +96,13 @@ EXPECTED_DEFAULT_KEYS = {
     "auto_rename_movie_library", "auto_rename_movie_library_4k", "auto_rename_movie_flat", "auto_rename_tv_library",
     "auto_rename_template_movie", "auto_rename_template_tv",
     "auto_rename_plex_sort_titles", "auto_rename_llm_enabled",
+    "rename_detect_moved_files_enabled",
     "ollama_base_url", "ollama_model", "ollama_vision_model", "deletions_require_confirmation",
     "trash_retention_days",
     # Dolby Vision host-detector + labeler
     "dv_library_roots", "dv_detection", "dv_file_tagging", "dv_label_vocab",
+    # Pipeline reconciliation
+    "pipeline_verify_grace_margin_minutes", "pipeline_reconcile_enabled",
     # Debug / logging
     "debug_mode", "verbose_logging", "clear_logs_startup", "scan_threads",
     # Matching thresholds
