@@ -41,9 +41,9 @@
   let gridClass = $derived($phoneColumns === 1 ? 'grid-cols-1 landscape:grid-cols-2' : 'grid-cols-2 landscape:grid-cols-3');
   let siblingCounts = $derived(computeSiblingCounts($filteredResults, $titleCounts, $pagedMode));
 
-  function toggleGroup(title: string) {
+  function toggleGroup(key: string) {
     const next = new Set(expandedGroups);
-    next.has(title) ? next.delete(title) : next.add(title);
+    next.has(key) ? next.delete(key) : next.add(key);
     expandedGroups = next;
   }
 
@@ -113,17 +113,17 @@
 
 <PullToRefresh onrefresh={refresh} onscroll={onWallScroll}>
   <div class="grid {gridClass} gap-2 p-2">
-    {#each groups as group (group.title)}
-      {#if isDuplicateGroup(group, siblingCounts) && !expandedGroups.has(group.title)}
+    {#each groups as group (group.key)}
+      {#if isDuplicateGroup(group, siblingCounts) && !expandedGroups.has(group.key)}
         <GroupTile
           title={group.title}
           items={group.items}
-          count={siblingCounts.get(group.title) ?? group.items.length}
+          count={siblingCounts.get(group.key) ?? group.items.length}
           formats={groupFormats(group.items)}
           statusSummary={groupStatusSummary(group.items)}
           sizeRange={groupSizeRange(group.items)}
           dateRange={groupDateRange(group.items)}
-          onToggle={() => toggleGroup(group.title)}
+          onToggle={() => toggleGroup(group.key)}
         />
       {:else}
         {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}

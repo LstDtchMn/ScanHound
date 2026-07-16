@@ -7,8 +7,20 @@ import type { ScanResult } from './api/types';
  *  original inline versions closed over. */
 
 export interface ResultGroup {
+  /** Unique grouping key (group_key or the composite fallback) -- use THIS,
+   *  never the bare display title, for keyed {#each} blocks, expand-state
+   *  tracking, and sibling-count lookups. Two groups can share a `title`
+   *  (e.g. Dune 1984 vs Dune 2021) but never a `key`. */
+  key: string;
   title: string;
   items: ScanResult[];
+}
+
+/** The same key groupResults()/computeSiblingCounts() use to distinguish
+ *  same-title/different-year releases: the canonical group_key, falling
+ *  back to a composite for legacy rows lacking one. */
+function siblingKey(item: ScanResult): string {
+  return item.group_key || `${item.title}|${item.year ?? ''}|S${item.season ?? ''}`;
 }
 
 export interface GroupFormats {
@@ -26,10 +38,10 @@ export function groupResults(items: ScanResult[]): ResultGroup[] {
   const groups: ResultGroup[] = [];
   const map = new Map<string, ResultGroup>();
   for (const item of items) {
-    const key = item.group_key || `${item.title}|${item.year ?? ''}|S${item.season ?? ''}`;
+    const key = siblingKey(item);
     let group = map.get(key);
     if (!group) {
-      group = { title: item.title, items: [] };
+      group = { key, title: item.title, items: [] };
       map.set(key, group);
       groups.push(group);
     }
@@ -49,12 +61,15 @@ export function computeSiblingCounts(
     return new Map(Object.entries(titleCounts));
   }
   const counts = new Map<string, number>();
-  for (const item of allFiltered) counts.set(item.title, (counts.get(item.title) || 0) + 1);
+  for (const item of allFiltered) {
+    const key = siblingKey(item);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
   return counts;
 }
 
 export function isDuplicateGroup(group: ResultGroup, siblingCounts: Map<string, number>): boolean {
-  return (siblingCounts.get(group.title) || group.items.length) > 1;
+  return (siblingCounts.get(group.key) || group.items.length) > 1;
 }
 
 function parseSizeGB(size: string | undefined): number {

@@ -44,33 +44,69 @@ describe('grouping', () => {
     expect(groups[1].items.map(i => i.url)).toEqual(['b']);
   });
 
+  it('groupResults gives every group a unique key even when titles collide (Dune 1984 vs 2021)', () => {
+    const groups = groupResults([
+      r({ title: 'Dune', year: 1984, url: 'a', group_key: 'dune|1984|S0' }),
+      r({ title: 'Dune', year: 2021, url: 'b', group_key: 'dune|2021|S0' }),
+    ]);
+    expect(groups.length).toBe(2);
+    expect(groups[0].title).toBe('Dune');
+    expect(groups[1].title).toBe('Dune');
+    // Both groups share the display title, but must have distinct keys so a
+    // Svelte keyed {#each (group.key)} never sees a duplicate key.
+    expect(groups[0].key).not.toBe(groups[1].key);
+    expect(new Set(groups.map(g => g.key)).size).toBe(2);
+    expect(groups[0].key).toBe('dune|1984|S0');
+    expect(groups[1].key).toBe('dune|2021|S0');
+  });
+
   it('computeSiblingCounts uses server titleCounts in paged mode when present', () => {
-    const counts = computeSiblingCounts([r({ title: 'Dune', url: 'a' })], { Dune: 3 }, true);
-    expect(counts.get('Dune')).toBe(3);
+    const counts = computeSiblingCounts([r({ title: 'Dune', url: 'a', group_key: 'dune|2021|S0' })], { 'dune|2021|S0': 3 }, true);
+    expect(counts.get('dune|2021|S0')).toBe(3);
   });
 
   it('computeSiblingCounts falls back to a local tally over the full filtered set (paged, empty titleCounts)', () => {
     const counts = computeSiblingCounts(
-      [r({ title: 'Dune', url: 'a' }), r({ title: 'Dune', url: 'b' }), r({ title: 'Blade', url: 'c' })],
+      [
+        r({ title: 'Dune', url: 'a', group_key: 'dune|2021|S0' }),
+        r({ title: 'Dune', url: 'b', group_key: 'dune|2021|S0' }),
+        r({ title: 'Blade', url: 'c', group_key: 'blade|1982|S0' }),
+      ],
       {}, true
     );
-    expect(counts.get('Dune')).toBe(2);
-    expect(counts.get('Blade')).toBe(1);
+    expect(counts.get('dune|2021|S0')).toBe(2);
+    expect(counts.get('blade|1982|S0')).toBe(1);
   });
 
-  it('computeSiblingCounts always uses a local tally in live mode', () => {
+  it('computeSiblingCounts always uses a local tally in live mode, keyed by group_key not bare title', () => {
     const counts = computeSiblingCounts(
-      [r({ title: 'Dune', url: 'a' }), r({ title: 'Dune', url: 'b' })],
-      { Dune: 99 }, false
+      [r({ title: 'Dune', url: 'a', group_key: 'dune|2021|S0' }), r({ title: 'Dune', url: 'b', group_key: 'dune|2021|S0' })],
+      { 'dune|2021|S0': 99 }, false
     );
-    expect(counts.get('Dune')).toBe(2); // titleCounts ignored outside paged mode
+    expect(counts.get('dune|2021|S0')).toBe(2); // titleCounts ignored outside paged mode
   });
 
-  it('isDuplicateGroup thresholds on siblingCounts, falling back to items.length', () => {
-    const group = { title: 'Dune', items: [r({ url: 'a' })] };
-    expect(isDuplicateGroup(group, new Map([['Dune', 3]]))).toBe(true);
+  it('computeSiblingCounts does not conflate a same-title/different-year item with unrelated siblings (live mode)', () => {
+    // A lone Dune 1984 alongside two Dune 2021 releases must NOT be tallied
+    // together just because they share a display title.
+    const items = [
+      r({ title: 'Dune', year: 1984, url: 'a', group_key: 'dune|1984|S0' }),
+      r({ title: 'Dune', year: 2021, url: 'b', group_key: 'dune|2021|S0' }),
+      r({ title: 'Dune', year: 2021, url: 'c', group_key: 'dune|2021|S0' }),
+    ];
+    const counts = computeSiblingCounts(items, {}, false);
+    expect(counts.get('dune|1984|S0')).toBe(1);
+    expect(counts.get('dune|2021|S0')).toBe(2);
+    const groups = groupResults(items);
+    const dune1984 = groups.find(g => g.key === 'dune|1984|S0')!;
+    expect(isDuplicateGroup(dune1984, counts)).toBe(false); // must NOT be flagged as a duplicate
+  });
+
+  it('isDuplicateGroup thresholds on siblingCounts (keyed by group.key), falling back to items.length', () => {
+    const group = { key: 'dune|2021|S0', title: 'Dune', items: [r({ url: 'a' })] };
+    expect(isDuplicateGroup(group, new Map([['dune|2021|S0', 3]]))).toBe(true);
     expect(isDuplicateGroup(group, new Map())).toBe(false); // 1 item, no count entry
-    const twoItemGroup = { title: 'Dune', items: [r({ url: 'a' }), r({ url: 'b' })] };
+    const twoItemGroup = { key: 'dune|2021|S0', title: 'Dune', items: [r({ url: 'a' }), r({ url: 'b' })] };
     expect(isDuplicateGroup(twoItemGroup, new Map())).toBe(true); // falls back to items.length
   });
 

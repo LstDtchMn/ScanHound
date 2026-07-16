@@ -135,14 +135,14 @@
     return isDupGroup(group, siblingCounts());
   }
 
-  function toggleGroup(title: string) {
+  function toggleGroup(key: string) {
     expandedGroups = new Set(expandedGroups);
-    if (expandedGroups.has(title)) expandedGroups.delete(title);
-    else expandedGroups.add(title);
+    if (expandedGroups.has(key)) expandedGroups.delete(key);
+    else expandedGroups.add(key);
   }
 
   function isGroupExpanded(group: ResultGroup): boolean {
-    return !isDuplicateGroup(group) || expandedGroups.has(group.title);
+    return !isDuplicateGroup(group) || expandedGroups.has(group.key);
   }
 
   /** Left bar for a collapsed group row. One vertical segment per distinct status
@@ -441,7 +441,7 @@
 >
   {#if $viewMode === 'grid'}
     <div class="grid {gridGapClass}" style={gridStyle}>
-      {#each groupedResults() as group (group.title)}
+      {#each groupedResults() as group (group.key)}
         {#if isDuplicateGroup(group) && !isGroupExpanded(group)}
           <!-- Collapsed duplicate group: a normal grid cell (stacked-poster card),
                not a full-width row — keeps the poster wall's rhythm intact. -->
@@ -449,12 +449,12 @@
             <GroupTile
               title={group.title}
               items={group.items}
-              count={siblingCounts().get(group.title) ?? group.items.length}
+              count={siblingCounts().get(group.key) ?? group.items.length}
               formats={groupFormats(group.items)}
               statusSummary={groupStatusSummary(group.items)}
               sizeRange={groupSizeRange(group.items)}
               dateRange={groupDateRange(group.items)}
-              onToggle={() => toggleGroup(group.title)}
+              onToggle={() => toggleGroup(group.key)}
             />
           </div>
         {:else if isDuplicateGroup(group)}
@@ -464,12 +464,12 @@
               type="button"
               class="flex w-full items-center gap-2 mb-2 mt-4 first:mt-0 cursor-pointer select-none text-left rounded-lg border-transparent bg-transparent py-0 transition-colors"
               aria-expanded="true"
-              aria-label="{group.title} — {siblingCounts().get(group.title)} releases, collapse"
-              onclick={() => toggleGroup(group.title)}
+              aria-label="{group.title} — {siblingCounts().get(group.key)} releases, collapse"
+              onclick={() => toggleGroup(group.key)}
             >
               <span class="text-[10px] text-[var(--text-secondary)] transition-transform rotate-90">&triangleright;</span>
               <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>
-              <Badge label="{siblingCounts().get(group.title)} releases" />
+              <Badge label="{siblingCounts().get(group.key)} releases" />
             </button>
             <div class="grid {gridGapClass}" style={gridStyle} transition:slide={{ duration: 150 }}>
               {#each group.items as item, idx (item.url || item.group_key + '-' + idx)}
@@ -500,7 +500,7 @@
         </tr>
       </thead>
       <tbody>
-        {#each groupedResults() as group (group.title)}
+        {#each groupedResults() as group (group.key)}
           {#if isDuplicateGroup(group)}
             {#if !isGroupExpanded(group)}
               {@const fmtsL = groupFormats(group.items)}
@@ -509,8 +509,8 @@
               <tr
                 class="cursor-pointer select-none border-b border-[var(--border)] hover:bg-[var(--bg-tertiary)] transition-colors"
                 style="{groupBarStyle(group.items)}"
-                onclick={() => toggleGroup(group.title)}
-                onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleGroup(group.title))}
+                onclick={() => toggleGroup(group.key)}
+                onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleGroup(group.key))}
                 tabindex="0"
                 role="button"
               >
@@ -529,7 +529,7 @@
                   <div class="flex items-center gap-2 flex-wrap">
                     <span class="text-sm font-semibold truncate">{group.title}</span>
                     {#if group.items[0].year}<span class="text-[var(--text-secondary)] text-sm font-normal">({group.items[0].year})</span>{/if}
-                    <Badge label="{siblingCounts().get(group.title)} releases" />
+                    <Badge label="{siblingCounts().get(group.key)} releases" />
                     {#each statusSummary as st}
                       <Badge label={`${st.count} ${formatStatus(st.status)}`} variant={statusVariant(st.status)} />
                     {/each}
@@ -570,8 +570,8 @@
               <!-- Expanded header row -->
               <tr
                 class="cursor-pointer select-none hover:bg-[var(--bg-tertiary)]"
-                onclick={() => toggleGroup(group.title)}
-                onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleGroup(group.title))}
+                onclick={() => toggleGroup(group.key)}
+                onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleGroup(group.key))}
                 tabindex="0"
                 role="button"
               >
@@ -579,7 +579,7 @@
                   <div class="flex items-center gap-2">
                     <span class="text-[10px] text-[var(--text-secondary)] transition-transform rotate-90">&triangleright;</span>
                     <span class="text-xs font-semibold text-[var(--text-secondary)]">{group.title}</span>
-                    <Badge label="{siblingCounts().get(group.title)} releases" />
+                    <Badge label="{siblingCounts().get(group.key)} releases" />
                   </div>
                 </td>
               </tr>
