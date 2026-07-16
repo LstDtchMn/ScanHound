@@ -438,11 +438,23 @@ def test_cached_pages_are_disjoint_and_cover_full_set():
 
 
 def test_cached_title_counts_sum_to_total():
-    rows = [_row("Dup"), _row("Dup", url="u/dup2", group_key="Dup-k2"), _row("Solo")]
+    rows = [_row("Dup", group_key="dup-k1"), _row("Dup", url="u/dup2", group_key="dup-k1"),
+            _row("Solo", group_key="solo-k")]
     c = _client_with_cache(rows)
     r = c.get("/results/cached", params={"per_page": 100}).json()
-    assert r["title_counts"]["Dup"] == 2
+    assert r["title_counts"]["dup-k1"] == 2
     assert sum(r["title_counts"].values()) == r["total"]
+
+
+def test_cached_title_counts_key_by_group_key_not_bare_title():
+    # Same title, different group_key (e.g. Dune 1984 vs 2021) must NOT be
+    # merged into one bare-title count -- they're different movies/seasons.
+    rows = [_row("Dune", group_key="dune-1984"), _row("Dune", url="u/dune2021", group_key="dune-2021")]
+    c = _client_with_cache(rows)
+    r = c.get("/results/cached", params={"per_page": 100}).json()
+    assert r["title_counts"].get("dune-1984") == 1
+    assert r["title_counts"].get("dune-2021") == 1
+    assert r["title_counts"].get("Dune") is None
 
 
 def test_cached_category_query_param_filters():
@@ -597,7 +609,7 @@ def test_cached_posted_range_narrows_total_and_title_counts_but_stats_stay_whole
     c = _client_with_cache(rows)
     r = c.get("/results/cached", params={"posted_after": "2026-06-05", "posted_before": "2026-06-10"}).json()
     assert r["total"] == 1
-    assert r["title_counts"] == {"Mid": 1}
+    assert r["title_counts"] == {"Mid-k": 1}  # keyed by group_key, not bare title
     assert r["stats"]["total"] == 3  # whole visible set, unaffected by the date range
 
 

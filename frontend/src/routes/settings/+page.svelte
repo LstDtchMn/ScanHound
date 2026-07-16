@@ -12,9 +12,10 @@
   import { serverUrl } from '$lib/stores/server';
   import { onMount } from 'svelte';
   import type { BackgroundStatus } from '$lib/api/types';
+  import { numOrDefault } from '$lib/numOrDefault';
 
   async function testJd() {
-    if ($isDirty) await saveSettings();
+    if ($isDirty && !(await saveSettings())) return;
     await refreshJdConnection();
   }
 
@@ -45,7 +46,11 @@
   async function testOllamaConnection() {
     ollamaTesting = true;
     ollamaTest = null;
-    if ($isDirty) await saveSettings();  // persist the URL before probing
+    if ($isDirty && !(await saveSettings())) {  // persist the URL before probing
+      ollamaTest = { ok: false, error: 'Failed to save settings before testing' };
+      ollamaTesting = false;
+      return;
+    }
     try {
       ollamaTest = await api.testOllama();
     } catch {
@@ -168,7 +173,11 @@
     testingChannel = channel;
     try {
       // Save current settings first so the backend tests the value the user just entered
-      await saveSettings();
+      if (!(await saveSettings())) {
+        testResults = { ...testResults, [channel]: 'error' };
+        addToast('Test Failed', 'Could not save settings before testing', 'error');
+        return;
+      }
       const result = await api.testNotification(channel);
       if (result.success) {
         testResults = { ...testResults, [channel]: 'success' };
@@ -281,7 +290,7 @@
               type="number"
               min="0"
               value={$settings.min_size_mb as number ?? 200}
-              oninput={(e) => settings.update((s) => ({ ...s, min_size_mb: parseInt(e.currentTarget.value) || 200 }))}
+              oninput={(e) => settings.update((s) => ({ ...s, min_size_mb: numOrDefault(e.currentTarget.value, 200) }))}
               class={inputSmClass}
             />
           </label>
@@ -323,7 +332,7 @@
               min="0"
               max="12"
               value={$settings.tile_columns as number ?? 0}
-              oninput={(e) => settings.update((s) => ({ ...s, tile_columns: parseInt(e.currentTarget.value) || 0 }))}
+              oninput={(e) => settings.update((s) => ({ ...s, tile_columns: numOrDefault(e.currentTarget.value, 0) }))}
               class={inputSmClass}
             />
           </label>
@@ -1030,7 +1039,7 @@
               min="0"
               max="5"
               value={$settings.year_tolerance as number ?? 1}
-              oninput={(e) => settings.update((s) => ({ ...s, year_tolerance: parseInt(e.currentTarget.value) || 1 }))}
+              oninput={(e) => settings.update((s) => ({ ...s, year_tolerance: numOrDefault(e.currentTarget.value, 1) }))}
               class={inputSmClass}
             />
           </label>
@@ -1044,7 +1053,7 @@
               min="0"
               max="100"
               value={$settings.upgrade_sensitivity as number ?? 10}
-              oninput={(e) => settings.update((s) => ({ ...s, upgrade_sensitivity: parseInt(e.currentTarget.value) || 10 }))}
+              oninput={(e) => settings.update((s) => ({ ...s, upgrade_sensitivity: numOrDefault(e.currentTarget.value, 10) }))}
               class={inputSmClass}
             />
           </label>
@@ -1058,7 +1067,7 @@
               min="0"
               max="100"
               value={$settings.upgrade_dv_loss_sensitivity as number ?? 20}
-              oninput={(e) => settings.update((s) => ({ ...s, upgrade_dv_loss_sensitivity: parseInt(e.currentTarget.value) || 20 }))}
+              oninput={(e) => settings.update((s) => ({ ...s, upgrade_dv_loss_sensitivity: numOrDefault(e.currentTarget.value, 20) }))}
               class={inputSmClass}
             />
           </label>
@@ -1170,7 +1179,7 @@
               type="number"
               min="0"
               value={$settings.auto_grab_min_votes as number ?? 0}
-              oninput={(e) => settings.update((s) => ({ ...s, auto_grab_min_votes: parseInt(e.currentTarget.value) || 0 }))}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_grab_min_votes: numOrDefault(e.currentTarget.value, 0) }))}
               class={inputSmClass}
             />
           </label>
@@ -1461,7 +1470,7 @@
               <span class="text-sm text-[var(--text-secondary)] cursor-help underline decoration-dotted">Low-confidence threshold ⓘ</span>
             </Tooltip>
             <input type="number" min="0" max="100" value={$settings.auto_rename_confidence_threshold ?? 70}
-              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_confidence_threshold: parseInt(e.currentTarget.value) || 70 }))}
+              oninput={(e) => settings.update((s) => ({ ...s, auto_rename_confidence_threshold: numOrDefault(e.currentTarget.value, 70) }))}
               class={inputSmClass} />
           </label>
 

@@ -554,11 +554,15 @@ def _shape_results(
         posted_before=posted_before, sort=sort, order=order,
     )
 
-    # Per-title counts over the filtered set (post-filter, pre-pagination).
+    # Per-group_key counts over the filtered set (post-filter, pre-pagination).
+    # Keyed by the canonical group_key (not bare title) so same-title/
+    # different-year releases (e.g. Dune 1984 vs 2021) don't get merged into
+    # one inflated count -- fall back to a composite key for legacy rows
+    # lacking group_key.
     title_counts: Dict[str, int] = {}
     for i in items:
-        t = str(i.get("title", ""))
-        title_counts[t] = title_counts.get(t, 0) + 1
+        gk = i.get("group_key") or f"{i.get('title', '')}|{i.get('year', '')}|S{i.get('season', '')}"
+        title_counts[gk] = title_counts.get(gk, 0) + 1
 
     total = len(items)
     start = (page - 1) * per_page

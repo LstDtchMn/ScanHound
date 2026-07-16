@@ -17,15 +17,19 @@ export interface GroupFormats {
   hdr: boolean;
 }
 
-/** Group a list of results by title, preserving first-seen order. */
+/** Group a list of results by their canonical group_key (falls back to a
+ *  composite title|year|season key for legacy rows lacking group_key), so
+ *  same-title/different-year releases (e.g. Dune 1984 vs 2021) stay in
+ *  separate groups while genuine variants sharing a group_key still group
+ *  together. Preserves first-seen order. */
 export function groupResults(items: ScanResult[]): ResultGroup[] {
   const groups: ResultGroup[] = [];
   const map = new Map<string, ResultGroup>();
   for (const item of items) {
-    const key = item.title;
+    const key = item.group_key || `${item.title}|${item.year ?? ''}|S${item.season ?? ''}`;
     let group = map.get(key);
     if (!group) {
-      group = { title: key, items: [] };
+      group = { title: item.title, items: [] };
       map.set(key, group);
       groups.push(group);
     }

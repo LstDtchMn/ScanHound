@@ -13,9 +13,35 @@ const r = (over: Partial<ScanResult>): ScanResult => ({
 
 describe('grouping', () => {
   it('groups same-title items preserving order', () => {
-    const groups = groupResults([r({ title: 'Dune', url: 'a' }), r({ title: 'Blade', url: 'b' }), r({ title: 'Dune', url: 'c' })]);
+    const groups = groupResults([
+      r({ title: 'Dune', url: 'a', group_key: 'dune|2021|S0' }),
+      r({ title: 'Blade', url: 'b', group_key: 'blade|1982|S0' }),
+      r({ title: 'Dune', url: 'c', group_key: 'dune|2021|S0' }),
+    ]);
     expect(groups.map(g => g.title)).toEqual(['Dune', 'Blade']);
     expect(groups[0].items.map(i => i.url)).toEqual(['a', 'c']);
+  });
+
+  it('groups by group_key, not bare title (same-title/different-year items stay separate)', () => {
+    const groups = groupResults([
+      r({ title: 'Dune', year: 1984, url: 'a', group_key: 'dune|1984|S0' }),
+      r({ title: 'Dune', year: 2021, url: 'b', group_key: 'dune|2021|S0' }),
+      r({ title: 'Dune', year: 2021, url: 'c', group_key: 'dune|2021|S0' }),
+    ]);
+    expect(groups.length).toBe(2);
+    expect(groups[0].items.map(i => i.url)).toEqual(['a']);
+    expect(groups[1].items.map(i => i.url)).toEqual(['b', 'c']);
+  });
+
+  it('groupResults falls back to a composite key for legacy rows with no group_key', () => {
+    const groups = groupResults([
+      r({ title: 'Dune', year: 1984, season: null, url: 'a', group_key: '' as unknown as string }),
+      r({ title: 'Dune', year: 2021, season: null, url: 'b', group_key: '' as unknown as string }),
+      r({ title: 'Dune', year: 1984, season: null, url: 'c', group_key: '' as unknown as string }),
+    ]);
+    expect(groups.length).toBe(2);
+    expect(groups[0].items.map(i => i.url)).toEqual(['a', 'c']);
+    expect(groups[1].items.map(i => i.url)).toEqual(['b']);
   });
 
   it('computeSiblingCounts uses server titleCounts in paged mode when present', () => {
