@@ -67,8 +67,16 @@ def _login(client, password=PASSWORD):
 # ── status ────────────────────────────────────────────────────────────
 
 def test_status_open_when_nothing_configured(client):
+    # ALLOW_OPEN=1 is the ambient conftest default (see
+    # conftest._default_to_open_auth), so setup_required is False here even
+    # with no credential — the escape hatch is explicitly engaged.
     data = client.get("/auth/status").json()
-    assert data == {"auth_required": False, "has_password": False, "nonce_active": False}
+    assert data == {
+        "auth_required": False,
+        "has_password": False,
+        "nonce_active": False,
+        "setup_required": False,
+    }
 
 
 def test_status_locked_after_password_set(client):
@@ -76,12 +84,49 @@ def test_status_locked_after_password_set(client):
     data = client.get("/auth/status").json()
     assert data["has_password"] is True
     assert data["auth_required"] is True
+    assert data["setup_required"] is False
 
 
 def test_status_reachable_without_token_when_locked(client):
     _set_first_password(client)
     # /auth/status is exempt — the login page needs it before holding a token.
     assert client.get("/auth/status").status_code == 200
+
+
+# ── setup_required (SH-H01: breaks the fresh-install /↔/login redirect loop) ──
+
+def test_status_setup_required_on_fresh_install_by_default(client, monkeypatch):
+    # No password, no nonce, escape hatch unset — the real production default
+    # for a fresh install or a wiped auth_credentials row. The frontend must
+    # be told to show the set-password prompt rather than trust the (false)
+    # auth_required, whose protected fetches would 401 under the fail-closed
+    # HTTP gate anyway.
+    monkeypatch.delenv("SCANHOUND_ALLOW_OPEN", raising=False)
+    data = client.get("/auth/status").json()
+    assert data["auth_required"] is False
+    assert data["setup_required"] is True
+
+
+def test_status_setup_required_false_once_password_set(client, monkeypatch):
+    monkeypatch.delenv("SCANHOUND_ALLOW_OPEN", raising=False)
+    _set_first_password(client)
+    data = client.get("/auth/status").json()
+    assert data["setup_required"] is False
+
+
+def test_status_setup_required_false_when_allow_open_set(client, monkeypatch):
+    # The escape hatch means the no-credential state is intentional (headless/
+    # dev), not a fresh install needing a prompt.
+    monkeypatch.setenv("SCANHOUND_ALLOW_OPEN", "1")
+    data = client.get("/auth/status").json()
+    assert data["setup_required"] is False
+
+
+def test_status_setup_required_false_when_nonce_active(client, monkeypatch):
+    monkeypatch.delenv("SCANHOUND_ALLOW_OPEN", raising=False)
+    registry.auth_nonce = "test-nonce"
+    data = client.get("/auth/status").json()
+    assert data["setup_required"] is False
 
 
 # ── middleware gating ─────────────────────────────────────────────────

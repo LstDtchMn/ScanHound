@@ -94,7 +94,28 @@ def test_ws_rejects_wrong_nonce(client):
             ws.receive_json()
 
 
-def test_ws_open_when_auth_disabled(client):
-    """No password, no nonce → dev/open mode keeps working without a token."""
+def test_ws_open_when_allow_open_escape_hatch_set(client, monkeypatch):
+    """No password, no nonce, SCANHOUND_ALLOW_OPEN=1 → dev/open mode keeps
+    working without a token.
+
+    Renamed from test_ws_open_when_auth_disabled: this used to pass on the
+    ambient conftest default alone (the old guard ignored allow_open()
+    entirely). Now explicit, mirroring tests/test_api_auth.py's pattern, so
+    it actually exercises the escape hatch rather than an accident of the
+    no-credential state.
+    """
+    monkeypatch.setenv("SCANHOUND_ALLOW_OPEN", "1")
     with client.websocket_connect("/ws") as ws:
         assert ws.receive_json()["type"] == "connected"
+
+
+def test_ws_rejects_no_token_when_no_credential_by_default(client, monkeypatch):
+    """Fail-closed regression (SH-H01): with an empty-credential DB and the
+    escape hatch unset, a no-token socket must be REJECTED — mirroring the
+    HTTP middleware's fail-closed default. Previously the guard only checked
+    auth_enabled() and ignored allow_open(), so this connected regardless.
+    """
+    monkeypatch.delenv("SCANHOUND_ALLOW_OPEN", raising=False)
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()

@@ -16,6 +16,7 @@ const { getStoredToken, setStoredToken } = await import('$lib/api/endpoint');
 const {
   authRequired,
   hasPassword,
+  setupRequired,
   authChecked,
   refreshAuthStatus,
   login,
@@ -29,6 +30,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   authRequired.set(false);
   hasPassword.set(false);
+  setupRequired.set(false);
   authChecked.set(false);
 });
 
@@ -37,7 +39,8 @@ describe('auth store', () => {
     vi.mocked(api.authStatus).mockResolvedValue({
       auth_required: true,
       has_password: true,
-      nonce_active: false
+      nonce_active: false,
+      setup_required: false
     });
     const s = await refreshAuthStatus();
     expect(s?.auth_required).toBe(true);
@@ -52,6 +55,23 @@ describe('auth store', () => {
     expect(s).toBeNull();
     expect(get(authRequired)).toBe(false);
     expect(get(authChecked)).toBe(true);
+  });
+
+  it('refreshAuthStatus mirrors setup_required into its store (SH-H01)', async () => {
+    vi.mocked(api.authStatus).mockResolvedValue({
+      auth_required: false,
+      has_password: false,
+      nonce_active: false,
+      setup_required: true
+    });
+    await refreshAuthStatus();
+    expect(get(setupRequired)).toBe(true);
+  });
+
+  it('refreshAuthStatus treats an unreachable server as not needing setup', async () => {
+    vi.mocked(api.authStatus).mockRejectedValue(new Error('network'));
+    await refreshAuthStatus();
+    expect(get(setupRequired)).toBe(false);
   });
 
   it('login stores the token and applies it to the client', async () => {

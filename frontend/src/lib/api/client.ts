@@ -90,7 +90,12 @@ export const api = {
 
   // Auth
   authStatus: () =>
-    request<{ auth_required: boolean; has_password: boolean; nonce_active: boolean }>('/auth/status'),
+    request<{
+      auth_required: boolean;
+      has_password: boolean;
+      nonce_active: boolean;
+      setup_required: boolean;
+    }>('/auth/status'),
   authLogin: (password: string) =>
     request<{ token: string; expires_at: string }>('/auth/login', {
       method: 'POST',

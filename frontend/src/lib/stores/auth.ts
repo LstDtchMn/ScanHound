@@ -9,6 +9,11 @@ import { setStoredToken } from '$lib/api/endpoint';
 export const authRequired = writable<boolean>(false);
 /** Whether a password has been configured (vs. nonce-only / open). */
 export const hasPassword = writable<boolean>(false);
+/** True only in the fresh-install / wiped-credential state where the server
+ *  fails CLOSED (SH-H01) despite auth_required being false — the frontend
+ *  must show the set-password prompt instead of entering the app or bouncing
+ *  between '/' and '/login' on 401s. */
+export const setupRequired = writable<boolean>(false);
 /** Set once the first status check has resolved. */
 export const authChecked = writable<boolean>(false);
 
@@ -19,10 +24,12 @@ export async function refreshAuthStatus() {
     const s = await api.authStatus();
     authRequired.set(s.auth_required);
     hasPassword.set(s.has_password);
+    setupRequired.set(s.setup_required);
     return s;
   } catch {
     authRequired.set(false);
     hasPassword.set(false);
+    setupRequired.set(false);
     return null;
   } finally {
     authChecked.set(true);

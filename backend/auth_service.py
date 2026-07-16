@@ -11,9 +11,19 @@ from __future__ import annotations
 import base64
 import datetime as _dt
 import hashlib
+import re
 import secrets
 
 import bcrypt
+
+# Canonical bcrypt hash prefix: $2a$/$2b$/$2y$ + 2-digit cost. Anything else
+# (a foreign/corrupted format) is treated as "no valid credential."
+_BCRYPT_HASH_RE = re.compile(r"^\$2[aby]\$(\d{2})\$")
+# Cost-18 measured at ~12s per verify; cap well below that so a mangled
+# manual DB restore (or a future accidental gensalt(31)) can't hang a login
+# for hours. verify_password fails closed (returns False) above this cap
+# without ever calling the expensive bcrypt.checkpw.
+_MAX_BCRYPT_COST = 14
 
 # Long-lived browser sessions — this is a self-hosted, single-admin tool, so
 # re-login friction matters more than aggressive rotation. Changing the
@@ -40,8 +50,17 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    """Constant-time check of a plaintext password against a stored hash."""
+    """Constant-time check of a plaintext password against a stored hash.
+
+    Rejects (fails closed, no expensive check attempted) any hash that isn't
+    canonical bcrypt or whose cost exceeds ``_MAX_BCRYPT_COST`` — defense-in-
+    depth against a mangled manual DB restore landing an absurd-cost hash
+    that would otherwise hang the login route for hours.
+    """
     if not password or not password_hash:
+        return False
+    match = _BCRYPT_HASH_RE.match(password_hash)
+    if not match or int(match.group(1)) > _MAX_BCRYPT_COST:
         return False
     try:
         return bcrypt.checkpw(_prehash(password), password_hash.encode("utf-8"))

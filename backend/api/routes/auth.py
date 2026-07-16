@@ -19,7 +19,7 @@ from typing import Deque, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from backend.api.dependencies import ServiceRegistry, get_registry
+from backend.api.dependencies import ServiceRegistry, get_registry, allow_open
 from backend import auth_service
 
 logger = logging.getLogger(__name__)
@@ -85,10 +85,18 @@ def auth_status(reg: ServiceRegistry = Depends(get_registry)):
     """
     has_password = bool(reg.db and reg.db.has_password())
     nonce_active = bool(reg.auth_nonce)
+    # True only in the fresh-install / wiped-credential state where the HTTP
+    # and WS layers fail CLOSED (SH-H01) despite auth_required being False —
+    # the frontend must show the set-password prompt instead of trusting
+    # auth_required, whose protected fetches would 401 anyway. Not set when
+    # SCANHOUND_ALLOW_OPEN=1 (that no-credential state is an intentional
+    # escape hatch, not a fresh install needing a prompt).
+    setup_required = not has_password and not nonce_active and not allow_open()
     return {
         "auth_required": has_password or nonce_active,
         "has_password": has_password,
         "nonce_active": nonce_active,
+        "setup_required": setup_required,
     }
 
 

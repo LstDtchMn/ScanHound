@@ -114,9 +114,15 @@
     initAuth().then(async () => {
       if (!isTauri) {
         const status = await refreshAuthStatus();
-        if (status?.auth_required && !currentToken()) {
+        // setup_required (SH-H01): a fresh install / wiped-credential DB
+        // fails CLOSED server-side even though auth_required reads false.
+        // Route to the login surface to show the set-password prompt rather
+        // than proceeding into the app, where every fetch would 401 and
+        // bounce to /login anyway — that bounce is the redirect loop this
+        // fixes, since /login used to see auth_required=false and goto('/').
+        if ((status?.auth_required || status?.setup_required) && !currentToken()) {
           if (window.location.pathname !== '/login') goto('/login');
-          return; // wait for login before opening the socket / fetching data
+          return; // wait for login/setup before opening the socket / fetching data
         }
       }
       connection.connect();

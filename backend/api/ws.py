@@ -85,15 +85,17 @@ ws_manager = ConnectionManager()
 
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, token: str = Query(default="")):
-    # Gate the socket with the SAME rule as the HTTP middleware: when auth is
-    # enabled (a nonce or a login password is set), require a valid desktop
-    # nonce or an unexpired session token. Checking only the nonce — as this
-    # endpoint used to — left the socket wide open in password-login mode,
-    # since the nonce is empty there and the early-out skipped validation.
-    from backend.api.dependencies import auth_enabled, token_authorized
-    if auth_enabled() and not token_authorized(token):
-        await ws.close(code=1008, reason="Unauthorized")
-        return
+    # Gate the socket with the SAME rule as the HTTP middleware (SH-H01): fail
+    # CLOSED unless the token is authorized. auth_enabled() alone used to gate
+    # this (accepting any/no token whenever no nonce/password existed — e.g. a
+    # wiped/corrupted auth_credentials row), which left the socket wide open
+    # in that state even though the HTTP path was already fail-closed. Both
+    # transports now deny by default and open only under SCANHOUND_ALLOW_OPEN=1.
+    from backend.api.dependencies import auth_enabled, token_authorized, allow_open
+    if not token_authorized(token):
+        if auth_enabled() or not allow_open():
+            await ws.close(code=1008, reason="Unauthorized")
+            return
     await ws_manager.connect(ws)
     try:
         while True:
