@@ -591,6 +591,33 @@ describe('Archived rename jobs', () => {
     expect(get(mod.renameJobs).find((j) => j.id === 42)).toBeUndefined();
   });
 
+  it('a finished apply queue reconciles rows stuck on a missed terminal event (self-heal)', async () => {
+    // The exact bug reported: a bulk apply completes, but one or more per-job
+    // terminal rename:job broadcasts never reach this tab, leaving those rows
+    // frozen at 'applying' with a full progress bar. The queue-done broadcast
+    // must trigger a reconcile that sweeps them.
+    vi.useFakeTimers();
+    try {
+      const mod = await import('./renames');
+      const { get } = await import('svelte/store');
+      mod.renameJobs.set([{ id: 99, status: 'applying' }] as unknown as RenameJob[]);
+      mod.renameProgress.set(new Map([
+        [99, { pct: 100, bytes_done: 100, bytes_total: 100, bytes_per_sec: null, eta_seconds: null, updatedAt: 1 }],
+      ]));
+      // Authoritative fresh snapshot: job 99 is done + archived — absent from
+      // both the general page and the status=applying filter.
+      mockJobsByStatus([], []);
+
+      handlers['rename:queue_progress']({ active: false, done: 1, total: 1 });
+      await vi.advanceTimersByTimeAsync(2100); // past the ~2s reconcile delay
+
+      expect(get(mod.renameJobs).find((j) => j.id === 99)).toBeUndefined();
+      expect(get(mod.renameProgress).has(99)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // --- shift-click range selection (desktop list view) ---
   it('shift-select: plain click sets the anchor, shift-click fills the range', async () => {
     const mod = await import('./renames');

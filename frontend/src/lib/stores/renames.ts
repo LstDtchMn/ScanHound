@@ -388,6 +388,7 @@ connection.on('rename:progress', (data) => {
 });
 
 let queueClearTimer: ReturnType<typeof setTimeout>;
+let queueReconcileTimer: ReturnType<typeof setTimeout>;
 connection.on('rename:queue_progress', (data) => {
   const active = !!data.active;
   clearTimeout(queueClearTimer);
@@ -404,6 +405,18 @@ connection.on('rename:queue_progress', (data) => {
     queueClearTimer = setTimeout(() => {
       renameQueue.set(null);
     }, 1500);
+    // Safety net for missed terminal events: a run can finish with one or more
+    // per-job terminal rename:job broadcasts never delivered to this tab (a
+    // dropped WS frame, a backgrounded tab, a broadcast race — see
+    // resyncAfterReconnect's comment). Those rows then stay frozen at
+    // 'Applying…' with a full progress bar, and nothing corrects them short of
+    // a reconnect or a manual refresh (the reconnect resync doesn't fire for a
+    // merely-dropped message). Reconcile against the authoritative REST state
+    // shortly after the run reports done so any stragglers self-heal. The short
+    // delay lets the final job's DB commit settle so its status reads terminal,
+    // not a stale 'applying'.
+    clearTimeout(queueReconcileTimer);
+    queueReconcileTimer = setTimeout(() => { resyncAfterReconnect(); }, 2000);
     return;
   }
   renameQueue.set({
