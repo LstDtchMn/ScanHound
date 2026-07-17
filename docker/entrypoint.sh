@@ -2,9 +2,23 @@
 set -e
 
 # Virtual display so undetected-chromedriver can run a headful Chromium
-# (needed to clear Cloudflare on HDEncode). Safe to ignore if Xvfb is absent.
+# (needed to clear Cloudflare on HDEncode). SUPERVISED — a crashed Xvfb
+# otherwise leaves DISPLAY :99 dead and silently breaks ALL scraping: every
+# grab then fails at "session not created: chrome not reachable", so no links
+# are extracted and nothing is ever handed to JDownloader, until the container
+# is restarted. And a restart alone doesn't even recover it, because the stale
+# /tmp/.X99-lock survives `docker restart` (same writable layer) and makes the
+# next Xvfb abort with "Server is already active for display 99". So: clear the
+# stale lock/socket on every (re)start, respawn Xvfb if it ever exits, and keep
+# its stderr (not /dev/null) so a future crash is visible in `docker logs`.
 if command -v Xvfb >/dev/null 2>&1; then
-  Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >/dev/null 2>&1 &
+  ( while :; do
+      rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
+      echo "[entrypoint] starting Xvfb on :99" >&2
+      Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp || true
+      echo "[entrypoint] Xvfb exited — cleared lock, restarting in 2s" >&2
+      sleep 2
+    done ) &
 fi
 
 # --no-auth only disables the desktop-sidecar nonce (SCANHOUND_AUTH_NONCE) —
