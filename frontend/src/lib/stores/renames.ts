@@ -5,6 +5,7 @@ import type { RenameJob, RenameStatus, DvScan } from '$lib/api/types';
 import { persisted } from '$lib/stores/results';
 import { addToast } from '$lib/stores/notifications';
 import type { RenameCategory } from '$lib/renames/category';
+import { computeRange } from '$lib/renames/rangeSelect';
 
 export const renameJobs = writable<RenameJob[]>([]);
 export const renameStatus = writable<RenameStatus | null>(null);
@@ -37,8 +38,44 @@ export function toggleSelect(id: number) {
 export function selectAll(ids: number[]) {
   selectedJobIds.set(new Set(ids));
 }
+
+// Flattened top-to-bottom id order of the currently-visible list rows (incl.
+// episodes inside season groups). The page keeps this current so shift-range
+// selection can resolve a contiguous span without prop-drilling the order down
+// through SeasonGroupRow into each RenameRow.
+export const orderedVisibleIds = writable<number[]>([]);
+export function setOrderedVisibleIds(ids: number[]) {
+  orderedVisibleIds.set(ids);
+}
+
+// The last checkbox clicked without Shift — the anchor a subsequent shift-click
+// extends a range from. Module-scoped (not reactive UI state).
+let selectionAnchorId: number | null = null;
+
+/** Checkbox click with modifier awareness (desktop list view). A plain click
+ *  toggles the row and becomes the new anchor; a Shift-click unions the inclusive
+ *  range anchor→id (in current visual order) into the selection, leaving the
+ *  anchor put so repeated shift-clicks re-extend from it. Shift with no valid
+ *  anchor falls back to a plain toggle. */
+export function selectClick(id: number, shiftKey: boolean) {
+  if (shiftKey && selectionAnchorId != null) {
+    const range = computeRange(get(orderedVisibleIds), selectionAnchorId, id);
+    if (range.length > 1) {
+      selectedJobIds.update((s) => {
+        const next = new Set(s);
+        for (const r of range) next.add(r);
+        return next;
+      });
+      return; // keep the anchor for further range extension
+    }
+  }
+  toggleSelect(id);
+  selectionAnchorId = id;
+}
+
 export function clearSelection() {
   selectedJobIds.set(new Set());
+  selectionAnchorId = null;
 }
 
 // --- View / sort / category / search prefs ---

@@ -3,7 +3,7 @@
   import BadgeCluster from './BadgeCluster.svelte';
   import Badge from '$lib/components/Badge.svelte';
   import {
-    selectedJobIds, toggleSelect, applyJob, renameProgress, applyActive, progressClock
+    selectedJobIds, selectClick, applyJob, renameProgress, applyActive, progressClock
   } from '$lib/stores/renames';
   import { hasDestinationConflict } from '$lib/renames/review';
   import { formatBytes, conflictSummary } from '$lib/renames/conflictView';
@@ -92,7 +92,7 @@
     type="checkbox"
     class="shrink-0 accent-[var(--accent)]"
     checked={selected}
-    onchange={(e) => { e.stopPropagation(); toggleSelect(job.id); }}
+    onclick={(e) => { e.stopPropagation(); e.preventDefault(); selectClick(job.id, e.shiftKey); }}
     aria-label="Select {titleLine}"
   />
 

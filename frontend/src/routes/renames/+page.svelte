@@ -8,7 +8,7 @@
     acceptCombinedJob, acceptCorrectionJob,
     dvScanProgress, dvScanResult, dvScans, dvCounts, dvScanRunning,
     dvSyncRunning, dvSyncProgress, dvSyncResult,
-    archivedRenameJobs, loadArchivedRenameJobs, clearSelection
+    archivedRenameJobs, loadArchivedRenameJobs, clearSelection, setOrderedVisibleIds
   } from '$lib/stores/renames';
   import { categoryOf } from '$lib/renames/category';
   import { matchesQuery } from '$lib/renames/review';
@@ -230,6 +230,20 @@
         )
   );
   let shownIds = $derived(shown.map((j) => j.id));
+
+  // Keep the store's flattened visual order in sync with the list view so a
+  // Shift-click in RenameRow can resolve a contiguous range. Mirrors the exact
+  // render order of the list branch: episodes inside a season group, then
+  // standalone rows, in place.
+  $effect(() => {
+    const flat: number[] = [];
+    for (const entry of groupJobsBySeason(shown)) {
+      if (entry.type === 'season') for (const j of entry.jobs) flat.push(j.id);
+      else flat.push(entry.job.id);
+    }
+    setOrderedVisibleIds(flat);
+  });
+
   let hasFilters = $derived(
     statusFilter !== 'all' || $renameCategory !== 'all' || $renameQuery.trim() !== ''
   );

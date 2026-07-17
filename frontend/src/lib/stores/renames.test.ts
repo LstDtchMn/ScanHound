@@ -590,4 +590,51 @@ describe('Archived rename jobs', () => {
 
     expect(get(mod.renameJobs).find((j) => j.id === 42)).toBeUndefined();
   });
+
+  // --- shift-click range selection (desktop list view) ---
+  it('shift-select: plain click sets the anchor, shift-click fills the range', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.setOrderedVisibleIds([1, 2, 3, 4, 5]);
+    mod.selectClick(2, false); // anchor = 2, {2}
+    mod.selectClick(4, true);  // range 2..4
+    expect([...get(mod.selectedJobIds)].sort((a, b) => a - b)).toEqual([2, 3, 4]);
+  });
+
+  it('shift-select is additive and re-extends from the same anchor', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.setOrderedVisibleIds([1, 2, 3, 4, 5]);
+    mod.selectClick(2, false);
+    mod.selectClick(4, true); // {2,3,4}
+    mod.selectClick(1, true); // range 2..1 -> {1,2}, unioned with existing
+    expect([...get(mod.selectedJobIds)].sort((a, b) => a - b)).toEqual([1, 2, 3, 4]);
+  });
+
+  it('shift-click with no anchor falls back to a single toggle', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.setOrderedVisibleIds([1, 2, 3]);
+    mod.selectClick(3, true);
+    expect([...get(mod.selectedJobIds)]).toEqual([3]);
+  });
+
+  it('a plain click on an already-selected row toggles it off', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.setOrderedVisibleIds([1, 2, 3]);
+    mod.selectClick(2, false);
+    mod.selectClick(2, false);
+    expect(get(mod.selectedJobIds).size).toBe(0);
+  });
+
+  it('clearSelection resets the anchor so the next shift-click has nothing to extend from', async () => {
+    const mod = await import('./renames');
+    const { get } = await import('svelte/store');
+    mod.setOrderedVisibleIds([1, 2, 3, 4]);
+    mod.selectClick(2, false);
+    mod.clearSelection();
+    mod.selectClick(4, true); // no anchor -> single toggle
+    expect([...get(mod.selectedJobIds)]).toEqual([4]);
+  });
 });
