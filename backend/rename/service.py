@@ -1481,6 +1481,18 @@ class RenameService:
                                      "located — nothing was changed."))
                 self._broadcast(job_id)
                 return {"ok": False, "error": "Library duplicate not found"}
+            if os.path.lexists(dst):
+                # A file now occupies the incoming destination itself (it was
+                # free at preview time) — this is a same-path collision, not the
+                # library-duplicate the user chose to replace. Do NOT trash the
+                # library copy; hold for review so they re-decide against the
+                # current state.
+                db.update_rename_job(
+                    job_id, status="needs_review",
+                    warning_message=("A file now occupies the destination — "
+                                     "re-review before replacing the library copy."))
+                self._broadcast(job_id)
+                return {"ok": False, "error": "Destination no longer free"}
             trashed_to = _fileops._trash(lib_path)
             restore_slot = lib_path
             db.update_rename_job(job_id, conflict_replaced_path=lib_path)

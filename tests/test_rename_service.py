@@ -2304,6 +2304,21 @@ class TestReplaceLibraryDupAndKeepPlex:
         assert os.path.isfile(src)       # source untouched
         assert os.path.isfile(dup)       # library copy untouched
 
+    def test_replace_library_dup_dst_occupied_does_not_trash_library(self, db, tmp_path):
+        # Race: a file appears at the (previously free) destination between
+        # preview and apply. Must NOT trash the library copy — hold for review.
+        from unittest.mock import patch
+        svc, jid, src, dst, dup = self._setup(db, tmp_path)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write("squatter")
+        with patch("backend.rename.conflicts.find_library_duplicate",
+                   return_value={"file_path": dup}):
+            out = svc.apply(jid, conflict_strategy="replace_library_dup")
+        assert out["ok"] is False
+        assert db.get_rename_job(jid)["status"] == "needs_review"
+        assert os.path.isfile(dup)       # library copy NOT trashed
+
     def test_keep_plex_archives_and_trashes_download(self, db, tmp_path):
         svc, jid, src, dst, dup = self._setup(db, tmp_path)
         out = svc.resolve_keep_plex(jid)
