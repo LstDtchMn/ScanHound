@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { formatBytes, formatMbps, specRows, needsDvScan, conflictSummary, actionsForKind } from './conflictView';
+import { formatBytes, formatMbps, specRows, needsDvScan, conflictSummary, actionsForKind, strategyForChoice } from './conflictView';
 import type { FileSpec, ConflictAnalysis } from '$lib/api/types';
 
 const spec = (o: Partial<FileSpec>): FileSpec => ({
@@ -235,5 +235,28 @@ describe('actionsForKind', () => {
 
   it('undefined kind defaults to same_path shape (no analysis yet)', () => {
     expect(actionsForKind(undefined)).toEqual({ overwrite: true, keepBoth: true, applyAnyway: false });
+  });
+});
+
+describe('strategyForChoice', () => {
+  it('keep_plex always routes to the keep-plex action, regardless of kind', () => {
+    expect(strategyForChoice('same_path', 'keep_plex')).toEqual({ action: 'keepPlex' });
+    expect(strategyForChoice('library_duplicate', 'keep_plex')).toEqual({ action: 'keepPlex' });
+    expect(strategyForChoice(undefined, 'keep_plex')).toEqual({ action: 'keepPlex' });
+  });
+
+  it('same_path: keep_downloaded -> overwrite, keep_both -> keep_both', () => {
+    expect(strategyForChoice('same_path', 'keep_downloaded')).toEqual({ action: 'apply', strategy: 'overwrite' });
+    expect(strategyForChoice('same_path', 'keep_both')).toEqual({ action: 'apply', strategy: 'keep_both' });
+  });
+
+  it('library_duplicate: keep_downloaded -> replace_library_dup, keep_both -> plain apply', () => {
+    expect(strategyForChoice('library_duplicate', 'keep_downloaded')).toEqual({ action: 'apply', strategy: 'replace_library_dup' });
+    expect(strategyForChoice('library_duplicate', 'keep_both')).toEqual({ action: 'apply' });
+  });
+
+  it('undefined kind defaults to the same_path mapping', () => {
+    expect(strategyForChoice(undefined, 'keep_downloaded')).toEqual({ action: 'apply', strategy: 'overwrite' });
+    expect(strategyForChoice(undefined, 'keep_both')).toEqual({ action: 'apply', strategy: 'keep_both' });
   });
 });

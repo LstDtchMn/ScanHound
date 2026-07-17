@@ -101,8 +101,20 @@ export async function refreshRenames() {
   await refresh();
 }
 
-export async function applyJob(id: number, strategy?: 'overwrite' | 'keep_both' | 'skip') {
+export async function applyJob(
+  id: number,
+  strategy?: 'overwrite' | 'keep_both' | 'skip' | 'replace_library_dup'
+) {
   await api.applyRename(id, strategy ? { conflict_strategy: strategy } : undefined);
+  await refresh();
+}
+
+// "Keep the Plex copy": archive the conflict + recoverable-trash the redundant
+// download (own endpoint, not the apply queue). Surfaces the backend's warning
+// if the download couldn't be trashed.
+export async function keepPlexJob(id: number) {
+  const r = await api.keepPlexRename(id);
+  if (r.warning) addToast('Keep Plex copy', r.warning, 'warning');
   await refresh();
 }
 

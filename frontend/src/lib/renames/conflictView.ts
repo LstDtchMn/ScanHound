@@ -201,3 +201,32 @@ export function actionsForKind(kind: ConflictAnalysis['kind'] | undefined): {
   }
   return { overwrite: true, keepBoth: true, applyAnyway: false };
 }
+
+/** The three plain-language resolutions the Compare modal offers. */
+export type ResolveChoice = 'keep_plex' | 'keep_downloaded' | 'keep_both';
+
+export type ResolveAction =
+  | { action: 'apply'; strategy?: 'overwrite' | 'keep_both' | 'replace_library_dup' }
+  | { action: 'keepPlex' };
+
+/** Maps a Keep-Plex / Keep-downloaded / Keep-both choice to the backend action
+ *  for this conflict's kind. `keep_plex` always resolves via the dedicated
+ *  keep-plex route (archive + recoverable-trash the download). For a same_path
+ *  conflict the incoming file collides at its own destination, so keeping the
+ *  download overwrites and keeping both dedupes the name. For a
+ *  library_duplicate the destination is free, so keeping the download means
+ *  replacing the library copy elsewhere (`replace_library_dup`) and keeping
+ *  both is a plain apply (a second copy). Undefined kind defaults to the
+ *  same_path shape, matching actionsForKind. */
+export function strategyForChoice(
+  kind: ConflictAnalysis['kind'] | undefined,
+  choice: ResolveChoice
+): ResolveAction {
+  if (choice === 'keep_plex') return { action: 'keepPlex' };
+  if (kind === 'library_duplicate') {
+    if (choice === 'keep_downloaded') return { action: 'apply', strategy: 'replace_library_dup' };
+    return { action: 'apply' }; // keep_both => plain apply (a second copy)
+  }
+  if (choice === 'keep_downloaded') return { action: 'apply', strategy: 'overwrite' };
+  return { action: 'apply', strategy: 'keep_both' };
+}

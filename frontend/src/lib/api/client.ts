@@ -378,9 +378,14 @@ export const api = {
     return request<{ jobs: RenameJob[]; counts: Record<string, number> }>(`/rename/jobs${qs}`);
   },
   getRenameStatus: () => request<RenameStatus>('/rename/status'),
-  applyRename: (id: number, body?: { conflict_strategy?: 'overwrite' | 'keep_both' | 'skip' }) =>
+  applyRename: (id: number, body?: {
+    conflict_strategy?: 'overwrite' | 'keep_both' | 'skip' | 'replace_library_dup';
+  }) =>
     request<{ ok: boolean }>(`/rename/jobs/${id}/apply`,
       { method: 'POST', body: body ? JSON.stringify(body) : undefined }),
+  keepPlexRename: (id: number) =>
+    request<{ ok: boolean; warning?: string | null }>(
+      `/rename/jobs/${id}/keep-plex`, { method: 'POST' }),
   conflictPreview: (id: number) =>
     request<ConflictComparison>(`/rename/jobs/${id}/conflict-preview`, { method: 'POST' }),
   scanConflictDv: (id: number) =>
