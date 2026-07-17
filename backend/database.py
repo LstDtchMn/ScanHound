@@ -661,6 +661,14 @@ class DatabaseManager:
                     # miss confirms the file is genuinely gone and the job is
                     # archived. See detect_moved_source_files in rename/service.py.
                     'ALTER TABLE rename_jobs ADD COLUMN source_missing_since TIMESTAMP',
+                    # Set by a 'replace_library_dup' apply: the (translated,
+                    # container-local) path of the existing library file that
+                    # was moved to recoverable trash so the downloaded copy
+                    # could take its place. NULL for every other apply. Read by
+                    # undo() to restore that exact file — it lives at a
+                    # different path than dst, so the dst-keyed overwrite
+                    # restore can't find it otherwise.
+                    'ALTER TABLE rename_jobs ADD COLUMN conflict_replaced_path TEXT',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -2320,7 +2328,7 @@ class DatabaseManager:
         "suggested_correction", "combined_episode", "split_file", "poster_path",
         "match_reasons", "prior_status", "conflict_kind", "conflict_same_size",
         "conflict_existing_size", "conflict_incoming_size", "conflict_analysis",
-        "archived_at", "source_missing_since",
+        "archived_at", "source_missing_since", "conflict_replaced_path",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.

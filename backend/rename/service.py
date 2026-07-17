@@ -1454,6 +1454,36 @@ class RenameService:
         # returned, so a subsequent placement failure can restore that exact
         # entry rather than guessing. None means nothing was displaced.
         trashed_to = None
+        # 'replace_library_dup': the incoming file's own destination (dst) is
+        # free, but an equal/worse copy of this title already sits ELSEWHERE in
+        # the library (a movies-only library_duplicate — see conflict_preview).
+        # Trash that existing library file (recoverable) so the downloaded copy
+        # replaces it, then fall through to the normal placement at the free
+        # dst. restore_slot tracks which slot a post-trash failure would strand
+        # a file in (the library path here, dst for a same-path overwrite) so
+        # the stranded-file message names the right location.
+        restore_slot = dst
+        if conflict_strategy == "replace_library_dup":
+            from backend.rename.conflicts import find_library_duplicate
+            from backend.rename.path_translation import translate_plex_path
+            match = (find_library_duplicate(job, db.list_plex_cache_movies())
+                     if db else None)
+            lib_path = (translate_plex_path(
+                match["file_path"], self._cfg.get("plex_library_path_mappings"))
+                if match and match.get("file_path") else None)
+            if not lib_path or not os.path.lexists(lib_path):
+                # The duplicate vanished since the Compare preview — never place
+                # blindly against an unknown state. Hold for review, touch
+                # nothing.
+                db.update_rename_job(
+                    job_id, status="needs_review",
+                    warning_message=("The library duplicate could no longer be "
+                                     "located — nothing was changed."))
+                self._broadcast(job_id)
+                return {"ok": False, "error": "Library duplicate not found"}
+            trashed_to = _fileops._trash(lib_path)
+            restore_slot = lib_path
+            db.update_rename_job(job_id, conflict_replaced_path=lib_path)
         # Collision guard: a prior apply (or a file already present in the
         # library) may already occupy this destination — e.g. two different
         # releases of the same title resolve to the identical target path.
@@ -1574,10 +1604,11 @@ class RenameService:
             # empty — restore the trashed original so a failed apply is a no-op
             # on disk, not a silent loss of the file that was already there.
             error_message = self._restore_overwritten_original(
-                trashed_to, dst, job_id, str(e))
+                trashed_to, restore_slot, job_id, str(e))
             db.update_rename_job(job_id, status="failed", error_message=error_message,
                                  conflict_kind=None, conflict_same_size=None,
-                                 conflict_existing_size=None, conflict_incoming_size=None)
+                                 conflict_existing_size=None, conflict_incoming_size=None,
+                                 conflict_replaced_path=None)
             self._broadcast(job_id)
             return {"ok": False, "error": error_message}
         rlog.info("move   | %s -> %s (%s)", src, dst, used)
@@ -1617,10 +1648,11 @@ class RenameService:
             # slot empty, the exact loss the SH-H09 place-failure branch above
             # already guards against. Same helper, so the two can't drift.
             error_message = self._restore_overwritten_original(
-                trashed_to, dst, job_id, f"apply bookkeeping failed: {e}")
+                trashed_to, restore_slot, job_id, f"apply bookkeeping failed: {e}")
             try:
                 db.update_rename_job(job_id, status="failed",
-                                     error_message=error_message)
+                                     error_message=error_message,
+                                     conflict_replaced_path=None)
             except Exception:
                 pass
             self._broadcast(job_id)
@@ -1701,8 +1733,13 @@ class RenameService:
         # the UI/caller should know.
         restore_warning = None
         try:
-            dst_key = os.path.normcase(os.path.abspath(dst))
-            roots = _fileops.trash_roots(dst)
+            # A 'replace_library_dup' apply trashed the existing library file at
+            # its OWN path (conflict_replaced_path), not at dst — restore that
+            # exact path (and search its volume's trash roots), else fall back
+            # to the dst-keyed overwrite restore.
+            restore_key = job.get("conflict_replaced_path") or dst
+            dst_key = os.path.normcase(os.path.abspath(restore_key))
+            roots = _fileops.trash_roots(restore_key)
             cands = [e for e in _fileops.list_trash_entries(roots)
                      if e.get("original_path")
                      and os.path.normcase(os.path.abspath(e["original_path"])) == dst_key
@@ -1718,8 +1755,8 @@ class RenameService:
                         "it remains recoverable there.")
                     logger.warning(
                         "undo: overwrite-original restore failed for job %s, "
-                        "destination %s left stranded in trash: %s",
-                        job_id, dst, restore_result.get("error"))
+                        "%s left stranded in trash: %s",
+                        job_id, restore_key, restore_result.get("error"))
         except Exception:
             restore_warning = ("The file that was overwritten could not be "
                                "restored from trash (see server logs).")
@@ -1727,6 +1764,41 @@ class RenameService:
         db.update_rename_job(job_id, status="reverted", reverted_at=_now())
         self._broadcast(job_id)
         return {"ok": True, "restore_warning": restore_warning}
+
+    def resolve_keep_plex(self, job_id: int) -> dict:
+        """Resolve a duplicate conflict in favour of the copy already in Plex.
+
+        The downloaded file is redundant once the user keeps the library copy,
+        so this (1) ARCHIVES the job — a decision was made, so it stops
+        re-surfacing as a pending conflict — and (2) moves the downloaded
+        source to the RECOVERABLE trash (never a hard delete; restorable from
+        the Trash panel). The library/destination file is never touched.
+
+        Archiving happens FIRST so the job leaves the
+        detect_moved_source_files scan set before its source is trashed —
+        otherwise a later maintenance pass would misread the now-missing source
+        as an external move and mark the job failed. A trash failure still
+        leaves the job archived (resolved) and surfaces a warning; the library
+        copy is safe either way.
+        """
+        db = self._db
+        job = db.get_rename_job(job_id) if db else None
+        if not job:
+            return {"ok": False, "error": "Job not found"}
+        db.archive_rename_jobs([job_id])
+        warning = None
+        src = job.get("original_path")
+        if src and os.path.lexists(src):
+            try:
+                _fileops._trash(src)
+            except Exception as e:
+                warning = ("Kept the Plex copy, but the downloaded file could "
+                           f"not be moved to trash ({e}) — remove it manually.")
+                logger.warning(
+                    "resolve_keep_plex: trash of %s failed for job %s: %s",
+                    src, job_id, e)
+        self._broadcast(job_id)
+        return {"ok": True, "warning": warning}
 
     def rematch(self, job_id: int, tmdb_id: int, media_type: Optional[str] = None,
                 season: Optional[int] = None, episode: Optional[int] = None) -> dict:

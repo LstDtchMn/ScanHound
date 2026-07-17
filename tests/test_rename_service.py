@@ -2227,6 +2227,106 @@ class TestConflictPreviewPathTranslation:
         db.close()
 
 
+# ── replace_library_dup + keep_plex resolution ───────────────────────
+
+def _norm(p):
+    return os.path.normcase(os.path.abspath(p))
+
+
+class TestReplaceLibraryDupAndKeepPlex:
+    """The Compare-modal 'Keep the downloaded copy' (library_duplicate kind) and
+    'Keep the Plex copy' resolutions. For a library duplicate the incoming file's
+    own destination is FREE; the existing copy sits elsewhere in the library."""
+
+    def _setup(self, db, tmp_path, content="incoming"):
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.BluRay.x264.mkv", content=content)
+        svc = _service(db, _matrix_search, movie_lib=str(tmp_path / "lib"))
+        jid = svc.process_package("pkg", save_to)[0]
+        job = db.get_rename_job(jid)
+        dst = os.path.join(job["destination_path"], job["new_filename"])
+        assert not os.path.lexists(dst)  # library_duplicate => own destination free
+        dup_dir = tmp_path / "existing-lib"; dup_dir.mkdir()
+        dup = dup_dir / "The Matrix (1999).mkv"; dup.write_text("library-copy")
+        return svc, jid, src, dst, str(dup)
+
+    def test_replace_library_dup_trashes_library_and_places_download(self, db, tmp_path):
+        from unittest.mock import patch
+        svc, jid, src, dst, dup = self._setup(db, tmp_path)
+        with patch("backend.rename.conflicts.find_library_duplicate",
+                   return_value={"file_path": dup}):
+            out = svc.apply(jid, conflict_strategy="replace_library_dup")
+        assert out["ok"] is True
+        assert os.path.isfile(dst)            # download placed at the free dst
+        assert not os.path.exists(dup)        # library copy moved to trash
+        job = db.get_rename_job(jid)
+        assert job["status"] == "applied"
+        assert _norm(job["conflict_replaced_path"]) == _norm(dup)
+
+    def test_replace_library_dup_restores_library_on_place_failure(self, db, tmp_path, monkeypatch):
+        from unittest.mock import patch
+        svc, jid, src, dst, dup = self._setup(db, tmp_path)
+
+        def _boom(*a, **kw):
+            raise OSError("simulated place_file failure after trashing the library copy")
+        monkeypatch.setattr("backend.rename.service._fileops.place_file", _boom)
+        with patch("backend.rename.conflicts.find_library_duplicate",
+                   return_value={"file_path": dup}):
+            out = svc.apply(jid, conflict_strategy="replace_library_dup")
+        assert out["ok"] is False
+        assert db.get_rename_job(jid)["status"] == "failed"
+        # The library copy must be restored to its own path, byte-for-byte.
+        assert os.path.isfile(dup)
+        with open(dup, encoding="utf-8") as f:
+            assert f.read() == "library-copy"
+
+    def test_undo_replace_library_dup_restores_library(self, db, tmp_path):
+        from unittest.mock import patch
+        svc, jid, src, dst, dup = self._setup(db, tmp_path)
+        with patch("backend.rename.conflicts.find_library_duplicate",
+                   return_value={"file_path": dup}):
+            assert svc.apply(jid, conflict_strategy="replace_library_dup")["ok"] is True
+        assert os.path.isfile(dst) and not os.path.exists(dup)
+        out = svc.undo(jid)
+        assert out["ok"] is True
+        assert not os.path.exists(dst)   # placed download reversed
+        assert os.path.isfile(dup)       # library copy restored from trash
+        with open(dup, encoding="utf-8") as f:
+            assert f.read() == "library-copy"
+
+    def test_replace_library_dup_no_duplicate_holds_for_review(self, db, tmp_path):
+        from unittest.mock import patch
+        svc, jid, src, dst, dup = self._setup(db, tmp_path)
+        with patch("backend.rename.conflicts.find_library_duplicate", return_value=None):
+            out = svc.apply(jid, conflict_strategy="replace_library_dup")
+        assert out["ok"] is False
+        assert db.get_rename_job(jid)["status"] == "needs_review"
+        assert not os.path.exists(dst)   # nothing placed
+        assert os.path.isfile(src)       # source untouched
+        assert os.path.isfile(dup)       # library copy untouched
+
+    def test_keep_plex_archives_and_trashes_download(self, db, tmp_path):
+        svc, jid, src, dst, dup = self._setup(db, tmp_path)
+        out = svc.resolve_keep_plex(jid)
+        assert out["ok"] is True
+        assert out.get("warning") is None
+        job = db.get_rename_job(jid)
+        assert job.get("archived_at")      # resolved — leaves the review queue
+        assert not os.path.exists(src)     # redundant download moved to trash
+        assert os.path.isfile(dup)         # library copy untouched
+
+    def test_keep_plex_trash_failure_still_archives(self, db, tmp_path, monkeypatch):
+        svc, jid, src, dst, dup = self._setup(db, tmp_path)
+
+        def _boom(path):
+            raise OSError("simulated trash failure")
+        monkeypatch.setattr("backend.rename.service._fileops._trash", _boom)
+        out = svc.resolve_keep_plex(jid)
+        assert out["ok"] is True
+        assert out.get("warning")          # surfaced, not swallowed
+        assert db.get_rename_job(jid).get("archived_at")
+        assert os.path.isfile(src)         # trash failed => download left in place
+
+
 # ── process_folder (manual backlog processing) ───────────────────────
 
 class TestProcessFolder:

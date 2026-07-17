@@ -131,7 +131,13 @@ class ApplyConfidentRequest(BaseModel):
 
 
 class ApplyRequest(BaseModel):
-    conflict_strategy: Optional[Literal["overwrite", "keep_both", "skip"]] = None
+    # 'replace_library_dup' trashes an existing library file at a DIFFERENT
+    # path (movies-only library duplicate) then places the download. 'keep_plex'
+    # is deliberately NOT accepted here — it is not a placement and has its own
+    # /keep-plex route; routing it through apply() would place the file instead
+    # of trashing the redundant download.
+    conflict_strategy: Optional[
+        Literal["overwrite", "keep_both", "skip", "replace_library_dup"]] = None
 
 
 @router.get("/jobs")
@@ -336,6 +342,17 @@ def undo_job(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
     out = _service(reg).undo(job_id)
     if not out.get("ok"):
         raise HTTPException(status_code=400, detail=out.get("error", "Undo failed"))
+    return out
+
+
+@router.post("/jobs/{job_id}/keep-plex")
+def keep_plex_job(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
+    # Resolve a duplicate conflict by keeping the copy already in Plex: archive
+    # the job and move the redundant download to recoverable trash. Not queued
+    # (no file placement), so it returns synchronously.
+    out = _service(reg).resolve_keep_plex(job_id)
+    if not out.get("ok"):
+        raise HTTPException(status_code=400, detail=out.get("error", "Keep-Plex failed"))
     return out
 
 
