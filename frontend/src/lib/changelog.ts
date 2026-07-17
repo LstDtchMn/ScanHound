@@ -7,6 +7,18 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.27.0",
+    date: "2026-07-17",
+    summary: "Clearer duplicate resolution: pick which copy to keep",
+    changes: [
+      "The Compare view now labels the two files plainly — \"In Plex\" (the copy already in your library) versus \"Downloaded\" (the new file), each with its filename — instead of the old \"Existing\" / \"Incoming\".",
+      "Resolving a duplicate is now an explicit choice: Keep the Plex copy, Keep the downloaded copy, or Keep both. Each option spells out exactly what it will do, the recommended one is pre-selected, and a single solid \"Apply choice\" button carries it out (no more decoding Overwrite / Apply-anyway / Skip).",
+      "\"Keep the downloaded copy\" now works even when the duplicate lives elsewhere in your library, not just at the same path: it moves the existing library file to the recoverable trash and imports the download in its place. Undo restores it.",
+      "\"Keep the Plex copy\" now tidies up after itself — it resolves the conflict and moves the redundant downloaded file to the recoverable trash, so unused copies don't pile up. Nothing is ever hard-deleted; everything stays restorable from Trash.",
+      "The Pipeline page is now readable on a phone: the status cards no longer clip to single-letter labels and rows no longer wrap one word per line.",
+    ],
+  },
+  {
     version: "2.26.0",
     date: "2026-07-11",
     summary: "Duplicates are auto-analyzed so you can pick the better copy",
