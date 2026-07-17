@@ -3,7 +3,7 @@
   import Badge from '$lib/components/Badge.svelte';
   import { confidenceVariant, dvLayerVariant, formatStatus, renameStatusVariant } from '$lib/constants';
   import { hasDestinationConflict } from '$lib/renames/review';
-  import { specRows, needsDvScan, actionsForKind } from '$lib/renames/conflictView';
+  import { specRows, needsDvScan, strategyForChoice, type ResolveChoice, type ResolveAction } from '$lib/renames/conflictView';
   import { api } from '$lib/api/client';
   import { dvScanTick } from '$lib/stores/renames';
   import type { RenameJob, ConflictComparison } from '$lib/api/types';
@@ -12,8 +12,7 @@
     job,
     busy = false,
     onApply,
-    onOverwrite,
-    onKeepBoth,
+    onResolve,
     onSkip,
     onRematch,
     onReidentify,
@@ -24,8 +23,7 @@
     job: RenameJob;
     busy?: boolean;
     onApply: () => void;
-    onOverwrite: () => void;
-    onKeepBoth: () => void;
+    onResolve: (action: ResolveAction) => void;
     onSkip: () => void;
     onRematch: () => void;
     onReidentify: () => void;
@@ -108,7 +106,50 @@
     !!preview && (needsDvScan(preview.existing) || needsDvScan(preview.incoming))
   );
 
-  let actions = $derived(actionsForKind(preview?.kind ?? undefined));
+  // --- Explicit resolution choice ---
+  // Pre-select the recommended resolution once per job (respecting later manual
+  // changes): recommended 'existing' -> keep the Plex copy, 'incoming' -> keep
+  // the download, tie/unknown -> keep both (non-destructive default).
+  let choice = $state<ResolveChoice>('keep_both');
+  let choiceSetFor: number | null = null;
+  $effect(() => {
+    if (preview && choiceSetFor !== job.id) {
+      choiceSetFor = job.id;
+      choice = preview.recommended === 'existing' ? 'keep_plex'
+        : preview.recommended === 'incoming' ? 'keep_downloaded'
+        : 'keep_both';
+    }
+  });
+
+  const CHOICES: { value: ResolveChoice; label: string }[] = [
+    { value: 'keep_plex', label: 'Keep the Plex copy' },
+    { value: 'keep_downloaded', label: 'Keep the downloaded copy' },
+    { value: 'keep_both', label: 'Keep both' },
+  ];
+
+  function caption(c: ResolveChoice): string {
+    const lib = preview?.kind === 'library_duplicate';
+    if (c === 'keep_plex')
+      return 'Archive this conflict and move the downloaded file to recoverable trash.';
+    if (c === 'keep_downloaded')
+      return lib
+        ? 'Move the existing library copy to recoverable trash and import the download instead.'
+        : 'Move the current library file to recoverable trash and import the download in its place.';
+    return lib
+      ? 'Keep the library copy and add the download alongside it as a second copy.'
+      : 'Keep the library file and import the download under a de-duplicated name.';
+  }
+
+  // Which choice the ★ recommendation maps to (drives the "Recommended" chip).
+  let recommendedChoice = $derived<ResolveChoice | null>(
+    preview?.recommended === 'existing' ? 'keep_plex'
+      : preview?.recommended === 'incoming' ? 'keep_downloaded'
+      : null
+  );
+
+  function resolve() {
+    onResolve(strategyForChoice(preview?.kind ?? undefined, choice));
+  }
 </script>
 
 <div class="rounded-xl border border-[var(--border)] bg-[var(--bg-secondary)] p-3 flex flex-col gap-3">
@@ -221,15 +262,19 @@
             <thead>
               <tr>
                 <th class="text-left font-medium pb-1"></th>
-                <th
-                  class="text-left font-medium pb-1 px-1.5 {preview.recommended === 'existing' ? 'text-[var(--success)]' : 'text-[var(--text-primary)]'}"
-                >
-                  Existing{#if preview.recommended === 'existing'}&nbsp;<span title="Recommended keep">★</span>{/if}
+                <th class="text-left font-medium pb-1 px-1.5 align-top {preview.recommended === 'existing' ? 'text-[var(--success)]' : 'text-[var(--text-primary)]'}">
+                  In Plex{#if preview.recommended === 'existing'}&nbsp;<span title="Recommended keep">★</span>{/if}
+                  <div class="text-[10px] font-normal text-[var(--text-secondary)]">📀 current library copy</div>
+                  {#if preview.existing?.original_filename}
+                    <div class="text-[10px] font-normal font-mono text-[var(--text-secondary)] truncate max-w-[9rem]" title={preview.existing.original_filename}>{preview.existing.original_filename}</div>
+                  {/if}
                 </th>
-                <th
-                  class="text-left font-medium pb-1 px-1.5 {preview.recommended === 'incoming' ? 'text-[var(--success)]' : 'text-[var(--text-primary)]'}"
-                >
-                  Incoming{#if preview.recommended === 'incoming'}&nbsp;<span title="Recommended keep">★</span>{/if}
+                <th class="text-left font-medium pb-1 px-1.5 align-top {preview.recommended === 'incoming' ? 'text-[var(--success)]' : 'text-[var(--text-primary)]'}">
+                  Downloaded{#if preview.recommended === 'incoming'}&nbsp;<span title="Recommended keep">★</span>{/if}
+                  <div class="text-[10px] font-normal text-[var(--text-secondary)]">⬇ new file</div>
+                  {#if preview.incoming?.original_filename}
+                    <div class="text-[10px] font-normal font-mono text-[var(--text-secondary)] truncate max-w-[9rem]" title={preview.incoming.original_filename}>{preview.incoming.original_filename}</div>
+                  {/if}
                 </th>
               </tr>
             </thead>
@@ -261,41 +306,49 @@
           </button>
         {/if}
 
-        <div class="flex flex-wrap gap-2 pt-1">
-          {#if actions.overwrite}
+        <!-- Explicit resolution choice: plain-language options that map to the
+             right backend action for this conflict kind (strategyForChoice). -->
+        <div class="flex flex-col gap-1.5 pt-1">
+          {#each CHOICES as opt (opt.value)}
             <button
-              class="flex-1 py-2 rounded-lg bg-[var(--error)] text-white text-xs font-semibold disabled:opacity-50 hover:brightness-110 transition-all"
-              disabled={busy}
-              onclick={onOverwrite}
+              type="button"
+              aria-pressed={choice === opt.value}
+              class="flex items-start gap-2 text-left rounded-lg border p-2 transition-colors
+                {choice === opt.value
+                  ? 'border-[var(--accent)] bg-[var(--accent)]/[0.07]'
+                  : 'border-[var(--border)] hover:bg-[var(--bg-tertiary)]/40'}"
+              onclick={() => (choice = opt.value)}
             >
-              Overwrite
+              <span class="mt-0.5 w-3.5 h-3.5 shrink-0 rounded-full border-2 flex items-center justify-center
+                {choice === opt.value ? 'border-[var(--accent)]' : 'border-[var(--text-secondary)]'}">
+                {#if choice === opt.value}<span class="w-1.5 h-1.5 rounded-full bg-[var(--accent)]"></span>{/if}
+              </span>
+              <span class="min-w-0">
+                <span class="text-xs font-semibold flex items-center gap-1.5 flex-wrap">
+                  {opt.label}
+                  {#if recommendedChoice === opt.value}
+                    <span class="text-[9px] font-bold uppercase tracking-wide bg-[var(--success)] text-black px-1 py-px rounded">Recommended</span>
+                  {/if}
+                </span>
+                <span class="block text-[11px] text-[var(--text-secondary)] leading-snug">{caption(opt.value)}</span>
+              </span>
             </button>
-          {/if}
-          {#if actions.keepBoth}
-            <button
-              class="flex-1 py-2 rounded-lg bg-[var(--accent)] text-white text-xs font-semibold disabled:opacity-50 hover:brightness-110 transition-all"
-              disabled={busy}
-              onclick={onKeepBoth}
-            >
-              Keep both
-            </button>
-          {/if}
-          {#if actions.applyAnyway}
-            <button
-              class="flex-1 py-2 rounded-lg bg-[var(--accent)] text-white text-xs font-semibold disabled:opacity-50 hover:brightness-110 transition-all"
-              disabled={busy}
-              onclick={onApply}
-              title="This title already exists elsewhere in the library — apply anyway to keep both copies"
-            >
-              Apply anyway
-            </button>
-          {/if}
+          {/each}
+        </div>
+        <div class="flex gap-2 pt-1">
           <button
-            class="flex-1 py-2 rounded-lg border border-[var(--border)] text-[var(--text-secondary)] text-xs font-semibold hover:bg-[var(--bg-tertiary)] disabled:opacity-50"
+            class="flex-1 py-2 rounded-lg bg-[var(--accent)] text-white text-sm font-semibold disabled:opacity-50 hover:brightness-110 transition-all"
+            disabled={busy}
+            onclick={resolve}
+          >
+            {busy ? 'Working…' : 'Apply choice'}
+          </button>
+          <button
+            class="px-4 py-2 rounded-lg border border-[var(--border)] text-[var(--text-secondary)] text-sm font-semibold hover:bg-[var(--bg-tertiary)] disabled:opacity-50"
             disabled={busy}
             onclick={onSkip}
           >
-            Skip
+            Cancel
           </button>
         </div>
       {/if}

@@ -4,7 +4,7 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import {
-    applyJob, deleteJob, acceptCombinedJob, acceptCorrectionJob, refreshRenames, applyActive
+    applyJob, keepPlexJob, deleteJob, acceptCombinedJob, acceptCorrectionJob, refreshRenames, applyActive
   } from '$lib/stores/renames';
   import { deckQueue, partitionJobs, type ReviewScope } from '$lib/renames/review';
   import { createDragTracker } from '$lib/components/mobile/gestures';
@@ -205,8 +205,9 @@
             job={current}
             busy={busyId === current.id || $applyActive}
             onApply={() => act(() => applyJob(current!.id), 'Applied')}
-            onOverwrite={() => act(() => applyJob(current!.id, 'overwrite'), 'Overwriting…')}
-            onKeepBoth={() => act(() => applyJob(current!.id, 'keep_both'), 'Keeping both')}
+            onResolve={(a) => a.action === 'keepPlex'
+              ? act(() => keepPlexJob(current!.id), 'Keeping Plex copy')
+              : act(() => applyJob(current!.id, a.strategy), 'Applying choice')}
             onSkip={skip}
             onRematch={() => (rematchJob = current)}
             onReidentify={() => act(async () => { await api.reidentifyRename(current!.id); await refreshRenames(); }, 'Re-identifying')}

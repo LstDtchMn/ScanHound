@@ -3,7 +3,7 @@
   import RenameReviewCard from './RenameReviewCard.svelte';
   import { api } from '$lib/api/client';
   import {
-    applyJob, deleteJob, acceptCombinedJob, acceptCorrectionJob, refreshRenames, applyActive
+    applyJob, keepPlexJob, deleteJob, acceptCombinedJob, acceptCorrectionJob, refreshRenames, applyActive
   } from '$lib/stores/renames';
   import { addToast } from '$lib/stores/notifications';
   import type { RenameJob } from '$lib/api/types';
@@ -40,8 +40,8 @@
       {job}
       busy={busy || $applyActive}
       onApply={() => act(() => applyJob(job.id))}
-      onOverwrite={() => act(() => applyJob(job.id, 'overwrite'))}
-      onKeepBoth={() => act(() => applyJob(job.id, 'keep_both'))}
+      onResolve={(a) => act(() =>
+        a.action === 'keepPlex' ? keepPlexJob(job.id) : applyJob(job.id, a.strategy))}
       onSkip={onClose}
       onRematch={onClose}
       onReidentify={() => act(async () => { await api.reidentifyRename(job.id); await refreshRenames(); })}

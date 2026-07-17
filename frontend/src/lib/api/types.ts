@@ -618,6 +618,8 @@ export interface FileSpec {
   resolution: string | null; video_codec: string | null; hdr: string | null;
   dv_layer: string | null; audio: string | null; audio_profile: string | null;
   duration_min: number | null; bitrate: number | null;
+  // basename of the file, set by conflict_preview for the compare-table headers.
+  original_filename?: string | null;
 }
 export interface ConflictAnalysis {
   kind: 'same_path' | 'library_duplicate';
