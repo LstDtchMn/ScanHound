@@ -279,11 +279,21 @@
               </tr>
             </thead>
             <tbody>
+              <!-- Highlight the winner of EACH ROW (row.better), not the whole
+                   recommended column. Blanket-highlighting the recommended
+                   column asserted "this copy wins on every axis", which is
+                   often false — a copy recommended on resolution can still lose
+                   on bitrate, and the old markup rendered that lower bitrate in
+                   green. The ★ in the header remains the holistic verdict, and
+                   the "Recommended keep" line below gives its reason, so a row
+                   that disagrees with the ★ is now visible and explained rather
+                   than silently misrepresented. Ties and non-comparable rows
+                   (codec/audio/duration) have better === null and stay plain. -->
               {#each specRows(preview.existing, preview.incoming) as row (row.label)}
                 <tr class="border-t border-[var(--border)]/60">
                   <td class="py-1 pr-2 text-[var(--text-secondary)] whitespace-nowrap">{row.label}</td>
-                  <td class="py-1 px-1.5 {preview.recommended === 'existing' ? 'font-semibold text-[var(--success)]' : ''}">{row.existing}</td>
-                  <td class="py-1 px-1.5 {preview.recommended === 'incoming' ? 'font-semibold text-[var(--success)]' : ''}">{row.incoming}</td>
+                  <td class="py-1 px-1.5 {row.better === 'existing' ? 'font-semibold text-[var(--success)]' : ''}">{row.existing}</td>
+                  <td class="py-1 px-1.5 {row.better === 'incoming' ? 'font-semibold text-[var(--success)]' : ''}">{row.incoming}</td>
                 </tr>
               {/each}
             </tbody>
