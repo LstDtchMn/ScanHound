@@ -267,3 +267,49 @@ def test_sync_labels_normalize_calls_dont_scale_with_movie_count(monkeypatch):
     assert delta <= 18 * 4, (
         f"normalize_path call delta for +18 movies was {delta}; "
         "suggests back-write is re-scanning all rows per movie")
+
+
+# --- additive-only mode (the scheduled auto-sync) ---------------------------
+# The whole point: an unattended sync must never REMOVE a managed label. A
+# movie whose path can't be matched on a given run yields desired=None, which
+# in full-reconcile mode strips its labels — on a timer, one transient
+# matching failure would wipe DV labels library-wide (and with them the Kometa
+# FEL/MEL overlays that key on those labels).
+
+def test_additive_only_keeps_label_when_unmatched():
+    idx = {}  # nothing matches this run -> desired is None
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
+    assert res["removed"] == []
+    pm.remove_label.assert_not_called()
+
+
+def test_additive_only_still_adds_missing_label():
+    idx = {"y:/a.mkv": "fel"}
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], [])
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
+    assert res["added"] == ["DV FEL"]
+    pm.add_label.assert_called_once_with(1, "DV FEL")
+
+
+def test_additive_only_adds_without_removing_stale():
+    """A wrong-but-managed label is left in place; cleaning it up stays a
+    deliberate manual-sync decision."""
+    idx = {"y:/a.mkv": "fel"}
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV MEL"])
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
+    assert res["added"] == ["DV FEL"]
+    assert res["removed"] == []
+    pm.remove_label.assert_not_called()
+
+
+def test_full_reconcile_still_removes_by_default():
+    """Regression guard: the manual sync path must be unchanged."""
+    idx = {}
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
+    assert res["removed"] == ["DV FEL"]

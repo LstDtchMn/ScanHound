@@ -83,8 +83,18 @@ def _existing_labels(movie):
     return out
 
 
-def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None):
-    """Reconcile one movie's managed label. Returns {added, removed, matched}."""
+def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
+                    additive_only=False):
+    """Reconcile one movie's managed label. Returns {added, removed, matched}.
+
+    ``additive_only`` adds a missing label but never removes an existing one.
+    Unattended (scheduled) syncs use it: a movie whose path can't be matched
+    this run yields desired=None, which in full-reconcile mode strips its
+    managed labels. That's correct for a deliberate manual sync, but on a timer
+    a transient matching failure (a dropped mount, a changed Plex path form, a
+    mapping gap) would silently wipe DV labels library-wide — and those labels
+    are what the Kometa FEL/MEL overlays key on. Removals stay manual.
+    """
     norm_paths = _movie_norm_paths(movie, mappings)
     layer = pick_layer(norm_paths, index)
     desired = desired_label(layer, vocab)
@@ -93,8 +103,9 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None):
     added, removed = [], []
     if desired and desired not in existing_managed:
         added.append(desired)
-    for stale in existing_managed - ({desired} if desired else set()):
-        removed.append(stale)
+    if not additive_only:
+        for stale in existing_managed - ({desired} if desired else set()):
+            removed.append(stale)
 
     if not dry_run:
         for lbl in added:
@@ -128,8 +139,13 @@ def _vocab_from_config(config):
         return dict(_DEFAULT_VOCAB)
 
 
-def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=None):
-    """Reconcile every movie against dv_scan (source='scan'). Returns a summary."""
+def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=None,
+                additive_only=False):
+    """Reconcile every movie against dv_scan (source='scan'). Returns a summary.
+
+    ``additive_only`` never removes a managed label — see reconcile_movie. The
+    scheduled auto-sync passes it; the manual button does not.
+    """
     vocab = _vocab_from_config(config)
     rows = db.get_dv_scans(source="scan", limit=1000000)
     index, norm_to_path = build_index_and_paths(rows, mappings)
@@ -156,7 +172,8 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     for i, mv in enumerate(movies):
         try:
             res = reconcile_movie(mv, index, vocab, pm,
-                                  dry_run=dry_run, mappings=mappings)
+                                  dry_run=dry_run, mappings=mappings,
+                                  additive_only=additive_only)
             added_n += len(res["added"])
             removed_n += len(res["removed"])
             if res["matched"]:

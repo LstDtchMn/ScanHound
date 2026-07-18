@@ -101,6 +101,7 @@ EXPECTED_DEFAULT_KEYS = {
     "trash_retention_days",
     # Dolby Vision host-detector + labeler
     "dv_library_roots", "dv_detection", "dv_file_tagging", "dv_label_vocab",
+    "dv_auto_sync_enabled",
     # Pipeline reconciliation
     "pipeline_verify_grace_margin_minutes", "pipeline_reconcile_enabled",
     # Debug / logging

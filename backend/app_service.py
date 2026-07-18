@@ -652,6 +652,47 @@ class AppService:
         except Exception:
             logger.exception("Unmapped Plex path check failed (non-fatal)")
 
+        try:
+            if self.db is not None and self.config.get("dv_auto_sync_enabled", True):
+                # Keep the Plex DV FEL/MEL labels (which the Kometa overlays key
+                # on) current without a manual button press. Two deliberate
+                # guards, both load-bearing:
+                #
+                #  1. Runs ONLY when new DV detections have landed since the
+                #     last pass (max(scanned_at) rose). A full sync iterates
+                #     every movie library, so firing it hourly regardless would
+                #     be pure waste. The first pass after startup just records a
+                #     baseline and syncs nothing, so restarting the app never
+                #     kicks off a full-library label pass.
+                #  2. additive_only — never removes a managed label. A movie
+                #     whose path can't be matched this run would otherwise have
+                #     its labels stripped; on a timer, one transient matching
+                #     failure (dropped mount, changed Plex path form) would
+                #     silently wipe DV labels library-wide. Removals stay on the
+                #     manual sync, where a human sees the removed count.
+                latest = self.db.get_latest_dv_scan_at(source="scan")
+                if not hasattr(self, "_last_dv_scan_at"):
+                    self._last_dv_scan_at = latest  # baseline only
+                elif latest and (self._last_dv_scan_at is None
+                                 or latest > self._last_dv_scan_at):
+                    self._last_dv_scan_at = latest
+                    from backend.api.dependencies import registry
+                    from backend.rename import dv_labeler
+                    plex_service = getattr(registry, "_plex_service", None)
+                    pm = getattr(plex_service, "plex_manager", None) if plex_service else None
+                    if pm is None:
+                        logger.info("DV auto-sync: new DV data but Plex not "
+                                    "initialized — skipping this pass")
+                    else:
+                        result = dv_labeler.sync_labels(
+                            self.db, pm, self.config, additive_only=True)
+                        logger.info(
+                            "DV auto-sync: %d matched, %d label(s) added "
+                            "(additive-only)",
+                            result.get("matched", 0), result.get("added", 0))
+        except Exception:
+            logger.exception("DV auto label sync failed (non-fatal)")
+
     def _start_maintenance_loop(self, interval_seconds: float = 3600.0):
         """Start the hourly trash-sweep + WAL-checkpoint background thread."""
         if self._maintenance_thread and self._maintenance_thread.is_alive():

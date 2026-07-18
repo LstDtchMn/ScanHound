@@ -141,6 +141,7 @@ class AppConfig(TypedDict, total=False):
     dv_detection: bool
     dv_file_tagging: bool
     dv_label_vocab: str        # JSON: {layer: label}
+    dv_auto_sync_enabled: bool # scheduled additive-only DV label sync
 
     # Debug & Logging
     debug_mode: bool
@@ -484,6 +485,12 @@ _DEFAULT_CONFIG: AppConfig = {
     "dv_detection": False,
     "dv_file_tagging": False,
     "dv_label_vocab": '{"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}',
+    # Scheduled DV label sync (maintenance loop). Runs ONLY when new DV
+    # detections have landed since the last pass, and ADDITIVE-ONLY — it never
+    # removes a managed label, so a transient path-matching failure can't wipe
+    # the DV FEL/MEL labels the Kometa overlays key on. Set False to disable
+    # and keep DV labelling entirely manual (the Renames DV panel button).
+    "dv_auto_sync_enabled": True,
     # Plex reports library file paths using ITS OWN path form (a drive letter,
     # an NTFS junction-folder alias, or a NAS UNC share path), which usually
     # differs from where ScanHound's own docker-compose mounts expose that
