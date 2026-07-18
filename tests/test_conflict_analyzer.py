@@ -72,10 +72,13 @@ def test_analyze_job_conflict_degraded_when_probe_fails():
     # The fallback dict must carry every FileSpec field (as null), matching
     # probe_specs' OWN not-present shape exactly — not an abbreviated dict —
     # so the frontend's FileSpec type never sees a field silently missing.
+    # Plus original_filename, which the analyzer attaches itself (probe_specs
+    # never returns it) so it scores filename tags the way the Compare modal
+    # does — it's the optional FileSpec field conflict_preview also sets.
     assert set(result["existing"].keys()) == {
         "present", "path", "size_bytes", "container", "duration_min",
         "bitrate", "resolution", "video_codec", "hdr", "dv_layer", "audio",
-        "audio_profile"}
+        "audio_profile", "original_filename"}
 
 
 def test_analyze_job_conflict_degraded_when_incoming_vanished():
@@ -212,3 +215,28 @@ def test_analyze_job_conflict_no_path_mappings_uses_raw_path():
         conflict_analyzer.analyze_job_conflict(db, _job(), plex_cache_rows=plex_rows)
         existing_call = probe_mock.call_args_list[0]
         assert existing_call.args[0] == "C:\\1080p Drives\\1080p Bismark\\X (2020).mkv"
+
+
+def test_analyze_job_conflict_scores_filename_tags_like_the_modal():
+    # The row badge (this analyzer) and the Compare modal (conflict_preview)
+    # must reach the SAME verdict on the same pair. _quality_score reads
+    # source/audio/edition tiers off `original_filename`, which probe_specs
+    # never returns — so the analyzer has to attach it just as
+    # conflict_preview does. Here the two copies are identical on every
+    # probed axis and differ ONLY in filename tags (WEB-DL vs BluRay REMUX):
+    # without the attached names this scores a "tie".
+    db = MagicMock()
+    job = _job(original_filename="X.2020.2160p.BluRay.REMUX.TrueHD.Atmos.mkv")
+    probed = {"present": True, "resolution": "2160p", "hdr": None, "dv_layer": None,
+              "audio": "AC3", "size_bytes": 10}
+    with patch("os.path.lexists", return_value=True), \
+         patch("backend.rename.conflict_analyzer.probe_specs") as probe_mock:
+        probe_mock.side_effect = [
+            {**probed, "path": "/library/movies/X (2020)/X.2020.2160p.WEB-DL.DDP5.1.mkv"},
+            {**probed, "path": "/incoming/X.mkv"},
+        ]
+        result = conflict_analyzer.analyze_job_conflict(db, job, plex_cache_rows=[])
+    assert result["existing"]["original_filename"] == "X (2020).mkv"
+    assert result["incoming"]["original_filename"] == \
+        "X.2020.2160p.BluRay.REMUX.TrueHD.Atmos.mkv"
+    assert result["recommended"] == "incoming"

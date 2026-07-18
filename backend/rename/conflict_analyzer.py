@@ -103,6 +103,17 @@ def analyze_job_conflict(db, job: dict, plex_cache_rows: Optional[list] = None,
     existing = existing or _absent_spec(existing_path)
     incoming = incoming or _absent_spec(incoming_path)
 
+    # Attach the filename-borne signals `_quality_score` reads but probe_specs
+    # can't know (source/audio/edition tiers live in the release name, not the
+    # container). conflict_preview() does the same for the Compare modal
+    # (service.py) — without this the row's ★ and the modal's ★ score the same
+    # pair differently and can disagree whenever only those tags differ.
+    existing = {**existing,
+                "original_filename": os.path.basename(existing_path) if existing_path else None}
+    incoming = {**incoming,
+                "original_filename": job.get("original_filename"),
+                "resolution": incoming.get("resolution") or job.get("resolution")}
+
     # A genuinely not-present incoming (source file vanished between detection
     # and analysis) must not yield a recommendation. rank_conflict() returns
     # "incoming" whenever `existing` is absent, WITHOUT verifying `incoming`
