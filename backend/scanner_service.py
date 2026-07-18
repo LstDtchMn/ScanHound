@@ -660,6 +660,16 @@ class ScannerService:
                             # isn't hammered with N requests in a few seconds.
                             await asyncio.sleep(min(0.5 * blocked_streak, 3.0))
                             if blocked_streak >= 3:
+                                # Reuse the ScannerService's existing cancellation
+                                # primitive. _process_posts checks this event before
+                                # every worker request and cancels queued futures.
+                                self.stop_scan_flag = True
+                                self._log(
+                                    f"{source_name}: confirmed shared block after "
+                                    f"{blocked_streak} consecutive responses; stopping "
+                                    "remaining scan work",
+                                    "warning",
+                                )
                                 break  # session can't clear the block this run
                         continue
                     blocked_streak = 0  # a good page resets the streak

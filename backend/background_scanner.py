@@ -58,8 +58,11 @@ class BackgroundScanner:
             logger.info("Background scanner started")
 
     def stop(self) -> None:
-        """Signal the loop to stop and wait briefly for it to exit."""
+        """Stop the scheduler and interrupt any active shared scan."""
         self._stop.set()
+        scanner = getattr(self._reg, "scanner", None)
+        if scanner is not None and self._running.is_set():
+            scanner.stop_scan_flag = True
         t = self._thread
         if t and t.is_alive():
             t.join(timeout=2.0)
