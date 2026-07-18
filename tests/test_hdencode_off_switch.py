@@ -1,9 +1,16 @@
 """Focused tests proving the HDEncode switch gates live access paths."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from backend.api.routes.pipeline import UrlRequest as PipelineUrlRequest
+from backend.api.routes.pipeline import search_sources
 from backend.download_service import DownloadService
 from backend.scanner_service import ScannerService
+from backend.sources.base import PageResult, SourceBase, SourceCapability, SourceConfig
+from backend.sources.registry import SourceRegistry
 
 
 def _scanner_with_config(config):
@@ -38,6 +45,65 @@ def test_site_search_returns_no_hdencode_sources_when_disabled():
     )
 
     assert sources == []
+
+
+def _search_source_class(name, calls):
+    class _SearchSource(SourceBase):
+        @classmethod
+        def get_config(cls):
+            return SourceConfig(
+                name=name,
+                display_name=name,
+                base_url=f"https://{name}.example",
+                capabilities=SourceCapability.SEARCH,
+            )
+
+        async def fetch_page(self, page=1, mode="movies", **kwargs):
+            return PageResult(releases=[])
+
+        def parse_release(self, raw_data):
+            return None
+
+        async def search(self, query, mode="all", **kwargs):
+            calls[name] += 1
+            return PageResult(releases=[])
+
+    return _SearchSource
+
+
+@pytest.mark.asyncio
+async def test_pipeline_search_never_calls_disabled_hdencode(monkeypatch):
+    calls = {"hdencode": 0, "ddlbase": 0}
+    fake_hdencode = _search_source_class("hdencode", calls)
+    fake_ddlbase = _search_source_class("ddlbase", calls)
+
+    def discover_only_test_sources(source_registry, package_path=None):
+        source_registry.register(fake_hdencode)
+        source_registry.register(fake_ddlbase)
+
+    monkeypatch.setattr(
+        SourceRegistry, "discover_sources", discover_only_test_sources
+    )
+
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"title": "Example Movie", "season": None}
+    connection = MagicMock()
+    connection.execute.return_value = cursor
+    database = MagicMock()
+    database.get_connection.return_value = connection
+    registry = SimpleNamespace(
+        db=database,
+        config={"hdencode_enabled": False, "ddlbase_enabled": True},
+    )
+
+    result = await search_sources(
+        PipelineUrlRequest(url="https://rapidgator.net/file/original"),
+        registry,
+    )
+
+    assert result == {"releases": [], "errors": []}
+    assert calls == {"hdencode": 0, "ddlbase": 1}
+
 
 
 def test_scrape_links_does_not_initialize_selenium_when_hdencode_disabled():
