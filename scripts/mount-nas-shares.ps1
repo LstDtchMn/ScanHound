@@ -1,4 +1,4 @@
-# Re-establishes the 8 TURTLELANDSRV2 NAS share mounts inside Docker
+# Re-establishes the 9 TURTLELANDSRV2 NAS share mounts inside Docker
 # Desktop's internal WSL2 distro (docker-desktop), so docker-compose.yml's
 # read-only bind mounts under /mnt/nas/... (see the volumes: block) have
 # something real to mount from.
@@ -36,6 +36,13 @@ $shares = [ordered]@{
     "nas-1080p-picasso-aka-newton" = "1080p Picasso aka Newton"
     "nas-4k-hdr-geronimo"          = "4K HDR Geronimo"
     "nas-4k-magellan"              = "4K Magellan"
+    # TV Shows Blackbeard (share name is literally "k"; mapped to V: on the
+    # host). Unlike the eight above -- read-only Plex sources -- this one is
+    # bind-mounted READ-WRITE in docker-compose.yml: it is the TV download,
+    # extraction and rename destination, so the container must write to it.
+    # The drvfs mount itself is read-write either way; the :ro is applied on
+    # the Docker bind-mount side, which is where the distinction lives.
+    "nas-tv-blackbeard"            = "k"
 }
 
 # Written to a script file rather than passed inline through

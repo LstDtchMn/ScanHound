@@ -23,13 +23,31 @@ services:
       - ./data:/data
       # Library/download folders for auto-rename. JDownloader (on the Windows
       # host) downloads to F:\Downloads; renamed 1080p stays there, 4K goes to
-      # G:\Downloads. TV downloads/extracts/renames land directly in F:\TV
-      # Shows (no separate download-vs-library split like movies have). The
-      # container sees them as /library/movies + /movies-4k + /library/tv;
-      # JD's Windows saveTo paths are translated to these (Settings → Renaming).
+      # G:\Downloads. The container sees them as /library/movies +
+      # /library/movies-4k; JD's Windows saveTo paths are translated to these
+      # (Settings → Renaming).
       - "F:/Downloads:/library/movies"
       - "G:/Downloads:/library/movies-4k"
-      - "F:/TV Shows:/library/tv"
+      # TV moved off F:\TV Shows to the "TV Shows Blackbeard" NAS share
+      # (\\TURTLELANDSRV2\k, V: on the host) on 2026-07-18 — F: was a staging
+      # area Plex never scanned, and its show folders had already been
+      # migrated to this share by hand. The WHOLE share root is mounted, not
+      # a subfolder, so V:\Downloads (JD's TV download folder) and
+      # V:\Extractions (JD's extraction folder) are reachable as
+      # /library/tv/Downloads and /library/tv/Extractions with no extra
+      # mounts or mapping entries — and download, extract and rename all
+      # happen on ONE volume, so applying a TV rename stays a metadata move
+      # instead of a copy across the network.
+      #
+      # Read-WRITE, unlike the plex-source mounts below: this is a rename
+      # DESTINATION, not just a probe target. Mounted via the same drvfs
+      # workaround as the other NAS shares (see scripts/mount-nas-shares.ps1
+      # and the comment on the /mnt/nas block).
+      - "/mnt/nas/nas-tv-blackbeard:/library/tv"
+      # The retired F:\TV Shows staging area, kept read-only so anything left
+      # behind there is still visible to the probe/scan paths. Safe to drop
+      # once it's confirmed empty.
+      - "F:/TV Shows:/library/tv-legacy:ro"
       # Read-only mounts of the ACTUAL organized Plex library (as opposed to
       # the JD download/output folders above) so the technical-metadata probe
       # (probe_specs()/dovi_tool -- resolution/audio-profile/HDR10+/DV FEL-MEL)
