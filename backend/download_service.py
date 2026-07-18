@@ -1285,6 +1285,18 @@ class DownloadService:
         Returns:
             List of download link URLs.
         """
+        normalized_url = (url or "").lower()
+        # scrape_links dispatches every non-DDLBase/non-Adit-HD URL through the
+        # HDEncode path, so apply the same rule here before Selenium is imported
+        # or a browser is started. This also covers auto-grab and copy-links.
+        is_hdencode = (
+            "ddlbase.com" not in normalized_url
+            and "adit-hd.com" not in normalized_url
+        )
+        if is_hdencode and not self.config.get("hdencode_enabled", True):
+            self._log("[HDEncode] Source is disabled in Settings; no request was made.", "warning")
+            return []
+
         _ensure_selenium()
         from bs4 import BeautifulSoup
 
