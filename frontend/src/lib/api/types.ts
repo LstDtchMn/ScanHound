@@ -669,6 +669,19 @@ export interface TrashRestoreResponse {
   error?: string;
 }
 
+export interface TrashDeleteResponse {
+  ok: boolean;
+  bytes_freed?: number;
+  error?: string;
+}
+
+/** Summary shape shared with the retention sweep (fileops.sweep_trash). */
+export interface TrashEmptyResponse {
+  files_deleted: number;
+  bytes_freed: number;
+  buckets_removed: number;
+}
+
 export interface RenameHealthResponse {
   binaries: Record<string, boolean>;
   capabilities: Record<string, boolean>;

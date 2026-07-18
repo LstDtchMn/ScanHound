@@ -7,6 +7,17 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "2.28.0",
+    date: "2026-07-18",
+    summary: "Empty the trash without waiting a month",
+    changes: [
+      "Trash can now be emptied on demand. Previously the only way anything left the trash was the automatic retention sweep, so a file you were certain you didn't want back still sat on disk for the full retention period (30 days by default).",
+      "Each trashed file has its own Delete button, and the panel header has an Empty trash button with a running file count and total size. Both ask for confirmation first, and both are permanent — Restore is still there for anything you're not sure about.",
+      "Delete also works on entries with no manifest record (older trashed files that can't be restored automatically) — those were previously stuck until the sweep collected them.",
+      "The duplicate recommendation on a Renames row now scores release-name tags (Remux, Atmos, IMAX and the like) the same way the Compare view does, so the ★ on the row and the ★ in the Compare view can no longer disagree about the same pair of files.",
+    ],
+  },
+  {
     version: "2.27.0",
     date: "2026-07-17",
     summary: "Clearer duplicate resolution: pick which copy to keep",

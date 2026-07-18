@@ -534,6 +534,81 @@ class TestTrashListAndRestore:
         assert os.path.isfile(trashed_path)
         assert original.read_text() == "occupied"
 
+    def test_delete_removes_file_and_manifest_record(self, tmp_path, monkeypatch):
+        root = tmp_path / "trash"
+        trashed_path, original = self._trash_one(
+            tmp_path, monkeypatch, root, "20260101-000000", "movie.mkv", content="xyz")
+
+        result = fileops.delete_trash_entry("20260101-000000", "movie.mkv", [str(root)])
+        assert result["ok"] is True
+        assert result["bytes_freed"] == 3
+        assert not os.path.exists(trashed_path)
+        # The original stays gone — delete is the opposite of restore.
+        assert not original.exists()
+        assert fileops.list_trash_entries([str(root)]) == []
+        # Last file gone -> the whole dated bucket goes too, manifest included.
+        assert not os.path.isdir(os.path.dirname(trashed_path))
+
+    def test_delete_keeps_bucket_while_siblings_remain(self, tmp_path, monkeypatch):
+        root = tmp_path / "trash"
+        self._trash_one(tmp_path, monkeypatch, root, "20260101-000000", "a.mkv")
+        trashed_b, _ = self._trash_one(
+            tmp_path, monkeypatch, root, "20260101-000000", "b.mkv")
+
+        assert fileops.delete_trash_entry("20260101-000000", "a.mkv", [str(root)])["ok"]
+        remaining = fileops.list_trash_entries([str(root)])
+        assert [e["name"] for e in remaining] == ["b.mkv"]
+        # The surviving sibling keeps its restorable manifest record.
+        assert remaining[0]["restorable"] is True
+        assert os.path.isfile(trashed_b)
+
+    def test_delete_works_on_manifest_less_entry(self, tmp_path):
+        # restore_trash_entry refuses these (nowhere safe to put them back) —
+        # delete must NOT, since an unrestorable entry is exactly the one a
+        # user needs a way to get rid of.
+        root = tmp_path / "trash"
+        bucket = root / "20260101-000000"
+        bucket.mkdir(parents=True)
+        (bucket / "orphan.mkv").write_text("orphan")
+
+        result = fileops.delete_trash_entry("20260101-000000", "orphan.mkv", [str(root)])
+        assert result["ok"] is True
+        assert fileops.list_trash_entries([str(root)]) == []
+
+    def test_delete_rejects_path_traversal(self, tmp_path):
+        root = tmp_path / "trash"
+        root.mkdir()
+        outsider = tmp_path / "keepme.mkv"
+        outsider.write_text("keep")
+
+        result = fileops.delete_trash_entry("..", "keepme.mkv", [str(root)])
+        assert result["ok"] is False
+        assert "traversal" in result["error"].lower()
+        assert outsider.exists()
+
+    def test_delete_missing_entry_reports_not_found(self, tmp_path):
+        root = tmp_path / "trash"
+        root.mkdir()
+        result = fileops.delete_trash_entry("20260101-999999", "ghost.mkv", [str(root)])
+        assert result["ok"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_empty_trash_removes_everything_regardless_of_age(self, tmp_path, monkeypatch):
+        # The bucket name is today's date, so a normal 30-day sweep would skip
+        # it entirely — empty_trash must take it anyway.
+        root = tmp_path / "trash"
+        import datetime as _dt
+        fresh = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self._trash_one(tmp_path, monkeypatch, root, fresh, "new.mkv", content="ab")
+
+        assert fileops.sweep_trash(30, roots=[str(root)])["files_deleted"] == 0
+
+        summary = fileops.empty_trash(roots=[str(root)])
+        assert summary["files_deleted"] == 1
+        assert summary["bytes_freed"] == 2
+        assert summary["buckets_removed"] == 1
+        assert fileops.list_trash_entries([str(root)]) == []
+
     def test_restore_missing_manifest_entry_errors(self, tmp_path):
         root = tmp_path / "trash"
         bucket = root / "20260101-000000"

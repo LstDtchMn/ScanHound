@@ -400,6 +400,90 @@ def restore_trash_entry(bucket: str, name: str, roots) -> dict:
     return {"ok": False, "error": "Trash entry not found"}
 
 
+def delete_trash_entry(bucket: str, name: str, roots) -> dict:
+    """Permanently delete ONE trashed file, dropping its manifest record.
+
+    The counterpart to :func:`restore_trash_entry`, and validated the same way
+    (``bucket``/``name`` must be single path components, so nothing outside the
+    trash roots is reachable). Unlike restore, this works on manifest-less
+    entries too — there's nothing to restore them to, which is exactly when a
+    user wants them gone. Symlinks are unlinked, never followed to a target.
+
+    Removes the bucket once its last file is gone (manifest included), so trash
+    doesn't accumulate empty dated directories.
+
+    Returns ``{"ok": True, "bytes_freed": int}`` or ``{"ok": False, "error": ...}``.
+    """
+    if not _is_safe_component(bucket) or not _is_safe_component(name):
+        return {"ok": False, "error": "Invalid bucket or name (path traversal rejected)"}
+    if name == "manifest.json":
+        return {"ok": False, "error": "Refusing to delete a bucket manifest"}
+
+    for root in roots:
+        root = os.path.abspath(root)
+        bucket_path = os.path.join(root, bucket)
+        if not os.path.isdir(bucket_path):
+            continue
+        fpath = os.path.join(bucket_path, name)
+        is_link = os.path.islink(fpath)
+        if not is_link and not os.path.isfile(fpath):
+            continue
+        try:
+            size = 0 if is_link else os.path.getsize(fpath)
+            os.unlink(fpath)
+        except OSError as e:
+            return {"ok": False, "error": f"Delete failed: {e}"}
+
+        manifest = _load_manifest(bucket_path)
+        remaining = [r for r in manifest if r.get("trashed_name") != name]
+        if remaining != manifest:
+            try:
+                _save_manifest(bucket_path, remaining)
+            except OSError:
+                logger.warning("Failed to update manifest after delete at %s (non-fatal)",
+                               bucket_path, exc_info=True)
+        _remove_bucket_if_empty(bucket_path)
+        logger.info("trash delete | %s (%d bytes)", fpath, size)
+        return {"ok": True, "bytes_freed": size}
+
+    return {"ok": False, "error": "Trash entry not found"}
+
+
+def _remove_bucket_if_empty(bucket_path: str) -> None:
+    """Drop a trash bucket that holds nothing but its own manifest.
+
+    Best-effort: any error leaves the bucket in place for the retention sweep
+    to collect later. Never raises.
+    """
+    try:
+        leftovers = os.listdir(bucket_path)
+    except OSError:
+        return
+    if any(n != "manifest.json" for n in leftovers):
+        return
+    try:
+        for n in leftovers:
+            os.remove(os.path.join(bucket_path, n))
+        os.rmdir(bucket_path)
+    except OSError:
+        logger.warning("Failed to remove emptied trash bucket %s (skipped)",
+                       bucket_path, exc_info=True)
+
+
+def empty_trash(roots=None) -> dict:
+    """Permanently delete EVERY trashed file, ignoring the retention period.
+
+    A user-triggered "empty it now" — deliberately implemented as a sweep with
+    a negative retention rather than a parallel deletion routine, so it
+    inherits the sweep's symlink safety, per-file error tolerance and bucket
+    cleanup exactly. Negative rather than 0 so that a bucket whose computed age
+    is fractionally negative (clock stepped back between trashing and
+    emptying) is still collected — "empty" must leave nothing behind. Same
+    return shape as :func:`sweep_trash`.
+    """
+    return sweep_trash(-1, roots=roots)
+
+
 def _posix_mount_points() -> list:
     """Best-effort list of mount points on this POSIX host.
 

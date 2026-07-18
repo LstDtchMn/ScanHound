@@ -539,6 +539,31 @@ def restore_trash(body: TrashRestoreRequest, reg: ServiceRegistry = Depends(get_
     return result
 
 
+@router.post("/trash/delete")
+def delete_trash(body: TrashRestoreRequest, reg: ServiceRegistry = Depends(get_registry)):
+    """Permanently delete one trash entry — the counterpart to /trash/restore.
+
+    Unlike restore this accepts manifest-less entries (there's nowhere to put
+    them back, which is precisely when a user wants them gone). Rejects (400)
+    bucket/name values that look like path traversal; 404 if not found."""
+    bucket, name = body.bucket, body.name
+    if not fileops._is_safe_component(bucket) or not fileops._is_safe_component(name):
+        raise HTTPException(status_code=400, detail="Invalid bucket or name")
+    result = fileops.delete_trash_entry(bucket, name, fileops.all_trash_roots())
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error", "Delete failed"))
+    return result
+
+
+@router.post("/trash/empty")
+def empty_trash(reg: ServiceRegistry = Depends(get_registry)):
+    """Permanently delete every trashed file now, ignoring trash_retention_days.
+
+    Irreversible — the frontend confirms before calling. Returns the same
+    summary shape as the retention sweep."""
+    return fileops.empty_trash(fileops.all_trash_roots())
+
+
 @router.post("/process-folder")
 def process_folder(req: ProcessFolderRequest, reg: ServiceRegistry = Depends(get_registry)):
     """Scan a folder for video files and create rename jobs for each — for

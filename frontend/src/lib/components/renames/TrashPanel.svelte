@@ -4,12 +4,22 @@
   import { addToast } from '$lib/stores/notifications';
   import Tooltip from '$lib/components/Tooltip.svelte';
   import Badge from '$lib/components/Badge.svelte';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import type { TrashEntry } from '$lib/api/types';
 
   let open = $state(false);
   let loading = $state(false);
   let entries = $state<TrashEntry[]>([]);
   let restoringKey = $state<string | null>(null);
+  let deletingKey = $state<string | null>(null);
+  // Permanent deletes are irreversible, so both paths route through a
+  // ConfirmDialog: `pendingDelete` holds the single entry awaiting
+  // confirmation, `confirmEmpty` the empty-everything case.
+  let pendingDelete = $state<TrashEntry | null>(null);
+  let confirmEmpty = $state(false);
+  let emptying = $state(false);
+
+  let totalBytes = $derived(entries.reduce((sum, e) => sum + (e.size ?? 0), 0));
   // failed_db_last_package / db_corruption_flag surfaced from /rename/health —
   // shown as a compact warning badge in the panel header so they're visible
   // without a dedicated health page.
@@ -69,6 +79,40 @@
     }
   }
 
+  async function confirmDelete() {
+    const entry = pendingDelete;
+    if (!entry) return;
+    const key = entryKey(entry);
+    pendingDelete = null;
+    deletingKey = key;
+    try {
+      const res = await api.trashDelete(entry.bucket, entry.name);
+      entries = entries.filter((e) => entryKey(e) !== key);
+      addToast('Trash', `Deleted ${entry.name} — freed ${formatSize(res.bytes_freed ?? 0)}`);
+    } catch (e) {
+      addToast('Error', e instanceof Error ? e.message : 'Delete failed', 'error');
+    } finally {
+      deletingKey = null;
+    }
+  }
+
+  async function doEmpty() {
+    confirmEmpty = false;
+    emptying = true;
+    try {
+      const res = await api.trashEmpty();
+      entries = [];
+      addToast('Trash', `Emptied — ${res.files_deleted} file(s), ${formatSize(res.bytes_freed)} freed`);
+    } catch (e) {
+      addToast('Error', e instanceof Error ? e.message : 'Empty trash failed', 'error');
+      // The sweep is fail-safe per file, so a failure may still have removed
+      // some entries — reload rather than trusting the stale list.
+      loadTrash();
+    } finally {
+      emptying = false;
+    }
+  }
+
   function toggle() {
     open = !open;
     if (open && entries.length === 0 && !loading) {
@@ -111,6 +155,18 @@
         (unless <em>Require confirmation before permanent deletes</em> is turned off in Settings).
         Swept automatically after the configured retention period.
       </p>
+      {#if entries.length}
+        <div class="flex items-center justify-between gap-2 mb-2">
+          <span class="text-xs text-[var(--text-secondary)]">
+            {entries.length} file{entries.length === 1 ? '' : 's'} · {formatSize(totalBytes)}
+          </span>
+          <button
+            onclick={() => (confirmEmpty = true)}
+            disabled={emptying}
+            class="shrink-0 px-2.5 py-1 rounded-lg border border-[var(--error)] text-[var(--error)] text-xs hover:bg-[var(--error)] hover:text-white disabled:opacity-50 transition-colors"
+          >{emptying ? 'Emptying…' : 'Empty trash'}</button>
+        </div>
+      {/if}
       {#if loading}
         <p class="text-xs text-[var(--text-secondary)]">Loading…</p>
       {:else if entries.length === 0}
@@ -138,6 +194,11 @@
                   <button disabled class="shrink-0 px-2.5 py-1 rounded-lg border border-[var(--border)] text-[var(--text-secondary)] opacity-50 cursor-help">Restore</button>
                 </Tooltip>
               {/if}
+              <button
+                onclick={() => (pendingDelete = entry)}
+                disabled={deletingKey === entryKey(entry)}
+                class="shrink-0 px-2.5 py-1 rounded-lg border border-[var(--border)] text-[var(--error)] hover:bg-[var(--error)] hover:text-white disabled:opacity-50 transition-colors"
+              >{deletingKey === entryKey(entry) ? 'Deleting…' : 'Delete'}</button>
             </div>
           {/each}
         </div>
@@ -145,3 +206,25 @@
     </div>
   {/if}
 </div>
+
+{#if pendingDelete}
+  <ConfirmDialog
+    title="Delete permanently?"
+    message={`${pendingDelete.name} (${formatSize(pendingDelete.size)}) will be erased from disk. This cannot be undone.`}
+    confirmLabel="Delete"
+    variant="danger"
+    onconfirm={confirmDelete}
+    oncancel={() => (pendingDelete = null)}
+  />
+{/if}
+
+{#if confirmEmpty}
+  <ConfirmDialog
+    title="Empty trash?"
+    message={`All ${entries.length} file${entries.length === 1 ? '' : 's'} (${formatSize(totalBytes)}) will be erased from disk. This cannot be undone.`}
+    confirmLabel="Empty trash"
+    variant="danger"
+    onconfirm={doEmpty}
+    oncancel={() => (confirmEmpty = false)}
+  />
+{/if}
