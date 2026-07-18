@@ -15,7 +15,17 @@ router = APIRouter(prefix="/sources", tags=["sources"])
 def list_sources(reg: ServiceRegistry = Depends(get_registry)):
     source_reg = get_source_registry()
     source_reg.sync_from_config(reg.config)
-    return source_reg.list_sources()
+    sources = source_reg.list_sources()
+    health_by_source = reg.db.get_source_health() if reg.db else {}
+    for source in sources:
+        health = health_by_source.get(source["name"], {})
+        source["health_state"] = health.get("state", "unknown")
+        source["health_reason_code"] = health.get("reason_code")
+        source["health_updated_at"] = health.get("updated_at")
+        source["last_success_at"] = health.get("last_success_at")
+        source["last_failure_at"] = health.get("last_failure_at")
+        source["cooldown_until"] = health.get("cooldown_until")
+    return sources
 
 
 @router.put("/{source_id}")

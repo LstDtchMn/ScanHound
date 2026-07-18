@@ -20,6 +20,7 @@ from backend.database import DatabaseManager
 from backend.app_service import normalize_title
 from backend.sources.ddlbase import decode_ddlbase_link
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
+from backend.source_health import record_scrape_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -2127,6 +2128,9 @@ class DownloadService:
         try:
             links = self.scrape_links(url, service_type, progress_callback=_cb)
             diagnostic = getattr(links, "diagnostic", None)
+            normalized_url = (url or "").lower()
+            if "ddlbase.com" not in normalized_url and "adit-hd.com" not in normalized_url:
+                record_scrape_outcome(self.db, "hdencode", links)
         except Exception as e:
             links = []
             scrape_failed = True

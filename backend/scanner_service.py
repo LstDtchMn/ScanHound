@@ -663,6 +663,25 @@ class ScannerService:
                                 # Reuse the ScannerService's existing cancellation
                                 # primitive. _process_posts checks this event before
                                 # every worker request and cancels queued futures.
+                                try:
+                                    if source_id == "hdencode" and self.db is not None:
+                                        state = "cooldown" if last_block_status == 429 else "blocked"
+                                        cooldown = 15 * 60 if last_block_status == 429 else None
+                                        self.db.record_source_failure(
+                                            "hdencode",
+                                            state,
+                                            f"http_{last_block_status}",
+                                            cooldown_seconds=cooldown,
+                                        )
+                                except Exception:
+                                    # Health persistence must never prevent the
+                                    # actual block-detection/stop from taking
+                                    # effect (same guarantee as
+                                    # backend/source_health.py's own docstring) —
+                                    # a DB write failure here must not silently
+                                    # swallow the abort via the broader per-page
+                                    # except below.
+                                    pass
                                 self.stop_scan_flag = True
                                 self._log(
                                     f"{source_name}: confirmed shared block after "
@@ -673,6 +692,15 @@ class ScannerService:
                                 break  # session can't clear the block this run
                         continue
                     blocked_streak = 0  # a good page resets the streak
+                    try:
+                        if source_id == "hdencode" and self.db is not None:
+                            self.db.record_source_success("hdencode")
+                    except Exception:
+                        # A health-write failure on a successful page must not
+                        # abort parsing that page's posts (they're extracted
+                        # further down in this same try block) — see the note
+                        # on the block-abort site above.
+                        pass
 
                     soup = BeautifulSoup(resp.content, 'html.parser')
                     posts = self._select_posts(soup, source_id)

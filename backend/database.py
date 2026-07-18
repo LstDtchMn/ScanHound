@@ -468,6 +468,21 @@ class DatabaseManager:
                     )
                 ''')
 
+                # Current source-health snapshot — one row per source.
+                # Detailed request events remain intentionally out of scope.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS source_health (
+                        source TEXT PRIMARY KEY,
+                        state TEXT NOT NULL DEFAULT 'unknown',
+                        reason_code TEXT,
+                        updated_at TEXT NOT NULL,
+                        last_success_at TEXT,
+                        last_failure_at TEXT,
+                        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                        cooldown_until TEXT
+                    )
+                ''')
+
                 # Auto-rename tracking: one row per extracted media file, with
                 # the identified match, confidence, and rename/move outcome.
                 # Modeled on Nomen's file_manager table. Statuses: pending,
@@ -2612,6 +2627,76 @@ class DatabaseManager:
         rows = self._query('SELECT link, title, resolution FROM scraped_link_map', default=[])
         return {row[0]: {"title": row[1], "resolution": row[2]} for row in rows}
 
+
+    # ── Source health ──────────────────────────────────────────────────
+
+    def get_source_health(self, source=None):
+        """Return one health row, or all rows keyed by source."""
+        if source is not None:
+            row = self._query(
+                "SELECT * FROM source_health WHERE source = ?",
+                (source,),
+                one=True,
+                default=None,
+            )
+            return dict(row) if row is not None else None
+        rows = self._query("SELECT * FROM source_health", default=[])
+        return {row["source"]: dict(row) for row in rows}
+
+    def record_source_success(self, source):
+        """Mark a source healthy and clear its failure/cooldown streak."""
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return self._mutate(
+            """INSERT INTO source_health (
+                   source, state, reason_code, updated_at, last_success_at,
+                   last_failure_at, consecutive_failures, cooldown_until
+               ) VALUES (?, 'healthy', NULL, ?, ?, NULL, 0, NULL)
+               ON CONFLICT(source) DO UPDATE SET
+                   state = 'healthy', reason_code = NULL, updated_at = excluded.updated_at,
+                   last_success_at = excluded.last_success_at,
+                   consecutive_failures = 0, cooldown_until = NULL""",
+            (source, now, now),
+            label="record_source_success",
+        )
+
+    def record_source_failure(
+        self, source, state, reason_code, *, cooldown_seconds=None
+    ):
+        """Persist one health-affecting failure and increment its streak."""
+        allowed = {"unknown", "healthy", "degraded", "blocked", "cooldown"}
+        if state not in allowed:
+            raise ValueError(f"Invalid source health state: {state}")
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        now = now_dt.isoformat()
+        cooldown_until = None
+        if cooldown_seconds:
+            cooldown_until = (
+                now_dt + datetime.timedelta(seconds=max(0, int(cooldown_seconds)))
+            ).isoformat()
+        return self._mutate(
+            """INSERT INTO source_health (
+                   source, state, reason_code, updated_at, last_success_at,
+                   last_failure_at, consecutive_failures, cooldown_until
+               ) VALUES (?, ?, ?, ?, NULL, ?, 1, ?)
+               ON CONFLICT(source) DO UPDATE SET
+                   state = excluded.state,
+                   reason_code = excluded.reason_code,
+                   updated_at = excluded.updated_at,
+                   last_failure_at = excluded.last_failure_at,
+                   consecutive_failures = source_health.consecutive_failures + 1,
+                   cooldown_until = excluded.cooldown_until""",
+            (source, state, reason_code, now, now, cooldown_until),
+            label="record_source_failure",
+        )
+
+    def clear_source_health(self, source=None):
+        if source is None:
+            return self._mutate("DELETE FROM source_health", label="clear_source_health")
+        return self._mutate(
+            "DELETE FROM source_health WHERE source = ?",
+            (source,),
+            label="clear_source_health",
+        )
 
 # ── Startup-time corruption surfacing ─────────────────────────────────────
 
