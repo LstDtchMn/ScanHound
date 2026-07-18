@@ -688,7 +688,13 @@ class ScannerService:
                             skipped_count += 1
                             continue
                         page_new += 1
-                        all_posts.append({'url': post_url, 'type': source_type_hint, 'source': source_id, 'category': source_category})
+                        all_posts.append({
+                            'url': post_url,
+                            'type': source_type_hint,
+                            'source': source_id,
+                            'category': source_category,
+                            'listing_title': post.get_text(' ', strip=True),
+                        })
 
                     # Early-stop: a populated page that yields no new posts means
                     # we've reached content already cached/seen — deeper pages are
@@ -749,9 +755,138 @@ class ScannerService:
 
     # ── Post processing ───────────────────────────────────────────────
 
+    def _parse_hdencode_listing_candidate(self, post_info: Dict):
+        """Return a lightweight ParsedRelease from listing text, or None."""
+        title = (post_info.get("listing_title") or "").strip()
+        if post_info.get("source") != "hdencode" or not title:
+            return None
+        try:
+            parser = getattr(self, "_hdencode_listing_parser", None)
+            if parser is None:
+                from backend.sources.hdencode import HDEncodeSource
+                parser = HDEncodeSource()
+                self._hdencode_listing_parser = parser
+            mode = "tv" if post_info.get("type") == "tv" else "movies"
+            return parser.parse_release({
+                "title": title,
+                "url": post_info.get("url", ""),
+                "mode": mode,
+                "article_html": "",
+            })
+        except Exception:
+            logger.debug("Could not parse HDEncode listing candidate %r", title, exc_info=True)
+            return None
+
+    def _should_hydrate_listing_candidate(self, post_info: Dict) -> bool:
+        """Whether a detail request is still needed for this listing candidate.
+
+        Fail-open by design: any missing field, uncertain Plex match, matching
+        exception, or unsupported source returns True. A False result requires
+        conclusive evidence that the candidate is not useful to the user.
+        """
+        if post_info.get("source") != "hdencode":
+            return True
+
+        url = post_info.get("url", "")
+        if url and url in self.download_history:
+            return False
+
+        release = self._parse_hdencode_listing_candidate(post_info)
+        if release is None or not getattr(release, "display_title", None):
+            return True
+
+        title = release.display_title
+        season = release.season
+        resolution = release.resolution or ""
+        dovi = bool(release.is_dovi)
+        title_key = normalize_title(title)
+        # Missing identity/quality fields are uncertain at listing time. Fetch the
+        # detail page rather than risk suppressing a real upgrade or different title.
+        if (not title_key or not resolution
+                or (not release.is_tv and not release.year)
+                or (release.is_tv and season is None)):
+            return True
+
+        # Title-level download history: skip same-or-lower quality siblings, but
+        # hydrate a real resolution/DV upgrade.
+        history_key = f"{title_key}|S{season}" if season is not None else title_key
+        prior_entries = self._downloaded_titles_lookup.get(history_key) or []
+        if prior_entries:
+            best = max(prior_entries, key=lambda entry: entry.get("downloaded_at", ""))
+            incoming_rank = _res_rank(resolution)
+            prior_rank = _res_rank(best.get("resolution"))
+            is_upgrade = incoming_rank > prior_rank or (
+                incoming_rank == prior_rank and dovi and not bool(best.get("dovi"))
+            )
+            if not is_upgrade:
+                return False
+
+        plex_index = getattr(self.plex, "plex_index", None) or {}
+        if not plex_index.get("all_items"):
+            return True
+
+        web_item = {
+            "display_title": title,
+            "year": release.year or 0,
+            "res": resolution or "?",
+            "size": release.size or "?",
+            "dovi": dovi,
+            "hdr": release.hdr_format or ("HDR" if release.is_hdr else "SDR"),
+            "url": url,
+            "imdb_id": release.imdb_id,
+            "is_tv": bool(release.is_tv),
+            "season": season,
+            "episodes": None,
+            "search_key": title_key,
+            "episode_number": release.episode,
+        }
+
+        try:
+            if web_item["is_tv"]:
+                matches, is_uncertain = self.matching.find_tv_season_matches(
+                    web_item, plex_index
+                )
+            else:
+                matches, is_uncertain = self.matching.find_movie_matches(
+                    web_item, plex_index
+                )
+            if is_uncertain or not matches:
+                return True
+
+            if web_item["is_tv"]:
+                status_str, _color, _info, is_upgrade = (
+                    self.matching.calculate_tv_upgrade_status(web_item, matches[0])
+                )
+                return bool(is_upgrade) or status_str == STATUS_MISSING
+
+            status_str, _color, _info, _plex_id = (
+                self.matching.calculate_movie_upgrade_status(web_item, matches)
+            )
+            return status_str == STATUS_MISSING or "UPGRADE" in status_str.upper()
+        except Exception:
+            logger.debug("Listing-stage Plex match failed for %s", title, exc_info=True)
+            return True
+
     async def _process_posts(self, all_posts: List[Dict], scraper, num_threads: int):
+        discovered_posts = len(all_posts)
+        eligible_posts = [
+            post for post in all_posts
+            if self._should_hydrate_listing_candidate(post)
+        ]
+        skipped = discovered_posts - len(eligible_posts)
+        if skipped:
+            self._log(
+                f"Lazy hydration skipped {skipped}/{discovered_posts} conclusive "
+                "already-owned candidate(s) before detail fetch"
+            )
         processed = 0
-        total_posts = len(all_posts)
+        total_posts = len(eligible_posts)
+        if total_posts == 0:
+            self._log(
+                f"Processing complete: 0 items created from {discovered_posts} posts "
+                f"({skipped} detail request(s) avoided)"
+            )
+            return
 
         def process_post(post_info):
             if self.stop_scan_flag:
@@ -772,7 +907,7 @@ class ScannerService:
                 return None
 
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = [executor.submit(process_post, post) for post in all_posts]
+            futures = [executor.submit(process_post, post) for post in eligible_posts]
             for future in as_completed(futures):
                 if self.stop_scan_flag:
                     # Cancel queued (not-yet-started) futures so the executor
@@ -796,7 +931,10 @@ class ScannerService:
                             self._item_counter += 1
                             self.items.append(item)
 
-        self._log(f"Processing complete: {len(self.items)} items created from {total_posts} posts")
+        self._log(
+            f"Processing complete: {len(self.items)} items created from "
+            f"{discovered_posts} posts ({skipped} detail request(s) avoided)"
+        )
 
     # ── Item creation ─────────────────────────────────────────────────
 
