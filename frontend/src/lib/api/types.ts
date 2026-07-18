@@ -357,11 +357,6 @@ export interface Settings {
   // Filtering
   exclude_720p?: boolean;
 
-  // Sources
-  source_2160p?: boolean;
-  source_remux?: boolean;
-  source_tv_packs?: boolean;
-
   // DDLBase / Cuty.io
   ddlbase_enabled?: boolean;
   ddlbase_manual_resolution_timeout?: number;

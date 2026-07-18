@@ -706,36 +706,11 @@
           <h3 class="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Source Options</h3>
 
           <div class="space-y-2">
-            <label class="flex items-center gap-3">
-              <input
-                type="checkbox"
-                checked={$settings.source_2160p as boolean ?? true}
-                onchange={(e) => settings.update((s) => ({ ...s, source_2160p: e.currentTarget.checked }))}
-                class="accent-[var(--accent)]"
-              />
-              <span class="text-sm">Include 2160p sources</span>
-            </label>
-
-            <label class="flex items-center gap-3">
-              <input
-                type="checkbox"
-                checked={$settings.source_remux as boolean ?? true}
-                onchange={(e) => settings.update((s) => ({ ...s, source_remux: e.currentTarget.checked }))}
-                class="accent-[var(--accent)]"
-              />
-              <span class="text-sm">Include Remux sources</span>
-            </label>
-
-            <label class="flex items-center gap-3">
-              <input
-                type="checkbox"
-                checked={$settings.source_tv_packs as boolean ?? false}
-                onchange={(e) => settings.update((s) => ({ ...s, source_tv_packs: e.currentTarget.checked }))}
-                class="accent-[var(--accent)]"
-              />
-              <span class="text-sm">Include TV packs</span>
-            </label>
-
+            <!-- The former "Include 2160p / Remux / TV packs" checkboxes lived
+                 here. They were write-only: persisted and editable, but never
+                 read by any scan path, so unchecking one silently did nothing.
+                 Which categories a scan actually covers is driven by the
+                 per-scan flags (4k/remux/tv) in scanner_service.py. -->
             <label class="flex items-center gap-3">
               <input
                 type="checkbox"

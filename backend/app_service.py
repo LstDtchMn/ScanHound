@@ -971,8 +971,8 @@ class AppService:
             'use_tmdb', 'show_rating', 'show_votes', 'show_rt', 'show_rg',
             'show_nf', 'show_links', 'jd_enabled', 'rule_1080_4k',
             'rule_1080_4k_size', 'rule_1080_1080', 'rule_4k_4k', 'rule_dv',
-            'strict_resolution', 'debug_mode', 'source_2160p', 'source_remux',
-            'source_tv_packs', 'scheduler_enabled', 'clear_logs_startup',
+            'strict_resolution', 'debug_mode',
+            'scheduler_enabled', 'clear_logs_startup',
             'plex_invalidate_on_new_content',
         ]
         for key in boolean_fields:

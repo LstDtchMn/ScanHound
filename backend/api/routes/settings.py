@@ -179,10 +179,8 @@ class SettingsUpdate(BaseModel):
     # Filtering
     exclude_720p: Optional[bool] = None
 
-    # Sources
-    source_2160p: Optional[bool] = None
-    source_remux: Optional[bool] = None
-    source_tv_packs: Optional[bool] = None
+    # (Removed with the dead Settings checkboxes: source_2160p / source_remux /
+    # source_tv_packs were accepted and stored but never read by any scan path.)
 
     # DDLBase / Cuty.io
     ddlbase_enabled: Optional[bool] = None

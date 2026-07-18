@@ -85,10 +85,10 @@ class AppConfig(TypedDict, total=False):
     # Filtering
     exclude_720p: bool
 
-    # Sources
-    source_2160p: bool
-    source_remux: bool
-    source_tv_packs: bool
+    # (Removed: source_2160p / source_remux / source_tv_packs. They were
+    # write-only — persisted and editable in Settings, but read by no scan
+    # path, so toggling one silently did nothing. Which categories a scan
+    # covers is driven by the per-scan flags in scanner_service.py.)
 
     # DDLBase / Cuty.io
     ddlbase_enabled: bool
@@ -440,9 +440,6 @@ _DEFAULT_CONFIG: AppConfig = {
     "debug_mode": False,
     "verbose_logging": False,
     "exclude_720p": False,
-    "source_2160p": True,
-    "source_remux": True,
-    "source_tv_packs": False,
     "ddlbase_enabled": True,
     "ddlbase_manual_resolution_timeout": 60,
     "cuty_email": "",

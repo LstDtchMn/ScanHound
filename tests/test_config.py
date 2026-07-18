@@ -75,7 +75,7 @@ EXPECTED_DEFAULT_KEYS = {
     "jd_movies_folder_4k", "jd_tv_folder",
     "jd_email", "jd_password", "jd_device",
     # Source / filtering
-    "exclude_720p", "source_2160p", "source_remux", "source_tv_packs",
+    "exclude_720p",
     # DDLBase / Cuty
     "ddlbase_enabled", "ddlbase_manual_resolution_timeout",
     "cuty_email", "cuty_password",
