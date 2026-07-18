@@ -21,6 +21,21 @@ if command -v Xvfb >/dev/null 2>&1; then
     done ) &
 fi
 
+# Stale Chromium profile locks. The browser profile lives under the scanhound
+# user's home (/data), which is a PERSISTENT volume — so a container that dies
+# while Chromium is running leaves SingletonLock/Cookie/Socket behind pointing
+# at a DEAD container's hostname+PID (e.g. "36a3997fb5cf-9776"). They survive
+# even a full `compose up --build` recreate. The next Chromium then refuses to
+# start ("The profile appears to be in use by another Chromium process"), and a
+# Chromium that dies during launch surfaces to chromedriver as exactly the same
+# "session not created: chrome not reachable" a dead display produces — so this
+# is a second, independent cause of the identical, easily-misattributed
+# failure. Nothing can legitimately hold the profile at container start, so
+# clearing these here is always safe.
+rm -f /data/.config/chromium/SingletonLock \
+      /data/.config/chromium/SingletonCookie \
+      /data/.config/chromium/SingletonSocket 2>/dev/null || true
+
 # --no-auth only disables the desktop-sidecar nonce (SCANHOUND_AUTH_NONCE) —
 # it does NOT disable the app's own password gate. The bearer-token
 # middleware (backend/api/main.py) now fails CLOSED when neither a nonce nor
