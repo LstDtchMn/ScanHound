@@ -241,12 +241,16 @@ def scrape_links(
     except Exception as e:
         logger.exception("Scrape failed for %s", req.url)
         raise HTTPException(status_code=502, detail=f"Scrape failed: {e}")
+    diagnostic = getattr(links, "diagnostic", None)
     if links and req.title and reg.db:
         try:
             reg.db.record_scraped_links(links, req.title, req.resolution, req.url)
         except Exception:
             pass
-    return {"links": links, "count": len(links)}
+    response = {"links": list(links), "count": len(links)}
+    if diagnostic is not None:
+        response.update(diagnostic.to_dict())
+    return response
 
 
 class ScrapeBatchRequest(BaseModel):
@@ -277,16 +281,21 @@ def copy_links_batch(
     def _do_copy():
         all_links: List[str] = []
         seen = set()
+        failures: List[Dict[str, Any]] = []
         for i, it in enumerate(items):
             ws_manager.broadcast_sync({
                 "type": "download:scrape_progress",
                 "data": {"completed": i, "total": total, "current": it.url},
             })
+            diagnostic = None
             try:
                 links = dl.scrape_links(it.url, it.service_type)
+                diagnostic = getattr(links, "diagnostic", None)
             except Exception:
                 logger.exception("Batch scrape failed for %s", it.url)
                 links = []
+            if not links and diagnostic is not None:
+                failures.append({"url": it.url, **diagnostic.to_dict()})
             for link in links:
                 if link not in seen:
                     seen.add(link)
@@ -310,14 +319,21 @@ def copy_links_batch(
             "data": {"completed": total, "total": total, "current": ""},
         })
         if not all_links:
-            body = f"No links found across {total} item(s)"
+            reason_codes = sorted({f["reason_code"] for f in failures})
+            suffix = f" ({', '.join(reason_codes)})" if reason_codes else ""
+            body = f"No links found across {total} item(s){suffix}"
         elif copied:
             body = f"Copied {len(all_links)} link(s) from {total} item(s) — JDownloader should grab them"
         else:
             body = f"Found {len(all_links)} link(s) but clipboard copy failed"
         ws_manager.broadcast_sync({
             "type": "notification",
-            "data": {"title": "Copy Links", "body": body, "priority": "normal" if all_links else "high"},
+            "data": {
+                "title": "Copy Links",
+                "body": body,
+                "priority": "normal" if all_links else "high",
+                "reason_codes": sorted({f["reason_code"] for f in failures}),
+            },
         })
 
     background_tasks.add_task(_do_copy)
