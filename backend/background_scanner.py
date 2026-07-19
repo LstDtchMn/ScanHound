@@ -182,10 +182,23 @@ class BackgroundScanner:
         # they aren't purged while still listed.
         cached_urls = db.get_background_cache_urls()
         total = 0
-        any_early_stopped = False
+        # Purging is safe only when every configured source completed a full
+        # crawl.  A disabled source is intentionally not visited, just like an
+        # early-stopped source is only partially visited.
+        purge_safe = True
         source_results: List[Dict[str, Any]] = []
         try:
             for source in sources:
+                if (str(source).strip().lower() == "hdencode"
+                        and not cfg.get("hdencode_enabled", True)):
+                    logger.info("Background scan: HDEncode disabled; skipping without network access")
+                    source_results.append({
+                        "source": source, "new": 0, "error": None,
+                        "skipped": "disabled",
+                    })
+                    purge_safe = False
+                    continue
+
                 err: Optional[str] = None
                 items: List[Any] = []
                 try:
@@ -200,7 +213,7 @@ class BackgroundScanner:
                     if seen:
                         db.touch_background_cache(seen)
                     if getattr(scanner, "_last_crawl_early_stopped", False):
-                        any_early_stopped = True
+                        purge_safe = False
 
                 rows = self._to_cache_rows(items, source)
                 if rows:
@@ -221,8 +234,11 @@ class BackgroundScanner:
             # deeper pages, so its seen-set is partial and last_seen wasn't
             # refreshed for still-listed items further down — purging now would
             # age out releases that are still on the site.
-            if any_early_stopped:
-                logger.info("Background scan: a source stopped early, skipping cache purge this run")
+            if not purge_safe:
+                logger.info(
+                    "Background scan: a source was disabled or stopped early; "
+                    "skipping cache purge this run"
+                )
             else:
                 try:
                     retain = max(1, int(cfg.get("background_scan_retain_days", 7)))
