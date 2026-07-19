@@ -229,3 +229,25 @@ def test_challenge_iframe_signal_drops_path_query_and_fragment():
     assert secret not in serialized
     assert "api.js" not in serialized
     assert "#state" not in serialized
+
+
+
+def test_challenge_iframe_signal_rejects_arbitrary_non_url_text():
+    from backend.download_service import _challenge_iframe_signal
+
+    signal = _challenge_iframe_signal("not a url at all captcha SECRET")
+
+    assert signal == "iframe:captcha@unknown"
+    assert "SECRET" not in signal
+    assert "not a url" not in signal
+
+
+def test_challenge_iframe_signal_parses_protocol_relative_host():
+    from backend.download_service import _challenge_iframe_signal
+
+    signal = _challenge_iframe_signal(
+        "//challenges.cloudflare.com/turnstile?sitekey=SECRET"
+    )
+
+    assert signal == "iframe:turnstile@challenges.cloudflare.com"
+    assert "SECRET" not in signal

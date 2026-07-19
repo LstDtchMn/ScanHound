@@ -116,8 +116,8 @@ def _challenge_iframe_signal(src: str) -> str:
     """Return a closed, non-sensitive challenge-frame signal.
 
     Full iframe URLs may contain site keys, return URLs, state, or tokens in
-    their path/query. Public diagnostics need only the challenge technology and
-    normalized hostname.
+    their path/query. Public diagnostics expose only a closed challenge marker
+    and a syntactically valid ASCII hostname.
     """
     raw = (src or "").strip()
     low = raw.lower()
@@ -127,11 +127,31 @@ def _challenge_iframe_signal(src: str) -> str:
         ) if name in low),
         "challenge",
     )
-    try:
-        parsed = urlparse(raw if "://" in raw else "https://" + raw)
-        host = (parsed.hostname or "unknown").lower().rstrip(".")
-    except Exception:
-        host = "unknown"
+
+    if raw.startswith("//"):
+        parse_target = "https:" + raw
+    elif "://" in raw:
+        parse_target = raw
+    else:
+        parse_target = ""
+
+    host = "unknown"
+    if parse_target:
+        try:
+            candidate = (urlparse(parse_target).hostname or "").lower().rstrip(".")
+            if (
+                candidate
+                and len(candidate) <= 253
+                and ".." not in candidate
+                and re.fullmatch(
+                    r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?",
+                    candidate,
+                )
+            ):
+                host = candidate
+        except Exception:
+            pass
+
     return f"iframe:{marker}@{host}"
 
 
