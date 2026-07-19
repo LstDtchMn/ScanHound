@@ -437,14 +437,20 @@ retargeted merely to run CI.
 | Branch | Contents | 3.11 | 3.12 | frontend |
 |---|---|---|---|---|
 | `fix/e2e-full-state-isolation` (PR #14) | main + E2E isolation | ✅ | ✅ | ✅ |
-| `review/int3-pr5` `f84ee19` | main + corrected PR #5 | queued | ✅ | ✅ |
-| `review/int3-pr6` `d782956` | main + corrected PR #6 | queued | ✅ | ✅ |
-| `review/int3-pr8` `066d7ec` | main + corrected PR #8 | queued | ✅ | ✅ |
-| `review/int3-pr7pr8` `589a579` | main + corrected #7 + #8 | queued | ✅ | ✅ |
+| `review/int3-pr5` `f84ee19` | main + corrected PR #5 | ✅ | ✅ | ✅ |
+| `review/int3-pr6` `d782956` | main + corrected PR #6 | ✅ | ✅ | ✅ |
+| `review/int3-pr8` `066d7ec` | main + corrected PR #8 | ✅ | ✅ | ✅ |
+| `review/int3-pr7pr8` `589a579` | main + corrected #7 + #8 | ✅ | ✅ | ✅ |
 
-All five merged cleanly — zero conflicts. **PR #14 is fully green on all three
-jobs.** Every completed job is green; the remaining 3.11 jobs are queued behind
-GitHub Actions concurrency and none had failed at time of writing.
+All five merged cleanly — zero conflicts, and **all five are fully green: every
+Python 3.11, Python 3.12, and frontend job passed.** That includes the combined
+corrected-PR #7 + corrected-PR #8 integration the review asked for.
+
+Run IDs: PR #14 `29690617321`, int3-pr5 `29690607651`, int3-pr6 `29690610138`,
+int3-pr8 `29690612617`, int3-pr7pr8 `29690615145`.
+
+No child-only regression appeared on any branch — each corrected PR integrates
+with current `main` without introducing a failure of its own.
 
 A `main + corrected PR #3` integration was **not** built, because Phase 1 is held
 (§4.1) — there is no corrected PR #3 to integrate.
