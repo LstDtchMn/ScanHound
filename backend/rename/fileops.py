@@ -123,18 +123,42 @@ def _trash_bucket_name() -> str:
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def _casefold_lexists(path: str) -> bool:
+    """Return whether a directory entry collides with ``path`` by casefold.
+
+    Keep-both output may move between Linux containers, Windows volumes, and
+    NAS mounts with different case semantics. Treat case-only differences as a
+    collision everywhere so a name chosen on one filesystem cannot overwrite
+    or alias another file when used on a case-insensitive destination later.
+    ``os.scandir`` also sees broken symlinks, matching ``lexists`` semantics.
+    """
+    directory = os.path.dirname(path) or os.curdir
+    target = os.path.basename(path).casefold()
+    try:
+        with os.scandir(directory) as entries:
+            return any(entry.name.casefold() == target for entry in entries)
+    except OSError:
+        # Preserve the old best-effort behavior when the directory cannot be
+        # enumerated (permissions, transient mount failure, missing parent).
+        return os.path.lexists(path)
+
+
 def dedupe_dest(dst: str) -> str:
-    """Return ``dst`` if free, else the next ``"{base} ({n}){ext}"`` that does not
-    exist. Case-insensitive existence check via ``os.path.lexists`` (NTFS mounts
-    are case-insensitive); the extension is preserved. Used by Keep-both."""
-    if not os.path.lexists(dst):
+    """Return a cross-platform collision-free Keep-both destination.
+
+    Exact and case-only filename matches collide on every filesystem. The next
+    available ``"{base} ({n}){ext}"`` name preserves the requested spelling and
+    extension while remaining safe if the file later crosses onto a
+    case-insensitive volume.
+    """
+    if not _casefold_lexists(dst):
         return dst
     directory = os.path.dirname(dst)
     base, ext = os.path.splitext(os.path.basename(dst))
     n = 1
     while True:
         candidate = os.path.join(directory, f"{base} ({n}){ext}")
-        if not os.path.lexists(candidate):
+        if not _casefold_lexists(candidate):
             return candidate
         n += 1
 
