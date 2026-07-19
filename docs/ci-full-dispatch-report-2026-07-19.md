@@ -211,3 +211,44 @@ PR #13 itself is verified as applied and behaving as specified; it is stacked on
 - `main` checkout clean; `frontend/playwright.config.ts` reverted there.
 - Deployment gate untouched: PR #3 still must deploy alone with HDEncode
   disabled and demonstrate one clean background-scan cycle before #5–#8 advance.
+
+---
+
+## ADDENDUM — Blocker 2 root cause confirmed and candidate fix validated
+
+Controlled local A/B. The CI condition was reproduced by pointing the backend at an
+empty data dir (`SCANHOUND_DATA_DIR` / `SCANHOUND_DB_DIR` -> fresh temp dir), which
+reproduces "no credential row" exactly as a fresh CI checkout does.
+
+| Run | Playwright config | `SCANHOUND_ALLOW_OPEN` | Result |
+|-----|-------------------|------------------------|--------|
+| A | dev (parent) | unset | **3 failed**, 15 passed — 4.5m |
+| B | dev (parent) | `1` | **18 passed** — 39.7s |
+| C | preview (PR #13) | `1` | **18 passed** — 13.2s |
+
+A's failures were the mobile URL/element assertions, with
+`Received string: "http://localhost:5174/login"` — the `setup_required` bounce,
+confirmed directly.
+
+A -> B changes exactly one variable and turns 3 failures into 0. **The auth gate is
+the cause, and `SCANHOUND_ALLOW_OPEN=1` on the e2e step is sufficient to clear it.**
+
+B -> C isolates PR #13's contribution: same passing result, **39.7s -> 13.2s (3x
+faster)**. The preview change is independently worth keeping even though it was not
+the CI blocker.
+
+### Honest scope limit
+
+Locally only 3 of CI's 12 failures reproduced; the 9 route-title failures did not
+reproduce on this host in dev mode. So this A/B proves the mechanism and the fix for
+everything that reproduced, and CI's evidence (every route returning the fallback
+title `"App | ScanHound"`, plus a `/login` URL in the tab-bar test) is consistent
+with the same cause — but the title failures themselves were not independently
+reproduced locally. The next CI run with `SCANHOUND_ALLOW_OPEN=1` set is the check.
+
+### Not applied
+
+`.github/workflows/tests.yml` is unchanged. Adding the env var to the e2e step is
+ChatGPT's call; note that `SCANHOUND_ALLOW_OPEN=1` is the documented intentional
+escape hatch for headless/dev use (`backend/api/dependencies.py:219`), so scoping it
+to the single e2e step keeps the fail-closed posture everywhere else.
