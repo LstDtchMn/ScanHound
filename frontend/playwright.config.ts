@@ -54,13 +54,20 @@ export default defineConfig({
       cwd: '..',
       url: `http://127.0.0.1:${BACKEND_PORT}/health`,
       env: {
+        // The backend's POSIX config/data paths derive from HOME. Keep every
+        // path inside the unique E2E directory, not the developer's profile.
+        HOME: E2E_DATA_DIR,
+        XDG_CONFIG_HOME: join(E2E_DATA_DIR, '.config'),
+        XDG_DATA_HOME: join(E2E_DATA_DIR, '.local', 'share'),
         APPDATA: E2E_DATA_DIR,
         LOCALAPPDATA: E2E_DATA_DIR,
         SCANHOUND_DATA_DIR: E2E_DATA_DIR,
         SCANHOUND_DB_DIR: E2E_DATA_DIR,
         SCANHOUND_ALLOW_OPEN: '1',
       },
-      reuseExistingServer: !process.env.CI,
+      // Reusing a backend can attach E2E to a real user process and bypass all
+      // of the isolation above. Port conflicts must fail loudly instead.
+      reuseExistingServer: false,
       timeout: 30_000,
     },
     {
