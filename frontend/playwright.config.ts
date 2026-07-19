@@ -1,4 +1,6 @@
 import { defineConfig, devices } from '@playwright/test';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Mirrors scripts/dev.py's port convention: backend on 9721 (--no-auth), Vite
 // dev server on 5174 (NOT Vite's default 5173, which tauri dev reserves as
@@ -7,6 +9,12 @@ import { defineConfig, devices } from '@playwright/test';
 // stored server URL to reach the backend.
 const FRONTEND_PORT = 5174;
 const BACKEND_PORT = 9721;
+// A unique credential-free data directory prevents E2E from inheriting a
+// developer's real crawler.db/password and keeps CI deterministic.
+const E2E_DATA_DIR = join(
+  tmpdir(),
+  `scanhound-playwright-${process.pid}-${Date.now()}`,
+);
 
 // CI already runs `npm run build` before Playwright. Exercise that production
 // artifact instead of paying Vite's cold on-demand compilation cost inside the
@@ -45,6 +53,13 @@ export default defineConfig({
       command: `python -m backend.api --port ${BACKEND_PORT} --host 127.0.0.1 --no-auth`,
       cwd: '..',
       url: `http://127.0.0.1:${BACKEND_PORT}/health`,
+      env: {
+        APPDATA: E2E_DATA_DIR,
+        LOCALAPPDATA: E2E_DATA_DIR,
+        SCANHOUND_DATA_DIR: E2E_DATA_DIR,
+        SCANHOUND_DB_DIR: E2E_DATA_DIR,
+        SCANHOUND_ALLOW_OPEN: '1',
+      },
       reuseExistingServer: !process.env.CI,
       timeout: 30_000,
     },
