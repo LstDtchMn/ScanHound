@@ -107,6 +107,7 @@ async def search_sources(req: UrlRequest, reg: ServiceRegistry = Depends(get_reg
 
     source_registry = SourceRegistry()
     source_registry.discover_sources()
+    source_registry.sync_from_config(reg.config)
     try:
         results = await asyncio.wait_for(source_registry.search_all(title, mode), timeout=45.0)
     except asyncio.TimeoutError:
