@@ -780,9 +780,10 @@ class ScannerService:
     def _should_hydrate_listing_candidate(self, post_info: Dict) -> bool:
         """Whether a detail request is still needed for this listing candidate.
 
-        Fail-open by design: any missing field, uncertain Plex match, matching
-        exception, or unsupported source returns True. A False result requires
-        conclusive evidence that the candidate is not useful to the user.
+        Fail-open by design. Listing text does not always expose Dolby Vision,
+        file size, episode count, or codec/preference metadata. A candidate is
+        skipped only when available listing evidence is sufficient under the
+        user's active upgrade rules.
         """
         if post_info.get("source") != "hdencode":
             return True
@@ -795,76 +796,149 @@ class ScannerService:
         if release is None or not getattr(release, "display_title", None):
             return True
 
-        title = release.display_title
-        season = release.season
-        resolution = release.resolution or ""
-        dovi = bool(release.is_dovi)
-        title_key = normalize_title(title)
-        # Missing identity/quality fields are uncertain at listing time. Fetch the
-        # detail page rather than risk suppressing a real upgrade or different title.
-        if (not title_key or not resolution
-                or (not release.is_tv and not release.year)
-                or (release.is_tv and season is None)):
-            return True
+        try:
+            title = release.display_title
+            season = release.season
+            resolution = release.resolution or ""
+            dovi = bool(release.is_dovi)
+            title_key = normalize_title(title)
+            raw_size = str(getattr(release, "size", "") or "").strip()
+            size_known = raw_size.lower() not in {
+                "", "?", "-", "unknown", "n/a", "none"
+            }
 
-        # Title-level download history: skip same-or-lower quality siblings, but
-        # hydrate a real resolution/DV upgrade.
-        history_key = f"{title_key}|S{season}" if season is not None else title_key
-        prior_entries = self._downloaded_titles_lookup.get(history_key) or []
-        if prior_entries:
-            best = max(prior_entries, key=lambda entry: entry.get("downloaded_at", ""))
-            incoming_rank = _res_rank(resolution)
-            prior_rank = _res_rank(best.get("resolution"))
-            is_upgrade = incoming_rank > prior_rank or (
-                incoming_rank == prior_rank and dovi and not bool(best.get("dovi"))
+            if (not title_key or not resolution
+                    or (not release.is_tv and not release.year)
+                    or (release.is_tv and season is None)):
+                return True
+
+            history_key = (
+                f"{title_key}|S{season}"
+                if season is not None
+                else title_key
             )
-            if not is_upgrade:
+            prior_entries = self._downloaded_titles_lookup.get(history_key) or []
+            if prior_entries:
+                # Compare against the best owned quality, not merely the latest row.
+                best = max(
+                    prior_entries,
+                    key=lambda entry: (
+                        _res_rank(entry.get("resolution")),
+                        bool(entry.get("dovi")),
+                        entry.get("downloaded_at", ""),
+                    ),
+                )
+                incoming_rank = _res_rank(resolution)
+                prior_rank = _res_rank(best.get("resolution"))
+                prior_dovi = bool(best.get("dovi"))
+
+                if incoming_rank > prior_rank:
+                    return True
+                if incoming_rank < prior_rank:
+                    return False
+                if dovi and not prior_dovi:
+                    return True
+                if (self.config.get("rule_dv", True)
+                        and not prior_dovi and not dovi):
+                    # Absence of a DV token in listing text is not proof that
+                    # the detail page lacks DV.
+                    return True
+                # Download-history sibling semantics intentionally ignore size.
                 return False
 
-        plex_index = getattr(self.plex, "plex_index", None) or {}
-        if not plex_index.get("all_items"):
-            return True
+            plex_index = getattr(self.plex, "plex_index", None) or {}
+            if not plex_index.get("all_items"):
+                return True
 
-        web_item = {
-            "display_title": title,
-            "year": release.year or 0,
-            "res": resolution or "?",
-            "size": release.size or "?",
-            "dovi": dovi,
-            "hdr": release.hdr_format or ("HDR" if release.is_hdr else "SDR"),
-            "url": url,
-            "imdb_id": release.imdb_id,
-            "is_tv": bool(release.is_tv),
-            "season": season,
-            "episodes": None,
-            "search_key": title_key,
-            "episode_number": release.episode,
-        }
+            web_item = {
+                "display_title": title,
+                "year": release.year or 0,
+                "res": resolution or "?",
+                "size": raw_size or "?",
+                "dovi": dovi,
+                "hdr": (
+                    release.hdr_format
+                    or ("HDR" if release.is_hdr else "SDR")
+                ),
+                "url": url,
+                "imdb_id": release.imdb_id,
+                "is_tv": bool(release.is_tv),
+                "season": season,
+                "episodes": None,
+                "search_key": title_key,
+                "episode_number": release.episode,
+            }
 
-        try:
             if web_item["is_tv"]:
                 matches, is_uncertain = self.matching.find_tv_season_matches(
-                    web_item, plex_index
+                    web_item,
+                    plex_index,
                 )
             else:
                 matches, is_uncertain = self.matching.find_movie_matches(
-                    web_item, plex_index
+                    web_item,
+                    plex_index,
                 )
             if is_uncertain or not matches:
                 return True
 
+            same_res = [
+                match for match in matches
+                if match.get("res") == resolution
+            ]
+            if same_res:
+                if (
+                    self.config.get("pref_hevc", False)
+                    or self.config.get("pref_hdr10plus", False)
+                ):
+                    return True
+
+                if (
+                    self.config.get("rule_dv", True)
+                    and not dovi
+                    and any(not bool(match.get("dovi")) for match in same_res)
+                ):
+                    return True
+
+                if not size_known:
+                    if web_item["is_tv"]:
+                        return True
+                    if (
+                        resolution == "1080p"
+                        and self.config.get("rule_1080_1080", True)
+                    ):
+                        return True
+                    if (
+                        resolution in ("4K", "2160p")
+                        and self.config.get("rule_4k_4k", True)
+                    ):
+                        return True
+
             if web_item["is_tv"]:
                 status_str, _color, _info, is_upgrade = (
-                    self.matching.calculate_tv_upgrade_status(web_item, matches[0])
+                    self.matching.calculate_tv_upgrade_status(
+                        web_item,
+                        matches[0],
+                    )
                 )
                 return bool(is_upgrade) or status_str == STATUS_MISSING
 
             status_str, _color, _info, _plex_id = (
-                self.matching.calculate_movie_upgrade_status(web_item, matches)
+                self.matching.calculate_movie_upgrade_status(
+                    web_item,
+                    matches,
+                )
             )
-            return status_str == STATUS_MISSING or "UPGRADE" in status_str.upper()
+            return (
+                status_str == STATUS_MISSING
+                or "UPGRADE" in status_str.upper()
+            )
         except Exception:
-            logger.debug("Listing-stage Plex match failed for %s", title, exc_info=True)
+            logger.debug(
+                "Listing-stage relevance check failed open for %s",
+                post_info.get("listing_title", "?"),
+                exc_info=True,
+            )
             return True
 
     async def _process_posts(self, all_posts: List[Dict], scraper, num_threads: int):
