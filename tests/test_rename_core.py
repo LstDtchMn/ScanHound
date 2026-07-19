@@ -378,10 +378,12 @@ class TestFileOps:
         assert not f.exists()
         assert os.path.isfile(trashed_path)
         assert os.path.basename(trashed_path) == "doomed.mkv"
-        # Landed under a same-volume .scanhound-trash bucket, not _DATA_DIR.
-        anchor, _ = os.path.splitdrive(os.path.abspath(str(f)))
-        expected_root = os.path.join(anchor + os.sep, ".scanhound-trash")
+        # Landed under the implementation's source-volume trash root. On
+        # Windows that is the drive anchor; on POSIX it is the real mount point.
+        expected_root = fileops._trash_root_for(str(f))
         assert os.path.commonpath([expected_root, trashed_path]) == expected_root
+        assert os.path.basename(expected_root) == ".scanhound-trash"
+        assert os.stat(os.path.dirname(expected_root)).st_dev == os.stat(trashed_path).st_dev
         assert not trashed_path.startswith(fileops._DATA_DIR)
         # _DATA_DIR's contents are untouched — no bytes copied in.
         after = set()
