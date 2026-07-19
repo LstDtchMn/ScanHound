@@ -17,6 +17,7 @@ go through a user's input first):
 """
 from __future__ import annotations
 
+import ctypes
 import datetime
 import errno
 import hashlib
@@ -24,6 +25,8 @@ import json
 import logging
 import os
 import shutil
+import sys
+import tempfile
 import threading
 from typing import Callable, Optional
 
@@ -71,24 +74,129 @@ def _hash_file(path: str, *, cold: bool = False) -> str:
     return h.hexdigest()
 
 
-def _copy_verify_atomic(src: str, dst: str,
-                        progress_cb: Optional[Callable[[int, int], None]] = None) -> None:
-    """Crash-safe verified copy of ``src`` → ``dst``.
 
-    Streams into a ``dst + '.part'`` sidecar on the *destination* volume, flushes
-    to disk (fsync), hash-verifies (blake2b, matching :func:`_hash_file`), then
-    atomically renames it into place with :func:`os.replace`. Consequences:
+def _linux_rename_noreplace(src: str, dst: str) -> bool:
+    """Atomically rename without replacement through Linux renameat2.
 
-    * A crash/power-loss mid-copy never leaves a partial file at the real
-      destination — only a ``.part`` temp, which the next apply truncates and
-      reuses. ``dst`` appears only once every byte is on disk and verified.
-    * The source is untouched here, so it is always recoverable; the caller
-      disposes of it only after this returns (for a 'move').
-
-    ``progress_cb(bytes_done, bytes_total)`` is called as bytes are written
-    (best-effort — exceptions from it are swallowed).
+    Returns False only when the running libc/filesystem cannot provide the
+    primitive, allowing the caller to use the hard-link fallback. Every other
+    error, including EEXIST and EXDEV, is propagated.
     """
-    part = dst + ".part"
+    if not sys.platform.startswith("linux"):
+        return False
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        return False
+
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+
+    at_fdcwd = -100
+    rename_noreplace = 1
+    result = renameat2(
+        at_fdcwd,
+        os.fsencode(src),
+        at_fdcwd,
+        os.fsencode(dst),
+        rename_noreplace,
+    )
+    if result == 0:
+        return True
+
+    err = ctypes.get_errno()
+    if err == errno.EEXIST:
+        raise FileExistsError(
+            errno.EEXIST,
+            f"Destination already exists: {dst}",
+            dst,
+        )
+
+    unsupported = {
+        errno.ENOSYS,
+        errno.EINVAL,
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+    }
+    if err in unsupported:
+        return False
+    raise OSError(err, os.strerror(err), dst)
+
+
+def _move_no_replace(src: str, dst: str) -> None:
+    """Publish/move one regular file at an absent destination atomically.
+
+    Windows `os.rename` already refuses an existing destination. Linux uses
+    `renameat2(RENAME_NOREPLACE)` when available. Other POSIX systems, and
+    Linux filesystems without renameat2 support, use an atomic hard-link
+    creation followed by source unlink.
+
+    The function never falls back to overwrite-capable `os.rename` or
+    `os.replace`. Unsupported filesystems fail safely with the source intact.
+    """
+    if os.name == "nt":
+        os.rename(src, dst)
+        return
+
+    if _linux_rename_noreplace(src, dst):
+        return
+
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            raise
+        raise OSError(
+            exc.errno,
+            "Destination filesystem cannot atomically publish without "
+            "replacement; source kept",
+            dst,
+        ) from exc
+
+    try:
+        os.unlink(src)
+    except BaseException:
+        try:
+            os.unlink(dst)
+        except OSError:
+            logger.critical(
+                "Atomic no-replace publication left both names after source "
+                "unlink and rollback failed: %s -> %s",
+                src,
+                dst,
+                exc_info=True,
+            )
+        raise
+
+
+
+def _copy_verify_atomic(
+    src: str,
+    dst: str,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> None:
+    """Crash-safe verified copy with atomic no-replace publication.
+
+    Bytes are written to a unique temporary file on the destination volume,
+    fsynced, metadata-copied, and hash-verified. `_move_no_replace` then
+    publishes the verified inode only if `dst` is still absent. A competing
+    writer therefore wins with its bytes intact; this operation raises
+    FileExistsError and keeps the source.
+    """
+    directory = os.path.dirname(dst) or os.curdir
+    prefix = f".{os.path.basename(dst)}.part."
+    fd, part = tempfile.mkstemp(prefix=prefix, dir=directory)
+    os.close(fd)
+
     total = os.path.getsize(src) or 0
     src_h = hashlib.blake2b()
     done = 0
@@ -108,23 +216,22 @@ def _copy_verify_atomic(src: str, dst: str,
                         pass
             fo.flush()
             os.fsync(fo.fileno())
+
         shutil.copystat(src, part)
-        # Verify from the PHYSICAL disk (cold read), not the write cache, so a
-        # latent bad write can't slip through and become the destination.
         if src_h.hexdigest() != _hash_file(part, cold=True):
-            raise OSError("Copy verification failed (hash mismatch — "
-                          "possible disk/transfer corruption; source kept)")
-        os.replace(part, dst)  # atomic on the destination volume
+            raise OSError(
+                "Copy verification failed (hash mismatch — possible "
+                "disk/transfer corruption; source kept)"
+            )
+
+        _move_no_replace(part, dst)
     except BaseException:
-        # Never leave a stray .part behind on failure (it would be reused on the
-        # next attempt anyway, but clean up eagerly).
         try:
-            if os.path.exists(part):
+            if os.path.lexists(part):
                 os.remove(part)
         except Exception:
             pass
         raise
-
 
 def _trash_bucket_name() -> str:
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -918,9 +1025,10 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
         _copy_verify_atomic(src, dst, progress_cb)
         return "copy"
 
-    # move: rename first (instant same-fs), else crash-safe copy + dispose source.
+    # move: atomic no-replace publication first, else verified copy +
+    # dispose source. Never use overwrite-capable rename/replace primitives.
     try:
-        os.rename(src, dst)
+        _move_no_replace(src, dst)
     except OSError as e:
         if e.errno != errno.EXDEV:
             raise

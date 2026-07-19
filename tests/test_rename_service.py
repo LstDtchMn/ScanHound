@@ -1415,13 +1415,24 @@ class TestApplyProgressBroadcast:
         # Small, deterministic chunking so a 10-byte file produces several
         # progress_cb calls (real transfers use 8 MiB chunks).
         monkeypatch.setattr(_fo, "_COPY_CHUNK", 2)
-        # Force the cross-device (EXDEV) branch so _copy_verify_atomic (and
-        # thus progress_cb) actually runs — a same-device 'move' is an
-        # instant os.rename with no byte-streaming.
-        def _exdev(a, b):
-            import errno
-            raise OSError(errno.EXDEV, "cross-device")
-        monkeypatch.setattr(_fo.os, "rename", _exdev)
+        # Force only the first publication attempt (the move) to report EXDEV.
+        # The corrected implementation calls _move_no_replace rather than
+        # os.rename; subsequent publication of the verified copy must remain
+        # real so progress/ETA are exercised end to end.
+        real_publish = _fo._move_no_replace
+        publish_calls = 0
+
+        def _first_publish_exdev_then_real(src_path, dst_path):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                import errno
+                raise OSError(errno.EXDEV, "cross-device")
+            return real_publish(src_path, dst_path)
+
+        monkeypatch.setattr(
+            _fo, "_move_no_replace", _first_publish_exdev_then_real
+        )
 
         captured = []
         monkeypatch.setattr(ws_mod.ws_manager, "broadcast_sync", captured.append)

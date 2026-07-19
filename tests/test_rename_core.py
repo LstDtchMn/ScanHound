@@ -132,7 +132,7 @@ class TestFileOps:
 
         def _boom(*a, **k):
             raise OSError("simulated power loss")
-        monkeypatch.setattr(fileops.os, "replace", _boom)
+        monkeypatch.setattr(fileops, "_move_no_replace", _boom)
 
         with pytest.raises(OSError):
             fileops.place_file(str(src), str(dst), "copy")
@@ -145,14 +145,19 @@ class TestFileOps:
         # file is never lost, and no partial appears at the destination.
         src = tmp_path / "src.mkv"; src.write_bytes(b"q" * 8192)
         dst = tmp_path / "lib" / "out.mkv"
-        # Force the EXDEV (cross-device) branch, then crash the atomic rename.
-        real_rename = fileops.os.rename
-        def _exdev(a, b):
-            import errno as _e
-            raise OSError(_e.EXDEV, "cross-device")
-        monkeypatch.setattr(fileops.os, "rename", _exdev)
-        monkeypatch.setattr(fileops.os, "replace",
-                            lambda *a, **k: (_ for _ in ()).throw(OSError("crash")))
+        # First publication reports EXDEV; the verified-copy publication then
+        # crashes. Source bytes must remain recoverable throughout.
+        calls = 0
+
+        def _exdev_then_crash(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                import errno as _e
+                raise OSError(_e.EXDEV, "cross-device")
+            raise OSError("crash")
+
+        monkeypatch.setattr(fileops, "_move_no_replace", _exdev_then_crash)
         with pytest.raises(OSError):
             fileops.place_file(str(src), str(dst), "move")
         assert src.exists() and src.read_bytes() == b"q" * 8192   # NEVER lost
@@ -163,6 +168,81 @@ class TestFileOps:
         dst = tmp_path / "out.mkv"; dst.write_text("existing")
         with pytest.raises(FileExistsError):
             fileops.place_file(str(src), str(dst), "move")
+
+
+
+    def test_move_publish_race_preserves_competing_destination(
+            self, tmp_path, monkeypatch):
+        """A destination created after the precheck must never be replaced."""
+        src = tmp_path / "src.mkv"
+        src.write_bytes(b"source")
+        dst = tmp_path / "lib" / "out.mkv"
+        real_publish = fileops._move_no_replace
+
+        def competing_publish(source, destination):
+            dst.write_bytes(b"victim")
+            return real_publish(source, destination)
+
+        monkeypatch.setattr(fileops, "_move_no_replace", competing_publish)
+
+        with pytest.raises(FileExistsError):
+            fileops.place_file(str(src), str(dst), "move")
+
+        assert src.read_bytes() == b"source"
+        assert dst.read_bytes() == b"victim"
+
+
+    def test_copy_publish_race_preserves_competing_destination(
+            self, tmp_path, monkeypatch):
+        """Verified-copy publication is no-replace, not os.replace."""
+        src = tmp_path / "src.mkv"
+        src.write_bytes(b"source" * 4096)
+        dst = tmp_path / "lib" / "out.mkv"
+        real_publish = fileops._move_no_replace
+
+        def competing_publish(source, destination):
+            dst.write_bytes(b"victim")
+            return real_publish(source, destination)
+
+        monkeypatch.setattr(fileops, "_move_no_replace", competing_publish)
+
+        with pytest.raises(FileExistsError):
+            fileops.place_file(str(src), str(dst), "copy")
+
+        assert src.read_bytes() == b"source" * 4096
+        assert dst.read_bytes() == b"victim"
+        assert not list(dst.parent.glob(f".{dst.name}.part.*"))
+
+
+    def test_cross_device_hardlink_fallback_cannot_replace_racing_destination(
+            self, tmp_path, monkeypatch):
+        """The default hardlink-to-copy path keeps a concurrent victim intact."""
+        import errno as _errno
+
+        src = tmp_path / "src.mkv"
+        src.write_bytes(b"source" * 4096)
+        dst = tmp_path / "lib" / "out.mkv"
+        real_link = fileops.os.link
+        real_publish = fileops._move_no_replace
+
+        def source_link_is_cross_device(source, destination, *args, **kwargs):
+            if os.fspath(source) == str(src):
+                raise OSError(_errno.EXDEV, "cross-device")
+            return real_link(source, destination, *args, **kwargs)
+
+        def competing_publish(source, destination):
+            dst.write_bytes(b"victim")
+            return real_publish(source, destination)
+
+        monkeypatch.setattr(fileops.os, "link", source_link_is_cross_device)
+        monkeypatch.setattr(fileops, "_move_no_replace", competing_publish)
+
+        with pytest.raises(FileExistsError):
+            fileops.place_file(str(src), str(dst), "hardlink")
+
+        assert src.read_bytes() == b"source" * 4096
+        assert dst.read_bytes() == b"victim"
+        assert not list(dst.parent.glob(f".{dst.name}.part.*"))
 
     def test_missing_source_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
@@ -292,8 +372,22 @@ class TestFileOps:
         def _exdev(*_a, **_k):
             raise OSError(_errno.EXDEV, "Invalid cross-device link")
 
-        monkeypatch.setattr(fileops.os, "link", _exdev)
-        monkeypatch.setattr(fileops.os, "rename", _exdev)
+        # The corrected Linux move path no longer calls os.rename.  Inject
+        # EXDEV at the publication abstraction for the first (move) attempt,
+        # then allow the verified-copy publication to use the real primitive.
+        real_publish = fileops._move_no_replace
+        publish_calls = 0
+
+        def _first_publish_exdev_then_real(src_path, dst_path):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                raise OSError(_errno.EXDEV, "Invalid cross-device link")
+            return real_publish(src_path, dst_path)
+
+        monkeypatch.setattr(
+            fileops, "_move_no_replace", _first_publish_exdev_then_real
+        )
         src = tmp_path / "src.mkv"; src.write_bytes(b"payload")
         dst = tmp_path / "lib" / "out.mkv"
         used = fileops.place_file(str(src), str(dst), "move",
@@ -316,8 +410,22 @@ class TestFileOps:
         def _exdev(*_a, **_k):
             raise OSError(_errno.EXDEV, "Invalid cross-device link")
 
-        monkeypatch.setattr(fileops.os, "link", _exdev)
-        monkeypatch.setattr(fileops.os, "rename", _exdev)
+        # The corrected Linux move path no longer calls os.rename.  Inject
+        # EXDEV at the publication abstraction for the first (move) attempt,
+        # then allow the verified-copy publication to use the real primitive.
+        real_publish = fileops._move_no_replace
+        publish_calls = 0
+
+        def _first_publish_exdev_then_real(src_path, dst_path):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                raise OSError(_errno.EXDEV, "Invalid cross-device link")
+            return real_publish(src_path, dst_path)
+
+        monkeypatch.setattr(
+            fileops, "_move_no_replace", _first_publish_exdev_then_real
+        )
         src = tmp_path / "src.mkv"; src.write_bytes(b"payload")
         dst = tmp_path / "lib" / "out.mkv"
         used = fileops.place_file(str(src), str(dst), "move",
@@ -773,8 +881,13 @@ class TestAllTrashRoots:
         source.write_text("payload")
 
         deeper_root = library / ".scanhound-trash"
+        fallback_root = tmp_path / "appdata-trash"
         index_path = tmp_path / "trash_roots.json"
         monkeypatch.setattr(fileops, "_TRASH_ROOTS_INDEX", str(index_path))
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(fallback_root))
+        # Give this test a private process-local registry so root/UID test runs
+        # and pre-existing /.scanhound-trash state cannot leak into the result.
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_RUNTIME", set())
         monkeypatch.setattr(
             fileops,
             "_same_volume_trash_roots",
@@ -785,7 +898,10 @@ class TestAllTrashRoots:
             "_trash_bucket_name",
             lambda: "20260101-000000",
         )
-        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: ["/"])
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
+        monkeypatch.setattr(
+            fileops, "_trash_root_for", lambda _path: str(fallback_root)
+        )
 
         trashed = fileops._trash(str(source))
 
