@@ -288,3 +288,73 @@ def test_no_more_than_three_detail_requests_are_in_flight(monkeypatch):
 
     assert calls == 6
     assert maximum == 3
+
+
+
+def test_waiting_worker_never_requests_after_cancellation(monkeypatch):
+    _reset_limiter(monkeypatch, max_concurrent=1, interval=0.0)
+    release_first = threading.Event()
+    first_started = threading.Event()
+    cancelled = threading.Event()
+    calls = []
+    lock = threading.Lock()
+
+    class Scraper:
+        def get(self, url, *_args, **_kwargs):
+            with lock:
+                calls.append(url)
+                call_number = len(calls)
+            if call_number == 1:
+                first_started.set()
+                assert release_first.wait(timeout=3)
+            return _Response()
+
+    detail = DetailScraper(_App())
+    session = Scraper()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            detail.scrape_details,
+            "https://hdencode.org/first",
+            {},
+            session,
+            stop_requested=cancelled.is_set,
+        )
+        assert first_started.wait(timeout=3)
+        waiting = executor.submit(
+            detail.scrape_details,
+            "https://hdencode.org/waiting",
+            {},
+            session,
+            stop_requested=cancelled.is_set,
+        )
+        cancelled.set()
+        release_first.set()
+
+        assert first.result(timeout=3)
+        assert waiting.result(timeout=3) is None
+
+    assert calls == ["https://hdencode.org/first"]
+
+
+def test_retry_backoff_stops_before_next_request(monkeypatch):
+    _reset_limiter(monkeypatch, max_concurrent=1, interval=0.0)
+    cancelled = threading.Event()
+    calls = 0
+
+    class Scraper:
+        def get(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            cancelled.set()
+            return _Response(status_code=429, content=b"")
+
+    result = DetailScraper(_App()).scrape_details(
+        "https://hdencode.org/retry-cancel",
+        {},
+        Scraper(),
+        stop_requested=cancelled.is_set,
+    )
+
+    assert result is None
+    assert calls == 1
