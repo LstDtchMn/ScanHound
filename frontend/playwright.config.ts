@@ -8,6 +8,13 @@ import { defineConfig, devices } from '@playwright/test';
 const FRONTEND_PORT = 5174;
 const BACKEND_PORT = 9721;
 
+// CI already runs `npm run build` before Playwright. Exercise that production
+// artifact instead of paying Vite's cold on-demand compilation cost inside the
+// first route assertion. Local development keeps the fast, reusable dev server.
+const FRONTEND_COMMAND = process.env.CI
+  ? `npm run preview -- --host localhost --port ${FRONTEND_PORT} --strictPort`
+  : `npm run dev -- --port ${FRONTEND_PORT}`;
+
 export default defineConfig({
   testDir: './tests/e2e',
   fullyParallel: true,
@@ -42,7 +49,7 @@ export default defineConfig({
       timeout: 30_000,
     },
     {
-      command: `npm run dev -- --port ${FRONTEND_PORT}`,
+      command: FRONTEND_COMMAND,
       cwd: '.',
       url: `http://localhost:${FRONTEND_PORT}`,
       reuseExistingServer: !process.env.CI,
