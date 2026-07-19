@@ -418,7 +418,11 @@ class ScannerService:
         sources = self._build_sources(scan_type, source_type, base_url, flags, search_query)
 
         if not sources:
-            self._log("No sources selected!", "error")
+            if ((scan_type == "Site Search" or source_type == "HDEncode")
+                    and not self.config.get("hdencode_enabled", True)):
+                self._log("HDEncode is disabled in Settings; no requests were made.", "warning")
+            else:
+                self._log("No sources selected!", "error")
             return
 
         self._log(f"Sources: {', '.join(s['name'] for s in sources)}")
@@ -520,6 +524,10 @@ class ScannerService:
             List of source descriptor dicts, or empty list if no flags are set.
         """
         sources = []
+
+        hdencode_requested = scan_type == "Site Search" or source_type == "HDEncode"
+        if hdencode_requested and not self.config.get("hdencode_enabled", True):
+            return []
 
         if scan_type == "Site Search":
             if not search_query:
