@@ -28,6 +28,7 @@ def test_download_item_surfaces_structured_failure_message():
         ScrapeCode.BROWSER_NETWORK_ERROR,
         retryable=True,
         signals=("ERR_NAME_NOT_RESOLVED",),
+        detail="driver failed at C:/Users/example/private-profile",
     )
     service.scrape_links = MagicMock(return_value=ScrapedLinks(diagnostic=diagnostic))
     service._is_supported_download_link = MagicMock(return_value=False)
@@ -41,6 +42,7 @@ def test_download_item_surfaces_structured_failure_message():
     assert result["retryable"] is True
     assert result["signals"] == ["ERR_NAME_NOT_RESOLVED"]
     assert "network" in result["message"].lower() or "reach" in result["message"].lower()
+    assert "C:/Users/example/private-profile" not in result["message"]
 
 
 def test_page_diagnostics_classifies_interactive_challenge():
@@ -179,3 +181,22 @@ def test_release_text_named_captcha_is_not_a_challenge():
 
     assert diagnostic.code is ScrapeCode.LAYOUT_CHANGED
     assert diagnostic.affects_source_health is True
+
+
+
+def test_serialized_diagnostic_never_exposes_internal_detail():
+    secret = "C:/Users/example/private-profile/chromedriver"
+    diagnostic = ScrapeDiagnostic(
+        ScrapeCode.BROWSER_LAUNCH_FAILED,
+        detail=secret,
+        signals=("SessionNotCreatedException",),
+    )
+
+    # Internal logs may use the detailed message.
+    assert secret in diagnostic.message
+
+    # API and WebSocket serialization must remain stable and sanitized.
+    payload = diagnostic.to_dict()
+    assert payload["message"] == diagnostic.public_message
+    assert secret not in payload["message"]
+    assert payload["signals"] == ["SessionNotCreatedException"]

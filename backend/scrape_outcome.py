@@ -48,13 +48,19 @@ class ScrapeDiagnostic:
     detail: str = ""
 
     @property
+    def public_message(self) -> str:
+        """Stable user-facing text that never includes raw exception details."""
+        return _MESSAGES[self.code]
+
+    @property
     def message(self) -> str:
-        return self.detail or _MESSAGES[self.code]
+        """Internal diagnostic text; may include a logged exception detail."""
+        return self.detail or self.public_message
 
     def to_dict(self) -> dict:
         return {
             "reason_code": self.code.value,
-            "message": self.message,
+            "message": self.public_message,
             "retryable": self.retryable,
             "affects_source_health": self.affects_source_health,
             "transport": self.transport,
