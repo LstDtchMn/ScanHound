@@ -1406,12 +1406,8 @@ class DownloadService:
         Returns:
             List of download link URLs.
         """
-        # Classify by parsed hostname only (PR #3/#4). Query/path text such as
-        # ``?next=https://ddlbase.com`` must not bypass the HDEncode switch.
-        # _source_page_kind defaults to "hdencode", preserving the historical
-        # rule that every non-DDLBase/non-Adit-HD page takes the HDEncode path,
-        # so the off switch still fires before Selenium is imported or a
-        # browser is started. This also covers auto-grab and copy-links.
+        # Classify once by parsed hostname. Query/path text such as
+        # `?next=https://ddlbase.com` must not bypass the HDEncode off switch.
         source_kind = _source_page_kind(url)
         if source_kind == "hdencode" and not self.config.get("hdencode_enabled", True):
             diagnostic = ScrapeDiagnostic(
@@ -1440,12 +1436,17 @@ class DownloadService:
 
         try:
             with self._driver_lock:
-                # Dispatch on the same parsed-hostname classification used for
-                # gating above (PR #3/#4), wrapped in PR #5's structured result.
                 if source_kind == "ddlbase":
-                    return ScrapedLinks(self._scrape_ddlbase_links(url, progress_callback=progress_callback))
+                    return ScrapedLinks(
+                        self._scrape_ddlbase_links(
+                            url,
+                            progress_callback=progress_callback,
+                        )
+                    )
                 if source_kind == "adithd":
-                    return ScrapedLinks(self._scrape_adithd_links(url, service_type))
+                    return ScrapedLinks(
+                        self._scrape_adithd_links(url, service_type)
+                    )
 
                 # Default: HDEncode. Map the requested host to its link keyword.
                 # The old `== "Rapidgator" else "nitroflare"` silently searched
