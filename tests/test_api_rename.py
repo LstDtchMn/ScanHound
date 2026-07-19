@@ -233,6 +233,53 @@ class TestRenameApi:
                            json={"folder": "/library/movies-4k"}).json()
         assert body["status"] == "started"
 
+    def test_dv_scan_folder_notification_reports_skipped_count(
+            self, client, monkeypatch):
+        """DV-scan success text covers the second pre-3.12 parser-sensitive path."""
+        import backend.api.routes.rename as rename_routes
+        import backend.rename.service as svc_mod
+
+        events = []
+        monkeypatch.setattr(
+            svc_mod.RenameService,
+            "scan_folder_dv",
+            lambda self, folder, force=False, progress_cb=None: {
+                "found": 5,
+                "scanned": 4,
+                "skipped": 2,
+                "by_layer": {"fel": 1},
+            },
+        )
+        monkeypatch.setattr(
+            rename_routes.ws_manager,
+            "broadcast_sync",
+            events.append,
+        )
+
+        class _ImmediateThread:
+            def __init__(self, target, *args, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        monkeypatch.setattr(rename_routes.threading, "Thread", _ImmediateThread)
+
+        response = client.post(
+            "/rename/dv-scan-folder",
+            json={"folder": "/library/movies-4k"},
+        )
+
+        assert response.status_code == 200
+        notification = next(
+            event for event in events
+            if event.get("type") == "notification"
+        )
+        assert notification["data"]["body"] == (
+            "Scanned 4 of 5 file(s) — 1 FEL, 2 unchanged"
+        )
+        assert notification["data"]["priority"] == "normal"
+
     def test_apply_unknown_job_is_400(self, client):
         assert client.post("/rename/jobs/99999/apply").status_code == 400
 
@@ -716,6 +763,63 @@ class TestPathConfinement:
             resp = client.post("/rename/process-folder", json={"folder": str(root)})
             assert resp.status_code == 200
             assert resp.json()["status"] == "started"
+
+    def test_process_folder_notification_reports_skipped_count(
+            self, tmp_path, monkeypatch):
+        """Process-folder success text remains valid on every supported Python."""
+        import backend.api.routes.rename as rename_routes
+        import backend.rename.service as svc_mod
+
+        root = tmp_path / "movies"
+        root.mkdir()
+        events = []
+
+        class _ImmediateThread:
+            def __init__(self, target, *args, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        # TestClient must create its AnyIO portal with the real stdlib Thread.
+        # Scope the synchronous route-thread replacement inside the live client
+        # context, and restore it before TestClient begins shutdown.
+        with _client_with_library(str(root)) as client:
+            with monkeypatch.context() as scoped_patch:
+                scoped_patch.setattr(
+                    svc_mod.RenameService,
+                    "process_folder",
+                    lambda self, folder, dry_run=False: {
+                        "created": 2,
+                        "found": 5,
+                        "skipped": 3,
+                    },
+                )
+                scoped_patch.setattr(
+                    rename_routes.ws_manager,
+                    "broadcast_sync",
+                    events.append,
+                )
+                scoped_patch.setattr(
+                    rename_routes.threading,
+                    "Thread",
+                    _ImmediateThread,
+                )
+
+                response = client.post(
+                    "/rename/process-folder",
+                    json={"folder": str(root)},
+                )
+
+        assert response.status_code == 200
+        notification = next(
+            event for event in events
+            if event.get("type") == "notification"
+        )
+        assert notification["data"]["body"] == (
+            "2 new rename job(s) from 5 file(s), 3 already tracked"
+        )
+        assert notification["data"]["priority"] == "normal"
 
     def test_process_folder_rejects_when_no_library_configured(self, client, tmp_path):
         folder = tmp_path / "movies"
