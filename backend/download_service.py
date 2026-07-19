@@ -84,12 +84,32 @@ _SUPPORTED_DOWNLOAD_HOSTS = (
 
 
 def _url_matches_domain(url: str, domains: tuple) -> bool:
-    """Check if a URL's host matches any of the given domains (netloc-based)."""
+    """Check a URL's parsed hostname against one or more registrable domains.
+
+    Path and query text must never influence source routing.  ``hostname`` also
+    strips credentials and ports, unlike a raw ``netloc`` comparison.
+    """
     try:
-        netloc = urlparse(url).netloc.lower()
-        return any(netloc == d or netloc.endswith("." + d) for d in domains)
+        raw = (url or "").strip()
+        parsed = urlparse(raw if "://" in raw else "https://" + raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        return any(host == d or host.endswith("." + d) for d in domains)
     except Exception:
         return False
+
+
+def _source_page_kind(url: str) -> str:
+    """Classify a source-page URL using only its hostname.
+
+    ``scrape_links`` historically treats every page that is not DDLBase or
+    Adit-HD as the HDEncode/default path.  Keep that compatibility while making
+    the decision once and reusing it for both gating and dispatch.
+    """
+    if _url_matches_domain(url, ("ddlbase.com",)):
+        return "ddlbase"
+    if _url_matches_domain(url, ("adit-hd.com",)):
+        return "adithd"
+    return "hdencode"
 
 
 def _normalize_link_url(url: str) -> str:
@@ -1219,6 +1239,15 @@ class DownloadService:
             body_text = " ".join((soup.get_text(" ") or "").split())[:240]
             self._log(f"[HDEncode][diag] visible text: {body_text!r}")
             body_low = body_text.lower()
+            try:
+                raw_title = driver.title
+                page_title_low = (
+                    raw_title.lower()
+                    if isinstance(raw_title, str)
+                    else ""
+                )
+            except Exception:
+                page_title_low = ""
             network_markers = (
                 "site can't be reached",
                 "site can’t be reached",
@@ -1282,17 +1311,45 @@ class DownloadService:
                 self._log(f"[HDEncode][diag] CAPTCHA/Turnstile iframes present: {captcha_frames}", "warning")
 
             low = html.lower()
-            page_markers = [marker for marker in (
-                "just a moment",
-                "cf-chl",
-                "checking your browser",
-                "captcha",
-                "verify you are human",
-                "access denied",
-            ) if marker in low]
-            if page_markers:
-                signals.extend(page_markers)
-                self._log(f"[HDEncode][diag] page markers detected: {page_markers}", "warning")
+            technical_challenge_markers = [
+                marker for marker in (
+                    "cf-chl",
+                    "challenges.cloudflare.com",
+                    "turnstile",
+                    "hcaptcha",
+                    "recaptcha",
+                )
+                if marker in low
+            ]
+            title_challenge_markers = [
+                marker for marker in (
+                    "just a moment",
+                    "attention required",
+                    "checking your browser",
+                    "verify you are human",
+                    "access denied",
+                )
+                if marker in page_title_low
+            ]
+            visible_challenge_markers = [
+                marker for marker in (
+                    "checking your browser",
+                    "verify you are human",
+                )
+                if marker in body_low
+            ]
+            challenge_markers = list(dict.fromkeys(
+                technical_challenge_markers
+                + title_challenge_markers
+                + visible_challenge_markers
+            ))
+            if challenge_markers:
+                signals.extend(challenge_markers)
+                self._log(
+                    f"[HDEncode][diag] strong challenge evidence: "
+                    f"{challenge_markers}",
+                    "warning",
+                )
 
             if keyword:
                 keyword_present = keyword.lower() in low
@@ -1306,7 +1363,7 @@ class DownloadService:
                     affects_source_health=False,
                     signals=tuple(signals),
                 )
-            if captcha_frames or page_markers:
+            if captcha_frames or challenge_markers:
                 return ScrapeDiagnostic(
                     ScrapeCode.INTERACTIVE_CHALLENGE,
                     retryable=False,
@@ -1386,15 +1443,10 @@ class DownloadService:
         Returns:
             List of download link URLs.
         """
-        normalized_url = (url or "").lower()
-        # scrape_links dispatches every non-DDLBase/non-Adit-HD URL through the
-        # HDEncode path, so apply the same rule here before Selenium is imported
-        # or a browser is started. This also covers auto-grab and copy-links.
-        is_hdencode = (
-            "ddlbase.com" not in normalized_url
-            and "adit-hd.com" not in normalized_url
-        )
-        if is_hdencode and not self.config.get("hdencode_enabled", True):
+        # Classify once by parsed hostname. Query/path text such as
+        # `?next=https://ddlbase.com` must not bypass the HDEncode off switch.
+        source_kind = _source_page_kind(url)
+        if source_kind == "hdencode" and not self.config.get("hdencode_enabled", True):
             diagnostic = ScrapeDiagnostic(
                 ScrapeCode.SOURCE_DISABLED, retryable=False, affects_source_health=False
             )
@@ -1421,10 +1473,17 @@ class DownloadService:
 
         try:
             with self._driver_lock:
-                if "ddlbase.com" in url:
-                    return ScrapedLinks(self._scrape_ddlbase_links(url, progress_callback=progress_callback))
-                if "adit-hd.com" in url:
-                    return ScrapedLinks(self._scrape_adithd_links(url, service_type))
+                if source_kind == "ddlbase":
+                    return ScrapedLinks(
+                        self._scrape_ddlbase_links(
+                            url,
+                            progress_callback=progress_callback,
+                        )
+                    )
+                if source_kind == "adithd":
+                    return ScrapedLinks(
+                        self._scrape_adithd_links(url, service_type)
+                    )
 
                 # Default: HDEncode. Map the requested host to its link keyword.
                 # The old `== "Rapidgator" else "nitroflare"` silently searched

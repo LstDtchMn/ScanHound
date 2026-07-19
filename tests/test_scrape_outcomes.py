@@ -1,5 +1,8 @@
 """Structured scrape outcome tests for PR 1c."""
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+from fastapi import BackgroundTasks
 
 from backend.download_service import DownloadService
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
@@ -80,6 +83,99 @@ def test_page_diagnostics_distinguishes_layout_change():
     driver.page_source = "<html><body><article>Release text only</article></body></html>"
 
     diagnostic = service._log_page_diagnostics(driver, stage="access_control")
+
+    assert diagnostic.code is ScrapeCode.LAYOUT_CHANGED
+    assert diagnostic.affects_source_health is True
+
+
+def test_query_text_cannot_spoof_hdencode_off_switch(monkeypatch):
+    service = _service()
+    service.config["hdencode_enabled"] = False
+    service._scrape_ddlbase_links = MagicMock(
+        side_effect=AssertionError("query text must not route to DDLBase")
+    )
+
+    links = service.scrape_links(
+        "https://hdencode.org/release/?next=https://ddlbase.com/post/example",
+        "Rapidgator",
+    )
+
+    assert links == []
+    assert links.diagnostic.code is ScrapeCode.SOURCE_DISABLED
+    service._scrape_ddlbase_links.assert_not_called()
+
+
+def test_exact_ddlbase_hostname_bypasses_hdencode_switch(monkeypatch):
+    service = _service()
+    service.config["hdencode_enabled"] = False
+    monkeypatch.setattr("backend.download_service._ensure_selenium", lambda: None)
+    service._scrape_ddlbase_links = MagicMock(
+        return_value=["https://1fichier.com/?abc"]
+    )
+
+    links = service.scrape_links(
+        "https://www.ddlbase.com/post/example",
+        "1fichier",
+    )
+
+    assert links == ["https://1fichier.com/?abc"]
+    assert links.diagnostic is None
+    service._scrape_ddlbase_links.assert_called_once()
+
+
+def test_batch_exception_is_reported_as_structured_failure(monkeypatch):
+    from backend.api.routes import downloads as download_routes
+
+    dl = MagicMock()
+    dl.scrape_links.side_effect = RuntimeError("browser exploded")
+    dl.copy_to_clipboard.return_value = False
+    reg = SimpleNamespace(download=dl, db=None)
+    background = BackgroundTasks()
+    events = []
+    monkeypatch.setattr(
+        download_routes.ws_manager,
+        "broadcast_sync",
+        events.append,
+    )
+
+    response = download_routes.copy_links_batch(
+        download_routes.ScrapeBatchRequest(items=[
+            download_routes.ScrapeRequest(
+                url="https://hdencode.org/release/example",
+                service_type="Rapidgator",
+            )
+        ]),
+        background,
+        reg,
+    )
+
+    assert response == {"status": "started", "count": 1}
+    assert len(background.tasks) == 1
+    task = background.tasks[0]
+    task.func(*task.args, **task.kwargs)
+
+    notification = next(
+        event for event in events
+        if event.get("type") == "notification"
+    )
+    assert notification["data"]["reason_codes"] == ["scrape_exception"]
+    assert "scrape_exception" in notification["data"]["body"]
+
+
+def test_release_text_named_captcha_is_not_a_challenge():
+    service = _service()
+    driver = MagicMock()
+    driver.title = "Captcha (2024)"
+    driver.page_source = """
+        <html><body>
+        <article>A documentary titled Captcha with ordinary release text.</article>
+        </body></html>
+    """
+
+    diagnostic = service._log_page_diagnostics(
+        driver,
+        stage="access_control",
+    )
 
     assert diagnostic.code is ScrapeCode.LAYOUT_CHANGED
     assert diagnostic.affects_source_health is True
