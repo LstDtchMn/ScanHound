@@ -599,9 +599,15 @@ def process_folder(req: ProcessFolderRequest, reg: ServiceRegistry = Depends(get
                 if result.get("error"):
                     body, prio = result["error"], "high"
                 else:
-                    body = (f"{result.get('created', 0)} new rename job(s) from "
-                            f"{result.get('found', 0)} file(s)"
-                            f"{f', {result['skipped']} already tracked' if result.get('skipped') else ''}")
+                    skipped = result.get("skipped", 0)
+                    skipped_suffix = (
+                        f", {skipped} already tracked" if skipped else ""
+                    )
+                    body = (
+                        f"{result.get('created', 0)} new rename job(s) from "
+                        f"{result.get('found', 0)} file(s)"
+                        f"{skipped_suffix}"
+                    )
                     prio = "normal"
             ws_manager.broadcast_sync({"type": "notification", "data": {
                 "title": "Process folder preview" if dry_run else "Process folder",
@@ -638,9 +644,15 @@ def dv_scan_folder(req: DvScanRequest, reg: ServiceRegistry = Depends(get_regist
                 body, prio = result["error"], "high"
             else:
                 fel = (result.get("by_layer") or {}).get("fel", 0)
-                body = (f"Scanned {result.get('scanned', 0)} of {result.get('found', 0)} "
-                        f"file(s) — {fel} FEL"
-                        f"{f', {result['skipped']} unchanged' if result.get('skipped') else ''}")
+                skipped = result.get("skipped", 0)
+                skipped_suffix = (
+                    f", {skipped} unchanged" if skipped else ""
+                )
+                body = (
+                    f"Scanned {result.get('scanned', 0)} of "
+                    f"{result.get('found', 0)} file(s) — {fel} FEL"
+                    f"{skipped_suffix}"
+                )
                 prio = "normal"
             ws_manager.broadcast_sync({"type": "notification", "data": {
                 "title": "Dolby Vision scan", "body": body, "priority": prio}})
