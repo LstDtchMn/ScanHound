@@ -378,12 +378,17 @@ class TestFileOps:
         assert not f.exists()
         assert os.path.isfile(trashed_path)
         assert os.path.basename(trashed_path) == "doomed.mkv"
-        # Landed under the implementation's source-volume trash root. On
-        # Windows that is the drive anchor; on POSIX it is the real mount point.
-        expected_root = fileops._trash_root_for(str(f))
-        assert os.path.commonpath([expected_root, trashed_path]) == expected_root
-        assert os.path.basename(expected_root) == ".scanhound-trash"
-        assert os.stat(os.path.dirname(expected_root)).st_dev == os.stat(trashed_path).st_dev
+        # Landed under one of the implementation's same-volume roots, not
+        # app-data. A non-root process may be unable to create the mount-root
+        # candidate and must then use a writable ancestor on the same device.
+        same_volume_roots = fileops._same_volume_trash_roots(str(f))
+        actual_root = next(
+            root for root in same_volume_roots
+            if os.path.commonpath([root, trashed_path]) == root
+        )
+        assert os.path.basename(actual_root) == ".scanhound-trash"
+        assert os.stat(os.path.dirname(actual_root)).st_dev == os.stat(trashed_path).st_dev
+        assert actual_root != fileops._TRASH_ROOT
         assert not trashed_path.startswith(fileops._DATA_DIR)
         # _DATA_DIR's contents are untouched — no bytes copied in.
         after = set()
@@ -400,6 +405,73 @@ class TestFileOps:
         trash_root_dir = os.path.dirname(shutil_bucket)
         if os.path.isdir(trash_root_dir) and not os.listdir(trash_root_dir):
             os.rmdir(trash_root_dir)
+
+    def test_trash_uses_writable_same_volume_ancestor_before_appdata(
+            self, tmp_path, monkeypatch):
+        """A denied volume-root candidate must not force a cross-device copy."""
+        library = tmp_path / "library"
+        library.mkdir()
+        source = library / "movie.mkv"
+        source.write_text("x")
+
+        blocked = tmp_path / "blocked" / ".scanhound-trash"
+        writable = library / ".scanhound-trash"
+        monkeypatch.setattr(
+            fileops,
+            "_same_volume_trash_roots",
+            lambda _path: [str(blocked), str(writable)],
+        )
+
+        real_makedirs = fileops.os.makedirs
+
+        def guarded_makedirs(path, *args, **kwargs):
+            if os.path.commonpath([str(blocked), str(path)]) == str(blocked):
+                raise PermissionError("volume root denied")
+            return real_makedirs(path, *args, **kwargs)
+
+        cross_device_moves = []
+        monkeypatch.setattr(fileops.os, "makedirs", guarded_makedirs)
+        monkeypatch.setattr(
+            fileops.shutil,
+            "move",
+            lambda *args, **kwargs: cross_device_moves.append((args, kwargs)),
+        )
+
+        trashed = fileops._trash(str(source))
+
+        assert os.path.commonpath([str(writable), trashed]) == str(writable)
+        assert os.path.isfile(trashed)
+        assert not cross_device_moves
+
+    def test_trash_exdev_never_cascades_to_appdata(
+            self, tmp_path, monkeypatch):
+        """EXDEV may require copying, but the copy must stay on source volume."""
+        import errno
+        source = tmp_path / "movie.mkv"
+        source.write_text("x")
+        same_volume = tmp_path / "volume-trash"
+        appdata = tmp_path / "appdata-trash"
+
+        monkeypatch.setattr(
+            fileops,
+            "_same_volume_trash_roots",
+            lambda _path: [str(same_volume)],
+        )
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(appdata))
+
+        real_rename = fileops.os.rename
+
+        def always_exdev(*_args, **_kwargs):
+            raise OSError(errno.EXDEV, "mount boundary")
+
+        monkeypatch.setattr(fileops.os, "rename", always_exdev)
+
+        trashed = fileops._trash(str(source))
+
+        assert os.path.commonpath([str(same_volume), trashed]) == str(same_volume)
+        assert not os.path.exists(source)
+        assert os.path.isfile(trashed)
+        assert not appdata.exists()
 
     # ── Trash manifest (enables restore) ─────────────────────────────────
 
@@ -688,6 +760,93 @@ class TestAllTrashRoots:
         entries = fileops.list_trash_entries(fileops.all_trash_roots())
         names = {e["name"] for e in entries}
         assert "movie.mkv" in names
+
+
+    def test_deeper_fallback_root_is_globally_discoverable_and_restorable(
+            self, tmp_path, monkeypatch):
+        """A non-mount-root placement must be visible to path-independent APIs."""
+        import json as _json
+
+        library = tmp_path / "library"
+        library.mkdir()
+        source = library / "movie.mkv"
+        source.write_text("payload")
+
+        deeper_root = library / ".scanhound-trash"
+        index_path = tmp_path / "trash_roots.json"
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_INDEX", str(index_path))
+        monkeypatch.setattr(
+            fileops,
+            "_same_volume_trash_roots",
+            lambda _path: [str(deeper_root)],
+        )
+        monkeypatch.setattr(
+            fileops,
+            "_trash_bucket_name",
+            lambda: "20260101-000000",
+        )
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: ["/"])
+
+        trashed = fileops._trash(str(source))
+
+        assert index_path.is_file()
+        payload = _json.loads(index_path.read_text())
+        assert str(deeper_root) in payload["roots"]
+
+        # Simulate a restart by dropping the process-local safety set.
+        fileops._TRASH_ROOTS_RUNTIME.clear()
+        global_roots = fileops.all_trash_roots()
+        assert str(deeper_root) in global_roots
+        entries = fileops.list_trash_entries(global_roots)
+        assert [entry["name"] for entry in entries] == ["movie.mkv"]
+
+        restored = fileops.restore_trash_entry(
+            "20260101-000000",
+            "movie.mkv",
+            global_roots,
+        )
+        assert restored["ok"] is True
+        assert source.read_text() == "payload"
+        assert not os.path.exists(trashed)
+
+    def test_registry_write_failure_keeps_same_process_restore_visible(
+            self, tmp_path, monkeypatch):
+        """A transient index failure cannot break immediate overwrite rollback."""
+        deeper_root = tmp_path / "library" / ".scanhound-trash"
+        index_path = tmp_path / "trash_roots.json"
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_INDEX", str(index_path))
+        monkeypatch.setattr(
+            fileops.os,
+            "replace",
+            lambda *_args, **_kwargs: (
+                _ for _ in ()
+            ).throw(OSError("index unavailable")),
+        )
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
+
+        fileops._record_trash_root(str(deeper_root))
+
+        assert str(deeper_root) in fileops.all_trash_roots()
+
+    def test_registered_root_index_rejects_arbitrary_paths(
+            self, tmp_path, monkeypatch):
+        """A corrupt index cannot turn global trash operations into arbitrary I/O."""
+        import json as _json
+
+        safe_root = tmp_path / "library" / ".scanhound-trash"
+        unsafe_root = tmp_path / "ordinary-directory"
+        index_path = tmp_path / "trash_roots.json"
+        index_path.write_text(_json.dumps({
+            "version": 1,
+            "roots": [str(safe_root), str(unsafe_root), "", None],
+        }))
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_INDEX", str(index_path))
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
+
+        roots = fileops.all_trash_roots()
+
+        assert str(safe_root) in roots
+        assert str(unsafe_root) not in roots
 
 
 class TestTrashRetentionSweep:

@@ -71,6 +71,26 @@ def _isolate_config_file(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_trash_root_registry(tmp_path, monkeypatch):
+    """Never let file-operation tests touch the user's persistent root index."""
+    from backend.rename import fileops as _fileops
+
+    monkeypatch.setattr(
+        _fileops,
+        "_TRASH_ROOTS_INDEX",
+        str(tmp_path / "trash_roots.json"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _fileops,
+        "_TRASH_ROOTS_RUNTIME",
+        set(),
+        raising=False,
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_default_database(tmp_path, monkeypatch):
     """Give every test its own default crawler.db.
 
