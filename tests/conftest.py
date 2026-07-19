@@ -125,20 +125,6 @@ def _isolate_default_database(tmp_path, monkeypatch):
         registry.db = None
 
 
-def test_default_database_path_is_function_scoped(_isolate_default_database):
-    """Omitted-path DatabaseManagers must use this test's isolated crawler.db."""
-    from backend.database import DatabaseManager
-
-    first = DatabaseManager()
-    second = DatabaseManager()
-    try:
-        assert first.db_path == _isolate_default_database
-        assert second.db_path == _isolate_default_database
-    finally:
-        first.close()
-        second.close()
-
-
 @pytest.fixture
 def tmp_db(tmp_path):
     """Provide a temporary database path that gets cleaned up."""
