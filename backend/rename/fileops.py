@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 from typing import Callable, Optional
 
 from backend.config import _DATA_DIR
@@ -34,6 +35,12 @@ MOVE_METHODS = ("move", "copy", "hardlink", "symlink")
 
 # Trash root — overridable by tests via monkeypatch.
 _TRASH_ROOT = os.path.join(_DATA_DIR, "trash")
+# Persistent discovery index for non-mount-root trash locations chosen
+# when an unprivileged process cannot create <mount>/.scanhound-trash.
+_TRASH_ROOTS_INDEX = os.path.join(_DATA_DIR, "trash_roots.json")
+_TRASH_ROOTS_INDEX_LOCK = threading.RLock()
+# Same-process safety net when persistence is temporarily unavailable.
+_TRASH_ROOTS_RUNTIME = set()
 
 # Streaming-copy chunk size. Big enough to keep USB HDD sequential throughput
 # high; small enough for smooth progress reporting.
@@ -194,6 +201,111 @@ def _record_trash_manifest(bucket: str, trashed_name: str, original_path: str) -
                        exc_info=True)
 
 
+def _normalize_registered_trash_root(root) -> Optional[str]:
+    """Validate one persisted trash-root path before it can be scanned.
+
+    Only absolute paths whose final component is exactly `.scanhound-trash`
+    are accepted. Existing symlinks are rejected so a later scan cannot be
+    redirected outside the intended trash directory.
+    """
+    try:
+        candidate = os.path.abspath(os.fspath(root))
+    except (TypeError, ValueError, OSError):
+        return None
+    if os.path.basename(os.path.normpath(candidate)).casefold() != ".scanhound-trash":
+        return None
+    try:
+        if os.path.lexists(candidate) and os.path.islink(candidate):
+            return None
+    except OSError:
+        return None
+    return candidate
+
+
+def _read_persisted_trash_roots_unlocked() -> list:
+    """Read and validate the index while the caller holds the registry lock."""
+    try:
+        with open(_TRASH_ROOTS_INDEX, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return []
+
+    raw_roots = payload.get("roots", []) if isinstance(payload, dict) else payload
+    if not isinstance(raw_roots, list):
+        return []
+
+    roots = []
+    seen = set()
+    for raw in raw_roots:
+        normalized = _normalize_registered_trash_root(raw)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            roots.append(normalized)
+    return roots
+
+
+def _load_registered_trash_roots() -> list:
+    """Return persisted roots plus roots registered in this process."""
+    with _TRASH_ROOTS_INDEX_LOCK:
+        roots = set(_read_persisted_trash_roots_unlocked())
+        roots.update(
+            root for root in _TRASH_ROOTS_RUNTIME
+            if _normalize_registered_trash_root(root) is not None
+        )
+    return sorted(roots)
+
+
+def _record_trash_root(root: str) -> None:
+    """Register a usable trash root before or after a move.
+
+    The in-memory set guarantees immediate rollback/list visibility even if the
+    app-data index cannot be written. Atomic replacement provides restart-safe
+    discovery when persistence succeeds.
+    """
+    normalized = _normalize_registered_trash_root(root)
+    if normalized is None:
+        return
+
+    tmp_path = None
+    try:
+        with _TRASH_ROOTS_INDEX_LOCK:
+            _TRASH_ROOTS_RUNTIME.add(normalized)
+            persisted = set(_read_persisted_trash_roots_unlocked())
+            if normalized in persisted:
+                return
+            persisted.add(normalized)
+
+            parent = os.path.dirname(_TRASH_ROOTS_INDEX) or os.curdir
+            os.makedirs(parent, exist_ok=True)
+            tmp_path = (
+                f"{_TRASH_ROOTS_INDEX}.tmp."
+                f"{os.getpid()}.{threading.get_ident()}"
+            )
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"version": 1, "roots": sorted(persisted)},
+                    f,
+                    indent=2,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, _TRASH_ROOTS_INDEX)
+    except OSError:
+        logger.warning(
+            "Failed to persist trash-root discovery index at %s; "
+            "same-process discovery remains available",
+            _TRASH_ROOTS_INDEX,
+            exc_info=True,
+        )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+
 def _trash_root_for(path: str) -> str:
     """Return the trash root that lives on ``path``'s own volume.
 
@@ -298,6 +410,7 @@ def _finish_trash_move(path: str, bucket: str, dst: str) -> str:
     """Record and return a completed trash move."""
     logger.info("trash  | %s -> %s", path, dst)
     _record_trash_manifest(bucket, os.path.basename(dst), path)
+    _record_trash_root(os.path.dirname(bucket))
     return dst
 
 
@@ -335,6 +448,9 @@ def _trash(path: str) -> str:
         except OSError:
             continue
 
+        # Register before moving to close the crash window between placement and
+        # path-independent restore/list/sweep discovery.
+        _record_trash_root(root)
         dst = dedupe_dest(os.path.join(bucket, name))
         try:
             os.rename(path, dst)
@@ -654,6 +770,7 @@ def all_trash_roots() -> list:
     didn't put there.
     """
     roots = {os.path.abspath(_TRASH_ROOT)}
+    roots.update(_load_registered_trash_roots())
     if os.name == "nt":
         import string
         for letter in string.ascii_uppercase:

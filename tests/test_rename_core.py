@@ -762,6 +762,93 @@ class TestAllTrashRoots:
         assert "movie.mkv" in names
 
 
+    def test_deeper_fallback_root_is_globally_discoverable_and_restorable(
+            self, tmp_path, monkeypatch):
+        """A non-mount-root placement must be visible to path-independent APIs."""
+        import json as _json
+
+        library = tmp_path / "library"
+        library.mkdir()
+        source = library / "movie.mkv"
+        source.write_text("payload")
+
+        deeper_root = library / ".scanhound-trash"
+        index_path = tmp_path / "trash_roots.json"
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_INDEX", str(index_path))
+        monkeypatch.setattr(
+            fileops,
+            "_same_volume_trash_roots",
+            lambda _path: [str(deeper_root)],
+        )
+        monkeypatch.setattr(
+            fileops,
+            "_trash_bucket_name",
+            lambda: "20260101-000000",
+        )
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: ["/"])
+
+        trashed = fileops._trash(str(source))
+
+        assert index_path.is_file()
+        payload = _json.loads(index_path.read_text())
+        assert str(deeper_root) in payload["roots"]
+
+        # Simulate a restart by dropping the process-local safety set.
+        fileops._TRASH_ROOTS_RUNTIME.clear()
+        global_roots = fileops.all_trash_roots()
+        assert str(deeper_root) in global_roots
+        entries = fileops.list_trash_entries(global_roots)
+        assert [entry["name"] for entry in entries] == ["movie.mkv"]
+
+        restored = fileops.restore_trash_entry(
+            "20260101-000000",
+            "movie.mkv",
+            global_roots,
+        )
+        assert restored["ok"] is True
+        assert source.read_text() == "payload"
+        assert not os.path.exists(trashed)
+
+    def test_registry_write_failure_keeps_same_process_restore_visible(
+            self, tmp_path, monkeypatch):
+        """A transient index failure cannot break immediate overwrite rollback."""
+        deeper_root = tmp_path / "library" / ".scanhound-trash"
+        index_path = tmp_path / "trash_roots.json"
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_INDEX", str(index_path))
+        monkeypatch.setattr(
+            fileops.os,
+            "replace",
+            lambda *_args, **_kwargs: (
+                _ for _ in ()
+            ).throw(OSError("index unavailable")),
+        )
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
+
+        fileops._record_trash_root(str(deeper_root))
+
+        assert str(deeper_root) in fileops.all_trash_roots()
+
+    def test_registered_root_index_rejects_arbitrary_paths(
+            self, tmp_path, monkeypatch):
+        """A corrupt index cannot turn global trash operations into arbitrary I/O."""
+        import json as _json
+
+        safe_root = tmp_path / "library" / ".scanhound-trash"
+        unsafe_root = tmp_path / "ordinary-directory"
+        index_path = tmp_path / "trash_roots.json"
+        index_path.write_text(_json.dumps({
+            "version": 1,
+            "roots": [str(safe_root), str(unsafe_root), "", None],
+        }))
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_INDEX", str(index_path))
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
+
+        roots = fileops.all_trash_roots()
+
+        assert str(safe_root) in roots
+        assert str(unsafe_root) not in roots
+
+
 class TestTrashRetentionSweep:
     """sweep_trash() — deletes only old buckets under the trash roots."""
 
