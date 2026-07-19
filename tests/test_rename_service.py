@@ -2340,17 +2340,22 @@ class TestReplaceLibraryDupAndKeepPlex:
         assert not os.path.exists(src)     # redundant download moved to trash
         assert os.path.isfile(dup)         # library copy untouched
 
-    def test_keep_plex_trash_failure_still_archives(self, db, tmp_path, monkeypatch):
+    def test_keep_plex_trash_failure_does_not_archive(
+            self, db, tmp_path, monkeypatch):
+        """SH-R03: Keep Plex is not committed unless durable trash succeeds."""
         svc, jid, src, dst, dup = self._setup(db, tmp_path)
 
         def _boom(path):
             raise OSError("simulated trash failure")
         monkeypatch.setattr("backend.rename.service._fileops._trash", _boom)
+
         out = svc.resolve_keep_plex(jid)
-        assert out["ok"] is True
-        assert out.get("warning")          # surfaced, not swallowed
-        assert db.get_rename_job(jid).get("archived_at")
-        assert os.path.isfile(src)         # trash failed => download left in place
+
+        assert out["ok"] is False
+        assert "not applied" in out.get("error", "").lower()
+        assert not db.get_rename_job(jid).get("archived_at")
+        assert os.path.isfile(src)         # failed transaction leaves download in place
+        assert os.path.isfile(dup)         # Plex/library copy is never touched
 
 
 # ── process_folder (manual backlog processing) ───────────────────────

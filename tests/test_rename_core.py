@@ -553,12 +553,16 @@ class TestFileOps:
 
     def test_trash_exdev_never_cascades_to_appdata(
             self, tmp_path, monkeypatch):
-        """EXDEV may require copying, but the copy must stay on source volume."""
+        """EXDEV may require copying, but the copy stays on the selected volume."""
         import errno
         source = tmp_path / "movie.mkv"
         source.write_text("x")
-        same_volume = tmp_path / "volume-trash"
+        # SH-R03 only accepts non-intrinsic roots that can be safely persisted
+        # and rediscovered. Use the real root shape rather than an arbitrary
+        # test-only directory name.
+        same_volume = tmp_path / ".scanhound-trash"
         appdata = tmp_path / "appdata-trash"
+        index = tmp_path / "trash_roots.json"
 
         monkeypatch.setattr(
             fileops,
@@ -566,16 +570,29 @@ class TestFileOps:
             lambda _path: [str(same_volume)],
         )
         monkeypatch.setattr(fileops, "_TRASH_ROOT", str(appdata))
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_INDEX", str(index))
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_RUNTIME", set())
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
 
-        real_rename = fileops.os.rename
+        real_move_no_replace = fileops._move_no_replace
+        calls = 0
 
-        def always_exdev(*_args, **_kwargs):
-            raise OSError(errno.EXDEV, "mount boundary")
+        def first_exdev_then_publish(source_path, destination_path):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError(errno.EXDEV, "mount boundary")
+            return real_move_no_replace(source_path, destination_path)
 
-        monkeypatch.setattr(fileops.os, "rename", always_exdev)
+        monkeypatch.setattr(
+            fileops,
+            "_move_no_replace",
+            first_exdev_then_publish,
+        )
 
         trashed = fileops._trash(str(source))
 
+        assert calls >= 2  # direct move failed; verified-copy publication ran
         assert os.path.commonpath([str(same_volume), trashed]) == str(same_volume)
         assert not os.path.exists(source)
         assert os.path.isfile(trashed)
@@ -622,26 +639,25 @@ class TestFileOps:
         originals = {r["original_path"] for r in records}
         assert originals == {os.path.abspath(str(f1)), os.path.abspath(str(f2))}
 
-    def test_trash_manifest_write_failure_does_not_raise(self, tmp_path, monkeypatch):
-        """A manifest write failure must be logged, never propagated out of
-        _trash — losing the restore record is acceptable, losing the file
-        disposal guarantee is not."""
+    def test_trash_manifest_write_failure_leaves_source_in_place(
+            self, tmp_path, monkeypatch):
+        """SH-R03: restore metadata failure must abort before source movement."""
         trash_root = tmp_path / "appdata" / "trash"
-        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
-        f = tmp_path / "movie.mkv"; f.write_text("bye")
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        monkeypatch.setattr(fileops, "_same_volume_trash_roots", lambda _path: [])
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_RUNTIME", set())
+        f = tmp_path / "movie.mkv"
+        f.write_text("bye")
 
-        real_open = open
-
-        def _boom(path, *a, **kw):
-            if str(path).endswith("manifest.json"):
-                raise OSError("disk full")
-            return real_open(path, *a, **kw)
-
-        monkeypatch.setattr(fileops, "open", _boom, raising=False)
-        # _trash must still succeed and move the file despite the manifest failure.
-        trashed_path = fileops._trash(str(f))
-        assert not f.exists()
-        assert os.path.isfile(trashed_path)
+        monkeypatch.setattr(
+            fileops.json,
+            "dump",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        with pytest.raises(OSError):
+            fileops._trash(str(f))
+        assert f.read_text() == "bye"
+        assert fileops.list_trash_entries([str(trash_root)]) == []
 
 
 class TestTrashListAndRestore:

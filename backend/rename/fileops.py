@@ -28,6 +28,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import uuid
 from typing import Callable, Optional
 
 from backend.config import _DATA_DIR
@@ -44,6 +45,9 @@ _TRASH_ROOTS_INDEX = os.path.join(_DATA_DIR, "trash_roots.json")
 _TRASH_ROOTS_INDEX_LOCK = threading.RLock()
 # Same-process safety net when persistence is temporarily unavailable.
 _TRASH_ROOTS_RUNTIME = set()
+# Serialize every manifest reservation/update.  The lock is process-wide
+# because a timestamp bucket may be shared by unrelated worker threads.
+_TRASH_MANIFEST_LOCK = threading.RLock()
 
 # Streaming-copy chunk size. Big enough to keep USB HDD sequential throughput
 # high; small enough for smooth progress reporting.
@@ -277,36 +281,117 @@ def dedupe_dest(dst: str) -> str:
         n += 1
 
 
-def _record_trash_manifest(bucket: str, trashed_name: str, original_path: str) -> None:
-    """Append a restore record to ``<bucket>/manifest.json`` (read-modify-write).
+def _fsync_directory(path: str) -> None:
+    """Durably publish directory-entry changes on POSIX.
 
-    Best-effort: any failure (disk full, permissions, corrupt existing JSON) is
-    logged as a warning and swallowed — losing the ability to restore a file
-    via the manifest is acceptable, but it must never turn a successful trash
-    disposal into a raised exception.
+    Windows does not provide a portable directory-fsync equivalent through
+    Python; file flush + atomic replacement remain the strongest available
+    primitive there.  On POSIX an unsupported directory fsync is a hard error:
+    trashing fails closed and the source stays in place.
     """
-    manifest_path = os.path.join(bucket, "manifest.json")
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path or os.curdir, flags)
     try:
-        records = []
-        if os.path.isfile(manifest_path):
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_json(path: str, payload) -> None:
+    """Write JSON through a unique fsynced temp file and atomic replacement."""
+    parent = os.path.dirname(path) or os.curdir
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.tmp.", dir=parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+        _fsync_directory(parent)
+    finally:
+        if tmp_path and os.path.lexists(tmp_path):
             try:
-                with open(manifest_path, "r", encoding="utf-8") as f:
-                    records = json.load(f)
-                if not isinstance(records, list):
-                    records = []
-            except (OSError, ValueError):
-                records = []
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _load_manifest_strict(bucket: str) -> list:
+    """Read a manifest without silently discarding corruption or I/O errors."""
+    manifest_path = os.path.join(bucket, "manifest.json")
+    if not os.path.lexists(manifest_path):
+        return []
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as stream:
+            records = json.load(stream)
+    except (OSError, ValueError, TypeError) as exc:
+        raise OSError(
+            f"Trash manifest is unreadable or corrupt: {manifest_path}"
+        ) from exc
+    if not isinstance(records, list):
+        raise OSError(f"Trash manifest is not a list: {manifest_path}")
+    return records
+
+
+def _choose_reserved_trash_name(bucket: str, requested: str, records: list) -> str:
+    """Choose a case-insensitive name not occupied on disk or in reservations."""
+    reserved = {
+        str(record.get("trashed_name") or "").casefold()
+        for record in records
+        if record.get("trashed_name")
+    }
+    base, ext = os.path.splitext(requested)
+    candidate = requested
+    suffix = 0
+    while candidate.casefold() in reserved or _casefold_lexists(
+        os.path.join(bucket, candidate)
+    ):
+        suffix += 1
+        candidate = f"{base} ({suffix}){ext}"
+    return candidate
+
+
+def _reserve_trash_record(bucket: str, requested_name: str, original_path: str):
+    """Durably reserve the final trash name before the source can move."""
+    with _TRASH_MANIFEST_LOCK:
+        records = _load_manifest_strict(bucket)
+        trashed_name = _choose_reserved_trash_name(bucket, requested_name, records)
+        reservation_id = uuid.uuid4().hex
         records.append({
+            "reservation_id": reservation_id,
             "trashed_name": trashed_name,
             "original_path": os.path.abspath(original_path),
             "trashed_at": datetime.datetime.now().isoformat(),
         })
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(records, f, indent=2)
-    except OSError:
-        logger.warning("Failed to update trash manifest at %s (non-fatal)", manifest_path,
-                       exc_info=True)
+        _atomic_write_json(os.path.join(bucket, "manifest.json"), records)
+    return os.path.join(bucket, trashed_name), reservation_id
 
+
+def _remove_reserved_trash_record(bucket: str, reservation_id: str) -> None:
+    """Best-effort rollback of metadata prepared for a move that did not occur."""
+    try:
+        with _TRASH_MANIFEST_LOCK:
+            records = _load_manifest_strict(bucket)
+            remaining = [
+                record for record in records
+                if record.get("reservation_id") != reservation_id
+            ]
+            if remaining != records:
+                _atomic_write_json(os.path.join(bucket, "manifest.json"), remaining)
+    except OSError:
+        # A metadata-only record with no file is harmless: list/restore enumerate
+        # actual files.  Log loudly, but never hide the original move failure.
+        logger.exception(
+            "Failed to roll back prepared trash record %s in %s",
+            reservation_id,
+            bucket,
+        )
 
 def _normalize_registered_trash_root(root) -> Optional[str]:
     """Validate one persisted trash-root path before it can be scanned.
@@ -362,56 +447,94 @@ def _load_registered_trash_roots() -> list:
     return sorted(roots)
 
 
-def _record_trash_root(root: str) -> None:
-    """Register a usable trash root before or after a move.
+def _read_trash_root_index_strict_unlocked() -> list:
+    """Read the discovery index without replacing a corrupt index with emptiness."""
+    if not os.path.lexists(_TRASH_ROOTS_INDEX):
+        return []
+    try:
+        with open(_TRASH_ROOTS_INDEX, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError, TypeError) as exc:
+        raise OSError(
+            f"Trash-root discovery index is unreadable: {_TRASH_ROOTS_INDEX}"
+        ) from exc
+    raw_roots = payload.get("roots", []) if isinstance(payload, dict) else payload
+    if not isinstance(raw_roots, list):
+        raise OSError("Trash-root discovery index does not contain a roots list")
+    roots = []
+    seen = set()
+    for raw in raw_roots:
+        normalized = _normalize_registered_trash_root(raw)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            roots.append(normalized)
+    return roots
 
-    The in-memory set guarantees immediate rollback/list visibility even if the
-    app-data index cannot be written. Atomic replacement provides restart-safe
-    discovery when persistence succeeds.
+
+def _trash_root_is_intrinsically_discoverable(root: str) -> bool:
+    """Whether all_trash_roots can rediscover root without the persisted index."""
+    candidate = os.path.abspath(root)
+    if candidate == os.path.abspath(_TRASH_ROOT):
+        return True
+    if os.name == "nt":
+        import string
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.isdir(drive) and candidate == os.path.abspath(
+                _trash_root_for(drive)
+            ):
+                return True
+        return False
+    intrinsic = {
+        os.path.abspath(os.path.join(mp, ".scanhound-trash"))
+        for mp in _posix_mount_points()
+    }
+    try:
+        intrinsic.add(os.path.abspath(_trash_root_for("/")))
+    except OSError:
+        pass
+    return candidate in intrinsic
+
+
+def _record_trash_root(root: str, *, required: bool = False) -> bool:
+    """Persist restart-safe discovery before a file is moved into a deep root.
+
+    For legacy/intrinsic callers, an index failure retains the old same-process
+    visibility behavior.  A destructive trash transaction passes required=True
+    for a non-intrinsic root; persistence failure then raises before source bytes
+    move.
     """
     normalized = _normalize_registered_trash_root(root)
     if normalized is None:
-        return
+        if required:
+            raise OSError(f"Unsafe trash root cannot be persisted: {root}")
+        return False
 
-    tmp_path = None
-    try:
-        with _TRASH_ROOTS_INDEX_LOCK:
+    with _TRASH_ROOTS_INDEX_LOCK:
+        if _trash_root_is_intrinsically_discoverable(normalized):
             _TRASH_ROOTS_RUNTIME.add(normalized)
-            persisted = set(_read_persisted_trash_roots_unlocked())
-            if normalized in persisted:
-                return
-            persisted.add(normalized)
-
-            parent = os.path.dirname(_TRASH_ROOTS_INDEX) or os.curdir
-            os.makedirs(parent, exist_ok=True)
-            tmp_path = (
-                f"{_TRASH_ROOTS_INDEX}.tmp."
-                f"{os.getpid()}.{threading.get_ident()}"
-            )
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(
+            return True
+        try:
+            persisted = set(_read_trash_root_index_strict_unlocked())
+            if normalized not in persisted:
+                persisted.add(normalized)
+                _atomic_write_json(
+                    _TRASH_ROOTS_INDEX,
                     {"version": 1, "roots": sorted(persisted)},
-                    f,
-                    indent=2,
                 )
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, _TRASH_ROOTS_INDEX)
-    except OSError:
-        logger.warning(
-            "Failed to persist trash-root discovery index at %s; "
-            "same-process discovery remains available",
-            _TRASH_ROOTS_INDEX,
-            exc_info=True,
-        )
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-
+            _TRASH_ROOTS_RUNTIME.add(normalized)
+            return True
+        except OSError:
+            if required:
+                raise
+            _TRASH_ROOTS_RUNTIME.add(normalized)
+            logger.warning(
+                "Failed to persist trash-root discovery index at %s; "
+                "same-process discovery remains available",
+                _TRASH_ROOTS_INDEX,
+                exc_info=True,
+            )
+            return False
 
 def _trash_root_for(path: str) -> str:
     """Return the trash root that lives on ``path``'s own volume.
@@ -514,94 +637,150 @@ def trash_roots(path: str) -> list:
 
 
 def _finish_trash_move(path: str, bucket: str, dst: str) -> str:
-    """Record and return a completed trash move."""
+    """Return a completed move whose discovery and restore record are durable."""
     logger.info("trash  | %s -> %s", path, dst)
-    _record_trash_manifest(bucket, os.path.basename(dst), path)
-    _record_trash_root(os.path.dirname(bucket))
     return dst
 
 
 def _remove_empty_bucket(bucket: str) -> None:
-    """Best-effort cleanup for a candidate rejected after EXDEV."""
+    """Best-effort cleanup for a candidate whose move did not complete."""
     try:
-        if os.path.isdir(bucket) and not os.listdir(bucket):
+        leftovers = os.listdir(bucket)
+        if leftovers == ["manifest.json"]:
+            manifest = _load_manifest(bucket)
+            if not manifest:
+                os.unlink(os.path.join(bucket, "manifest.json"))
+                leftovers = []
+        if not leftovers:
             os.rmdir(bucket)
     except OSError:
         pass
 
 
+def _prepare_trash_destination(root: str, bucket_name: str, path: str):
+    """Create durable discovery + restore metadata before consuming path."""
+    os.makedirs(root, exist_ok=True)
+    _fsync_directory(os.path.dirname(root) or os.curdir)
+    required = not _trash_root_is_intrinsically_discoverable(root)
+    _record_trash_root(root, required=required)
+
+    bucket = os.path.join(root, bucket_name)
+    os.makedirs(bucket, exist_ok=True)
+    _fsync_directory(root)
+    dst, reservation_id = _reserve_trash_record(
+        bucket, os.path.basename(path), path
+    )
+    return bucket, dst, reservation_id
+
+
+def _cleanup_prepared_trash(bucket: str, dst: str, reservation_id: str) -> None:
+    """Rollback a transaction that did not consume the source."""
+    try:
+        if os.path.lexists(dst):
+            os.unlink(dst)
+    except OSError:
+        logger.exception("Failed to remove incomplete trash destination %s", dst)
+    _remove_reserved_trash_record(bucket, reservation_id)
+    _remove_empty_bucket(bucket)
+
+
+def _copy_then_unlink_to_trash(path: str, dst: str) -> None:
+    """Cross-device verified copy; source unlink is the final destructive step."""
+    _copy_verify_atomic(path, dst)
+    try:
+        os.unlink(path)
+    except BaseException:
+        try:
+            os.unlink(dst)
+        except OSError:
+            logger.critical(
+                "Trash copy published but source unlink and destination rollback "
+                "both failed: %s -> %s",
+                path,
+                dst,
+                exc_info=True,
+            )
+        raise
+
+
 def _trash(path: str) -> str:
-    """Move ``path`` to a recoverable trash bucket without deleting it.
+    """Move path into recoverable trash with a durable pre-move restore record.
 
-    Same-device roots are attempted from the volume root toward the source.
-    A writable candidate first gets an atomic ``os.rename`` attempt. If a bind
-    mount or overlay boundary still reports ``EXDEV``, deeper same-device
-    candidates are tried for an atomic rename.
-
-    If every writable same-device candidate reports ``EXDEV``, copy/move into
-    the first writable same-volume trash root. Never abandon a viable
-    source-volume destination in favor of app-data merely because atomic rename
-    is unavailable. App-data remains the last resort only when no same-volume
-    candidate can even be created.
+    No source-consuming operation begins until both restart-safe root discovery
+    (when needed) and the manifest reservation are atomically persisted.  Move,
+    manifest, fsync, or index failures therefore leave the source untouched.
     """
     bucket_name = _trash_bucket_name()
-    name = os.path.basename(path)
     first_exdev_root = None
+    preparation_errors = []
 
     for root in _same_volume_trash_roots(path):
-        bucket = os.path.join(root, bucket_name)
         try:
-            os.makedirs(bucket, exist_ok=True)
-        except OSError:
-            continue
-
-        # Register before moving to close the crash window between placement and
-        # path-independent restore/list/sweep discovery.
-        _record_trash_root(root)
-        dst = dedupe_dest(os.path.join(bucket, name))
-        try:
-            os.rename(path, dst)
+            bucket, dst, reservation_id = _prepare_trash_destination(
+                root, bucket_name, path
+            )
         except OSError as exc:
-            if exc.errno != errno.EXDEV:
-                raise
-            if first_exdev_root is None:
-                first_exdev_root = root
-            _remove_empty_bucket(bucket)
+            preparation_errors.append(exc)
             continue
-
+        try:
+            _move_no_replace(path, dst)
+        except OSError as exc:
+            if exc.errno == errno.EXDEV:
+                if first_exdev_root is None:
+                    first_exdev_root = root
+                _cleanup_prepared_trash(bucket, dst, reservation_id)
+                continue
+            _cleanup_prepared_trash(bucket, dst, reservation_id)
+            raise
+        except BaseException:
+            _cleanup_prepared_trash(bucket, dst, reservation_id)
+            raise
         return _finish_trash_move(path, bucket, dst)
 
     if first_exdev_root is not None:
-        # Every creatable same-volume candidate crossed a mount boundary.
-        # Preserve the preferred same-volume destination and use shutil.move's
-        # copy+unlink fallback there rather than copying into app-data.
-        bucket = os.path.join(first_exdev_root, bucket_name)
-        os.makedirs(bucket, exist_ok=True)
-        dst = dedupe_dest(os.path.join(bucket, name))
-        logger.warning(
-            "Atomic trash rename crossed a mount boundary for %s; "
-            "using same-volume move fallback at %s",
-            path,
-            first_exdev_root,
+        bucket, dst, reservation_id = _prepare_trash_destination(
+            first_exdev_root, bucket_name, path
         )
-        shutil.move(path, dst)
+        try:
+            logger.warning(
+                "Atomic trash move crossed a mount boundary for %s; using "
+                "verified copy + unlink at %s",
+                path,
+                first_exdev_root,
+            )
+            _copy_then_unlink_to_trash(path, dst)
+        except BaseException:
+            _cleanup_prepared_trash(bucket, dst, reservation_id)
+            raise
         return _finish_trash_move(path, bucket, dst)
 
-    logger.warning(
-        "No writable same-volume trash root for %s; falling back to app-data",
-        path,
-    )
-    bucket = os.path.join(_TRASH_ROOT, bucket_name)
-    os.makedirs(bucket, exist_ok=True)
-    dst = dedupe_dest(os.path.join(bucket, name))
     try:
-        os.rename(path, dst)
+        bucket, dst, reservation_id = _prepare_trash_destination(
+            _TRASH_ROOT, bucket_name, path
+        )
+    except OSError:
+        if preparation_errors:
+            raise OSError(
+                "No trash destination could durably prepare a restore record; "
+                "source kept"
+            ) from preparation_errors[-1]
+        raise
+
+    try:
+        _move_no_replace(path, dst)
     except OSError as exc:
         if exc.errno != errno.EXDEV:
+            _cleanup_prepared_trash(bucket, dst, reservation_id)
             raise
-        shutil.move(path, dst)
+        try:
+            _copy_then_unlink_to_trash(path, dst)
+        except BaseException:
+            _cleanup_prepared_trash(bucket, dst, reservation_id)
+            raise
+    except BaseException:
+        _cleanup_prepared_trash(bucket, dst, reservation_id)
+        raise
     return _finish_trash_move(path, bucket, dst)
-
 
 def _is_safe_component(component: str) -> bool:
     """Whether a single path component is safe to join under a trash root.
@@ -632,10 +811,9 @@ def _load_manifest(bucket_path: str) -> list:
 
 
 def _save_manifest(bucket_path: str, records: list) -> None:
-    manifest_path = os.path.join(bucket_path, "manifest.json")
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2)
-
+    """Atomically and durably replace a bucket manifest."""
+    with _TRASH_MANIFEST_LOCK:
+        _atomic_write_json(os.path.join(bucket_path, "manifest.json"), records)
 
 def list_trash_entries(roots) -> list:
     """List every trashed file across the given trash roots.
