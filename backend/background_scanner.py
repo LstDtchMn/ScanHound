@@ -15,6 +15,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from backend.config import source_enabled
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SOURCES = ["HDEncode", "DDLBase", "Adit-HD"]
@@ -187,7 +189,11 @@ class BackgroundScanner:
         try:
             for source in sources:
                 if (str(source).strip().lower() == "hdencode"
-                        and not cfg.get("hdencode_enabled", True)):
+                        and not source_enabled(
+                            cfg,
+                            "hdencode_enabled",
+                            missing_default=True,
+                        )):
                     logger.info("Background scan: HDEncode disabled; skipping without network access")
                     source_results.append({
                         "source": source, "new": 0, "error": None,

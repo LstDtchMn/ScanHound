@@ -684,3 +684,32 @@ class TestAppConfigTypedDict:
     def test_appconfig_total_false(self):
         """AppConfig is defined with total=False so all fields are optional."""
         assert AppConfig.__total__ is False
+
+
+
+def test_source_enabled_rejects_truthy_non_boolean_values():
+    from backend.config import source_enabled
+
+    for value in ("false", "0", "off", "true", 1, [], {}, object(), None):
+        assert source_enabled(
+            {"hdencode_enabled": value},
+            "hdencode_enabled",
+        ) is False
+
+    assert source_enabled(
+        {"hdencode_enabled": True},
+        "hdencode_enabled",
+    ) is True
+    assert source_enabled({}, "hdencode_enabled", missing_default=True) is True
+
+
+def test_validate_config_fails_closed_for_malformed_hdencode_flag():
+    from backend.config import validate_config
+
+    assert validate_config({"hdencode_enabled": "false"})[
+        "hdencode_enabled"
+    ] is False
+    assert validate_config({"hdencode_enabled": True})[
+        "hdencode_enabled"
+    ] is True
+    assert validate_config({}) == {}

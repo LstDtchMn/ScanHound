@@ -15,6 +15,7 @@ from .base import (
     ParsedRelease,
     PageResult
 )
+from backend.config import source_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,11 @@ class SourceRegistry:
         for name in list(self._enabled):
             key = f"{name}_enabled"
             if key in config:
-                enabled = bool(config[key])
+                enabled = source_enabled(
+                    config,
+                    key,
+                    missing_default=self._enabled.get(name, True),
+                )
                 if self._enabled.get(name) != enabled:
                     self.enable_source(name, enabled)
 

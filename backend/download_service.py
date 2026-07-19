@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
 from backend.database import DatabaseManager
+from backend.config import source_enabled
 from backend.app_service import normalize_title
 from backend.sources.ddlbase import decode_ddlbase_link
 
@@ -1308,7 +1309,8 @@ class DownloadService:
         # Classify by parsed hostname only.  Query/path text such as
         # ``?next=https://ddlbase.com`` must not bypass the HDEncode switch.
         source_kind = _source_page_kind(url)
-        if source_kind == "hdencode" and not self.config.get("hdencode_enabled", True):
+        if source_kind == "hdencode" and not source_enabled(
+                self.config, "hdencode_enabled", missing_default=True):
             self._log("[HDEncode] Source is disabled in Settings; no request was made.", "warning")
             return []
 

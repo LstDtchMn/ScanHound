@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.ws import ws_manager
+from backend.config import source_enabled
 from backend.scanner_service import ScanStatus, STATUS_COLORS, STATUS_TEXTS
 
 logger = logging.getLogger(__name__)
@@ -348,7 +349,7 @@ def scan_start(
     global _scan_thread
 
     if (_scan_request_uses_hdencode(req)
-            and not reg.config.get("hdencode_enabled", True)):
+            and not source_enabled(reg.config, "hdencode_enabled", missing_default=True)):
         raise HTTPException(
             status_code=409,
             detail="HDEncode is disabled in Settings; no request was made")
@@ -391,7 +392,7 @@ def rescan_item(
         raise HTTPException(status_code=400, detail="No URL provided")
 
     if (_is_hdencode_url(req.url, reg.config)
-            and not reg.config.get("hdencode_enabled", True)):
+            and not source_enabled(reg.config, "hdencode_enabled", missing_default=True)):
         raise HTTPException(
             status_code=409,
             detail="HDEncode is disabled in Settings; no request was made")

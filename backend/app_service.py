@@ -849,7 +849,12 @@ class AppService:
                 if "plex_mode" in config and "plex_connection_mode" not in file_config:
                     config["plex_connection_mode"] = config.pop("plex_mode")
             except (json.JSONDecodeError, IOError) as e:
-                logger.error(f"Error loading config: {e}, using defaults")
+                logger.error(
+                    "Error loading config: %s; using defaults with HDEncode "
+                    "disabled fail-closed",
+                    e,
+                )
+                config["hdencode_enabled"] = False
 
         env_overrides = {
             "plex_url": os.getenv("PLEX_URL"),
@@ -871,6 +876,14 @@ class AppService:
             "pushover_user": os.getenv("PUSHOVER_USER"),
             "pushover_token": os.getenv("PUSHOVER_TOKEN"),
             "webhook_url": os.getenv("WEBHOOK_URL"),
+            # Deployment-grade emergency override. Any non-true value is
+            # normalized to False by validate_config().
+            "hdencode_enabled": (
+                None
+                if os.getenv("SCANHOUND_HDENCODE_ENABLED") is None
+                else os.getenv("SCANHOUND_HDENCODE_ENABLED", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ),
         }
         for key, value in env_overrides.items():
             if value is not None:

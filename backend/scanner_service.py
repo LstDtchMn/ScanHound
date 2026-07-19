@@ -23,6 +23,7 @@ from backend.app_service import (
     LRUCache, clean_string, normalize_title, STATUS_MISSING,
 )
 from backend.database import DatabaseManager
+from backend.config import source_enabled
 from backend.matching import MatchingEngine, clear_fuzzy_cache
 from backend.metadata_enricher import MetadataEnricher
 from backend.scrapers import WebScrapers
@@ -419,7 +420,8 @@ class ScannerService:
 
         if not sources:
             if ((scan_type == "Site Search" or source_type == "HDEncode")
-                    and not self.config.get("hdencode_enabled", True)):
+                    and not source_enabled(
+                    self.config, "hdencode_enabled", missing_default=True)):
                 self._log("HDEncode is disabled in Settings; no requests were made.", "warning")
             else:
                 self._log("No sources selected!", "error")
@@ -526,7 +528,8 @@ class ScannerService:
         sources = []
 
         hdencode_requested = scan_type == "Site Search" or source_type == "HDEncode"
-        if hdencode_requested and not self.config.get("hdencode_enabled", True):
+        if hdencode_requested and not source_enabled(
+                self.config, "hdencode_enabled", missing_default=True):
             return []
 
         if scan_type == "Site Search":
