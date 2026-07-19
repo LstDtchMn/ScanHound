@@ -7,8 +7,11 @@ synchronous (blocking) and designed to run in thread-pool executors.
 
 import logging
 import re
+import threading
 import time
-from typing import Optional
+from contextlib import contextmanager, nullcontext
+from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -17,6 +20,132 @@ from backend.models import ScrapeResult
 from backend.rename import llm_identify as _llm
 
 logger = logging.getLogger(__name__)
+
+# HDEncode detail pages are the burstiest live request path: ScannerService can
+# submit every discovered post to a thread pool at once, and /scan/rescan-item
+# reaches this same module with a fresh cloudscraper session. Keep the safety
+# policy here so both entry points share one process-wide concurrency ceiling
+# and one request-start clock.
+_HDENCODE_MAX_CONCURRENT_REQUESTS = 3
+_HDENCODE_MIN_REQUEST_INTERVAL_SECONDS = 2.0
+_hdencode_request_semaphore = threading.BoundedSemaphore(
+    _HDENCODE_MAX_CONCURRENT_REQUESTS
+)
+_hdencode_pacing_lock = threading.Lock()
+_hdencode_last_request_started: Optional[float] = None
+
+
+def _detail_source_kind(url: str) -> str:
+    """Classify a detail-page URL using its parsed hostname.
+
+    DDLBase and Adit-HD share this facade with HDEncode, but must not share
+    HDEncode's emergency traffic policy. Unknown or malformed page URLs fail
+    closed to the existing default HDEncode path.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        host = ""
+
+    if host == "ddlbase.com" or host.endswith(".ddlbase.com"):
+        return "ddlbase"
+    if host == "adit-hd.com" or host.endswith(".adit-hd.com"):
+        return "adithd"
+    return "hdencode"
+
+
+class _DetailRequestCancelled(Exception):
+    """Internal control-flow signal; never exposed as a scrape failure."""
+
+
+def _is_cancelled(stop_requested: Optional[Callable[[], bool]]) -> bool:
+    if stop_requested is None:
+        return False
+    try:
+        return bool(stop_requested())
+    except Exception:
+        # A broken cancellation observer must not create new source traffic.
+        return True
+
+
+def _interruptible_sleep(
+    seconds: float,
+    stop_requested: Optional[Callable[[], bool]],
+) -> None:
+    """Sleep normally for legacy callers; poll cancellation for scan workers."""
+    if seconds <= 0:
+        return
+    if stop_requested is None:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while True:
+        if _is_cancelled(stop_requested):
+            raise _DetailRequestCancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
+
+
+@contextmanager
+def _hdencode_request_slot(
+    stop_requested: Optional[Callable[[], bool]] = None,
+):
+    """Limit and pace requests without issuing traffic after cancellation.
+
+    Legacy/manual callers without a cancellation callback retain the original
+    semaphore and one-shot sleep behavior. Scanner workers use timed semaphore
+    acquisition and interruptible pacing so a worker that was already running
+    but waiting for capacity cannot make a request after stop is requested.
+    """
+    global _hdencode_last_request_started
+
+    if stop_requested is None:
+        with _hdencode_request_semaphore:
+            with _hdencode_pacing_lock:
+                now = time.monotonic()
+                if _hdencode_last_request_started is not None:
+                    wait_seconds = max(
+                        0.0,
+                        _HDENCODE_MIN_REQUEST_INTERVAL_SECONDS
+                        - (now - _hdencode_last_request_started),
+                    )
+                    if wait_seconds:
+                        time.sleep(wait_seconds)
+                _hdencode_last_request_started = time.monotonic()
+            yield
+        return
+
+    acquired = False
+    while not acquired:
+        if _is_cancelled(stop_requested):
+            raise _DetailRequestCancelled()
+        acquired = _hdencode_request_semaphore.acquire(timeout=0.1)
+
+    try:
+        while True:
+            if _is_cancelled(stop_requested):
+                raise _DetailRequestCancelled()
+            with _hdencode_pacing_lock:
+                now = time.monotonic()
+                wait_seconds = 0.0
+                if _hdencode_last_request_started is not None:
+                    wait_seconds = max(
+                        0.0,
+                        _HDENCODE_MIN_REQUEST_INTERVAL_SECONDS
+                        - (now - _hdencode_last_request_started),
+                    )
+                if wait_seconds <= 0:
+                    _hdencode_last_request_started = now
+                    break
+            _interruptible_sleep(
+                min(wait_seconds, 0.1),
+                stop_requested,
+            )
+        yield
+    finally:
+        _hdencode_request_semaphore.release()
 
 
 class DetailScraper:
@@ -31,7 +160,14 @@ class DetailScraper:
         """
         self.app = parent_app
 
-    def scrape_details(self, url, headers, scraper=None) -> Optional[ScrapeResult]:
+    def scrape_details(
+        self,
+        url,
+        headers,
+        scraper=None,
+        *,
+        stop_requested: Optional[Callable[[], bool]] = None,
+    ) -> Optional[ScrapeResult]:
         """Scrape movie/TV show details from an HDEncode post page.
 
         Extracts filename, title, year, resolution, file size, HDR/DV flags,
@@ -57,25 +193,47 @@ class DetailScraper:
             if not scraper:
                 scraper = cloudscraper.create_scraper()
 
+            # ScannerService sends HDEncode, DDLBase, and Adit-HD detail pages
+            # through this facade. Apply the shared limiter only to the default
+            # HDEncode path; other sources retain independent throughput.
+            if _detail_source_kind(url) == "hdencode":
+                request_context = (
+                    _hdencode_request_slot
+                    if stop_requested is None
+                    else lambda: _hdencode_request_slot(stop_requested)
+                )
+            else:
+                request_context = nullcontext
+
             # Retry logic for robust connection
             max_retries = 3
             resp = None
             last_error = None
 
             for attempt in range(max_retries):
+                if _is_cancelled(stop_requested):
+                    return None
                 try:
-                    resp = scraper.get(url, headers=headers, timeout=20)
+                    with request_context():
+                        if _is_cancelled(stop_requested):
+                            return None
+                        resp = scraper.get(url, headers=headers, timeout=20)
                     if resp.status_code == 200:
                         break
                     elif resp.status_code == 429:  # Too Many Requests
-                        time.sleep(2 * (attempt + 1))
+                        _interruptible_sleep(2 * (attempt + 1), stop_requested)
                         continue
                     else:
-                        time.sleep(1 * (attempt + 1))
+                        _interruptible_sleep(1 * (attempt + 1), stop_requested)
                         continue
+                except _DetailRequestCancelled:
+                    return None
                 except Exception as e:
                     last_error = e
-                    time.sleep(1 * (attempt + 1))  # Backoff: 1s, 2s, 3s
+                    try:
+                        _interruptible_sleep(1 * (attempt + 1), stop_requested)
+                    except _DetailRequestCancelled:
+                        return None
 
             if not resp or resp.status_code != 200:
                 if self.app.config.get("debug_mode"):

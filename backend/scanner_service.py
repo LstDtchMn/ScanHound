@@ -418,7 +418,11 @@ class ScannerService:
         sources = self._build_sources(scan_type, source_type, base_url, flags, search_query)
 
         if not sources:
-            self._log("No sources selected!", "error")
+            if ((scan_type == "Site Search" or source_type == "HDEncode")
+                    and not self.config.get("hdencode_enabled", True)):
+                self._log("HDEncode is disabled in Settings; no requests were made.", "warning")
+            else:
+                self._log("No sources selected!", "error")
             return
 
         self._log(f"Sources: {', '.join(s['name'] for s in sources)}")
@@ -520,6 +524,10 @@ class ScannerService:
             List of source descriptor dicts, or empty list if no flags are set.
         """
         sources = []
+
+        hdencode_requested = scan_type == "Site Search" or source_type == "HDEncode"
+        if hdencode_requested and not self.config.get("hdencode_enabled", True):
+            return []
 
         if scan_type == "Site Search":
             if not search_query:
@@ -652,6 +660,16 @@ class ScannerService:
                             # isn't hammered with N requests in a few seconds.
                             await asyncio.sleep(min(0.5 * blocked_streak, 3.0))
                             if blocked_streak >= 3:
+                                # Reuse the ScannerService's existing cancellation
+                                # primitive. _process_posts checks this event before
+                                # every worker request and cancels queued futures.
+                                self.stop_scan_flag = True
+                                self._log(
+                                    f"{source_name}: confirmed shared block after "
+                                    f"{blocked_streak} consecutive responses; stopping "
+                                    "remaining scan work",
+                                    "warning",
+                                )
                                 break  # session can't clear the block this run
                         continue
                     blocked_streak = 0  # a good page resets the streak
@@ -752,7 +770,12 @@ class ScannerService:
             post_source = post_info.get('source', 'hdencode')
             try:
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-                details = self.scrapers.scrape_details(url, headers, scraper)
+                details = self.scrapers.scrape_details(
+                    url,
+                    headers,
+                    scraper,
+                    stop_requested=lambda: self.stop_scan_flag,
+                )
                 if not details:
                     return None
                 is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'
