@@ -15,6 +15,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         # README supports Python 3.11 or higher; production currently runs 3.12.
         python-version: ["3.11", "3.12"]
