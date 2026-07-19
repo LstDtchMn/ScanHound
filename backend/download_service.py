@@ -84,12 +84,32 @@ _SUPPORTED_DOWNLOAD_HOSTS = (
 
 
 def _url_matches_domain(url: str, domains: tuple) -> bool:
-    """Check if a URL's host matches any of the given domains (netloc-based)."""
+    """Check a URL's parsed hostname against one or more registrable domains.
+
+    Path and query text must never influence source routing.  ``hostname`` also
+    strips credentials and ports, unlike a raw ``netloc`` comparison.
+    """
     try:
-        netloc = urlparse(url).netloc.lower()
-        return any(netloc == d or netloc.endswith("." + d) for d in domains)
+        raw = (url or "").strip()
+        parsed = urlparse(raw if "://" in raw else "https://" + raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        return any(host == d or host.endswith("." + d) for d in domains)
     except Exception:
         return False
+
+
+def _source_page_kind(url: str) -> str:
+    """Classify a source-page URL using only its hostname.
+
+    ``scrape_links`` historically treats every page that is not DDLBase or
+    Adit-HD as the HDEncode/default path.  Keep that compatibility while making
+    the decision once and reusing it for both gating and dispatch.
+    """
+    if _url_matches_domain(url, ("ddlbase.com",)):
+        return "ddlbase"
+    if _url_matches_domain(url, ("adit-hd.com",)):
+        return "adithd"
+    return "hdencode"
 
 
 def _normalize_link_url(url: str) -> str:
@@ -1386,15 +1406,14 @@ class DownloadService:
         Returns:
             List of download link URLs.
         """
-        normalized_url = (url or "").lower()
-        # scrape_links dispatches every non-DDLBase/non-Adit-HD URL through the
-        # HDEncode path, so apply the same rule here before Selenium is imported
-        # or a browser is started. This also covers auto-grab and copy-links.
-        is_hdencode = (
-            "ddlbase.com" not in normalized_url
-            and "adit-hd.com" not in normalized_url
-        )
-        if is_hdencode and not self.config.get("hdencode_enabled", True):
+        # Classify by parsed hostname only (PR #3/#4). Query/path text such as
+        # ``?next=https://ddlbase.com`` must not bypass the HDEncode switch.
+        # _source_page_kind defaults to "hdencode", preserving the historical
+        # rule that every non-DDLBase/non-Adit-HD page takes the HDEncode path,
+        # so the off switch still fires before Selenium is imported or a
+        # browser is started. This also covers auto-grab and copy-links.
+        source_kind = _source_page_kind(url)
+        if source_kind == "hdencode" and not self.config.get("hdencode_enabled", True):
             diagnostic = ScrapeDiagnostic(
                 ScrapeCode.SOURCE_DISABLED, retryable=False, affects_source_health=False
             )
@@ -1421,9 +1440,11 @@ class DownloadService:
 
         try:
             with self._driver_lock:
-                if "ddlbase.com" in url:
+                # Dispatch on the same parsed-hostname classification used for
+                # gating above (PR #3/#4), wrapped in PR #5's structured result.
+                if source_kind == "ddlbase":
                     return ScrapedLinks(self._scrape_ddlbase_links(url, progress_callback=progress_callback))
-                if "adit-hd.com" in url:
+                if source_kind == "adithd":
                     return ScrapedLinks(self._scrape_adithd_links(url, service_type))
 
                 # Default: HDEncode. Map the requested host to its link keyword.
