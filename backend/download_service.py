@@ -83,12 +83,32 @@ _SUPPORTED_DOWNLOAD_HOSTS = (
 
 
 def _url_matches_domain(url: str, domains: tuple) -> bool:
-    """Check if a URL's host matches any of the given domains (netloc-based)."""
+    """Check a URL's parsed hostname against one or more registrable domains.
+
+    Path and query text must never influence source routing.  ``hostname`` also
+    strips credentials and ports, unlike a raw ``netloc`` comparison.
+    """
     try:
-        netloc = urlparse(url).netloc.lower()
-        return any(netloc == d or netloc.endswith("." + d) for d in domains)
+        raw = (url or "").strip()
+        parsed = urlparse(raw if "://" in raw else "https://" + raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        return any(host == d or host.endswith("." + d) for d in domains)
     except Exception:
         return False
+
+
+def _source_page_kind(url: str) -> str:
+    """Classify a source-page URL using only its hostname.
+
+    ``scrape_links`` historically treats every page that is not DDLBase or
+    Adit-HD as the HDEncode/default path.  Keep that compatibility while making
+    the decision once and reusing it for both gating and dispatch.
+    """
+    if _url_matches_domain(url, ("ddlbase.com",)):
+        return "ddlbase"
+    if _url_matches_domain(url, ("adit-hd.com",)):
+        return "adithd"
+    return "hdencode"
 
 
 def _normalize_link_url(url: str) -> str:
@@ -1285,6 +1305,13 @@ class DownloadService:
         Returns:
             List of download link URLs.
         """
+        # Classify by parsed hostname only.  Query/path text such as
+        # ``?next=https://ddlbase.com`` must not bypass the HDEncode switch.
+        source_kind = _source_page_kind(url)
+        if source_kind == "hdencode" and not self.config.get("hdencode_enabled", True):
+            self._log("[HDEncode] Source is disabled in Settings; no request was made.", "warning")
+            return []
+
         _ensure_selenium()
         from bs4 import BeautifulSoup
 
@@ -1294,9 +1321,9 @@ class DownloadService:
 
         try:
             with self._driver_lock:
-                if "ddlbase.com" in url:
+                if source_kind == "ddlbase":
                     return self._scrape_ddlbase_links(url, progress_callback=progress_callback)
-                if "adit-hd.com" in url:
+                if source_kind == "adithd":
                     return self._scrape_adithd_links(url, service_type)
 
                 # Default: HDEncode. Map the requested host to its link keyword.

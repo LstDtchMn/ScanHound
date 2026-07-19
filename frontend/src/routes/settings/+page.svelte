@@ -724,6 +724,16 @@
             <label class="flex items-center gap-3">
               <input
                 type="checkbox"
+                checked={$settings.hdencode_enabled as boolean ?? true}
+                onchange={(e) => settings.update((s) => ({ ...s, hdencode_enabled: e.currentTarget.checked }))}
+                class="accent-[var(--accent)]"
+              />
+              <span class="text-sm">HDEncode enabled</span>
+            </label>
+
+            <label class="flex items-center gap-3">
+              <input
+                type="checkbox"
                 checked={$settings.ddlbase_enabled as boolean ?? true}
                 onchange={(e) => settings.update((s) => ({ ...s, ddlbase_enabled: e.currentTarget.checked }))}
                 class="accent-[var(--accent)]"

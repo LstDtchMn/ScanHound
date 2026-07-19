@@ -7,8 +7,11 @@ synchronous (blocking) and designed to run in thread-pool executors.
 
 import logging
 import re
+import threading
 import time
+from contextlib import contextmanager, nullcontext
 from typing import Optional
+from urllib.parse import urlparse
 
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -17,6 +20,63 @@ from backend.models import ScrapeResult
 from backend.rename import llm_identify as _llm
 
 logger = logging.getLogger(__name__)
+
+# HDEncode detail pages are the burstiest live request path: ScannerService can
+# submit every discovered post to a thread pool at once, and /scan/rescan-item
+# reaches this same module with a fresh cloudscraper session. Keep the safety
+# policy here so both entry points share one process-wide concurrency ceiling
+# and one request-start clock.
+_HDENCODE_MAX_CONCURRENT_REQUESTS = 3
+_HDENCODE_MIN_REQUEST_INTERVAL_SECONDS = 2.0
+_hdencode_request_semaphore = threading.BoundedSemaphore(
+    _HDENCODE_MAX_CONCURRENT_REQUESTS
+)
+_hdencode_pacing_lock = threading.Lock()
+_hdencode_last_request_started: Optional[float] = None
+
+
+def _detail_source_kind(url: str) -> str:
+    """Classify a detail-page URL using its parsed hostname.
+
+    DDLBase and Adit-HD share this facade with HDEncode, but must not share
+    HDEncode's emergency traffic policy. Unknown or malformed page URLs fail
+    closed to the existing default HDEncode path.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        host = ""
+
+    if host == "ddlbase.com" or host.endswith(".ddlbase.com"):
+        return "ddlbase"
+    if host == "adit-hd.com" or host.endswith(".adit-hd.com"):
+        return "adithd"
+    return "hdencode"
+
+
+@contextmanager
+def _hdencode_request_slot():
+    """Limit in-flight detail requests and space every request attempt.
+
+    The semaphore covers only the actual HTTP request, not HTML parsing or
+    retry backoff. The pacing lock is held while waiting so concurrent worker
+    threads cannot calculate the same start time and launch together.
+    """
+    global _hdencode_last_request_started
+
+    with _hdencode_request_semaphore:
+        with _hdencode_pacing_lock:
+            now = time.monotonic()
+            if _hdencode_last_request_started is not None:
+                wait_seconds = max(
+                    0.0,
+                    _HDENCODE_MIN_REQUEST_INTERVAL_SECONDS
+                    - (now - _hdencode_last_request_started),
+                )
+                if wait_seconds:
+                    time.sleep(wait_seconds)
+            _hdencode_last_request_started = time.monotonic()
+        yield
 
 
 class DetailScraper:
@@ -57,6 +117,15 @@ class DetailScraper:
             if not scraper:
                 scraper = cloudscraper.create_scraper()
 
+            # ScannerService sends HDEncode, DDLBase, and Adit-HD detail pages
+            # through this facade. Apply the shared limiter only to the default
+            # HDEncode path; other sources retain independent throughput.
+            request_context = (
+                _hdencode_request_slot
+                if _detail_source_kind(url) == "hdencode"
+                else nullcontext
+            )
+
             # Retry logic for robust connection
             max_retries = 3
             resp = None
@@ -64,7 +133,8 @@ class DetailScraper:
 
             for attempt in range(max_retries):
                 try:
-                    resp = scraper.get(url, headers=headers, timeout=20)
+                    with request_context():
+                        resp = scraper.get(url, headers=headers, timeout=20)
                     if resp.status_code == 200:
                         break
                     elif resp.status_code == 429:  # Too Many Requests
