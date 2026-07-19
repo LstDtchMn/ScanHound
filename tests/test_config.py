@@ -75,7 +75,7 @@ EXPECTED_DEFAULT_KEYS = {
     "jd_movies_folder_4k", "jd_tv_folder",
     "jd_email", "jd_password", "jd_device",
     # Source / filtering
-    "exclude_720p",
+    "exclude_720p", "hdencode_enabled",
     # DDLBase / Cuty
     "ddlbase_enabled", "ddlbase_manual_resolution_timeout",
     "cuty_email", "cuty_password",
@@ -166,6 +166,10 @@ class TestDefaultConfig:
 
     def test_default_config_scan_threads(self):
         assert _DEFAULT_CONFIG["scan_threads"] == 10
+
+
+    def test_default_config_hdencode_switch_is_boolean(self):
+        assert isinstance(_DEFAULT_CONFIG["hdencode_enabled"], bool)
 
     def test_default_config_trash_retention_days(self):
         assert _DEFAULT_CONFIG["trash_retention_days"] == 30
