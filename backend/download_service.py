@@ -112,6 +112,29 @@ def _source_page_kind(url: str) -> str:
     return "hdencode"
 
 
+def _challenge_iframe_signal(src: str) -> str:
+    """Return a closed, non-sensitive challenge-frame signal.
+
+    Full iframe URLs may contain site keys, return URLs, state, or tokens in
+    their path/query. Public diagnostics need only the challenge technology and
+    normalized hostname.
+    """
+    raw = (src or "").strip()
+    low = raw.lower()
+    marker = next(
+        (name for name in (
+            "turnstile", "challenges.cloudflare", "recaptcha", "hcaptcha", "captcha"
+        ) if name in low),
+        "challenge",
+    )
+    try:
+        parsed = urlparse(raw if "://" in raw else "https://" + raw)
+        host = (parsed.hostname or "unknown").lower().rstrip(".")
+    except Exception:
+        host = "unknown"
+    return f"iframe:{marker}@{host}"
+
+
 def _normalize_link_url(url: str) -> str:
     """Canonicalize a file-host URL so ScanHound's scrape map and JDownloader's
     stored links match despite cosmetic differences.
@@ -1307,8 +1330,16 @@ class DownloadService:
                 for marker in ("turnstile", "challenges.cloudflare", "recaptcha", "hcaptcha", "captcha")
             )]
             if captcha_frames:
-                signals.extend(f"iframe:{src}" for src in captcha_frames[:5])
-                self._log(f"[HDEncode][diag] CAPTCHA/Turnstile iframes present: {captcha_frames}", "warning")
+                safe_iframe_signals = [
+                    _challenge_iframe_signal(src)
+                    for src in captcha_frames[:5]
+                ]
+                signals.extend(safe_iframe_signals)
+                self._log(
+                    "[HDEncode][diag] CAPTCHA/Turnstile iframe signal(s): %s"
+                    % safe_iframe_signals,
+                    "warning",
+                )
 
             low = html.lower()
             technical_challenge_markers = [
