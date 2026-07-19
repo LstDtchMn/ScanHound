@@ -213,3 +213,38 @@ def test_plex_copy_without_dv_cannot_conclusively_skip_unmarked_listing():
     )
 
     assert scanner._should_hydrate_listing_candidate(_post()) is True
+
+
+
+def test_download_history_same_quality_hydrates_for_hevc_preference():
+    scanner = _scanner()
+    scanner.config.update({"rule_dv": False, "pref_hevc": True})
+    scanner._parse_hdencode_listing_candidate = MagicMock(
+        return_value=_release(resolution="2160p", is_dovi=True)
+    )
+    scanner._downloaded_titles_lookup = {
+        "example movie": [{
+            "resolution": "2160p",
+            "dovi": True,
+            "downloaded_at": "2026",
+        }]
+    }
+
+    assert scanner._should_hydrate_listing_candidate(_post()) is True
+
+
+def test_download_history_same_quality_hydrates_for_hdr10plus_preference():
+    scanner = _scanner()
+    scanner.config.update({"rule_dv": False, "pref_hdr10plus": True})
+    scanner._parse_hdencode_listing_candidate = MagicMock(
+        return_value=_release(resolution="2160p", is_dovi=True)
+    )
+    scanner._downloaded_titles_lookup = {
+        "example movie": [{
+            "resolution": "2160p",
+            "dovi": True,
+            "downloaded_at": "2026",
+        }]
+    }
+
+    assert scanner._should_hydrate_listing_candidate(_post()) is True

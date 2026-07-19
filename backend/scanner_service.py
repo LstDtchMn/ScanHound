@@ -838,6 +838,14 @@ class ScannerService:
                     return False
                 if dovi and not prior_dovi:
                     return True
+                if (
+                    self.config.get("pref_hevc", False)
+                    or self.config.get("pref_hdr10plus", False)
+                ):
+                    # Download history records resolution/DV but not enough
+                    # listing-stage codec metadata to prove this is not the
+                    # user's configured same-resolution preference upgrade.
+                    return True
                 if (self.config.get("rule_dv", True)
                         and not prior_dovi and not dovi):
                     # Absence of a DV token in listing text is not proof that
