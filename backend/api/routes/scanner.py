@@ -8,6 +8,7 @@ import threading
 import time
 from enum import Enum
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -78,6 +79,33 @@ _SOURCE_NAME_MAP = {
     "adit-hd": "Adit-HD",
     "adithd": "Adit-HD",
 }
+
+
+def _scan_request_uses_hdencode(req: ScanRequest) -> bool:
+    """Mirror _run_scan's source normalization without starting a scan thread."""
+    source_type = req.source
+    if req.sources and len(req.sources) == 1:
+        source_type = req.sources[0]
+    source_type = _SOURCE_NAME_MAP.get(source_type.lower(), source_type)
+    scan_type = _SCAN_TYPE_MAP.get(req.type, req.type)
+    return scan_type == "Site Search" or source_type == "HDEncode"
+
+
+def _normalized_hostname(url: str) -> str:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _is_hdencode_url(url: str, config: Dict[str, Any]) -> bool:
+    """Recognize the normal HDEncode host and a configured HDEncode base URL."""
+    host = _normalized_hostname(url)
+    configured_host = _normalized_hostname(
+        str(config.get("base_url", "https://hdencode.org"))
+    )
+    return bool(host and host in {"hdencode.org", configured_host})
 
 
 def get_last_scan_items() -> List[Any]:
@@ -319,6 +347,12 @@ def scan_start(
 ):
     global _scan_thread
 
+    if (_scan_request_uses_hdencode(req)
+            and not reg.config.get("hdencode_enabled", True)):
+        raise HTTPException(
+            status_code=409,
+            detail="HDEncode is disabled in Settings; no request was made")
+
     scanner = reg.scanner
     if scanner and scanner.scan_in_progress:
         raise HTTPException(
@@ -355,6 +389,12 @@ def rescan_item(
     enrichment pipeline the bulk scan uses — no new matching logic."""
     if not req.url:
         raise HTTPException(status_code=400, detail="No URL provided")
+
+    if (_is_hdencode_url(req.url, reg.config)
+            and not reg.config.get("hdencode_enabled", True)):
+        raise HTTPException(
+            status_code=409,
+            detail="HDEncode is disabled in Settings; no request was made")
     db = reg.db
     scanner = reg.scanner
     if not db or not scanner:
