@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.sources.registry import get_registry as get_source_registry
+from backend.source_health import effective_health_state
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sources", tags=["sources"])
@@ -16,10 +17,16 @@ def list_sources(reg: ServiceRegistry = Depends(get_registry)):
     source_reg = get_source_registry()
     source_reg.sync_from_config(reg.config)
     sources = source_reg.list_sources()
-    health_by_source = reg.db.get_source_health() if reg.db else {}
+    try:
+        health_by_source = reg.db.get_source_health() if reg.db else {}
+    except Exception:
+        # Health is advisory. A locked/corrupt/unavailable snapshot must not
+        # make the source-settings endpoint unusable.
+        logger.warning("Source health snapshot unavailable", exc_info=True)
+        health_by_source = {}
     for source in sources:
         health = health_by_source.get(source["name"], {})
-        source["health_state"] = health.get("state", "unknown")
+        source["health_state"] = effective_health_state(health)
         source["health_reason_code"] = health.get("reason_code")
         source["health_updated_at"] = health.get("updated_at")
         source["last_success_at"] = health.get("last_success_at")

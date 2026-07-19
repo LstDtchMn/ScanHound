@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.ws import ws_manager
+from backend.download_service import _source_page_kind
 from backend.source_health import record_scrape_outcome
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 
@@ -244,8 +245,7 @@ def scrape_links(
         logger.exception("Scrape failed for %s", req.url)
         raise HTTPException(status_code=502, detail=f"Scrape failed: {e}")
     diagnostic = getattr(links, "diagnostic", None)
-    normalized_url = (req.url or "").lower()
-    if "ddlbase.com" not in normalized_url and "adit-hd.com" not in normalized_url:
+    if _source_page_kind(req.url) == "hdencode":
         record_scrape_outcome(reg.db, "hdencode", links)
     if links and req.title and reg.db:
         try:
@@ -296,8 +296,7 @@ def copy_links_batch(
             try:
                 links = dl.scrape_links(it.url, it.service_type)
                 diagnostic = getattr(links, "diagnostic", None)
-                normalized_url = (it.url or "").lower()
-                if "ddlbase.com" not in normalized_url and "adit-hd.com" not in normalized_url:
+                if _source_page_kind(it.url) == "hdencode":
                     record_scrape_outcome(reg.db, "hdencode", links)
             except Exception as exc:
                 logger.exception("Batch scrape failed for %s", it.url)

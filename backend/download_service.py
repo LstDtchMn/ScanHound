@@ -2187,8 +2187,7 @@ class DownloadService:
         try:
             links = self.scrape_links(url, service_type, progress_callback=_cb)
             diagnostic = getattr(links, "diagnostic", None)
-            normalized_url = (url or "").lower()
-            if "ddlbase.com" not in normalized_url and "adit-hd.com" not in normalized_url:
+            if _source_page_kind(url) == "hdencode":
                 record_scrape_outcome(self.db, "hdencode", links)
         except Exception as e:
             links = []
