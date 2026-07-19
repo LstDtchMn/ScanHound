@@ -9,8 +9,9 @@ import logging
 import re
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Optional
+from urllib.parse import urlparse
 
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -32,6 +33,25 @@ _hdencode_request_semaphore = threading.BoundedSemaphore(
 )
 _hdencode_pacing_lock = threading.Lock()
 _hdencode_last_request_started: Optional[float] = None
+
+
+def _detail_source_kind(url: str) -> str:
+    """Classify a detail-page URL using its parsed hostname.
+
+    DDLBase and Adit-HD share this facade with HDEncode, but must not share
+    HDEncode's emergency traffic policy. Unknown or malformed page URLs fail
+    closed to the existing default HDEncode path.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        host = ""
+
+    if host == "ddlbase.com" or host.endswith(".ddlbase.com"):
+        return "ddlbase"
+    if host == "adit-hd.com" or host.endswith(".adit-hd.com"):
+        return "adithd"
+    return "hdencode"
 
 
 @contextmanager
@@ -97,6 +117,15 @@ class DetailScraper:
             if not scraper:
                 scraper = cloudscraper.create_scraper()
 
+            # ScannerService sends HDEncode, DDLBase, and Adit-HD detail pages
+            # through this facade. Apply the shared limiter only to the default
+            # HDEncode path; other sources retain independent throughput.
+            request_context = (
+                _hdencode_request_slot
+                if _detail_source_kind(url) == "hdencode"
+                else nullcontext
+            )
+
             # Retry logic for robust connection
             max_retries = 3
             resp = None
@@ -104,7 +133,7 @@ class DetailScraper:
 
             for attempt in range(max_retries):
                 try:
-                    with _hdencode_request_slot():
+                    with request_context():
                         resp = scraper.get(url, headers=headers, timeout=20)
                     if resp.status_code == 200:
                         break

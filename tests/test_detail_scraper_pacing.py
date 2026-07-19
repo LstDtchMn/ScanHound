@@ -69,6 +69,130 @@ def _reset_limiter(monkeypatch, *, max_concurrent=3, interval=2.0):
     monkeypatch.setattr(detail_scraper, "_hdencode_last_request_started", None)
 
 
+def test_non_hdencode_sources_bypass_hdencode_limiter(monkeypatch):
+    """DDLBase and Adit-HD detail pages keep independent request throughput."""
+
+    @detail_scraper.contextmanager
+    def forbidden_slot():
+        raise AssertionError("HDEncode limiter must not wrap this source")
+        yield
+
+    monkeypatch.setattr(
+        detail_scraper,
+        "_hdencode_request_slot",
+        forbidden_slot,
+    )
+
+    class Scraper:
+        def get(self, *_args, **_kwargs):
+            return _Response()
+
+    detail = DetailScraper(_App())
+    session = Scraper()
+
+    for url in (
+        "https://ddlbase.com/post/example",
+        "https://www.ddlbase.com/post/example",
+        "https://adit-hd.com/threads/example",
+        "https://forum.adit-hd.com/threads/example",
+    ):
+        assert detail.scrape_details(url, {}, session)
+
+
+def test_hdencode_query_text_cannot_spoof_source_classification(monkeypatch):
+    entered = 0
+
+    @detail_scraper.contextmanager
+    def recording_slot():
+        nonlocal entered
+        entered += 1
+        yield
+
+    monkeypatch.setattr(
+        detail_scraper,
+        "_hdencode_request_slot",
+        recording_slot,
+    )
+
+    class Scraper:
+        def get(self, *_args, **_kwargs):
+            return _Response()
+
+    result = DetailScraper(_App()).scrape_details(
+        "https://hdencode.org/release/?next=https://ddlbase.com/post/example",
+        {},
+        Scraper(),
+    )
+
+    assert result
+    assert entered == 1
+
+
+def test_malformed_detail_url_fails_closed_to_hdencode_limiter(monkeypatch):
+    entered = 0
+
+    @detail_scraper.contextmanager
+    def recording_slot():
+        nonlocal entered
+        entered += 1
+        yield
+
+    monkeypatch.setattr(
+        detail_scraper,
+        "_hdencode_request_slot",
+        recording_slot,
+    )
+
+    class Scraper:
+        def get(self, *_args, **_kwargs):
+            return _Response()
+
+    result = DetailScraper(_App()).scrape_details(
+        "not a valid page URL",
+        {},
+        Scraper(),
+    )
+
+    assert result
+    assert entered == 1
+
+
+def test_concurrent_request_starts_are_globally_spaced(monkeypatch):
+    """The pacing lock serializes starts from different worker threads."""
+    interval = 0.04
+    _reset_limiter(monkeypatch, max_concurrent=4, interval=interval)
+
+    starts = []
+    starts_lock = threading.Lock()
+
+    class Scraper:
+        def get(self, *_args, **_kwargs):
+            with starts_lock:
+                starts.append(detail_scraper.time.monotonic())
+            return _Response()
+
+    detail = DetailScraper(_App())
+    session = Scraper()
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(
+                detail.scrape_details,
+                f"https://hdencode.org/concurrent-{index}",
+                {},
+                session,
+            )
+            for index in range(4)
+        ]
+        for future in futures:
+            assert future.result(timeout=3)
+
+    ordered = sorted(starts)
+    assert len(ordered) == 4
+    gaps = [later - earlier for earlier, later in zip(ordered, ordered[1:])]
+    assert all(gap >= interval * 0.75 for gap in gaps), gaps
+
+
 def test_detail_requests_are_spaced_across_separate_calls(monkeypatch):
     _reset_limiter(monkeypatch, interval=2.0)
     clock = _FakeClock()
