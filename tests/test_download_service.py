@@ -747,6 +747,46 @@ class TestScrapeLinksRouting:
         svc._scrape_adithd_links.assert_called_once_with("http://adit-hd.com/thread/123", "Rapidgator")
         assert result == ["http://rapidgator.net/file/abc"]
 
+    @patch("backend.download_service._ensure_selenium")
+    def test_hdencode_query_text_cannot_spoof_ddlbase_host(self, mock_ensure):
+        svc = _make_service(config={"hdencode_enabled": False})
+
+        result = svc.scrape_links(
+            "https://hdencode.org/release/?next=https://ddlbase.com/movie",
+            "Rapidgator",
+        )
+
+        assert result == []
+        mock_ensure.assert_not_called()
+
+    @patch("backend.download_service._ensure_selenium")
+    def test_disabled_hdencode_does_not_block_real_ddlbase(self, mock_ensure):
+        svc = _make_service(config={"hdencode_enabled": False})
+        svc._scrape_ddlbase_links = MagicMock(return_value=["https://1fichier.com/?abc"])
+
+        result = svc.scrape_links("https://ddlbase.com/movie-xyz", "Rapidgator")
+
+        assert result == ["https://1fichier.com/?abc"]
+        mock_ensure.assert_called_once()
+        svc._scrape_ddlbase_links.assert_called_once_with(
+            "https://ddlbase.com/movie-xyz", progress_callback=None
+        )
+
+    @patch("backend.download_service._ensure_selenium")
+    def test_disabled_hdencode_does_not_block_real_adithd(self, mock_ensure):
+        svc = _make_service(config={"hdencode_enabled": False})
+        svc._scrape_adithd_links = MagicMock(
+            return_value=["https://rapidgator.net/file/abc"]
+        )
+
+        result = svc.scrape_links("https://adit-hd.com/thread/123", "Rapidgator")
+
+        assert result == ["https://rapidgator.net/file/abc"]
+        mock_ensure.assert_called_once()
+        svc._scrape_adithd_links.assert_called_once_with(
+            "https://adit-hd.com/thread/123", "Rapidgator"
+        )
+
 
 class TestScrapeLinksHDEncode:
     """Test the default HDEncode scraping path."""
