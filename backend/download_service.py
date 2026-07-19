@@ -1239,6 +1239,15 @@ class DownloadService:
             body_text = " ".join((soup.get_text(" ") or "").split())[:240]
             self._log(f"[HDEncode][diag] visible text: {body_text!r}")
             body_low = body_text.lower()
+            try:
+                raw_title = driver.title
+                page_title_low = (
+                    raw_title.lower()
+                    if isinstance(raw_title, str)
+                    else ""
+                )
+            except Exception:
+                page_title_low = ""
             network_markers = (
                 "site can't be reached",
                 "site can’t be reached",
@@ -1302,17 +1311,45 @@ class DownloadService:
                 self._log(f"[HDEncode][diag] CAPTCHA/Turnstile iframes present: {captcha_frames}", "warning")
 
             low = html.lower()
-            page_markers = [marker for marker in (
-                "just a moment",
-                "cf-chl",
-                "checking your browser",
-                "captcha",
-                "verify you are human",
-                "access denied",
-            ) if marker in low]
-            if page_markers:
-                signals.extend(page_markers)
-                self._log(f"[HDEncode][diag] page markers detected: {page_markers}", "warning")
+            technical_challenge_markers = [
+                marker for marker in (
+                    "cf-chl",
+                    "challenges.cloudflare.com",
+                    "turnstile",
+                    "hcaptcha",
+                    "recaptcha",
+                )
+                if marker in low
+            ]
+            title_challenge_markers = [
+                marker for marker in (
+                    "just a moment",
+                    "attention required",
+                    "checking your browser",
+                    "verify you are human",
+                    "access denied",
+                )
+                if marker in page_title_low
+            ]
+            visible_challenge_markers = [
+                marker for marker in (
+                    "checking your browser",
+                    "verify you are human",
+                )
+                if marker in body_low
+            ]
+            challenge_markers = list(dict.fromkeys(
+                technical_challenge_markers
+                + title_challenge_markers
+                + visible_challenge_markers
+            ))
+            if challenge_markers:
+                signals.extend(challenge_markers)
+                self._log(
+                    f"[HDEncode][diag] strong challenge evidence: "
+                    f"{challenge_markers}",
+                    "warning",
+                )
 
             if keyword:
                 keyword_present = keyword.lower() in low
@@ -1326,7 +1363,7 @@ class DownloadService:
                     affects_source_health=False,
                     signals=tuple(signals),
                 )
-            if captcha_frames or page_markers:
+            if captcha_frames or challenge_markers:
                 return ScrapeDiagnostic(
                     ScrapeCode.INTERACTIVE_CHALLENGE,
                     retryable=False,

@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.ws import ws_manager
+from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/download", tags=["downloads"])
@@ -291,9 +292,16 @@ def copy_links_batch(
             try:
                 links = dl.scrape_links(it.url, it.service_type)
                 diagnostic = getattr(links, "diagnostic", None)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Batch scrape failed for %s", it.url)
-                links = []
+                diagnostic = ScrapeDiagnostic(
+                    ScrapeCode.SCRAPE_EXCEPTION,
+                    retryable=True,
+                    affects_source_health=False,
+                    signals=(type(exc).__name__,),
+                    detail=f"Batch link scrape failed: {exc}",
+                )
+                links = ScrapedLinks(diagnostic=diagnostic)
             if not links and diagnostic is not None:
                 failures.append({"url": it.url, **diagnostic.to_dict()})
             for link in links:
