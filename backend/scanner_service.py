@@ -798,7 +798,12 @@ class ScannerService:
             post_source = post_info.get('source', 'hdencode')
             try:
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-                details = self.scrapers.scrape_details(url, headers, scraper)
+                details = self.scrapers.scrape_details(
+                    url,
+                    headers,
+                    scraper,
+                    stop_requested=lambda: self.stop_scan_flag,
+                )
                 if not details:
                     return None
                 is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'

@@ -200,3 +200,54 @@ def test_serialized_diagnostic_never_exposes_internal_detail():
     assert payload["message"] == diagnostic.public_message
     assert secret not in payload["message"]
     assert payload["signals"] == ["SessionNotCreatedException"]
+
+
+
+def test_challenge_iframe_signal_drops_path_query_and_fragment():
+    service = _service()
+    driver = MagicMock()
+    secret = "sensitive-site-key"
+    driver.title = "Just a moment"
+    driver.page_source = f"""
+        <html><body>
+        <iframe src="https://challenges.cloudflare.com/turnstile/v0/api.js?sitekey={secret}#state"></iframe>
+        </body></html>
+    """
+
+    diagnostic = service._log_page_diagnostics(
+        driver,
+        stage="access_control",
+    )
+    payload = diagnostic.to_dict()
+
+    assert diagnostic.code is ScrapeCode.INTERACTIVE_CHALLENGE
+    assert any(
+        signal.startswith("iframe:turnstile@challenges.cloudflare.com")
+        for signal in payload["signals"]
+    )
+    serialized = repr(payload)
+    assert secret not in serialized
+    assert "api.js" not in serialized
+    assert "#state" not in serialized
+
+
+
+def test_challenge_iframe_signal_rejects_arbitrary_non_url_text():
+    from backend.download_service import _challenge_iframe_signal
+
+    signal = _challenge_iframe_signal("not a url at all captcha SECRET")
+
+    assert signal == "iframe:captcha@unknown"
+    assert "SECRET" not in signal
+    assert "not a url" not in signal
+
+
+def test_challenge_iframe_signal_parses_protocol_relative_host():
+    from backend.download_service import _challenge_iframe_signal
+
+    signal = _challenge_iframe_signal(
+        "//challenges.cloudflare.com/turnstile?sitekey=SECRET"
+    )
+
+    assert signal == "iframe:turnstile@challenges.cloudflare.com"
+    assert "SECRET" not in signal
