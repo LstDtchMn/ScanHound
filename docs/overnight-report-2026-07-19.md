@@ -203,8 +203,29 @@ hard prerequisite for the HDEncode stack**, independent of any CI run.
 ### Integration branch CI
 
 All six review branches were patched with `fail-fast: false` (review-only, so
-both Python jobs finish) and dispatched. `frontend` succeeded on **all six**.
-Backend results are covered in §7.3.
+both Python jobs finish) and dispatched. **All six runs completed**; every
+`frontend` job succeeded; every backend job failed on both 3.11 and 3.12.
+
+Crucially, the failures are *only* the two already-attributed blockers — no new
+or unexpected failure appeared anywhere:
+
+| Integration branch | 3.12 result | Failing tests |
+|---|---|---|
+| `int-ci-pr3` | 1 failed, 3779 passed, 4 skipped | config allowlist (§7.3) |
+| `int-ci-pr4` | 1 failed, 3786 passed, 4 skipped | config allowlist (§7.3) |
+| `int-ci-pr5` | 1 failed, 3795 passed, 4 skipped | config allowlist (§7.3) |
+| `int-ci-pr6` | 1 failed, 3801 passed, 4 skipped | config allowlist (§7.3) |
+| `int-ci-pr7` | 2 failed | config allowlist (§7.3) **+** source-health contradiction (§7.2) |
+| `int-ci-pr8` | 1 failed | config allowlist (§7.3) |
+
+Both Python jobs completed on every branch, confirming `fail-fast: false` did
+what it was set for. The rising pass counts (3779 → 3801) track each HDEncode
+layer's added tests, all of which pass.
+
+The practical reading: **once the two blockers are fixed, the whole combined
+project is expected to be green.** Every HDEncode layer integrates cleanly with
+the CI-stabilization stack; nothing in PRs #4–#8 introduces a failure of its
+own.
 
 ---
 
