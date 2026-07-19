@@ -2190,7 +2190,15 @@ class DownloadService:
             links = []
             scrape_failed = True
             self._log(f"Scrape error: {e}", "warning")
-            self._progress("download:fallback", {"title": title, "reason": str(e)}, _cb=_cb)
+            self._progress(
+                "download:fallback",
+                {
+                    "title": title,
+                    "reason": "scrape_exception",
+                    "signal": type(e).__name__,
+                },
+                _cb=_cb,
+            )
 
         if not links:
             # Only fall back to the URL itself if it is *already* a file-host
@@ -2202,7 +2210,9 @@ class DownloadService:
                 diagnostic = None
             else:
                 if diagnostic is not None:
-                    msg = diagnostic.message
+                    # API/WS-facing result must not expose diagnostic.detail,
+                    # which may contain local paths or driver internals.
+                    msg = diagnostic.public_message
                     result["reason_code"] = diagnostic.code.value
                     result["retryable"] = diagnostic.retryable
                     result["signals"] = list(diagnostic.signals)
