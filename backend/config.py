@@ -90,6 +90,9 @@ class AppConfig(TypedDict, total=False):
     # path, so toggling one silently did nothing. Which categories a scan
     # covers is driven by the per-scan flags in scanner_service.py.)
 
+    # Source enablement
+    hdencode_enabled: bool
+
     # DDLBase / Cuty.io
     ddlbase_enabled: bool
     cuty_email: str
@@ -440,6 +443,7 @@ _DEFAULT_CONFIG: AppConfig = {
     "debug_mode": False,
     "verbose_logging": False,
     "exclude_720p": False,
+    "hdencode_enabled": True,
     "ddlbase_enabled": True,
     "ddlbase_manual_resolution_timeout": 60,
     "cuty_email": "",

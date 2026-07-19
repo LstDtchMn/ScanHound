@@ -182,6 +182,9 @@ class SettingsUpdate(BaseModel):
     # (Removed with the dead Settings checkboxes: source_2160p / source_remux /
     # source_tv_packs were accepted and stored but never read by any scan path.)
 
+    # Source enablement
+    hdencode_enabled: Optional[bool] = None
+
     # DDLBase / Cuty.io
     ddlbase_enabled: Optional[bool] = None
     ddlbase_manual_resolution_timeout: Optional[int] = None
