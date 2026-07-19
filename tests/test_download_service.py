@@ -44,10 +44,15 @@ def _make_service(config=None, db=None):
 
 @pytest.fixture
 def download_service(db_manager):
-    """A DownloadService wired to the real (temp-file) ``db_manager`` fixture
-    (see tests/conftest.py) rather than a MagicMock — for tests that need
-    genuine adopt-or-insert / delete-by-id database behavior."""
-    return _make_service(db=db_manager)
+    """A server-mode DownloadService with a real temporary database.
+
+    Tests using this fixture exercise backend delivery and deduplication, not
+    desktop clipboard/UI fallbacks. Desktop-specific tests construct their own
+    service explicitly and mock PySide6 where appropriate.
+    """
+    service = _make_service(db=db_manager)
+    service.server_mode = True
+    return service
 
 
 class TestComputePackageName:

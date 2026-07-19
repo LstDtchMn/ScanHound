@@ -70,6 +70,61 @@ def _isolate_config_file(tmp_path, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_default_database(tmp_path, monkeypatch):
+    """Give every test its own default crawler.db.
+
+    backend.config and DatabaseManager bind their default database path at
+    import time, so changing SCANHOUND_DB_DIR inside a test is not sufficient.
+    Patch the class constructor for omitted-path calls while preserving every
+    explicit db_path supplied by focused database tests.
+    """
+    import backend.config as _config
+    import backend.database as _database
+
+    isolated_dir = str(tmp_path)
+    isolated_path = str(tmp_path / "crawler.db")
+    omitted = object()
+    original_init = _database.DatabaseManager.__init__
+
+    def _isolated_init(self, db_path=omitted):
+        resolved_path = isolated_path if db_path is omitted else db_path
+        original_init(self, db_path=resolved_path)
+
+    monkeypatch.setenv("SCANHOUND_DB_DIR", isolated_dir)
+    monkeypatch.setattr(_config, "_DB_DIR", isolated_dir, raising=False)
+    monkeypatch.setattr(_config, "DB_PATH", isolated_path, raising=False)
+    monkeypatch.setattr(_config, "CACHE_FILE", isolated_path, raising=False)
+    monkeypatch.setattr(_database, "DB_PATH", isolated_path, raising=False)
+    monkeypatch.setattr(_database.DatabaseManager, "__init__", _isolated_init)
+
+    # AppService imports CACHE_FILE by value. Keep its legacy persistence alias
+    # inside the same per-test directory when that module is already loaded.
+    app_service = sys.modules.get("backend.app_service")
+    if app_service is not None:
+        monkeypatch.setattr(
+            app_service,
+            "CACHE_FILE",
+            isolated_path,
+            raising=False,
+        )
+
+    yield isolated_path
+
+    # TestClient normally closes this during lifespan shutdown. This final guard
+    # prevents a global registry reference from retaining an open handle after a
+    # test that constructed an app without entering its context manager.
+    dependencies = sys.modules.get("backend.api.dependencies")
+    registry = getattr(dependencies, "registry", None) if dependencies else None
+    active_db = getattr(registry, "db", None) if registry else None
+    if getattr(active_db, "db_path", None) == isolated_path:
+        try:
+            active_db.close()
+        except Exception:
+            pass
+        registry.db = None
+
+
 @pytest.fixture
 def tmp_db(tmp_path):
     """Provide a temporary database path that gets cleaned up."""

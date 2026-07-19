@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 from backend.api.main import create_app
 from backend.api.dependencies import registry
 from backend.database import DatabaseManager
+from backend.plex_manager import PlexManager
 from backend.rename import dv_labeler
 
 # The host-native path the detector would have recorded, and the exact string
@@ -73,7 +74,8 @@ def _make_plex_movie(path: str):
 
 
 def test_end_to_end_fel_labels_exactly_once(monkeypatch, tmp_path):
-    # 1. App with DV enabled + a root; DB is the container's sole crawler.db.
+    # 1. App with DV enabled + a root; the autouse isolation fixture gives
+    #    this app its own crawler.db for the duration of the test.
     app = create_app(config_override={
         "plex_url": "http://x", "plex_token": "t",
         "movie_libs": ["Movies"],
@@ -107,9 +109,18 @@ def test_end_to_end_fel_labels_exactly_once(monkeypatch, tmp_path):
     fake_server.fetchItem.return_value = movie
 
     with TestClient(app) as client:
-        pm = registry._plex_service.plex_manager
+        # Snapshot the state owned by this app lifespan, then use a fresh
+        # PlexManager for the acceptance path. The API registry is process-wide
+        # and intentionally reused by many tests; borrowing its Plex manager
+        # makes this test vulnerable to unrelated singleton state from the
+        # 3,000+ test session even though the DB itself is isolated.
+        db = registry.db
+        config = dict(registry.config)
+        assert db is not None
+
+        pm = PlexManager()
         # is_connected is a read-only property (`self._server is not None`) --
-        # setting _server to a MagicMock makes it True without patching it.
+        # setting _server to a MagicMock makes it True without a network call.
         monkeypatch.setattr(pm, "_server", fake_server, raising=False)
 
         # 4. Import host rows into dv_scan(source='scan') via the real endpoint.
@@ -118,11 +129,11 @@ def test_end_to_end_fel_labels_exactly_once(monkeypatch, tmp_path):
         assert r_imp.json()["imported"] == 1
 
         # 5. Run the real sync logic synchronously (not dry_run). This is the
-        #    exact call the /rename/dv-sync-labels route makes from its
-        #    background thread; invoked directly here so the assertion below
-        #    is deterministic instead of racing a daemon thread.
+        #    same service call the /rename/dv-sync-labels route makes from its
+        #    background thread, but with this test's isolated DB/config/Plex
+        #    dependencies rather than process-global leftovers.
         result = dv_labeler.sync_labels(
-            registry.db, pm, registry.config, dry_run=False)
+            db, pm, config, dry_run=False)
 
     # 6. Assertions -- the merge gate.
     movie.addLabel.assert_called_once_with("DV FEL")    # exactly one add
