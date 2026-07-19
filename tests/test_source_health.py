@@ -45,18 +45,30 @@ def test_429_cooldown_survives_restart(tmp_path):
         reopened.close()
 
 
-def test_non_health_affecting_diagnostic_does_not_change_state(tmp_path):
+def test_local_non_health_affecting_failure_does_not_change_source_state(
+        tmp_path):
+    """A local browser/network failure neither degrades nor clears the source."""
     db = DatabaseManager(str(tmp_path / "operation.db"))
     try:
+        db.record_source_failure(
+            "hdencode",
+            "blocked",
+            "interactive_challenge",
+        )
         links = ScrapedLinks(
             diagnostic=ScrapeDiagnostic(
-                ScrapeCode.REQUESTED_HOST_MISSING,
-                retryable=False,
+                ScrapeCode.BROWSER_NETWORK_ERROR,
+                retryable=True,
                 affects_source_health=False,
             )
         )
+
         record_scrape_outcome(db, "hdencode", links)
-        assert db.get_source_health("hdencode") is None
+
+        row = db.get_source_health("hdencode")
+        assert row["state"] == "blocked"
+        assert row["reason_code"] == "interactive_challenge"
+        assert row["consecutive_failures"] == 1
     finally:
         db.close()
 
