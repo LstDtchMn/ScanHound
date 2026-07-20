@@ -25,6 +25,7 @@ from backend.config import (
     get_default_config, validate_config,
 )
 from backend.database import DatabaseManager
+from backend.runtime_lock import RuntimeWriterLock
 from backend.plex_manager import PlexManager, migrate_library_config
 
 logger = logging.getLogger(__name__)
@@ -401,6 +402,7 @@ class AppService:
         # effects, so they don't need a settings gate.
         self._maintenance_thread: Optional[threading.Thread] = None
         self._maintenance_stop = threading.Event()
+        self._runtime_writer_lock: Optional[RuntimeWriterLock] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -425,6 +427,13 @@ class AppService:
         except Exception as e:
             self.logger = logging.getLogger(__name__)
             warnings.append(f"Logging setup failed: {e}")
+
+        # Acquire process-lifetime ownership before DatabaseManager, the
+        # maintenance sweep, scheduler, or any trash mutation can start.
+        if self._runtime_writer_lock is None:
+            lock = RuntimeWriterLock(CACHE_FILE, app_version=APP_VERSION)
+            lock.acquire()
+            self._runtime_writer_lock = lock
 
         # Migrate legacy library keys → movie_libs / tv_libs if still empty
         # Save immediately so a Settings > Cancel can't undo the migration.
@@ -798,9 +807,15 @@ class AppService:
             except Exception as e:
                 logger.warning("Error closing watchlist manager: %s", e)
 
-        # Close database last
-        if self.db:
-            self.db.close()
+        # Close database last, then release process-lifetime ownership.
+        try:
+            if self.db:
+                self.db.close()
+        finally:
+            runtime_lock = getattr(self, "_runtime_writer_lock", None)
+            if runtime_lock is not None:
+                runtime_lock.release()
+                self._runtime_writer_lock = None
 
         logger.info("AppService shutdown complete")
 

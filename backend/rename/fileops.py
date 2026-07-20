@@ -28,6 +28,10 @@ import threading
 from typing import Callable, Optional
 
 from backend.config import _DATA_DIR
+from backend.runtime_lock import (
+    _unlocked_fileops_for_tests,
+    require_writer_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +182,7 @@ def _record_trash_manifest(bucket: str, trashed_name: str, original_path: str) -
     via the manifest is acceptable, but it must never turn a successful trash
     disposal into a raised exception.
     """
+    require_writer_lock()
     manifest_path = os.path.join(bucket, "manifest.json")
     try:
         records = []
@@ -262,6 +267,7 @@ def _record_trash_root(root: str) -> None:
     app-data index cannot be written. Atomic replacement provides restart-safe
     discovery when persistence succeeds.
     """
+    require_writer_lock()
     normalized = _normalize_registered_trash_root(root)
     if normalized is None:
         return
@@ -437,6 +443,7 @@ def _trash(path: str) -> str:
     is unavailable. App-data remains the last resort only when no same-volume
     candidate can even be created.
     """
+    require_writer_lock()
     bucket_name = _trash_bucket_name()
     name = os.path.basename(path)
     first_exdev_root = None
@@ -525,6 +532,7 @@ def _load_manifest(bucket_path: str) -> list:
 
 
 def _save_manifest(bucket_path: str, records: list) -> None:
+    require_writer_lock()
     manifest_path = os.path.join(bucket_path, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(records, f, indent=2)
@@ -583,6 +591,7 @@ def list_trash_entries(roots) -> list:
 
 
 def restore_trash_entry(bucket: str, name: str, roots) -> dict:
+    require_writer_lock()
     """Restore a manifest-backed trash entry to its recorded original_path.
 
     Safety:
@@ -636,6 +645,7 @@ def restore_trash_entry(bucket: str, name: str, roots) -> dict:
 
 
 def delete_trash_entry(bucket: str, name: str, roots) -> dict:
+    require_writer_lock()
     """Permanently delete ONE trashed file, dropping its manifest record.
 
     The counterpart to :func:`restore_trash_entry`, and validated the same way
@@ -690,6 +700,7 @@ def _remove_bucket_if_empty(bucket_path: str) -> None:
     Best-effort: any error leaves the bucket in place for the retention sweep
     to collect later. Never raises.
     """
+    require_writer_lock()
     try:
         leftovers = os.listdir(bucket_path)
     except OSError:
@@ -716,6 +727,7 @@ def empty_trash(roots=None) -> dict:
     emptying) is still collected — "empty" must leave nothing behind. Same
     return shape as :func:`sweep_trash`.
     """
+    require_writer_lock()
     return sweep_trash(-1, roots=roots)
 
 
@@ -822,6 +834,7 @@ def sweep_trash(retention_days: int, roots=None) -> dict:
 
     Returns ``{"files_deleted": int, "bytes_freed": int, "buckets_removed": int}``.
     """
+    require_writer_lock()
     if roots is None:
         roots = all_trash_roots()
     files_deleted = 0
@@ -891,6 +904,7 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
     ``os.remove``, it is moved to a timestamped trash folder. Pass False to
     restore the old hard-delete behavior (explicit user opt-out in settings).
     """
+    require_writer_lock()
     if method not in MOVE_METHODS:
         method = "hardlink"
     if automatic and method == "move":
@@ -937,6 +951,7 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
 
 def undo_place(src: str, dst: str, method: str) -> None:
     """Reverse a :func:`place_file`: restore ``src``, remove ``dst`` as needed."""
+    require_writer_lock()
     if method in ("hardlink", "symlink", "copy"):
         # The original src still exists — just drop the link/copy.
         if os.path.lexists(dst):

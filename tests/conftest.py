@@ -35,6 +35,27 @@ for _modname in ("backend.config", "backend.app_service"):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_runtime_writer_lock_state():
+    import backend.runtime_lock as runtime_lock_module
+
+    def cleanup():
+        with runtime_lock_module._STATE_LOCK:
+            locks = list(runtime_lock_module._ACTIVE_LOCKS.values())
+        for lock in locks:
+            lock.release()
+        with runtime_lock_module._STATE_LOCK:
+            runtime_lock_module._ACTIVE_LOCKS.clear()
+            runtime_lock_module._TEST_BYPASS_DEPTH = 0
+
+    cleanup()
+    try:
+        with runtime_lock_module._unlocked_fileops_for_tests():
+            yield
+    finally:
+        cleanup()
+
+
+@pytest.fixture(autouse=True)
 def _default_to_open_auth(monkeypatch):
     """Most of the test suite predates the auth system entirely and hits API
     routes with no password/nonce configured, expecting them reachable (the
