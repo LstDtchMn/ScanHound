@@ -862,24 +862,257 @@ def list_trash_entries(roots) -> list:
                     "size": size,
                     "trashed_at": rec.get("trashed_at") if rec else None,
                     "original_path": rec.get("original_path") if rec else None,
-                    "restorable": bool(rec),
+                    "restorable": bool(rec and rec.get("original_path") and not rec.get("pending_operation")),
+                    "transaction_state": rec.get("pending_operation") if rec else None,
+                    "repair_required": bool(rec and rec.get("operation_error")),
                 })
     return entries
 
 
-def restore_trash_entry(bucket: str, name: str, roots) -> dict:
-    """Restore a manifest-backed trash entry to its recorded original_path.
 
-    Safety:
-      - ``bucket``/``name`` are validated as single path components (no
-        separators, no ``..``) so nothing outside the trash roots is ever
-        reachable, regardless of what a caller supplies.
-      - Refuses (never overwrites) if the destination is already occupied.
-      - Refuses if the entry or its manifest record can't be found.
+_OPERATION_FIELDS = (
+    "pending_operation",
+    "operation_id",
+    "operation_started_at",
+    "operation_synthetic",
+    "operation_error",
+)
 
-    Returns ``{"ok": True, "restored_path": ...}`` or
-    ``{"ok": False, "error": ...}``. Never raises for expected failure modes.
+
+def _clear_operation_fields(record: dict) -> dict:
+    cleaned = dict(record)
+    for field in _OPERATION_FIELDS:
+        cleaned.pop(field, None)
+    return cleaned
+
+
+def _begin_trash_operation(
+    bucket_path: str,
+    name: str,
+    operation: str,
+    *,
+    original_path: Optional[str] = None,
+) -> tuple[str, dict]:
+    """Persist one restore/delete intent before changing bytes."""
+    if operation not in ("restore", "delete"):
+        raise ValueError(f"Unsupported trash operation: {operation}")
+
+    with _TRASH_MANIFEST_LOCK:
+        records = _load_manifest_strict(bucket_path)
+        rec = next((r for r in records if r.get("trashed_name") == name), None)
+        synthetic = rec is None
+        if rec is None:
+            if operation != "delete":
+                raise OSError("No manifest record for this entry")
+            rec = {
+                "reservation_id": uuid.uuid4().hex,
+                "trashed_name": name,
+                "original_path": original_path,
+                "trashed_at": datetime.datetime.now().isoformat(),
+            }
+            records.append(rec)
+
+        if rec.get("pending_operation"):
+            raise OSError(
+                f"Trash entry already has an incomplete "
+                f"{rec.get('pending_operation')} operation"
+            )
+
+        operation_id = uuid.uuid4().hex
+        updated = dict(rec)
+        updated.update({
+            "pending_operation": operation,
+            "operation_id": operation_id,
+            "operation_started_at": datetime.datetime.now().isoformat(),
+            "operation_synthetic": synthetic,
+        })
+        index = records.index(rec)
+        records[index] = updated
+        _atomic_write_json(os.path.join(bucket_path, "manifest.json"), records)
+        return operation_id, updated
+
+
+def _clear_trash_operation(bucket_path: str, operation_id: str) -> None:
+    """Roll back an intent when the byte operation did not occur."""
+    with _TRASH_MANIFEST_LOCK:
+        records = _load_manifest_strict(bucket_path)
+        changed = False
+        remaining = []
+        for record in records:
+            if record.get("operation_id") != operation_id:
+                remaining.append(record)
+                continue
+            changed = True
+            if record.get("operation_synthetic"):
+                continue
+            remaining.append(_clear_operation_fields(record))
+        if changed:
+            _atomic_write_json(os.path.join(bucket_path, "manifest.json"), remaining)
+
+
+def _complete_trash_operation(bucket_path: str, operation_id: str) -> None:
+    """Durably remove the record after restore/delete bytes are complete."""
+    with _TRASH_MANIFEST_LOCK:
+        records = _load_manifest_strict(bucket_path)
+        remaining = [
+            record for record in records
+            if record.get("operation_id") != operation_id
+        ]
+        if remaining == records:
+            raise OSError(f"Trash operation record not found: {operation_id}")
+        _atomic_write_json(os.path.join(bucket_path, "manifest.json"), remaining)
+
+
+def _restore_no_replace(fpath: str, original_path: str) -> None:
+    """Restore bytes without replacement, including a verified EXDEV fallback."""
+    try:
+        _move_no_replace(fpath, original_path)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+
+    _copy_verify_atomic(fpath, original_path)
+    try:
+        os.unlink(fpath)
+    except BaseException:
+        try:
+            if os.path.lexists(original_path):
+                os.unlink(original_path)
+        except OSError:
+            logger.critical(
+                "Restore copy published but trash unlink and destination rollback "
+                "both failed: %s -> %s",
+                fpath,
+                original_path,
+                exc_info=True,
+            )
+        raise
+
+
+def repair_trash_transactions(roots=None) -> dict:
+    """Reconcile interrupted restore/delete intents without guessing.
+
+    Safe states:
+      restore intent + trash exists + destination absent -> byte move never
+      occurred, so clear the intent.
+      restore intent + trash absent + destination exists -> restore completed,
+      so remove the manifest record.
+      delete intent + trash exists -> unlink never occurred, so clear/remove the
+      intent.
+      delete intent + trash absent -> deletion completed, so remove the record.
+
+    Ambiguous both/neither restore states remain visible for manual repair.
     """
+    if roots is None:
+        roots = all_trash_roots()
+
+    intents_seen = 0
+    completed = 0
+    rolled_back = 0
+    repair_required = 0
+    errors = []
+
+    for root in roots:
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            continue
+        try:
+            bucket_names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for bucket_name in bucket_names:
+            bucket_path = os.path.join(root, bucket_name)
+            if os.path.islink(bucket_path) or not os.path.isdir(bucket_path):
+                continue
+            try:
+                with _TRASH_MANIFEST_LOCK:
+                    records = _load_manifest_strict(bucket_path)
+                    changed = False
+                    revised = []
+                    for record in records:
+                        operation = record.get("pending_operation")
+                        operation_id = record.get("operation_id")
+                        if not operation or not operation_id:
+                            revised.append(record)
+                            continue
+
+                        intents_seen += 1
+                        name = record.get("trashed_name") or ""
+                        fpath = os.path.join(bucket_path, name)
+                        trash_exists = os.path.lexists(fpath)
+
+                        if operation == "delete":
+                            changed = True
+                            if trash_exists:
+                                if not record.get("operation_synthetic"):
+                                    revised.append(_clear_operation_fields(record))
+                                rolled_back += 1
+                            else:
+                                completed += 1
+                            continue
+
+                        if operation != "restore":
+                            changed = True
+                            repair_required += 1
+                            flagged = dict(record)
+                            flagged["operation_error"] = "unknown operation"
+                            revised.append(flagged)
+                            continue
+
+                        original_path = record.get("original_path")
+                        original_exists = bool(
+                            original_path and os.path.lexists(original_path)
+                        )
+                        if trash_exists and not original_exists:
+                            changed = True
+                            revised.append(_clear_operation_fields(record))
+                            rolled_back += 1
+                        elif not trash_exists and original_exists:
+                            changed = True
+                            completed += 1
+                        else:
+                            changed = True
+                            repair_required += 1
+                            state = (
+                                "both trash and destination exist"
+                                if trash_exists and original_exists
+                                else "neither trash nor destination exists"
+                            )
+                            flagged = dict(record)
+                            flagged["operation_error"] = state
+                            revised.append(flagged)
+                            errors.append({
+                                "bucket": bucket_name,
+                                "name": name,
+                                "operation": operation,
+                                "error": state,
+                            })
+                    if changed:
+                        _atomic_write_json(
+                            os.path.join(bucket_path, "manifest.json"),
+                            revised,
+                        )
+            except OSError as exc:
+                repair_required += 1
+                errors.append({
+                    "bucket": bucket_name,
+                    "error": f"manifest repair failed: {type(exc).__name__}",
+                })
+                logger.exception("Trash transaction repair failed for %s", bucket_path)
+                continue
+            _remove_bucket_if_empty(bucket_path)
+
+    return {
+        "intents_seen": intents_seen,
+        "completed": completed,
+        "rolled_back": rolled_back,
+        "repair_required": repair_required,
+        "errors": errors,
+    }
+
+def restore_trash_entry(bucket: str, name: str, roots) -> dict:
+    """Restore one manifest-backed entry through a durable intent transaction."""
     if not _is_safe_component(bucket) or not _is_safe_component(name):
         return {"ok": False, "error": "Invalid bucket or name (path traversal rejected)"}
 
@@ -891,29 +1124,76 @@ def restore_trash_entry(bucket: str, name: str, roots) -> dict:
         fpath = os.path.join(bucket_path, name)
         if not os.path.isfile(fpath):
             continue
-        manifest = _load_manifest(bucket_path)
+
+        try:
+            manifest = _load_manifest_strict(bucket_path)
+        except OSError:
+            return {"ok": False, "error": "Trash manifest is unreadable; restore refused"}
+
         rec = next((r for r in manifest if r.get("trashed_name") == name), None)
         if not rec or not rec.get("original_path"):
-            return {"ok": False, "error": "No manifest record for this entry — cannot restore safely"}
+            return {
+                "ok": False,
+                "error": "No manifest record for this entry — cannot restore safely",
+            }
+
         original_path = rec["original_path"]
         if os.path.lexists(original_path):
-            return {"ok": False, "error": f"Destination already exists: {original_path}"}
+            return {"ok": False, "error": "Restore destination already exists"}
+
         try:
             os.makedirs(os.path.dirname(original_path) or ".", exist_ok=True)
-            os.rename(fpath, original_path)
-        except OSError as e:
-            if e.errno != errno.EXDEV:
-                return {"ok": False, "error": f"Restore failed: {e}"}
-            try:
-                shutil.move(fpath, original_path)
-            except OSError as e2:
-                return {"ok": False, "error": f"Restore failed: {e2}"}
-        remaining = [r for r in manifest if r is not rec]
+            operation_id, _ = _begin_trash_operation(
+                bucket_path,
+                name,
+                "restore",
+                original_path=original_path,
+            )
+        except OSError as exc:
+            logger.exception("Could not prepare trash restore intent")
+            return {
+                "ok": False,
+                "error": "Restore could not prepare durable recovery metadata",
+                "reason": type(exc).__name__,
+            }
+
         try:
-            _save_manifest(bucket_path, remaining)
-        except OSError:
-            logger.warning("Failed to update manifest after restore at %s (non-fatal)",
-                           bucket_path, exc_info=True)
+            _restore_no_replace(fpath, original_path)
+        except (OSError, FileExistsError) as exc:
+            try:
+                _clear_trash_operation(bucket_path, operation_id)
+            except OSError:
+                logger.exception("Could not roll back failed restore intent")
+            logger.exception("Trash restore failed")
+            return {
+                "ok": False,
+                "error": (
+                    "Restore destination already exists"
+                    if isinstance(exc, FileExistsError)
+                    else "Restore failed; trashed file was kept"
+                ),
+                "reason": type(exc).__name__,
+            }
+
+        try:
+            _complete_trash_operation(bucket_path, operation_id)
+        except OSError as exc:
+            logger.exception(
+                "Restore bytes completed but manifest completion failed; "
+                "restart repair is required"
+            )
+            return {
+                "ok": False,
+                "error": "Restore completed, but bookkeeping requires repair",
+                "repair_required": True,
+                "bytes_restored": True,
+                "operation_id": operation_id,
+                "reason": type(exc).__name__,
+            }
+
+        # Keep the empty manifest after successful restore for compatibility
+        # with existing restore/history readers. Explicit deletion or retention
+        # maintenance may remove the empty bucket later.
         logger.info("restore | %s -> %s", fpath, original_path)
         return {"ok": True, "restored_path": original_path}
 
@@ -921,19 +1201,7 @@ def restore_trash_entry(bucket: str, name: str, roots) -> dict:
 
 
 def delete_trash_entry(bucket: str, name: str, roots) -> dict:
-    """Permanently delete ONE trashed file, dropping its manifest record.
-
-    The counterpart to :func:`restore_trash_entry`, and validated the same way
-    (``bucket``/``name`` must be single path components, so nothing outside the
-    trash roots is reachable). Unlike restore, this works on manifest-less
-    entries too — there's nothing to restore them to, which is exactly when a
-    user wants them gone. Symlinks are unlinked, never followed to a target.
-
-    Removes the bucket once its last file is gone (manifest included), so trash
-    doesn't accumulate empty dated directories.
-
-    Returns ``{"ok": True, "bytes_freed": int}`` or ``{"ok": False, "error": ...}``.
-    """
+    """Permanently delete one entry through a durable intent transaction."""
     if not _is_safe_component(bucket) or not _is_safe_component(name):
         return {"ok": False, "error": "Invalid bucket or name (path traversal rejected)"}
     if name == "manifest.json":
@@ -948,20 +1216,52 @@ def delete_trash_entry(bucket: str, name: str, roots) -> dict:
         is_link = os.path.islink(fpath)
         if not is_link and not os.path.isfile(fpath):
             continue
+
         try:
             size = 0 if is_link else os.path.getsize(fpath)
-            os.unlink(fpath)
-        except OSError as e:
-            return {"ok": False, "error": f"Delete failed: {e}"}
+            operation_id, _ = _begin_trash_operation(
+                bucket_path,
+                name,
+                "delete",
+            )
+        except OSError as exc:
+            logger.exception("Could not prepare trash delete intent")
+            return {
+                "ok": False,
+                "error": "Delete could not prepare durable recovery metadata",
+                "reason": type(exc).__name__,
+            }
 
-        manifest = _load_manifest(bucket_path)
-        remaining = [r for r in manifest if r.get("trashed_name") != name]
-        if remaining != manifest:
+        try:
+            os.unlink(fpath)
+        except OSError as exc:
             try:
-                _save_manifest(bucket_path, remaining)
+                _clear_trash_operation(bucket_path, operation_id)
             except OSError:
-                logger.warning("Failed to update manifest after delete at %s (non-fatal)",
-                               bucket_path, exc_info=True)
+                logger.exception("Could not roll back failed delete intent")
+            return {
+                "ok": False,
+                "error": "Delete failed; trashed file was kept",
+                "reason": type(exc).__name__,
+            }
+
+        try:
+            _complete_trash_operation(bucket_path, operation_id)
+        except OSError as exc:
+            logger.exception(
+                "Delete bytes completed but manifest completion failed; "
+                "restart repair is required"
+            )
+            return {
+                "ok": False,
+                "error": "Delete completed, but bookkeeping requires repair",
+                "repair_required": True,
+                "file_deleted": True,
+                "bytes_freed": size,
+                "operation_id": operation_id,
+                "reason": type(exc).__name__,
+            }
+
         _remove_bucket_if_empty(bucket_path)
         logger.info("trash delete | %s (%d bytes)", fpath, size)
         return {"ok": True, "bytes_freed": size}
@@ -970,24 +1270,38 @@ def delete_trash_entry(bucket: str, name: str, roots) -> dict:
 
 
 def _remove_bucket_if_empty(bucket_path: str) -> None:
-    """Drop a trash bucket that holds nothing but its own manifest.
-
-    Best-effort: any error leaves the bucket in place for the retention sweep
-    to collect later. Never raises.
-    """
+    """Remove a bucket only when no bytes and no recovery records remain."""
     try:
         leftovers = os.listdir(bucket_path)
     except OSError:
         return
-    if any(n != "manifest.json" for n in leftovers):
+    if any(name != "manifest.json" for name in leftovers):
         return
+
+    manifest_path = os.path.join(bucket_path, "manifest.json")
+    if os.path.lexists(manifest_path):
+        try:
+            records = _load_manifest_strict(bucket_path)
+        except OSError:
+            logger.warning(
+                "Refusing to remove bucket with unreadable manifest %s",
+                bucket_path,
+                exc_info=True,
+            )
+            return
+        if records:
+            return
+
     try:
-        for n in leftovers:
-            os.remove(os.path.join(bucket_path, n))
+        if os.path.lexists(manifest_path):
+            os.unlink(manifest_path)
         os.rmdir(bucket_path)
     except OSError:
-        logger.warning("Failed to remove emptied trash bucket %s (skipped)",
-                       bucket_path, exc_info=True)
+        logger.warning(
+            "Failed to remove emptied trash bucket %s (skipped)",
+            bucket_path,
+            exc_info=True,
+        )
 
 
 def empty_trash(roots=None) -> dict:
@@ -1094,66 +1408,92 @@ def _bucket_age_days(bucket_path: str) -> float:
 
 
 def sweep_trash(retention_days: int, roots=None) -> dict:
-    """Delete trash buckets older than ``retention_days``; remove emptied buckets.
-
-    Only ever touches files strictly under the given trash roots (defaults to
-    :func:`all_trash_roots` — every per-volume ``.scanhound-trash`` root plus
-    the app-data fallback — so a real disposal on any drive is eventually
-    swept even if the caller doesn't pass ``roots`` explicitly). Never follows symlinks —
-    a symlink found inside an old bucket is unlinked (removing the link
-    itself), never resolved and deleted at its target. Logs a per-run summary
-    and is fail-safe: per-file/per-bucket errors are logged and skipped
-    rather than aborting the whole sweep.
-
-    Returns ``{"files_deleted": int, "bytes_freed": int, "buckets_removed": int}``.
-    """
+    """Transactionally delete entries from buckets older than retention_days."""
     if roots is None:
         roots = all_trash_roots()
+
     files_deleted = 0
     bytes_freed = 0
     buckets_removed = 0
+    repair_required = 0
+    errors = []
 
     for root in roots:
         root = os.path.abspath(root)
         if not os.path.isdir(root):
             continue
         try:
-            bucket_names = os.listdir(root)
+            bucket_names = sorted(os.listdir(root))
         except OSError:
             continue
+
         for bucket_name in bucket_names:
             bucket_path = os.path.join(root, bucket_name)
             if os.path.islink(bucket_path) or not os.path.isdir(bucket_path):
-                continue  # never descend into a symlinked "bucket"
+                continue
             if _bucket_age_days(bucket_path) < retention_days:
                 continue
-            try:
-                for entry in os.listdir(bucket_path):
-                    epath = os.path.join(bucket_path, entry)
-                    try:
-                        if os.path.islink(epath):
-                            os.unlink(epath)  # remove the link, never its target
-                        elif os.path.isfile(epath):
-                            size = os.path.getsize(epath)
-                            os.remove(epath)
-                            if entry != "manifest.json":
-                                files_deleted += 1
-                                bytes_freed += size
-                        elif os.path.isdir(epath):
-                            shutil.rmtree(epath, ignore_errors=True)
-                    except OSError:
-                        logger.warning("sweep_trash: failed to remove %s (skipped)",
-                                       epath, exc_info=True)
-                os.rmdir(bucket_path)
-                buckets_removed += 1
-            except OSError:
-                logger.warning("sweep_trash: failed to remove bucket %s (skipped)",
-                               bucket_path, exc_info=True)
 
-    logger.info("sweep_trash: removed %d file(s), %d bucket(s), freed %d bytes (retention=%dd)",
-               files_deleted, buckets_removed, bytes_freed, retention_days)
-    return {"files_deleted": files_deleted, "bytes_freed": bytes_freed,
-            "buckets_removed": buckets_removed}
+            bucket_existed = True
+            try:
+                names = [
+                    entry for entry in os.listdir(bucket_path)
+                    if entry != "manifest.json"
+                ]
+            except OSError:
+                continue
+
+            for entry in names:
+                epath = os.path.join(bucket_path, entry)
+                if not os.path.islink(epath) and not os.path.isfile(epath):
+                    logger.warning(
+                        "sweep_trash: refusing nested non-file entry %s",
+                        epath,
+                    )
+                    errors.append({
+                        "bucket": bucket_name,
+                        "name": entry,
+                        "error": "nested non-file entry refused",
+                    })
+                    continue
+
+                result = delete_trash_entry(
+                    bucket_name,
+                    entry,
+                    [root],
+                )
+                if result.get("ok") or result.get("file_deleted"):
+                    files_deleted += 1
+                    bytes_freed += int(result.get("bytes_freed") or 0)
+                if result.get("repair_required"):
+                    repair_required += 1
+                if not result.get("ok"):
+                    errors.append({
+                        "bucket": bucket_name,
+                        "name": entry,
+                        "error": result.get("error", "delete failed"),
+                    })
+
+            _remove_bucket_if_empty(bucket_path)
+            if bucket_existed and not os.path.exists(bucket_path):
+                buckets_removed += 1
+
+    logger.info(
+        "sweep_trash: removed %d file(s), %d bucket(s), freed %d bytes "
+        "(retention=%dd, repair_required=%d)",
+        files_deleted,
+        buckets_removed,
+        bytes_freed,
+        retention_days,
+        repair_required,
+    )
+    return {
+        "files_deleted": files_deleted,
+        "bytes_freed": bytes_freed,
+        "buckets_removed": buckets_removed,
+        "repair_required": repair_required,
+        "errors": errors,
+    }
 
 
 def place_file(src: str, dst: str, method: str = "hardlink", *,

@@ -577,7 +577,17 @@ class AppService:
         try:
             from backend.rename import fileops
             retention_days = self.config.get("trash_retention_days", 30)
-            summary = fileops.sweep_trash(retention_days, roots=fileops.all_trash_roots())
+            roots = fileops.all_trash_roots()
+            repaired = fileops.repair_trash_transactions(roots)
+            if repaired.get("intents_seen"):
+                logger.info(
+                    "Trash repair: %d completed, %d rolled back, "
+                    "%d require attention",
+                    repaired.get("completed", 0),
+                    repaired.get("rolled_back", 0),
+                    repaired.get("repair_required", 0),
+                )
+            summary = fileops.sweep_trash(retention_days, roots=roots)
             if summary.get("files_deleted"):
                 logger.info(
                     "Trash sweep: removed %d file(s), freed %d bytes (retention=%dd)",
