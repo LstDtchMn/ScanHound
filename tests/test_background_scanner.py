@@ -85,10 +85,21 @@ class _FakeRegistry:
         self._scanner_service = scanner
         self.db = db
         self.backend = _FakeBackend()
+        self._lifespan_generation = 1
 
     @property
     def scanner(self):
         return self._scanner_service
+
+    @property
+    def lifespan_generation(self):
+        return self._lifespan_generation
+
+    def owns_lifespan(self, generation):
+        return generation == self._lifespan_generation
+
+    def advance_lifespan(self):
+        self._lifespan_generation += 1
 
 
 # ── DB layer ──────────────────────────────────────────────────────────
@@ -199,6 +210,22 @@ class TestBackgroundCacheDB:
 # ── Service ───────────────────────────────────────────────────────────
 
 class TestBackgroundScannerService:
+    def test_stale_lifespan_skips_without_touching_scanner(self, db):
+        scanner = _FakeScanner({"HDEncode": [_FakeMediaItem("h1", "H1")]})
+        reg = _FakeRegistry(
+            {"background_scan_sources": ["HDEncode"], "background_scan_pages": 1},
+            scanner,
+            db,
+        )
+        background = BackgroundScanner(reg)
+        reg.advance_lifespan()
+
+        result = background.scan_once()
+
+        assert result["skipped"] is True
+        assert result["reason"] == "stale_lifespan"
+        assert scanner.calls == []
+
     def test_scan_once_scans_each_source_with_page_count(self, db):
         scanner = _FakeScanner({
             "HDEncode": [_FakeMediaItem("h1", "H1")],

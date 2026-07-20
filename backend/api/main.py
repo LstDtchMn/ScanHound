@@ -67,12 +67,13 @@ def _clear_registry_lifespan_state(reg: ServiceRegistry) -> None:
     reg.config = {}
 
 
-def _prepare_registry_for_startup(reg: ServiceRegistry) -> None:
-    """Make a reused registry indistinguishable from a fresh process registry."""
-    # request_shutdown() is sticky by design for worker loops.  A new lifespan
-    # must explicitly clear it before starting any new background service.
-    reg._shutdown_event.clear()
+def _prepare_registry_for_startup(reg: ServiceRegistry) -> int:
+    """Make a reused registry fresh and return its new ownership generation."""
+    # Advancing the generation before clearing references means an old worker
+    # remains stale even after begin_lifespan() clears the shared shutdown event.
+    generation = reg.begin_lifespan()
     _clear_registry_lifespan_state(reg)
+    return generation
 
 
 def _init_services(

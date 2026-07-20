@@ -110,6 +110,8 @@ class ServiceRegistry:
     _plex_metadata_scan_job: Any = None
     _plex_metadata_scan_job_lock: threading.Lock = field(default_factory=threading.Lock)
     _shutdown_event: threading.Event = field(default_factory=threading.Event)
+    _lifespan_generation: int = 0
+    _lifespan_generation_lock: threading.Lock = field(default_factory=threading.Lock)
     # Auth nonce — generated on startup, validated by middleware.
     # If SCANHOUND_AUTH_NONCE env var is set, use that (Tauri passes it).
     # If empty string, auth is disabled (dev mode).
@@ -177,6 +179,25 @@ class ServiceRegistry:
 
                     self._plex_metadata_scan_job = PlexMetadataScanJob(self.db, progress_cb=_broadcast)
         return self._plex_metadata_scan_job
+
+    def begin_lifespan(self) -> int:
+        """Advance ownership and clear cancellation for one new app lifespan."""
+        with self._lifespan_generation_lock:
+            self._lifespan_generation += 1
+            generation = self._lifespan_generation
+        self._shutdown_event.clear()
+        return generation
+
+    @property
+    def lifespan_generation(self) -> int:
+        with self._lifespan_generation_lock:
+            return self._lifespan_generation
+
+    def owns_lifespan(self, generation: int) -> bool:
+        """Whether work created by ``generation`` may still publish state."""
+        with self._lifespan_generation_lock:
+            current = self._lifespan_generation
+        return generation == current and not self._shutdown_event.is_set()
 
     def request_shutdown(self):
         self._shutdown_event.set()
