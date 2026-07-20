@@ -57,6 +57,21 @@ because the integration branch merges the exact heads that currently cannot be c
 | **PR B** | `agent/trash-lifecycle-transaction` from `44ea7ba` | partial → aborts | — | ⛔ **FP-B-1** |
 | PR E/F/G/H/I, PR#8, cross-seams, sentinel | — | not reached | — | census stopped after decisive pattern |
 
+## Proposed fixes (brief)
+
+| ID | Package | One-line fix |
+|----|---------|-------------|
+| FP-14-1 | PR #14 | Move `global-teardown.ts` out of the svelte-check include → `frontend/global-teardown.ts`, reference it as `./global-teardown.ts` (mirrors `playwright.config.ts`). |
+| FP-J-1 | PR J | Change the `client.test.ts` op from `write_new` to append the `formatErrorDetail` `describe` block (or write a new file, e.g. `client.errors.test.ts`) so the existing `conflict apis` tests survive. |
+| FP-A-1 | PR A | Add an autouse teardown (conftest or test_runtime_lock.py) that releases any locks left in `_ACTIVE_LOCKS` and resets `_TEST_BYPASS_DEPTH`; or mock/release the lock in `test_app_service_extended.py`. |
+| FP-C-1 | PR C | Rewrite op [23]'s `old` anchor to the real multi-line `_log_page_diagnostics(` signature at `8a48382`, then verify the full op list applies so op [27] (undetection-flag removal) runs. |
+| FP-B-1 | PR B | Rewrite the `_run_maintenance_pass` "maintenance anchor" to the real `app_service.py` text at `44ea7ba`; verify end-to-end. |
+| FP-15-1 | PR #15 fs | Strip the trailing blank line at `tests/test_rename_core.py:1129`. |
+
+Cross-cutting: because blob/branch guards pass while operations still fail, **every package
+must actually be applied and its suite run against a real checkout before resubmission** —
+guard-passing ≠ apply-clean, and no suite has been executed author-side.
+
 ## Blocking defects (require corrected packages)
 
 **FP-14-1 — PR #14 breaks `npm run check` (CI red).** The new
