@@ -32,6 +32,7 @@ import uuid
 from typing import Callable, Optional
 
 from backend.config import _DATA_DIR
+from backend.runtime_lock import require_writer_lock
 
 logger = logging.getLogger(__name__)
 
@@ -662,6 +663,7 @@ def _record_trash_root(root: str, *, required: bool = False) -> bool:
     for a non-intrinsic root; persistence failure then raises before source bytes
     move.
     """
+    require_writer_lock()
     normalized = _normalize_registered_trash_root(root)
     if normalized is None:
         if required:
@@ -868,6 +870,7 @@ def _trash(path: str) -> str:
     (when needed) and the manifest reservation are atomically persisted.  Move,
     manifest, fsync, or index failures therefore leave the source untouched.
     """
+    require_writer_lock()
     bucket_name = _trash_bucket_name()
     first_exdev_root = None
     preparation_errors = []
@@ -970,6 +973,7 @@ def _load_manifest(bucket_path: str) -> list:
 
 def _save_manifest(bucket_path: str, records: list) -> None:
     """Atomically and durably replace a bucket manifest."""
+    require_writer_lock()
     with _TRASH_MANIFEST_LOCK:
         _atomic_write_json(os.path.join(bucket_path, "manifest.json"), records)
 
@@ -1162,6 +1166,7 @@ def repair_trash_transactions(roots=None) -> dict:
 
     Ambiguous both/neither restore states remain visible for manual repair.
     """
+    require_writer_lock()
     if roots is None:
         roots = all_trash_roots()
 
@@ -1271,6 +1276,7 @@ def repair_trash_transactions(roots=None) -> dict:
 
 def restore_trash_entry(bucket: str, name: str, roots) -> dict:
     """Restore one manifest-backed entry through a durable intent transaction."""
+    require_writer_lock()
     if not _is_safe_component(bucket) or not _is_safe_component(name):
         return {"ok": False, "error": "Invalid bucket or name (path traversal rejected)"}
 
@@ -1360,6 +1366,7 @@ def restore_trash_entry(bucket: str, name: str, roots) -> dict:
 
 def delete_trash_entry(bucket: str, name: str, roots) -> dict:
     """Permanently delete one entry through a durable intent transaction."""
+    require_writer_lock()
     if not _is_safe_component(bucket) or not _is_safe_component(name):
         return {"ok": False, "error": "Invalid bucket or name (path traversal rejected)"}
     if name == "manifest.json":
@@ -1429,6 +1436,7 @@ def delete_trash_entry(bucket: str, name: str, roots) -> dict:
 
 def _remove_bucket_if_empty(bucket_path: str) -> None:
     """Remove a bucket only when no bytes and no recovery records remain."""
+    require_writer_lock()
     try:
         leftovers = os.listdir(bucket_path)
     except OSError:
@@ -1473,6 +1481,7 @@ def empty_trash(roots=None) -> dict:
     emptying) is still collected — "empty" must leave nothing behind. Same
     return shape as :func:`sweep_trash`.
     """
+    require_writer_lock()
     return sweep_trash(-1, roots=roots)
 
 
@@ -1567,6 +1576,7 @@ def _bucket_age_days(bucket_path: str) -> float:
 
 def sweep_trash(retention_days: int, roots=None) -> dict:
     """Transactionally delete entries from buckets older than retention_days."""
+    require_writer_lock()
     if roots is None:
         roots = all_trash_roots()
 
@@ -1674,6 +1684,7 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
     ``os.remove``, it is moved to a timestamped trash folder. Pass False to
     restore the old hard-delete behavior (explicit user opt-out in settings).
     """
+    require_writer_lock()
     if method not in MOVE_METHODS:
         method = "hardlink"
     if automatic and method == "move":
@@ -1731,6 +1742,7 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
 
 def undo_place(src: str, dst: str, method: str) -> None:
     """Reverse a :func:`place_file`: restore ``src``, remove ``dst`` as needed."""
+    require_writer_lock()
     if method in ("hardlink", "symlink", "copy"):
         # The original src still exists — just drop the link/copy.
         if os.path.lexists(dst):
