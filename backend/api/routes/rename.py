@@ -8,6 +8,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
+from backend.api.public_errors import capture_public_exception
 from backend.api.routes.scanner import TMDB_IMAGE_BASE  # same base+size as Scan posters (w500)
 from backend.api.ws import ws_manager
 from backend.rename import dv_detect, dv_labeler, fileops, llm_identify
@@ -451,9 +452,14 @@ def reidentify_all(reg: ServiceRegistry = Depends(get_registry)):
                 "title": "Re-identify", "body": f"Re-ran {result.get('reidentified', 0)} job(s)",
                 "priority": "normal"}})
         except Exception as e:
-            logger.exception("reidentify-all failed")
-            ws_manager.broadcast_sync({"type": "notification", "data": {
-                "title": "Re-identify failed", "body": str(e), "priority": "high"}})
+            public = capture_public_exception(
+                logger, e, code="reidentify_failed",
+                message="Re-identification could not be completed.",
+                context="reidentify-all failed",
+            )
+            ws_manager.broadcast_sync({"type": "notification",
+                                       "data": public.notification_data(
+                                           title="Re-identify failed")})
 
     threading.Thread(target=_run, name="rename-reidentify-all", daemon=True).start()
     return {"status": "started"}
@@ -613,9 +619,14 @@ def process_folder(req: ProcessFolderRequest, reg: ServiceRegistry = Depends(get
                 "title": "Process folder preview" if dry_run else "Process folder",
                 "body": body, "priority": prio}})
         except Exception as e:
-            logger.exception("process-folder failed")
-            ws_manager.broadcast_sync({"type": "notification", "data": {
-                "title": "Process folder failed", "body": str(e), "priority": "high"}})
+            public = capture_public_exception(
+                logger, e, code="process_folder_failed",
+                message="The folder could not be processed.",
+                context="process-folder failed",
+            )
+            ws_manager.broadcast_sync({"type": "notification",
+                                       "data": public.notification_data(
+                                           title="Process folder failed")})
 
     threading.Thread(target=_run, name="rename-process-folder", daemon=True).start()
     return {"status": "started", "folder": folder, "dry_run": dry_run}
@@ -657,9 +668,14 @@ def dv_scan_folder(req: DvScanRequest, reg: ServiceRegistry = Depends(get_regist
             ws_manager.broadcast_sync({"type": "notification", "data": {
                 "title": "Dolby Vision scan", "body": body, "priority": prio}})
         except Exception as e:
-            logger.exception("dv-scan-folder failed")
-            ws_manager.broadcast_sync({"type": "notification", "data": {
-                "title": "Dolby Vision scan failed", "body": str(e), "priority": "high"}})
+            public = capture_public_exception(
+                logger, e, code="dv_scan_failed",
+                message="The Dolby Vision scan could not be completed.",
+                context="dv-scan-folder failed",
+            )
+            ws_manager.broadcast_sync({"type": "notification",
+                                       "data": public.notification_data(
+                                           title="Dolby Vision scan failed")})
 
     threading.Thread(target=_run, name="dv-scan-folder", daemon=True).start()
     return {"status": "started", "folder": folder, "force": force}
@@ -711,11 +727,15 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
                          f"{' (dry run)' if dry_run else ''}"),
                 "priority": "normal"}})
         except Exception as e:
-            logger.exception("dv-sync-labels failed")
-            ws_manager.broadcast_sync({"type": "notification", "data": {
-                "title": "Dolby Vision label sync failed",
-                "body": str(e), "priority": "high"}})
-            result = {"error": str(e)}
+            public = capture_public_exception(
+                logger, e, code="dv_label_sync_failed",
+                message="Dolby Vision labels could not be synchronized.",
+                context="dv-sync-labels failed",
+            )
+            ws_manager.broadcast_sync({"type": "notification",
+                                       "data": public.notification_data(
+                                           title="Dolby Vision label sync failed")})
+            result = {"error": public.message, **public.as_detail()}
         finally:
             ws_manager.broadcast_sync({"type": "dv:sync_done", "data": result})
 

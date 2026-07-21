@@ -3,6 +3,30 @@ import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
+export type PublicErrorDetail = {
+  code?: string;
+  message?: string;
+  correlation_id?: string;
+};
+
+export function formatErrorDetail(detail: unknown): string | undefined {
+  if (typeof detail === 'string') {
+    return detail;
+  }
+  if (!detail || typeof detail !== 'object') {
+    return undefined;
+  }
+  const candidate = detail as PublicErrorDetail;
+  if (typeof candidate.message !== 'string' || !candidate.message.trim()) {
+    return undefined;
+  }
+  if (typeof candidate.correlation_id === 'string' && candidate.correlation_id) {
+    return `${candidate.message} (Reference: ${candidate.correlation_id})`;
+  }
+  return candidate.message;
+}
+
+
 /** Auth token: a stored token (Android/remote) seeds it; the Tauri sidecar or
  *  setAuthNonce() can override at runtime. Empty = dev mode (no auth). */
 let authNonce = getStoredToken();
@@ -65,7 +89,7 @@ async function request<T>(path: string, options?: RequestInit, timeoutMs = REQUE
     let detail: string | undefined;
     try {
       const body = await resp.clone().json();
-      detail = body?.detail;
+      detail = formatErrorDetail(body?.detail);
     } catch {
       // non-JSON error body — fall through to the generic message
     }
