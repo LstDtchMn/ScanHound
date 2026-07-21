@@ -1,0 +1,55 @@
+{
+  "created_at": "20260721T222449Z",
+  "source": "/dbvol/crawler.db",
+  "snapshot": "production-20260721T222449Z.sqlite3",
+  "source_observation": {
+    "sha256": "f489f9cb67dcc4825941357898a126358370875562024359e24240a1cf9a9089",
+    "size": 17117184,
+    "integrity_check": "ok",
+    "user_version": 2,
+    "row_counts": {
+      "auth_credentials": 1,
+      "auth_sessions": 11,
+      "background_scan_cache": 2050,
+      "bookmarks": 0,
+      "dismissed_items": 572,
+      "download_results": 313,
+      "downloads": 266,
+      "dv_scan": 4192,
+      "media_probe": 21,
+      "pipeline_verdicts": 52,
+      "plex_cache": 21405,
+      "rename_jobs": 158,
+      "scan_history": 0,
+      "scanned_urls": 170,
+      "scraped_link_map": 1162,
+      "watchlist": 0
+    },
+    "schema_sha256": "3a91a1b3edd651d416720d966bcffba3d0741e1804d09635cec67811ec3c7881"
+  },
+  "snapshot_observation": {
+    "sha256": "195f21f82691d8bcb04c2f1c2558a4d56d294552230b28e4e5ecbc0a3b03fb8f",
+    "size": 17117184,
+    "integrity_check": "ok",
+    "user_version": 2,
+    "row_counts": {
+      "auth_credentials": 1,
+      "auth_sessions": 11,
+      "background_scan_cache": 2050,
+      "bookmarks": 0,
+      "dismissed_items": 572,
+      "download_results": 313,
+      "downloads": 266,
+      "dv_scan": 4192,
+      "media_probe": 21,
+      "pipeline_verdicts": 52,
+      "plex_cache": 21405,
+      "rename_jobs": 158,
+      "scan_history": 0,
+      "scanned_urls": 170,
+      "scraped_link_map": 1162,
+      "watchlist": 0
+    },
+    "schema_sha256": "3a91a1b3edd651d416720d966bcffba3d0741e1804d09635cec67811ec3c7881"
+  }
+}

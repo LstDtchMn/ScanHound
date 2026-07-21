@@ -1,0 +1,62 @@
+{
+  "started_at": "2026-07-21T20:48:20.544956+00:00",
+  "parent": "/probe/scanhound-sentinel-g",
+  "identity": {
+    "path": "/probe/scanhound-sentinel-g",
+    "device": 1048729,
+    "mode": "0o777",
+    "platform": "linux",
+    "block_size": 2097152,
+    "blocks": 11444122,
+    "free_blocks": 7507179,
+    "name_max": 255
+  },
+  "tests": {
+    "no_replace": {
+      "supported": true,
+      "destination_preserved": true,
+      "errno": 17,
+      "error": "File exists",
+      "source_exists": true,
+      "source_unchanged": true,
+      "destination_exists": true,
+      "destination_unchanged": true
+    },
+    "hardlink": {
+      "supported": true,
+      "same_inode": true,
+      "same_device": true,
+      "content_equal": true
+    },
+    "file_fsync": {
+      "supported": true
+    },
+    "directory_fsync": {
+      "supported": true
+    },
+    "manifest_atomic_replace": {
+      "temp_fsync": {
+        "supported": true
+      },
+      "directory_fsync": {
+        "supported": true
+      },
+      "content": "{\"generation\":1}\n"
+    }
+  },
+  "failures": [],
+  "ok": true,
+  "created_files": [
+    "dst.bin",
+    "fsync.bin",
+    "hardlink-link",
+    "hardlink-original",
+    "manifest.json",
+    "src.bin"
+  ],
+  "cleanup": {
+    "run_removed": true,
+    "parent_empty": true
+  },
+  "finished_at": "2026-07-21T20:48:20.635702+00:00"
+}

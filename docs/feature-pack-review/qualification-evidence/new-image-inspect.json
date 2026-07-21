@@ -1,0 +1,78 @@
+[
+    {
+        "Id": "sha256:56d23a0cbe3c24cb6d523178f79b28240f43d4d12e1930bc0e92ca224ff39d6b",
+        "RepoTags": [
+            "scanhound:feature-pack-a6b4a7b"
+        ],
+        "RepoDigests": [
+            "scanhound@sha256:56d23a0cbe3c24cb6d523178f79b28240f43d4d12e1930bc0e92ca224ff39d6b"
+        ],
+        "Comment": "buildkit.dockerfile.v0",
+        "Created": "2026-07-21T20:44:05.591708413Z",
+        "Config": {
+            "ExposedPorts": {
+                "9721/tcp": {}
+            },
+            "Env": [
+                "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "LANG=C.UTF-8",
+                "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+                "PYTHON_VERSION=3.12.13",
+                "PYTHON_SHA256=c08bc65a81971c1dd5783182826503369466c7e67374d1646519adf05207b684",
+                "PYTHONUNBUFFERED=1",
+                "PIP_NO_CACHE_DIR=1",
+                "HOME=/data",
+                "DISPLAY=:99",
+                "SCANHOUND_FRONTEND_DIR=/app/frontend/build",
+                "CHROME_BIN=/usr/bin/chromium"
+            ],
+            "Entrypoint": [
+                "/usr/bin/tini",
+                "--",
+                "/entrypoint.sh"
+            ],
+            "WorkingDir": "/app",
+            "Labels": {
+                "org.opencontainers.image.revision": "a6b4a7b14d6613c27f17de670677ed848fec458d"
+            }
+        },
+        "Architecture": "amd64",
+        "Os": "linux",
+        "Size": 463886304,
+        "RootFS": {
+            "Type": "layers",
+            "Layers": [
+                "sha256:81f823b9617547261c907396f63f770deaa554748ff739bedfa650e3bb74595a",
+                "sha256:ce33c9de66cdd02adfc5d2c90060519f50596db724128d3d1ff45f50f00b864b",
+                "sha256:c2b26ec5a1949f5c91508a243e07b92ed88a4540c285156784dfb7b55b2ccb56",
+                "sha256:03944bf5bf4e36dc438f56c82f5c5e564205edaac4a03c55f997febff27597c0",
+                "sha256:ee65e5598370c08ca5b693b2fde7ce3f61f4490448bdf3bf5a9b45eb04a7f0fc",
+                "sha256:ed9832ae92f54325c858af7fb0f24304e5b59090aa7c46701f61784e937aa36d",
+                "sha256:2274805a3a100aec16a953b917faccb818dce12609983cb039e2dcf16e03f555",
+                "sha256:e8bc44564502617815dfe526c7f4fd5d418eaa80a8f2ce6a2faa2a05c121e61c",
+                "sha256:c8465bf54e279e52d0020b5ff5eb66b4fd446ec4037d39341b670e607d51eed3",
+                "sha256:71321a2a8df68371b9be010920beca1a9566f5d03fefa96dc44e023b762c53a9",
+                "sha256:6d460bc6f5bf04ebb95e753241da87a4c6682a71f718760f5779737f00e7c5d9",
+                "sha256:b804a58b6f2eb73d6f2c98e70d7013d2747fc2dff0e8987b73e6c0192d763cf4",
+                "sha256:e8b005b3cf1d2d9db37205d1bd913f9f8e526294b7b895c31f0b723722095986",
+                "sha256:f2a633642d58fb9f666acd549130800d3d4d787574fbddeaf9710d4fdbe1ca59"
+            ]
+        },
+        "Metadata": {
+            "LastTagTime": "2026-07-21T20:44:06.212775649Z"
+        },
+        "Descriptor": {
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "digest": "sha256:56d23a0cbe3c24cb6d523178f79b28240f43d4d12e1930bc0e92ca224ff39d6b",
+            "size": 856
+        },
+        "Identity": {
+            "Build": [
+                {
+                    "Ref": "i7p9b91duilbye8qeoqnkqslx",
+                    "CreatedAt": "2026-07-21T20:44:06.408071535Z"
+                }
+            ]
+        }
+    }
+]

@@ -1,0 +1,22 @@
+Merge feature-pack integration (RSS/HDEncode + file-safety) for production qualification
+
+Integrates agent/feature-pack-integration at code-tested SHA a6b4a7b
+(backend 3974 passed / 0 failed; frontend check/vitest/build green) plus
+docs-only qualification tooling and evidence.
+
+Migration matrix run against a byte copy of the real production database
+(v2, 16 tables, 30373 rows): ok=true, zero failures. Cases: v2->v6 upgrade
+with all pre-existing row counts preserved; restart idempotency; old-image
+reopen of a migrated DB; interrupted migration recovered clean on reopen;
+rollback restore byte-identical to baseline; plus an extra
+rollback-then-roll-forward case whose schema hash and row counts match a
+clean migration exactly.
+
+Filesystem sentinel: 8/8 ok across F/G/X NTFS binds and the blackbeard CIFS
+share, host- and container-side; RENAME_NOREPLACE preserved the destination
+on every mount.
+
+Deployed fail-closed: Auto-rename, general auto-grab, HDEncode, and
+background scan disabled, discovery mode forced to listing at first startup.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>

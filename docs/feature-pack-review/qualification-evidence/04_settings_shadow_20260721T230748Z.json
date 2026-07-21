@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "stage": "shadow",
+  "settings_put": {
+    "auto_rename_enabled": false,
+    "auto_grab_enabled": false,
+    "hdencode_enabled": true
+  },
+  "rss_mode_set": "rss_shadow",
+  "before_snapshot": "/out/settings-before-shadow-20260721T230748Z.json",
+  "mismatches": {},
+  "unsettable_mismatches": {},
+  "completed_at": "2026-07-21T23:07:49.097575+00:00"
+}
