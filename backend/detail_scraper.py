@@ -13,34 +13,29 @@ from contextlib import contextmanager, nullcontext
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
-import cloudscraper
 from bs4 import BeautifulSoup
 
 from backend.models import ScrapeResult
+from backend.hdencode_coordinator import (
+    HDEncodeRequestCancelled,
+    HDEncodeTrafficDenied,
+    configure_hdencode_coordinator,
+    get_hdencode_coordinator,
+)
+from backend.hdencode_transport import create_source_http_client
 from backend.rename import llm_identify as _llm
 
 logger = logging.getLogger(__name__)
 
-# HDEncode detail pages are the burstiest live request path: ScannerService can
-# submit every discovered post to a thread pool at once, and /scan/rescan-item
-# reaches this same module with a fresh cloudscraper session. Keep the safety
-# policy here so both entry points share one process-wide concurrency ceiling
-# and one request-start clock.
-_HDENCODE_MAX_CONCURRENT_REQUESTS = 3
-_HDENCODE_MIN_REQUEST_INTERVAL_SECONDS = 2.0
-_hdencode_request_semaphore = threading.BoundedSemaphore(
-    _HDENCODE_MAX_CONCURRENT_REQUESTS
-)
-_hdencode_pacing_lock = threading.Lock()
-_hdencode_last_request_started: Optional[float] = None
+# HDEncode pacing and authorization now live in HDEncodeTrafficCoordinator.
 
 
 def _detail_source_kind(url: str) -> str:
-    """Classify a detail-page URL using its parsed hostname.
+    """Classify detail traffic by parsed hostname.
 
-    DDLBase and Adit-HD share this facade with HDEncode, but must not share
-    HDEncode's emergency traffic policy. Unknown or malformed page URLs fail
-    closed to the existing default HDEncode path.
+    DDLBase and Adit-HD share the parsing facade but remain outside the
+    HDEncode traffic coordinator. Unknown and malformed URLs fail closed to
+    the HDEncode policy.
     """
     try:
         host = (urlparse(url).hostname or "").lower()
@@ -64,7 +59,6 @@ def _is_cancelled(stop_requested: Optional[Callable[[], bool]]) -> bool:
     try:
         return bool(stop_requested())
     except Exception:
-        # A broken cancellation observer must not create new source traffic.
         return True
 
 
@@ -72,7 +66,6 @@ def _interruptible_sleep(
     seconds: float,
     stop_requested: Optional[Callable[[], bool]],
 ) -> None:
-    """Sleep normally for legacy callers; poll cancellation for scan workers."""
     if seconds <= 0:
         return
     if stop_requested is None:
@@ -88,66 +81,6 @@ def _interruptible_sleep(
         time.sleep(min(0.1, remaining))
 
 
-@contextmanager
-def _hdencode_request_slot(
-    stop_requested: Optional[Callable[[], bool]] = None,
-):
-    """Limit and pace requests without issuing traffic after cancellation.
-
-    Legacy/manual callers without a cancellation callback retain the original
-    semaphore and one-shot sleep behavior. Scanner workers use timed semaphore
-    acquisition and interruptible pacing so a worker that was already running
-    but waiting for capacity cannot make a request after stop is requested.
-    """
-    global _hdencode_last_request_started
-
-    if stop_requested is None:
-        with _hdencode_request_semaphore:
-            with _hdencode_pacing_lock:
-                now = time.monotonic()
-                if _hdencode_last_request_started is not None:
-                    wait_seconds = max(
-                        0.0,
-                        _HDENCODE_MIN_REQUEST_INTERVAL_SECONDS
-                        - (now - _hdencode_last_request_started),
-                    )
-                    if wait_seconds:
-                        time.sleep(wait_seconds)
-                _hdencode_last_request_started = time.monotonic()
-            yield
-        return
-
-    acquired = False
-    while not acquired:
-        if _is_cancelled(stop_requested):
-            raise _DetailRequestCancelled()
-        acquired = _hdencode_request_semaphore.acquire(timeout=0.1)
-
-    try:
-        while True:
-            if _is_cancelled(stop_requested):
-                raise _DetailRequestCancelled()
-            with _hdencode_pacing_lock:
-                now = time.monotonic()
-                wait_seconds = 0.0
-                if _hdencode_last_request_started is not None:
-                    wait_seconds = max(
-                        0.0,
-                        _HDENCODE_MIN_REQUEST_INTERVAL_SECONDS
-                        - (now - _hdencode_last_request_started),
-                    )
-                if wait_seconds <= 0:
-                    _hdencode_last_request_started = now
-                    break
-            _interruptible_sleep(
-                min(wait_seconds, 0.1),
-                stop_requested,
-            )
-        yield
-    finally:
-        _hdencode_request_semaphore.release()
-
-
 class DetailScraper:
     """Scrapes media metadata from HDEncode post pages."""
 
@@ -159,6 +92,10 @@ class DetailScraper:
                         clean_string, safe_log).
         """
         self.app = parent_app
+        configure_hdencode_coordinator(
+            getattr(parent_app, "config", {}),
+            getattr(parent_app, "db", None),
+        )
 
     def scrape_details(
         self,
@@ -190,20 +127,8 @@ class DetailScraper:
             dict with parsed media metadata, or None on failure.
         """
         try:
-            if not scraper:
-                scraper = cloudscraper.create_scraper()
-
-            # ScannerService sends HDEncode, DDLBase, and Adit-HD detail pages
-            # through this facade. Apply the shared limiter only to the default
-            # HDEncode path; other sources retain independent throughput.
-            if _detail_source_kind(url) == "hdencode":
-                request_context = (
-                    _hdencode_request_slot
-                    if stop_requested is None
-                    else lambda: _hdencode_request_slot(stop_requested)
-                )
-            else:
-                request_context = nullcontext
+            source_kind = _detail_source_kind(url)
+            hdencode_request = source_kind == "hdencode"
 
             # Retry logic for robust connection
             max_retries = 3
@@ -214,10 +139,29 @@ class DetailScraper:
                 if _is_cancelled(stop_requested):
                     return None
                 try:
-                    with request_context():
-                        if _is_cancelled(stop_requested):
-                            return None
-                        resp = scraper.get(url, headers=headers, timeout=20)
+                    if hdencode_request:
+                        with get_hdencode_coordinator().request(
+                            "detail",
+                            stop_requested=stop_requested,
+                        ):
+                            if _is_cancelled(stop_requested):
+                                return None
+                            active_scraper = scraper or create_source_http_client(
+                                hdencode=True
+                            )
+                            resp = active_scraper.get(
+                                url, headers=headers, timeout=20
+                            )
+                        get_hdencode_coordinator().observe_http_status(
+                            resp.status_code
+                        )
+                    else:
+                        active_scraper = scraper or create_source_http_client(
+                            hdencode=False
+                        )
+                        resp = active_scraper.get(
+                            url, headers=headers, timeout=20
+                        )
                     if resp.status_code == 200:
                         break
                     elif resp.status_code == 429:  # Too Many Requests
@@ -226,10 +170,18 @@ class DetailScraper:
                     else:
                         _interruptible_sleep(1 * (attempt + 1), stop_requested)
                         continue
-                except _DetailRequestCancelled:
+                except (
+                    HDEncodeRequestCancelled,
+                    HDEncodeTrafficDenied,
+                    _DetailRequestCancelled,
+                ):
                     return None
                 except Exception as e:
                     last_error = e
+                    if hdencode_request:
+                        get_hdencode_coordinator().observe_network_failure(
+                            type(e).__name__
+                        )
                     try:
                         _interruptible_sleep(1 * (attempt + 1), stop_requested)
                     except _DetailRequestCancelled:

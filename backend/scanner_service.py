@@ -10,7 +10,6 @@ import re
 import time
 import threading
 import requests
-import cloudscraper
 from bs4 import BeautifulSoup
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +22,13 @@ from backend.app_service import (
     LRUCache, clean_string, normalize_title, STATUS_MISSING,
 )
 from backend.database import DatabaseManager
+from backend.hdencode_coordinator import (
+    HDEncodeRequestCancelled,
+    HDEncodeTrafficDenied,
+    configure_hdencode_coordinator,
+    get_hdencode_coordinator,
+)
+from backend.hdencode_transport import create_source_http_client
 from backend.matching import MatchingEngine, clear_fuzzy_cache
 from backend.metadata_enricher import MetadataEnricher
 from backend.scrapers import WebScrapers
@@ -154,6 +160,7 @@ class ScannerService:
     ):
         self.config = config
         self.db = db
+        configure_hdencode_coordinator(config, db)
         self.scrapers = scrapers
         self.matching = matching
         self.plex = plex_service
@@ -428,7 +435,9 @@ class ScannerService:
         self._log(f"Sources: {', '.join(s['name'] for s in sources)}")
 
         # ── Crawl pages ───────────────────────────────────────────────
-        scraper = cloudscraper.create_scraper()
+        scraper = None
+        if any(s.get("source") != "hdencode" for s in sources):
+            scraper = create_source_http_client(hdencode=False)
         loop = asyncio.get_running_loop()
 
         previously_scanned: Set[str] = set()
@@ -645,7 +654,32 @@ class ScannerService:
                         url = f"{source_base}page/{page_num}/{source_suffix}"
 
                 try:
-                    resp = await loop.run_in_executor(None, lambda u=url: scraper.get(u, timeout=15))
+                    def _fetch_page(u=url):
+                        if source_id == "hdencode":
+                            with get_hdencode_coordinator().request(
+                                "listing",
+                                stop_requested=lambda: self.stop_scan_flag,
+                            ):
+                                client = scraper or create_source_http_client(hdencode=True)
+                                return client.get(u, timeout=15)
+                        client = scraper or create_source_http_client(hdencode=False)
+                        return client.get(u, timeout=15)
+
+                    try:
+                        resp = await loop.run_in_executor(None, _fetch_page)
+                    except (HDEncodeTrafficDenied, HDEncodeRequestCancelled):
+                        early_stopped = True
+                        self.stop_scan_flag = True
+                        self._log(
+                            f"{source_name}: coordinator stopped remaining traffic",
+                            "warning",
+                        )
+                        break
+                    decision = (
+                        get_hdencode_coordinator().observe_http_status(resp.status_code)
+                        if source_id == "hdencode"
+                        else None
+                    )
                     if resp.status_code != 200:
                         # ONLY a Cloudflare / rate-limit block (403/429/503) is a
                         # "block": it fails every page, so back off and abandon the
@@ -659,29 +693,7 @@ class ScannerService:
                             # Back off (grows with the streak) so a blocked source
                             # isn't hammered with N requests in a few seconds.
                             await asyncio.sleep(min(0.5 * blocked_streak, 3.0))
-                            if blocked_streak >= 3:
-                                # Reuse the ScannerService's existing cancellation
-                                # primitive. _process_posts checks this event before
-                                # every worker request and cancels queued futures.
-                                try:
-                                    if source_id == "hdencode" and self.db is not None:
-                                        state = "cooldown" if last_block_status == 429 else "blocked"
-                                        cooldown = 15 * 60 if last_block_status == 429 else None
-                                        self.db.record_source_failure(
-                                            "hdencode",
-                                            state,
-                                            f"http_{last_block_status}",
-                                            cooldown_seconds=cooldown,
-                                        )
-                                except Exception:
-                                    # Health persistence must never prevent the
-                                    # actual block-detection/stop from taking
-                                    # effect (same guarantee as
-                                    # backend/source_health.py's own docstring) —
-                                    # a DB write failure here must not silently
-                                    # swallow the abort via the broader per-page
-                                    # except below.
-                                    pass
+                            if decision is not None and decision.blocked:
                                 self.stop_scan_flag = True
                                 self._log(
                                     f"{source_name}: confirmed shared block after "
@@ -691,16 +703,7 @@ class ScannerService:
                                 )
                                 break  # session can't clear the block this run
                         continue
-                    blocked_streak = 0  # a good page resets the streak
-                    try:
-                        if source_id == "hdencode" and self.db is not None:
-                            self.db.record_source_success("hdencode")
-                    except Exception:
-                        # A health-write failure on a successful page must not
-                        # abort parsing that page's posts (they're extracted
-                        # further down in this same try block) — see the note
-                        # on the block-abort site above.
-                        pass
+                    blocked_streak = 0  # coordinator reset the global streak
 
                     soup = BeautifulSoup(resp.content, 'html.parser')
                     posts = self._select_posts(soup, source_id)

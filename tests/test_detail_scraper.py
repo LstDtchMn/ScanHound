@@ -351,7 +351,7 @@ class TestScrapeDetailsScraperParam:
         scraper = make_scraper()
         mock_cs = make_mock_scraper(200, MOVIE_HTML)
 
-        with patch("backend.detail_scraper.cloudscraper.create_scraper") as mock_create:
+        with patch("backend.detail_scraper.create_source_http_client") as mock_create:
             scraper.scrape_details("https://example.com", {}, scraper=mock_cs)
             mock_create.assert_not_called()
 
@@ -360,9 +360,13 @@ class TestScrapeDetailsScraperParam:
         scraper = make_scraper()
         mock_cs = make_mock_scraper(200, MOVIE_HTML)
 
-        with patch("backend.detail_scraper.cloudscraper.create_scraper", return_value=mock_cs):
-            scraper.scrape_details("https://example.com", {})
-            # create_scraper was called since we didn't provide one
+        with patch(
+            "backend.detail_scraper.create_source_http_client",
+            return_value=mock_cs,
+        ) as mock_create:
+            result = scraper.scrape_details("https://example.com", {})
+            mock_create.assert_called_once_with(hdencode=True)
+            assert result is not None
 
 
 # ── Result structure ──────────────────────────────────────────────────

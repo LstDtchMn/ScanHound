@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.sources.registry import get_registry as get_source_registry
 from backend.source_health import effective_health_state
+from backend.hdencode_coordinator import get_hdencode_coordinator
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sources", tags=["sources"])
@@ -32,6 +33,8 @@ def list_sources(reg: ServiceRegistry = Depends(get_registry)):
         source["last_success_at"] = health.get("last_success_at")
         source["last_failure_at"] = health.get("last_failure_at")
         source["cooldown_until"] = health.get("cooldown_until")
+        if source["name"] == "hdencode":
+            source["traffic"] = get_hdencode_coordinator().snapshot()
     return sources
 
 

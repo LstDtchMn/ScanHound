@@ -2,7 +2,9 @@
 import asyncio
 from unittest.mock import MagicMock
 
+import backend.hdencode_coordinator as coordinator_module
 from backend.background_scanner import BackgroundScanner
+from backend.hdencode_coordinator import HDEncodeTrafficCoordinator
 from backend.scanner_service import ScannerService
 
 
@@ -32,7 +34,21 @@ def _scanner_shell():
     return scanner
 
 
+def _install_coordinator(monkeypatch):
+    coordinator = HDEncodeTrafficCoordinator()
+    coordinator._MIN_START_INTERVAL = 0
+    coordinator._HEALTH_CACHE_SECONDS = 0
+    coordinator.configure({"hdencode_enabled": True}, None)
+    monkeypatch.setattr(
+        coordinator_module,
+        "_COORDINATOR",
+        coordinator,
+    )
+    return coordinator
+
+
 def test_three_consecutive_blocks_set_existing_stop_event(monkeypatch):
+    _install_coordinator(monkeypatch)
     scanner = _scanner_shell()
     scraper = _BlockedScraper([403, 403, 403, 200])
     source = {
@@ -90,8 +106,8 @@ def test_background_stop_does_not_set_scan_flag_when_idle():
     assert not scanner.mock_calls
 
 
-
 def _run_status_sequence(monkeypatch, statuses):
+    _install_coordinator(monkeypatch)
     scanner = _scanner_shell()
     scraper = _BlockedScraper(statuses)
     source = {
@@ -132,7 +148,6 @@ def test_successful_page_resets_consecutive_block_streak(monkeypatch):
         monkeypatch,
         [403, 403, 200, 403, 403, 200],
     )
-
     assert scraper.calls == 6
     assert scanner.stop_scan_flag is False
 
@@ -142,7 +157,6 @@ def test_non_block_http_statuses_do_not_trigger_cancellation(monkeypatch):
         monkeypatch,
         [404, 500, 404, 200],
     )
-
     assert scraper.calls == 4
     assert scanner.stop_scan_flag is False
 
@@ -152,6 +166,5 @@ def test_429_and_503_are_counted_as_confirmed_blocks(monkeypatch):
         monkeypatch,
         [429, 503, 429, 200],
     )
-
     assert scraper.calls == 3
     assert scanner.stop_scan_flag is True

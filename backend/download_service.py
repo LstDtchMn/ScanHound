@@ -12,11 +12,18 @@ import sys
 import time
 import threading
 import webbrowser
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
 from backend.database import DatabaseManager
+from backend.hdencode_coordinator import (
+    HDEncodeTrafficDenied,
+    configure_hdencode_coordinator,
+    get_hdencode_coordinator,
+    require_transport_authorization,
+)
 from backend.app_service import normalize_title
 from backend.sources.ddlbase import decode_ddlbase_link
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
@@ -222,6 +229,7 @@ class DownloadService:
     def __init__(self, config: Dict[str, Any], db: DatabaseManager, server_mode: bool = False):
         self.config = config
         self.db = db
+        configure_hdencode_coordinator(config, db)
         # In server/headless mode (the FastAPI/Docker deployment) there is no
         # user-facing browser, so the browser fallback is meaningless and must
         # not be reported as a successful delivery.
@@ -1029,8 +1037,10 @@ class DownloadService:
                 "warning",
             )
 
-    def get_driver(self):
+    def get_driver(self, *, require_hdencode_authorization: bool = False):
         """Get or create a cached WebDriver instance (thread-safe)."""
+        if require_hdencode_authorization:
+            require_transport_authorization("selenium")
         _ensure_selenium()
         with self._driver_lock:
             if self.cached_driver:
@@ -1194,64 +1204,88 @@ class DownloadService:
     def _navigate_with_diagnostic(
         self, url: str, tag: str = "Scrape", attempts: int = 3
     ):
-        """Load ``url`` and return ``(driver, diagnostic)``.
-
-        Browser creation, navigation exceptions, and Chromium's own ``ERR_*``
-        pages are deliberately separate outcomes. ``get_driver`` already has
-        bounded launch retries, so a launch exception is final for this operation.
-        """
+        """Load a source page through the appropriate traffic policy."""
         last_diag: Optional[ScrapeDiagnostic] = None
+        hdencode_request = _source_page_kind(url) == "hdencode"
+
         for attempt in range(1, attempts + 1):
             try:
-                driver = self.get_driver()
-            except Exception as e:
-                diag = ScrapeDiagnostic(
-                    ScrapeCode.BROWSER_LAUNCH_FAILED,
-                    retryable=True,
-                    affects_source_health=False,
-                    signals=(type(e).__name__,),
-                    detail=f"The browser could not start: {e}",
+                request_context = (
+                    get_hdencode_coordinator().request("selenium")
+                    if hdencode_request
+                    else nullcontext()
                 )
-                self._log(f"[{tag}] browser launch failed: {e}", "error")
-                return None, diag
+                with request_context:
+                    try:
+                        driver = self.get_driver(
+                            require_hdencode_authorization=hdencode_request
+                        )
+                    except Exception as exc:
+                        diag = ScrapeDiagnostic(
+                            ScrapeCode.BROWSER_LAUNCH_FAILED,
+                            retryable=True,
+                            affects_source_health=False,
+                            signals=(type(exc).__name__,),
+                            detail="The browser could not start.",
+                        )
+                        self._log(
+                            f"[{tag}] browser launch failed: {type(exc).__name__}",
+                            "error",
+                        )
+                        return None, diag
 
-            try:
-                driver.get(url)
-            except Exception as e:
-                last_diag = ScrapeDiagnostic(
-                    ScrapeCode.BROWSER_NAVIGATION_FAILED,
-                    retryable=True,
+                    try:
+                        driver.get(url)
+                    except Exception as exc:
+                        if hdencode_request:
+                            get_hdencode_coordinator().observe_network_failure(
+                                type(exc).__name__
+                            )
+                        last_diag = ScrapeDiagnostic(
+                            ScrapeCode.BROWSER_NAVIGATION_FAILED,
+                            retryable=True,
+                            affects_source_health=False,
+                            signals=(type(exc).__name__,),
+                            detail="Browser navigation failed.",
+                        )
+                        self._log(
+                            f"[{tag}] navigation raised "
+                            f"(attempt {attempt}/{attempts}): {type(exc).__name__}",
+                            "warning",
+                        )
+                    else:
+                        code = self._browser_error_code(driver, url)
+                        if not code:
+                            if hdencode_request:
+                                get_hdencode_coordinator().observe_http_status(200)
+                            return driver, None
+                        if hdencode_request:
+                            get_hdencode_coordinator().observe_network_failure(code)
+                        last_diag = ScrapeDiagnostic(
+                            ScrapeCode.BROWSER_NETWORK_ERROR,
+                            retryable=True,
+                            affects_source_health=False,
+                            signals=(code,),
+                            detail=f"Chromium could not reach the source ({code}).",
+                        )
+                        self._log(
+                            f"[{tag}] browser network error {code}; recycling "
+                            f"({attempt}/{attempts}).",
+                            "warning",
+                        )
+            except HDEncodeTrafficDenied as exc:
+                return None, ScrapeDiagnostic(
+                    ScrapeCode.SOURCE_DISABLED,
+                    retryable=False,
                     affects_source_health=False,
-                    signals=(type(e).__name__,),
-                    detail=f"Browser navigation failed: {e}",
-                )
-                self._log(
-                    f"[{tag}] navigation raised (attempt {attempt}/{attempts}): {e}",
-                    "warning",
-                )
-            else:
-                code = self._browser_error_code(driver, url)
-                if not code:
-                    return driver, None
-                last_diag = ScrapeDiagnostic(
-                    ScrapeCode.BROWSER_NETWORK_ERROR,
-                    retryable=True,
-                    affects_source_health=False,
-                    signals=(code,),
-                    detail=f"Chromium could not reach the source ({code}).",
-                )
-                self._log(
-                    f"[{tag}] browser could not reach the site ({code}) — a network/DNS "
-                    f"error, NOT a Cloudflare wall. Recycling the browser and retrying "
-                    f"({attempt}/{attempts}).",
-                    "warning",
+                    signals=(exc.code,),
                 )
 
             self._recycle_driver()
             if attempt < attempts:
                 time.sleep(min(2 * attempt, 5))
 
-        self._log(f"[{tag}] giving up — {url} unreachable from the container", "error")
+        self._log(f"[{tag}] giving up after {attempts} navigation attempt(s)", "error")
         return None, last_diag or ScrapeDiagnostic(
             ScrapeCode.BROWSER_NETWORK_ERROR,
             retryable=True,
@@ -1269,6 +1303,7 @@ class DownloadService:
         keyword: Optional[str] = None,
         *,
         stage: str = "page",
+        source_kind: str = "hdencode",
     ) -> ScrapeDiagnostic:
         """Log page evidence and return a structured operation classification."""
         try:
@@ -1416,6 +1451,8 @@ class DownloadService:
                     signals=tuple(signals),
                 )
             if captcha_frames or challenge_markers:
+                if source_kind == "hdencode":
+                    get_hdencode_coordinator().observe_challenge()
                 return ScrapeDiagnostic(
                     ScrapeCode.INTERACTIVE_CHALLENGE,
                     retryable=False,
@@ -1454,36 +1491,13 @@ class DownloadService:
             )
 
     def _wait_past_cloudflare(self, driver, timeout: int = 30) -> None:
-        """Wait for a Cloudflare interstitial ("Just a moment…") to clear.
+        """Compatibility no-op.
 
-        undetected_chromedriver solves the JS/Turnstile challenge on its own,
-        but it needs a few seconds.  We poll until the challenge markers are
-        gone (or the timeout elapses) so the subsequent element search doesn't
-        fire while the challenge page is still up — which previously made the
-        scrape return zero links the moment Cloudflare engaged.
+        ScanHound does not wait for, solve, or automate interactive challenges.
+        Strong challenge evidence is classified by _log_page_diagnostics(),
+        which establishes a source cooldown through the coordinator.
         """
-        deadline = time.monotonic() + timeout
-        announced = False
-        while time.monotonic() < deadline:
-            try:
-                title = (driver.title or "").lower()
-                src = (driver.page_source or "").lower()
-            except Exception:
-                return
-            challenge = (
-                "just a moment" in title
-                or "attention required" in title
-                or "checking your browser" in src
-                or "cf-chl" in src
-                or "challenges.cloudflare.com" in src
-            )
-            if not challenge:
-                return
-            if not announced:
-                self._log("[Scrape] Cloudflare challenge detected — waiting for it to clear...")
-                announced = True
-            time.sleep(1)
-        self._log("[Scrape] Cloudflare challenge did not clear within timeout", "warning")
+        return
 
     def scrape_links(self, url: str, service_type: str, progress_callback: Optional[Callable] = None) -> ScrapedLinks:
         """Scrape download links from a page using WebDriver.
@@ -1506,7 +1520,8 @@ class DownloadService:
             return ScrapedLinks(diagnostic=diagnostic)
 
         try:
-            _ensure_selenium()
+            if source_kind != "hdencode":
+                _ensure_selenium()
         except Exception as e:
             diagnostic = ScrapeDiagnostic(
                 ScrapeCode.BROWSER_LAUNCH_FAILED,
@@ -1719,7 +1734,9 @@ class DownloadService:
 
             if not shortlinks and not direct_links:
                 self._log("[DDLBase] No shortlinks or download links found", "warning")
-                self._log_page_diagnostics(driver)
+                self._log_page_diagnostics(
+                    driver, source_kind="ddlbase"
+                )
                 return []
 
             self._log(f"[DDLBase] Found {len(shortlinks)} shortlinks, {len(direct_links)} direct links")

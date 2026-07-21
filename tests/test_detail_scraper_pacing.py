@@ -1,11 +1,15 @@
-"""Safety tests for HDEncode detail-request concurrency and pacing."""
-
+"""Safety tests for the process-wide HDEncode detail coordinator."""
+from contextlib import contextmanager
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
+import pytest
+
 import backend.detail_scraper as detail_scraper
+import backend.hdencode_coordinator as coordinator_module
 from backend.detail_scraper import DetailScraper
+from backend.hdencode_coordinator import HDEncodeTrafficCoordinator
 
 
 _VALID_DETAIL_HTML = b"""
@@ -26,7 +30,8 @@ class _Response:
 
 
 class _App:
-    config = {"debug_mode": False}
+    config = {"debug_mode": False, "hdencode_enabled": True}
+    db = None
 
     @staticmethod
     def parse_size(value):
@@ -55,33 +60,38 @@ class _FakeClock:
         self.now += seconds
 
 
-def _reset_limiter(monkeypatch, *, max_concurrent=3, interval=2.0):
-    monkeypatch.setattr(
-        detail_scraper,
-        "_hdencode_request_semaphore",
-        threading.BoundedSemaphore(max_concurrent),
+def _install_coordinator(
+    monkeypatch,
+    *,
+    max_concurrent=3,
+    interval=2.0,
+):
+    coordinator = HDEncodeTrafficCoordinator()
+    coordinator._MIN_START_INTERVAL = interval
+    coordinator._HEALTH_CACHE_SECONDS = 0
+    coordinator._semaphores["detail"] = threading.BoundedSemaphore(
+        max_concurrent
     )
+    coordinator.configure({"hdencode_enabled": True}, None)
     monkeypatch.setattr(
-        detail_scraper,
-        "_HDENCODE_MIN_REQUEST_INTERVAL_SECONDS",
-        interval,
+        coordinator_module,
+        "_COORDINATOR",
+        coordinator,
     )
-    monkeypatch.setattr(detail_scraper, "_hdencode_last_request_started", None)
+    return coordinator
 
 
-def test_non_hdencode_sources_bypass_hdencode_limiter(monkeypatch):
-    """DDLBase and Adit-HD detail pages keep independent request throughput."""
+def test_non_hdencode_sources_bypass_hdencode_coordinator(monkeypatch):
+    coordinator = _install_coordinator(monkeypatch)
 
-    @detail_scraper.contextmanager
-    def forbidden_slot():
-        raise AssertionError("HDEncode limiter must not wrap this source")
+    @contextmanager
+    def forbidden_request(*_args, **_kwargs):
+        raise AssertionError(
+            "HDEncode coordinator must not wrap this source"
+        )
         yield
 
-    monkeypatch.setattr(
-        detail_scraper,
-        "_hdencode_request_slot",
-        forbidden_slot,
-    )
+    monkeypatch.setattr(coordinator, "request", forbidden_request)
 
     class Scraper:
         def get(self, *_args, **_kwargs):
@@ -89,7 +99,6 @@ def test_non_hdencode_sources_bypass_hdencode_limiter(monkeypatch):
 
     detail = DetailScraper(_App())
     session = Scraper()
-
     for url in (
         "https://ddlbase.com/post/example",
         "https://www.ddlbase.com/post/example",
@@ -100,19 +109,17 @@ def test_non_hdencode_sources_bypass_hdencode_limiter(monkeypatch):
 
 
 def test_hdencode_query_text_cannot_spoof_source_classification(monkeypatch):
+    coordinator = _install_coordinator(monkeypatch)
     entered = 0
 
-    @detail_scraper.contextmanager
-    def recording_slot():
+    @contextmanager
+    def recording_request(request_class, **_kwargs):
         nonlocal entered
+        assert request_class == "detail"
         entered += 1
         yield
 
-    monkeypatch.setattr(
-        detail_scraper,
-        "_hdencode_request_slot",
-        recording_slot,
-    )
+    monkeypatch.setattr(coordinator, "request", recording_request)
 
     class Scraper:
         def get(self, *_args, **_kwargs):
@@ -123,25 +130,22 @@ def test_hdencode_query_text_cannot_spoof_source_classification(monkeypatch):
         {},
         Scraper(),
     )
-
     assert result
     assert entered == 1
 
 
-def test_malformed_detail_url_fails_closed_to_hdencode_limiter(monkeypatch):
+def test_malformed_detail_url_fails_closed_to_hdencode_coordinator(monkeypatch):
+    coordinator = _install_coordinator(monkeypatch)
     entered = 0
 
-    @detail_scraper.contextmanager
-    def recording_slot():
+    @contextmanager
+    def recording_request(request_class, **_kwargs):
         nonlocal entered
+        assert request_class == "detail"
         entered += 1
         yield
 
-    monkeypatch.setattr(
-        detail_scraper,
-        "_hdencode_request_slot",
-        recording_slot,
-    )
+    monkeypatch.setattr(coordinator, "request", recording_request)
 
     class Scraper:
         def get(self, *_args, **_kwargs):
@@ -152,28 +156,28 @@ def test_malformed_detail_url_fails_closed_to_hdencode_limiter(monkeypatch):
         {},
         Scraper(),
     )
-
     assert result
     assert entered == 1
 
 
 def test_concurrent_request_starts_are_globally_spaced(monkeypatch):
-    """The pacing lock serializes starts from different worker threads."""
     interval = 0.04
-    _reset_limiter(monkeypatch, max_concurrent=4, interval=interval)
-
+    _install_coordinator(
+        monkeypatch,
+        max_concurrent=4,
+        interval=interval,
+    )
     starts = []
     starts_lock = threading.Lock()
 
     class Scraper:
         def get(self, *_args, **_kwargs):
             with starts_lock:
-                starts.append(detail_scraper.time.monotonic())
+                starts.append(coordinator_module.time.monotonic())
             return _Response()
 
     detail = DetailScraper(_App())
     session = Scraper()
-
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [
             executor.submit(
@@ -189,15 +193,26 @@ def test_concurrent_request_starts_are_globally_spaced(monkeypatch):
 
     ordered = sorted(starts)
     assert len(ordered) == 4
-    gaps = [later - earlier for earlier, later in zip(ordered, ordered[1:])]
+    gaps = [
+        later - earlier
+        for earlier, later in zip(ordered, ordered[1:])
+    ]
     assert all(gap >= interval * 0.75 for gap in gaps), gaps
 
 
 def test_detail_requests_are_spaced_across_separate_calls(monkeypatch):
-    _reset_limiter(monkeypatch, interval=2.0)
+    _install_coordinator(monkeypatch, interval=2.0)
     clock = _FakeClock()
-    monkeypatch.setattr(detail_scraper.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(detail_scraper.time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        coordinator_module.time,
+        "monotonic",
+        clock.monotonic,
+    )
+    monkeypatch.setattr(
+        coordinator_module.time,
+        "sleep",
+        clock.sleep,
+    )
 
     starts = []
 
@@ -208,22 +223,33 @@ def test_detail_requests_are_spaced_across_separate_calls(monkeypatch):
 
     scraper = DetailScraper(_App())
     session = Scraper()
-
     assert scraper.scrape_details("https://hdencode.org/a", {}, session)
     assert scraper.scrape_details("https://hdencode.org/b", {}, session)
 
     assert starts == [100.0, 102.0]
-    assert clock.sleeps == [2.0]
+    assert sum(clock.sleeps) == pytest.approx(2.0)
+    assert all(0 < value <= 0.1 for value in clock.sleeps)
 
 
-def test_each_retry_attempt_uses_the_shared_start_clock(monkeypatch):
-    _reset_limiter(monkeypatch, interval=2.0)
+def test_each_retry_attempt_uses_shared_start_clock(monkeypatch):
+    _install_coordinator(monkeypatch, interval=2.0)
     clock = _FakeClock()
-    monkeypatch.setattr(detail_scraper.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(detail_scraper.time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        coordinator_module.time,
+        "monotonic",
+        clock.monotonic,
+    )
+    monkeypatch.setattr(
+        coordinator_module.time,
+        "sleep",
+        clock.sleep,
+    )
 
     starts = []
-    responses = iter([_Response(status_code=429, content=b""), _Response()])
+    responses = iter([
+        _Response(status_code=429, content=b""),
+        _Response(),
+    ])
 
     class Scraper:
         def get(self, *_args, **_kwargs):
@@ -231,19 +257,22 @@ def test_each_retry_attempt_uses_the_shared_start_clock(monkeypatch):
             return next(responses)
 
     result = DetailScraper(_App()).scrape_details(
-        "https://hdencode.org/retry", {}, Scraper()
+        "https://hdencode.org/retry",
+        {},
+        Scraper(),
     )
-
     assert result
-    # Existing 429 backoff advances the fake clock by two seconds. The shared
-    # pacer sees that the minimum interval has already elapsed.
+    # Existing 429 backoff advances the shared fake clock two seconds.
     assert starts == [100.0, 102.0]
     assert clock.sleeps == [2]
 
 
 def test_no_more_than_three_detail_requests_are_in_flight(monkeypatch):
-    _reset_limiter(monkeypatch, max_concurrent=3, interval=0.0)
-
+    _install_coordinator(
+        monkeypatch,
+        max_concurrent=3,
+        interval=0.0,
+    )
     lock = threading.Lock()
     release = threading.Event()
     three_active = threading.Event()
@@ -260,14 +289,13 @@ def test_no_more_than_three_detail_requests_are_in_flight(monkeypatch):
                 maximum = max(maximum, active)
                 if active == 3:
                     three_active.set()
-            assert release.wait(timeout=3), "test did not release blocked requests"
+            assert release.wait(timeout=3)
             with lock:
                 active -= 1
             return _Response()
 
     scraper = DetailScraper(_App())
     session = BlockingScraper()
-
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [
             executor.submit(
@@ -278,7 +306,7 @@ def test_no_more_than_three_detail_requests_are_in_flight(monkeypatch):
             )
             for index in range(6)
         ]
-        assert three_active.wait(timeout=3), "three requests never became active"
+        assert three_active.wait(timeout=3)
         with lock:
             assert active == 3
             assert maximum == 3
@@ -290,9 +318,12 @@ def test_no_more_than_three_detail_requests_are_in_flight(monkeypatch):
     assert maximum == 3
 
 
-
 def test_waiting_worker_never_requests_after_cancellation(monkeypatch):
-    _reset_limiter(monkeypatch, max_concurrent=1, interval=0.0)
+    _install_coordinator(
+        monkeypatch,
+        max_concurrent=1,
+        interval=0.0,
+    )
     release_first = threading.Event()
     first_started = threading.Event()
     cancelled = threading.Event()
@@ -311,7 +342,6 @@ def test_waiting_worker_never_requests_after_cancellation(monkeypatch):
 
     detail = DetailScraper(_App())
     session = Scraper()
-
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(
             detail.scrape_details,
@@ -330,7 +360,6 @@ def test_waiting_worker_never_requests_after_cancellation(monkeypatch):
         )
         cancelled.set()
         release_first.set()
-
         assert first.result(timeout=3)
         assert waiting.result(timeout=3) is None
 
@@ -338,7 +367,11 @@ def test_waiting_worker_never_requests_after_cancellation(monkeypatch):
 
 
 def test_retry_backoff_stops_before_next_request(monkeypatch):
-    _reset_limiter(monkeypatch, max_concurrent=1, interval=0.0)
+    _install_coordinator(
+        monkeypatch,
+        max_concurrent=1,
+        interval=0.0,
+    )
     cancelled = threading.Event()
     calls = 0
 
@@ -355,6 +388,5 @@ def test_retry_backoff_stops_before_next_request(monkeypatch):
         Scraper(),
         stop_requested=cancelled.is_set,
     )
-
     assert result is None
     assert calls == 1
