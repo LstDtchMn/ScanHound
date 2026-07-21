@@ -33,6 +33,7 @@ class BackgroundScanner:
 
     def __init__(self, registry):
         self._reg = registry
+        self._lifespan_generation = registry.lifespan_generation
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._running = threading.Event()  # a scan is currently executing
@@ -80,6 +81,10 @@ class BackgroundScanner:
     def last_run(self) -> Optional[Dict[str, Any]]:
         """Summary of the most recent completed run (per-source counts/errors)."""
         return self._last_run
+
+    def _owns_lifespan(self) -> bool:
+        """Whether this worker still belongs to the registry's active lifespan."""
+        return self._reg.owns_lifespan(self._lifespan_generation)
 
     def next_run_at(self) -> Optional[float]:
         """Epoch timestamp of the next scheduled run, or None if disabled."""
@@ -153,6 +158,12 @@ class BackgroundScanner:
         cfg = reg.config or {}
         scanner = reg.scanner
         db = reg.db
+        if not self._owns_lifespan():
+            logger.info("Background scan abandoned: stale app lifespan")
+            return {
+                "scanned": 0, "cached": 0, "skipped": True,
+                "reason": "stale_lifespan",
+            }
         if scanner is None or db is None:
             logger.warning("Background scan skipped: scanner/db unavailable")
             return {"scanned": 0, "cached": 0, "skipped": True}
@@ -207,6 +218,19 @@ class BackgroundScanner:
                     err = str(e)
                     logger.exception("Background scan of source %s failed", source)
 
+                # A source scan can block past teardown's bounded join. Re-check
+                # ownership before any captured DB object or the reused registry
+                # can be mutated.
+                if not self._owns_lifespan():
+                    logger.info(
+                        "Background scan abandoned after source %s: stale app lifespan",
+                        source,
+                    )
+                    return {
+                        "scanned": 0, "cached": 0, "skipped": True,
+                        "reason": "stale_lifespan",
+                    }
+
                 # Refresh last_seen for still-listed items we skipped re-scraping.
                 if not err:
                     seen = getattr(scanner, "_last_crawl_seen_urls", None)
@@ -220,6 +244,13 @@ class BackgroundScanner:
                     db.upsert_background_cache(rows)
                     total += len(rows)
                 source_results.append({"source": source, "new": len(rows), "error": err})
+
+            if not self._owns_lifespan():
+                logger.info("Background scan abandoned before cache re-match: stale app lifespan")
+                return {
+                    "scanned": 0, "cached": 0, "skipped": True,
+                    "reason": "stale_lifespan",
+                }
 
             # Refresh library/downloaded status across the WHOLE cache (cheap —
             # no re-scraping) so already-cached items reflect the current Plex
@@ -254,6 +285,13 @@ class BackgroundScanner:
         finally:
             self._running.clear()
             scanner.release_scan()
+
+        if not self._owns_lifespan():
+            logger.info("Background scan abandoned before completion publish: stale app lifespan")
+            return {
+                "scanned": 0, "cached": 0, "skipped": True,
+                "reason": "stale_lifespan",
+            }
 
         cached = db.count_background_cache()
         self._last_run = {
