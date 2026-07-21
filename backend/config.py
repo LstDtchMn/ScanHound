@@ -115,6 +115,7 @@ class AppConfig(TypedDict, total=False):
     hdencode_rss_poll_minutes: int
     hdencode_rss_catchup_hours: int
     hdencode_rss_shadow_compare_enabled: bool
+    hdencode_rss_hydration_limit: int
 
     # Background pre-cache scanning (pre-fetch results so the app opens fast)
     background_scan_enabled: bool
@@ -466,6 +467,7 @@ _DEFAULT_CONFIG: AppConfig = {
     "hdencode_rss_poll_minutes": 60,
     "hdencode_rss_catchup_hours": 4,
     "hdencode_rss_shadow_compare_enabled": True,
+    "hdencode_rss_hydration_limit": 10,
     "background_scan_enabled": False,
     "background_scan_interval_hours": 6,
     "background_scan_pages": 3,

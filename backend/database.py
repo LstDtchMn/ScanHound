@@ -218,7 +218,7 @@ class DatabaseManager:
     # ── Schema initialization ────────────────────────────────────────
 
     # Schema version — increment when migrations are added.
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def init_db(self):
         """Initialize database tables and run schema migrations.
@@ -819,7 +819,37 @@ class DatabaseManager:
                     )
                 """)
 
-                # ── Versioned migrations ─────────────────────────────────
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_hydration_queue (
+                        canonical_url TEXT PRIMARY KEY,
+                        reason TEXT NOT NULL,
+                        priority INTEGER NOT NULL DEFAULT 0,
+                        state TEXT NOT NULL DEFAULT 'queued',
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        queued_at TEXT NOT NULL,
+                        claimed_at TEXT,
+                        completed_at TEXT,
+                        last_error_code TEXT,
+                        FOREIGN KEY (canonical_url)
+                            REFERENCES hdencode_candidates(canonical_url)
+                            ON DELETE CASCADE
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_hdencode_hydration_priority
+                    ON hdencode_hydration_queue(state, priority DESC, queued_at)
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_candidate_details (
+                        canonical_url TEXT PRIMARY KEY,
+                        hydrated_at TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        FOREIGN KEY (canonical_url)
+                            REFERENCES hdencode_candidates(canonical_url)
+                            ON DELETE CASCADE
+                    )
+                """)
+
                 if current_version < 2:
                     # v2: Drop legacy tables from removed subsystems
                     for table in ('file_manager', 'schema_version', 'app_config'):
@@ -1216,6 +1246,399 @@ class DatabaseManager:
             "SET observed_depth_seconds = ? WHERE feed_key = ?",
             (depth_seconds, feed_key),
             label="update_hdencode_feed_depth",
+        )
+
+    def get_hdencode_candidate(self, canonical_url):
+        row = self._query(
+            "SELECT * FROM hdencode_candidates WHERE canonical_url = ?",
+            (canonical_url,),
+            one=True,
+            default=None,
+        )
+        return dict(row) if row is not None else None
+
+    def get_hdencode_candidate_context(
+        self, *, canonical_url, clean_title, media_type, years, season
+    ):
+        exact_url_downloaded = bool(self._query(
+            "SELECT 1 FROM downloads WHERE url = ? LIMIT 1",
+            (canonical_url,), one=True, default=None,
+        ))
+        if not clean_title:
+            return {
+                "exact_url_downloaded": exact_url_downloaded,
+                "plex_matches": [],
+            }
+
+        clauses = ["LOWER(title) = LOWER(?)"]
+        params = [clean_title]
+        if media_type == "tv":
+            clauses.append("content_type = 'TV Shows'")
+            if season is not None:
+                clauses.append("season = ?")
+                params.append(season)
+        else:
+            clauses.append("content_type = 'Movies'")
+        year_values = [
+            int(year) for year in (years or ())
+            if year is not None
+        ]
+        if year_values:
+            placeholders = ",".join("?" for _ in year_values)
+            clauses.append(f"(year IN ({placeholders}) OR year IS NULL)")
+            params.extend(year_values)
+
+        matches = self._query_dicts(
+            "SELECT title, year, res AS resolution, size AS size_gb, "
+            "dovi, hdr, season, rating_key, file_path "
+            "FROM plex_cache WHERE " + " AND ".join(clauses),
+            tuple(params),
+            default=[],
+        )
+        return {
+            "exact_url_downloaded": exact_url_downloaded,
+            "plex_matches": matches,
+        }
+
+    def enqueue_hdencode_hydration(self, canonical_url, *, reason, priority):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return self._mutate(
+            """
+            INSERT INTO hdencode_hydration_queue (
+                canonical_url, reason, priority, state, queued_at
+            ) VALUES (?, ?, ?, 'queued', ?)
+            ON CONFLICT(canonical_url) DO UPDATE SET
+                reason = excluded.reason,
+                priority = MAX(
+                    hdencode_hydration_queue.priority,
+                    excluded.priority
+                ),
+                state = CASE
+                    WHEN hdencode_hydration_queue.state = 'completed'
+                        THEN hdencode_hydration_queue.state
+                    ELSE 'queued'
+                END,
+                claimed_at = CASE
+                    WHEN hdencode_hydration_queue.state = 'completed'
+                        THEN hdencode_hydration_queue.claimed_at
+                    ELSE NULL
+                END,
+                queued_at = CASE
+                    WHEN hdencode_hydration_queue.state = 'completed'
+                        THEN hdencode_hydration_queue.queued_at
+                    ELSE excluded.queued_at
+                END,
+                last_error_code = CASE
+                    WHEN hdencode_hydration_queue.state = 'completed'
+                        THEN hdencode_hydration_queue.last_error_code
+                    ELSE NULL
+                END
+            """,
+            (canonical_url, reason, int(priority), now),
+            label="enqueue_hdencode_hydration",
+        )
+
+    def resolve_hdencode_hydration(self, canonical_url, *, reason):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            conn.execute(
+                """
+                UPDATE hdencode_hydration_queue
+                SET state = CASE
+                        WHEN state = 'completed' THEN state
+                        WHEN state = 'running' THEN state
+                        ELSE 'cancelled'
+                    END,
+                    last_error_code = CASE
+                        WHEN state IN ('completed', 'running')
+                            THEN last_error_code
+                        ELSE ?
+                    END
+                WHERE canonical_url = ?
+                """,
+                (reason, canonical_url),
+            )
+            conn.execute(
+                """
+                UPDATE hdencode_candidates
+                SET hydration_state = CASE
+                        WHEN hydration_state = 'completed' THEN hydration_state
+                        WHEN hydration_state = 'running' THEN hydration_state
+                        ELSE 'not_requested'
+                    END,
+                    updated_at = ?
+                WHERE canonical_url = ?
+                """,
+                (now, canonical_url),
+            )
+
+    def claim_hdencode_hydration(self, *, limit=10):
+        limit = max(0, min(int(limit), 50))
+        if limit == 0:
+            return []
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                return []
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                rows = conn.execute(
+                    """
+                    SELECT q.canonical_url, q.reason, q.priority,
+                           c.title, c.pub_date, c.media_type,
+                           c.clean_title, c.title_year, c.description_year,
+                           c.season, c.episode, c.resolution, c.size_gb,
+                           c.dv_evidence, c.hdr_evidence, c.hevc_evidence,
+                           c.hdr_formats, c.description_complete
+                    FROM hdencode_hydration_queue q
+                    JOIN hdencode_candidates c
+                      ON c.canonical_url = q.canonical_url
+                    WHERE q.state = 'queued'
+                    ORDER BY q.priority DESC, q.queued_at ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+                claimed = []
+                for row in rows:
+                    changed = conn.execute(
+                        """
+                        UPDATE hdencode_hydration_queue
+                        SET state = 'running',
+                            claimed_at = ?,
+                            attempts = attempts + 1
+                        WHERE canonical_url = ? AND state = 'queued'
+                        """,
+                        (now, row["canonical_url"]),
+                    ).rowcount
+                    if changed != 1:
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE hdencode_candidates
+                        SET hydration_state = 'running', updated_at = ?
+                        WHERE canonical_url = ?
+                        """,
+                        (now, row["canonical_url"]),
+                    )
+                    claimed.append(dict(row))
+                conn.commit()
+                return claimed
+            except Exception:
+                conn.rollback()
+                raise
+
+    def complete_hdencode_hydration(
+        self,
+        canonical_url,
+        *,
+        payload,
+        candidate_updates,
+    ):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        updates = dict(candidate_updates or {})
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            conn.execute(
+                """
+                INSERT INTO hdencode_candidate_details (
+                    canonical_url, hydrated_at, payload
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(canonical_url) DO UPDATE SET
+                    hydrated_at = excluded.hydrated_at,
+                    payload = excluded.payload
+                """,
+                (canonical_url, now, json.dumps(payload, default=str)),
+            )
+            conn.execute(
+                """
+                UPDATE hdencode_hydration_queue
+                SET state = 'completed',
+                    completed_at = ?,
+                    claimed_at = NULL,
+                    last_error_code = NULL
+                WHERE canonical_url = ?
+                """,
+                (now, canonical_url),
+            )
+            conn.execute(
+                """
+                UPDATE hdencode_candidates
+                SET clean_title = COALESCE(?, clean_title),
+                    title_year = COALESCE(?, title_year),
+                    season = COALESCE(?, season),
+                    episode = COALESCE(?, episode),
+                    resolution = COALESCE(?, resolution),
+                    size_text = COALESCE(?, size_text),
+                    size_gb = COALESCE(?, size_gb),
+                    dv_evidence = COALESCE(?, dv_evidence),
+                    hdr_evidence = COALESCE(?, hdr_evidence),
+                    hdr_formats = COALESCE(?, hdr_formats),
+                    description_complete = CASE
+                        WHEN ? THEN 1 ELSE description_complete
+                    END,
+                    hydration_state = 'completed',
+                    identity_state = COALESCE(?, 'exact'),
+                    relevance_state = 'unclassified',
+                    detail_reason = NULL,
+                    updated_at = ?
+                WHERE canonical_url = ?
+                """,
+                (
+                    updates.get("clean_title"),
+                    updates.get("title_year"),
+                    updates.get("season"),
+                    updates.get("episode"),
+                    updates.get("resolution"),
+                    updates.get("size_text"),
+                    updates.get("size_gb"),
+                    updates.get("dv_evidence"),
+                    updates.get("hdr_evidence"),
+                    json.dumps(updates.get("hdr_formats") or []),
+                    1 if updates.get("description_complete") else 0,
+                    updates.get("identity_state"),
+                    now,
+                    canonical_url,
+                ),
+            )
+
+    def fail_hdencode_hydration(self, canonical_url, *, error_code):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            conn.execute(
+                """
+                UPDATE hdencode_hydration_queue
+                SET state = CASE
+                        WHEN attempts >= 3 THEN 'failed'
+                        ELSE 'queued'
+                    END,
+                    last_error_code = ?,
+                    claimed_at = NULL
+                WHERE canonical_url = ?
+                """,
+                (error_code, canonical_url),
+            )
+            conn.execute(
+                """
+                UPDATE hdencode_candidates
+                SET hydration_state = CASE
+                        WHEN (
+                            SELECT attempts
+                            FROM hdencode_hydration_queue
+                            WHERE canonical_url = ?
+                        ) >= 3
+                        THEN 'failed'
+                        ELSE 'queued'
+                    END,
+                    updated_at = ?
+                WHERE canonical_url = ?
+                """,
+                (canonical_url, now, canonical_url),
+            )
+
+    def release_hdencode_hydration(self, canonical_url, *, reason):
+        """Requeue lifecycle cancellation without consuming a failure attempt."""
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            conn.execute(
+                """
+                UPDATE hdencode_hydration_queue
+                SET state = 'queued',
+                    attempts = MAX(attempts - 1, 0),
+                    claimed_at = NULL,
+                    last_error_code = ?
+                WHERE canonical_url = ? AND state = 'running'
+                """,
+                (reason, canonical_url),
+            )
+            conn.execute(
+                """
+                UPDATE hdencode_candidates
+                SET hydration_state = 'queued',
+                    updated_at = ?
+                WHERE canonical_url = ?
+                  AND hydration_state = 'running'
+                """,
+                (now, canonical_url),
+            )
+
+    def recover_hdencode_hydration_queue(self, *, stale_after_minutes=30):
+        """Requeue claims left running by a crashed process."""
+        try:
+            minutes = max(1, int(stale_after_minutes))
+        except (TypeError, ValueError):
+            minutes = 30
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        cutoff = (now_dt - datetime.timedelta(minutes=minutes)).isoformat()
+        now = now_dt.isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            urls = [
+                row[0]
+                for row in conn.execute(
+                    """
+                    SELECT canonical_url
+                    FROM hdencode_hydration_queue
+                    WHERE state = 'running'
+                      AND (claimed_at IS NULL OR claimed_at < ?)
+                    """,
+                    (cutoff,),
+                ).fetchall()
+            ]
+            for canonical_url in urls:
+                conn.execute(
+                    """
+                    UPDATE hdencode_hydration_queue
+                    SET state = 'queued',
+                        attempts = MAX(attempts - 1, 0),
+                        claimed_at = NULL,
+                        last_error_code = 'recovered_after_restart'
+                    WHERE canonical_url = ?
+                    """,
+                    (canonical_url,),
+                )
+                conn.execute(
+                    """
+                    UPDATE hdencode_candidates
+                    SET hydration_state = 'queued',
+                        updated_at = ?
+                    WHERE canonical_url = ?
+                    """,
+                    (now, canonical_url),
+                )
+            return len(urls)
+
+    def list_hdencode_hydration_queue(self, *, limit=500):
+        return self._query_dicts(
+            """
+            SELECT q.*, c.title, c.pub_date, c.media_type,
+                   c.resolution, c.dv_evidence
+            FROM hdencode_hydration_queue q
+            JOIN hdencode_candidates c
+              ON c.canonical_url = q.canonical_url
+            ORDER BY
+                CASE q.state
+                    WHEN 'running' THEN 0
+                    WHEN 'queued' THEN 1
+                    WHEN 'failed' THEN 2
+                    WHEN 'cancelled' THEN 3
+                    ELSE 4
+                END,
+                q.priority DESC,
+                q.queued_at ASC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit), 5000)),),
+            default=[],
         )
 
     # ── Plex cache ───────────────────────────────────────────────────

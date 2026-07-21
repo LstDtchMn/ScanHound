@@ -129,6 +129,8 @@ EXPECTED_DEFAULT_KEYS = {
     # HDEncode RSS shadow (PR F)
     "hdencode_rss_poll_minutes", "hdencode_rss_catchup_hours",
     "hdencode_discovery_mode", "hdencode_rss_shadow_compare_enabled",
+    # HDEncode RSS classification (PR G)
+    "hdencode_rss_hydration_limit",
 }
 
 

@@ -205,13 +205,42 @@ class BackgroundScanner:
                 and cfg.get("hdencode_discovery_mode") == "rss_shadow"
             ):
                 from backend.hdencode_rss_service import HDEncodeRSSService
-                rss_shadow = HDEncodeRSSService(cfg, db).poll_cycle(
-                    stop_requested=lambda: (
-                        self._stop.is_set()
-                        or not self._owns_lifespan()
-                    ),
+                stop_requested = lambda: (
+                    self._stop.is_set()
+                    or not self._owns_lifespan()
                 )
-                if not self._owns_lifespan():
+                rss_shadow = HDEncodeRSSService(cfg, db).poll_cycle(
+                    stop_requested=stop_requested,
+                )
+                if stop_requested():
+                    return {
+                        "scanned": 0,
+                        "cached": 0,
+                        "skipped": True,
+                        "reason": "stale_lifespan",
+                    }
+                from backend.hdencode_candidate_service import (
+                    HDEncodeCandidateService,
+                )
+                candidate_service = HDEncodeCandidateService(cfg, db)
+                rss_shadow["classification"] = (
+                    candidate_service.classify_pending(
+                        stop_requested=stop_requested,
+                    )
+                )
+                detail_scraper = getattr(
+                    getattr(scanner, "scrapers", None),
+                    "_detail",
+                    None,
+                )
+                if detail_scraper is not None and not stop_requested():
+                    rss_shadow["hydration"] = (
+                        candidate_service.hydrate_pending(
+                            detail_scraper,
+                            stop_requested=stop_requested,
+                        )
+                    )
+                if stop_requested():
                     return {
                         "scanned": 0,
                         "cached": 0,

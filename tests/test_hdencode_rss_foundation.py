@@ -143,6 +143,6 @@ def test_additive_migration_legacy_reader(tmp_path):
         assert {"downloads", "plex_cache", "hdencode_candidates"} <= tables
         conn.execute("SELECT url, title FROM downloads LIMIT 1").fetchall()
         conn.execute("SELECT key, title FROM plex_cache LIMIT 1").fetchall()
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] >= 3
     finally:
         conn.close()
