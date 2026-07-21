@@ -130,15 +130,62 @@ Also flagged (pre-existing, unrelated to the graft): a duplicate
 `_fsync_directory` definition (lines ~125 and ~443) where the second shadows
 the first — worth a follow-up cleanup, does not affect the invariant.
 
+## 5c. Peer-review round (ChatGPT) — two runnable issues, both resolved
+
+ChatGPT peer-reviewed this closeout and raised two runnable issues + a doc
+correction. All addressed on head **`6e62cde`** (Python 3.12.13, root/uid=0,
+`scanhound:latest`, pytest 9.1.1).
+
+**Issue 1 — no-exclusion backend run.** `tests/test_api_routes.py` is runnable,
+not env-gated. Ran the COMPLETE suite with no `--ignore`:
+`pytest -q --deselect <3 network tests>` → **3964 passed, 4 skipped, 3
+deselected, 0 failed** (514 s). The only tests that cannot run are
+`TestDownloads::{test_download_valid_request, test_download_with_all_fields,
+test_download_batch_valid}` — pre-existing integration tests that POST real
+download requests to JDownloader/scrape with NO network mock; they require a
+live JDownloader + internet the sandbox lacks. They are not stale-test
+mismatches and not feature-pack code; the proper fix is a download-service mock
+(test-infra follow-up, out of scope). NOTE: a first no-ignore pass with
+`--timeout-method=signal` reported 8 failures, but 5 of those
+(`test_download_service` scrape tests) were SIGALRM artifacts — they pass
+normally (8/8). The `--ignore` was never needed for a code reason.
+
+**Issue 2 — hydrated identity semantics.** Both claims confirmed with evidence
+and fixed (see the "Identity safety" commit):
+- `classify_candidate` promoted `{exact,high,hydrated}` → `exact` when no Plex
+  match existed (raw `hydrated` became `exact` with no identity). Now promotes
+  to `exact` only for prior `exact`/`high`, or a HYDRATED candidate that is
+  also identity-confirmed via `_identity_is_confirmed()` (external id, or a
+  complete non-conflicting tuple: movie `clean_title+year`, TV
+  `clean_title+season+episode`; season packs / year conflicts need an explicit
+  external id). Un-hydrated parsed title+year and raw `hydrated` stay
+  unresolved.
+- Auto-grab gate (`_validate_auto_action`) now accepts only `{exact, high}`.
+- `tests/test_hdencode_identity_promotion.py` (14 tests) covers all 7 requested
+  cases; identity/classify/action regression set = 62 passed. No sibling test
+  was silently changed; auto-grab stays disabled by default + Jesse-gated.
+
+**Documentation correction (accepted) — head lineage.**
+- `6939220` — code-tested full-matrix head (backend broad 3729/0, frontend,
+  gates). This is the authoritative code-tested integration.
+- `05729f5`, `2d6ade3` — closeout/reconciliation DOCUMENTATION only (same code
+  as `6939220`).
+- `6e62cde` — adds the identity-safety CODE fix, validated by the complete
+  no-ignore suite **3964/0** (3 network tests deselected) + the 62-test
+  identity regression set. Frontend unchanged from `6939220` (backend-only fix).
+
 ## 6. FINAL VERDICT
 
 The complete feature pack is assembled on `agent/feature-pack-integration`
-(`6939220`) and passes every gate this reviewer can execute: full backend
-suite (3729/0 on Python 3.12), frontend typecheck/unit/build, `git diff
---check`, Stage-B cross-seam gates, file-safety cross-seam suites, additive
-migration, security/lifecycle gates, and a code-level DNS-pinned-TLS review
-confirming hostname verification is intact. No production regression was
-found in any track.
+(code-tested `6939220`; identity-safety fix `6e62cde`) and passes every gate
+this reviewer can execute: the COMPLETE backend suite with no exclusions
+(**3964 passed, 0 failed**, 3 pre-existing network-integration tests deselected
+with reason), frontend typecheck/unit/build, `git diff --check`, Stage-B
+cross-seam gates, file-safety cross-seam suites, additive migration,
+security/lifecycle gates, and a code-level DNS-pinned-TLS review confirming
+hostname verification is intact. Both ChatGPT peer-review issues (no-exclusion
+run; hydrated-identity promotion) are resolved (§5c). No production regression
+was found in any track.
 
 Acceptance still depends on environment evidence that cannot be produced here
 and must not be simulated: Python 3.11, UID 1000, Playwright isolation,
