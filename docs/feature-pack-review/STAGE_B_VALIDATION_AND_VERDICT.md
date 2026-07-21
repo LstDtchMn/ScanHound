@@ -38,6 +38,7 @@ SH-R04 `repair_trash_transactions`, per §5 invariant #7).
 | Whitespace/conflict | `git diff --check` | clean | — |
 | Stage-B cross-seam gates | `test_feature_pack_integration.py` | **3 passed** | 3.12 |
 | File-safety cross-seam | runtime_lock/trash_durability/trash_lifecycle/fileops_dedupe | **35 passed** | 3.12 |
+| Single-writer graft (fileops.py) | independent adversarial STATIC review | **GRAFT SOUND** (see §5b) | code review |
 | Migration (additive) | SCHEMA_VERSION 4→5→6; CREATE TABLE IF NOT EXISTS + guarded ALTER only; recovery on service init | verified additive, zero destructive ops | 3.12 fresh + reopen |
 | Constructor / off-switch / lifecycle / coordinator priority | test_hdencode_constructor_gate / off_switch / priority / coordinator | passed (in broad) | 3.12 |
 | Public-error boundary (SH-R09) | test_public_error_boundary + client.errors.test | passed | 3.12 + node |
@@ -99,6 +100,36 @@ label did not cover — all root-caused as intended-behavior / stale-test with
   init not DB init (2 own-tests at wrong layer); feed-client wholesale replace
   dropped `validate_feed_url`; source-capability-correction test updates.
 
+## 5b. Adversarial review of the one manual merge (fileops.py graft)
+
+An independent skeptical review of the single-writer × SH-R04 resolution
+returned **GRAFT SOUND**:
+- all 11 `require_writer_lock()` calls are the first executable statement of
+  their function (verified line-by-line);
+- every externally-reachable trash mutation is covered — directly (the 11) or
+  transitively (SH-R04 helpers `_reserve/_remove_reserved_trash_record`,
+  `_begin/_complete/_clear_trash_operation`, `_restore_no_replace`,
+  `_atomic_write_json` are called only from guarded functions; the api-route,
+  service, and app_service entry points reach mutation only through guarded
+  functions);
+- no read/discovery path is over-guarded, and startup ordering is correct
+  (`app_service.py:435` acquires the lifetime lock BEFORE the maintenance pass
+  that calls `repair_trash_transactions`/`sweep_trash`);
+- `require_writer_lock()` **raises** (fails closed), never blocks — no deadlock
+  risk on a lock-free path.
+
+**Important honesty note surfaced by the review:** the 3729/0 backend run does
+NOT by itself validate this graft. `tests/conftest.py`'s autouse
+`_unlocked_fileops_for_tests()` fixture bypasses `require_writer_lock()`
+suite-wide, so the test suite would pass even with a misplaced guard. Guard
+correctness therefore rests on (a) the adversarial STATIC analysis above and
+(b) `test_runtime_lock` (10 pass), which exercises the lock mechanism itself
+across processes. This should be re-confirmed by a human reviewer.
+
+Also flagged (pre-existing, unrelated to the graft): a duplicate
+`_fsync_directory` definition (lines ~125 and ~443) where the second shadows
+the first — worth a follow-up cleanup, does not affect the invariant.
+
 ## 6. FINAL VERDICT
 
 The complete feature pack is assembled on `agent/feature-pack-integration`
@@ -117,7 +148,9 @@ and the Jesse-authorized filesystem sentinel.
 ### **FEATURE PACK REQUIRES ENVIRONMENT EVIDENCE**
 
 No merge, deploy, RSS-primary/auto-grab enablement, or production change has
-been made; the integration branch is draft. The single remaining code item to
-adjudicate before merge is the `fileops.py` single-writer × SH-R04 cross-seam
-resolution (§1), which warrants an independent adversarial read since it was a
-manual integration merge.
+been made; the integration branch is draft. The one manual integration merge
+(the `fileops.py` single-writer × SH-R04 graft) has been independently
+adversarially reviewed — **GRAFT SOUND** (§5b) — with the caveat that the test
+suite bypasses the lock via an autouse fixture, so a human should re-confirm
+the static analysis before merge. A pre-existing duplicate `_fsync_directory`
+definition (§5b) is worth a follow-up cleanup.
