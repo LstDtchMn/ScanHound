@@ -79,6 +79,150 @@ def _hash_file(path: str, *, cold: bool = False) -> str:
 
 
 
+class UnsupportedFilesystemSafetyError(OSError):
+    """The filesystem cannot provide the safety guarantee this operation needs."""
+
+    PUBLIC_MESSAGE = (
+        "This filesystem cannot safely complete the requested file operation. "
+        "The source was kept unchanged."
+    )
+
+    def __init__(self, operation: str, path: str, *, reason: str):
+        super().__init__(errno.ENOTSUP, self.PUBLIC_MESSAGE, path)
+        self.operation = operation
+        self.path = path
+        self.reason = reason
+
+
+_UNSUPPORTED_DIRSYNC_ERRNOS = {
+    errno.ENOSYS,
+    errno.EINVAL,
+    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    getattr(errno, "ENOTSUP", errno.EINVAL),
+}
+
+
+def _windows_move_no_replace(src: str, dst: str) -> None:
+    """No-replace Windows move with write-through durability semantics."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    move_file_ex = kernel32.MoveFileExW
+    move_file_ex.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint)
+    move_file_ex.restype = ctypes.c_int
+
+    movefile_write_through = 0x00000008
+    if move_file_ex(src, dst, movefile_write_through):
+        return
+
+    err = ctypes.get_last_error()
+    if err in (80, 183):
+        raise FileExistsError(errno.EEXIST, f"Destination already exists: {dst}", dst)
+    if err == 17:
+        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), dst)
+    raise OSError(err, ctypes.FormatError(err), dst)
+
+
+def _fsync_directory(path: str) -> None:
+    """Persist directory-entry changes or report the guarantee unavailable.
+
+    Windows source-consuming moves use MoveFileExW(MOVEFILE_WRITE_THROUGH), so
+    there is no separate directory-fsync primitive to invoke here.
+    """
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _require_directory_durability(path: str, *, operation: str) -> None:
+    """Preflight durability before a source-consuming operation starts."""
+    try:
+        _fsync_directory(path)
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_DIRSYNC_ERRNOS:
+            raise UnsupportedFilesystemSafetyError(
+                operation,
+                path,
+                reason=f"directory fsync unavailable (errno={exc.errno})",
+            ) from exc
+        raise
+
+
+def _sync_directories(paths) -> None:
+    seen = set()
+    for path in paths:
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        _fsync_directory(path)
+
+
+def _move_no_replace_durable(src: str, dst: str) -> None:
+    """Move without replacement and persist the directory-entry transition."""
+    src_dir = os.path.dirname(src) or os.curdir
+    dst_dir = os.path.dirname(dst) or os.curdir
+    directories = [dst_dir, src_dir]
+
+    if os.name != "nt":
+        for directory in directories:
+            _require_directory_durability(directory, operation="move")
+
+    _move_no_replace(src, dst)
+    try:
+        _sync_directories(directories)
+    except BaseException:
+        try:
+            _move_no_replace(dst, src)
+            try:
+                _sync_directories(directories)
+            except OSError:
+                logger.critical(
+                    "Move rollback restored the source name but directory sync "
+                    "still failed: %s <- %s",
+                    src,
+                    dst,
+                    exc_info=True,
+                )
+        except BaseException:
+            logger.critical(
+                "Durable move failed after publication and rollback also failed: "
+                "%s -> %s",
+                src,
+                dst,
+                exc_info=True,
+            )
+        raise
+
+
+def filesystem_safety_status(path: str) -> dict:
+    """Return a diagnostic capability snapshot without mutating user files."""
+    directory = path if os.path.isdir(path) else (os.path.dirname(path) or os.curdir)
+    if os.name == "nt":
+        return {
+            "no_replace": True,
+            "source_consuming_move_durability": "movefile_write_through",
+            "directory_fsync": False,
+        }
+    try:
+        _require_directory_durability(directory, operation="probe")
+    except UnsupportedFilesystemSafetyError as exc:
+        return {
+            "no_replace": "renameat2_or_hardlink",
+            "source_consuming_move_durability": False,
+            "directory_fsync": False,
+            "reason": exc.reason,
+        }
+    return {
+        "no_replace": "renameat2_or_hardlink",
+        "source_consuming_move_durability": True,
+        "directory_fsync": True,
+    }
+
+
 def _linux_rename_noreplace(src: str, dst: str) -> bool:
     """Atomically rename without replacement through Linux renameat2.
 
@@ -146,7 +290,7 @@ def _move_no_replace(src: str, dst: str) -> None:
     `os.replace`. Unsupported filesystems fail safely with the source intact.
     """
     if os.name == "nt":
-        os.rename(src, dst)
+        _windows_move_no_replace(src, dst)
         return
 
     if _linux_rename_noreplace(src, dst):
@@ -229,6 +373,20 @@ def _copy_verify_atomic(
             )
 
         _move_no_replace(part, dst)
+        try:
+            _fsync_directory(directory)
+        except BaseException:
+            try:
+                if os.path.lexists(dst):
+                    os.unlink(dst)
+            except OSError:
+                logger.critical(
+                    "Copy publication was not durably synced and cleanup "
+                    "failed: %s",
+                    dst,
+                    exc_info=True,
+                )
+            raise
     except BaseException:
         try:
             if os.path.lexists(part):
@@ -1529,6 +1687,11 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
     if method == "hardlink":
         try:
             os.link(src, dst)
+            try:
+                _fsync_directory(os.path.dirname(dst) or os.curdir)
+            except BaseException:
+                os.unlink(dst)
+                raise
             return "hardlink"
         except OSError as e:
             if e.errno != errno.EXDEV:
@@ -1537,6 +1700,11 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
 
     if method == "symlink":
         os.symlink(os.path.abspath(src), dst)
+        try:
+            _fsync_directory(os.path.dirname(dst) or os.curdir)
+        except BaseException:
+            os.unlink(dst)
+            raise
         return "symlink"
 
     if method == "copy":
@@ -1546,7 +1714,7 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
     # move: atomic no-replace publication first, else verified copy +
     # dispose source. Never use overwrite-capable rename/replace primitives.
     try:
-        _move_no_replace(src, dst)
+        _move_no_replace_durable(src, dst)
     except OSError as e:
         if e.errno != errno.EXDEV:
             raise
