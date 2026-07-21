@@ -218,7 +218,7 @@ class DatabaseManager:
     # ── Schema initialization ────────────────────────────────────────
 
     # Schema version — increment when migrations are added.
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def init_db(self):
         """Initialize database tables and run schema migrations.
@@ -730,6 +730,95 @@ class DatabaseManager:
                     if "duplicate column" not in str(e).lower():
                         raise
 
+                # HDEncode RSS evidence tables (v3, additive-only).
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_feed_state (
+                        feed_key TEXT PRIMARY KEY,
+                        feed_url TEXT NOT NULL,
+                        last_modified TEXT,
+                        last_checked_at TEXT,
+                        last_changed_at TEXT,
+                        last_status INTEGER,
+                        body_sha256 TEXT,
+                        channel_last_build_date TEXT,
+                        newest_entry_at TEXT,
+                        oldest_entry_at TEXT,
+                        observed_depth_seconds INTEGER,
+                        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                        last_error_code TEXT
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_candidates (
+                        canonical_url TEXT PRIMARY KEY,
+                        guid TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        pub_date TEXT NOT NULL,
+                        media_type TEXT NOT NULL,
+                        clean_title TEXT,
+                        title_year INTEGER,
+                        description_year INTEGER,
+                        season INTEGER,
+                        episode INTEGER,
+                        episode_end INTEGER,
+                        resolution TEXT,
+                        size_text TEXT,
+                        size_gb REAL,
+                        dv_evidence TEXT NOT NULL DEFAULT 'unknown',
+                        hdr_evidence TEXT NOT NULL DEFAULT 'unknown',
+                        hevc_evidence TEXT NOT NULL DEFAULT 'unknown',
+                        hdr_formats TEXT NOT NULL DEFAULT '[]',
+                        categories TEXT NOT NULL DEFAULT '[]',
+                        raw_description TEXT NOT NULL DEFAULT '',
+                        raw_hash TEXT NOT NULL,
+                        description_complete INTEGER NOT NULL DEFAULT 0,
+                        parse_state TEXT NOT NULL DEFAULT 'parsed',
+                        identity_state TEXT NOT NULL DEFAULT 'unknown',
+                        relevance_state TEXT NOT NULL DEFAULT 'unclassified',
+                        detail_reason TEXT,
+                        hydration_state TEXT NOT NULL DEFAULT 'not_requested',
+                        action_state TEXT NOT NULL DEFAULT 'none',
+                        first_seen_at TEXT NOT NULL,
+                        last_seen_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                """)
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_hdencode_candidates_guid
+                    ON hdencode_candidates(guid)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_hdencode_candidates_state
+                    ON hdencode_candidates(relevance_state, hydration_state, pub_date)
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_candidate_feeds (
+                        feed_key TEXT NOT NULL,
+                        canonical_url TEXT NOT NULL,
+                        first_seen_at TEXT NOT NULL,
+                        last_seen_at TEXT NOT NULL,
+                        PRIMARY KEY (feed_key, canonical_url),
+                        FOREIGN KEY (canonical_url)
+                            REFERENCES hdencode_candidates(canonical_url)
+                            ON DELETE CASCADE
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_ingest_cycles (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        feed_key TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        completed_at TEXT NOT NULL,
+                        http_status INTEGER NOT NULL,
+                        changed INTEGER NOT NULL,
+                        candidate_count INTEGER NOT NULL DEFAULT 0,
+                        body_sha256 TEXT,
+                        last_modified TEXT,
+                        outcome TEXT NOT NULL,
+                        error_code TEXT
+                    )
+                """)
+
                 # ── Versioned migrations ─────────────────────────────────
                 if current_version < 2:
                     # v2: Drop legacy tables from removed subsystems
@@ -847,6 +936,279 @@ class DatabaseManager:
                 }, f, indent=2)
         except OSError:
             logger.exception("Failed to write DB corruption flag file")
+
+    # ── HDEncode RSS evidence ──────────────────────────────────────────
+
+    def get_hdencode_feed_state(self, feed_key):
+        row = self._query(
+            "SELECT * FROM hdencode_feed_state WHERE feed_key = ?",
+            (feed_key,), one=True, default=None,
+        )
+        return dict(row) if row is not None else None
+
+    def list_hdencode_feed_states(self):
+        return self._query_dicts(
+            "SELECT * FROM hdencode_feed_state ORDER BY feed_key",
+            default=[],
+        )
+
+    def ingest_hdencode_feed(
+        self, *, feed_key, feed_url, last_modified, http_status,
+        body_sha256, channel_last_build_date, entries, started_at,
+        completed_at, _test_fail_after_step=None,
+    ):
+        """Commit feed evidence and its validator as one SQLite transaction."""
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            step = 0
+
+            def executed():
+                nonlocal step
+                step += 1
+                if _test_fail_after_step == step:
+                    raise RuntimeError(
+                        f"injected ingest failure after step {step}"
+                    )
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                executed()
+                newest = max((row["pub_date"] for row in entries), default=None)
+                oldest = min((row["pub_date"] for row in entries), default=None)
+                now = completed_at
+                for row in entries:
+                    conn.execute(
+                        """
+                        INSERT INTO hdencode_candidates (
+                            canonical_url, guid, title, pub_date, media_type,
+                            clean_title, title_year, description_year,
+                            season, episode, episode_end, resolution,
+                            size_text, size_gb, dv_evidence, hdr_evidence,
+                            hevc_evidence, hdr_formats, categories,
+                            raw_description, raw_hash, description_complete,
+                            first_seen_at, last_seen_at, updated_at
+                        ) VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?
+                        )
+                        ON CONFLICT(canonical_url) DO UPDATE SET
+                            guid = excluded.guid,
+                            title = excluded.title,
+                            pub_date = excluded.pub_date,
+                            media_type = excluded.media_type,
+                            clean_title = excluded.clean_title,
+                            title_year = excluded.title_year,
+                            description_year = excluded.description_year,
+                            season = excluded.season,
+                            episode = excluded.episode,
+                            episode_end = excluded.episode_end,
+                            resolution = excluded.resolution,
+                            size_text = excluded.size_text,
+                            size_gb = excluded.size_gb,
+                            dv_evidence = excluded.dv_evidence,
+                            hdr_evidence = excluded.hdr_evidence,
+                            hevc_evidence = excluded.hevc_evidence,
+                            hdr_formats = excluded.hdr_formats,
+                            categories = excluded.categories,
+                            raw_description = excluded.raw_description,
+                            raw_hash = excluded.raw_hash,
+                            description_complete = excluded.description_complete,
+                            last_seen_at = excluded.last_seen_at,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            row["canonical_url"], row["guid"], row["title"],
+                            row["pub_date"], row["media_type"],
+                            row.get("clean_title"), row.get("title_year"),
+                            row.get("description_year"), row.get("season"),
+                            row.get("episode"), row.get("episode_end"),
+                            row.get("resolution"), row.get("size_text"),
+                            row.get("size_gb"), row.get("dv", "unknown"),
+                            row.get("hdr", "unknown"),
+                            row.get("hevc", "unknown"),
+                            json.dumps(row.get("hdr_formats") or []),
+                            json.dumps(row.get("categories") or []),
+                            row.get("raw_description") or "",
+                            row["raw_hash"],
+                            1 if row.get("description_complete") else 0,
+                            now, now, now,
+                        ),
+                    )
+                    executed()
+                    conn.execute(
+                        """
+                        INSERT INTO hdencode_candidate_feeds (
+                            feed_key, canonical_url, first_seen_at, last_seen_at
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(feed_key, canonical_url) DO UPDATE SET
+                            last_seen_at = excluded.last_seen_at
+                        """,
+                        (feed_key, row["canonical_url"], now, now),
+                    )
+                    executed()
+
+                conn.execute(
+                    """
+                    INSERT INTO hdencode_ingest_cycles (
+                        feed_key, started_at, completed_at, http_status, changed,
+                        candidate_count, body_sha256, last_modified, outcome
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, 'changed')
+                    """,
+                    (
+                        feed_key, started_at, completed_at, int(http_status),
+                        len(entries), body_sha256, last_modified,
+                    ),
+                )
+                executed()
+                conn.execute(
+                    """
+                    INSERT INTO hdencode_feed_state (
+                        feed_key, feed_url, last_modified, last_checked_at,
+                        last_changed_at, last_status, body_sha256,
+                        channel_last_build_date, newest_entry_at,
+                        oldest_entry_at, consecutive_failures, last_error_code
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+                    ON CONFLICT(feed_key) DO UPDATE SET
+                        feed_url = excluded.feed_url,
+                        last_modified = excluded.last_modified,
+                        last_checked_at = excluded.last_checked_at,
+                        last_changed_at = excluded.last_changed_at,
+                        last_status = excluded.last_status,
+                        body_sha256 = excluded.body_sha256,
+                        channel_last_build_date =
+                            excluded.channel_last_build_date,
+                        newest_entry_at = excluded.newest_entry_at,
+                        oldest_entry_at = excluded.oldest_entry_at,
+                        consecutive_failures = 0,
+                        last_error_code = NULL
+                    """,
+                    (
+                        feed_key, feed_url, last_modified, completed_at,
+                        completed_at, int(http_status), body_sha256,
+                        channel_last_build_date, newest, oldest,
+                    ),
+                )
+                executed()
+                conn.commit()
+                return len(entries)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def record_hdencode_feed_not_modified(
+        self, *, feed_key, feed_url, last_modified, checked_at
+    ):
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            conn.execute(
+                """
+                INSERT INTO hdencode_ingest_cycles (
+                    feed_key, started_at, completed_at, http_status, changed,
+                    candidate_count, last_modified, outcome
+                ) VALUES (?, ?, ?, 304, 0, 0, ?, 'not_modified')
+                """,
+                (feed_key, checked_at, checked_at, last_modified),
+            )
+            conn.execute(
+                """
+                INSERT INTO hdencode_feed_state (
+                    feed_key, feed_url, last_modified, last_checked_at,
+                    last_status, consecutive_failures
+                ) VALUES (?, ?, ?, ?, 304, 0)
+                ON CONFLICT(feed_key) DO UPDATE SET
+                    feed_url = excluded.feed_url,
+                    last_checked_at = excluded.last_checked_at,
+                    last_status = 304,
+                    consecutive_failures = 0,
+                    last_error_code = NULL
+                """,
+                (feed_key, feed_url, last_modified, checked_at),
+            )
+
+    def record_hdencode_feed_failure(
+        self, *, feed_key, feed_url, checked_at, status, error_code
+    ):
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            conn.execute(
+                """
+                INSERT INTO hdencode_ingest_cycles (
+                    feed_key, started_at, completed_at, http_status, changed,
+                    candidate_count, outcome, error_code
+                ) VALUES (?, ?, ?, ?, 0, 0, 'failed', ?)
+                """,
+                (feed_key, checked_at, checked_at, int(status or 0), error_code),
+            )
+            conn.execute(
+                """
+                INSERT INTO hdencode_feed_state (
+                    feed_key, feed_url, last_checked_at, last_status,
+                    consecutive_failures, last_error_code
+                ) VALUES (?, ?, ?, ?, 1, ?)
+                ON CONFLICT(feed_key) DO UPDATE SET
+                    feed_url = excluded.feed_url,
+                    last_checked_at = excluded.last_checked_at,
+                    last_status = excluded.last_status,
+                    consecutive_failures =
+                        hdencode_feed_state.consecutive_failures + 1,
+                    last_error_code = excluded.last_error_code
+                """,
+                (feed_key, feed_url, checked_at, int(status or 0), error_code),
+            )
+
+    def list_hdencode_candidates(
+        self, *, relevance_state=None, hydration_state=None, limit=500
+    ):
+        clauses = []
+        params = []
+        if relevance_state:
+            clauses.append("relevance_state = ?")
+            params.append(relevance_state)
+        if hydration_state:
+            clauses.append("hydration_state = ?")
+            params.append(hydration_state)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, min(int(limit), 5000)))
+        return self._query_dicts(
+            "SELECT * FROM hdencode_candidates" + where
+            + " ORDER BY pub_date DESC LIMIT ?",
+            tuple(params), default=[],
+        )
+
+    def update_hdencode_candidate_state(
+        self, canonical_url, *, identity_state=None,
+        relevance_state=None, detail_reason=None,
+        hydration_state=None, action_state=None,
+    ):
+        values = {
+            "identity_state": identity_state,
+            "relevance_state": relevance_state,
+            "detail_reason": detail_reason,
+            "hydration_state": hydration_state,
+            "action_state": action_state,
+        }
+        assignments = []
+        params = []
+        for column, value in values.items():
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+        if not assignments:
+            return True
+        assignments.append("updated_at = ?")
+        params.append(datetime.datetime.now(datetime.timezone.utc).isoformat())
+        params.append(canonical_url)
+        return self._mutate(
+            "UPDATE hdencode_candidates SET "
+            + ", ".join(assignments)
+            + " WHERE canonical_url = ?",
+            tuple(params),
+            label="update_hdencode_candidate_state",
+        )
 
     # ── Plex cache ───────────────────────────────────────────────────
 

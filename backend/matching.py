@@ -140,7 +140,7 @@ class MatchingEngine:
 
         # HDR10+ Preference
         if self.app.config.get("pref_hdr10plus", False):
-            if 'HDR10+' in title or 'HDR10PLUS' in title:
+            if 'HDR10+' in title or 'HDR10PLUS' in title or 'HDR10P' in title:
                 return True, "HDR10+"
         
         return False, ""
@@ -684,7 +684,16 @@ class MatchingEngine:
         """
         # Extract web item properties with safe defaults
         web_res = web.get('res', '?')
-        web_dovi = web.get('dovi', False)
+        dv_evidence = str(web.get('dovi_evidence') or '').lower()
+        if dv_evidence == 'asserted':
+            web_dovi = True
+        elif dv_evidence == 'negated':
+            web_dovi = False
+        elif dv_evidence == 'unknown':
+            web_dovi = False
+        else:
+            # Hydrated/legacy items retain the existing Boolean contract.
+            web_dovi = bool(web.get('dovi', False))
 
         p_size = exact.get('size', 0)
         w_size = self.app.parse_size(web.get('size', '0'))
@@ -694,8 +703,14 @@ class MatchingEngine:
         # premium attribute, so only a clearly bigger file (default 20% via
         # upgrade_dv_loss_sensitivity, vs the normal upgrade_sensitivity) is worth
         # losing it. Gated on rule_dv; the resolution jump in Case 2 is exempt.
-        web_loses_dv = (self.app.config.get("rule_dv", True)
-                        and exact.get('dovi') and not web_dovi)
+        web_loses_dv = (
+            self.app.config.get("rule_dv", True)
+            and exact.get('dovi')
+            and (
+                dv_evidence == 'negated'
+                or (not dv_evidence and not web_dovi)
+            )
+        )
         size_sens = (self.app.config.get("upgrade_dv_loss_sensitivity", 20) / 100.0
                      if web_loses_dv else sens)
         is_upgrade = False
