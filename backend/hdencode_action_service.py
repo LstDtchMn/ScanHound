@@ -396,10 +396,14 @@ class HDEncodeActionService:
                 "auto_not_relevant",
                 "The candidate is not approved for automatic action.",
             )
-        if candidate.get("identity_state") not in {"exact", "high", "hydrated"}:
+        if candidate.get("identity_state") not in {"exact", "high"}:
+            # Raw 'hydrated' is provenance, not confirmed identity — it is not
+            # sufficient for an autonomous grab. Identity must be promoted to
+            # 'exact'/'high' (external id, unique Plex match, or a complete
+            # non-conflicting tuple) by classify_candidate first.
             raise HDEncodeActionError(
                 "auto_identity_unknown",
-                "The candidate identity is not exact.",
+                "The candidate identity is not confirmed.",
             )
         if candidate.get("hydration_state") != "completed":
             raise HDEncodeActionError(

@@ -114,7 +114,15 @@ class HDEncodeCandidateService:
             elif len(matches) > 1:
                 resolved_identity = "ambiguous"
                 decision = _detail_decision("identity_ambiguous")
-            elif identity_state in {"exact", "high", "hydrated"}:
+            elif identity_state in {"exact", "high"} or (
+                identity_state == "hydrated" and _identity_is_confirmed(row)
+            ):
+                # Promote to 'exact' only on a real identity: a prior exact/high
+                # resolution, or a HYDRATED candidate that also carries a
+                # confirmed identity (external id or complete non-conflicting
+                # tuple). Raw 'hydrated' provenance alone — and an un-hydrated
+                # 'unknown' with only a parsed title/year — are NOT sufficient;
+                # they fall through to identity_unresolved and keep their state.
                 resolved_identity = "exact"
                 exact_evidence = CandidateEvidence.from_mapping({
                     **row,
@@ -278,6 +286,37 @@ def _result_dict(result):
     if hasattr(result, "__dict__"):
         return dict(vars(result))
     raise TypeError("Unsupported detail result")
+
+
+def _identity_is_confirmed(row) -> bool:
+    """Is this candidate's media identity actually resolved (not merely
+    hydrated/provenance)?
+
+    Successful detail hydration proves *provenance* (we scraped the page), not
+    *identity* (which title/episode it is). Promote to 'exact' only with a real
+    identity: an external id, or a complete, non-conflicting identity tuple.
+    Season packs and conflicting years are NOT auto-confirmed here (they require
+    an explicit external id).
+    """
+    imdb = str(row.get("imdb_id") or "").strip()
+    if imdb.startswith("tt") and imdb[2:].isdigit():
+        return True
+    if str(row.get("tmdb_id") or "").strip():
+        return True
+    clean = str(row.get("clean_title") or "").strip()
+    if not clean:
+        return False
+    title_year = row.get("title_year")
+    description_year = row.get("description_year")
+    # Conflicting year evidence is never auto-confirmed.
+    if title_year and description_year and title_year != description_year:
+        return False
+    if str(row.get("media_type") or "").lower() == "tv":
+        # A single episode needs season AND episode; a season pack (season with
+        # no episode) requires explicit pack identity, not auto-confirmed here.
+        return row.get("season") is not None and row.get("episode") is not None
+    # Movie: a complete, non-conflicting title + year.
+    return bool(title_year)
 
 
 def _candidate_updates(payload):
