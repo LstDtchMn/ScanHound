@@ -217,9 +217,9 @@ matched exactly — authored against the real pushed head):
 | Track | Result |
 |---|---|
 | **A — Python 3.11 (non-browser suite)** | **PASS** — core modules import on 3.11.15; non-browser suite **3804 passed / 0 failed** (fresh `python:3.11-slim` + `requirements-docker.txt` + pytest-asyncio). |
-| **A — Python 3.11 (browser-backed scraper subset)** | **PENDING ENVIRONMENT EVIDENCE** — `test_scrapers`, `test_scrapers_extended`, `test_rt_scraper` were NOT run because Chromium/ChromeDriver were unavailable in the slim image. These must run in a browser-enabled Python 3.11 environment before 3.11 can be represented as a full-suite pass. (The dependency is image-provisioning, identical on 3.12; but it is not yet proven on 3.11.) |
+| **A — Python 3.11 (browser-backed scraper subset)** | **PASS** — built `scanhound:py311` (the production Dockerfile with the runtime base changed to `python:3.11-slim-bookworm`, so it carries the same apt-provisioned matched browser: **Chromium 150.0.7871.124 + ChromeDriver 150.0.7871.124**) and ran the three suites: `test_scrapers` + `test_scrapers_extended` + `test_rt_scraper` = **170 passed / 0 failed** on Python 3.11.15. With the 3804 non-browser tests, **Python 3.11 is a full pass**. |
 | **B — UID 1000** | **PASS** — full unrestricted suite as `1000:1000` = **3974 passed / 0 failed**, identical to root; app init, runtime-lock acquisition, trash transactions, and RSS/action recovery all correct as non-root. |
-| **C — Playwright production E2E** | NOT RUN — needs a browser + running app+backend harness in the sandbox. The occupied-port/state-isolation properties it targets are covered at the unit level by PR #14 within the 3974 suite; full browser E2E is a dedicated-environment run. |
+| **C — Playwright production E2E** | **PASS** — `npm run test:e2e` (production `preview` build + host backend `python -m backend.api --no-auth` in an isolated `SCANHOUND_E2E_DATA_DIR`, `reuseExistingServer:false` + `--strictPort`, desktop + mobile projects) = **18 passed / 0 failed**. A Windows-only teardown artifact (`EBUSY unlink crawler.db-wal` during temp-dir cleanup) was logged AFTER all tests passed — a Windows open-file-unlink limitation, not a test or state-isolation failure (isolation worked: a unique temp data dir per run). |
 | **D — production-schema migration matrix** | PARTIAL — the additive path (SCHEMA v4→5→6, `CREATE TABLE IF NOT EXISTS` + guarded `ALTER`, zero destructive ops) and a clean reopen are proven in-suite. The full matrix (byte-for-byte production-DB copy, interrupt-during-migration, old-image reopen, documented rollback) requires a production-DB snapshot Jesse provides; the running production instance was not touched. |
 
 ## 6. FINAL VERDICT
@@ -235,18 +235,21 @@ hostname verification is intact. ChatGPT independently reviewed `a6b4a7b`:
 **CODE CLOSURE ACCEPTED**, no new code defect. No production regression was
 found in any track.
 
-Environment gates executed and GREEN: **UID 1000** (3974/0) and **Python 3.11
-non-browser suite** (3804/0). Still outstanding and not producible here (must
-not be simulated):
+Environment gates executed and GREEN: **UID 1000** (3974/0), **Python 3.11 —
+full** (3804 non-browser + 170 browser scraper on `scanhound:py311` with
+Chromium/ChromeDriver 150), and **Playwright production E2E** (18/0). Only three
+items remain, all requiring a production-DB snapshot or Jesse's explicit
+authorization (must not be simulated):
 
-- **Python 3.11 browser-backed scraper subset** (`test_scrapers`,
-  `test_scrapers_extended`, `test_rt_scraper`) — needs Chromium/ChromeDriver;
-  not yet run on 3.11;
-- **Playwright** production-build E2E / occupied-port / state isolation;
 - the full **production-schema migration** matrix
-  (interrupt/old-image-reopen/rollback) — needs a production-DB snapshot;
-- the **seven-day ≥20-cycle RSS shadow** gate;
+  (interrupt-during-migration / old-image reopen / documented rollback) — needs
+  a byte-for-byte production-DB snapshot; the running instance was not touched;
+- the **seven-day ≥20-cycle RSS shadow** gate (calendar-bound);
 - the **Jesse-authorized filesystem sentinel**.
+
+Every runnable and browser-backed validation gate is now green. The verdict
+remains bounded by the calendar/operational gate and the production-data and
+sentinel authorizations:
 
 ### **FEATURE PACK REQUIRES ENVIRONMENT EVIDENCE**
 
