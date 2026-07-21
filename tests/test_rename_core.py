@@ -1,4 +1,5 @@
 """Unit tests for the ported rename core: confidence, naming, fileops."""
+import errno
 import os
 import pytest
 
@@ -1034,3 +1035,94 @@ class TestTrashRetentionSweep:
         # The symlink target must survive even though the bucket was swept.
         assert target.exists()
         assert target.read_text() == "do not delete"
+
+class TestFilesystemFailSafe:
+    def test_unsupported_filesystem_refuses_move_before_source_consumption(
+            self, tmp_path, monkeypatch):
+        src = tmp_path / "source" / "src.mkv"
+        src.parent.mkdir()
+        src.write_bytes(b"source-bytes")
+        dst = tmp_path / "library" / "dst.mkv"
+
+        monkeypatch.setattr(fileops, "_linux_rename_noreplace", lambda *_: False)
+        monkeypatch.setattr(
+            fileops.os,
+            "link",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                OSError(errno.EXDEV, "simulated cross-device hardlink")
+            ),
+        )
+        monkeypatch.setattr(
+            fileops,
+            "_fsync_directory",
+            lambda *_: (_ for _ in ()).throw(
+                OSError(errno.EINVAL, "simulated unsupported directory fsync")
+            ),
+        )
+
+        with pytest.raises(fileops.UnsupportedFilesystemSafetyError) as caught:
+            fileops.place_file(str(src), str(dst), "move")
+
+        assert caught.value.reason.startswith("directory fsync unavailable")
+        assert src.read_bytes() == b"source-bytes"
+        assert not dst.exists()
+
+    def test_post_publish_directory_sync_failure_rolls_back_move(
+            self, tmp_path, monkeypatch):
+        src = tmp_path / "source" / "src.mkv"
+        src.parent.mkdir()
+        src.write_bytes(b"source-bytes")
+        dst = tmp_path / "library" / "dst.mkv"
+        dst.parent.mkdir()
+
+        real_sync = fileops._fsync_directory
+        calls = 0
+
+        def fail_after_preflight(path):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError(errno.EIO, "simulated post-publication sync failure")
+            return real_sync(path)
+
+        monkeypatch.setattr(fileops, "_fsync_directory", fail_after_preflight)
+
+        with pytest.raises(OSError, match="post-publication"):
+            fileops.place_file(str(src), str(dst), "move")
+
+        assert src.read_bytes() == b"source-bytes"
+        assert not dst.exists()
+
+    def test_copy_directory_sync_failure_removes_destination_and_keeps_source(
+            self, tmp_path, monkeypatch):
+        src = tmp_path / "src.mkv"
+        src.write_bytes(b"copy-source")
+        dst = tmp_path / "library" / "dst.mkv"
+        dst.parent.mkdir()
+
+        monkeypatch.setattr(
+            fileops,
+            "_fsync_directory",
+            lambda *_: (_ for _ in ()).throw(
+                OSError(errno.EINVAL, "simulated unsupported directory fsync")
+            ),
+        )
+
+        with pytest.raises(OSError, match="directory fsync"):
+            fileops.place_file(str(src), str(dst), "copy")
+
+        assert src.read_bytes() == b"copy-source"
+        assert not dst.exists()
+
+    def test_filesystem_safety_status_reports_unsupported_directory_sync(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            fileops,
+            "_fsync_directory",
+            lambda *_: (_ for _ in ()).throw(
+                OSError(errno.ENOTSUP, "simulated unsupported")
+            ),
+        )
+        status = fileops.filesystem_safety_status(str(tmp_path))
+        assert status["directory_fsync"] is False
+        assert status["source_consuming_move_durability"] is False
