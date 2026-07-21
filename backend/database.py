@@ -1609,6 +1609,7 @@ class DatabaseManager:
                 UPDATE hdencode_candidates
                 SET clean_title = COALESCE(?, clean_title),
                     title_year = COALESCE(?, title_year),
+                    description_year = COALESCE(?, description_year),
                     season = COALESCE(?, season),
                     episode = COALESCE(?, episode),
                     resolution = COALESCE(?, resolution),
@@ -1631,6 +1632,7 @@ class DatabaseManager:
                 (
                     updates.get("clean_title"),
                     updates.get("title_year"),
+                    updates.get("description_year"),
                     updates.get("season"),
                     updates.get("episode"),
                     updates.get("resolution"),

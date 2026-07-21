@@ -626,6 +626,14 @@ class TestBookmarks:
 # ── Downloads ─────────────────────────────────────────────────────────
 
 class TestDownloads:
+    @pytest.fixture(autouse=True)
+    def _prevent_real_download_background_work(self, monkeypatch):
+        """Route-shape tests must not scrape or contact JDownloader."""
+        monkeypatch.setattr(
+            "fastapi.BackgroundTasks.add_task",
+            lambda *_args, **_kwargs: None,
+        )
+
     def test_download_history_empty(self, client):
         resp = client.get("/download/history")
         assert resp.status_code == 200

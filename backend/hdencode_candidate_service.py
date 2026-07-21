@@ -316,7 +316,7 @@ def _identity_is_confirmed(row) -> bool:
         # no episode) requires explicit pack identity, not auto-confirmed here.
         return row.get("season") is not None and row.get("episode") is not None
     # Movie: a complete, non-conflicting title + year.
-    return bool(title_year)
+    return bool(title_year or description_year)
 
 
 def _candidate_updates(payload):
@@ -326,7 +326,7 @@ def _candidate_updates(payload):
         if value is not None and value != "": updates[name] = value
 
     put("clean_title", str(payload.get("display_title") or "").strip() or None)
-    put("title_year", _int_or_none(payload.get("year")))
+    put("description_year", _int_or_none(payload.get("year")))
     put("season", _int_or_none(payload.get("season")))
     put("episode", _int_or_none(payload.get("episode_number")))
     put("resolution", str(payload.get("res") or "").strip() or None)
