@@ -70,12 +70,24 @@ class WebScrapers:
 
     # ── HDEncode detail ────────────────────────────────────────────────
 
-    def scrape_details(self, url, headers, scraper=None):
+    def scrape_details(
+        self,
+        url,
+        headers,
+        scraper=None,
+        *,
+        stop_requested=None,
+    ):
         """Scrape media metadata from an HDEncode post page.
 
         See ``DetailScraper.scrape_details`` for full documentation.
         """
-        return self._detail.scrape_details(url, headers, scraper=scraper)
+        return self._detail.scrape_details(
+            url,
+            headers,
+            scraper=scraper,
+            stop_requested=stop_requested,
+        )
 
     # ── Selenium link resolution ───────────────────────────────────────
 

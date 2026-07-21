@@ -21,7 +21,8 @@ const E2E_DATA_DIR = join(
 // first route assertion. Local development keeps the fast, reusable dev server.
 const FRONTEND_COMMAND = process.env.CI
   ? `npm run preview -- --host localhost --port ${FRONTEND_PORT} --strictPort`
-  : `npm run dev -- --port ${FRONTEND_PORT}`;
+  : `npm run build && npm run preview -- --host localhost --port ${FRONTEND_PORT} --strictPort`;
+process.env.SCANHOUND_E2E_DATA_DIR = E2E_DATA_DIR;
 
 export default defineConfig({
   testDir: './tests/e2e',
@@ -30,6 +31,7 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 1 : undefined,
   reporter: process.env.CI ? 'github' : 'list',
+  globalTeardown: './global-teardown.ts',
   use: {
     baseURL: `http://localhost:${FRONTEND_PORT}`,
     trace: 'on-first-retry',
@@ -54,13 +56,20 @@ export default defineConfig({
       cwd: '..',
       url: `http://127.0.0.1:${BACKEND_PORT}/health`,
       env: {
+        // The backend's POSIX config/data paths derive from HOME. Keep every
+        // path inside the unique E2E directory, not the developer's profile.
+        HOME: E2E_DATA_DIR,
+        XDG_CONFIG_HOME: join(E2E_DATA_DIR, '.config'),
+        XDG_DATA_HOME: join(E2E_DATA_DIR, '.local', 'share'),
         APPDATA: E2E_DATA_DIR,
         LOCALAPPDATA: E2E_DATA_DIR,
         SCANHOUND_DATA_DIR: E2E_DATA_DIR,
         SCANHOUND_DB_DIR: E2E_DATA_DIR,
         SCANHOUND_ALLOW_OPEN: '1',
       },
-      reuseExistingServer: !process.env.CI,
+      // Reusing a backend can attach E2E to a real user process and bypass all
+      // of the isolation above. Port conflicts must fail loudly instead.
+      reuseExistingServer: false,
       timeout: 30_000,
     },
     {

@@ -8,7 +8,11 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
+from backend.api.public_errors import capture_public_exception
 from backend.api.ws import ws_manager
+from backend.download_service import _source_page_kind
+from backend.source_health import record_scrape_outcome
+from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/download", tags=["downloads"])
@@ -106,14 +110,18 @@ def _run_grab(dl, reg: ServiceRegistry, req: "DownloadRequest", force: bool = Fa
                 "data": {"title": "Download", "body": f"{message} (not sent to JDownloader — method: {method})", "priority": "warning"},
             })
     except Exception as e:
-        logger.exception("Download failed for %s", req.title)
+        public = capture_public_exception(
+            logger, e, code="download_failed",
+            message="The download could not be completed.",
+            context=f"Download failed for {req.title}",
+        )
         try:
             dl.save_to_history(req.url, req.title, req.season, req.resolution, req.size, status="failed", hdr=req.hdr, dovi=req.dovi)
         except Exception:
             pass
         ws_manager.broadcast_sync({
             "type": "notification",
-            "data": {"title": "Download Failed", "body": str(e), "priority": "high"},
+            "data": public.notification_data(title="Download Failed"),
         })
 
 
@@ -205,7 +213,11 @@ def download_batch(
             if delivered:
                 _persist_grab_annotations(reg)  # once for the whole batch
         except Exception as e:
-            logger.exception("Batch download failed")
+            public = capture_public_exception(
+                logger, e, code="batch_download_failed",
+                message="The batch download could not be completed.",
+                context="Batch download failed",
+            )
             for item in req.items:
                 try:
                     dl.save_to_history(item.url, item.title, item.season, item.resolution, item.size, status="failed", hdr=item.hdr, dovi=item.dovi)
@@ -213,7 +225,7 @@ def download_batch(
                     pass
             ws_manager.broadcast_sync({
                 "type": "notification",
-                "data": {"title": "Batch Failed", "body": str(e), "priority": "high"},
+                "data": public.notification_data(title="Batch Failed"),
             })
 
     background_tasks.add_task(_do_batch)
@@ -239,14 +251,24 @@ def scrape_links(
     try:
         links = dl.scrape_links(req.url, req.service_type)
     except Exception as e:
-        logger.exception("Scrape failed for %s", req.url)
-        raise HTTPException(status_code=502, detail=f"Scrape failed: {e}")
+        public = capture_public_exception(
+            logger, e, code="scrape_failed",
+            message="Links could not be retrieved.",
+            context="Scrape failed",
+        )
+        raise HTTPException(status_code=502, detail=public.as_detail())
+    diagnostic = getattr(links, "diagnostic", None)
+    if _source_page_kind(req.url) == "hdencode":
+        record_scrape_outcome(reg.db, "hdencode", links)
     if links and req.title and reg.db:
         try:
             reg.db.record_scraped_links(links, req.title, req.resolution, req.url)
         except Exception:
             pass
-    return {"links": links, "count": len(links)}
+    response = {"links": list(links), "count": len(links)}
+    if diagnostic is not None:
+        response.update(diagnostic.to_dict())
+    return response
 
 
 class ScrapeBatchRequest(BaseModel):
@@ -277,16 +299,30 @@ def copy_links_batch(
     def _do_copy():
         all_links: List[str] = []
         seen = set()
+        failures: List[Dict[str, Any]] = []
         for i, it in enumerate(items):
             ws_manager.broadcast_sync({
                 "type": "download:scrape_progress",
                 "data": {"completed": i, "total": total, "current": it.url},
             })
+            diagnostic = None
             try:
                 links = dl.scrape_links(it.url, it.service_type)
-            except Exception:
+                diagnostic = getattr(links, "diagnostic", None)
+                if _source_page_kind(it.url) == "hdencode":
+                    record_scrape_outcome(reg.db, "hdencode", links)
+            except Exception as exc:
                 logger.exception("Batch scrape failed for %s", it.url)
-                links = []
+                diagnostic = ScrapeDiagnostic(
+                    ScrapeCode.SCRAPE_EXCEPTION,
+                    retryable=True,
+                    affects_source_health=False,
+                    signals=(type(exc).__name__,),
+                    detail=f"Batch link scrape failed: {exc}",
+                )
+                links = ScrapedLinks(diagnostic=diagnostic)
+            if not links and diagnostic is not None:
+                failures.append({"url": it.url, **diagnostic.to_dict()})
             for link in links:
                 if link not in seen:
                     seen.add(link)
@@ -310,14 +346,21 @@ def copy_links_batch(
             "data": {"completed": total, "total": total, "current": ""},
         })
         if not all_links:
-            body = f"No links found across {total} item(s)"
+            reason_codes = sorted({f["reason_code"] for f in failures})
+            suffix = f" ({', '.join(reason_codes)})" if reason_codes else ""
+            body = f"No links found across {total} item(s){suffix}"
         elif copied:
             body = f"Copied {len(all_links)} link(s) from {total} item(s) — JDownloader should grab them"
         else:
             body = f"Found {len(all_links)} link(s) but clipboard copy failed"
         ws_manager.broadcast_sync({
             "type": "notification",
-            "data": {"title": "Copy Links", "body": body, "priority": "normal" if all_links else "high"},
+            "data": {
+                "title": "Copy Links",
+                "body": body,
+                "priority": "normal" if all_links else "high",
+                "reason_codes": sorted({f["reason_code"] for f in failures}),
+            },
         })
 
     background_tasks.add_task(_do_copy)
@@ -344,8 +387,12 @@ def open_in_plex(
             plex_rating_key=req.plex_rating_key,
         )
     except Exception as e:
-        logger.exception("Failed to open in Plex: %s", req.title)
-        raise HTTPException(status_code=502, detail=f"Plex lookup failed: {e}")
+        public = capture_public_exception(
+            logger, e, code="plex_lookup_failed",
+            message="The Plex item could not be opened.",
+            context=f"Failed to open in Plex: {req.title}",
+        )
+        raise HTTPException(status_code=502, detail=public.as_detail())
     if not url:
         raise HTTPException(status_code=404, detail=f"'{req.title}' not found in Plex library")
     return {"url": url}

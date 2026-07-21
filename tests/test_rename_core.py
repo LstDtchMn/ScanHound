@@ -1,4 +1,5 @@
 """Unit tests for the ported rename core: confidence, naming, fileops."""
+import errno
 import os
 import pytest
 
@@ -132,7 +133,7 @@ class TestFileOps:
 
         def _boom(*a, **k):
             raise OSError("simulated power loss")
-        monkeypatch.setattr(fileops.os, "replace", _boom)
+        monkeypatch.setattr(fileops, "_move_no_replace", _boom)
 
         with pytest.raises(OSError):
             fileops.place_file(str(src), str(dst), "copy")
@@ -145,14 +146,19 @@ class TestFileOps:
         # file is never lost, and no partial appears at the destination.
         src = tmp_path / "src.mkv"; src.write_bytes(b"q" * 8192)
         dst = tmp_path / "lib" / "out.mkv"
-        # Force the EXDEV (cross-device) branch, then crash the atomic rename.
-        real_rename = fileops.os.rename
-        def _exdev(a, b):
-            import errno as _e
-            raise OSError(_e.EXDEV, "cross-device")
-        monkeypatch.setattr(fileops.os, "rename", _exdev)
-        monkeypatch.setattr(fileops.os, "replace",
-                            lambda *a, **k: (_ for _ in ()).throw(OSError("crash")))
+        # First publication reports EXDEV; the verified-copy publication then
+        # crashes. Source bytes must remain recoverable throughout.
+        calls = 0
+
+        def _exdev_then_crash(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                import errno as _e
+                raise OSError(_e.EXDEV, "cross-device")
+            raise OSError("crash")
+
+        monkeypatch.setattr(fileops, "_move_no_replace", _exdev_then_crash)
         with pytest.raises(OSError):
             fileops.place_file(str(src), str(dst), "move")
         assert src.exists() and src.read_bytes() == b"q" * 8192   # NEVER lost
@@ -163,6 +169,81 @@ class TestFileOps:
         dst = tmp_path / "out.mkv"; dst.write_text("existing")
         with pytest.raises(FileExistsError):
             fileops.place_file(str(src), str(dst), "move")
+
+
+
+    def test_move_publish_race_preserves_competing_destination(
+            self, tmp_path, monkeypatch):
+        """A destination created after the precheck must never be replaced."""
+        src = tmp_path / "src.mkv"
+        src.write_bytes(b"source")
+        dst = tmp_path / "lib" / "out.mkv"
+        real_publish = fileops._move_no_replace
+
+        def competing_publish(source, destination):
+            dst.write_bytes(b"victim")
+            return real_publish(source, destination)
+
+        monkeypatch.setattr(fileops, "_move_no_replace", competing_publish)
+
+        with pytest.raises(FileExistsError):
+            fileops.place_file(str(src), str(dst), "move")
+
+        assert src.read_bytes() == b"source"
+        assert dst.read_bytes() == b"victim"
+
+
+    def test_copy_publish_race_preserves_competing_destination(
+            self, tmp_path, monkeypatch):
+        """Verified-copy publication is no-replace, not os.replace."""
+        src = tmp_path / "src.mkv"
+        src.write_bytes(b"source" * 4096)
+        dst = tmp_path / "lib" / "out.mkv"
+        real_publish = fileops._move_no_replace
+
+        def competing_publish(source, destination):
+            dst.write_bytes(b"victim")
+            return real_publish(source, destination)
+
+        monkeypatch.setattr(fileops, "_move_no_replace", competing_publish)
+
+        with pytest.raises(FileExistsError):
+            fileops.place_file(str(src), str(dst), "copy")
+
+        assert src.read_bytes() == b"source" * 4096
+        assert dst.read_bytes() == b"victim"
+        assert not list(dst.parent.glob(f".{dst.name}.part.*"))
+
+
+    def test_cross_device_hardlink_fallback_cannot_replace_racing_destination(
+            self, tmp_path, monkeypatch):
+        """The default hardlink-to-copy path keeps a concurrent victim intact."""
+        import errno as _errno
+
+        src = tmp_path / "src.mkv"
+        src.write_bytes(b"source" * 4096)
+        dst = tmp_path / "lib" / "out.mkv"
+        real_link = fileops.os.link
+        real_publish = fileops._move_no_replace
+
+        def source_link_is_cross_device(source, destination, *args, **kwargs):
+            if os.fspath(source) == str(src):
+                raise OSError(_errno.EXDEV, "cross-device")
+            return real_link(source, destination, *args, **kwargs)
+
+        def competing_publish(source, destination):
+            dst.write_bytes(b"victim")
+            return real_publish(source, destination)
+
+        monkeypatch.setattr(fileops.os, "link", source_link_is_cross_device)
+        monkeypatch.setattr(fileops, "_move_no_replace", competing_publish)
+
+        with pytest.raises(FileExistsError):
+            fileops.place_file(str(src), str(dst), "hardlink")
+
+        assert src.read_bytes() == b"source" * 4096
+        assert dst.read_bytes() == b"victim"
+        assert not list(dst.parent.glob(f".{dst.name}.part.*"))
 
     def test_missing_source_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
@@ -292,8 +373,22 @@ class TestFileOps:
         def _exdev(*_a, **_k):
             raise OSError(_errno.EXDEV, "Invalid cross-device link")
 
-        monkeypatch.setattr(fileops.os, "link", _exdev)
-        monkeypatch.setattr(fileops.os, "rename", _exdev)
+        # The corrected Linux move path no longer calls os.rename.  Inject
+        # EXDEV at the publication abstraction for the first (move) attempt,
+        # then allow the verified-copy publication to use the real primitive.
+        real_publish = fileops._move_no_replace
+        publish_calls = 0
+
+        def _first_publish_exdev_then_real(src_path, dst_path):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                raise OSError(_errno.EXDEV, "Invalid cross-device link")
+            return real_publish(src_path, dst_path)
+
+        monkeypatch.setattr(
+            fileops, "_move_no_replace", _first_publish_exdev_then_real
+        )
         src = tmp_path / "src.mkv"; src.write_bytes(b"payload")
         dst = tmp_path / "lib" / "out.mkv"
         used = fileops.place_file(str(src), str(dst), "move",
@@ -316,8 +411,22 @@ class TestFileOps:
         def _exdev(*_a, **_k):
             raise OSError(_errno.EXDEV, "Invalid cross-device link")
 
-        monkeypatch.setattr(fileops.os, "link", _exdev)
-        monkeypatch.setattr(fileops.os, "rename", _exdev)
+        # The corrected Linux move path no longer calls os.rename.  Inject
+        # EXDEV at the publication abstraction for the first (move) attempt,
+        # then allow the verified-copy publication to use the real primitive.
+        real_publish = fileops._move_no_replace
+        publish_calls = 0
+
+        def _first_publish_exdev_then_real(src_path, dst_path):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                raise OSError(_errno.EXDEV, "Invalid cross-device link")
+            return real_publish(src_path, dst_path)
+
+        monkeypatch.setattr(
+            fileops, "_move_no_replace", _first_publish_exdev_then_real
+        )
         src = tmp_path / "src.mkv"; src.write_bytes(b"payload")
         dst = tmp_path / "lib" / "out.mkv"
         used = fileops.place_file(str(src), str(dst), "move",
@@ -445,12 +554,16 @@ class TestFileOps:
 
     def test_trash_exdev_never_cascades_to_appdata(
             self, tmp_path, monkeypatch):
-        """EXDEV may require copying, but the copy must stay on source volume."""
+        """EXDEV may require copying, but the copy stays on the selected volume."""
         import errno
         source = tmp_path / "movie.mkv"
         source.write_text("x")
-        same_volume = tmp_path / "volume-trash"
+        # SH-R03 only accepts non-intrinsic roots that can be safely persisted
+        # and rediscovered. Use the real root shape rather than an arbitrary
+        # test-only directory name.
+        same_volume = tmp_path / ".scanhound-trash"
         appdata = tmp_path / "appdata-trash"
+        index = tmp_path / "trash_roots.json"
 
         monkeypatch.setattr(
             fileops,
@@ -458,16 +571,29 @@ class TestFileOps:
             lambda _path: [str(same_volume)],
         )
         monkeypatch.setattr(fileops, "_TRASH_ROOT", str(appdata))
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_INDEX", str(index))
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_RUNTIME", set())
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
 
-        real_rename = fileops.os.rename
+        real_move_no_replace = fileops._move_no_replace
+        calls = 0
 
-        def always_exdev(*_args, **_kwargs):
-            raise OSError(errno.EXDEV, "mount boundary")
+        def first_exdev_then_publish(source_path, destination_path):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError(errno.EXDEV, "mount boundary")
+            return real_move_no_replace(source_path, destination_path)
 
-        monkeypatch.setattr(fileops.os, "rename", always_exdev)
+        monkeypatch.setattr(
+            fileops,
+            "_move_no_replace",
+            first_exdev_then_publish,
+        )
 
         trashed = fileops._trash(str(source))
 
+        assert calls >= 2  # direct move failed; verified-copy publication ran
         assert os.path.commonpath([str(same_volume), trashed]) == str(same_volume)
         assert not os.path.exists(source)
         assert os.path.isfile(trashed)
@@ -514,26 +640,25 @@ class TestFileOps:
         originals = {r["original_path"] for r in records}
         assert originals == {os.path.abspath(str(f1)), os.path.abspath(str(f2))}
 
-    def test_trash_manifest_write_failure_does_not_raise(self, tmp_path, monkeypatch):
-        """A manifest write failure must be logged, never propagated out of
-        _trash — losing the restore record is acceptable, losing the file
-        disposal guarantee is not."""
+    def test_trash_manifest_write_failure_leaves_source_in_place(
+            self, tmp_path, monkeypatch):
+        """SH-R03: restore metadata failure must abort before source movement."""
         trash_root = tmp_path / "appdata" / "trash"
-        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
-        f = tmp_path / "movie.mkv"; f.write_text("bye")
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(trash_root))
+        monkeypatch.setattr(fileops, "_same_volume_trash_roots", lambda _path: [])
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_RUNTIME", set())
+        f = tmp_path / "movie.mkv"
+        f.write_text("bye")
 
-        real_open = open
-
-        def _boom(path, *a, **kw):
-            if str(path).endswith("manifest.json"):
-                raise OSError("disk full")
-            return real_open(path, *a, **kw)
-
-        monkeypatch.setattr(fileops, "open", _boom, raising=False)
-        # _trash must still succeed and move the file despite the manifest failure.
-        trashed_path = fileops._trash(str(f))
-        assert not f.exists()
-        assert os.path.isfile(trashed_path)
+        monkeypatch.setattr(
+            fileops.json,
+            "dump",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        with pytest.raises(OSError):
+            fileops._trash(str(f))
+        assert f.read_text() == "bye"
+        assert fileops.list_trash_entries([str(trash_root)]) == []
 
 
 class TestTrashListAndRestore:
@@ -773,8 +898,13 @@ class TestAllTrashRoots:
         source.write_text("payload")
 
         deeper_root = library / ".scanhound-trash"
+        fallback_root = tmp_path / "appdata-trash"
         index_path = tmp_path / "trash_roots.json"
         monkeypatch.setattr(fileops, "_TRASH_ROOTS_INDEX", str(index_path))
+        monkeypatch.setattr(fileops, "_TRASH_ROOT", str(fallback_root))
+        # Give this test a private process-local registry so root/UID test runs
+        # and pre-existing /.scanhound-trash state cannot leak into the result.
+        monkeypatch.setattr(fileops, "_TRASH_ROOTS_RUNTIME", set())
         monkeypatch.setattr(
             fileops,
             "_same_volume_trash_roots",
@@ -785,7 +915,10 @@ class TestAllTrashRoots:
             "_trash_bucket_name",
             lambda: "20260101-000000",
         )
-        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: ["/"])
+        monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
+        monkeypatch.setattr(
+            fileops, "_trash_root_for", lambda _path: str(fallback_root)
+        )
 
         trashed = fileops._trash(str(source))
 
@@ -918,3 +1051,94 @@ class TestTrashRetentionSweep:
         # The symlink target must survive even though the bucket was swept.
         assert target.exists()
         assert target.read_text() == "do not delete"
+
+class TestFilesystemFailSafe:
+    def test_unsupported_filesystem_refuses_move_before_source_consumption(
+            self, tmp_path, monkeypatch):
+        src = tmp_path / "source" / "src.mkv"
+        src.parent.mkdir()
+        src.write_bytes(b"source-bytes")
+        dst = tmp_path / "library" / "dst.mkv"
+
+        monkeypatch.setattr(fileops, "_linux_rename_noreplace", lambda *_: False)
+        monkeypatch.setattr(
+            fileops.os,
+            "link",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                OSError(errno.EXDEV, "simulated cross-device hardlink")
+            ),
+        )
+        monkeypatch.setattr(
+            fileops,
+            "_fsync_directory",
+            lambda *_: (_ for _ in ()).throw(
+                OSError(errno.EINVAL, "simulated unsupported directory fsync")
+            ),
+        )
+
+        with pytest.raises(fileops.UnsupportedFilesystemSafetyError) as caught:
+            fileops.place_file(str(src), str(dst), "move")
+
+        assert caught.value.reason.startswith("directory fsync unavailable")
+        assert src.read_bytes() == b"source-bytes"
+        assert not dst.exists()
+
+    def test_post_publish_directory_sync_failure_rolls_back_move(
+            self, tmp_path, monkeypatch):
+        src = tmp_path / "source" / "src.mkv"
+        src.parent.mkdir()
+        src.write_bytes(b"source-bytes")
+        dst = tmp_path / "library" / "dst.mkv"
+        dst.parent.mkdir()
+
+        real_sync = fileops._fsync_directory
+        calls = 0
+
+        def fail_after_preflight(path):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError(errno.EIO, "simulated post-publication sync failure")
+            return real_sync(path)
+
+        monkeypatch.setattr(fileops, "_fsync_directory", fail_after_preflight)
+
+        with pytest.raises(OSError, match="post-publication"):
+            fileops.place_file(str(src), str(dst), "move")
+
+        assert src.read_bytes() == b"source-bytes"
+        assert not dst.exists()
+
+    def test_copy_directory_sync_failure_removes_destination_and_keeps_source(
+            self, tmp_path, monkeypatch):
+        src = tmp_path / "src.mkv"
+        src.write_bytes(b"copy-source")
+        dst = tmp_path / "library" / "dst.mkv"
+        dst.parent.mkdir()
+
+        monkeypatch.setattr(
+            fileops,
+            "_fsync_directory",
+            lambda *_: (_ for _ in ()).throw(
+                OSError(errno.EINVAL, "simulated unsupported directory fsync")
+            ),
+        )
+
+        with pytest.raises(OSError, match="directory fsync"):
+            fileops.place_file(str(src), str(dst), "copy")
+
+        assert src.read_bytes() == b"copy-source"
+        assert not dst.exists()
+
+    def test_filesystem_safety_status_reports_unsupported_directory_sync(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            fileops,
+            "_fsync_directory",
+            lambda *_: (_ for _ in ()).throw(
+                OSError(errno.ENOTSUP, "simulated unsupported")
+            ),
+        )
+        status = fileops.filesystem_safety_status(str(tmp_path))
+        assert status["directory_fsync"] is False
+        assert status["source_consuming_move_durability"] is False

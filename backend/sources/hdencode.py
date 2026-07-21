@@ -44,12 +44,10 @@ class HDEncodeSource(SourceBase):
                 SourceCapability.MOVIES |
                 SourceCapability.TV_SHOWS |
                 SourceCapability.PAGINATION |
-                SourceCapability.SEARCH |
-                SourceCapability.DIRECT_LINKS |
-                SourceCapability.CLOUDFLARE_BYPASS
+                SourceCapability.SEARCH
             ),
             rate_limit=2.0,  # Be respectful
-            requires_cloudflare_bypass=True,
+            requires_cloudflare_bypass=False,
             timeout=30,
             priority=100
         )
@@ -417,116 +415,15 @@ class HDEncodeSource(SourceBase):
     async def fetch_download_links(
         self,
         release: ParsedRelease,
-        service: str = "rapidgator"
+        service: str = "rapidgator",
     ) -> List[str]:
-        """Fetch download links for a release.
+        """Fail closed: browser retrieval is owned by DownloadService.
 
-        Note: This requires Selenium for the protected links.
-        Returns empty list if Selenium is not available.
+        This removes the dormant independent WebDriver constructor and its
+        automation-obscuring options. Callers must use the coordinated API path.
         """
-        try:
-            from selenium import webdriver
-            from selenium.webdriver.common.by import By
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-            from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
-            from bs4 import BeautifulSoup
-            import time
-        except ImportError as e:
-            logger.warning("Required dependencies not available: %s", e)
-            return []
-
-        links = []
-        driver = None
-
-        try:
-            url = release.url
-            logger.info("Fetching %s links from: %s", service, url)
-
-            # Get or create WebDriver - you'll need to pass this from the app
-            # For now, we'll create a simple driver
-            # NOTE: In production, you should reuse the app's cached driver
-            options = webdriver.ChromeOptions()
-            options.add_argument('--headless')
-            options.add_argument('--disable-blink-features=AutomationControlled')
-            options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            options.add_experimental_option('useAutomationExtension', False)
-
-            try:
-                driver = webdriver.Chrome(options=options)
-            except Exception as e:
-                logger.error("Failed to create WebDriver: %s", e)
-                return []
-
-            driver.get(url)
-            wait = WebDriverWait(driver, 8)
-
-            # Find and click "Access the links" button
-            access_btn = None
-            selectors = [
-                "//input[@value='Access the links']",
-                "//input[contains(@value, 'Access')]",
-                "//input[@type='submit']",
-                "//button[contains(text(), 'Access')]"
-            ]
-
-            for xpath in selectors:
-                try:
-                    access_btn = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
-                    if access_btn:
-                        break
-                except (TimeoutException, NoSuchElementException, WebDriverException):
-                    continue
-
-            if not access_btn:
-                try:
-                    access_btn = driver.find_element(By.CSS_SELECTOR, "form input[type='submit']")
-                except (NoSuchElementException, WebDriverException):
-                    logger.warning("Could not find access button on %s", url)
-                    return []
-
-            if access_btn:
-                driver.execute_script("arguments[0].scrollIntoView();", access_btn)
-                time.sleep(0.3)
-                driver.execute_script("arguments[0].click();", access_btn)
-            else:
-                logger.warning("Could not find access button on %s", url)
-                return []
-
-            # Wait for download links to appear
-            keyword = service.lower()
-            if keyword == "rapidgator":
-                keyword = "rapidgator"
-            elif keyword == "nitroflare":
-                keyword = "nitroflare"
-
-            xpath_query = f"//a[contains(@href, '{keyword}')]"
-
-            try:
-                wait = WebDriverWait(driver, 10)
-                wait.until(EC.presence_of_element_located((By.XPATH, xpath_query)))
-            except (TimeoutException, WebDriverException):
-                logger.warning("No %s links found on %s", service, url)
-                return []
-
-            # Extract links from page
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            found_links = []
-            for a in soup.find_all('a', href=True):
-                if keyword in a['href'].lower():
-                    found_links.append(a['href'])
-
-            links = found_links
-            logger.info("Found %s %s links", len(links), service)
-
-        except Exception as e:
-            logger.error("Error fetching download links: %s", e)
-            return []
-        finally:
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-
-        return links
+        logger.warning(
+            "HDEncodeSource.fetch_download_links is disabled; "
+            "use DownloadService through the coordinated API path"
+        )
+        return []

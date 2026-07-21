@@ -12,13 +12,22 @@ import sys
 import time
 import threading
 import webbrowser
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
 from backend.database import DatabaseManager
+from backend.hdencode_coordinator import (
+    HDEncodeTrafficDenied,
+    configure_hdencode_coordinator,
+    get_hdencode_coordinator,
+    require_transport_authorization,
+)
 from backend.app_service import normalize_title
 from backend.sources.ddlbase import decode_ddlbase_link
+from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
+from backend.source_health import record_scrape_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +92,75 @@ _SUPPORTED_DOWNLOAD_HOSTS = (
 
 
 def _url_matches_domain(url: str, domains: tuple) -> bool:
-    """Check if a URL's host matches any of the given domains (netloc-based)."""
+    """Check a URL's parsed hostname against one or more registrable domains.
+
+    Path and query text must never influence source routing.  ``hostname`` also
+    strips credentials and ports, unlike a raw ``netloc`` comparison.
+    """
     try:
-        netloc = urlparse(url).netloc.lower()
-        return any(netloc == d or netloc.endswith("." + d) for d in domains)
+        raw = (url or "").strip()
+        parsed = urlparse(raw if "://" in raw else "https://" + raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        return any(host == d or host.endswith("." + d) for d in domains)
     except Exception:
         return False
+
+
+def _source_page_kind(url: str) -> str:
+    """Classify a source-page URL using only its hostname.
+
+    ``scrape_links`` historically treats every page that is not DDLBase or
+    Adit-HD as the HDEncode/default path.  Keep that compatibility while making
+    the decision once and reusing it for both gating and dispatch.
+    """
+    if _url_matches_domain(url, ("ddlbase.com",)):
+        return "ddlbase"
+    if _url_matches_domain(url, ("adit-hd.com",)):
+        return "adithd"
+    return "hdencode"
+
+
+def _challenge_iframe_signal(src: str) -> str:
+    """Return a closed, non-sensitive challenge-frame signal.
+
+    Full iframe URLs may contain site keys, return URLs, state, or tokens in
+    their path/query. Public diagnostics expose only a closed challenge marker
+    and a syntactically valid ASCII hostname.
+    """
+    raw = (src or "").strip()
+    low = raw.lower()
+    marker = next(
+        (name for name in (
+            "turnstile", "challenges.cloudflare", "recaptcha", "hcaptcha", "captcha"
+        ) if name in low),
+        "challenge",
+    )
+
+    if raw.startswith("//"):
+        parse_target = "https:" + raw
+    elif "://" in raw:
+        parse_target = raw
+    else:
+        parse_target = ""
+
+    host = "unknown"
+    if parse_target:
+        try:
+            candidate = (urlparse(parse_target).hostname or "").lower().rstrip(".")
+            if (
+                candidate
+                and len(candidate) <= 253
+                and ".." not in candidate
+                and re.fullmatch(
+                    r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?",
+                    candidate,
+                )
+            ):
+                host = candidate
+        except Exception:
+            pass
+
+    return f"iframe:{marker}@{host}"
 
 
 def _normalize_link_url(url: str) -> str:
@@ -157,6 +229,7 @@ class DownloadService:
     def __init__(self, config: Dict[str, Any], db: DatabaseManager, server_mode: bool = False):
         self.config = config
         self.db = db
+        configure_hdencode_coordinator(config, db)
         # In server/headless mode (the FastAPI/Docker deployment) there is no
         # user-facing browser, so the browser fallback is meaningless and must
         # not be reported as a successful delivery.
@@ -964,8 +1037,10 @@ class DownloadService:
                 "warning",
             )
 
-    def get_driver(self):
+    def get_driver(self, *, require_hdencode_authorization: bool = False):
         """Get or create a cached WebDriver instance (thread-safe)."""
+        if require_hdencode_authorization:
+            require_transport_authorization("selenium")
         _ensure_selenium()
         with self._driver_lock:
             if self.cached_driver:
@@ -1126,156 +1201,305 @@ class DownloadService:
         match = re.search(r"ERR_[A-Z_]+", text)
         return match.group(0) if match else "ERR_UNKNOWN"
 
-    def _navigate(self, url: str, tag: str = "Scrape", attempts: int = 3):
-        """Load ``url``, healing the browser if it serves its own error page.
+    def _navigate_with_diagnostic(
+        self, url: str, tag: str = "Scrape", attempts: int = 3
+    ):
+        """Load a source page through the appropriate traffic policy."""
+        last_diag: Optional[ScrapeDiagnostic] = None
+        hdencode_request = _source_page_kind(url) == "hdencode"
 
-        Returns the live driver, or ``None`` if the host is genuinely unreachable
-        after ``attempts`` tries. Each retry recycles the browser, because a fresh
-        Chrome usually resolves the host fine even when the previous one couldn't.
-        """
-        last: Optional[str] = None
         for attempt in range(1, attempts + 1):
-            driver = self.get_driver()
             try:
-                driver.get(url)
-            except Exception as e:
-                last = str(e)
-                self._log(f"[{tag}] navigation raised (attempt {attempt}/{attempts}): {e}", "warning")
-            else:
-                code = self._browser_error_code(driver, url)
-                if not code:
-                    return driver
-                last = code
-                self._log(
-                    f"[{tag}] browser could not reach the site ({code}) — a network/DNS "
-                    f"error, NOT a Cloudflare wall. Recycling the browser and retrying "
-                    f"({attempt}/{attempts}).",
-                    "warning",
+                request_context = (
+                    get_hdencode_coordinator().request("selenium")
+                    if hdencode_request
+                    else nullcontext()
                 )
+                with request_context:
+                    try:
+                        driver = self.get_driver(
+                            require_hdencode_authorization=hdencode_request
+                        )
+                    except Exception as exc:
+                        diag = ScrapeDiagnostic(
+                            ScrapeCode.BROWSER_LAUNCH_FAILED,
+                            retryable=True,
+                            affects_source_health=False,
+                            signals=(type(exc).__name__,),
+                            detail="The browser could not start.",
+                        )
+                        self._log(
+                            f"[{tag}] browser launch failed: {type(exc).__name__}",
+                            "error",
+                        )
+                        return None, diag
+
+                    try:
+                        driver.get(url)
+                    except Exception as exc:
+                        if hdencode_request:
+                            get_hdencode_coordinator().observe_network_failure(
+                                type(exc).__name__
+                            )
+                        last_diag = ScrapeDiagnostic(
+                            ScrapeCode.BROWSER_NAVIGATION_FAILED,
+                            retryable=True,
+                            affects_source_health=False,
+                            signals=(type(exc).__name__,),
+                            detail="Browser navigation failed.",
+                        )
+                        self._log(
+                            f"[{tag}] navigation raised "
+                            f"(attempt {attempt}/{attempts}): {type(exc).__name__}",
+                            "warning",
+                        )
+                    else:
+                        code = self._browser_error_code(driver, url)
+                        if not code:
+                            if hdencode_request:
+                                get_hdencode_coordinator().observe_http_status(200)
+                            return driver, None
+                        if hdencode_request:
+                            get_hdencode_coordinator().observe_network_failure(code)
+                        last_diag = ScrapeDiagnostic(
+                            ScrapeCode.BROWSER_NETWORK_ERROR,
+                            retryable=True,
+                            affects_source_health=False,
+                            signals=(code,),
+                            detail=f"Chromium could not reach the source ({code}).",
+                        )
+                        self._log(
+                            f"[{tag}] browser network error {code}; recycling "
+                            f"({attempt}/{attempts}).",
+                            "warning",
+                        )
+            except HDEncodeTrafficDenied as exc:
+                return None, ScrapeDiagnostic(
+                    ScrapeCode.SOURCE_DISABLED,
+                    retryable=False,
+                    affects_source_health=False,
+                    signals=(exc.code,),
+                )
+
             self._recycle_driver()
             if attempt < attempts:
                 time.sleep(min(2 * attempt, 5))
-        self._log(f"[{tag}] giving up — {url} unreachable from the container ({last})", "error")
-        return None
 
-    def _log_page_diagnostics(self, driver, keyword: Optional[str] = None) -> None:
-        """Emit detailed diagnostics about the current page to debug empty scrapes."""
+        self._log(f"[{tag}] giving up after {attempts} navigation attempt(s)", "error")
+        return None, last_diag or ScrapeDiagnostic(
+            ScrapeCode.BROWSER_NETWORK_ERROR,
+            retryable=True,
+            affects_source_health=False,
+        )
+
+    def _navigate(self, url: str, tag: str = "Scrape", attempts: int = 3):
+        """Backward-compatible driver-only wrapper used by non-HDEncode paths."""
+        driver, _diagnostic = self._navigate_with_diagnostic(url, tag=tag, attempts=attempts)
+        return driver
+
+    def _log_page_diagnostics(
+        self,
+        driver,
+        keyword: Optional[str] = None,
+        *,
+        stage: str = "page",
+        source_kind: str = "hdencode",
+    ) -> ScrapeDiagnostic:
+        """Log page evidence and return a structured operation classification."""
         try:
             from bs4 import BeautifulSoup
+
             html = driver.page_source or ""
-            soup = BeautifulSoup(html, 'html.parser')
-            anchors = soup.find_all('a', href=True)
+            soup = BeautifulSoup(html, "html.parser")
+            anchors = soup.find_all("a", href=True)
+            signals: List[str] = []
             self._log(f"[HDEncode][diag] {len(anchors)} links, {len(html)} bytes of HTML")
 
-            # The visible text is the single most useful signal for *why* a scrape
-            # came back empty — it distinguishes a Cloudflare/bot challenge, a
-            # login wall, and a Chrome network-error page ("This site can't be
-            # reached") from an actual layout change. Log a short snippet.
             body_text = " ".join((soup.get_text(" ") or "").split())[:240]
             self._log(f"[HDEncode][diag] visible text: {body_text!r}")
-
-            # Chrome's own error page (host unreachable / timed out) renders with a
-            # real <title> of the host but no usable content — call it out plainly
-            # so it isn't mistaken for a site layout change.
-            err_low = body_text.lower()
-            if any(m in err_low for m in (
-                "site can't be reached", "site can’t be reached", "took too long to respond",
-                "err_", "no internet", "dns_probe", "connection was reset",
-            )):
+            body_low = body_text.lower()
+            try:
+                raw_title = driver.title
+                page_title_low = (
+                    raw_title.lower()
+                    if isinstance(raw_title, str)
+                    else ""
+                )
+            except Exception:
+                page_title_low = ""
+            network_markers = (
+                "site can't be reached",
+                "site can’t be reached",
+                "took too long to respond",
+                "err_",
+                "no internet",
+                "dns_probe",
+                "connection was reset",
+            )
+            matched_network = [m for m in network_markers if m in body_low]
+            if matched_network:
+                signals.extend(matched_network)
                 self._log(
-                    "[HDEncode][diag] this is a browser NETWORK-ERROR page, not the site — "
-                    "the source host was unreachable from the container (DNS/blocked/down).",
+                    "[HDEncode][diag] browser NETWORK-ERROR page detected; this is not a site challenge.",
                     "warning",
                 )
-            elif len(anchors) == 0 and len(html) > 40000:
-                # A large document with zero anchors is the signature of an
-                # unsolved Cloudflare/bot challenge (JS-only shell), NOT a
-                # renamed button — say so instead of guessing "layout change".
+
+            if len(anchors) == 0 and len(html) > 40000:
+                signals.append("large_zero_anchor_document")
                 self._log(
-                    "[HDEncode][diag] large HTML but ZERO anchors — almost certainly an "
-                    "unsolved Cloudflare/bot challenge (undetected-chromedriver didn't clear it).",
+                    "[HDEncode][diag] large HTML document with zero anchors; treating this as a supporting signal only.",
                     "warning",
                 )
 
             hosts = ("rapidgator", "nitroflare", "1fichier", "ddownload")
-            host_links = [a['href'] for a in anchors if any(h in a['href'].lower() for h in hosts)]
+            host_links = [a["href"] for a in anchors if any(h in a["href"].lower() for h in hosts)]
             if host_links:
                 self._log(f"[HDEncode][diag] file-host links on page ({len(host_links)}): {host_links[:5]}")
             else:
-                sample = [a['href'] for a in anchors[:15]]
+                sample = [a["href"] for a in anchors[:15]]
                 self._log(f"[HDEncode][diag] no file-host links; sample hrefs: {sample}")
 
-            # Candidate "access the links" controls (buttons/inputs/anchors)
             candidates = []
-            for el in soup.find_all(['button', 'input', 'a']):
-                label = (el.get('value') or el.get_text() or '').strip()
+            for el in soup.find_all(["button", "input", "a"]):
+                label = (el.get("value") or el.get_text() or "").strip()
                 if not label:
                     continue
-                low_l = label.lower()
-                if any(k in low_l for k in (
-                    'access', 'download', 'link', 'get ', 'show', 'reveal', 'unlock', 'continue',
+                low_label = label.lower()
+                if any(k in low_label for k in (
+                    "access", "download", "link", "get ", "show", "reveal", "unlock", "continue",
                 )):
                     candidates.append(f"{el.name}={label[:40]!r}")
             if candidates:
+                signals.append("access_control_present")
                 self._log(f"[HDEncode][diag] possible access controls: {candidates[:10]}")
             else:
+                signals.append("access_control_absent")
                 self._log("[HDEncode][diag] no access/download/link controls found on page", "warning")
 
-            forms = [(f.get('action') or '(no action)') for f in soup.find_all('form')]
+            forms = [(f.get("action") or "(no action)") for f in soup.find_all("form")]
             if forms:
                 self._log(f"[HDEncode][diag] forms: {forms[:5]}")
-            iframes = [i.get('src', '') for i in soup.find_all('iframe') if i.get('src')]
-            captcha_frames = [s for s in iframes if any(
-                k in s.lower() for k in ('turnstile', 'challenges.cloudflare', 'recaptcha', 'hcaptcha', 'captcha')
+
+            iframes = [i.get("src", "") for i in soup.find_all("iframe") if i.get("src")]
+            captcha_frames = [src for src in iframes if any(
+                marker in src.lower()
+                for marker in ("turnstile", "challenges.cloudflare", "recaptcha", "hcaptcha", "captcha")
             )]
             if captcha_frames:
-                self._log(f"[HDEncode][diag] CAPTCHA/Turnstile iframes present: {captcha_frames}", "warning")
+                safe_iframe_signals = [
+                    _challenge_iframe_signal(src)
+                    for src in captcha_frames[:5]
+                ]
+                signals.extend(safe_iframe_signals)
+                self._log(
+                    "[HDEncode][diag] CAPTCHA/Turnstile iframe signal(s): %s"
+                    % safe_iframe_signals,
+                    "warning",
+                )
 
             low = html.lower()
-            markers = [m for m in (
-                "just a moment", "cf-chl", "cloudflare", "checking your browser",
-                "log in", "sign in", "captcha", "verify you are human", "access denied",
-            ) if m in low]
-            if markers:
-                self._log(f"[HDEncode][diag] page markers detected: {markers}", "warning")
+            technical_challenge_markers = [
+                marker for marker in (
+                    "cf-chl",
+                    "challenges.cloudflare.com",
+                    "turnstile",
+                    "hcaptcha",
+                    "recaptcha",
+                )
+                if marker in low
+            ]
+            title_challenge_markers = [
+                marker for marker in (
+                    "just a moment",
+                    "attention required",
+                    "checking your browser",
+                    "verify you are human",
+                    "access denied",
+                )
+                if marker in page_title_low
+            ]
+            visible_challenge_markers = [
+                marker for marker in (
+                    "checking your browser",
+                    "verify you are human",
+                )
+                if marker in body_low
+            ]
+            challenge_markers = list(dict.fromkeys(
+                technical_challenge_markers
+                + title_challenge_markers
+                + visible_challenge_markers
+            ))
+            if challenge_markers:
+                signals.extend(challenge_markers)
+                self._log(
+                    f"[HDEncode][diag] strong challenge evidence: "
+                    f"{challenge_markers}",
+                    "warning",
+                )
+
             if keyword:
-                self._log(f"[HDEncode][diag] keyword '{keyword}' present in HTML: {keyword in low}")
+                keyword_present = keyword.lower() in low
+                signals.append(f"requested_host_present:{str(keyword_present).lower()}")
+                self._log(f"[HDEncode][diag] keyword '{keyword}' present in HTML: {keyword_present}")
+
+            if matched_network:
+                return ScrapeDiagnostic(
+                    ScrapeCode.BROWSER_NETWORK_ERROR,
+                    retryable=True,
+                    affects_source_health=False,
+                    signals=tuple(signals),
+                )
+            if captcha_frames or challenge_markers:
+                if source_kind == "hdencode":
+                    get_hdencode_coordinator().observe_challenge()
+                return ScrapeDiagnostic(
+                    ScrapeCode.INTERACTIVE_CHALLENGE,
+                    retryable=False,
+                    affects_source_health=True,
+                    signals=tuple(signals),
+                )
+            if stage == "access_control":
+                return ScrapeDiagnostic(
+                    ScrapeCode.LAYOUT_CHANGED,
+                    retryable=False,
+                    affects_source_health=True,
+                    signals=tuple(signals),
+                )
+            if stage == "requested_host":
+                code = ScrapeCode.REQUESTED_HOST_MISSING if host_links else ScrapeCode.NO_FILE_HOST_LINKS
+                return ScrapeDiagnostic(
+                    code,
+                    retryable=False,
+                    affects_source_health=False,
+                    signals=tuple(signals),
+                )
+            return ScrapeDiagnostic(
+                ScrapeCode.NO_FILE_HOST_LINKS,
+                retryable=False,
+                affects_source_health=False,
+                signals=tuple(signals),
+            )
         except Exception as e:
             self._log(f"[HDEncode][diag] failed to gather diagnostics: {e}", "warning")
+            return ScrapeDiagnostic(
+                ScrapeCode.SCRAPE_EXCEPTION,
+                retryable=True,
+                affects_source_health=False,
+                signals=(type(e).__name__,),
+                detail=f"Failed to classify the loaded page: {e}",
+            )
 
     def _wait_past_cloudflare(self, driver, timeout: int = 30) -> None:
-        """Wait for a Cloudflare interstitial ("Just a moment…") to clear.
+        """Compatibility no-op.
 
-        undetected_chromedriver solves the JS/Turnstile challenge on its own,
-        but it needs a few seconds.  We poll until the challenge markers are
-        gone (or the timeout elapses) so the subsequent element search doesn't
-        fire while the challenge page is still up — which previously made the
-        scrape return zero links the moment Cloudflare engaged.
+        ScanHound does not wait for, solve, or automate interactive challenges.
+        Strong challenge evidence is classified by _log_page_diagnostics(),
+        which establishes a source cooldown through the coordinator.
         """
-        deadline = time.monotonic() + timeout
-        announced = False
-        while time.monotonic() < deadline:
-            try:
-                title = (driver.title or "").lower()
-                src = (driver.page_source or "").lower()
-            except Exception:
-                return
-            challenge = (
-                "just a moment" in title
-                or "attention required" in title
-                or "checking your browser" in src
-                or "cf-chl" in src
-                or "challenges.cloudflare.com" in src
-            )
-            if not challenge:
-                return
-            if not announced:
-                self._log("[Scrape] Cloudflare challenge detected — waiting for it to clear...")
-                announced = True
-            time.sleep(1)
-        self._log("[Scrape] Cloudflare challenge did not clear within timeout", "warning")
+        return
 
-    def scrape_links(self, url: str, service_type: str, progress_callback: Optional[Callable] = None) -> List[str]:
+    def scrape_links(self, url: str, service_type: str, progress_callback: Optional[Callable] = None) -> ScrapedLinks:
         """Scrape download links from a page using WebDriver.
 
         Args:
@@ -1285,7 +1509,29 @@ class DownloadService:
         Returns:
             List of download link URLs.
         """
-        _ensure_selenium()
+        # Classify once by parsed hostname. Query/path text such as
+        # `?next=https://ddlbase.com` must not bypass the HDEncode off switch.
+        source_kind = _source_page_kind(url)
+        if source_kind == "hdencode" and not self.config.get("hdencode_enabled", True):
+            diagnostic = ScrapeDiagnostic(
+                ScrapeCode.SOURCE_DISABLED, retryable=False, affects_source_health=False
+            )
+            self._log(f"[HDEncode] {diagnostic.message}", "warning")
+            return ScrapedLinks(diagnostic=diagnostic)
+
+        try:
+            if source_kind != "hdencode":
+                _ensure_selenium()
+        except Exception as e:
+            diagnostic = ScrapeDiagnostic(
+                ScrapeCode.BROWSER_LAUNCH_FAILED,
+                retryable=True,
+                affects_source_health=False,
+                signals=(type(e).__name__,),
+                detail=f"Selenium/Chromium could not initialize: {e}",
+            )
+            self._log(f"[HDEncode] {diagnostic.message}", "error")
+            return ScrapedLinks(diagnostic=diagnostic)
         from bs4 import BeautifulSoup
 
         # Track active scrapes separately from driver access
@@ -1294,10 +1540,17 @@ class DownloadService:
 
         try:
             with self._driver_lock:
-                if "ddlbase.com" in url:
-                    return self._scrape_ddlbase_links(url, progress_callback=progress_callback)
-                if "adit-hd.com" in url:
-                    return self._scrape_adithd_links(url, service_type)
+                if source_kind == "ddlbase":
+                    return ScrapedLinks(
+                        self._scrape_ddlbase_links(
+                            url,
+                            progress_callback=progress_callback,
+                        )
+                    )
+                if source_kind == "adithd":
+                    return ScrapedLinks(
+                        self._scrape_adithd_links(url, service_type)
+                    )
 
                 # Default: HDEncode. Map the requested host to its link keyword.
                 # The old `== "Rapidgator" else "nitroflare"` silently searched
@@ -1313,9 +1566,11 @@ class DownloadService:
                     # Navigates with browser-error-page detection + recycle/retry,
                     # so a transient container DNS/connect failure doesn't silently
                     # look like "no links on the page".
-                    driver = self._navigate(url, tag="HDEncode")
+                    driver, navigation_diagnostic = self._navigate_with_diagnostic(
+                        url, tag="HDEncode"
+                    )
                     if driver is None:
-                        return []
+                        return ScrapedLinks(diagnostic=navigation_diagnostic)
 
                     # Let any Cloudflare "Just a moment…" challenge resolve
                     # before we look for page elements.
@@ -1368,8 +1623,10 @@ class DownloadService:
                             "Page may be a Cloudflare wall, login gate, or changed layout.",
                             "warning",
                         )
-                        self._log_page_diagnostics(driver)
-                        return []
+                        diagnostic = self._log_page_diagnostics(
+                            driver, stage="access_control"
+                        )
+                        return ScrapedLinks(diagnostic=diagnostic)
 
                     try:
                         btn_desc = access_btn.get_attribute("value") or access_btn.text or access_btn.tag_name
@@ -1387,8 +1644,10 @@ class DownloadService:
                         )
                     except Exception:
                         self._log(f"[HDEncode] No {service_type} links appeared after clicking", "warning")
-                        self._log_page_diagnostics(driver, keyword=keyword)
-                        return []
+                        diagnostic = self._log_page_diagnostics(
+                            driver, keyword=keyword, stage="requested_host"
+                        )
+                        return ScrapedLinks(diagnostic=diagnostic)
 
                     soup = BeautifulSoup(driver.page_source, 'html.parser')
                     seen: Set[str] = set()
@@ -1403,12 +1662,22 @@ class DownloadService:
                         self._log(f"[HDEncode] Found {len(links)} {service_type} link(s); first: {links[0]}", "success")
                     else:
                         self._log(f"[HDEncode] 0 {service_type} links parsed from the page", "warning")
-                        self._log_page_diagnostics(driver, keyword=keyword)
-                    return links
+                        diagnostic = self._log_page_diagnostics(
+                            driver, keyword=keyword, stage="requested_host"
+                        )
+                        return ScrapedLinks(diagnostic=diagnostic)
+                    return ScrapedLinks(links)
 
                 except Exception as e:
+                    diagnostic = ScrapeDiagnostic(
+                        ScrapeCode.SCRAPE_EXCEPTION,
+                        retryable=True,
+                        affects_source_health=False,
+                        signals=(type(e).__name__,),
+                        detail=f"Link scrape failed: {e}",
+                    )
                     self._log(f"[HDEncode] Error scraping {url}: {e}", "error")
-                    return []
+                    return ScrapedLinks(diagnostic=diagnostic)
         finally:
             with self._scrape_count_lock:
                 self._active_scrapes -= 1
@@ -1465,7 +1734,9 @@ class DownloadService:
 
             if not shortlinks and not direct_links:
                 self._log("[DDLBase] No shortlinks or download links found", "warning")
-                self._log_page_diagnostics(driver)
+                self._log_page_diagnostics(
+                    driver, source_kind="ddlbase"
+                )
                 return []
 
             self._log(f"[DDLBase] Found {len(shortlinks)} shortlinks, {len(direct_links)} direct links")
@@ -1922,6 +2193,9 @@ class DownloadService:
             "link_count": 0,
             "message": "",
             "history_saved": False,
+            "reason_code": None,
+            "retryable": False,
+            "signals": [],
         }
 
         if not url:
@@ -1977,13 +2251,25 @@ class DownloadService:
 
         # Step 1: Scrape links from page
         scrape_failed = False
+        diagnostic = None
         try:
             links = self.scrape_links(url, service_type, progress_callback=_cb)
+            diagnostic = getattr(links, "diagnostic", None)
+            if _source_page_kind(url) == "hdencode":
+                record_scrape_outcome(self.db, "hdencode", links)
         except Exception as e:
             links = []
             scrape_failed = True
             self._log(f"Scrape error: {e}", "warning")
-            self._progress("download:fallback", {"title": title, "reason": str(e)}, _cb=_cb)
+            self._progress(
+                "download:fallback",
+                {
+                    "title": title,
+                    "reason": "scrape_exception",
+                    "signal": type(e).__name__,
+                },
+                _cb=_cb,
+            )
 
         if not links:
             # Only fall back to the URL itself if it is *already* a file-host
@@ -1992,13 +2278,21 @@ class DownloadService:
             # "Blocked by Cloudflare" entry, so refuse it instead.
             if self._is_supported_download_link(url):
                 links = [url]
+                diagnostic = None
             else:
-                msg = (
-                    "No download links found — the source page is protected "
-                    "(Cloudflare/captcha) or has no links for this host."
-                    if not scrape_failed else
-                    "Scrape failed — could not retrieve download links."
-                )
+                if diagnostic is not None:
+                    # API/WS-facing result must not expose diagnostic.detail,
+                    # which may contain local paths or driver internals.
+                    msg = diagnostic.public_message
+                    result["reason_code"] = diagnostic.code.value
+                    result["retryable"] = diagnostic.retryable
+                    result["signals"] = list(diagnostic.signals)
+                else:
+                    msg = (
+                        "No download links found on the source page."
+                        if not scrape_failed else
+                        "Scrape failed — could not retrieve download links."
+                    )
                 self._log(f"[Download] {title}: {msg}", "warning")
                 result["message"] = msg
                 self._progress("download:no_links", {"title": title, "url": url}, _cb=_cb)

@@ -138,6 +138,12 @@ class TestSettings:
         assert "theme_mode" in keys
         assert "tile_columns" in keys
 
+    def test_hdencode_enabled_round_trips(self, client):
+        resp = client.put("/settings", json={"hdencode_enabled": False})
+        assert resp.status_code == 200
+        assert "hdencode_enabled" in resp.json()["updated_keys"]
+        assert client.get("/settings").json()["hdencode_enabled"] is False
+
     def test_put_settings_rejects_unknown_keys(self, client):
         """Unknown keys should be rejected with 422 (extra='forbid')."""
         resp = client.put("/settings", json={"theme_mode": "dark", "bogus_key": 123})
@@ -253,18 +259,25 @@ class TestSources:
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data, list)
-        if data:
-            assert "name" in data[0]
+        assert data, "source registry must be discovered before listing"
+        assert {source["name"] for source in data} >= {"hdencode", "ddlbase", "adithd"}
 
     def test_toggle_source(self, client):
         resp = client.put("/sources/hdencode", json={"enabled": False})
         assert resp.status_code == 200
         assert resp.json()["source"] == "hdencode"
+        assert client.get("/settings").json()["hdencode_enabled"] is False
+        sources = {source["name"]: source for source in client.get("/sources").json()}
+        assert sources["hdencode"]["enabled"] is False
 
     def test_toggle_source_enable(self, client):
         resp = client.put("/sources/hdencode", json={"enabled": True})
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
+
+    def test_toggle_source_requires_boolean(self, client):
+        resp = client.put("/sources/hdencode", json={"enabled": "false"})
+        assert resp.status_code == 422
 
     def test_update_source_no_enabled_key(self, client):
         """Body without 'enabled' key should still return ok."""
@@ -272,10 +285,9 @@ class TestSources:
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
-    def test_update_different_source_id(self, client):
+    def test_update_unknown_source_id_is_rejected(self, client):
         resp = client.put("/sources/mysource", json={"enabled": True})
-        assert resp.status_code == 200
-        assert resp.json()["source"] == "mysource"
+        assert resp.status_code == 404
 
 
 # ── Plex ──────────────────────────────────────────────────────────────
@@ -434,6 +446,25 @@ class TestScanner:
             "flags": {"4k": True, "1080p": False},
         })
         assert resp.status_code == 200
+
+    def test_scan_start_rejects_disabled_hdencode(self, client):
+        assert client.put("/settings", json={"hdencode_enabled": False}).status_code == 200
+        resp = client.post("/scan/start", json={
+            "type": "deep",
+            "source": "HDEncode",
+            "pages": 1,
+        })
+        assert resp.status_code == 409
+        assert "disabled" in resp.json()["detail"].lower()
+        assert client.get("/scan/status").json()["state"] == "idle"
+
+    def test_rescan_item_rejects_disabled_hdencode_before_scraping(self, client):
+        assert client.put("/settings", json={"hdencode_enabled": False}).status_code == 200
+        resp = client.post("/scan/rescan-item", json={
+            "url": "https://hdencode.org/example-release/",
+        })
+        assert resp.status_code == 409
+        assert "no request was made" in resp.json()["detail"].lower()
 
 
 # ── Results ───────────────────────────────────────────────────────────
@@ -595,6 +626,14 @@ class TestBookmarks:
 # ── Downloads ─────────────────────────────────────────────────────────
 
 class TestDownloads:
+    @pytest.fixture(autouse=True)
+    def _prevent_real_download_background_work(self, monkeypatch):
+        """Route-shape tests must not scrape or contact JDownloader."""
+        monkeypatch.setattr(
+            "fastapi.BackgroundTasks.add_task",
+            lambda *_args, **_kwargs: None,
+        )
+
     def test_download_history_empty(self, client):
         resp = client.get("/download/history")
         assert resp.status_code == 200

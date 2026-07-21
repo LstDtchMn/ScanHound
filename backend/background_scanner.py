@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -33,6 +34,7 @@ class BackgroundScanner:
 
     def __init__(self, registry):
         self._reg = registry
+        self._lifespan_generation = registry.lifespan_generation
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._running = threading.Event()  # a scan is currently executing
@@ -43,6 +45,7 @@ class BackgroundScanner:
         self._next_run_ts: Optional[float] = None
         # Summary of the most recent run, surfaced via /background/status.
         self._last_run: Optional[Dict[str, Any]] = None
+        self._rss_jitter_seconds = random.uniform(-600.0, 600.0)
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
@@ -58,8 +61,11 @@ class BackgroundScanner:
             logger.info("Background scanner started")
 
     def stop(self) -> None:
-        """Signal the loop to stop and wait briefly for it to exit."""
+        """Stop the scheduler and interrupt any active shared scan."""
         self._stop.set()
+        scanner = getattr(self._reg, "scanner", None)
+        if scanner is not None and self._running.is_set():
+            scanner.stop_scan_flag = True
         t = self._thread
         if t and t.is_alive():
             t.join(timeout=2.0)
@@ -78,10 +84,19 @@ class BackgroundScanner:
         """Summary of the most recent completed run (per-source counts/errors)."""
         return self._last_run
 
+    def _owns_lifespan(self) -> bool:
+        """Whether this worker still belongs to the registry's active lifespan."""
+        return self._reg.owns_lifespan(self._lifespan_generation)
+
     def next_run_at(self) -> Optional[float]:
         """Epoch timestamp of the next scheduled run, or None if disabled."""
         cfg = self._reg.config or {}
-        if not cfg.get("background_scan_enabled"):
+        rss_active = (
+            cfg.get("hdencode_enabled", True) is True
+            and cfg.get("hdencode_discovery_mode")
+            in {"rss_shadow", "rss_primary"}
+        )
+        if not cfg.get("background_scan_enabled") and not rss_active:
             return None
         # The timestamp the loop is actually sleeping toward is authoritative;
         # fall back to last_run + interval before the loop has armed it.
@@ -95,11 +110,26 @@ class BackgroundScanner:
 
     def _interval_seconds(self) -> float:
         cfg = self._reg.config or {}
-        try:
-            hours = max(1, int(cfg.get("background_scan_interval_hours", 6)))
-        except (TypeError, ValueError):
-            hours = 6
-        return hours * 3600.0
+        intervals = []
+        if cfg.get("background_scan_enabled"):
+            try:
+                hours = max(1, int(cfg.get("background_scan_interval_hours", 6)))
+            except (TypeError, ValueError):
+                hours = 6
+            intervals.append(hours * 3600.0)
+        if (
+            cfg.get("hdencode_enabled", True) is True
+            and cfg.get("hdencode_discovery_mode")
+            in {"rss_shadow", "rss_primary"}
+        ):
+            try:
+                minutes = max(15, min(int(
+                    cfg.get("hdencode_rss_poll_minutes", 60)
+                ), 360))
+            except (TypeError, ValueError):
+                minutes = 60
+            intervals.append(max(300.0, minutes * 60.0 + self._rss_jitter_seconds))
+        return min(intervals) if intervals else 3600.0
 
     def _wait_interval(self) -> bool:
         """Sleep one interval, re-reading it in short slices so a change to
@@ -132,11 +162,18 @@ class BackgroundScanner:
                 self._next_run_ts = None
                 return  # stop requested
             cfg = self._reg.config or {}
-            if cfg.get("background_scan_enabled"):
+            rss_active = (
+                cfg.get("hdencode_enabled", True) is True
+                and cfg.get("hdencode_discovery_mode")
+                in {"rss_shadow", "rss_primary"}
+            )
+            if cfg.get("background_scan_enabled") or rss_active:
                 try:
                     self.scan_once()
                 except Exception:
                     logger.exception("Background scan failed")
+                finally:
+                    self._rss_jitter_seconds = random.uniform(-600.0, 600.0)
 
     # ── the scan itself ───────────────────────────────────────────────
 
@@ -150,11 +187,24 @@ class BackgroundScanner:
         cfg = reg.config or {}
         scanner = reg.scanner
         db = reg.db
+        if not self._owns_lifespan():
+            logger.info("Background scan abandoned: stale app lifespan")
+            return {
+                "scanned": 0, "cached": 0, "skipped": True,
+                "reason": "stale_lifespan",
+            }
         if scanner is None or db is None:
             logger.warning("Background scan skipped: scanner/db unavailable")
             return {"scanned": 0, "cached": 0, "skipped": True}
 
         sources = cfg.get("background_scan_sources") or _DEFAULT_SOURCES
+        rss_active = (
+            cfg.get("hdencode_enabled", True) is True
+            and cfg.get("hdencode_discovery_mode")
+            in {"rss_shadow", "rss_primary"}
+        )
+        if rss_active and not cfg.get("background_scan_enabled"):
+            sources = ["HDEncode"]
         try:
             pages = max(1, int(cfg.get("background_scan_pages", 3)))
         except (TypeError, ValueError):
@@ -179,17 +229,149 @@ class BackgroundScanner:
         # they aren't purged while still listed.
         cached_urls = db.get_background_cache_urls()
         total = 0
-        any_early_stopped = False
+        # Purging is safe only when every configured source completed a full
+        # crawl.  A disabled source is intentionally not visited, just like an
+        # early-stopped source is only partially visited.
+        purge_safe = True
         source_results: List[Dict[str, Any]] = []
+        rss_cycle = None
+        discovery_mode = cfg.get(
+            "hdencode_discovery_mode", "listing"
+        )
         try:
+            if (
+                "HDEncode" in sources
+                and discovery_mode in {"rss_shadow", "rss_primary"}
+            ):
+                from backend.hdencode_rss_service import HDEncodeRSSService
+                stop_requested = lambda: (
+                    self._stop.is_set()
+                    or not self._owns_lifespan()
+                )
+                rss_cycle = HDEncodeRSSService(cfg, db).poll_cycle(
+                    stop_requested=stop_requested,
+                )
+                if stop_requested():
+                    return {
+                        "scanned": 0,
+                        "cached": 0,
+                        "skipped": True,
+                        "reason": "stale_lifespan",
+                    }
+                from backend.hdencode_candidate_service import (
+                    HDEncodeCandidateService,
+                )
+                candidate_service = HDEncodeCandidateService(cfg, db)
+                rss_cycle["classification"] = (
+                    candidate_service.classify_pending(
+                        stop_requested=stop_requested,
+                    )
+                )
+                detail_scraper = getattr(
+                    getattr(scanner, "scrapers", None),
+                    "_detail",
+                    None,
+                )
+                if detail_scraper is not None and not stop_requested():
+                    rss_cycle["hydration"] = (
+                        candidate_service.hydrate_pending(
+                            detail_scraper,
+                            stop_requested=stop_requested,
+                        )
+                    )
+                if (
+                    cfg.get("hdencode_rss_auto_grab_enabled") is True
+                    and not stop_requested()
+                ):
+                    from backend.hdencode_action_service import (
+                        HDEncodeActionService,
+                    )
+                    try:
+                        action_service = HDEncodeActionService(
+                            cfg, db, getattr(self._reg, "download", None)
+                        )
+                        queued_actions = (
+                            action_service.queue_approved_auto_actions(
+                                limit=1,
+                                lifespan_generation=getattr(
+                                    self, "_lifespan_generation", None
+                                ),
+                                stop_requested=stop_requested,
+                            )
+                        )
+                        action_results = []
+                        for queued_action in queued_actions:
+                            if stop_requested():
+                                break
+                            result = action_service.run_action(
+                                queued_action["action_uuid"],
+                                owns_lifespan=self._owns_lifespan,
+                            )
+                            action_results.append({
+                                "action_uuid": result.get("action_uuid"),
+                                "state": result.get("state"),
+                            })
+                        rss_cycle["auto_actions"] = action_results
+                    except Exception:
+                        logger.exception("RSS automatic action cycle failed")
+                        rss_cycle["auto_actions_error"] = "action_cycle_failed"
+                if stop_requested():
+                    return {
+                        "scanned": 0,
+                        "cached": 0,
+                        "skipped": True,
+                        "reason": "stale_lifespan",
+                    }
             for source in sources:
+                if (str(source).strip().lower() == "hdencode"
+                        and not cfg.get("hdencode_enabled", True)):
+                    logger.info("Background scan: HDEncode disabled; skipping without network access")
+                    source_results.append({
+                        "source": source, "new": 0, "error": None,
+                        "skipped": "disabled",
+                    })
+                    purge_safe = False
+                    continue
+
+                is_hdencode = str(source).lower() == "hdencode"
+                if is_hdencode and discovery_mode == "rss_primary":
+                    if not (
+                        rss_cycle
+                        and rss_cycle.get("fallback_qualified")
+                    ):
+                        source_results.append({
+                            "source": source,
+                            "new": 0,
+                            "error": None,
+                            "skipped": "rss_primary",
+                        })
+                        continue
+                    source_pages = 1
+                    rss_cycle["listing_fallback_started"] = True
+                else:
+                    source_pages = pages
                 err: Optional[str] = None
                 items: List[Any] = []
                 try:
-                    items = self._scan_source(source, pages, cached_urls)
+                    items = self._scan_source(
+                        source, source_pages, cached_urls
+                    )
                 except Exception as e:
                     err = str(e)
                     logger.exception("Background scan of source %s failed", source)
+
+                # A source scan can block past teardown's bounded join. Re-check
+                # ownership before any captured DB object or the reused registry
+                # can be mutated.
+                if not self._owns_lifespan():
+                    logger.info(
+                        "Background scan abandoned after source %s: stale app lifespan",
+                        source,
+                    )
+                    return {
+                        "scanned": 0, "cached": 0, "skipped": True,
+                        "reason": "stale_lifespan",
+                    }
 
                 # Refresh last_seen for still-listed items we skipped re-scraping.
                 if not err:
@@ -197,13 +379,57 @@ class BackgroundScanner:
                     if seen:
                         db.touch_background_cache(seen)
                     if getattr(scanner, "_last_crawl_early_stopped", False):
-                        any_early_stopped = True
+                        purge_safe = False
+
+                if (
+                    is_hdencode
+                    and discovery_mode == "rss_shadow"
+                    and rss_cycle
+                    and cfg.get("hdencode_rss_shadow_compare_enabled", True)
+                ):
+                    from datetime import datetime, timezone
+                    import uuid
+                    from backend.hdencode_shadow import compare_shadow
+                    normal = {
+                        result.get("feed"): result.get("outcome")
+                        for result in rss_cycle.get("feeds", [])
+                        if result.get("feed") in {"movies_all", "tv_all"}
+                    }
+                    metrics = compare_shadow(
+                        rss_urls=rss_cycle.get("candidate_urls", []),
+                        listing_items=items,
+                        rss_requests=rss_cycle.get("requests", 0),
+                        listing_requests=getattr(
+                            scanner, "_last_crawl_request_count", source_pages
+                        ),
+                        normal_feeds_complete=(
+                            set(normal) == {"movies_all", "tv_all"}
+                            and all(value in {"changed", "not_modified"} for value in normal.values())
+                        ),
+                    ).as_dict()
+                    completed_at = datetime.now(timezone.utc).isoformat()
+                    db.record_hdencode_shadow_comparison(
+                        cycle_uuid=str(uuid.uuid4()),
+                        started_at=completed_at,
+                        completed_at=completed_at,
+                        metrics=metrics,
+                        catchup_used=rss_cycle.get("catchup_used", False),
+                        restart_recovery=rss_cycle.get("restart_recovery", False),
+                    )
+                    rss_cycle["comparison"] = metrics
 
                 rows = self._to_cache_rows(items, source)
                 if rows:
                     db.upsert_background_cache(rows)
                     total += len(rows)
                 source_results.append({"source": source, "new": len(rows), "error": err})
+
+            if not self._owns_lifespan():
+                logger.info("Background scan abandoned before cache re-match: stale app lifespan")
+                return {
+                    "scanned": 0, "cached": 0, "skipped": True,
+                    "reason": "stale_lifespan",
+                }
 
             # Refresh library/downloaded status across the WHOLE cache (cheap —
             # no re-scraping) so already-cached items reflect the current Plex
@@ -218,8 +444,11 @@ class BackgroundScanner:
             # deeper pages, so its seen-set is partial and last_seen wasn't
             # refreshed for still-listed items further down — purging now would
             # age out releases that are still on the site.
-            if any_early_stopped:
-                logger.info("Background scan: a source stopped early, skipping cache purge this run")
+            if not purge_safe:
+                logger.info(
+                    "Background scan: a source was disabled or stopped early; "
+                    "skipping cache purge this run"
+                )
             else:
                 try:
                     retain = max(1, int(cfg.get("background_scan_retain_days", 7)))
@@ -236,6 +465,13 @@ class BackgroundScanner:
             self._running.clear()
             scanner.release_scan()
 
+        if not self._owns_lifespan():
+            logger.info("Background scan abandoned before completion publish: stale app lifespan")
+            return {
+                "scanned": 0, "cached": 0, "skipped": True,
+                "reason": "stale_lifespan",
+            }
+
         cached = db.count_background_cache()
         self._last_run = {
             "at": time.time(),
@@ -243,6 +479,7 @@ class BackgroundScanner:
             "cached": cached,
             "rematched": rematched,
             "sources": source_results,
+            "rss": rss_cycle,
         }
         logger.info(
             "Background scan complete: %d new/updated from %d source(s), %d cached",

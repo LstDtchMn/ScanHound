@@ -40,6 +40,42 @@ def _should_auto_connect_plex(config: Dict[str, Any]) -> bool:
     return bool(config.get("plex_url") and config.get("plex_token"))
 
 
+# Every object in this tuple belongs to exactly one FastAPI lifespan.  Keeping
+# any of them across TestClient/app lifespans lets a new startup reach a service
+# whose AppService/DatabaseManager was already shut down.
+_REGISTRY_LIFESPAN_FIELDS = (
+    "backend",
+    "db",
+    "bridge",
+    "_scanner_service",
+    "_plex_service",
+    "_download_service",
+    "_auto_grab_service",
+    "_notification_bridge",
+    "_watchlist_manager",
+    "_analytics_dashboard",
+    "_background_scanner",
+    "_rename_service",
+    "_plex_metadata_scan_job",
+)
+
+
+def _clear_registry_lifespan_state(reg: ServiceRegistry) -> None:
+    """Drop every reference owned by a completed or abandoned lifespan."""
+    for field_name in _REGISTRY_LIFESPAN_FIELDS:
+        setattr(reg, field_name, None)
+    reg.config = {}
+
+
+def _prepare_registry_for_startup(reg: ServiceRegistry) -> int:
+    """Make a reused registry fresh and return its new ownership generation."""
+    # Advancing the generation before clearing references means an old worker
+    # remains stale even after begin_lifespan() clears the shared shutdown event.
+    generation = reg.begin_lifespan()
+    _clear_registry_lifespan_state(reg)
+    return generation
+
+
 def _init_services(
     reg: ServiceRegistry,
     config_override: Optional[Dict[str, Any]] = None,
@@ -52,8 +88,18 @@ def _init_services(
     from backend.app_service import AppService
     from backend.notification_bridge import NotificationBridge
 
-    # Core backend — config, DB, plex manager, optional subsystems
+    # A module-level registry is intentionally reused by create_app(), including
+    # repeated TestClient lifespans.  Clear the previous lifespan *before*
+    # AppService.startup() runs its synchronous maintenance pass, otherwise that
+    # pass can reach a stale RenameService whose DB was already closed.
+    _prepare_registry_for_startup(reg)
+
+    # Publish the new backend object immediately.  AppService.startup() creates
+    # its DatabaseManager internally, so reg.db cannot truthfully be assigned
+    # before startup; the critical safety property is that no old service or DB
+    # reference remains reachable while startup maintenance executes.
     backend = AppService()
+    reg.backend = backend
     startup_warnings = backend.startup()
     for w in startup_warnings:
         logger.warning("Startup warning: %s", w)
@@ -438,29 +484,34 @@ def _within(path: str, base: str) -> bool:
 
 
 def _teardown_services(reg: ServiceRegistry) -> None:
-    """Gracefully shut down all services."""
+    """Gracefully shut down one lifespan, then erase its complete object graph."""
     reg.request_shutdown()  # stop the background results poller
-    if reg._background_scanner:
-        try:
-            reg._background_scanner.stop()
-        except Exception:
-            pass
-    if reg._notification_bridge:
-        try:
-            reg._notification_bridge.shutdown()
-        except Exception:
-            pass
-    if reg._watchlist_manager:
-        try:
-            reg._watchlist_manager.close()
-        except Exception:
-            pass
-    if reg.backend:
-        try:
-            reg.backend.shutdown()
-        except Exception:
-            pass
-
+    try:
+        if reg._background_scanner:
+            try:
+                reg._background_scanner.stop()
+            except Exception:
+                pass
+        if reg._notification_bridge:
+            try:
+                reg._notification_bridge.shutdown()
+            except Exception:
+                pass
+        if reg._watchlist_manager:
+            try:
+                reg._watchlist_manager.close()
+            except Exception:
+                pass
+        if reg.backend:
+            try:
+                reg.backend.shutdown()
+            except Exception:
+                pass
+    finally:
+        # Even a failing shutdown hook must not leak a closed DB/service into the
+        # next lifespan.  Leave the shutdown event set until the next startup so
+        # late old threads still observe cancellation.
+        _clear_registry_lifespan_state(reg)
 
 def create_app(
     config_override: Optional[Dict[str, Any]] = None,
@@ -524,14 +575,14 @@ def create_app(
         return await call_next(request)
 
     # Register route modules
-    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler, auth, background, rename, pipeline
+    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler, auth, background, rename, pipeline, rss
     from backend.api import ws
 
     api_routers = [
         system.router, auth.router, ws.router, settings.router, sources.router,
         plex.router, scanner.router, results.router, downloads.router,
         analytics.router, watchlist.router, scheduler.router, background.router,
-        rename.router, pipeline.router,
+        rename.router, pipeline.router, rss.router,
     ]
     for router in api_routers:
         app.include_router(router)

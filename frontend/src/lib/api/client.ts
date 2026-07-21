@@ -3,6 +3,30 @@ import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
+export type PublicErrorDetail = {
+  code?: string;
+  message?: string;
+  correlation_id?: string;
+};
+
+export function formatErrorDetail(detail: unknown): string | undefined {
+  if (typeof detail === 'string') {
+    return detail;
+  }
+  if (!detail || typeof detail !== 'object') {
+    return undefined;
+  }
+  const candidate = detail as PublicErrorDetail;
+  if (typeof candidate.message !== 'string' || !candidate.message.trim()) {
+    return undefined;
+  }
+  if (typeof candidate.correlation_id === 'string' && candidate.correlation_id) {
+    return `${candidate.message} (Reference: ${candidate.correlation_id})`;
+  }
+  return candidate.message;
+}
+
+
 /** Auth token: a stored token (Android/remote) seeds it; the Tauri sidecar or
  *  setAuthNonce() can override at runtime. Empty = dev mode (no auth). */
 let authNonce = getStoredToken();
@@ -65,7 +89,7 @@ async function request<T>(path: string, options?: RequestInit, timeoutMs = REQUE
     let detail: string | undefined;
     try {
       const body = await resp.clone().json();
-      detail = body?.detail;
+      detail = formatErrorDetail(body?.detail);
     } catch {
       // non-JSON error body — fall through to the generic message
     }
@@ -173,6 +197,68 @@ export const api = {
       items: { id: number; imdb_id: string | null; title: string; year: number | null; media_type: string; created_at: string }[];
       count: number;
     }>('/results/bookmarks'),
+
+  // HDEncode RSS operations
+  rssStatus: () => request<any>('/rss/status'),
+  rssCandidates: (state?: string, hydration?: string, limit = 250) => {
+    const params = new URLSearchParams();
+    if (state) params.set('state', state);
+    if (hydration) params.set('hydration', hydration);
+    params.set('limit', String(limit));
+    return request<{ items: any[]; count: number }>(`/rss/candidates?${params}`);
+  },
+  rssHydration: (limit = 250) =>
+    request<{ items: any[]; count: number }>(`/rss/hydration?limit=${limit}`),
+  rssSetMode: (mode: 'listing' | 'rss_shadow' | 'rss_primary') =>
+    request<{ mode: string }>('/rss/mode', {
+      method: 'POST',
+      body: JSON.stringify({ mode })
+    }),
+  rssHydrate: (canonicalUrl: string) =>
+    request<{ status: string; canonical_url: string }>('/rss/hydrate', {
+      method: 'POST',
+      body: JSON.stringify({ canonical_url: canonicalUrl })
+    }),
+  rssRetry: (canonicalUrl: string) =>
+    request<{ status: string; canonical_url: string }>('/rss/retry', {
+      method: 'POST',
+      body: JSON.stringify({ canonical_url: canonicalUrl })
+    }),
+
+  rssActions: (state?: string, limit = 250) => {
+    const params = new URLSearchParams();
+    if (state) params.set('state', state);
+    params.set('limit', String(limit));
+    return request<{ items: any[]; count: number }>(`/rss/actions?${params}`);
+  },
+  rssStartAction: (
+    canonicalUrl: string,
+    actionKind: 'retrieve_links' | 'grab',
+    serviceType = 'Rapidgator',
+    idempotencyKey?: string
+  ) => request<{ status: string; action_uuid: string; created: boolean }>(
+    '/rss/actions',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        canonical_url: canonicalUrl,
+        action_kind: actionKind,
+        service_type: serviceType,
+        idempotency_key: idempotencyKey
+      })
+    }
+  ),
+  rssCancelAction: (actionUuid: string) =>
+    request<{ action_uuid: string; status: string }>(
+      `/rss/actions/${encodeURIComponent(actionUuid)}/cancel`,
+      { method: 'POST' }
+    ),
+  rssRetryAction: (actionUuid: string) =>
+    request<{ action_uuid: string; status: string }>(
+      `/rss/actions/${encodeURIComponent(actionUuid)}/retry`,
+      { method: 'POST' }
+    ),
+
 
   // Plex
   plexConnect: () => request('/plex/connect', { method: 'POST' }),
