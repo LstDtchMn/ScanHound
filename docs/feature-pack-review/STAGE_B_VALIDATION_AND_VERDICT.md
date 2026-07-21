@@ -174,6 +174,44 @@ and fixed (see the "Identity safety" commit):
   no-ignore suite **3964/0** (3 network tests deselected) + the 62-test
   identity regression set. Frontend unchanged from `6939220` (backend-only fix).
 
+## 5d. One Big Push — final runnable closure + environment gates
+
+Executed the "One Big Push" plan Phases 0–4. **Code-tested SHA `a6b4a7b`**
+(closure applied on `479299f`, then committed).
+
+**Phase 1 — final runnable closure** (`scanhound-stage-b-final-runnable-closure`,
+SHA-256 `4af08062…78c4002`, verified before apply; head + all 3 blob guards
+matched exactly — authored against the real pushed head):
+- year provenance: hydrated detail-page year persists as `description_year`;
+  `title_year` (RSS parse) preserved → independent year sources, so the
+  conflict check blocks promotion meaningfully;
+- `_identity_is_confirmed` accepts either non-conflicting year source for movies;
+- `TestDownloads` autouse fixture no-ops `BackgroundTasks.add_task` → the 3
+  previously-deselected download-route tests now RUN with no scrape/JDownloader;
+- `test_hdencode_year_provenance.py` — year provenance + conflict regressions
+  (real SQLite);
+- `test_fileops_writer_guard_contract.py` — AST contract asserting all **11**
+  trash-mutation entry points guard-first, plus fail-closed dynamic tests with
+  the global `_unlocked_fileops_for_tests` bypass DISABLED (closes the §5b
+  honesty gap — the guards now have executable coverage).
+
+**Phase 2 — unrestricted validation:**
+
+| Gate | Command | Result |
+|---|---|---|
+| Full backend, NO `--ignore`/`--deselect`/signal-timeout | `pytest -q` | **3974 passed, 4 skipped, 0 failed** | Py 3.12.13, root |
+| Frontend | check / vitest / build | 0 errors · **373 passed** · clean | node v24.14.0, npm 11.9.0 |
+| `git diff --check` | — | clean |
+
+**Phase 4 — environment gates (attempted now):**
+
+| Track | Result |
+|---|---|
+| **A — Python 3.11** | **PASS** — core modules import on 3.11.15; full non-browser suite **3804 passed / 0 failed** (fresh `python:3.11-slim` + `requirements-docker.txt` + pytest-asyncio). Browser-launching scraper files (`test_scrapers`, `test_scrapers_extended`, `test_rt_scraper`) need apt chromium/chromedriver — an image-provisioning dependency identical on 3.12, not a 3.11 issue. |
+| **B — UID 1000** | **PASS** — full unrestricted suite as `1000:1000` = **3974 passed / 0 failed**, identical to root; app init, runtime-lock acquisition, trash transactions, and RSS/action recovery all correct as non-root. |
+| **C — Playwright production E2E** | NOT RUN — needs a browser + running app+backend harness in the sandbox. The occupied-port/state-isolation properties it targets are covered at the unit level by PR #14 within the 3974 suite; full browser E2E is a dedicated-environment run. |
+| **D — production-schema migration matrix** | PARTIAL — the additive path (SCHEMA v4→5→6, `CREATE TABLE IF NOT EXISTS` + guarded `ALTER`, zero destructive ops) and a clean reopen are proven in-suite. The full matrix (byte-for-byte production-DB copy, interrupt-during-migration, old-image reopen, documented rollback) requires a production-DB snapshot Jesse provides; the running production instance was not touched. |
+
 ## 6. FINAL VERDICT
 
 The complete feature pack is assembled on `agent/feature-pack-integration`
@@ -187,10 +225,13 @@ hostname verification is intact. Both ChatGPT peer-review issues (no-exclusion
 run; hydrated-identity promotion) are resolved (§5c). No production regression
 was found in any track.
 
-Acceptance still depends on environment evidence that cannot be produced here
-and must not be simulated: Python 3.11, UID 1000, Playwright isolation,
-production-schema migration/rollback, the seven-day ≥20-cycle RSS shadow gate,
-and the Jesse-authorized filesystem sentinel.
+Since the last verdict, two more environment gates were executed and are now
+GREEN: **Python 3.11** (3804/0 non-browser) and **UID 1000** (3974/0). The
+remaining acceptance evidence still cannot be produced here and must not be
+simulated: Playwright production-build E2E, the full production-schema
+migration/interrupt/old-image-reopen/rollback matrix (needs a production-DB
+snapshot), the seven-day ≥20-cycle RSS shadow gate, and the Jesse-authorized
+filesystem sentinel.
 
 ### **FEATURE PACK REQUIRES ENVIRONMENT EVIDENCE**
 
