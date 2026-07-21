@@ -44,12 +44,10 @@ class HDEncodeSource(SourceBase):
                 SourceCapability.MOVIES |
                 SourceCapability.TV_SHOWS |
                 SourceCapability.PAGINATION |
-                SourceCapability.SEARCH |
-                SourceCapability.DIRECT_LINKS |
-                SourceCapability.CLOUDFLARE_BYPASS
+                SourceCapability.SEARCH
             ),
             rate_limit=2.0,  # Be respectful
-            requires_cloudflare_bypass=True,
+            requires_cloudflare_bypass=False,
             timeout=30,
             priority=100
         )

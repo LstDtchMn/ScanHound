@@ -225,6 +225,41 @@ export const api = {
       body: JSON.stringify({ canonical_url: canonicalUrl })
     }),
 
+  rssActions: (state?: string, limit = 250) => {
+    const params = new URLSearchParams();
+    if (state) params.set('state', state);
+    params.set('limit', String(limit));
+    return request<{ items: any[]; count: number }>(`/rss/actions?${params}`);
+  },
+  rssStartAction: (
+    canonicalUrl: string,
+    actionKind: 'retrieve_links' | 'grab',
+    serviceType = 'Rapidgator',
+    idempotencyKey?: string
+  ) => request<{ status: string; action_uuid: string; created: boolean }>(
+    '/rss/actions',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        canonical_url: canonicalUrl,
+        action_kind: actionKind,
+        service_type: serviceType,
+        idempotency_key: idempotencyKey
+      })
+    }
+  ),
+  rssCancelAction: (actionUuid: string) =>
+    request<{ action_uuid: string; status: string }>(
+      `/rss/actions/${encodeURIComponent(actionUuid)}/cancel`,
+      { method: 'POST' }
+    ),
+  rssRetryAction: (actionUuid: string) =>
+    request<{ action_uuid: string; status: string }>(
+      `/rss/actions/${encodeURIComponent(actionUuid)}/retry`,
+      { method: 'POST' }
+    ),
+
+
   // Plex
   plexConnect: () => request('/plex/connect', { method: 'POST' }),
   plexStatus: () => request<PlexStatus>('/plex/status'),

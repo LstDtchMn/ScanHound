@@ -218,7 +218,7 @@ class DatabaseManager:
     # ── Schema initialization ────────────────────────────────────────
 
     # Schema version — increment when migrations are added.
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     def init_db(self):
         """Initialize database tables and run schema migrations.
@@ -910,6 +910,55 @@ class DatabaseManager:
                     except sqlite3.OperationalError as exc:
                         if "duplicate column" not in str(exc).lower():
                             raise
+
+                # Persistent RSS candidate actions (v6, additive-only).
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_actions (
+                        action_uuid TEXT PRIMARY KEY,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        canonical_url TEXT NOT NULL,
+                        action_kind TEXT NOT NULL,
+                        requested_by TEXT NOT NULL,
+                        service_type TEXT NOT NULL,
+                        priority INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        package_name TEXT,
+                        destination TEXT,
+                        links_json TEXT NOT NULL DEFAULT '[]',
+                        link_count INTEGER NOT NULL DEFAULT 0,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        cancel_requested INTEGER NOT NULL DEFAULT 0,
+                        queued_at TEXT NOT NULL,
+                        claimed_at TEXT,
+                        links_ready_at TEXT,
+                        submitted_at TEXT,
+                        completed_at TEXT,
+                        cancelled_at TEXT,
+                        updated_at TEXT NOT NULL,
+                        last_error_code TEXT,
+                        correlation_id TEXT,
+                        authorized_evidence_json TEXT NOT NULL DEFAULT '{}',
+                        lifespan_generation INTEGER,
+                        FOREIGN KEY (canonical_url)
+                            REFERENCES hdencode_candidates(canonical_url)
+                            ON DELETE CASCADE
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_hdencode_actions_queue
+                    ON hdencode_actions(state, priority DESC, queued_at)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_hdencode_actions_candidate
+                    ON hdencode_actions(canonical_url, updated_at DESC)
+                """)
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_hdencode_actions_active
+                    ON hdencode_actions(canonical_url)
+                    WHERE state IN (
+                        'queued', 'retrieving_links', 'links_ready', 'submitting'
+                    )
+                """)
 
                 # ── Stamp current version ────────────────────────────────
                 cursor.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
@@ -1853,6 +1902,382 @@ class DatabaseManager:
         if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
         if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")
         return {"ready":not reasons,"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
+
+    # ── HDEncode candidate actions ─────────────────────────────────────
+
+    def get_hdencode_action(self, action_uuid):
+        row = self._query(
+            "SELECT * FROM hdencode_actions WHERE action_uuid = ?",
+            (action_uuid,), one=True, default=None,
+        )
+        return dict(row) if row is not None else None
+
+    def list_hdencode_actions(self, *, state=None, limit=250):
+        params = []
+        where = ""
+        if state:
+            where = " WHERE a.state = ?"
+            params.append(state)
+        params.append(max(1, min(int(limit), 1000)))
+        return self._query_dicts(
+            "SELECT a.*, c.title, c.clean_title, c.resolution, "
+            "c.dv_evidence, c.hdr_evidence, c.discovery_source "
+            "FROM hdencode_actions a JOIN hdencode_candidates c "
+            "ON c.canonical_url = a.canonical_url"
+            + where
+            + " ORDER BY a.updated_at DESC LIMIT ?",
+            tuple(params), default=[],
+        )
+
+    def create_hdencode_action(
+        self, *, action_uuid, idempotency_key, canonical_url, action_kind,
+        requested_by, service_type, priority, package_name, destination,
+        lifespan_generation, authorized_evidence,
+    ):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            existing = conn.execute(
+                "SELECT * FROM hdencode_actions WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                result = dict(existing)
+                result["created"] = False
+                result["idempotent"] = True
+                return result
+            active = conn.execute(
+                "SELECT * FROM hdencode_actions WHERE canonical_url = ? "
+                "AND state IN ('queued','retrieving_links','links_ready','submitting')",
+                (canonical_url,),
+            ).fetchone()
+            if active is not None:
+                result = dict(active)
+                result["created"] = False
+                result["conflict"] = True
+                return result
+            conn.execute(
+                """
+                INSERT INTO hdencode_actions (
+                    action_uuid, idempotency_key, canonical_url, action_kind,
+                    requested_by, service_type, priority, state, package_name,
+                    destination, queued_at, updated_at,
+                    authorized_evidence_json, lifespan_generation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    action_uuid, idempotency_key, canonical_url, action_kind,
+                    requested_by, service_type, int(priority), package_name,
+                    destination, now, now,
+                    json.dumps(authorized_evidence or {}, sort_keys=True),
+                    lifespan_generation,
+                ),
+            )
+            conn.execute(
+                "UPDATE hdencode_candidates SET action_state='queued', "
+                "updated_at=? WHERE canonical_url=?",
+                (now, canonical_url),
+            )
+            result = dict(conn.execute(
+                "SELECT * FROM hdencode_actions WHERE action_uuid = ?",
+                (action_uuid,),
+            ).fetchone())
+            result["created"] = True
+            return result
+
+    def claim_hdencode_action(self, action_uuid):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            changed = conn.execute(
+                """UPDATE hdencode_actions
+                   SET state='retrieving_links', attempts=attempts+1,
+                       claimed_at=?, cancel_requested=0, updated_at=?,
+                       last_error_code=NULL, correlation_id=NULL
+                   WHERE action_uuid=? AND state='queued'""",
+                (now, now, action_uuid),
+            ).rowcount
+            if changed != 1:
+                return None
+            row = conn.execute(
+                """SELECT a.*, c.title, c.clean_title, c.resolution,
+                          c.size_text, c.season, c.title_year,
+                          c.description_year, c.dv_evidence, c.hdr_formats
+                   FROM hdencode_actions a
+                   JOIN hdencode_candidates c
+                     ON c.canonical_url=a.canonical_url
+                   WHERE a.action_uuid=?""",
+                (action_uuid,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE hdencode_candidates SET action_state='retrieving_links', "
+                "updated_at=? WHERE canonical_url=?",
+                (now, row["canonical_url"]),
+            )
+            return dict(row)
+
+    def hdencode_action_cancel_requested(self, action_uuid):
+        row = self._query(
+            "SELECT cancel_requested, state FROM hdencode_actions "
+            "WHERE action_uuid=?",
+            (action_uuid,), one=True, default=None,
+        )
+        return bool(row and (row[0] or row[1] == "cancelled"))
+
+    def mark_hdencode_action_links_ready(self, action_uuid, *, links):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            row = conn.execute(
+                "SELECT canonical_url FROM hdencode_actions WHERE action_uuid=?",
+                (action_uuid,),
+            ).fetchone()
+            if row is None:
+                return False
+            changed = conn.execute(
+                """UPDATE hdencode_actions
+                   SET state='links_ready', links_json=?, link_count=?,
+                       links_ready_at=?, claimed_at=NULL, updated_at=?
+                   WHERE action_uuid=? AND state='retrieving_links'""",
+                (json.dumps(list(links)), len(list(links)), now, now, action_uuid),
+            ).rowcount
+            if changed:
+                conn.execute(
+                    "UPDATE hdencode_candidates SET action_state='links_ready', "
+                    "updated_at=? WHERE canonical_url=?",
+                    (now, row["canonical_url"]),
+                )
+            return changed == 1
+
+    def mark_hdencode_action_submitting(self, action_uuid):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            row = conn.execute(
+                "SELECT canonical_url FROM hdencode_actions WHERE action_uuid=?",
+                (action_uuid,),
+            ).fetchone()
+            if row is None:
+                return False
+            changed = conn.execute(
+                """UPDATE hdencode_actions
+                   SET state='submitting', updated_at=?
+                   WHERE action_uuid=? AND state='links_ready'
+                     AND cancel_requested=0""",
+                (now, action_uuid),
+            ).rowcount
+            if changed:
+                conn.execute(
+                    "UPDATE hdencode_candidates SET action_state='submitting', "
+                    "updated_at=? WHERE canonical_url=?",
+                    (now, row["canonical_url"]),
+                )
+            return changed == 1
+
+    def complete_hdencode_action_submitted(self, action_uuid):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            row = conn.execute(
+                "SELECT canonical_url FROM hdencode_actions WHERE action_uuid=?",
+                (action_uuid,),
+            ).fetchone()
+            if row is None:
+                return False
+            changed = conn.execute(
+                """UPDATE hdencode_actions
+                   SET state='submitted', submitted_at=?, completed_at=?,
+                       claimed_at=NULL, updated_at=?
+                   WHERE action_uuid=? AND state='submitting'""",
+                (now, now, now, action_uuid),
+            ).rowcount
+            if changed:
+                conn.execute(
+                    "UPDATE hdencode_candidates SET action_state='submitted', "
+                    "updated_at=? WHERE canonical_url=?",
+                    (now, row["canonical_url"]),
+                )
+            return changed == 1
+
+    def fail_hdencode_action(self, action_uuid, *, error_code, correlation_id=None):
+        return self._finish_hdencode_action(
+            action_uuid, state="failed", error_code=error_code,
+            correlation_id=correlation_id,
+        )
+
+    def mark_hdencode_action_needs_review(
+        self, action_uuid, *, error_code, correlation_id=None
+    ):
+        return self._finish_hdencode_action(
+            action_uuid, state="needs_review", error_code=error_code,
+            correlation_id=correlation_id,
+        )
+
+    def _finish_hdencode_action(
+        self, action_uuid, *, state, error_code=None, correlation_id=None
+    ):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            row = conn.execute(
+                "SELECT canonical_url FROM hdencode_actions WHERE action_uuid=?",
+                (action_uuid,),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                """UPDATE hdencode_actions
+                   SET state=?, claimed_at=NULL, updated_at=?,
+                       last_error_code=?, correlation_id=?
+                   WHERE action_uuid=?""",
+                (state, now, error_code, correlation_id, action_uuid),
+            )
+            conn.execute(
+                "UPDATE hdencode_candidates SET action_state=?, updated_at=? "
+                "WHERE canonical_url=?",
+                (state, now, row["canonical_url"]),
+            )
+            return True
+
+    def request_cancel_hdencode_action(self, action_uuid):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            row = conn.execute(
+                "SELECT canonical_url, state FROM hdencode_actions "
+                "WHERE action_uuid=?",
+                (action_uuid,),
+            ).fetchone()
+            if row is None:
+                return None
+            state = row["state"]
+            if state in {"submitted", "needs_review"}:
+                return dict(conn.execute(
+                    "SELECT * FROM hdencode_actions WHERE action_uuid=?",
+                    (action_uuid,),
+                ).fetchone())
+            immediate = state in {"queued", "links_ready", "failed"}
+            new_state = "cancelled" if immediate else state
+            conn.execute(
+                """UPDATE hdencode_actions
+                   SET cancel_requested=1, state=?, cancelled_at=CASE
+                         WHEN ? THEN ? ELSE cancelled_at END,
+                       updated_at=? WHERE action_uuid=?""",
+                (new_state, 1 if immediate else 0, now, now, action_uuid),
+            )
+            if immediate:
+                conn.execute(
+                    "UPDATE hdencode_candidates SET action_state='cancelled', "
+                    "updated_at=? WHERE canonical_url=?",
+                    (now, row["canonical_url"]),
+                )
+            return dict(conn.execute(
+                "SELECT * FROM hdencode_actions WHERE action_uuid=?",
+                (action_uuid,),
+            ).fetchone())
+
+    def cancel_hdencode_action(self, action_uuid, *, reason):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            row = conn.execute(
+                "SELECT canonical_url FROM hdencode_actions WHERE action_uuid=?",
+                (action_uuid,),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                """UPDATE hdencode_actions
+                   SET state='cancelled', cancel_requested=1,
+                       cancelled_at=?, claimed_at=NULL, updated_at=?,
+                       last_error_code=? WHERE action_uuid=?""",
+                (now, now, reason, action_uuid),
+            )
+            conn.execute(
+                "UPDATE hdencode_candidates SET action_state='cancelled', "
+                "updated_at=? WHERE canonical_url=?",
+                (now, row["canonical_url"]),
+            )
+            return True
+
+    def retry_hdencode_action(self, action_uuid):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            row = conn.execute(
+                "SELECT canonical_url, state FROM hdencode_actions "
+                "WHERE action_uuid=?",
+                (action_uuid,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["state"] not in {"failed", "cancelled"}:
+                return dict(conn.execute(
+                    "SELECT * FROM hdencode_actions WHERE action_uuid=?",
+                    (action_uuid,),
+                ).fetchone())
+            conn.execute(
+                """UPDATE hdencode_actions
+                   SET state='queued', cancel_requested=0,
+                       queued_at=?, claimed_at=NULL, links_json='[]',
+                       link_count=0, links_ready_at=NULL, submitted_at=NULL,
+                       completed_at=NULL, cancelled_at=NULL, updated_at=?,
+                       last_error_code=NULL, correlation_id=NULL
+                   WHERE action_uuid=?""",
+                (now, now, action_uuid),
+            )
+            conn.execute(
+                "UPDATE hdencode_candidates SET action_state='queued', "
+                "updated_at=? WHERE canonical_url=?",
+                (now, row["canonical_url"]),
+            )
+            return dict(conn.execute(
+                "SELECT * FROM hdencode_actions WHERE action_uuid=?",
+                (action_uuid,),
+            ).fetchone())
+
+    def recover_hdencode_actions(self):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                return {"requeued": 0, "needs_review": 0}
+            requeued = conn.execute(
+                """UPDATE hdencode_actions
+                   SET state='queued', claimed_at=NULL, updated_at=?,
+                       last_error_code='recovered_after_restart'
+                   WHERE state='retrieving_links'""",
+                (now,),
+            ).rowcount
+            needs_review = conn.execute(
+                """UPDATE hdencode_actions
+                   SET state='needs_review', claimed_at=NULL, updated_at=?,
+                       last_error_code='submission_interrupted'
+                   WHERE state='submitting'""",
+                (now,),
+            ).rowcount
+            conn.execute(
+                """UPDATE hdencode_candidates
+                   SET action_state=(
+                       SELECT a.state FROM hdencode_actions a
+                       WHERE a.canonical_url=hdencode_candidates.canonical_url
+                       ORDER BY a.updated_at DESC LIMIT 1
+                   ), updated_at=?
+                   WHERE canonical_url IN (
+                       SELECT canonical_url FROM hdencode_actions
+                       WHERE state IN ('queued','needs_review')
+                   )""",
+                (now,),
+            )
+            return {"requeued": requeued, "needs_review": needs_review}
 
     # ── Plex cache ───────────────────────────────────────────────────
 

@@ -3,6 +3,7 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import { canEnablePrimary, evidenceLabel, reasonLabel } from '$lib/rss/status';
+  import { canCancelAction, canCopyActionLinks, canRetryAction } from '$lib/rss/actions';
 
   type FeedState = {
     feed_key: string;
@@ -47,6 +48,24 @@
     discovery_source?: string | null;
   };
 
+  type CandidateAction = {
+    action_uuid: string;
+    canonical_url: string;
+    action_kind: 'retrieve_links' | 'grab';
+    requested_by: 'explicit' | 'auto';
+    service_type: string;
+    priority: number;
+    state: string;
+    package_name?: string | null;
+    link_count: number;
+    links: string[];
+    attempts: number;
+    last_error_code?: string | null;
+    correlation_id?: string | null;
+    title?: string | null;
+    resolution?: string | null;
+  };
+
   type RssStatus = {
     mode: 'listing' | 'rss_shadow' | 'rss_primary';
     enabled: boolean;
@@ -71,20 +90,24 @@
 
   let status = $state<RssStatus | null>(null);
   let candidates = $state<Candidate[]>([]);
+  let actions = $state<CandidateAction[]>([]);
   let loading = $state(true);
   let modeSaving = $state(false);
   let actionUrl = $state<string | null>(null);
+  let runningAction = $state<string | null>(null);
   let stateFilter = $state('');
 
   async function refresh() {
     loading = true;
     try {
-      const [nextStatus, candidateResponse] = await Promise.all([
+      const [nextStatus, candidateResponse, actionResponse] = await Promise.all([
         api.rssStatus(),
-        api.rssCandidates(stateFilter || undefined)
+        api.rssCandidates(stateFilter || undefined),
+        api.rssActions()
       ]);
       status = nextStatus;
       candidates = candidateResponse.items;
+      actions = actionResponse.items;
     } catch (error) {
       addToast(
         'RSS',
@@ -144,6 +167,70 @@
       );
     } finally {
       actionUrl = null;
+    }
+  }
+
+  async function startAction(
+    item: Candidate,
+    actionKind: 'retrieve_links' | 'grab'
+  ) {
+    runningAction = item.canonical_url;
+    try {
+      await api.rssStartAction(
+        item.canonical_url,
+        actionKind,
+        'Rapidgator'
+      );
+      addToast(
+        'RSS action',
+        actionKind === 'grab'
+          ? 'JDownloader action queued'
+          : 'Link retrieval queued'
+      );
+      window.setTimeout(() => void refresh(), 750);
+    } catch (error) {
+      addToast(
+        'RSS action',
+        error instanceof Error ? error.message : 'Action could not start',
+        'error'
+      );
+    } finally {
+      runningAction = null;
+    }
+  }
+
+  async function cancelAction(actionUuid: string) {
+    try {
+      await api.rssCancelAction(actionUuid);
+      await refresh();
+    } catch (error) {
+      addToast(
+        'RSS action',
+        error instanceof Error ? error.message : 'Cancel failed',
+        'error'
+      );
+    }
+  }
+
+  async function retryAction(actionUuid: string) {
+    try {
+      await api.rssRetryAction(actionUuid);
+      await refresh();
+    } catch (error) {
+      addToast(
+        'RSS action',
+        error instanceof Error ? error.message : 'Retry failed',
+        'error'
+      );
+    }
+  }
+
+  async function copyLinks(links: string[]) {
+    try {
+      await navigator.clipboard.writeText(links.join('\n'));
+      addToast('RSS action', `Copied ${links.length} link(s)`);
+    } catch {
+      addToast('RSS action', 'Clipboard copy failed', 'error');
     }
   }
 
@@ -356,6 +443,18 @@
               </p>
             {/if}
           </div>
+          <div class="flex flex-wrap gap-2">
+            <button
+              class="px-3 py-1.5 rounded-lg text-sm bg-[var(--bg-tertiary)] disabled:opacity-50"
+              disabled={!status?.enabled || runningAction === item.canonical_url}
+              onclick={() => void startAction(item, 'retrieve_links')}
+            >Retrieve links</button>
+            <button
+              class="px-3 py-1.5 rounded-lg text-sm bg-[var(--accent)] text-white disabled:opacity-50"
+              disabled={!status?.enabled || runningAction === item.canonical_url}
+              onclick={() => void startAction(item, 'grab')}
+            >Send to JDownloader</button>
+          </div>
           {#if item.hydration_state !== 'completed'}
             <button
               class="px-3 py-1.5 rounded-lg text-sm bg-[var(--accent)] text-white disabled:opacity-50"
@@ -385,4 +484,46 @@
       {/each}
     </div>
   </section>
+
+  <section class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl">
+    <div class="p-4 border-b border-[var(--border)]">
+      <h2 class="font-semibold">Candidate actions</h2>
+      <p class="text-xs text-[var(--text-secondary)]">
+        Link retrieval and JDownloader submission are explicit, persisted actions.
+      </p>
+    </div>
+    <div class="divide-y divide-[var(--border)]">
+      {#each actions as action}
+        <article class="p-4 flex flex-wrap items-center gap-3">
+          <div class="min-w-0 flex-1">
+            <div class="font-medium">{action.title ?? action.package_name ?? 'RSS candidate'}</div>
+            <div class="text-xs text-[var(--text-secondary)]">
+              {action.action_kind} · {action.state} · {action.link_count ?? 0} link(s)
+              {#if action.last_error_code} · {action.last_error_code}{/if}
+            </div>
+          </div>
+          {#if canCopyActionLinks(action)}
+            <button
+              class="px-3 py-1.5 rounded-lg text-sm bg-[var(--accent)] text-white"
+              onclick={() => void copyLinks(action.links)}
+            >Copy links</button>
+          {/if}
+          {#if canCancelAction(action)}
+            <button
+              class="px-3 py-1.5 rounded-lg text-sm bg-[var(--bg-tertiary)]"
+              onclick={() => void cancelAction(action.action_uuid)}
+            >Cancel</button>
+          {:else if canRetryAction(action)}
+            <button
+              class="px-3 py-1.5 rounded-lg text-sm bg-[var(--bg-tertiary)]"
+              onclick={() => void retryAction(action.action_uuid)}
+            >Retry</button>
+          {/if}
+        </article>
+      {:else}
+        <p class="p-6 text-sm text-[var(--text-secondary)]">No RSS actions yet.</p>
+      {/each}
+    </div>
+  </section>
+
 </div>

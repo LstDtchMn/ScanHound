@@ -279,6 +279,42 @@ class BackgroundScanner:
                             stop_requested=stop_requested,
                         )
                     )
+                if (
+                    cfg.get("hdencode_rss_auto_grab_enabled") is True
+                    and not stop_requested()
+                ):
+                    from backend.hdencode_action_service import (
+                        HDEncodeActionService,
+                    )
+                    try:
+                        action_service = HDEncodeActionService(
+                            cfg, db, getattr(self._reg, "download", None)
+                        )
+                        queued_actions = (
+                            action_service.queue_approved_auto_actions(
+                                limit=1,
+                                lifespan_generation=getattr(
+                                    self, "_lifespan_generation", None
+                                ),
+                                stop_requested=stop_requested,
+                            )
+                        )
+                        action_results = []
+                        for queued_action in queued_actions:
+                            if stop_requested():
+                                break
+                            result = action_service.run_action(
+                                queued_action["action_uuid"],
+                                owns_lifespan=self._owns_lifespan,
+                            )
+                            action_results.append({
+                                "action_uuid": result.get("action_uuid"),
+                                "state": result.get("state"),
+                            })
+                        rss_cycle["auto_actions"] = action_results
+                    except Exception:
+                        logger.exception("RSS automatic action cycle failed")
+                        rss_cycle["auto_actions_error"] = "action_cycle_failed"
                 if stop_requested():
                     return {
                         "scanned": 0,

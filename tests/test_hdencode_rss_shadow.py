@@ -11,7 +11,7 @@ from backend.hdencode_rss_service import HDEncodeRSSService
 from backend.sources.hdencode_feed_client import (
     FeedResponse,
     _read_limited,
-    validate_feed_url,
+    _validated_target,
 )
 from backend.sources.hdencode_feed_parser import MAX_FEED_BYTES
 from backend.sources.hdencode_feeds import get_feed
@@ -251,4 +251,4 @@ def test_url_validation_rejects_private_resolution(monkeypatch):
         ],
     )
     with pytest.raises(ValueError, match="Unsafe"):
-        validate_feed_url("https://hdencode.org/tag/movies/feed/")
+        _validated_target("https://hdencode.org/tag/movies/feed/")

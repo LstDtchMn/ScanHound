@@ -4,13 +4,18 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.hdencode_candidate_service import HDEncodeCandidateService
+from backend.hdencode_action_service import (
+    HDEncodeActionError,
+    HDEncodeActionService,
+)
+from backend.api.public_errors import capture_public_exception
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +28,40 @@ def _join_rss_hydration_threads(reg):
         if thread.is_alive():
             thread.join(timeout=2.0)
 
+
+
+
+def _join_rss_action_threads(reg):
+    threads = list(getattr(reg, "_rss_action_threads", set()))
+    for thread in threads:
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+
+
+def _start_tracked_action_thread(reg, target):
+    if not hasattr(reg, "_rss_action_threads"):
+        reg._rss_action_threads = set()
+        if reg.backend is not None:
+            reg.backend.add_shutdown_hook(
+                lambda: _join_rss_action_threads(reg)
+            )
+    holder = {}
+
+    def wrapped():
+        try:
+            target()
+        finally:
+            reg._rss_action_threads.discard(holder["thread"])
+
+    thread = threading.Thread(
+        target=wrapped,
+        name="rss-candidate-action",
+        daemon=True,
+    )
+    holder["thread"] = thread
+    reg._rss_action_threads.add(thread)
+    thread.start()
+    return thread
 
 def _start_tracked_hydration_thread(reg, target):
     if not hasattr(reg, "_rss_hydration_threads"):
@@ -54,6 +93,16 @@ class ModeRequest(BaseModel):
 
 class CandidateRequest(BaseModel):
     canonical_url: str
+
+
+class ActionRequest(BaseModel):
+    canonical_url: str
+    action_kind: Literal["retrieve_links", "grab"]
+    service_type: Literal[
+        "Rapidgator", "Nitroflare", "1fichier", "ddownload"
+    ] = "Rapidgator"
+    destination: str = ""
+    idempotency_key: Optional[str] = None
 
 
 _CANDIDATE_FIELDS = (
@@ -314,6 +363,157 @@ def retry_candidate(
         "status": "queued",
         "canonical_url": request.canonical_url,
     }
+
+
+@router.get("/actions")
+def rss_actions(
+    state: Optional[str] = None,
+    limit: int = 250,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    rows = reg.db.list_hdencode_actions(
+        state=state,
+        limit=max(1, min(limit, 1000)),
+    )
+    items = []
+    for row in rows:
+        item = {
+            key: row.get(key)
+            for key in (
+                "action_uuid", "canonical_url", "action_kind",
+                "requested_by", "service_type", "priority", "state",
+                "package_name", "link_count", "attempts", "queued_at",
+                "claimed_at", "links_ready_at", "submitted_at",
+                "completed_at", "cancelled_at", "updated_at",
+                "last_error_code", "correlation_id", "title",
+                "clean_title", "resolution", "dv_evidence",
+                "hdr_evidence", "discovery_source",
+            )
+        }
+        item["links"] = []
+        if row.get("state") == "links_ready":
+            try:
+                parsed = json.loads(row.get("links_json") or "[]")
+                if isinstance(parsed, list):
+                    item["links"] = [str(value) for value in parsed]
+            except (TypeError, ValueError):
+                pass
+        items.append(item)
+    return {"items": items, "count": len(items)}
+
+
+def _action_worker(reg, service, action_uuid, generation):
+    try:
+        service.run_action(
+            action_uuid,
+            owns_lifespan=lambda: reg.owns_lifespan(generation),
+        )
+    except HDEncodeActionError as exc:
+        reg.db.fail_hdencode_action(
+            action_uuid, error_code=exc.code
+        )
+    except Exception as exc:
+        public = capture_public_exception(
+            logger, exc, code="rss_action_failed",
+            message="The RSS action could not be completed.",
+            context="Tracked RSS action worker failed",
+        )
+        reg.db.fail_hdencode_action(
+            action_uuid, error_code=public.code,
+            correlation_id=public.correlation_id,
+        )
+
+
+@router.post("/actions")
+def start_rss_action(
+    request: ActionRequest,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    if reg.db is None or reg.download is None:
+        raise HTTPException(status_code=503, detail="Action services unavailable")
+    generation = reg.lifespan_generation
+    service = HDEncodeActionService(reg.config or {}, reg.db, reg.download)
+    try:
+        action = service.queue_action(
+            request.canonical_url,
+            action_kind=request.action_kind,
+            requested_by="explicit",
+            service_type=request.service_type,
+            destination=request.destination,
+            idempotency_key=request.idempotency_key,
+            lifespan_generation=generation,
+        )
+    except HDEncodeActionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+    except Exception as exc:
+        public = capture_public_exception(
+            logger, exc, code="rss_action_queue_failed",
+            message="The RSS action could not be queued.",
+            context="RSS action queue failed",
+        )
+        raise HTTPException(status_code=500, detail=public.as_detail())
+
+    if action.get("created"):
+        _start_tracked_action_thread(
+            reg,
+            lambda: _action_worker(
+                reg, service, action["action_uuid"], generation
+            ),
+        )
+
+    return {
+        "status": action.get("state"),
+        "action_uuid": action.get("action_uuid"),
+        "created": bool(action.get("created")),
+        "idempotent": bool(action.get("idempotent")),
+    }
+
+
+@router.post("/actions/{action_uuid}/cancel")
+def cancel_rss_action(
+    action_uuid: str,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    action = reg.db.request_cancel_hdencode_action(action_uuid)
+    if action is None:
+        raise HTTPException(status_code=404, detail="RSS action not found")
+    return {"action_uuid": action_uuid, "status": action.get("state")}
+
+
+@router.post("/actions/{action_uuid}/retry")
+def retry_rss_action(
+    action_uuid: str,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    if reg.db is None or reg.download is None:
+        raise HTTPException(status_code=503, detail="Action services unavailable")
+    if (reg.config or {}).get("hdencode_enabled", True) is not True:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "source_disabled", "message": "HDEncode is disabled."},
+        )
+    action = reg.db.retry_hdencode_action(action_uuid)
+    if action is None:
+        raise HTTPException(status_code=404, detail="RSS action not found")
+    if action.get("state") != "queued":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "action_not_retryable",
+                "message": "This action cannot be retried safely.",
+            },
+        )
+    generation = reg.lifespan_generation
+    service = HDEncodeActionService(reg.config or {}, reg.db, reg.download)
+    _start_tracked_action_thread(
+        reg,
+        lambda: _action_worker(reg, service, action_uuid, generation),
+    )
+    return {"action_uuid": action_uuid, "status": "queued"}
 
 
 def _counts(rows, key):
