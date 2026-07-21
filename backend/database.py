@@ -1641,6 +1641,95 @@ class DatabaseManager:
             default=[],
         )
 
+    def get_hdencode_rss_readiness(
+        self,
+        *,
+        min_cycles=20,
+        min_days=7,
+    ):
+        """Return the evidence gate for promotion from shadow to primary."""
+        try:
+            required_cycles = max(1, int(min_cycles))
+        except (TypeError, ValueError):
+            required_cycles = 20
+        try:
+            required_days = max(1, int(min_days))
+        except (TypeError, ValueError):
+            required_days = 7
+
+        cycle = self._query(
+            """
+            SELECT COUNT(*) AS successful_cycles,
+                   MIN(completed_at) AS first_completed_at,
+                   MAX(completed_at) AS last_completed_at
+            FROM hdencode_ingest_cycles
+            WHERE feed_key IN ('movies_all', 'tv_all')
+              AND outcome IN ('changed', 'not_modified')
+            """,
+            one=True,
+            default=None,
+        )
+        successful_cycles = int(
+            cycle["successful_cycles"] if cycle is not None else 0
+        )
+        first_completed_at = (
+            cycle["first_completed_at"] if cycle is not None else None
+        )
+        last_completed_at = (
+            cycle["last_completed_at"] if cycle is not None else None
+        )
+        observed_days = 0.0
+        if first_completed_at:
+            try:
+                first = datetime.datetime.fromisoformat(first_completed_at)
+                if first.tzinfo is None:
+                    first = first.replace(tzinfo=datetime.timezone.utc)
+                observed_days = max(
+                    0.0,
+                    (
+                        datetime.datetime.now(datetime.timezone.utc)
+                        - first.astimezone(datetime.timezone.utc)
+                    ).total_seconds() / 86400.0,
+                )
+            except (TypeError, ValueError):
+                observed_days = 0.0
+
+        feed_rows = self._query_dicts(
+            """
+            SELECT feed_key, last_status, consecutive_failures,
+                   last_checked_at, observed_depth_seconds
+            FROM hdencode_feed_state
+            WHERE feed_key IN ('movies_all', 'tv_all')
+            """,
+            default=[],
+        )
+        by_key = {row["feed_key"]: row for row in feed_rows}
+        normal_feeds_healthy = all(
+            key in by_key
+            and by_key[key].get("last_status") in (200, 304)
+            and int(by_key[key].get("consecutive_failures") or 0) == 0
+            for key in ("movies_all", "tv_all")
+        )
+        reasons = []
+        if successful_cycles < required_cycles:
+            reasons.append("insufficient_cycles")
+        if observed_days < required_days:
+            reasons.append("insufficient_days")
+        if not normal_feeds_healthy:
+            reasons.append("normal_feeds_unhealthy")
+
+        return {
+            "ready": not reasons,
+            "required_cycles": required_cycles,
+            "successful_cycles": successful_cycles,
+            "required_days": required_days,
+            "observed_days": observed_days,
+            "normal_feeds_healthy": normal_feeds_healthy,
+            "first_completed_at": first_completed_at,
+            "last_completed_at": last_completed_at,
+            "reasons": reasons,
+        }
+
     # ── Plex cache ───────────────────────────────────────────────────
 
     def clear_plex_cache(self):

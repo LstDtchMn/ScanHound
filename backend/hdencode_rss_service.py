@@ -44,7 +44,8 @@ class HDEncodeRSSService:
     def _enabled(self) -> bool:
         return (
             self.config.get("hdencode_enabled", True) is True
-            and self.config.get("hdencode_discovery_mode") == "rss_shadow"
+            and self.config.get("hdencode_discovery_mode")
+            in {"rss_shadow", "rss_primary"}
         )
 
     def _poll_interval_seconds(self) -> int:
@@ -84,11 +85,37 @@ class HDEncodeRSSService:
             return {
                 "mode": mode,
                 "skipped": True,
-                "reason": "rss_shadow_disabled",
+                "reason": "rss_discovery_disabled",
                 "feeds": [],
                 "listing_fallback_started": False,
                 "downloads_started": 0,
             }
+
+        readiness = self.db.get_hdencode_rss_readiness(
+            min_cycles=self.config.get(
+                "hdencode_rss_shadow_min_cycles", 20
+            ),
+            min_days=self.config.get(
+                "hdencode_rss_shadow_min_days", 7
+            ),
+        )
+        if mode == "rss_primary" and not readiness["ready"]:
+            cycle = {
+                "mode": mode,
+                "skipped": True,
+                "reason": "primary_not_ready",
+                "readiness": readiness,
+                "feeds": [],
+                "changed": 0,
+                "candidates": 0,
+                "requests": 0,
+                "coverage_uncertain": True,
+                "fallback_qualified": False,
+                "listing_fallback_started": False,
+                "downloads_started": 0,
+            }
+            self._last_cycle = cycle
+            return cycle
 
         normal = list(normal_feeds())
         if include_catchup is None:
@@ -121,13 +148,37 @@ class HDEncodeRSSService:
                 self.poll_feed(feed, stop_requested=stop_requested)
             )
 
+        normal_outcomes = {
+            result.get("outcome")
+            for result in results
+            if result.get("feed") in {"movies_all", "tv_all"}
+        }
+        coverage_uncertain = bool(
+            normal_outcomes
+            & {"failed", "http_error", "parse_failed", "denied"}
+        )
+        coordinator_blocked = bool(
+            self.coordinator.snapshot().get("blocked")
+        )
+        fallback_qualified = bool(
+            mode == "rss_primary"
+            and readiness["ready"]
+            and coverage_uncertain
+            and self.config.get(
+                "hdencode_rss_listing_fallback_enabled"
+            ) is True
+            and not coordinator_blocked
+        )
         cycle = {
-            "mode": "rss_shadow",
+            "mode": mode,
             "at": time.time(),
             "feeds": results,
             "changed": sum(r.get("changed", 0) for r in results),
             "candidates": sum(r.get("candidate_count", 0) for r in results),
             "requests": sum(1 for r in results if r.get("requested")),
+            "readiness": readiness,
+            "coverage_uncertain": coverage_uncertain,
+            "fallback_qualified": fallback_qualified,
             "listing_fallback_started": False,
             "downloads_started": 0,
         }
@@ -288,6 +339,14 @@ class HDEncodeRSSService:
             "feeds": self.db.list_hdencode_feed_states(),
             "last_cycle": self._last_cycle,
             "coordinator": self.coordinator.snapshot(),
+            "readiness": self.db.get_hdencode_rss_readiness(
+                min_cycles=self.config.get(
+                    "hdencode_rss_shadow_min_cycles", 20
+                ),
+                min_days=self.config.get(
+                    "hdencode_rss_shadow_min_days", 7
+                ),
+            ),
         }
 
 

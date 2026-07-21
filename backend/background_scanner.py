@@ -198,18 +198,21 @@ class BackgroundScanner:
         # early-stopped source is only partially visited.
         purge_safe = True
         source_results: List[Dict[str, Any]] = []
-        rss_shadow = None
+        rss_cycle = None
+        discovery_mode = cfg.get(
+            "hdencode_discovery_mode", "listing"
+        )
         try:
             if (
                 "HDEncode" in sources
-                and cfg.get("hdencode_discovery_mode") == "rss_shadow"
+                and discovery_mode in {"rss_shadow", "rss_primary"}
             ):
                 from backend.hdencode_rss_service import HDEncodeRSSService
                 stop_requested = lambda: (
                     self._stop.is_set()
                     or not self._owns_lifespan()
                 )
-                rss_shadow = HDEncodeRSSService(cfg, db).poll_cycle(
+                rss_cycle = HDEncodeRSSService(cfg, db).poll_cycle(
                     stop_requested=stop_requested,
                 )
                 if stop_requested():
@@ -223,7 +226,7 @@ class BackgroundScanner:
                     HDEncodeCandidateService,
                 )
                 candidate_service = HDEncodeCandidateService(cfg, db)
-                rss_shadow["classification"] = (
+                rss_cycle["classification"] = (
                     candidate_service.classify_pending(
                         stop_requested=stop_requested,
                     )
@@ -234,7 +237,7 @@ class BackgroundScanner:
                     None,
                 )
                 if detail_scraper is not None and not stop_requested():
-                    rss_shadow["hydration"] = (
+                    rss_cycle["hydration"] = (
                         candidate_service.hydrate_pending(
                             detail_scraper,
                             stop_requested=stop_requested,
@@ -258,10 +261,29 @@ class BackgroundScanner:
                     purge_safe = False
                     continue
 
+                is_hdencode = str(source).lower() == "hdencode"
+                if is_hdencode and discovery_mode == "rss_primary":
+                    if not (
+                        rss_cycle
+                        and rss_cycle.get("fallback_qualified")
+                    ):
+                        source_results.append({
+                            "source": source,
+                            "new": 0,
+                            "error": None,
+                            "skipped": "rss_primary",
+                        })
+                        continue
+                    source_pages = 1
+                    rss_cycle["listing_fallback_started"] = True
+                else:
+                    source_pages = pages
                 err: Optional[str] = None
                 items: List[Any] = []
                 try:
-                    items = self._scan_source(source, pages, cached_urls)
+                    items = self._scan_source(
+                        source, source_pages, cached_urls
+                    )
                 except Exception as e:
                     err = str(e)
                     logger.exception("Background scan of source %s failed", source)
@@ -348,7 +370,7 @@ class BackgroundScanner:
             "cached": cached,
             "rematched": rematched,
             "sources": source_results,
-            "rss_shadow": rss_shadow,
+            "rss": rss_cycle,
         }
         logger.info(
             "Background scan complete: %d new/updated from %d source(s), %d cached",

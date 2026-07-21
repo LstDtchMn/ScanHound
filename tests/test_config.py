@@ -131,6 +131,9 @@ EXPECTED_DEFAULT_KEYS = {
     "hdencode_discovery_mode", "hdencode_rss_shadow_compare_enabled",
     # HDEncode RSS classification (PR G)
     "hdencode_rss_hydration_limit",
+    # HDEncode RSS-primary readiness / fallback (PR H)
+    "hdencode_rss_shadow_min_cycles", "hdencode_rss_shadow_min_days",
+    "hdencode_rss_auto_grab_enabled", "hdencode_rss_listing_fallback_enabled",
 }
 
 
