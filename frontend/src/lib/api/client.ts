@@ -174,6 +174,33 @@ export const api = {
       count: number;
     }>('/results/bookmarks'),
 
+  // HDEncode RSS operations
+  rssStatus: () => request<any>('/rss/status'),
+  rssCandidates: (state?: string, hydration?: string, limit = 250) => {
+    const params = new URLSearchParams();
+    if (state) params.set('state', state);
+    if (hydration) params.set('hydration', hydration);
+    params.set('limit', String(limit));
+    return request<{ items: any[]; count: number }>(`/rss/candidates?${params}`);
+  },
+  rssHydration: (limit = 250) =>
+    request<{ items: any[]; count: number }>(`/rss/hydration?limit=${limit}`),
+  rssSetMode: (mode: 'listing' | 'rss_shadow' | 'rss_primary') =>
+    request<{ mode: string }>('/rss/mode', {
+      method: 'POST',
+      body: JSON.stringify({ mode })
+    }),
+  rssHydrate: (canonicalUrl: string) =>
+    request<{ status: string; canonical_url: string }>('/rss/hydrate', {
+      method: 'POST',
+      body: JSON.stringify({ canonical_url: canonicalUrl })
+    }),
+  rssRetry: (canonicalUrl: string) =>
+    request<{ status: string; canonical_url: string }>('/rss/retry', {
+      method: 'POST',
+      body: JSON.stringify({ canonical_url: canonicalUrl })
+    }),
+
   // Plex
   plexConnect: () => request('/plex/connect', { method: 'POST' }),
   plexStatus: () => request<PlexStatus>('/plex/status'),

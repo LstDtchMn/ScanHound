@@ -575,14 +575,14 @@ def create_app(
         return await call_next(request)
 
     # Register route modules
-    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler, auth, background, rename, pipeline
+    from backend.api.routes import system, settings, sources, plex, scanner, results, downloads, analytics, watchlist, scheduler, auth, background, rename, pipeline, rss
     from backend.api import ws
 
     api_routers = [
         system.router, auth.router, ws.router, settings.router, sources.router,
         plex.router, scanner.router, results.router, downloads.router,
         analytics.router, watchlist.router, scheduler.router, background.router,
-        rename.router, pipeline.router,
+        rename.router, pipeline.router, rss.router,
     ]
     for router in api_routers:
         app.include_router(router)
