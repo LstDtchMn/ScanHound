@@ -1210,6 +1210,14 @@ class DatabaseManager:
             label="update_hdencode_candidate_state",
         )
 
+    def update_hdencode_feed_depth(self, feed_key, depth_seconds):
+        return self._mutate(
+            "UPDATE hdencode_feed_state "
+            "SET observed_depth_seconds = ? WHERE feed_key = ?",
+            (depth_seconds, feed_key),
+            label="update_hdencode_feed_depth",
+        )
+
     # ── Plex cache ───────────────────────────────────────────────────
 
     def clear_plex_cache(self):

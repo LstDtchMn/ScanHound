@@ -126,6 +126,9 @@ EXPECTED_DEFAULT_KEYS = {
     "webhook_url", "webhook_method",
     "email_enabled", "smtp_host", "smtp_port", "smtp_username",
     "smtp_password", "email_from", "email_to", "smtp_tls",
+    # HDEncode RSS shadow (PR F)
+    "hdencode_rss_poll_minutes", "hdencode_rss_catchup_hours",
+    "hdencode_discovery_mode", "hdencode_rss_shadow_compare_enabled",
 }
 
 

@@ -110,6 +110,12 @@ class AppConfig(TypedDict, total=False):
     scheduler_interval: int  # hours
     last_scan_time: float  # timestamp
 
+    # HDEncode RSS discovery
+    hdencode_discovery_mode: Literal["listing", "rss_shadow", "rss_primary"]
+    hdencode_rss_poll_minutes: int
+    hdencode_rss_catchup_hours: int
+    hdencode_rss_shadow_compare_enabled: bool
+
     # Background pre-cache scanning (pre-fetch results so the app opens fast)
     background_scan_enabled: bool
     background_scan_interval_hours: int
@@ -456,6 +462,10 @@ _DEFAULT_CONFIG: AppConfig = {
     "scheduler_enabled": False,
     "scheduler_interval": 24,
     "last_scan_time": 0,
+    "hdencode_discovery_mode": "listing",
+    "hdencode_rss_poll_minutes": 60,
+    "hdencode_rss_catchup_hours": 4,
+    "hdencode_rss_shadow_compare_enabled": True,
     "background_scan_enabled": False,
     "background_scan_interval_hours": 6,
     "background_scan_pages": 3,

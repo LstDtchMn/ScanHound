@@ -198,7 +198,26 @@ class BackgroundScanner:
         # early-stopped source is only partially visited.
         purge_safe = True
         source_results: List[Dict[str, Any]] = []
+        rss_shadow = None
         try:
+            if (
+                "HDEncode" in sources
+                and cfg.get("hdencode_discovery_mode") == "rss_shadow"
+            ):
+                from backend.hdencode_rss_service import HDEncodeRSSService
+                rss_shadow = HDEncodeRSSService(cfg, db).poll_cycle(
+                    stop_requested=lambda: (
+                        self._stop.is_set()
+                        or not self._owns_lifespan()
+                    ),
+                )
+                if not self._owns_lifespan():
+                    return {
+                        "scanned": 0,
+                        "cached": 0,
+                        "skipped": True,
+                        "reason": "stale_lifespan",
+                    }
             for source in sources:
                 if (str(source).strip().lower() == "hdencode"
                         and not cfg.get("hdencode_enabled", True)):
@@ -300,6 +319,7 @@ class BackgroundScanner:
             "cached": cached,
             "rematched": rematched,
             "sources": source_results,
+            "rss_shadow": rss_shadow,
         }
         logger.info(
             "Background scan complete: %d new/updated from %d source(s), %d cached",
