@@ -188,6 +188,7 @@ class ScannerService:
         # True when the last crawl stopped early at cached content — the scanner
         # then never saw deeper pages, so it must NOT purge against this crawl.
         self._last_crawl_early_stopped: bool = False
+        self._last_crawl_request_count: int = 0
 
         # Download history
         self.download_history: Set[str] = set()
@@ -314,6 +315,7 @@ class ScannerService:
             self.items.clear()
             self._item_counter = 0
         self._last_crawl_seen_urls = set()
+        self._last_crawl_request_count = 0
 
         # Load download history
         self.download_history = self._load_download_history()
@@ -655,10 +657,12 @@ class ScannerService:
 
                 try:
                     def _fetch_page(u=url):
+                        self._last_crawl_request_count += 1
                         if source_id == "hdencode":
                             with get_hdencode_coordinator().request(
                                 "listing",
                                 stop_requested=lambda: self.stop_scan_flag,
+                                priority=20,
                             ):
                                 client = scraper or create_source_http_client(hdencode=True)
                                 return client.get(u, timeout=15)

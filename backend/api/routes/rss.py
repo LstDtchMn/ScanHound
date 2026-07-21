@@ -17,6 +17,37 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/rss", tags=["rss"])
 
 
+def _join_rss_hydration_threads(reg):
+    threads = list(getattr(reg, "_rss_hydration_threads", set()))
+    for thread in threads:
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+
+
+def _start_tracked_hydration_thread(reg, target):
+    if not hasattr(reg, "_rss_hydration_threads"):
+        reg._rss_hydration_threads = set()
+        if reg.backend is not None:
+            reg.backend.add_shutdown_hook(
+                lambda: _join_rss_hydration_threads(reg)
+            )
+    holder = {}
+    def wrapped():
+        try:
+            target()
+        finally:
+            reg._rss_hydration_threads.discard(holder["thread"])
+    thread = threading.Thread(
+        target=wrapped,
+        name="rss-explicit-hydration",
+        daemon=True,
+    )
+    holder["thread"] = thread
+    reg._rss_hydration_threads.add(thread)
+    thread.start()
+    return thread
+
+
 class ModeRequest(BaseModel):
     mode: str
 
@@ -50,6 +81,9 @@ _CANDIDATE_FIELDS = (
     "hydration_state",
     "action_state",
     "description_complete",
+    "imdb_id",
+    "tmdb_id",
+    "discovery_source",
 )
 
 
@@ -91,8 +125,8 @@ def rss_status(reg: ServiceRegistry = Depends(get_registry)):
         raise HTTPException(status_code=503, detail="Database unavailable")
     background = reg.background_scanner
     last_run = background.last_run if background else None
-    candidates = reg.db.list_hdencode_candidates(limit=5000)
-    queue = reg.db.list_hdencode_hydration_queue(limit=5000)
+    counts = reg.db.get_hdencode_rss_dashboard_counts()
+    shadow = reg.db.get_hdencode_shadow_summary()
     return {
         "mode": (reg.config or {}).get(
             "hdencode_discovery_mode",
@@ -102,32 +136,14 @@ def rss_status(reg: ServiceRegistry = Depends(get_registry)):
         "feeds": reg.db.list_hdencode_feed_states(),
         "last_cycle": (last_run or {}).get("rss"),
         "readiness": _readiness(reg),
-        "candidate_counts": _counts(candidates, "relevance_state"),
-        "hydration_counts": _counts(queue, "state"),
-        "unknown_counts": {
-            "dv": sum(
-                row.get("dv_evidence") == "unknown"
-                for row in candidates
-            ),
-            "hdr": sum(
-                row.get("hdr_evidence") == "unknown"
-                for row in candidates
-            ),
-            "identity": sum(
-                row.get("identity_state") in {
-                    None, "", "unknown", "ambiguous"
-                }
-                for row in candidates
-            ),
-            "year_conflict": sum(
-                bool(
-                    row.get("title_year")
-                    and row.get("description_year")
-                    and row["title_year"] != row["description_year"]
-                )
-                for row in candidates
-            ),
-        },
+        "candidate_counts": counts["candidate_counts"],
+        "hydration_counts": counts["hydration_counts"],
+        "unknown_counts": counts["unknown_counts"],
+        "shadow": shadow,
+        "coordinator": (
+            (last_run or {}).get("rss", {}).get("coordinator")
+            or {}
+        ),
         "safe_defaults": {
             "listing_fallback": (
                 (reg.config or {}).get(
@@ -236,6 +252,11 @@ def hydrate_candidate(
     candidate = reg.db.get_hdencode_candidate(request.canonical_url)
     if candidate is None:
         raise HTTPException(status_code=404, detail="Candidate not found")
+    if candidate.get("hydration_state") == "completed":
+        return {
+            "status": "already_hydrated",
+            "canonical_url": request.canonical_url,
+        }
 
     reg.db.enqueue_hdencode_hydration(
         request.canonical_url,
@@ -266,11 +287,7 @@ def hydrate_candidate(
         except Exception:
             logger.exception("Explicit RSS hydration worker failed")
 
-    threading.Thread(
-        target=run_hydration,
-        name="rss-explicit-hydration",
-        daemon=True,
-    ).start()
+    _start_tracked_hydration_thread(reg, run_hydration)
     return {
         "status": "started",
         "canonical_url": request.canonical_url,
@@ -284,17 +301,14 @@ def retry_candidate(
 ):
     if reg.db is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
+    if (reg.config or {}).get("hdencode_enabled", True) is not True:
+        raise HTTPException(status_code=409, detail="HDEncode is disabled")
     if reg.db.get_hdencode_candidate(request.canonical_url) is None:
         raise HTTPException(status_code=404, detail="Candidate not found")
-    reg.db.enqueue_hdencode_hydration(
+    reg.db.requeue_hdencode_hydration(
         request.canonical_url,
         reason="explicit_detail",
         priority=90,
-    )
-    reg.db.update_hdencode_candidate_state(
-        request.canonical_url,
-        hydration_state="queued",
-        detail_reason="explicit_detail",
     )
     return {
         "status": "queued",

@@ -132,6 +132,7 @@ def test_hydration_is_bounded_merges_authoritative_evidence_and_never_downloads(
         def scrape_details(self, url, **_kwargs):
             self.calls.append(url)
             return {
+                "url": "https://hdencode.org/a/",
                 "display_title": "Hydrated",
                 "year": 2026,
                 "season": None,
@@ -150,7 +151,9 @@ def test_hydration_is_bounded_merges_authoritative_evidence_and_never_downloads(
     assert result["claimed"] == 1
     assert detail.calls == ["https://hdencode.org/a/"]
     _, _, updates = db.completed
-    assert updates["identity_state"] == "exact"
+    # Completion identity model: hydration marks display fields "hydrated"
+    # (identity resolution to imdb/tmdb is a separate stage), not "exact".
+    assert updates["identity_state"] == "hydrated"
     assert updates["dv_evidence"] == "asserted"
     assert updates["hdr_evidence"] == "asserted"
     assert updates["hdr_formats"] == ["HDR10+"]
@@ -259,6 +262,7 @@ def test_hydration_updates_candidate_and_breaks_detail_loop(tmp_path):
     class Detail:
         def scrape_details(self, *_args, **_kwargs):
             return {
+                "url": "https://hdencode.org/example/",
                 "display_title": "Example",
                 "year": 2026,
                 "season": None,
@@ -273,7 +277,7 @@ def test_hydration_updates_candidate_and_breaks_detail_loop(tmp_path):
     result = service.hydrate_pending(Detail(), limit=1)
     assert result["completed"] == 1
     candidate = db.get_hdencode_candidate(url)
-    assert candidate["identity_state"] == "exact"
+    assert candidate["identity_state"] == "hydrated"
     assert candidate["dv_evidence"] == "asserted"
     assert candidate["size_gb"] == 55
     assert service.classify_candidate(candidate) == "relevant_missing"

@@ -11,6 +11,7 @@ from backend.candidate_evidence import (
     CandidateDecisionEngine,
     CandidateEvidence,
 )
+from backend.hdencode_coordinator import get_hdencode_coordinator
 
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,8 @@ _HYDRATION_PRIORITY = {
     "auto_grab_candidate": 80,
     "identity_ambiguous": 75,
     "identity_unresolved": 70,
+    "description_truncated": 65,
+    "multi_episode_details": 64,
     "dolby_vision_unknown": 60,
     "size_upgrade_with_unknown_dv": 55,
     "insufficient_evidence": 50,
@@ -89,6 +92,8 @@ class HDEncodeCandidateService:
             media_type=row.get("media_type"),
             years=evidence.observed_years,
             season=row.get("season"),
+            imdb_id=row.get("imdb_id"),
+            tmdb_id=row.get("tmdb_id"),
         )
 
         resolved_identity = identity_state
@@ -175,12 +180,15 @@ class HDEncodeCandidateService:
                 cancelled += 1
                 continue
             try:
-                result = detail_scraper.scrape_details(
-                    row["canonical_url"],
-                    headers={},
-                    scraper=None,
-                    stop_requested=stop_requested,
-                )
+                with get_hdencode_coordinator().prioritize(
+                    int(row.get("priority") or 40)
+                ):
+                    result = detail_scraper.scrape_details(
+                        row["canonical_url"],
+                        headers={},
+                        scraper=None,
+                        stop_requested=stop_requested,
+                    )
             except Exception as exc:
                 logger.exception(
                     "RSS detail hydration failed for %s",
@@ -273,47 +281,41 @@ def _result_dict(result):
 
 
 def _candidate_updates(payload):
-    hdr_value = str(payload.get("hdr") or "").strip()
-    hdr_upper = hdr_value.upper()
-    if hdr_upper in {"", "?", "UNKNOWN"}:
-        hdr_evidence = "unknown"
-    elif hdr_upper in {"SDR", "NONE", "NO"}:
-        hdr_evidence = "negated"
-    else:
-        hdr_evidence = "asserted"
+    """Return only authoritative hydrated fields; absence never means false."""
+    updates = {}
+    def put(name, value):
+        if value is not None and value != "": updates[name] = value
 
-    hdr_formats = []
-    if "HDR10+" in hdr_upper or "HDR10P" in hdr_upper:
-        hdr_formats.append("HDR10+")
-    elif "HDR10" in hdr_upper:
-        hdr_formats.append("HDR10")
-    if "HLG" in hdr_upper:
-        hdr_formats.append("HLG")
-    if hdr_evidence == "asserted" and not hdr_formats:
-        hdr_formats.append("HDR")
+    put("clean_title", str(payload.get("display_title") or "").strip() or None)
+    put("title_year", _int_or_none(payload.get("year")))
+    put("season", _int_or_none(payload.get("season")))
+    put("episode", _int_or_none(payload.get("episode_number")))
+    put("resolution", str(payload.get("res") or "").strip() or None)
+    put("size_text", str(payload.get("size") or "").strip() or None)
+    put("size_gb", _size_gb(payload.get("size")))
+    imdb_id = str(payload.get("imdb_id") or "").strip()
+    if imdb_id.startswith("tt") and imdb_id[2:].isdigit(): updates["imdb_id"] = imdb_id
 
-    return {
-        "clean_title": (
-            str(payload.get("display_title") or "").strip() or None
-        ),
-        "title_year": _int_or_none(payload.get("year")),
-        "season": _int_or_none(payload.get("season")),
-        "episode": _int_or_none(payload.get("episode_number")),
-        "resolution": (
-            str(payload.get("res") or "").strip() or None
-        ),
-        "size_text": (
-            str(payload.get("size") or "").strip() or None
-        ),
-        "size_gb": _size_gb(payload.get("size")),
-        "dv_evidence": (
-            "asserted" if payload.get("dovi") is True else "negated"
-        ),
-        "hdr_evidence": hdr_evidence,
-        "hdr_formats": hdr_formats,
-        "description_complete": True,
-        "identity_state": "exact",
-    }
+    if "dovi" in payload and payload.get("dovi") is not None:
+        updates["dv_evidence"] = "asserted" if payload.get("dovi") is True else "negated"
+
+    if "hdr" in payload and payload.get("hdr") is not None:
+        hdr_value=str(payload.get("hdr") or "").strip(); hdr_upper=hdr_value.upper()
+        if hdr_upper not in {"", "?", "UNKNOWN"}:
+            if hdr_upper in {"SDR", "NONE", "NO"}:
+                updates["hdr_evidence"]="negated"; updates["hdr_formats"]=[]
+            else:
+                formats=[]
+                if "HDR10+" in hdr_upper or "HDR10P" in hdr_upper: formats.append("HDR10+")
+                elif "HDR10" in hdr_upper: formats.append("HDR10")
+                if "HLG" in hdr_upper: formats.append("HLG")
+                if not formats: formats.append("HDR")
+                updates["hdr_evidence"]="asserted"; updates["hdr_formats"]=formats
+
+    if payload.get("url") and payload.get("display_title"):
+        updates["description_complete"] = True
+        updates["identity_state"] = "hydrated"
+    return updates
 
 
 def _size_gb(value):

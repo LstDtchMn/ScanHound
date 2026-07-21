@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
+  import { canEnablePrimary, evidenceLabel, reasonLabel } from '$lib/rss/status';
 
   type FeedState = {
     feed_key: string;
@@ -43,6 +44,7 @@
     hydration_state: string;
     evidence_incomplete: boolean;
     year_conflict: boolean;
+    discovery_source?: string | null;
   };
 
   type RssStatus = {
@@ -54,6 +56,12 @@
     candidate_counts: Record<string, number>;
     hydration_counts: Record<string, number>;
     unknown_counts: Record<string, number>;
+    shadow: {
+      successful_cycles: number; relevant_misses: number;
+      request_reduction_pct: number; recovery_cycles: number;
+      latest?: Record<string, unknown> | null;
+    };
+    coordinator: Record<string, unknown>;
     safe_defaults: {
       listing_fallback: boolean;
       rss_auto_grab: boolean;
@@ -89,7 +97,7 @@
   }
 
   async function setMode(mode: RssStatus['mode']) {
-    if (mode === 'rss_primary' && !status?.readiness.ready) {
+    if (mode === 'rss_primary' && !canEnablePrimary(status?.readiness)) {
       addToast(
         'RSS discovery',
         'RSS primary is locked until shadow validation is complete',
@@ -144,18 +152,6 @@
     if (seconds >= 86400) return `${(seconds / 86400).toFixed(1)} d`;
     if (seconds >= 3600) return `${(seconds / 3600).toFixed(1)} h`;
     return `${Math.round(seconds / 60)} min`;
-  }
-
-  function evidence(value: string) {
-    return value === 'asserted'
-      ? 'Yes'
-      : value === 'negated'
-        ? 'No'
-        : 'Unknown';
-  }
-
-  function reasonLabel(reason: string) {
-    return reason.replaceAll('_', ' ');
   }
 
   onMount(() => {
@@ -243,6 +239,29 @@
       </div>
     </section>
 
+    <section class="grid md:grid-cols-4 gap-3">
+      <div class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-4">
+        <div class="text-xs uppercase text-[var(--text-secondary)]">Shadow comparisons</div>
+        <p class="mt-2 text-sm">Cycles: {status.shadow.successful_cycles}</p>
+        <p class="text-sm">Relevant misses: {status.shadow.relevant_misses}</p>
+      </div>
+      <div class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-4">
+        <div class="text-xs uppercase text-[var(--text-secondary)]">Request reduction</div>
+        <p class="mt-2 text-lg font-semibold">{status.shadow.request_reduction_pct.toFixed(1)}%</p>
+        <p class="text-xs text-[var(--text-secondary)]">Measured against constrained listing requests</p>
+      </div>
+      <div class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-4">
+        <div class="text-xs uppercase text-[var(--text-secondary)]">Recovery evidence</div>
+        <p class="mt-2 text-sm">Cycles: {status.shadow.recovery_cycles}</p>
+        <p class="text-xs text-[var(--text-secondary)]">Restart or adaptive catch-up</p>
+      </div>
+      <div class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-4">
+        <div class="text-xs uppercase text-[var(--text-secondary)]">Coordinator</div>
+        <p class="mt-2 text-sm">{String(status.coordinator.state ?? 'unknown')}</p>
+        <p class="text-xs text-[var(--text-secondary)]">{String(status.coordinator.reason_code ?? 'No active block')}</p>
+      </div>
+    </section>
+
     <section class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl overflow-hidden">
       <div class="p-4 border-b border-[var(--border)]">
         <h2 class="font-semibold">Feed health</h2>
@@ -309,13 +328,16 @@
                 {item.resolution ?? 'Resolution unknown'}
               </span>
               <span class="rounded px-2 py-0.5 bg-[var(--bg-tertiary)]">
-                DV: {evidence(item.dv_evidence)}
+                DV: {evidenceLabel(item.dv_evidence)}
               </span>
               <span class="rounded px-2 py-0.5 bg-[var(--bg-tertiary)]">
-                HDR: {evidence(item.hdr_evidence)}
+                HDR: {evidenceLabel(item.hdr_evidence)}
               </span>
               <span class="rounded px-2 py-0.5 bg-[var(--bg-tertiary)]">
                 {item.relevance_state}
+              </span>
+              <span class="rounded px-2 py-0.5 bg-[var(--bg-tertiary)]">
+                Source: {item.discovery_source ?? 'rss'}
               </span>
               {#if item.year_conflict}
                 <span class="rounded px-2 py-0.5 bg-[var(--bg-tertiary)]">

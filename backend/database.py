@@ -218,7 +218,7 @@ class DatabaseManager:
     # ── Schema initialization ────────────────────────────────────────
 
     # Schema version — increment when migrations are added.
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
 
     def init_db(self):
         """Initialize database tables and run schema migrations.
@@ -858,6 +858,59 @@ class DatabaseManager:
                         except sqlite3.OperationalError:
                             pass
 
+                # RSS comparison evidence and identity additions (v5).
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_shadow_cycles (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        cycle_uuid TEXT NOT NULL UNIQUE,
+                        started_at TEXT NOT NULL,
+                        completed_at TEXT NOT NULL,
+                        normal_feeds_complete INTEGER NOT NULL,
+                        rss_requests INTEGER NOT NULL,
+                        listing_requests INTEGER NOT NULL,
+                        rss_count INTEGER NOT NULL,
+                        listing_count INTEGER NOT NULL,
+                        duplicate_count INTEGER NOT NULL,
+                        feed_only_count INTEGER NOT NULL,
+                        listing_only_count INTEGER NOT NULL,
+                        relevant_miss_count INTEGER NOT NULL,
+                        request_reduction_pct REAL NOT NULL,
+                        catchup_used INTEGER NOT NULL DEFAULT 0,
+                        restart_recovery INTEGER NOT NULL DEFAULT 0,
+                        outcome TEXT NOT NULL,
+                        details_json TEXT NOT NULL DEFAULT '{}'
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_shadow_misses (
+                        cycle_uuid TEXT NOT NULL,
+                        canonical_url TEXT NOT NULL,
+                        title TEXT,
+                        status TEXT,
+                        PRIMARY KEY (cycle_uuid, canonical_url),
+                        FOREIGN KEY (cycle_uuid)
+                            REFERENCES hdencode_shadow_cycles(cycle_uuid)
+                            ON DELETE CASCADE
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_hdencode_shadow_completed
+                    ON hdencode_shadow_cycles(completed_at, outcome)
+                """)
+                for _column, _declaration in (
+                    ("imdb_id", "TEXT"),
+                    ("tmdb_id", "TEXT"),
+                    ("discovery_source", "TEXT NOT NULL DEFAULT 'rss'"),
+                ):
+                    try:
+                        cursor.execute(
+                            f"ALTER TABLE hdencode_candidates "
+                            f"ADD COLUMN {_column} {_declaration}"
+                        )
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
+
                 # ── Stamp current version ────────────────────────────────
                 cursor.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
 
@@ -1258,47 +1311,55 @@ class DatabaseManager:
         return dict(row) if row is not None else None
 
     def get_hdencode_candidate_context(
-        self, *, canonical_url, clean_title, media_type, years, season
+        self, *, canonical_url, clean_title, media_type, years, season,
+        imdb_id=None, tmdb_id=None,
     ):
         exact_url_downloaded = bool(self._query(
-            "SELECT 1 FROM downloads WHERE url = ? LIMIT 1",
+            """
+            SELECT 1
+            FROM scraped_link_map AS mapping
+            JOIN downloads AS history ON history.url = mapping.link
+            WHERE RTRIM(mapping.source_url, '/') = RTRIM(?, '/')
+            LIMIT 1
+            """,
             (canonical_url,), one=True, default=None,
         ))
-        if not clean_title:
-            return {
-                "exact_url_downloaded": exact_url_downloaded,
-                "plex_matches": [],
-            }
+        if not clean_title and not imdb_id and not tmdb_id:
+            return {"exact_url_downloaded": exact_url_downloaded, "plex_matches": []}
 
-        clauses = ["LOWER(title) = LOWER(?)"]
-        params = [clean_title]
-        if media_type == "tv":
-            clauses.append("content_type = 'TV Shows'")
-            if season is not None:
-                clauses.append("season = ?")
-                params.append(season)
-        else:
-            clauses.append("content_type = 'Movies'")
-        year_values = [
-            int(year) for year in (years or ())
-            if year is not None
-        ]
-        if year_values:
-            placeholders = ",".join("?" for _ in year_values)
-            clauses.append(f"(year IN ({placeholders}) OR year IS NULL)")
-            params.extend(year_values)
-
-        matches = self._query_dicts(
+        select = (
             "SELECT title, year, res AS resolution, size AS size_gb, "
-            "dovi, hdr, season, rating_key, file_path "
-            "FROM plex_cache WHERE " + " AND ".join(clauses),
-            tuple(params),
-            default=[],
+            "dovi, hdr, season, rating_key, file_path, imdb_id, media_id "
+            "FROM plex_cache WHERE "
         )
-        return {
-            "exact_url_downloaded": exact_url_downloaded,
-            "plex_matches": matches,
-        }
+        if imdb_id:
+            matches = self._query_dicts(select + "imdb_id = ?", (imdb_id,), default=[])
+            if matches:
+                return {"exact_url_downloaded": exact_url_downloaded, "plex_matches": matches, "identity_basis": "imdb_id"}
+        if tmdb_id:
+            matches = self._query_dicts(select + "media_id = ?", (str(tmdb_id),), default=[])
+            if matches:
+                return {"exact_url_downloaded": exact_url_downloaded, "plex_matches": matches, "identity_basis": "tmdb_id"}
+        if not clean_title:
+            return {"exact_url_downloaded": exact_url_downloaded, "plex_matches": []}
+
+        base_clauses=["LOWER(title) = LOWER(?)"]; base_params=[clean_title]
+        if media_type == "tv":
+            base_clauses.append("content_type = 'TV Shows'")
+            if season is not None: base_clauses.append("season = ?"); base_params.append(season)
+        else:
+            base_clauses.append("content_type = 'Movies'")
+        ordered_years=[]
+        for year in years or ():
+            try: value=int(year)
+            except (TypeError,ValueError): continue
+            if value not in ordered_years: ordered_years.append(value)
+        for year in ordered_years:
+            matches=self._query_dicts(select+" AND ".join(base_clauses+["year = ?"]),tuple(base_params+[year]),default=[])
+            if matches:
+                return {"exact_url_downloaded": exact_url_downloaded, "plex_matches": matches, "identity_basis": f"year:{year}"}
+        matches=self._query_dicts(select+" AND ".join(base_clauses+["year IS NULL"]),tuple(base_params),default=[])
+        return {"exact_url_downloaded": exact_url_downloaded, "plex_matches": matches, "identity_basis": "title_only" if matches else None}
 
     def enqueue_hdencode_hydration(self, canonical_url, *, reason, priority):
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -1337,6 +1398,35 @@ class DatabaseManager:
             (canonical_url, reason, int(priority), now),
             label="enqueue_hdencode_hydration",
         )
+
+    def requeue_hdencode_hydration(self, canonical_url, *, reason, priority):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            changed = conn.execute(
+                """
+                UPDATE hdencode_hydration_queue
+                SET reason = ?, priority = ?, state = 'queued',
+                    attempts = 0, queued_at = ?, claimed_at = NULL,
+                    completed_at = NULL, last_error_code = NULL
+                WHERE canonical_url = ?
+                """,
+                (reason, int(priority), now, canonical_url),
+            ).rowcount
+            if changed == 0:
+                conn.execute(
+                    """INSERT INTO hdencode_hydration_queue
+                       (canonical_url, reason, priority, state, queued_at)
+                       VALUES (?, ?, ?, 'queued', ?)""",
+                    (canonical_url, reason, int(priority), now),
+                )
+            conn.execute(
+                """UPDATE hdencode_candidates
+                   SET hydration_state='queued', detail_reason=?, updated_at=?
+                   WHERE canonical_url=?""",
+                (reason, now, canonical_url),
+            )
 
     def resolve_hdencode_hydration(self, canonical_url, *, reason):
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -1478,11 +1568,12 @@ class DatabaseManager:
                     dv_evidence = COALESCE(?, dv_evidence),
                     hdr_evidence = COALESCE(?, hdr_evidence),
                     hdr_formats = COALESCE(?, hdr_formats),
+                    imdb_id = COALESCE(?, imdb_id),
                     description_complete = CASE
                         WHEN ? THEN 1 ELSE description_complete
                     END,
                     hydration_state = 'completed',
-                    identity_state = COALESCE(?, 'exact'),
+                    identity_state = COALESCE(?, identity_state),
                     relevance_state = 'unclassified',
                     detail_reason = NULL,
                     updated_at = ?
@@ -1498,7 +1589,12 @@ class DatabaseManager:
                     updates.get("size_gb"),
                     updates.get("dv_evidence"),
                     updates.get("hdr_evidence"),
-                    json.dumps(updates.get("hdr_formats") or []),
+                    (
+                        json.dumps(updates["hdr_formats"])
+                        if "hdr_formats" in updates
+                        else None
+                    ),
+                    updates.get("imdb_id"),
                     1 if updates.get("description_complete") else 0,
                     updates.get("identity_state"),
                     now,
@@ -1641,94 +1737,122 @@ class DatabaseManager:
             default=[],
         )
 
-    def get_hdencode_rss_readiness(
-        self,
-        *,
-        min_cycles=20,
-        min_days=7,
-    ):
-        """Return the evidence gate for promotion from shadow to primary."""
-        try:
-            required_cycles = max(1, int(min_cycles))
-        except (TypeError, ValueError):
-            required_cycles = 20
-        try:
-            required_days = max(1, int(min_days))
-        except (TypeError, ValueError):
-            required_days = 7
+    def list_hdencode_current_feed_urls(self, feed_keys=("movies_all", "tv_all")):
+        keys=tuple(feed_keys or ())
+        if not keys: return []
+        placeholders=",".join("?" for _ in keys)
+        rows=self._query(
+            "SELECT DISTINCT membership.canonical_url "
+            "FROM hdencode_candidate_feeds membership "
+            "JOIN hdencode_feed_state state ON state.feed_key=membership.feed_key "
+            f"WHERE membership.feed_key IN ({placeholders}) "
+            "AND state.last_changed_at IS NOT NULL "
+            "AND membership.last_seen_at >= state.last_changed_at",
+            keys, default=[],
+        )
+        return [row[0] for row in rows]
 
-        cycle = self._query(
-            """
-            SELECT COUNT(*) AS successful_cycles,
-                   MIN(completed_at) AS first_completed_at,
-                   MAX(completed_at) AS last_completed_at
-            FROM hdencode_ingest_cycles
-            WHERE feed_key IN ('movies_all', 'tv_all')
-              AND outcome IN ('changed', 'not_modified')
-            """,
-            one=True,
-            default=None,
-        )
-        successful_cycles = int(
-            cycle["successful_cycles"] if cycle is not None else 0
-        )
-        first_completed_at = (
-            cycle["first_completed_at"] if cycle is not None else None
-        )
-        last_completed_at = (
-            cycle["last_completed_at"] if cycle is not None else None
-        )
-        observed_days = 0.0
-        if first_completed_at:
-            try:
-                first = datetime.datetime.fromisoformat(first_completed_at)
-                if first.tzinfo is None:
-                    first = first.replace(tzinfo=datetime.timezone.utc)
-                observed_days = max(
-                    0.0,
-                    (
-                        datetime.datetime.now(datetime.timezone.utc)
-                        - first.astimezone(datetime.timezone.utc)
-                    ).total_seconds() / 86400.0,
+    def record_hdencode_shadow_comparison(self, *, cycle_uuid, started_at, completed_at, metrics, catchup_used=False, restart_recovery=False):
+        details=dict(metrics)
+        misses=list(details.pop("relevant_misses",[]) or [])
+        with self.transaction() as conn:
+            if not conn: raise RuntimeError("Database unavailable")
+            conn.execute(
+                """INSERT INTO hdencode_shadow_cycles (
+                    cycle_uuid, started_at, completed_at, normal_feeds_complete,
+                    rss_requests, listing_requests, rss_count, listing_count,
+                    duplicate_count, feed_only_count, listing_only_count,
+                    relevant_miss_count, request_reduction_pct, catchup_used,
+                    restart_recovery, outcome, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (cycle_uuid,started_at,completed_at,1 if metrics.get("normal_feeds_complete") else 0,
+                 int(metrics.get("rss_requests") or 0),int(metrics.get("listing_requests") or 0),
+                 int(metrics.get("rss_count") or 0),int(metrics.get("listing_count") or 0),
+                 int(metrics.get("duplicate_count") or 0),int(metrics.get("feed_only_count") or 0),
+                 int(metrics.get("listing_only_count") or 0),int(metrics.get("relevant_miss_count") or 0),
+                 float(metrics.get("request_reduction_pct") or 0),1 if catchup_used else 0,
+                 1 if restart_recovery else 0,str(metrics.get("outcome") or "unknown"),
+                 json.dumps(details,default=str)),
+            )
+            for miss in misses:
+                conn.execute(
+                    "INSERT OR REPLACE INTO hdencode_shadow_misses "
+                    "(cycle_uuid, canonical_url, title, status) VALUES (?, ?, ?, ?)",
+                    (cycle_uuid,miss.get("canonical_url"),miss.get("title"),miss.get("status")),
                 )
-            except (TypeError, ValueError):
-                observed_days = 0.0
 
-        feed_rows = self._query_dicts(
-            """
-            SELECT feed_key, last_status, consecutive_failures,
-                   last_checked_at, observed_depth_seconds
-            FROM hdencode_feed_state
-            WHERE feed_key IN ('movies_all', 'tv_all')
-            """,
-            default=[],
-        )
-        by_key = {row["feed_key"]: row for row in feed_rows}
-        normal_feeds_healthy = all(
-            key in by_key
-            and by_key[key].get("last_status") in (200, 304)
-            and int(by_key[key].get("consecutive_failures") or 0) == 0
-            for key in ("movies_all", "tv_all")
-        )
-        reasons = []
-        if successful_cycles < required_cycles:
-            reasons.append("insufficient_cycles")
-        if observed_days < required_days:
-            reasons.append("insufficient_days")
-        if not normal_feeds_healthy:
-            reasons.append("normal_feeds_unhealthy")
-
+    def get_hdencode_rss_dashboard_counts(self):
+        candidate_rows=self._query_dicts(
+            "SELECT relevance_state AS name, COUNT(*) AS count "
+            "FROM hdencode_candidates GROUP BY relevance_state",default=[])
+        hydration_rows=self._query_dicts(
+            "SELECT state AS name, COUNT(*) AS count "
+            "FROM hdencode_hydration_queue GROUP BY state",default=[])
+        unknown=self._query(
+            """SELECT
+                SUM(CASE WHEN dv_evidence='unknown' THEN 1 ELSE 0 END) AS dv,
+                SUM(CASE WHEN hdr_evidence='unknown' THEN 1 ELSE 0 END) AS hdr,
+                SUM(CASE WHEN identity_state IN ('unknown','ambiguous','hydrated') OR identity_state IS NULL THEN 1 ELSE 0 END) AS identity,
+                SUM(CASE WHEN title_year IS NOT NULL AND description_year IS NOT NULL AND title_year != description_year THEN 1 ELSE 0 END) AS year_conflict
+               FROM hdencode_candidates""",one=True,default=None)
         return {
-            "ready": not reasons,
-            "required_cycles": required_cycles,
-            "successful_cycles": successful_cycles,
-            "required_days": required_days,
-            "observed_days": observed_days,
-            "normal_feeds_healthy": normal_feeds_healthy,
-            "first_completed_at": first_completed_at,
-            "last_completed_at": last_completed_at,
-            "reasons": reasons,
+            "candidate_counts":{row["name"]:int(row["count"]) for row in candidate_rows},
+            "hydration_counts":{row["name"]:int(row["count"]) for row in hydration_rows},
+            "unknown_counts":{key:int((unknown[key] if unknown else 0) or 0) for key in ("dv","hdr","identity","year_conflict")},
         }
+
+    def get_hdencode_shadow_summary(self):
+        totals=self._query(
+            """SELECT COUNT(*) AS cycles, MIN(completed_at) AS first_completed_at,
+                      MAX(completed_at) AS last_completed_at,
+                      SUM(relevant_miss_count) AS relevant_misses,
+                      SUM(rss_requests) AS rss_requests,
+                      SUM(listing_requests) AS listing_requests,
+                      SUM(CASE WHEN normal_feeds_complete=1 THEN 1 ELSE 0 END) AS complete_cycles,
+                      SUM(CASE WHEN restart_recovery=1 OR catchup_used=1 THEN 1 ELSE 0 END) AS recovery_cycles
+               FROM hdencode_shadow_cycles WHERE outcome IN ('success','relevant_miss')""",
+            one=True,default=None)
+        latest=self._query("SELECT * FROM hdencode_shadow_cycles ORDER BY completed_at DESC LIMIT 1",one=True,default=None)
+        listing=int((totals["listing_requests"] if totals else 0) or 0); rss=int((totals["rss_requests"] if totals else 0) or 0)
+        reduction=(100.0*(listing-rss)/listing) if listing>0 else 0.0
+        return {
+            "successful_cycles":int((totals["complete_cycles"] if totals else 0) or 0),
+            "first_completed_at":totals["first_completed_at"] if totals else None,
+            "last_completed_at":totals["last_completed_at"] if totals else None,
+            "relevant_misses":int((totals["relevant_misses"] if totals else 0) or 0),
+            "rss_requests":rss,"listing_requests":listing,"request_reduction_pct":round(reduction,2),
+            "recovery_cycles":int((totals["recovery_cycles"] if totals else 0) or 0),
+            "latest":dict(latest) if latest is not None else None,
+        }
+
+    def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180):
+        required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days)); summary=self.get_hdencode_shadow_summary()
+        first=summary.get("first_completed_at"); last=summary.get("last_completed_at"); observed_days=0.0
+        try:
+            first_dt=datetime.datetime.fromisoformat(first); last_dt=datetime.datetime.fromisoformat(last)
+            if first_dt.tzinfo is None: first_dt=first_dt.replace(tzinfo=datetime.timezone.utc)
+            if last_dt.tzinfo is None: last_dt=last_dt.replace(tzinfo=datetime.timezone.utc)
+            observed_days=max(0.0,(last_dt-first_dt).total_seconds()/86400.0)
+        except (TypeError,ValueError): pass
+        feed_rows=self._query_dicts(
+            "SELECT feed_key,last_status,consecutive_failures,last_checked_at FROM hdencode_feed_state "
+            "WHERE feed_key IN ('movies_all','tv_all')",default=[])
+        by_key={row["feed_key"]:row for row in feed_rows}; now=datetime.datetime.now(datetime.timezone.utc)
+        def fresh(row):
+            try:
+                value=datetime.datetime.fromisoformat(row.get("last_checked_at"))
+                if value.tzinfo is None: value=value.replace(tzinfo=datetime.timezone.utc)
+                return (now-value.astimezone(datetime.timezone.utc)).total_seconds() <= max(15,int(max_stale_minutes))*60
+            except (TypeError,ValueError): return False
+        feeds_healthy=all(key in by_key and by_key[key].get("last_status") in (200,304) and int(by_key[key].get("consecutive_failures") or 0)==0 and fresh(by_key[key]) for key in ("movies_all","tv_all"))
+        reasons=[]
+        if summary["successful_cycles"]<required_cycles: reasons.append("insufficient_comparison_cycles")
+        if observed_days<required_days: reasons.append("insufficient_observation_days")
+        if summary["relevant_misses"]>0: reasons.append("relevant_misses_detected")
+        if summary["request_reduction_pct"]<=0: reasons.append("request_reduction_not_proven")
+        if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
+        if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")
+        return {"ready":not reasons,"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
 
     # ── Plex cache ───────────────────────────────────────────────────
 

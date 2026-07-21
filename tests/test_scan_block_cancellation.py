@@ -29,6 +29,10 @@ def _scanner_shell():
     scanner._stop_event = __import__("threading").Event()
     scanner._last_crawl_seen_urls = set()
     scanner._last_crawl_early_stopped = False
+    # ScannerService.__init__ initializes this listing-request counter (added by
+    # the RSS completion package); the __new__-based shell must set it too, since
+    # _fetch_page increments it before the scraper call.
+    scanner._last_crawl_request_count = 0
     scanner._log = MagicMock()
     scanner._progress = MagicMock()
     return scanner

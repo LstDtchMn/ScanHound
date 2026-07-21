@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -44,6 +45,7 @@ class BackgroundScanner:
         self._next_run_ts: Optional[float] = None
         # Summary of the most recent run, surfaced via /background/status.
         self._last_run: Optional[Dict[str, Any]] = None
+        self._rss_jitter_seconds = random.uniform(-600.0, 600.0)
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
@@ -89,7 +91,12 @@ class BackgroundScanner:
     def next_run_at(self) -> Optional[float]:
         """Epoch timestamp of the next scheduled run, or None if disabled."""
         cfg = self._reg.config or {}
-        if not cfg.get("background_scan_enabled"):
+        rss_active = (
+            cfg.get("hdencode_enabled", True) is True
+            and cfg.get("hdencode_discovery_mode")
+            in {"rss_shadow", "rss_primary"}
+        )
+        if not cfg.get("background_scan_enabled") and not rss_active:
             return None
         # The timestamp the loop is actually sleeping toward is authoritative;
         # fall back to last_run + interval before the loop has armed it.
@@ -103,11 +110,26 @@ class BackgroundScanner:
 
     def _interval_seconds(self) -> float:
         cfg = self._reg.config or {}
-        try:
-            hours = max(1, int(cfg.get("background_scan_interval_hours", 6)))
-        except (TypeError, ValueError):
-            hours = 6
-        return hours * 3600.0
+        intervals = []
+        if cfg.get("background_scan_enabled"):
+            try:
+                hours = max(1, int(cfg.get("background_scan_interval_hours", 6)))
+            except (TypeError, ValueError):
+                hours = 6
+            intervals.append(hours * 3600.0)
+        if (
+            cfg.get("hdencode_enabled", True) is True
+            and cfg.get("hdencode_discovery_mode")
+            in {"rss_shadow", "rss_primary"}
+        ):
+            try:
+                minutes = max(15, min(int(
+                    cfg.get("hdencode_rss_poll_minutes", 60)
+                ), 360))
+            except (TypeError, ValueError):
+                minutes = 60
+            intervals.append(max(300.0, minutes * 60.0 + self._rss_jitter_seconds))
+        return min(intervals) if intervals else 3600.0
 
     def _wait_interval(self) -> bool:
         """Sleep one interval, re-reading it in short slices so a change to
@@ -140,11 +162,18 @@ class BackgroundScanner:
                 self._next_run_ts = None
                 return  # stop requested
             cfg = self._reg.config or {}
-            if cfg.get("background_scan_enabled"):
+            rss_active = (
+                cfg.get("hdencode_enabled", True) is True
+                and cfg.get("hdencode_discovery_mode")
+                in {"rss_shadow", "rss_primary"}
+            )
+            if cfg.get("background_scan_enabled") or rss_active:
                 try:
                     self.scan_once()
                 except Exception:
                     logger.exception("Background scan failed")
+                finally:
+                    self._rss_jitter_seconds = random.uniform(-600.0, 600.0)
 
     # ── the scan itself ───────────────────────────────────────────────
 
@@ -169,6 +198,13 @@ class BackgroundScanner:
             return {"scanned": 0, "cached": 0, "skipped": True}
 
         sources = cfg.get("background_scan_sources") or _DEFAULT_SOURCES
+        rss_active = (
+            cfg.get("hdencode_enabled", True) is True
+            and cfg.get("hdencode_discovery_mode")
+            in {"rss_shadow", "rss_primary"}
+        )
+        if rss_active and not cfg.get("background_scan_enabled"):
+            sources = ["HDEncode"]
         try:
             pages = max(1, int(cfg.get("background_scan_pages", 3)))
         except (TypeError, ValueError):
@@ -308,6 +344,43 @@ class BackgroundScanner:
                         db.touch_background_cache(seen)
                     if getattr(scanner, "_last_crawl_early_stopped", False):
                         purge_safe = False
+
+                if (
+                    is_hdencode
+                    and discovery_mode == "rss_shadow"
+                    and rss_cycle
+                    and cfg.get("hdencode_rss_shadow_compare_enabled", True)
+                ):
+                    from datetime import datetime, timezone
+                    import uuid
+                    from backend.hdencode_shadow import compare_shadow
+                    normal = {
+                        result.get("feed"): result.get("outcome")
+                        for result in rss_cycle.get("feeds", [])
+                        if result.get("feed") in {"movies_all", "tv_all"}
+                    }
+                    metrics = compare_shadow(
+                        rss_urls=rss_cycle.get("candidate_urls", []),
+                        listing_items=items,
+                        rss_requests=rss_cycle.get("requests", 0),
+                        listing_requests=getattr(
+                            scanner, "_last_crawl_request_count", source_pages
+                        ),
+                        normal_feeds_complete=(
+                            set(normal) == {"movies_all", "tv_all"}
+                            and all(value in {"changed", "not_modified"} for value in normal.values())
+                        ),
+                    ).as_dict()
+                    completed_at = datetime.now(timezone.utc).isoformat()
+                    db.record_hdencode_shadow_comparison(
+                        cycle_uuid=str(uuid.uuid4()),
+                        started_at=completed_at,
+                        completed_at=completed_at,
+                        metrics=metrics,
+                        catchup_used=rss_cycle.get("catchup_used", False),
+                        restart_recovery=rss_cycle.get("restart_recovery", False),
+                    )
+                    rss_cycle["comparison"] = metrics
 
                 rows = self._to_cache_rows(items, source)
                 if rows:

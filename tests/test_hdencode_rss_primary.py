@@ -52,6 +52,11 @@ class Db:
             "observed_days": 7,
         }
 
+    def record_hdencode_shadow_comparison(self, **_kwargs):
+        # Added by the RSS completion package; the shadow crawl persists a
+        # comparison row after each listing cycle.
+        return None
+
     def get_background_cache_urls(self):
         return set()
 
@@ -76,6 +81,7 @@ class Backend:
 class Registry:
     def __init__(self, mode, *, fallback=False):
         self.config = {
+            "background_scan_enabled": True,
             "background_scan_sources": ["HDEncode", "DDLBase"],
             "background_scan_pages": 3,
             "background_scan_retain_days": 7,
@@ -221,21 +227,30 @@ def test_primary_service_refuses_before_shadow_gate():
 def test_readiness_requires_cycles_days_and_two_healthy_normal_feeds(tmp_path):
     db = DatabaseManager(str(tmp_path / "crawler.db"))
     now = datetime.now(timezone.utc)
-    old = (now - timedelta(days=8)).isoformat()
+    # The RSS completion readiness gate reads hdencode_shadow_cycles (via
+    # get_hdencode_shadow_summary), not hdencode_ingest_cycles: it requires >=20
+    # complete comparison cycles spanning >=7 days, zero relevant misses, proven
+    # request reduction (listing_requests > rss_requests), and >=1 restart/catchup
+    # recovery cycle.
     for index in range(20):
-        feed = "movies_all" if index % 2 == 0 else "tv_all"
+        completed = (now - timedelta(days=8) + timedelta(days=index * 0.4)).isoformat()
         with db.transaction() as conn:
             conn.execute(
                 """
-                INSERT INTO hdencode_ingest_cycles (
-                    feed_key, started_at, completed_at, http_status,
-                    changed, candidate_count, outcome
-                ) VALUES (?, ?, ?, 304, 0, 0, 'not_modified')
+                INSERT INTO hdencode_shadow_cycles (
+                    cycle_uuid, started_at, completed_at, normal_feeds_complete,
+                    rss_requests, listing_requests, rss_count, listing_count,
+                    duplicate_count, feed_only_count, listing_only_count,
+                    relevant_miss_count, request_reduction_pct, catchup_used,
+                    restart_recovery, outcome
+                ) VALUES (?, ?, ?, 1, 1, 2, 5, 5, 5, 0, 0, 0, 50.0, ?, ?, 'success')
                 """,
                 (
-                    feed,
-                    old,
-                    (now - timedelta(days=8) + timedelta(hours=index)).isoformat(),
+                    f"cycle-{index}",
+                    completed,
+                    completed,
+                    1 if index == 0 else 0,
+                    1 if index == 1 else 0,
                 ),
             )
     with db.transaction() as conn:
@@ -271,4 +286,4 @@ def test_readiness_requires_cycles_days_and_two_healthy_normal_feeds(tmp_path):
         min_days=7,
     )
     assert readiness["ready"] is False
-    assert "normal_feeds_unhealthy" in readiness["reasons"]
+    assert "normal_feeds_unhealthy_or_stale" in readiness["reasons"]

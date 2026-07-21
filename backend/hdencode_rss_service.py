@@ -14,6 +14,7 @@ from backend.hdencode_coordinator import (
 from backend.sources.hdencode_feed_client import HDEncodeFeedClient
 from backend.sources.hdencode_feed_parser import parse_feed
 from backend.sources.hdencode_feeds import catchup_feeds, normal_feeds
+from backend.hdencode_shadow import catchup_required
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ class HDEncodeRSSService:
         # unrelated caller or test to have configured the process singleton.
         self.coordinator = configure_hdencode_coordinator(self.config, db)
         self._last_cycle = None
+        self._first_cycle = True
 
     def _enabled(self) -> bool:
         return (
@@ -119,12 +121,14 @@ class HDEncodeRSSService:
 
         normal = list(normal_feeds())
         if include_catchup is None:
-            include_catchup = any(
-                self._due(
-                    self.db.get_hdencode_feed_state(feed.key),
-                    self._catchup_interval_seconds(),
-                )
-                for feed in catchup_feeds()
+            include_catchup = catchup_required(
+                [
+                    self.db.get_hdencode_feed_state(feed.key) or {}
+                    for feed in normal_feeds()
+                ],
+                fallback_hours=self.config.get(
+                    "hdencode_rss_catchup_hours", 4
+                ),
             )
         feeds = normal + (list(catchup_feeds()) if include_catchup else [])
 
@@ -169,12 +173,16 @@ class HDEncodeRSSService:
             ) is True
             and not coordinator_blocked
         )
+        candidate_urls = self.db.list_hdencode_current_feed_urls()
         cycle = {
             "mode": mode,
             "at": time.time(),
             "feeds": results,
             "changed": sum(r.get("changed", 0) for r in results),
-            "candidates": sum(r.get("candidate_count", 0) for r in results),
+            "candidates": len(candidate_urls),
+            "candidate_urls": candidate_urls,
+            "catchup_used": bool(include_catchup),
+            "restart_recovery": self._first_cycle,
             "requests": sum(1 for r in results if r.get("requested")),
             "readiness": readiness,
             "coverage_uncertain": coverage_uncertain,
@@ -182,6 +190,7 @@ class HDEncodeRSSService:
             "listing_fallback_started": False,
             "downloads_started": 0,
         }
+        self._first_cycle = False
         self._last_cycle = cycle
         return cycle
 
@@ -201,6 +210,7 @@ class HDEncodeRSSService:
             with self.coordinator.request(
                 "rss",
                 stop_requested=stop_requested,
+                priority=10,
             ):
                 response = self.client.fetch(
                     feed.url,
@@ -321,7 +331,14 @@ class HDEncodeRSSService:
             completed_at=checked,
         )
         depth = _observed_depth_seconds(parsed.entries)
-        self.db.update_hdencode_feed_depth(feed.key, depth)
+        try:
+            self.db.update_hdencode_feed_depth(feed.key, depth)
+        except Exception:
+            logger.warning(
+                "RSS depth update failed after committed ingest for %s",
+                feed.key,
+                exc_info=True,
+            )
         return {
             "feed": feed.key,
             "outcome": "changed",

@@ -61,6 +61,14 @@ class FakeDb:
             "normal_feeds_healthy": False,
         }
 
+    def list_hdencode_current_feed_urls(self, *_args, **_kwargs):
+        # Added by the RSS completion package; the shadow poll queries it to
+        # scope the comparison to currently-listed feed URLs.
+        return []
+
+    def record_hdencode_shadow_comparison(self, **_kwargs):
+        return None
+
     def ingest_hdencode_feed(self, **kwargs):
         self.ingests.append(kwargs)
         self.state[kwargs["feed_key"]] = {

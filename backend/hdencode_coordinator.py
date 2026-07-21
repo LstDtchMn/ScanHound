@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import heapq
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import threading
@@ -25,6 +26,10 @@ class HDEncodeRequestCancelled(HDEncodeTrafficDenied):
 
 _AUTHORIZED_CLASS: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "scanhound_hdencode_authorized_class",
+    default=None,
+)
+_REQUEST_PRIORITY: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "scanhound_hdencode_request_priority",
     default=None,
 )
 
@@ -96,12 +101,21 @@ class HDEncodeTrafficCoordinator:
         "selenium": 1,
         "rss": 1,
     }
+    _DEFAULT_PRIORITY = {
+        "rss": 10,
+        "listing": 20,
+        "detail": 50,
+        "selenium": 60,
+    }
 
     def __init__(self):
         self._config = {}
         self._db = None
         self._state_lock = threading.RLock()
         self._pacing_lock = threading.Lock()
+        self._priority_condition = threading.Condition()
+        self._priority_waiters = []
+        self._priority_sequence = 0
         self._last_start: Optional[float] = None
         self._semaphores = {
             name: threading.BoundedSemaphore(limit)
@@ -235,6 +249,63 @@ class HDEncodeTrafficCoordinator:
             "metrics": metrics,
         }
 
+    @contextlib.contextmanager
+    def prioritize(self, priority: int):
+        """Set the inherited priority for nested detail/browser operations."""
+        token = _REQUEST_PRIORITY.set(int(priority))
+        try:
+            yield
+        finally:
+            _REQUEST_PRIORITY.reset(token)
+
+    def _remove_waiter(self, waiter) -> None:
+        with self._priority_condition:
+            try:
+                self._priority_waiters.remove(waiter)
+            except ValueError:
+                return
+            heapq.heapify(self._priority_waiters)
+            self._priority_condition.notify_all()
+
+    def _acquire_priority_slot(
+        self,
+        request_class: str,
+        priority: int,
+        stop_requested: Optional[Callable[[], bool]],
+    ):
+        semaphore = self._semaphores[request_class]
+        with self._priority_condition:
+            self._priority_sequence += 1
+            waiter = (-int(priority), self._priority_sequence, request_class)
+            heapq.heappush(self._priority_waiters, waiter)
+            self._priority_condition.notify_all()
+
+        while True:
+            if _cancelled(stop_requested):
+                self._remove_waiter(waiter)
+                with self._state_lock:
+                    self._metrics["cancelled"][request_class] += 1
+                raise HDEncodeRequestCancelled()
+            decision = self._active_decision()
+            if decision.blocked:
+                self._remove_waiter(waiter)
+                with self._state_lock:
+                    self._metrics["denied"][request_class] += 1
+                raise HDEncodeTrafficDenied(
+                    decision.reason_code or decision.state,
+                    f"HDEncode traffic is {decision.state}",
+                )
+            with self._priority_condition:
+                if (
+                    self._priority_waiters
+                    and self._priority_waiters[0] == waiter
+                    and semaphore.acquire(blocking=False)
+                ):
+                    heapq.heappop(self._priority_waiters)
+                    self._priority_condition.notify_all()
+                    return semaphore
+                self._priority_condition.wait(timeout=0.1)
+
     def _wait_for_start(
         self,
         request_class: str,
@@ -266,6 +337,7 @@ class HDEncodeTrafficCoordinator:
         request_class: str,
         *,
         stop_requested: Optional[Callable[[], bool]] = None,
+        priority: Optional[int] = None,
     ) -> Iterator[None]:
         """Authorize exactly one transport operation."""
         if request_class not in self._semaphores:
@@ -280,14 +352,17 @@ class HDEncodeTrafficCoordinator:
                 f"HDEncode traffic is {decision.state}",
             )
 
-        semaphore = self._semaphores[request_class]
-        acquired = False
-        while not acquired:
-            if _cancelled(stop_requested):
-                with self._state_lock:
-                    self._metrics["cancelled"][request_class] += 1
-                raise HDEncodeRequestCancelled()
-            acquired = semaphore.acquire(timeout=0.1)
+        inherited = _REQUEST_PRIORITY.get()
+        effective_priority = (
+            int(priority)
+            if priority is not None
+            else int(inherited)
+            if inherited is not None
+            else self._DEFAULT_PRIORITY[request_class]
+        )
+        semaphore = self._acquire_priority_slot(
+            request_class, effective_priority, stop_requested
+        )
 
         token = None
         try:
@@ -307,6 +382,8 @@ class HDEncodeTrafficCoordinator:
             if token is not None:
                 _AUTHORIZED_CLASS.reset(token)
             semaphore.release()
+            with self._priority_condition:
+                self._priority_condition.notify_all()
 
     def _persist_success(self) -> None:
         try:
@@ -360,6 +437,8 @@ class HDEncodeTrafficCoordinator:
             self._local_cooldown_until = until
             self._health_cache_at = 0.0
         self._persist_failure("cooldown", f"http_{status}", seconds)
+        with self._priority_condition:
+            self._priority_condition.notify_all()
         return HDEncodeDecision(
             True,
             "cooldown",
@@ -375,6 +454,8 @@ class HDEncodeTrafficCoordinator:
             self._local_cooldown_until = until
             self._health_cache_at = 0.0
         self._persist_failure("cooldown", reason_code, seconds)
+        with self._priority_condition:
+            self._priority_condition.notify_all()
 
     def observe_network_failure(self, reason_code: str) -> None:
         with self._state_lock:

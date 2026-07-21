@@ -62,6 +62,30 @@ class Db:
     def recover_hdencode_hydration_queue(self):
         return 0
 
+    def get_hdencode_rss_dashboard_counts(self):
+        # Mirrors the single unknown/ambiguous/year-conflict candidate in
+        # list_hdencode_candidates() so the status route surfaces dv=1,
+        # identity=1, year_conflict=1 (computation moved from the route into
+        # this DB method by the RSS completion package).
+        return {
+            "candidate_counts": {"detail_required": 1},
+            "hydration_counts": {"queued": 1},
+            "unknown_counts": {"dv": 1, "hdr": 0, "identity": 1, "year_conflict": 1},
+        }
+
+    def get_hdencode_shadow_summary(self):
+        return {
+            "successful_cycles": 20 if self.ready else 4,
+            "first_completed_at": None,
+            "last_completed_at": None,
+            "relevant_misses": 0,
+            "rss_requests": 0,
+            "listing_requests": 0,
+            "request_reduction_pct": 0.0,
+            "recovery_cycles": 0,
+            "latest": None,
+        }
+
 
 class Registry:
     def __init__(self, *, ready=True, enabled=True):
@@ -76,7 +100,10 @@ class Registry:
             "hdencode_rss_shadow_min_days": 7,
         }
         self.background_scanner = SimpleNamespace(last_run=None)
-        self.backend = SimpleNamespace(save_config=lambda: None)
+        self.backend = SimpleNamespace(
+            save_config=lambda: None,
+            add_shutdown_hook=lambda *_a, **_k: None,
+        )
         self.scanner = SimpleNamespace(
             scrapers=SimpleNamespace(_detail=object())
         )
