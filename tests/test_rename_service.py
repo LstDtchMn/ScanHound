@@ -1415,13 +1415,24 @@ class TestApplyProgressBroadcast:
         # Small, deterministic chunking so a 10-byte file produces several
         # progress_cb calls (real transfers use 8 MiB chunks).
         monkeypatch.setattr(_fo, "_COPY_CHUNK", 2)
-        # Force the cross-device (EXDEV) branch so _copy_verify_atomic (and
-        # thus progress_cb) actually runs — a same-device 'move' is an
-        # instant os.rename with no byte-streaming.
-        def _exdev(a, b):
-            import errno
-            raise OSError(errno.EXDEV, "cross-device")
-        monkeypatch.setattr(_fo.os, "rename", _exdev)
+        # Force only the first publication attempt (the move) to report EXDEV.
+        # The corrected implementation calls _move_no_replace rather than
+        # os.rename; subsequent publication of the verified copy must remain
+        # real so progress/ETA are exercised end to end.
+        real_publish = _fo._move_no_replace
+        publish_calls = 0
+
+        def _first_publish_exdev_then_real(src_path, dst_path):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                import errno
+                raise OSError(errno.EXDEV, "cross-device")
+            return real_publish(src_path, dst_path)
+
+        monkeypatch.setattr(
+            _fo, "_move_no_replace", _first_publish_exdev_then_real
+        )
 
         captured = []
         monkeypatch.setattr(ws_mod.ws_manager, "broadcast_sync", captured.append)
@@ -2329,17 +2340,22 @@ class TestReplaceLibraryDupAndKeepPlex:
         assert not os.path.exists(src)     # redundant download moved to trash
         assert os.path.isfile(dup)         # library copy untouched
 
-    def test_keep_plex_trash_failure_still_archives(self, db, tmp_path, monkeypatch):
+    def test_keep_plex_trash_failure_does_not_archive(
+            self, db, tmp_path, monkeypatch):
+        """SH-R03: Keep Plex is not committed unless durable trash succeeds."""
         svc, jid, src, dst, dup = self._setup(db, tmp_path)
 
         def _boom(path):
             raise OSError("simulated trash failure")
         monkeypatch.setattr("backend.rename.service._fileops._trash", _boom)
+
         out = svc.resolve_keep_plex(jid)
-        assert out["ok"] is True
-        assert out.get("warning")          # surfaced, not swallowed
-        assert db.get_rename_job(jid).get("archived_at")
-        assert os.path.isfile(src)         # trash failed => download left in place
+
+        assert out["ok"] is False
+        assert "not applied" in out.get("error", "").lower()
+        assert not db.get_rename_job(jid).get("archived_at")
+        assert os.path.isfile(src)         # failed transaction leaves download in place
+        assert os.path.isfile(dup)         # Plex/library copy is never touched
 
 
 # ── process_folder (manual backlog processing) ───────────────────────

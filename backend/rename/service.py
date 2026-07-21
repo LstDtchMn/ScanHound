@@ -1493,7 +1493,16 @@ class RenameService:
                                      "re-review before replacing the library copy."))
                 self._broadcast(job_id)
                 return {"ok": False, "error": "Destination no longer free"}
-            trashed_to = _fileops._trash(lib_path)
+            try:
+                trashed_to = _fileops._trash(lib_path)
+            except Exception as exc:
+                msg = ("The library duplicate could not be moved to durable "
+                       f"trash ({exc}); nothing was changed.")
+                db.update_rename_job(
+                    job_id, status="needs_review", warning_message=msg,
+                    conflict_replaced_path=None)
+                self._broadcast(job_id)
+                return {"ok": False, "error": msg}
             restore_slot = lib_path
             db.update_rename_job(job_id, conflict_replaced_path=lib_path)
         # Collision guard: a prior apply (or a file already present in the
@@ -1525,7 +1534,16 @@ class RenameService:
                 # destination (SH-H09): if place_file() below then fails, the
                 # except branch restores this exact entry back to dst rather
                 # than leaving the library slot permanently empty.
-                trashed_to = _fileops._trash(dst)
+                try:
+                    trashed_to = _fileops._trash(dst)
+                except Exception as exc:
+                    msg = ("The existing destination could not be moved to "
+                           f"durable trash ({exc}); nothing was changed.")
+                    db.update_rename_job(
+                        job_id, status="needs_review", warning_message=msg,
+                        conflict_replaced_path=None)
+                    self._broadcast(job_id)
+                    return {"ok": False, "error": msg}
             elif conflict_strategy == "keep_both":
                 # Place the incoming file alongside the existing one under a
                 # deduped sibling name; the existing file is never touched.
@@ -1778,39 +1796,61 @@ class RenameService:
         return {"ok": True, "restore_warning": restore_warning}
 
     def resolve_keep_plex(self, job_id: int) -> dict:
-        """Resolve a duplicate conflict in favour of the copy already in Plex.
+        """Keep Plex only after the redundant download is durably recoverable.
 
-        The downloaded file is redundant once the user keeps the library copy,
-        so this (1) ARCHIVES the job — a decision was made, so it stops
-        re-surfacing as a pending conflict — and (2) moves the downloaded
-        source to the RECOVERABLE trash (never a hard delete; restorable from
-        the Trash panel). The library/destination file is never touched.
-
-        Archiving happens FIRST so the job leaves the
-        detect_moved_source_files scan set before its source is trashed —
-        otherwise a later maintenance pass would misread the now-missing source
-        as an external move and mark the job failed. A trash failure still
-        leaves the job archived (resolved) and surfaces a warning; the library
-        copy is safe either way.
+        Trashing happens before archival.  If trash preparation fails, the job
+        remains unresolved and the source stays in place.  If archival fails
+        after the move, the exact trash entry is restored before returning an
+        error, so callers never receive success for a half-completed decision.
         """
         db = self._db
         job = db.get_rename_job(job_id) if db else None
         if not job:
             return {"ok": False, "error": "Job not found"}
-        db.archive_rename_jobs([job_id])
-        warning = None
+
         src = job.get("original_path")
+        trashed_to = None
         if src and os.path.lexists(src):
             try:
-                _fileops._trash(src)
-            except Exception as e:
-                warning = ("Kept the Plex copy, but the downloaded file could "
-                           f"not be moved to trash ({e}) — remove it manually.")
+                trashed_to = _fileops._trash(src)
+            except Exception as exc:
+                msg = (
+                    "The downloaded file could not be moved to durable trash "
+                    f"({exc}); the Keep Plex decision was not applied."
+                )
                 logger.warning(
-                    "resolve_keep_plex: trash of %s failed for job %s: %s",
-                    src, job_id, e)
+                    "resolve_keep_plex: durable trash of %s failed for job %s: %s",
+                    src, job_id, exc)
+                self._broadcast(job_id)
+                return {"ok": False, "error": msg}
+
+        try:
+            archived = db.archive_rename_jobs([job_id])
+            if archived is False:
+                raise RuntimeError("archive write did not persist")
+        except Exception as exc:
+            restore_error = None
+            if trashed_to:
+                bucket = os.path.basename(os.path.dirname(trashed_to))
+                name = os.path.basename(trashed_to)
+                try:
+                    restored = _fileops.restore_trash_entry(
+                        bucket, name, _fileops.all_trash_roots())
+                    if not restored.get("ok"):
+                        restore_error = restored.get("error") or "unknown error"
+                except Exception as restore_exc:
+                    restore_error = str(restore_exc)
+            msg = f"Keep Plex bookkeeping failed: {exc}"
+            if restore_error:
+                msg += (
+                    ". The downloaded file could not be restored from trash "
+                    f"({restore_error}); manual recovery is required."
+                )
+            self._broadcast(job_id)
+            return {"ok": False, "error": msg}
+
         self._broadcast(job_id)
-        return {"ok": True, "warning": warning}
+        return {"ok": True, "warning": None}
 
     def rematch(self, job_id: int, tmdb_id: int, media_type: Optional[str] = None,
                 season: Optional[int] = None, episode: Optional[int] = None) -> dict:
