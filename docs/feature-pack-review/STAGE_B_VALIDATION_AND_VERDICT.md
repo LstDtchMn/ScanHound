@@ -1,8 +1,14 @@
 # ScanHound feature pack — Stage B validation and final verdict
 
 Reviewer: Claude (git/deploy/real-checkout validation lane).
-Integration branch: `agent/feature-pack-integration` head **`6939220`**
-(pushed to origin). Assembled from `origin/main` `555e26bc`.
+Integration branch: `agent/feature-pack-integration`, assembled from
+`origin/main` `555e26bc`. Head lineage (all pushed):
+
+```text
+Current draft branch head: 2915e3a   (evidence/report documentation)
+Latest code-tested SHA:    a6b4a7b   (final runnable closure; unrestricted 3974/0)
+Original Stage-B SHA:      6939220   (initial full-matrix integration; 3729/0)
+```
 
 ## 1. Assembled commits (all validated + pushed individually first)
 
@@ -44,13 +50,16 @@ SH-R04 `repair_trash_transactions`, per §5 invariant #7).
 | Public-error boundary (SH-R09) | test_public_error_boundary + client.errors.test | passed | 3.12 + node |
 | DNS-pinned TLS review | code review of `hdencode_feed_client._PinnedHTTPSConnection` | PASS — pinned-IP socket wrapped with `create_default_context` (check_hostname=True, CERT_REQUIRED) + `server_hostname`=approved host; SSRF IP rejection; 2 MiB bounded gzip; hostname verification NOT weakened | code review |
 
-## 3. Validation matrix — ENVIRONMENT-GATED (NOT run; reported honestly)
+## 3. Validation matrix — ENVIRONMENT-GATED (reported honestly)
 
-These require an environment this reviewer cannot provide. They are **not**
-simulated and remain open:
+> NOTE: this section is the ORIGINAL Stage-B snapshot. Since then, UID 1000 and
+> the Python 3.11 non-browser suite were executed and are GREEN — see §5d for
+> the current, authoritative classification. The items below that remain open
+> are Playwright, the full prod-migration matrix, the 3.11 browser subset, the
+> 7-day shadow, and the sentinel.
 
-- **Python 3.11** — the validation image is Python 3.12-only; the 3.11 floor
-  is unverified here.
+- **Python 3.11** — non-browser suite now GREEN (3804/0, §5d); the
+  browser-backed scraper subset is still PENDING (needs Chromium/ChromeDriver).
 - **Root AND UID 1000** — all runs were as root in the container; UID-1000 is
   unverified.
 - **Playwright production-build occupied-port / state isolation** — no browser
@@ -207,7 +216,8 @@ matched exactly — authored against the real pushed head):
 
 | Track | Result |
 |---|---|
-| **A — Python 3.11** | **PASS** — core modules import on 3.11.15; full non-browser suite **3804 passed / 0 failed** (fresh `python:3.11-slim` + `requirements-docker.txt` + pytest-asyncio). Browser-launching scraper files (`test_scrapers`, `test_scrapers_extended`, `test_rt_scraper`) need apt chromium/chromedriver — an image-provisioning dependency identical on 3.12, not a 3.11 issue. |
+| **A — Python 3.11 (non-browser suite)** | **PASS** — core modules import on 3.11.15; non-browser suite **3804 passed / 0 failed** (fresh `python:3.11-slim` + `requirements-docker.txt` + pytest-asyncio). |
+| **A — Python 3.11 (browser-backed scraper subset)** | **PENDING ENVIRONMENT EVIDENCE** — `test_scrapers`, `test_scrapers_extended`, `test_rt_scraper` were NOT run because Chromium/ChromeDriver were unavailable in the slim image. These must run in a browser-enabled Python 3.11 environment before 3.11 can be represented as a full-suite pass. (The dependency is image-provisioning, identical on 3.12; but it is not yet proven on 3.11.) |
 | **B — UID 1000** | **PASS** — full unrestricted suite as `1000:1000` = **3974 passed / 0 failed**, identical to root; app init, runtime-lock acquisition, trash transactions, and RSS/action recovery all correct as non-root. |
 | **C — Playwright production E2E** | NOT RUN — needs a browser + running app+backend harness in the sandbox. The occupied-port/state-isolation properties it targets are covered at the unit level by PR #14 within the 3974 suite; full browser E2E is a dedicated-environment run. |
 | **D — production-schema migration matrix** | PARTIAL — the additive path (SCHEMA v4→5→6, `CREATE TABLE IF NOT EXISTS` + guarded `ALTER`, zero destructive ops) and a clean reopen are proven in-suite. The full matrix (byte-for-byte production-DB copy, interrupt-during-migration, old-image reopen, documented rollback) requires a production-DB snapshot Jesse provides; the running production instance was not touched. |
@@ -215,23 +225,28 @@ matched exactly — authored against the real pushed head):
 ## 6. FINAL VERDICT
 
 The complete feature pack is assembled on `agent/feature-pack-integration`
-(code-tested `6939220`; identity-safety fix `6e62cde`) and passes every gate
-this reviewer can execute: the COMPLETE backend suite with no exclusions
-(**3964 passed, 0 failed**, 3 pre-existing network-integration tests deselected
-with reason), frontend typecheck/unit/build, `git diff --check`, Stage-B
-cross-seam gates, file-safety cross-seam suites, additive migration,
-security/lifecycle gates, and a code-level DNS-pinned-TLS review confirming
-hostname verification is intact. Both ChatGPT peer-review issues (no-exclusion
-run; hydrated-identity promotion) are resolved (§5c). No production regression
-was found in any track.
+(latest code-tested SHA `a6b4a7b`, the final runnable closure) and passes every
+gate this reviewer can execute: the COMPLETE backend suite with NO exclusions
+(no `--ignore`, no `--deselect`, no signal timeout) = **3974 passed, 0 failed**
+on Python 3.12; frontend typecheck/unit/build; `git diff --check`; Stage-B
+cross-seam gates; file-safety cross-seam suites; the additive migration path;
+security/lifecycle gates; and a code-level DNS-pinned-TLS review confirming
+hostname verification is intact. ChatGPT independently reviewed `a6b4a7b`:
+**CODE CLOSURE ACCEPTED**, no new code defect. No production regression was
+found in any track.
 
-Since the last verdict, two more environment gates were executed and are now
-GREEN: **Python 3.11** (3804/0 non-browser) and **UID 1000** (3974/0). The
-remaining acceptance evidence still cannot be produced here and must not be
-simulated: Playwright production-build E2E, the full production-schema
-migration/interrupt/old-image-reopen/rollback matrix (needs a production-DB
-snapshot), the seven-day ≥20-cycle RSS shadow gate, and the Jesse-authorized
-filesystem sentinel.
+Environment gates executed and GREEN: **UID 1000** (3974/0) and **Python 3.11
+non-browser suite** (3804/0). Still outstanding and not producible here (must
+not be simulated):
+
+- **Python 3.11 browser-backed scraper subset** (`test_scrapers`,
+  `test_scrapers_extended`, `test_rt_scraper`) — needs Chromium/ChromeDriver;
+  not yet run on 3.11;
+- **Playwright** production-build E2E / occupied-port / state isolation;
+- the full **production-schema migration** matrix
+  (interrupt/old-image-reopen/rollback) — needs a production-DB snapshot;
+- the **seven-day ≥20-cycle RSS shadow** gate;
+- the **Jesse-authorized filesystem sentinel**.
 
 ### **FEATURE PACK REQUIRES ENVIRONMENT EVIDENCE**
 
