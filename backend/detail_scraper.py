@@ -7,16 +7,78 @@ synchronous (blocking) and designed to run in thread-pool executors.
 
 import logging
 import re
+import threading
 import time
-from typing import Optional
+from contextlib import contextmanager, nullcontext
+from typing import Callable, Optional
+from urllib.parse import urlparse
 
-import cloudscraper
 from bs4 import BeautifulSoup
 
 from backend.models import ScrapeResult
+from backend.hdencode_coordinator import (
+    HDEncodeRequestCancelled,
+    HDEncodeTrafficDenied,
+    configure_hdencode_coordinator,
+    get_hdencode_coordinator,
+)
+from backend.hdencode_transport import create_source_http_client
 from backend.rename import llm_identify as _llm
 
 logger = logging.getLogger(__name__)
+
+# HDEncode pacing and authorization now live in HDEncodeTrafficCoordinator.
+
+
+def _detail_source_kind(url: str) -> str:
+    """Classify detail traffic by parsed hostname.
+
+    DDLBase and Adit-HD share the parsing facade but remain outside the
+    HDEncode traffic coordinator. Unknown and malformed URLs fail closed to
+    the HDEncode policy.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        host = ""
+
+    if host == "ddlbase.com" or host.endswith(".ddlbase.com"):
+        return "ddlbase"
+    if host == "adit-hd.com" or host.endswith(".adit-hd.com"):
+        return "adithd"
+    return "hdencode"
+
+
+class _DetailRequestCancelled(Exception):
+    """Internal control-flow signal; never exposed as a scrape failure."""
+
+
+def _is_cancelled(stop_requested: Optional[Callable[[], bool]]) -> bool:
+    if stop_requested is None:
+        return False
+    try:
+        return bool(stop_requested())
+    except Exception:
+        return True
+
+
+def _interruptible_sleep(
+    seconds: float,
+    stop_requested: Optional[Callable[[], bool]],
+) -> None:
+    if seconds <= 0:
+        return
+    if stop_requested is None:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while True:
+        if _is_cancelled(stop_requested):
+            raise _DetailRequestCancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
 
 
 class DetailScraper:
@@ -30,8 +92,19 @@ class DetailScraper:
                         clean_string, safe_log).
         """
         self.app = parent_app
+        configure_hdencode_coordinator(
+            getattr(parent_app, "config", {}),
+            getattr(parent_app, "db", None),
+        )
 
-    def scrape_details(self, url, headers, scraper=None) -> Optional[ScrapeResult]:
+    def scrape_details(
+        self,
+        url,
+        headers,
+        scraper=None,
+        *,
+        stop_requested: Optional[Callable[[], bool]] = None,
+    ) -> Optional[ScrapeResult]:
         """Scrape movie/TV show details from an HDEncode post page.
 
         Extracts filename, title, year, resolution, file size, HDR/DV flags,
@@ -54,8 +127,8 @@ class DetailScraper:
             dict with parsed media metadata, or None on failure.
         """
         try:
-            if not scraper:
-                scraper = cloudscraper.create_scraper()
+            source_kind = _detail_source_kind(url)
+            hdencode_request = source_kind == "hdencode"
 
             # Retry logic for robust connection
             max_retries = 3
@@ -63,19 +136,56 @@ class DetailScraper:
             last_error = None
 
             for attempt in range(max_retries):
+                if _is_cancelled(stop_requested):
+                    return None
                 try:
-                    resp = scraper.get(url, headers=headers, timeout=20)
+                    if hdencode_request:
+                        with get_hdencode_coordinator().request(
+                            "detail",
+                            stop_requested=stop_requested,
+                        ):
+                            if _is_cancelled(stop_requested):
+                                return None
+                            active_scraper = scraper or create_source_http_client(
+                                hdencode=True
+                            )
+                            resp = active_scraper.get(
+                                url, headers=headers, timeout=20
+                            )
+                        get_hdencode_coordinator().observe_http_status(
+                            resp.status_code
+                        )
+                    else:
+                        active_scraper = scraper or create_source_http_client(
+                            hdencode=False
+                        )
+                        resp = active_scraper.get(
+                            url, headers=headers, timeout=20
+                        )
                     if resp.status_code == 200:
                         break
                     elif resp.status_code == 429:  # Too Many Requests
-                        time.sleep(2 * (attempt + 1))
+                        _interruptible_sleep(2 * (attempt + 1), stop_requested)
                         continue
                     else:
-                        time.sleep(1 * (attempt + 1))
+                        _interruptible_sleep(1 * (attempt + 1), stop_requested)
                         continue
+                except (
+                    HDEncodeRequestCancelled,
+                    HDEncodeTrafficDenied,
+                    _DetailRequestCancelled,
+                ):
+                    return None
                 except Exception as e:
                     last_error = e
-                    time.sleep(1 * (attempt + 1))  # Backoff: 1s, 2s, 3s
+                    if hdencode_request:
+                        get_hdencode_coordinator().observe_network_failure(
+                            type(e).__name__
+                        )
+                    try:
+                        _interruptible_sleep(1 * (attempt + 1), stop_requested)
+                    except _DetailRequestCancelled:
+                        return None
 
             if not resp or resp.status_code != 200:
                 if self.app.config.get("debug_mode"):

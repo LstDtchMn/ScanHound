@@ -90,6 +90,9 @@ class AppConfig(TypedDict, total=False):
     # path, so toggling one silently did nothing. Which categories a scan
     # covers is driven by the per-scan flags in scanner_service.py.)
 
+    # Source enablement
+    hdencode_enabled: bool
+
     # DDLBase / Cuty.io
     ddlbase_enabled: bool
     cuty_email: str
@@ -106,6 +109,17 @@ class AppConfig(TypedDict, total=False):
     scheduler_enabled: bool
     scheduler_interval: int  # hours
     last_scan_time: float  # timestamp
+
+    # HDEncode RSS discovery
+    hdencode_discovery_mode: Literal["listing", "rss_shadow", "rss_primary"]
+    hdencode_rss_poll_minutes: int
+    hdencode_rss_catchup_hours: int
+    hdencode_rss_shadow_compare_enabled: bool
+    hdencode_rss_hydration_limit: int
+    hdencode_rss_listing_fallback_enabled: bool
+    hdencode_rss_auto_grab_enabled: bool
+    hdencode_rss_shadow_min_cycles: int
+    hdencode_rss_shadow_min_days: int
 
     # Background pre-cache scanning (pre-fetch results so the app opens fast)
     background_scan_enabled: bool
@@ -440,6 +454,7 @@ _DEFAULT_CONFIG: AppConfig = {
     "debug_mode": False,
     "verbose_logging": False,
     "exclude_720p": False,
+    "hdencode_enabled": True,
     "ddlbase_enabled": True,
     "ddlbase_manual_resolution_timeout": 60,
     "cuty_email": "",
@@ -452,6 +467,15 @@ _DEFAULT_CONFIG: AppConfig = {
     "scheduler_enabled": False,
     "scheduler_interval": 24,
     "last_scan_time": 0,
+    "hdencode_discovery_mode": "listing",
+    "hdencode_rss_poll_minutes": 60,
+    "hdencode_rss_catchup_hours": 4,
+    "hdencode_rss_shadow_compare_enabled": True,
+    "hdencode_rss_hydration_limit": 10,
+    "hdencode_rss_listing_fallback_enabled": False,
+    "hdencode_rss_auto_grab_enabled": False,
+    "hdencode_rss_shadow_min_cycles": 20,
+    "hdencode_rss_shadow_min_days": 7,
     "background_scan_enabled": False,
     "background_scan_interval_hours": 6,
     "background_scan_pages": 3,

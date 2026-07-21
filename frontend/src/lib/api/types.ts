@@ -357,6 +357,9 @@ export interface Settings {
   // Filtering
   exclude_720p?: boolean;
 
+  // Source enablement
+  hdencode_enabled?: boolean;
+
   // DDLBase / Cuty.io
   ddlbase_enabled?: boolean;
   ddlbase_manual_resolution_timeout?: number;

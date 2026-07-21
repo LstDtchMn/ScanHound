@@ -75,7 +75,7 @@ EXPECTED_DEFAULT_KEYS = {
     "jd_movies_folder_4k", "jd_tv_folder",
     "jd_email", "jd_password", "jd_device",
     # Source / filtering
-    "exclude_720p",
+    "exclude_720p", "hdencode_enabled",
     # DDLBase / Cuty
     "ddlbase_enabled", "ddlbase_manual_resolution_timeout",
     "cuty_email", "cuty_password",
@@ -126,6 +126,14 @@ EXPECTED_DEFAULT_KEYS = {
     "webhook_url", "webhook_method",
     "email_enabled", "smtp_host", "smtp_port", "smtp_username",
     "smtp_password", "email_from", "email_to", "smtp_tls",
+    # HDEncode RSS shadow (PR F)
+    "hdencode_rss_poll_minutes", "hdencode_rss_catchup_hours",
+    "hdencode_discovery_mode", "hdencode_rss_shadow_compare_enabled",
+    # HDEncode RSS classification (PR G)
+    "hdencode_rss_hydration_limit",
+    # HDEncode RSS-primary readiness / fallback (PR H)
+    "hdencode_rss_shadow_min_cycles", "hdencode_rss_shadow_min_days",
+    "hdencode_rss_auto_grab_enabled", "hdencode_rss_listing_fallback_enabled",
 }
 
 
@@ -166,6 +174,10 @@ class TestDefaultConfig:
 
     def test_default_config_scan_threads(self):
         assert _DEFAULT_CONFIG["scan_threads"] == 10
+
+
+    def test_default_config_hdencode_switch_is_boolean(self):
+        assert isinstance(_DEFAULT_CONFIG["hdencode_enabled"], bool)
 
     def test_default_config_trash_retention_days(self):
         assert _DEFAULT_CONFIG["trash_retention_days"] == 30

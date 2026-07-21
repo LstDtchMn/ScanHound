@@ -10,7 +10,6 @@ import re
 import time
 import threading
 import requests
-import cloudscraper
 from bs4 import BeautifulSoup
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +22,13 @@ from backend.app_service import (
     LRUCache, clean_string, normalize_title, STATUS_MISSING,
 )
 from backend.database import DatabaseManager
+from backend.hdencode_coordinator import (
+    HDEncodeRequestCancelled,
+    HDEncodeTrafficDenied,
+    configure_hdencode_coordinator,
+    get_hdencode_coordinator,
+)
+from backend.hdencode_transport import create_source_http_client
 from backend.matching import MatchingEngine, clear_fuzzy_cache
 from backend.metadata_enricher import MetadataEnricher
 from backend.scrapers import WebScrapers
@@ -154,6 +160,7 @@ class ScannerService:
     ):
         self.config = config
         self.db = db
+        configure_hdencode_coordinator(config, db)
         self.scrapers = scrapers
         self.matching = matching
         self.plex = plex_service
@@ -181,6 +188,7 @@ class ScannerService:
         # True when the last crawl stopped early at cached content — the scanner
         # then never saw deeper pages, so it must NOT purge against this crawl.
         self._last_crawl_early_stopped: bool = False
+        self._last_crawl_request_count: int = 0
 
         # Download history
         self.download_history: Set[str] = set()
@@ -307,6 +315,7 @@ class ScannerService:
             self.items.clear()
             self._item_counter = 0
         self._last_crawl_seen_urls = set()
+        self._last_crawl_request_count = 0
 
         # Load download history
         self.download_history = self._load_download_history()
@@ -418,13 +427,19 @@ class ScannerService:
         sources = self._build_sources(scan_type, source_type, base_url, flags, search_query)
 
         if not sources:
-            self._log("No sources selected!", "error")
+            if ((scan_type == "Site Search" or source_type == "HDEncode")
+                    and not self.config.get("hdencode_enabled", True)):
+                self._log("HDEncode is disabled in Settings; no requests were made.", "warning")
+            else:
+                self._log("No sources selected!", "error")
             return
 
         self._log(f"Sources: {', '.join(s['name'] for s in sources)}")
 
         # ── Crawl pages ───────────────────────────────────────────────
-        scraper = cloudscraper.create_scraper()
+        scraper = None
+        if any(s.get("source") != "hdencode" for s in sources):
+            scraper = create_source_http_client(hdencode=False)
         loop = asyncio.get_running_loop()
 
         previously_scanned: Set[str] = set()
@@ -520,6 +535,10 @@ class ScannerService:
             List of source descriptor dicts, or empty list if no flags are set.
         """
         sources = []
+
+        hdencode_requested = scan_type == "Site Search" or source_type == "HDEncode"
+        if hdencode_requested and not self.config.get("hdencode_enabled", True):
+            return []
 
         if scan_type == "Site Search":
             if not search_query:
@@ -637,7 +656,34 @@ class ScannerService:
                         url = f"{source_base}page/{page_num}/{source_suffix}"
 
                 try:
-                    resp = await loop.run_in_executor(None, lambda u=url: scraper.get(u, timeout=15))
+                    def _fetch_page(u=url):
+                        self._last_crawl_request_count += 1
+                        if source_id == "hdencode":
+                            with get_hdencode_coordinator().request(
+                                "listing",
+                                stop_requested=lambda: self.stop_scan_flag,
+                                priority=20,
+                            ):
+                                client = scraper or create_source_http_client(hdencode=True)
+                                return client.get(u, timeout=15)
+                        client = scraper or create_source_http_client(hdencode=False)
+                        return client.get(u, timeout=15)
+
+                    try:
+                        resp = await loop.run_in_executor(None, _fetch_page)
+                    except (HDEncodeTrafficDenied, HDEncodeRequestCancelled):
+                        early_stopped = True
+                        self.stop_scan_flag = True
+                        self._log(
+                            f"{source_name}: coordinator stopped remaining traffic",
+                            "warning",
+                        )
+                        break
+                    decision = (
+                        get_hdencode_coordinator().observe_http_status(resp.status_code)
+                        if source_id == "hdencode"
+                        else None
+                    )
                     if resp.status_code != 200:
                         # ONLY a Cloudflare / rate-limit block (403/429/503) is a
                         # "block": it fails every page, so back off and abandon the
@@ -651,10 +697,17 @@ class ScannerService:
                             # Back off (grows with the streak) so a blocked source
                             # isn't hammered with N requests in a few seconds.
                             await asyncio.sleep(min(0.5 * blocked_streak, 3.0))
-                            if blocked_streak >= 3:
+                            if decision is not None and decision.blocked:
+                                self.stop_scan_flag = True
+                                self._log(
+                                    f"{source_name}: confirmed shared block after "
+                                    f"{blocked_streak} consecutive responses; stopping "
+                                    "remaining scan work",
+                                    "warning",
+                                )
                                 break  # session can't clear the block this run
                         continue
-                    blocked_streak = 0  # a good page resets the streak
+                    blocked_streak = 0  # coordinator reset the global streak
 
                     soup = BeautifulSoup(resp.content, 'html.parser')
                     posts = self._select_posts(soup, source_id)
@@ -752,7 +805,12 @@ class ScannerService:
             post_source = post_info.get('source', 'hdencode')
             try:
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-                details = self.scrapers.scrape_details(url, headers, scraper)
+                details = self.scrapers.scrape_details(
+                    url,
+                    headers,
+                    scraper,
+                    stop_requested=lambda: self.stop_scan_flag,
+                )
                 if not details:
                     return None
                 is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'

@@ -169,20 +169,24 @@ class TestGetConfig:
         config = HDEncodeSource.get_config()
         assert SourceCapability.SEARCH in config.capabilities
 
-    def test_capabilities_include_direct_links(self):
-        """Capabilities should include DIRECT_LINKS."""
+    def test_capabilities_exclude_direct_links(self):
+        """HDEncode's direct-link method is fail-closed, so the plugin must
+        not claim DIRECT_LINKS (source capability correction, RSS actions
+        package)."""
         config = HDEncodeSource.get_config()
-        assert SourceCapability.DIRECT_LINKS in config.capabilities
+        assert not (config.capabilities & SourceCapability.DIRECT_LINKS)
 
-    def test_capabilities_include_cloudflare_bypass(self):
-        """Capabilities should include CLOUDFLARE_BYPASS."""
+    def test_capabilities_exclude_cloudflare_bypass(self):
+        """HDEncode RSS is fetched via the DNS-pinned client, so the plugin
+        must not claim CLOUDFLARE_BYPASS (source capability correction)."""
         config = HDEncodeSource.get_config()
-        assert SourceCapability.CLOUDFLARE_BYPASS in config.capabilities
+        assert not (config.capabilities & SourceCapability.CLOUDFLARE_BYPASS)
 
-    def test_requires_cloudflare_bypass(self):
-        """HDEncode should require cloudflare bypass."""
+    def test_does_not_require_cloudflare_bypass(self):
+        """HDEncode does not require cloudflare bypass (source capability
+        correction; RSS uses the pinned direct-IP client)."""
         config = HDEncodeSource.get_config()
-        assert config.requires_cloudflare_bypass is True
+        assert config.requires_cloudflare_bypass is False
 
     def test_enabled_by_default(self):
         """HDEncode should be enabled by default."""

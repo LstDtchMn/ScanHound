@@ -666,13 +666,15 @@ class TestScrapeDetailsEdgeCases:
 
     def test_scraper_creates_own_if_none_provided(self, scraper):
         """When no scraper arg is passed, scrape_details creates one internally."""
-        with patch("backend.detail_scraper.cloudscraper") as mock_cs:
-            fake_scraper = MagicMock()
-            ok_html = _build_detail_html("Movie.2020.1080p.mkv")
-            fake_scraper.get.return_value = _FakeResponse(ok_html)
-            mock_cs.create_scraper.return_value = fake_scraper
+        fake_scraper = MagicMock()
+        ok_html = _build_detail_html("Movie.2020.1080p.mkv")
+        fake_scraper.get.return_value = _FakeResponse(ok_html)
+        with patch(
+            "backend.detail_scraper.create_source_http_client",
+            return_value=fake_scraper,
+        ) as mock_create:
             result = scraper.scrape_details("https://example.com", {}, scraper=None)
-            mock_cs.create_scraper.assert_called_once()
+            mock_create.assert_called_once()
             assert result is not None
 
     def test_url_field_stored(self, scraper):
