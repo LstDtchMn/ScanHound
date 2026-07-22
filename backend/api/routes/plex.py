@@ -175,10 +175,21 @@ def _movie_targets_for_scope(reg: ServiceRegistry, scope: str, ids: Optional[Lis
     movies = reg.db.list_plex_cache_movies() if reg.db else []
     if scope == "selected":
         wanted = {str(value) for value in (ids or [])}
+        # Browser/API callers use Plex's public rating_key.  Older callers may
+        # still hold the cache's internal key, so retain that compatibility
+        # only when an ID did not match any public rating_key.  Treating the
+        # two namespaces as an unconditional OR can expand a selected pilot
+        # when one movie's rating_key equals another row's internal key.
+        public_matches = {
+            str(m.get("rating_key") or "")
+            for m in movies
+            if str(m.get("rating_key") or "") in wanted
+        }
+        internal_fallbacks = wanted - public_matches
         movies = [
             m for m in movies
             if str(m.get("rating_key") or "") in wanted
-            or str(m.get("key") or "") in wanted
+            or str(m.get("key") or "") in internal_fallbacks
         ]
     mappings = reg.config.get("plex_library_path_mappings") if reg.config else None
     targets = []

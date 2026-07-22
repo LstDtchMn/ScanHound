@@ -69,6 +69,36 @@ def test_selected_pilot_resolves_public_plex_rating_keys_not_internal_cache_keys
     assert targets[0]["rating_key"] == "101"
 
 
+def test_selected_pilot_does_not_expand_when_rating_key_collides_with_internal_key():
+    class Db:
+        @staticmethod
+        def list_plex_cache_movies():
+            return [
+                {
+                    "key": "206045_media-version",
+                    "rating_key": "206045",
+                    "file_path": "/library/selected.mkv",
+                    "title": "Selected Movie",
+                    "res": "2160p",
+                    "library_name": "4K Movies",
+                },
+                {
+                    "key": "206045",
+                    "rating_key": "999999",
+                    "file_path": "/library/collision.mkv",
+                    "title": "Unrelated Internal-Key Collision",
+                    "res": "2160p",
+                    "library_name": "4K Movies",
+                },
+            ]
+
+    reg = SimpleNamespace(db=Db(), config={"plex_library_path_mappings": []})
+
+    targets = plex_routes._movie_targets_for_scope(reg, "selected", ["206045"])
+
+    assert [target["rating_key"] for target in targets] == ["206045"]
+
+
 def test_inventory_csv_neutralizes_spreadsheet_formulas(tmp_path):
     db = DatabaseManager(str(tmp_path / "inventory.sqlite"))
     db.upsert_media_inventory({
