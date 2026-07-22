@@ -2521,7 +2521,7 @@ class DatabaseManager:
         candidate pool for find_library_duplicate()."""
         return self._query_dicts(
             "SELECT key, title, original_title, year, res, size, imdb_id, "
-            "rating_key, media_id, is_tv, dovi, hdr, file_path "
+            "rating_key, media_id, is_tv, dovi, hdr, library_name, file_path "
             "FROM plex_cache WHERE content_type = 'Movies'", default=[])
 
     def load_plex_cache(self, mode):

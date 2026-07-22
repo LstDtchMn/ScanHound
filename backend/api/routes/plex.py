@@ -185,11 +185,24 @@ def _movie_targets_for_scope(reg: ServiceRegistry, scope: str, ids: Optional[Lis
             "title": m.get("title"),
             "rating_key": m.get("rating_key"),
             "imdb_id": m.get("imdb_id"),
+            "library_name": m.get("library_name"),
+            "resolution": m.get("res"),
         })
     return targets
 
 
 class ScanMetadataRequest(BaseModel):
+    scope: str
+    ids: Optional[List[str]] = None
+
+
+class DurableMetadataScanRequest(BaseModel):
+    """Explicit, read-only metadata-inventory scan request.
+
+    ``pilot`` and ``targeted`` require caller-selected Plex keys. ``full`` is
+    intentionally limited to the cached 4K movie set; it never scans TV or
+    starts from a background scheduler.
+    """
     scope: str
     ids: Optional[List[str]] = None
 
@@ -225,6 +238,51 @@ def plex_scan_metadata_cancel(reg: ServiceRegistry = Depends(get_registry)):
 @router.get("/scan-metadata/status")
 def plex_scan_metadata_status(reg: ServiceRegistry = Depends(get_registry)):
     return reg.plex_metadata_scan_job.status_dict()
+
+
+@router.post("/metadata-scans")
+def plex_start_durable_metadata_scan(
+    body: DurableMetadataScanRequest,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    if body.scope not in ("pilot", "full", "targeted"):
+        raise HTTPException(status_code=400, detail="scope must be 'pilot', 'full', or 'targeted'")
+    if body.scope in ("pilot", "targeted") and not body.ids:
+        raise HTTPException(status_code=400, detail="ids are required for pilot or targeted scans")
+
+    targets = _movie_targets_for_scope(
+        reg, "selected" if body.scope in ("pilot", "targeted") else "all", body.ids
+    )
+    targets = [
+        target for target in targets
+        if str(target.get("resolution") or "").lower() in {"2160p", "4k", "uhd"}
+    ]
+    if not targets:
+        raise HTTPException(status_code=400, detail="no eligible 4K movie files were found")
+    try:
+        return reg.plex_metadata_scan_job.start_run(body.scope, targets)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/metadata-scans/{run_uuid}")
+def plex_durable_metadata_scan_status(run_uuid: str, reg: ServiceRegistry = Depends(get_registry)):
+    if not reg.db:
+        raise HTTPException(status_code=503, detail="Database service not initialized")
+    run = reg.db.get_metadata_scan_run(run_uuid)
+    if not run:
+        raise HTTPException(status_code=404, detail="metadata scan run not found")
+    return run
+
+
+@router.get("/metadata-scans/{run_uuid}/items")
+def plex_durable_metadata_scan_items(
+    run_uuid: str, status: Optional[str] = None,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    if not reg.db or not reg.db.get_metadata_scan_run(run_uuid):
+        raise HTTPException(status_code=404, detail="metadata scan run not found")
+    return {"items": reg.db.list_metadata_scan_items(run_uuid, status=status)}
 
 
 @router.get("/media-inventory")

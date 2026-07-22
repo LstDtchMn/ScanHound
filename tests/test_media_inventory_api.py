@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from backend.api.routes import plex as plex_routes
 from backend.api.routes.plex import plex_media_inventory, plex_media_inventory_facets
 from backend.database import DatabaseManager
 
@@ -17,3 +18,25 @@ def test_inventory_route_filters_local_fel_metadata(tmp_path):
     assert result["total"] == 1
     assert result["items"][0]["path"] == "/movies/fel.mkv"
     assert plex_media_inventory_facets(reg=reg)["dv_layer"] == [{"value": "fel", "count": 1}]
+
+
+def test_durable_scan_endpoint_accepts_only_cached_4k_targets(monkeypatch):
+    calls = []
+
+    class Job:
+        def start_run(self, scope, targets):
+            calls.append((scope, targets))
+            return {"run_uuid": "run-1", "status": "queued"}
+
+    monkeypatch.setattr(plex_routes, "_movie_targets_for_scope", lambda *_args: [
+        {"path": "/movies/uhd.mkv", "resolution": "2160p"},
+        {"path": "/movies/hd.mkv", "resolution": "1080p"},
+    ])
+    reg = SimpleNamespace(plex_metadata_scan_job=Job())
+
+    result = plex_routes.plex_start_durable_metadata_scan(
+        plex_routes.DurableMetadataScanRequest(scope="full"), reg=reg
+    )
+
+    assert result["run_uuid"] == "run-1"
+    assert calls == [("full", [{"path": "/movies/uhd.mkv", "resolution": "2160p"}])]
