@@ -51,6 +51,47 @@ class BackgroundScanner:
         # here rather than on the service instance.
         self._rss_first_cycle_after_startup = True
 
+    @staticmethod
+    def _rss_normal_feeds_complete(feeds, *, listing_error=None) -> bool:
+        """Return True only when both normal feeds and listing completed."""
+        if listing_error:
+            return False
+        normal = {
+            result.get("feed"): result.get("outcome")
+            for result in (feeds or [])
+            if result.get("feed") in {"movies_all", "tv_all"}
+        }
+        return (
+            set(normal) == {"movies_all", "tv_all"}
+            and all(
+                outcome in {"changed", "not_modified"}
+                for outcome in normal.values()
+            )
+        )
+
+    def _qualify_restart_recovery(
+        self,
+        *,
+        preexisting_normal_feed_state: bool,
+        metrics: Dict[str, Any],
+    ) -> bool:
+        """Consume startup evidence only on the first eligible comparison."""
+        eligible = (
+            bool(metrics.get("normal_feeds_complete"))
+            and int(metrics.get("rss_requests") or 0) > 0
+            and int(metrics.get("listing_requests") or 0) > 0
+            and str(metrics.get("outcome") or "")
+            in {"success", "relevant_miss"}
+        )
+        if not eligible:
+            return False
+        recovery = bool(
+            self._rss_first_cycle_after_startup
+            and preexisting_normal_feed_state
+        )
+        self._rss_first_cycle_after_startup = False
+        return recovery
+
     # ── lifecycle ─────────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -239,6 +280,7 @@ class BackgroundScanner:
         purge_safe = True
         source_results: List[Dict[str, Any]] = []
         rss_cycle = None
+        preexisting_normal_feed_state = False
         discovery_mode = cfg.get(
             "hdencode_discovery_mode", "listing"
         )
@@ -263,27 +305,6 @@ class BackgroundScanner:
                 rss_cycle = HDEncodeRSSService(cfg, db).poll_cycle(
                     stop_requested=stop_requested,
                 )
-                normal_outcomes = {
-                    result.get("outcome")
-                    for result in rss_cycle.get("feeds", [])
-                    if result.get("feed") in {"movies_all", "tv_all"}
-                }
-                completed_normal_cycle = (
-                    normal_outcomes
-                    and normal_outcomes <= {"changed", "not_modified", "not_due"}
-                    and {
-                        result.get("feed")
-                        for result in rss_cycle.get("feeds", [])
-                        if result.get("feed") in {"movies_all", "tv_all"}
-                    } == {"movies_all", "tv_all"}
-                )
-                rss_cycle["restart_recovery"] = bool(
-                    self._rss_first_cycle_after_startup
-                    and preexisting_normal_feed_state
-                    and completed_normal_cycle
-                )
-                if not rss_cycle.get("skipped"):
-                    self._rss_first_cycle_after_startup = False
                 if stop_requested():
                     return {
                         "scanned": 0,
@@ -435,20 +456,27 @@ class BackgroundScanner:
                         listing_requests=getattr(
                             scanner, "_last_crawl_request_count", source_pages
                         ),
-                        normal_feeds_complete=(
-                            set(normal) == {"movies_all", "tv_all"}
-                            and all(value in {"changed", "not_modified"} for value in normal.values())
+                        normal_feeds_complete=self._rss_normal_feeds_complete(
+                            rss_cycle.get("feeds", []),
+                            listing_error=err,
                         ),
                     ).as_dict()
                     completed_at = datetime.now(timezone.utc).isoformat()
+                    restart_recovery = self._qualify_restart_recovery(
+                        preexisting_normal_feed_state=(
+                            preexisting_normal_feed_state
+                        ),
+                        metrics=metrics,
+                    )
                     db.record_hdencode_shadow_comparison(
                         cycle_uuid=str(uuid.uuid4()),
                         started_at=completed_at,
                         completed_at=completed_at,
                         metrics=metrics,
                         catchup_used=rss_cycle.get("catchup_used", False),
-                        restart_recovery=rss_cycle.get("restart_recovery", False),
+                        restart_recovery=restart_recovery,
                     )
+                    rss_cycle["restart_recovery"] = restart_recovery
                     rss_cycle["comparison"] = metrics
 
                 rows = self._to_cache_rows(items, source)
