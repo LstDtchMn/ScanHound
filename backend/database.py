@@ -3682,6 +3682,19 @@ class DatabaseManager:
         )
         return rows[0] if rows else None
 
+    def list_dv_seed_baseline(self, *, limit=1000000):
+        """Return immutable imported seed evidence for reconciliation reports."""
+        try:
+            limit = max(1, min(int(limit), 1000000))
+        except (TypeError, ValueError):
+            limit = 1000000
+        return self._query_dicts(
+            'SELECT path, seed_layer, title, sig_mtime, sig_size, rating_key, '
+            'imdb_id, seed_scanned_at, imported_at FROM dv_seed_baseline '
+            'ORDER BY path ASC LIMIT ?',
+            (limit,), default=[],
+        )
+
     def create_metadata_scan_run(self, *, scope, expected_count=0):
         """Create a durable scan run before any file analysis begins."""
         if scope not in self._METADATA_SCAN_SCOPES:

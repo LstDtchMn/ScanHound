@@ -118,7 +118,14 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
         if added or removed:
             time.sleep(_THROTTLE_S)
 
-    return {"added": added, "removed": removed, "matched": layer is not None}
+    return {
+        "added": added,
+        "removed": removed,
+        "matched": layer is not None,
+        "layer": layer,
+        "desired_label": desired,
+        "existing_labels": sorted(existing_managed),
+    }
 
 
 _DEFAULT_VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}
@@ -147,6 +154,14 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     vocab = _vocab_from_config(config)
     rows = db.get_dv_scans(source="scan", limit=1000000)
     index, norm_to_path = build_index_and_paths(rows, mappings)
+    seed_rows = []
+    list_seed = getattr(db, "list_dv_seed_baseline", None)
+    if callable(list_seed):
+        seed_rows = list_seed(limit=1000000)
+    seed_index = {
+        normalize_path(row.get("path"), mappings): row.get("seed_layer")
+        for row in seed_rows if normalize_path(row.get("path"), mappings)
+    }
 
     movie_libs = (config.get("movie_libs")
                   or config.get("known_movie_libraries") or [])
@@ -167,6 +182,7 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
 
     total = len(movies)
     added_n = removed_n = matched_n = 0
+    details = []
     for i, mv in enumerate(movies):
         try:
             res = reconcile_movie(mv, index, vocab, pm,
@@ -185,6 +201,34 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
                                 index[p], rating_key=str(mv.ratingKey),
                                 source="scan")
                             break
+            if dry_run:
+                movie_paths = _movie_norm_paths(mv, mappings)
+                matched_path = next((p for p in movie_paths if p in index), None)
+                original_path = norm_to_path.get(matched_path, matched_path) if matched_path else None
+                seed_layer = next((seed_index[p] for p in movie_paths if p in seed_index), None)
+                scan_layer = res["layer"]
+                if seed_layer and scan_layer and seed_layer != scan_layer:
+                    discrepancy = f"seed_{seed_layer}_live_{scan_layer}"
+                elif seed_layer and not scan_layer:
+                    discrepancy = "seed_unverified"
+                elif seed_layer and scan_layer:
+                    discrepancy = "verified"
+                elif scan_layer:
+                    discrepancy = "live_only"
+                else:
+                    discrepancy = "none"
+                details.append({
+                    "rating_key": str(mv.ratingKey),
+                    "title": getattr(mv, "title", None),
+                    "path": original_path,
+                    "seed_layer": seed_layer,
+                    "scan_layer": scan_layer,
+                    "discrepancy": discrepancy,
+                    "desired_label": res["desired_label"],
+                    "existing_labels": res["existing_labels"],
+                    "added": res["added"],
+                    "removed": res["removed"],
+                })
         except Exception as e:
             logger.warning("dv sync: title %s failed: %s",
                            getattr(mv, "title", "?"), e)
@@ -192,4 +236,6 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
             progress_cb(i + 1, total)
 
     return {"total": total, "added": added_n, "removed": removed_n,
-            "matched": matched_n, "dry_run": dry_run}
+            "matched": matched_n, "dry_run": dry_run,
+            "writes": 0 if dry_run else added_n + removed_n,
+            "details": details}
