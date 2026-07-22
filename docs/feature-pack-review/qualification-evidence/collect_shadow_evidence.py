@@ -38,6 +38,52 @@ DB_VOLUME = "scanhound_scanhound_db"
 IMAGE = "scanhound:latest"
 LOG = EVIDENCE / "shadow-window.log"
 
+# Gotify alerting. Gotify publishes no host port, so the push goes through a
+# short-lived container on the internal `proxy` network (same pattern as the
+# DB read above). The app token is read at runtime from the WUD compose file
+# (an existing token under the admin account, which is the phone's account) --
+# no additional copy of the secret is written anywhere.
+WUD_COMPOSE = Path(r"X:/Docker Apps/Whats up docker/docker-compose.yml")
+GOTIFY_URL = "http://gotify:80"
+
+
+def _gotify_token():
+    try:
+        import re
+        m = re.search(r"WUD_TRIGGER_GOTIFY_MYGOTIFY_TOKEN=(\S+)",
+                      WUD_COMPOSE.read_text(encoding="utf-8"))
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def notify(title, message, priority):
+    """Send a Gotify push. Must never break collection -- best-effort only."""
+    token = _gotify_token()
+    if not token:
+        log_line("notify: no gotify token available; skipping push")
+        return
+    code = (
+        "import json,sys,urllib.request;"
+        "d=json.dumps({'title':sys.argv[1],'message':sys.argv[2],"
+        "'priority':int(sys.argv[3])}).encode();"
+        f"r=urllib.request.urlopen(urllib.request.Request("
+        f"'{GOTIFY_URL}/message?token='+sys.argv[4],data=d,"
+        "headers={'Content-Type':'application/json'}),timeout=15);"
+        "print(r.status)"
+    )
+    try:
+        p = subprocess.run(
+            ["docker", "run", "--rm", "--network", "proxy",
+             "--entrypoint", "python", IMAGE, "-c", code,
+             title, message, str(priority), token],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=60)
+        ok = p.returncode == 0 and p.stdout.strip().endswith("200")
+        log_line(f"notify: {'sent' if ok else 'FAILED: ' + p.stdout.strip()[:200]}")
+    except Exception as e:  # never let alerting kill collection
+        log_line(f"notify: FAILED: {e}")
+
 
 def log_line(text):
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -68,12 +114,18 @@ def main():
                        stderr=subprocess.STDOUT)
     if p.returncode != 0 and not p.stdout.strip().startswith("{"):
         log_line(f"COLLECT FAILED (exit {p.returncode}): {p.stdout.strip()[:400]}")
+        notify("ScanHound QUAL: collection failed",
+               f"Evidence collection failed (exit {p.returncode}). The window is "
+               "not gathering data until this is fixed. See shadow-window.log.", 6)
         return 2
 
     try:
         summary = json.loads(p.stdout)
     except json.JSONDecodeError:
         log_line(f"COLLECT FAILED: unparseable output: {p.stdout.strip()[:400]}")
+        notify("ScanHound QUAL: collection failed",
+               "Evidence collector produced unparseable output. See "
+               "shadow-window.log.", 6)
         return 2
 
     r = summary.get("readiness", {})
@@ -99,10 +151,21 @@ def main():
     if stop:
         log_line("!! MANDATORY STOP CONDITION: " + "; ".join(stop))
         log_line("!! Per the runbook: stop and roll back. Do not continue the window.")
+        notify("ScanHound QUAL: STOP CONDITION",
+               "Mandatory stop condition detected: " + "; ".join(stop)
+               + ". Per the runbook: stop and roll back. Do not continue the window.",
+               8)
         return 3
 
     if ready:
         log_line("** READINESS GATE PASSED -- window complete, ready for review. **")
+        marker = EVIDENCE / "gate-passed.notified"
+        if not marker.exists():
+            notify("ScanHound QUAL: gate PASSED",
+                   f"Readiness gate passed: {cycles} cycles over {days:.1f} days, "
+                   f"0 misses, reduction {reduction}%. Window complete — evidence "
+                   "ready for final review.", 5)
+            marker.write_text(dt.datetime.now(dt.timezone.utc).isoformat())
     return 0
 
 
