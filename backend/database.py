@@ -3952,9 +3952,31 @@ class DatabaseManager:
             item.get("probe_json"), scan_state,
         ), label="upsert_media_inventory") is not None
 
+    _MEDIA_INVENTORY_EVIDENCE_CTE = '''
+        WITH inventory_evidence AS (
+            SELECT mi.*, seed.seed_layer, live.dv_layer AS scan_layer,
+                CASE
+                    WHEN seed.seed_layer IS NOT NULL AND live.dv_layer IS NULL
+                        THEN 'seed_unverified'
+                    WHEN seed.seed_layer IS NOT NULL AND live.dv_layer IS NOT NULL
+                         AND lower(seed.seed_layer) != lower(live.dv_layer)
+                        THEN 'seed_' || lower(seed.seed_layer) || '_live_' || lower(live.dv_layer)
+                    WHEN seed.seed_layer IS NOT NULL AND live.dv_layer IS NOT NULL
+                        THEN 'verified'
+                    WHEN seed.seed_layer IS NULL AND live.dv_layer IS NOT NULL
+                        THEN 'live_only'
+                    ELSE 'none'
+                END AS discrepancy
+            FROM media_inventory AS mi
+            LEFT JOIN dv_seed_baseline AS seed ON seed.path = mi.path
+            LEFT JOIN dv_scan AS live ON live.path = mi.path AND live.source = 'scan'
+        )
+    '''
+
     def search_media_inventory(self, *, q=None, library=None, resolution=None, hdr=None,
                                hdr10plus_state=None, dv_layer=None, dv_profile=None,
-                               scan_state=None, page=1, page_size=100, sort="title"):
+                               scan_state=None, discrepancy=None, page=1, page_size=100,
+                               sort="title"):
         """Search the inventory through a fixed, indexed filter vocabulary.
 
         ``sort`` is allowlisted rather than interpolated from caller input;
@@ -3969,6 +3991,7 @@ class DatabaseManager:
             "dv_layer": ("dv_layer", dv_layer),
             "dv_profile": ("dv_profile", dv_profile),
             "scan_state": ("scan_state", scan_state),
+            "discrepancy": ("discrepancy", discrepancy),
         }
         clauses, params = [], []
         for _name, (column, value) in filter_columns.items():
@@ -3993,18 +4016,37 @@ class DatabaseManager:
         except (TypeError, ValueError):
             page, page_size = 1, 100
         count_row = self._query(
-            "SELECT COUNT(*) FROM media_inventory" + where, tuple(params), one=True, default=None
+            self._MEDIA_INVENTORY_EVIDENCE_CTE +
+            " SELECT COUNT(*) FROM inventory_evidence" + where,
+            tuple(params), one=True, default=None
         )
         total = int(count_row[0]) if count_row else 0
         rows = self._query_dicts(
-            "SELECT path, library_name, rating_key, title, year, resolution, hdr, "
+            self._MEDIA_INVENTORY_EVIDENCE_CTE +
+            " SELECT path, library_name, rating_key, title, year, resolution, hdr, "
             "hdr10plus_state, dv_layer, dv_profile, scan_state, sig_mtime, sig_size, "
-            "scan_run_uuid, last_scanned_at, updated_at FROM media_inventory" + where +
+            "scan_run_uuid, last_scanned_at, updated_at, seed_layer, scan_layer, discrepancy "
+            "FROM inventory_evidence" + where +
             f" ORDER BY {order}, path ASC LIMIT ? OFFSET ?",
             tuple(params + [page_size, (page - 1) * page_size]),
             default=[],
         )
         return {"items": rows, "total": total, "page": page, "page_size": page_size}
+
+    def list_metadata_discrepancies(self, run_uuid=None):
+        """Return seed/live disagreements and unverified historic seed rows."""
+        clauses = ["discrepancy NOT IN ('none', 'verified', 'live_only')"]
+        params = []
+        if run_uuid:
+            clauses.append("scan_run_uuid = ?")
+            params.append(run_uuid)
+        return self._query_dicts(
+            self._MEDIA_INVENTORY_EVIDENCE_CTE +
+            " SELECT path, title, rating_key, seed_layer, scan_layer, discrepancy "
+            "FROM inventory_evidence WHERE " + " AND ".join(clauses) +
+            " ORDER BY title COLLATE NOCASE, path ASC",
+            tuple(params), default=[],
+        )
 
     def media_inventory_facets(self):
         """Return safe facet counts for the inventory filter controls."""
@@ -4018,6 +4060,12 @@ class DatabaseManager:
                 default=[],
             )
             facets[column] = rows
+        facets["discrepancy"] = self._query_dicts(
+            self._MEDIA_INVENTORY_EVIDENCE_CTE +
+            " SELECT discrepancy AS value, COUNT(*) AS count FROM inventory_evidence "
+            "GROUP BY discrepancy ORDER BY value COLLATE NOCASE",
+            default=[],
+        )
         return facets
 
     def upsert_dv_scan(self, path, dv_layer, *, title=None, sig_mtime=None,

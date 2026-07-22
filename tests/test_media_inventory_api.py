@@ -20,6 +20,20 @@ def test_inventory_route_filters_local_fel_metadata(tmp_path):
     assert plex_media_inventory_facets(reg=reg)["dv_layer"] == [{"value": "fel", "count": 1}]
 
 
+def test_inventory_csv_neutralizes_spreadsheet_formulas(tmp_path):
+    db = DatabaseManager(str(tmp_path / "inventory.sqlite"))
+    db.upsert_media_inventory({
+        "path": "/movies/formula.mkv", "title": '=HYPERLINK("https://invalid")',
+        "resolution": "2160p", "scan_state": "current",
+    })
+
+    response = plex_routes.plex_media_inventory_export(reg=SimpleNamespace(db=db))
+    text = response.body.decode("utf-8")
+
+    assert "'=HYPERLINK" in text
+    assert response.media_type == "text/csv"
+
+
 def test_durable_scan_endpoint_accepts_only_cached_4k_targets(monkeypatch):
     calls = []
 

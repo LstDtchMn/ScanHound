@@ -1,10 +1,12 @@
 """Plex integration endpoints."""
 from __future__ import annotations
 
+import csv
+import io
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
@@ -326,6 +328,7 @@ def plex_media_inventory(
     dv_layer: Optional[str] = None,
     dv_profile: Optional[str] = None,
     scan_state: Optional[str] = None,
+    discrepancy: Optional[str] = None,
     page: int = 1,
     page_size: int = 100,
     sort: str = "title",
@@ -341,7 +344,8 @@ def plex_media_inventory(
     return reg.db.search_media_inventory(
         q=q, library=library, resolution=resolution, hdr=hdr,
         hdr10plus_state=hdr10plus_state, dv_layer=dv_layer, dv_profile=dv_profile,
-        scan_state=scan_state, page=page, page_size=page_size, sort=sort,
+        scan_state=scan_state, discrepancy=discrepancy,
+        page=page, page_size=page_size, sort=sort,
     )
 
 
@@ -350,6 +354,66 @@ def plex_media_inventory_facets(reg: ServiceRegistry = Depends(get_registry)):
     if not reg.db:
         raise HTTPException(status_code=503, detail="Database service not initialized")
     return reg.db.media_inventory_facets()
+
+
+def _csv_cell(value) -> str:
+    text = "" if value is None else str(value)
+    if text.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + text
+    return text
+
+
+@router.get("/media-inventory/export.csv")
+def plex_media_inventory_export(
+    q: Optional[str] = None,
+    library: Optional[str] = None,
+    resolution: Optional[str] = None,
+    hdr: Optional[str] = None,
+    hdr10plus_state: Optional[str] = None,
+    dv_layer: Optional[str] = None,
+    dv_profile: Optional[str] = None,
+    scan_state: Optional[str] = None,
+    discrepancy: Optional[str] = None,
+    sort: str = "title",
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    """Export the filtered authenticated inventory with spreadsheet-safe cells."""
+    if not reg.db:
+        raise HTTPException(status_code=503, detail="Database service not initialized")
+    filters = dict(
+        q=q, library=library, resolution=resolution, hdr=hdr,
+        hdr10plus_state=hdr10plus_state, dv_layer=dv_layer, dv_profile=dv_profile,
+        scan_state=scan_state, discrepancy=discrepancy, sort=sort,
+    )
+    first = reg.db.search_media_inventory(**filters, page=1, page_size=500)
+    rows = list(first["items"])
+    pages = (first["total"] + 499) // 500
+    for page in range(2, pages + 1):
+        rows.extend(reg.db.search_media_inventory(**filters, page=page, page_size=500)["items"])
+
+    columns = [
+        "title", "year", "library_name", "resolution", "hdr", "hdr10plus_state",
+        "dv_layer", "dv_profile", "seed_layer", "scan_layer", "discrepancy",
+        "scan_state", "last_scanned_at", "rating_key", "path",
+    ]
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\r\n")
+    writer.writerow(columns)
+    for row in rows:
+        writer.writerow([_csv_cell(row.get(column)) for column in columns])
+    return Response(
+        content=output.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=media-inventory.csv"},
+    )
+
+
+@router.get("/metadata-scans/{run_uuid}/discrepancies")
+def plex_metadata_scan_discrepancies(
+    run_uuid: str, reg: ServiceRegistry = Depends(get_registry)
+):
+    if not reg.db or not reg.db.get_metadata_scan_run(run_uuid):
+        raise HTTPException(status_code=404, detail="metadata scan run not found")
+    return {"items": reg.db.list_metadata_discrepancies(run_uuid)}
 
 
 @router.get("/unmapped-paths")
