@@ -57,6 +57,13 @@ class Db:
         # comparison row after each listing cycle.
         return None
 
+    def get_hdencode_feed_state(self, _feed_key):
+        # Added by the readiness-corrections package: scan_once now probes
+        # feed state before polling to decide restart_recovery. No preexisting
+        # state -> restart_recovery is False, the correct default here (these
+        # tests exercise listing/shadow behavior, not recovery).
+        return None
+
     def get_background_cache_urls(self):
         return set()
 

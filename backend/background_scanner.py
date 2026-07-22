@@ -46,6 +46,10 @@ class BackgroundScanner:
         # Summary of the most recent run, surfaced via /background/status.
         self._last_run: Optional[Dict[str, Any]] = None
         self._rss_jitter_seconds = random.uniform(-600.0, 600.0)
+        # Process-lifetime marker.  HDEncodeRSSService is intentionally
+        # short-lived (one instance per scan), so recovery evidence must live
+        # here rather than on the service instance.
+        self._rss_first_cycle_after_startup = True
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
@@ -248,9 +252,38 @@ class BackgroundScanner:
                     self._stop.is_set()
                     or not self._owns_lifespan()
                 )
+                preexisting_normal_feed_state = all(
+                    bool(
+                        (db.get_hdencode_feed_state(feed_key) or {}).get(
+                            "last_checked_at"
+                        )
+                    )
+                    for feed_key in ("movies_all", "tv_all")
+                )
                 rss_cycle = HDEncodeRSSService(cfg, db).poll_cycle(
                     stop_requested=stop_requested,
                 )
+                normal_outcomes = {
+                    result.get("outcome")
+                    for result in rss_cycle.get("feeds", [])
+                    if result.get("feed") in {"movies_all", "tv_all"}
+                }
+                completed_normal_cycle = (
+                    normal_outcomes
+                    and normal_outcomes <= {"changed", "not_modified", "not_due"}
+                    and {
+                        result.get("feed")
+                        for result in rss_cycle.get("feeds", [])
+                        if result.get("feed") in {"movies_all", "tv_all"}
+                    } == {"movies_all", "tv_all"}
+                )
+                rss_cycle["restart_recovery"] = bool(
+                    self._rss_first_cycle_after_startup
+                    and preexisting_normal_feed_state
+                    and completed_normal_cycle
+                )
+                if not rss_cycle.get("skipped"):
+                    self._rss_first_cycle_after_startup = False
                 if stop_requested():
                     return {
                         "scanned": 0,

@@ -148,6 +148,9 @@ def main():
         stop.append(f"RELEVANT RSS MISS x{misses}")
     if integrity != "ok":
         stop.append(f"DB INTEGRITY {integrity}")
+    safety = summary.get("safety") or {}
+    for violation in safety.get("violations") or []:
+        stop.append(str(violation))
     if stop:
         log_line("!! MANDATORY STOP CONDITION: " + "; ".join(stop))
         log_line("!! Per the runbook: stop and roll back. Do not continue the window.")

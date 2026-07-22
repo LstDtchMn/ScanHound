@@ -1853,26 +1853,45 @@ class DatabaseManager:
         }
 
     def get_hdencode_shadow_summary(self):
-        totals=self._query(
-            """SELECT COUNT(*) AS cycles, MIN(completed_at) AS first_completed_at,
+        # Readiness evidence is derived only from structurally eligible cycles:
+        # both normal feeds completed and both comparison sides made at least
+        # one request.  Incomplete/degenerate rows must not stretch the
+        # observation window or improve the request-reduction percentage.
+        eligible=self._query(
+            """SELECT COUNT(*) AS cycles,
+                      MIN(completed_at) AS first_completed_at,
                       MAX(completed_at) AS last_completed_at,
-                      SUM(relevant_miss_count) AS relevant_misses,
                       SUM(rss_requests) AS rss_requests,
                       SUM(listing_requests) AS listing_requests,
-                      SUM(CASE WHEN normal_feeds_complete=1 THEN 1 ELSE 0 END) AS complete_cycles,
                       SUM(CASE WHEN restart_recovery=1 OR catchup_used=1 THEN 1 ELSE 0 END) AS recovery_cycles
-               FROM hdencode_shadow_cycles WHERE outcome IN ('success','relevant_miss')""",
+               FROM hdencode_shadow_cycles
+               WHERE outcome IN ('success','relevant_miss')
+                 AND normal_feeds_complete=1
+                 AND rss_requests>0
+                 AND listing_requests>0""",
             one=True,default=None)
-        latest=self._query("SELECT * FROM hdencode_shadow_cycles ORDER BY completed_at DESC LIMIT 1",one=True,default=None)
-        listing=int((totals["listing_requests"] if totals else 0) or 0); rss=int((totals["rss_requests"] if totals else 0) or 0)
+        # A relevant miss is a mandatory stop condition even when the cycle was
+        # otherwise incomplete, so miss accounting deliberately spans every row.
+        misses=self._query(
+            "SELECT SUM(relevant_miss_count) AS relevant_misses "
+            "FROM hdencode_shadow_cycles",
+            one=True,default=None)
+        latest=self._query(
+            "SELECT * FROM hdencode_shadow_cycles "
+            "ORDER BY completed_at DESC LIMIT 1",
+            one=True,default=None)
+        listing=int((eligible["listing_requests"] if eligible else 0) or 0)
+        rss=int((eligible["rss_requests"] if eligible else 0) or 0)
         reduction=(100.0*(listing-rss)/listing) if listing>0 else 0.0
         return {
-            "successful_cycles":int((totals["complete_cycles"] if totals else 0) or 0),
-            "first_completed_at":totals["first_completed_at"] if totals else None,
-            "last_completed_at":totals["last_completed_at"] if totals else None,
-            "relevant_misses":int((totals["relevant_misses"] if totals else 0) or 0),
-            "rss_requests":rss,"listing_requests":listing,"request_reduction_pct":round(reduction,2),
-            "recovery_cycles":int((totals["recovery_cycles"] if totals else 0) or 0),
+            "successful_cycles":int((eligible["cycles"] if eligible else 0) or 0),
+            "first_completed_at":eligible["first_completed_at"] if eligible else None,
+            "last_completed_at":eligible["last_completed_at"] if eligible else None,
+            "relevant_misses":int((misses["relevant_misses"] if misses else 0) or 0),
+            "rss_requests":rss,
+            "listing_requests":listing,
+            "request_reduction_pct":round(reduction,2),
+            "recovery_cycles":int((eligible["recovery_cycles"] if eligible else 0) or 0),
             "latest":dict(latest) if latest is not None else None,
         }
 
