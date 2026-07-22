@@ -33,6 +33,11 @@ with dm._lock:
         records,
     )
     conn.commit()
+
+# Preserve the imported seed list independently before a later live local-file
+# scan replaces the compatibility-cache row in dv_scan.
+baseline_added = dm.backfill_dv_seed_baseline()
 print(f"Imported {len(records)} seed record(s)")
+print(f"Preserved {baseline_added} new seed-baseline record(s)")
 print("dv_scan by layer:", dm.count_dv_scans_by_layer())
 dm.close()

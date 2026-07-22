@@ -12,6 +12,7 @@ import datetime
 import logging
 import time
 import threading
+import uuid
 from contextlib import contextmanager
 
 from backend.config import DB_PATH
@@ -218,7 +219,7 @@ class DatabaseManager:
     # ── Schema initialization ────────────────────────────────────────
 
     # Schema version — increment when migrations are added.
-    SCHEMA_VERSION = 6
+    SCHEMA_VERSION = 7
 
     def init_db(self):
         """Initialize database tables and run schema migrations.
@@ -557,6 +558,100 @@ class DatabaseManager:
                     )
                 ''')
 
+                # Durable 4K metadata inventory.  ``dv_scan`` and
+                # ``media_probe`` remain compatibility caches; these tables
+                # preserve the run/item history and the evidence needed to
+                # distinguish a known negative from an unscanned or failed
+                # file.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS dv_seed_baseline (
+                        path TEXT PRIMARY KEY,
+                        seed_layer TEXT NOT NULL,
+                        title TEXT,
+                        sig_mtime REAL,
+                        sig_size INTEGER,
+                        rating_key TEXT,
+                        imdb_id TEXT,
+                        seed_scanned_at TEXT,
+                        imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS metadata_scan_runs (
+                        run_uuid TEXT PRIMARY KEY,
+                        scope TEXT NOT NULL CHECK(scope IN ('pilot', 'full', 'targeted')),
+                        status TEXT NOT NULL CHECK(status IN
+                            ('queued', 'running', 'paused', 'cancelled',
+                             'completed', 'failed', 'interrupted')),
+                        expected_count INTEGER NOT NULL DEFAULT 0 CHECK(expected_count >= 0),
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        started_at TEXT,
+                        completed_at TEXT,
+                        cancelled_at TEXT,
+                        error_code TEXT,
+                        error_message TEXT
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS metadata_scan_items (
+                        run_uuid TEXT NOT NULL REFERENCES metadata_scan_runs(run_uuid)
+                            ON DELETE CASCADE,
+                        path TEXT NOT NULL,
+                        library_name TEXT,
+                        rating_key TEXT,
+                        title TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN
+                            ('pending', 'running', 'current', 'failed', 'skipped',
+                             'cancelled', 'interrupted')),
+                        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+                        sig_mtime REAL,
+                        sig_size INTEGER,
+                        failure_stage TEXT,
+                        error_code TEXT,
+                        error_message TEXT,
+                        started_at TEXT,
+                        completed_at TEXT,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (run_uuid, path)
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS media_inventory (
+                        path TEXT PRIMARY KEY,
+                        library_name TEXT,
+                        rating_key TEXT,
+                        title TEXT,
+                        year INTEGER,
+                        resolution TEXT,
+                        hdr TEXT,
+                        hdr10plus_state TEXT NOT NULL DEFAULT 'unknown' CHECK(
+                            hdr10plus_state IN ('present', 'absent', 'unknown')),
+                        dv_layer TEXT,
+                        dv_profile TEXT,
+                        scan_state TEXT NOT NULL DEFAULT 'unscanned' CHECK(scan_state IN
+                            ('unscanned', 'current', 'stale', 'failed', 'source_changed')),
+                        sig_mtime REAL,
+                        sig_size INTEGER,
+                        scan_run_uuid TEXT REFERENCES metadata_scan_runs(run_uuid),
+                        probe_json TEXT,
+                        last_scanned_at TEXT,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
+                # The historic imported FEL/MEL list must never be overwritten
+                # when a real local-file scan replaces a dv_scan compatibility
+                # row for the same path.
+                cursor.execute('''
+                    INSERT OR IGNORE INTO dv_seed_baseline
+                        (path, seed_layer, title, sig_mtime, sig_size,
+                         rating_key, imdb_id, seed_scanned_at)
+                    SELECT path, dv_layer, title, sig_mtime, sig_size,
+                           rating_key, imdb_id, scanned_at
+                    FROM dv_scan
+                    WHERE source = 'seed'
+                ''')
+
                 # Per-title bookmarks (distinct from watchlist -- this is for
                 # titles the user HAS already found and wants to remember, not
                 # titles being searched-for). title_key is normalize_title(title),
@@ -597,6 +692,13 @@ class DatabaseManager:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_bg_cache_last_seen ON background_scan_cache(last_seen_at)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_dv_scan_layer ON dv_scan(dv_layer)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_metadata_scan_runs_status '
+                               'ON metadata_scan_runs(status, created_at)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_metadata_scan_items_status '
+                               'ON metadata_scan_items(run_uuid, status, path)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_media_inventory_filters '
+                               'ON media_inventory(library_name, resolution, hdr10plus_state, '
+                               'dv_layer, scan_state)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_rename_jobs_status ON rename_jobs(status)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_rename_jobs_detected ON rename_jobs(detected_at DESC)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_pipeline_verdicts_category '
@@ -2419,7 +2521,7 @@ class DatabaseManager:
         candidate pool for find_library_duplicate()."""
         return self._query_dicts(
             "SELECT key, title, original_title, year, res, size, imdb_id, "
-            "rating_key, media_id, is_tv, dovi, hdr, file_path "
+            "rating_key, media_id, is_tv, dovi, hdr, library_name, file_path "
             "FROM plex_cache WHERE content_type = 'Movies'", default=[])
 
     def load_plex_cache(self, mode):
@@ -3534,6 +3636,451 @@ class DatabaseManager:
 
     # ── Dolby Vision layer inventory (dv_scan) ────────────────────────────
 
+    # Durable 4K metadata inventory. ``dv_scan`` and ``media_probe`` remain
+    # compatibility caches; these helpers preserve run/item history and the
+    # evidence needed to distinguish an unknown from a known negative.
+
+    _METADATA_SCAN_SCOPES = frozenset({"pilot", "full", "targeted"})
+    _METADATA_SCAN_RUN_STATUSES = frozenset({
+        "queued", "running", "paused", "cancelled", "completed", "failed", "interrupted",
+    })
+    _METADATA_SCAN_ITEM_STATUSES = frozenset({
+        "pending", "running", "current", "failed", "skipped", "cancelled", "interrupted",
+    })
+
+    def backfill_dv_seed_baseline(self):
+        """Copy legacy imported seed evidence into its immutable baseline table.
+
+        ``dv_scan`` is a compatibility cache where a local scan deliberately
+        replaces a same-path seed row. The baseline table is append-only for a
+        path, so this operation is safe to run at startup and during imports.
+        """
+        try:
+            with self.transaction() as conn:
+                if not conn:
+                    return 0
+                cursor = conn.execute('''
+                    INSERT OR IGNORE INTO dv_seed_baseline
+                        (path, seed_layer, title, sig_mtime, sig_size,
+                         rating_key, imdb_id, seed_scanned_at)
+                    SELECT path, dv_layer, title, sig_mtime, sig_size,
+                           rating_key, imdb_id, scanned_at
+                    FROM dv_scan
+                    WHERE source = 'seed'
+                ''')
+                return max(cursor.rowcount, 0)
+        except Exception as exc:
+            logger.error("DB Error (backfill_dv_seed_baseline): %s", exc)
+            return 0
+
+    def get_dv_seed_baseline(self, path):
+        """Return preserved imported FEL/MEL evidence for *path*, if any."""
+        rows = self._query_dicts(
+            'SELECT path, seed_layer, title, sig_mtime, sig_size, rating_key, '
+            'imdb_id, seed_scanned_at, imported_at FROM dv_seed_baseline WHERE path = ?',
+            (path,),
+        )
+        return rows[0] if rows else None
+
+    def list_dv_seed_baseline(self, *, limit=1000000):
+        """Return immutable imported seed evidence for reconciliation reports."""
+        try:
+            limit = max(1, min(int(limit), 1000000))
+        except (TypeError, ValueError):
+            limit = 1000000
+        return self._query_dicts(
+            'SELECT path, seed_layer, title, sig_mtime, sig_size, rating_key, '
+            'imdb_id, seed_scanned_at, imported_at FROM dv_seed_baseline '
+            'ORDER BY path ASC LIMIT ?',
+            (limit,), default=[],
+        )
+
+    def create_metadata_scan_run(self, *, scope, expected_count=0):
+        """Create a durable scan run before any file analysis begins."""
+        if scope not in self._METADATA_SCAN_SCOPES:
+            raise ValueError(f"Unsupported metadata scan scope: {scope!r}")
+        try:
+            expected_count = int(expected_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("expected_count must be a non-negative integer") from exc
+        if expected_count < 0:
+            raise ValueError("expected_count must be a non-negative integer")
+
+        run_uuid = str(uuid.uuid4())
+        try:
+            with self.transaction() as conn:
+                if not conn:
+                    return None
+                conn.execute('''
+                    INSERT INTO metadata_scan_runs (run_uuid, scope, status, expected_count)
+                    VALUES (?, ?, 'queued', ?)
+                ''', (run_uuid, scope, expected_count))
+            return self.get_metadata_scan_run(run_uuid)
+        except Exception as exc:
+            logger.error("DB Error (create_metadata_scan_run): %s", exc)
+            return None
+
+    def get_metadata_scan_run(self, run_uuid):
+        """Return the durable run record for *run_uuid*, if present."""
+        rows = self._query_dicts(
+            'SELECT run_uuid, scope, status, expected_count, created_at, started_at, '
+            'completed_at, cancelled_at, error_code, error_message '
+            'FROM metadata_scan_runs WHERE run_uuid = ?',
+            (run_uuid,),
+        )
+        return rows[0] if rows else None
+
+    def update_metadata_scan_run(self, run_uuid, *, status, error_code=None, error_message=None):
+        """Transition one durable scan run through its explicit status vocabulary."""
+        if status not in self._METADATA_SCAN_RUN_STATUSES or not run_uuid:
+            return False
+        terminal = status in {"cancelled", "completed", "failed", "interrupted"}
+        try:
+            with self.transaction() as conn:
+                if not conn:
+                    return False
+                cursor = conn.execute('''
+                    UPDATE metadata_scan_runs
+                    SET status = ?, error_code = ?, error_message = ?,
+                        started_at = CASE WHEN ? = 'running' AND started_at IS NULL
+                            THEN CURRENT_TIMESTAMP ELSE started_at END,
+                        cancelled_at = CASE WHEN ? = 'cancelled' THEN CURRENT_TIMESTAMP
+                            ELSE cancelled_at END,
+                        completed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP
+                            ELSE completed_at END
+                    WHERE run_uuid = ?
+                ''', (status, error_code, error_message, status, status, terminal, run_uuid))
+                return cursor.rowcount == 1
+        except Exception as exc:
+            logger.error("DB Error (update_metadata_scan_run): %s", exc)
+            return False
+
+    def create_metadata_scan_items(self, run_uuid, items):
+        """Persist a scan manifest before scheduling workers.
+
+        Duplicate paths in the same run are ignored. No filesystem state is
+        observed here; callers provide only read-only Plex manifest facts.
+        """
+        rows = []
+        for item in items or []:
+            path = (item or {}).get("path")
+            if not path:
+                continue
+            rows.append((
+                run_uuid, path, item.get("library_name"), item.get("rating_key"),
+                item.get("title"), item.get("sig_mtime"), item.get("sig_size"),
+            ))
+        if not rows:
+            return 0
+        try:
+            with self.transaction() as conn:
+                if not conn or not conn.execute(
+                    'SELECT 1 FROM metadata_scan_runs WHERE run_uuid = ?', (run_uuid,)
+                ).fetchone():
+                    return 0
+                created = 0
+                for row in rows:
+                    cursor = conn.execute('''
+                        INSERT OR IGNORE INTO metadata_scan_items
+                            (run_uuid, path, library_name, rating_key, title, sig_mtime, sig_size)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', row)
+                    created += max(cursor.rowcount, 0)
+                return created
+        except Exception as exc:
+            logger.error("DB Error (create_metadata_scan_items): %s", exc)
+            return 0
+
+    def list_metadata_scan_items(self, run_uuid, *, status=None, limit=100000):
+        """Return persisted manifest rows in stable path order."""
+        clauses = ['run_uuid = ?']
+        params = [run_uuid]
+        if status is not None:
+            if status not in self._METADATA_SCAN_ITEM_STATUSES:
+                return []
+            clauses.append('status = ?')
+            params.append(status)
+        try:
+            limit = max(1, min(int(limit), 100000))
+        except (TypeError, ValueError):
+            limit = 100000
+        params.append(limit)
+        return self._query_dicts(
+            'SELECT run_uuid, path, library_name, rating_key, title, status, attempt_count, '
+            'sig_mtime, sig_size, failure_stage, error_code, error_message, started_at, '
+            'completed_at, updated_at FROM metadata_scan_items WHERE ' +
+            ' AND '.join(clauses) + ' ORDER BY path ASC LIMIT ?',
+            tuple(params),
+            default=[],
+        )
+
+    def update_metadata_scan_item(self, run_uuid, path, *, status, failure_stage=None,
+                                  error_code=None, error_message=None):
+        """Transition one manifest row using the explicit item status vocabulary."""
+        if status not in self._METADATA_SCAN_ITEM_STATUSES or not run_uuid or not path:
+            return False
+        terminal = status in {"current", "failed", "skipped", "cancelled", "interrupted"}
+        try:
+            with self.transaction() as conn:
+                if not conn:
+                    return False
+                cursor = conn.execute('''
+                    UPDATE metadata_scan_items
+                    SET status = ?,
+                        attempt_count = attempt_count + CASE WHEN ? = 'running' THEN 1 ELSE 0 END,
+                        failure_stage = ?, error_code = ?, error_message = ?,
+                        started_at = CASE WHEN ? = 'running' THEN CURRENT_TIMESTAMP ELSE started_at END,
+                        completed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE completed_at END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE run_uuid = ? AND path = ?
+                ''', (status, status, failure_stage, error_code, error_message,
+                      status, terminal, run_uuid, path))
+                return cursor.rowcount == 1
+        except Exception as exc:
+            logger.error("DB Error (update_metadata_scan_item): %s", exc)
+            return False
+
+    def interrupt_abandoned_metadata_scans(self):
+        """Atomically preserve work left running by an earlier process.
+
+        This is intentionally limited to ``running`` state. A user-paused run
+        remains paused across restart, while an in-flight item becomes
+        explicitly retryable rather than silently returning to pending.
+        """
+        try:
+            with self.transaction() as conn:
+                if not conn:
+                    return 0
+                run_count = conn.execute(
+                    "SELECT COUNT(*) FROM metadata_scan_runs WHERE status = 'running'"
+                ).fetchone()[0]
+                conn.execute('''
+                    UPDATE metadata_scan_items
+                    SET status = 'interrupted', failure_stage = 'process',
+                        error_code = 'process_interrupted',
+                        error_message = 'Scan process ended before this item completed',
+                        completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                    WHERE status = 'running'
+                      AND run_uuid IN (
+                          SELECT run_uuid FROM metadata_scan_runs WHERE status = 'running'
+                      )
+                ''')
+                conn.execute('''
+                    UPDATE metadata_scan_runs
+                    SET status = 'interrupted', error_code = 'process_interrupted',
+                        error_message = 'Scan process ended before the run completed',
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE status = 'running'
+                ''')
+                return int(run_count)
+        except Exception as exc:
+            logger.error("DB Error (interrupt_abandoned_metadata_scans): %s", exc)
+            return 0
+
+    def prepare_metadata_scan_resume(self, run_uuid, *, retry_failed=False):
+        """Reset only resumable manifest rows and queue an existing run.
+
+        Successfully scanned items are immutable for the resumed attempt. A
+        normal resume retries interrupted/cancelled work; ``retry_failed`` also
+        includes terminal probe failures selected by the operator.
+        """
+        if not run_uuid:
+            return 0
+        statuses = ["interrupted", "cancelled"]
+        if retry_failed:
+            statuses.append("failed")
+        placeholders = ",".join("?" for _ in statuses)
+        try:
+            with self.transaction() as conn:
+                if not conn:
+                    return 0
+                run = conn.execute(
+                    "SELECT status FROM metadata_scan_runs WHERE run_uuid = ?", (run_uuid,)
+                ).fetchone()
+                if not run or run[0] == "running":
+                    return 0
+                cursor = conn.execute(f'''
+                    UPDATE metadata_scan_items
+                    SET status = 'pending', failure_stage = NULL, error_code = NULL,
+                        error_message = NULL, completed_at = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE run_uuid = ? AND status IN ({placeholders})
+                ''', (run_uuid, *statuses))
+                reset_count = max(cursor.rowcount, 0)
+                if reset_count == 0:
+                    return 0
+                conn.execute('''
+                    UPDATE metadata_scan_runs
+                    SET status = 'queued', completed_at = NULL, cancelled_at = NULL,
+                        error_code = NULL, error_message = NULL
+                    WHERE run_uuid = ?
+                ''', (run_uuid,))
+                return reset_count
+        except Exception as exc:
+            logger.error("DB Error (prepare_metadata_scan_resume): %s", exc)
+            return 0
+
+    def upsert_media_inventory(self, item):
+        """Upsert a current, searchable technical-metadata projection."""
+        item = item or {}
+        path = item.get("path")
+        if not path:
+            return False
+        hdr10plus_state = item.get("hdr10plus_state", "unknown")
+        scan_state = item.get("scan_state", "unscanned")
+        if hdr10plus_state not in {"present", "absent", "unknown"}:
+            return False
+        if scan_state not in {"unscanned", "current", "stale", "failed", "source_changed"}:
+            return False
+        return self._mutate('''
+            INSERT INTO media_inventory
+                (path, library_name, rating_key, title, year, resolution, hdr,
+                 hdr10plus_state, dv_layer, dv_profile, scan_state, sig_mtime,
+                 sig_size, scan_run_uuid, probe_json, last_scanned_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    CASE WHEN ? = 'current' THEN CURRENT_TIMESTAMP ELSE NULL END,
+                    CURRENT_TIMESTAMP)
+            ON CONFLICT(path) DO UPDATE SET
+                library_name = excluded.library_name,
+                rating_key = excluded.rating_key,
+                title = excluded.title,
+                year = excluded.year,
+                resolution = excluded.resolution,
+                hdr = excluded.hdr,
+                hdr10plus_state = excluded.hdr10plus_state,
+                dv_layer = excluded.dv_layer,
+                dv_profile = excluded.dv_profile,
+                scan_state = excluded.scan_state,
+                sig_mtime = excluded.sig_mtime,
+                sig_size = excluded.sig_size,
+                scan_run_uuid = excluded.scan_run_uuid,
+                probe_json = excluded.probe_json,
+                last_scanned_at = CASE WHEN excluded.scan_state = 'current'
+                    THEN CURRENT_TIMESTAMP ELSE media_inventory.last_scanned_at END,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (
+            path, item.get("library_name"), item.get("rating_key"), item.get("title"),
+            item.get("year"), item.get("resolution"), item.get("hdr"), hdr10plus_state,
+            item.get("dv_layer"), item.get("dv_profile"), scan_state,
+            item.get("sig_mtime"), item.get("sig_size"), item.get("scan_run_uuid"),
+            item.get("probe_json"), scan_state,
+        ), label="upsert_media_inventory") is not None
+
+    _MEDIA_INVENTORY_EVIDENCE_CTE = '''
+        WITH inventory_evidence AS (
+            SELECT mi.*, seed.seed_layer, live.dv_layer AS scan_layer,
+                CASE
+                    WHEN seed.seed_layer IS NOT NULL AND live.dv_layer IS NULL
+                        THEN 'seed_unverified'
+                    WHEN seed.seed_layer IS NOT NULL AND live.dv_layer IS NOT NULL
+                         AND lower(seed.seed_layer) != lower(live.dv_layer)
+                        THEN 'seed_' || lower(seed.seed_layer) || '_live_' || lower(live.dv_layer)
+                    WHEN seed.seed_layer IS NOT NULL AND live.dv_layer IS NOT NULL
+                        THEN 'verified'
+                    WHEN seed.seed_layer IS NULL AND live.dv_layer IS NOT NULL
+                        THEN 'live_only'
+                    ELSE 'none'
+                END AS discrepancy
+            FROM media_inventory AS mi
+            LEFT JOIN dv_seed_baseline AS seed ON seed.path = mi.path
+            LEFT JOIN dv_scan AS live ON live.path = mi.path AND live.source = 'scan'
+        )
+    '''
+
+    def search_media_inventory(self, *, q=None, library=None, resolution=None, hdr=None,
+                               hdr10plus_state=None, dv_layer=None, dv_profile=None,
+                               scan_state=None, discrepancy=None, page=1, page_size=100,
+                               sort="title"):
+        """Search the inventory through a fixed, indexed filter vocabulary.
+
+        ``sort`` is allowlisted rather than interpolated from caller input;
+        all values are bound parameters. The stable path tiebreaker makes CSV,
+        API pagination, and later Kometa reconciliation deterministic.
+        """
+        filter_columns = {
+            "library": ("library_name", library),
+            "resolution": ("resolution", resolution),
+            "hdr": ("hdr", hdr),
+            "hdr10plus_state": ("hdr10plus_state", hdr10plus_state),
+            "dv_layer": ("dv_layer", dv_layer),
+            "dv_profile": ("dv_profile", dv_profile),
+            "scan_state": ("scan_state", scan_state),
+            "discrepancy": ("discrepancy", discrepancy),
+        }
+        clauses, params = [], []
+        for _name, (column, value) in filter_columns.items():
+            if value is not None and value != "":
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if q:
+            clauses.append("(title LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')")
+            escaped = str(q).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            params.extend([f"%{escaped}%", f"%{escaped}%"])
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sort_columns = {
+            "title": "title COLLATE NOCASE",
+            "updated": "updated_at DESC",
+            "resolution": "resolution COLLATE NOCASE",
+            "scan_state": "scan_state COLLATE NOCASE",
+        }
+        order = sort_columns.get(sort, sort_columns["title"])
+        try:
+            page = max(1, int(page))
+            page_size = max(1, min(int(page_size), 500))
+        except (TypeError, ValueError):
+            page, page_size = 1, 100
+        count_row = self._query(
+            self._MEDIA_INVENTORY_EVIDENCE_CTE +
+            " SELECT COUNT(*) FROM inventory_evidence" + where,
+            tuple(params), one=True, default=None
+        )
+        total = int(count_row[0]) if count_row else 0
+        rows = self._query_dicts(
+            self._MEDIA_INVENTORY_EVIDENCE_CTE +
+            " SELECT path, library_name, rating_key, title, year, resolution, hdr, "
+            "hdr10plus_state, dv_layer, dv_profile, scan_state, sig_mtime, sig_size, "
+            "scan_run_uuid, last_scanned_at, updated_at, seed_layer, scan_layer, discrepancy "
+            "FROM inventory_evidence" + where +
+            f" ORDER BY {order}, path ASC LIMIT ? OFFSET ?",
+            tuple(params + [page_size, (page - 1) * page_size]),
+            default=[],
+        )
+        return {"items": rows, "total": total, "page": page, "page_size": page_size}
+
+    def list_metadata_discrepancies(self, run_uuid=None):
+        """Return seed/live disagreements and unverified historic seed rows."""
+        clauses = ["discrepancy NOT IN ('none', 'verified', 'live_only')"]
+        params = []
+        if run_uuid:
+            clauses.append("scan_run_uuid = ?")
+            params.append(run_uuid)
+        return self._query_dicts(
+            self._MEDIA_INVENTORY_EVIDENCE_CTE +
+            " SELECT path, title, rating_key, seed_layer, scan_layer, discrepancy "
+            "FROM inventory_evidence WHERE " + " AND ".join(clauses) +
+            " ORDER BY title COLLATE NOCASE, path ASC",
+            tuple(params), default=[],
+        )
+
+    def media_inventory_facets(self):
+        """Return safe facet counts for the inventory filter controls."""
+        facets = {}
+        for column in ("library_name", "resolution", "hdr", "hdr10plus_state",
+                       "dv_layer", "dv_profile", "scan_state"):
+            rows = self._query_dicts(
+                f"SELECT {column} AS value, COUNT(*) AS count FROM media_inventory "
+                f"WHERE {column} IS NOT NULL AND {column} != '' GROUP BY {column} "
+                "ORDER BY value COLLATE NOCASE",
+                default=[],
+            )
+            facets[column] = rows
+        facets["discrepancy"] = self._query_dicts(
+            self._MEDIA_INVENTORY_EVIDENCE_CTE +
+            " SELECT discrepancy AS value, COUNT(*) AS count FROM inventory_evidence "
+            "GROUP BY discrepancy ORDER BY value COLLATE NOCASE",
+            default=[],
+        )
+        return facets
+
     def upsert_dv_scan(self, path, dv_layer, *, title=None, sig_mtime=None,
                        sig_size=None, source="scan", rating_key=None, imdb_id=None):
         """Insert/update a DV-layer record for ``path``. Refreshes last_seen_at;
@@ -3558,17 +4105,18 @@ class DatabaseManager:
               rating_key, imdb_id), label="upsert_dv_scan") is not None
 
     def get_latest_dv_scan_at(self, source="scan"):
-        """Newest ``scanned_at`` among dv_scan rows for *source*, else None.
+        """Newest ``last_seen_at`` among dv_scan rows for *source*, else None.
 
         Cheap change-detector for the scheduled DV label sync: a value higher
-        than the last one seen means fresh DV detections landed (via
-        dv-import), so a sync is worth running. Fail-safe — any error returns
+        than the last one seen means fresh DV detections landed or an existing
+        file's layer changed, so a sync is worth running. Fail-safe — any error
+        returns
         None, which the caller reads as "nothing new", so a DB hiccup can never
         trigger a spurious full-library label pass.
         """
         try:
             rows = self._query_dicts(
-                'SELECT MAX(scanned_at) AS latest FROM dv_scan WHERE source = ?',
+                'SELECT MAX(last_seen_at) AS latest FROM dv_scan WHERE source = ?',
                 (source,))
             return (rows[0].get("latest") if rows else None) or None
         except Exception as e:

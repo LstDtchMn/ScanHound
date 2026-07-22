@@ -294,16 +294,33 @@ def test_additive_only_still_adds_missing_label():
     pm.add_label.assert_called_once_with(1, "DV FEL")
 
 
-def test_additive_only_adds_without_removing_stale():
-    """A wrong-but-managed label is left in place; cleaning it up stays a
-    deliberate manual-sync decision."""
+def test_additive_only_converges_conflicting_label_when_path_is_matched():
+    """A positive path match is sufficient to replace a stale managed label.
+
+    The unattended safety rule still protects unmatched movies; it must not
+    preserve a known-wrong FEL/MEL/P5/P8 label after an authoritative rescan.
+    """
     idx = {"y:/a.mkv": "fel"}
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], ["DV MEL"])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
     assert res["added"] == ["DV FEL"]
-    assert res["removed"] == []
-    pm.remove_label.assert_not_called()
+    assert res["removed"] == ["DV MEL"]
+    pm.remove_label.assert_called_once_with(1, "DV MEL")
+
+
+def test_additive_only_removes_stale_label_for_authoritative_none_match():
+    """A matched no-DV scan is evidence; an unmatched movie remains protected."""
+    idx = {"y:/a.mkv": "none"}
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
+
+    assert res["matched"] is True
+    assert res["added"] == []
+    assert res["removed"] == ["DV FEL"]
+    pm.remove_label.assert_called_once_with(1, "DV FEL")
 
 
 def test_full_reconcile_still_removes_by_default():

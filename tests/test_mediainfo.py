@@ -31,6 +31,82 @@ def test_probe_specs_parses_ffprobe(tmp_path):
 def test_probe_specs_missing_file_returns_not_present():
     assert mediainfo.probe_specs("/no/such.mkv")["present"] is False
 
+
+def test_probe_detailed_uses_full_detector_after_plain_hdr10(monkeypatch):
+    monkeypatch.setattr(mediainfo, "probe_specs", lambda *_args, **_kwargs: {
+        "present": True, "path": "/movie.mkv", "hdr": "HDR10", "video_codec": "HEVC",
+    })
+    monkeypatch.setattr(mediainfo.hdr10plus_detect, "detect_hdr10plus", lambda *_args, **_kwargs: {
+        "state": "unknown", "method": "full_extract", "tool_version": "1.7.2", "error": "timeout",
+    })
+
+    result = mediainfo.probe_detailed("/movie.mkv")
+
+    assert result["hdr"] == "HDR10"
+    assert result["hdr10plus_state"] == "unknown"
+    assert result["hdr10plus_evidence"]["method"] == "full_extract"
+
+
+def test_probe_detailed_promotes_authoritative_hdr10plus(monkeypatch):
+    monkeypatch.setattr(mediainfo, "probe_specs", lambda *_args, **_kwargs: {
+        "present": True, "path": "/movie.mkv", "hdr": "HDR10", "video_codec": "HEVC",
+    })
+    monkeypatch.setattr(mediainfo.hdr10plus_detect, "detect_hdr10plus", lambda *_args, **_kwargs: {
+        "state": "present", "method": "full_extract", "tool_version": "1.7.2", "error": None,
+    })
+
+    result = mediainfo.probe_detailed("/movie.mkv")
+
+    assert result["hdr"] == "HDR10+"
+    assert result["hdr10plus_state"] == "present"
+
+
+def test_probe_detailed_preserves_all_streams_and_dolby_vision_fields(monkeypatch, tmp_path):
+    media = tmp_path / "movie.mkv"
+    media.write_bytes(b"generated-test-media")
+    monkeypatch.setattr(mediainfo, "probe_specs", lambda *_args, **_kwargs: {
+        "present": True, "path": str(media), "hdr": "Dolby Vision", "video_codec": "HEVC",
+    })
+    monkeypatch.setattr(mediainfo.hdr10plus_detect, "detect_hdr10plus", lambda *_args, **_kwargs: {
+        "state": "absent", "method": "full_extract", "tool_version": "1.7.2", "error": None,
+    })
+    stream_json = json.dumps({
+        "format": {"format_name": "matroska", "nb_streams": 4},
+        "streams": [
+            {"codec_type": "video", "codec_name": "hevc", "profile": "Main 10",
+             "width": 3840, "height": 2160, "pix_fmt": "yuv420p10le",
+             "color_space": "bt2020nc", "color_transfer": "smpte2084",
+             "color_primaries": "bt2020", "side_data_list": [{
+                 "side_data_type": "DOVI configuration record", "dv_profile": 7,
+                 "dv_level": 6, "rpu_present_flag": 1, "el_present_flag": 1,
+                 "bl_present_flag": 1, "dv_bl_signal_compatibility_id": 6,
+             }]},
+            {"codec_type": "audio", "index": 1, "codec_name": "truehd", "channels": 8,
+             "channel_layout": "7.1", "tags": {"language": "eng", "title": "Atmos"}},
+            {"codec_type": "audio", "index": 2, "codec_name": "ac3", "channels": 6,
+             "tags": {"language": "spa"}},
+            {"codec_type": "subtitle", "index": 3, "codec_name": "subrip",
+             "disposition": {"forced": 1}, "tags": {"language": "eng"}},
+        ],
+    })
+    monkeypatch.setattr(mediainfo.shutil, "which", lambda name: f"/tools/{name}")
+    monkeypatch.setattr(
+        mediainfo.subprocess, "run",
+        lambda *_args, **_kwargs: MagicMock(returncode=0, stdout=stream_json),
+    )
+
+    result = mediainfo.probe_detailed(str(media))
+
+    assert result["dv_profile"] == "7"
+    assert result["video_details"]["bit_depth"] == 10
+    assert result["video_details"]["dolby_vision"]["el_present"] is True
+    assert [stream["language"] for stream in result["audio_streams"]] == ["eng", "spa"]
+    assert result["subtitle_streams"] == [{
+        "index": 3, "codec": "subrip", "language": "eng", "title": None,
+        "default": False, "forced": True, "hearing_impaired": False,
+    }]
+    assert result["hdr10plus_state"] == "absent"
+
 def test_probe_specs_no_ffprobe_returns_none(tmp_path):
     f = tmp_path / "m.mkv"; f.write_bytes(b"x")
     with patch("shutil.which", return_value=None):

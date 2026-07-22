@@ -43,6 +43,8 @@ export async function refreshPlexStatus() {
 export const plexMetadataScanStatus = writable<PlexMetadataScanStatus>({
   status: 'idle',
   processed: 0,
+  succeeded: 0,
+  failed: 0,
   total: 0,
   current_files: [],
   elapsed_seconds: 0,

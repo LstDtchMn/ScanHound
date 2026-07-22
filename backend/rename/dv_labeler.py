@@ -87,13 +87,10 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
                     additive_only=False):
     """Reconcile one movie's managed label. Returns {added, removed, matched}.
 
-    ``additive_only`` adds a missing label but never removes an existing one.
-    Unattended (scheduled) syncs use it: a movie whose path can't be matched
-    this run yields desired=None, which in full-reconcile mode strips its
-    managed labels. That's correct for a deliberate manual sync, but on a timer
-    a transient matching failure (a dropped mount, a changed Plex path form, a
-    mapping gap) would silently wipe DV labels library-wide — and those labels
-    are what the Kometa FEL/MEL overlays key on. Removals stay manual.
+    ``additive_only`` leaves an unmatched movie untouched. A positive path
+    match may still replace a stale managed label so unattended reconciliation
+    converges after an authoritative rescan. A transient matching failure must
+    never strip the labels that Kometa's FEL/MEL overlays depend on.
     """
     norm_paths = _movie_norm_paths(movie, mappings)
     layer = pick_layer(norm_paths, index)
@@ -103,7 +100,7 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     added, removed = [], []
     if desired and desired not in existing_managed:
         added.append(desired)
-    if not additive_only:
+    if not additive_only or layer is not None:
         for stale in existing_managed - ({desired} if desired else set()):
             removed.append(stale)
 
@@ -121,7 +118,14 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
         if added or removed:
             time.sleep(_THROTTLE_S)
 
-    return {"added": added, "removed": removed, "matched": layer is not None}
+    return {
+        "added": added,
+        "removed": removed,
+        "matched": layer is not None,
+        "layer": layer,
+        "desired_label": desired,
+        "existing_labels": sorted(existing_managed),
+    }
 
 
 _DEFAULT_VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}
@@ -143,12 +147,21 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
                 additive_only=False):
     """Reconcile every movie against dv_scan (source='scan'). Returns a summary.
 
-    ``additive_only`` never removes a managed label — see reconcile_movie. The
-    scheduled auto-sync passes it; the manual button does not.
+    ``additive_only`` never removes labels from an unmatched movie — see
+    reconcile_movie. The scheduled auto-sync passes it; the manual button does
+    not.
     """
     vocab = _vocab_from_config(config)
     rows = db.get_dv_scans(source="scan", limit=1000000)
     index, norm_to_path = build_index_and_paths(rows, mappings)
+    seed_rows = []
+    list_seed = getattr(db, "list_dv_seed_baseline", None)
+    if callable(list_seed):
+        seed_rows = list_seed(limit=1000000)
+    seed_index = {
+        normalize_path(row.get("path"), mappings): row.get("seed_layer")
+        for row in seed_rows if normalize_path(row.get("path"), mappings)
+    }
 
     movie_libs = (config.get("movie_libs")
                   or config.get("known_movie_libraries") or [])
@@ -169,6 +182,7 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
 
     total = len(movies)
     added_n = removed_n = matched_n = 0
+    details = []
     for i, mv in enumerate(movies):
         try:
             res = reconcile_movie(mv, index, vocab, pm,
@@ -187,6 +201,34 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
                                 index[p], rating_key=str(mv.ratingKey),
                                 source="scan")
                             break
+            if dry_run:
+                movie_paths = _movie_norm_paths(mv, mappings)
+                matched_path = next((p for p in movie_paths if p in index), None)
+                original_path = norm_to_path.get(matched_path, matched_path) if matched_path else None
+                seed_layer = next((seed_index[p] for p in movie_paths if p in seed_index), None)
+                scan_layer = res["layer"]
+                if seed_layer and scan_layer and seed_layer != scan_layer:
+                    discrepancy = f"seed_{seed_layer}_live_{scan_layer}"
+                elif seed_layer and not scan_layer:
+                    discrepancy = "seed_unverified"
+                elif seed_layer and scan_layer:
+                    discrepancy = "verified"
+                elif scan_layer:
+                    discrepancy = "live_only"
+                else:
+                    discrepancy = "none"
+                details.append({
+                    "rating_key": str(mv.ratingKey),
+                    "title": getattr(mv, "title", None),
+                    "path": original_path,
+                    "seed_layer": seed_layer,
+                    "scan_layer": scan_layer,
+                    "discrepancy": discrepancy,
+                    "desired_label": res["desired_label"],
+                    "existing_labels": res["existing_labels"],
+                    "added": res["added"],
+                    "removed": res["removed"],
+                })
         except Exception as e:
             logger.warning("dv sync: title %s failed: %s",
                            getattr(mv, "title", "?"), e)
@@ -194,4 +236,6 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
             progress_cb(i + 1, total)
 
     return {"total": total, "added": added_n, "removed": removed_n,
-            "matched": matched_n, "dry_run": dry_run}
+            "matched": matched_n, "dry_run": dry_run,
+            "writes": 0 if dry_run else added_n + removed_n,
+            "details": details}

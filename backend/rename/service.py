@@ -1504,7 +1504,17 @@ class RenameService:
                 self._broadcast(job_id)
                 return {"ok": False, "error": msg}
             restore_slot = lib_path
-            db.update_rename_job(job_id, conflict_replaced_path=lib_path)
+            restore_key_ok = db.update_rename_job(
+                job_id, conflict_replaced_path=lib_path)
+            if not restore_key_ok:
+                error_message = self._restore_overwritten_original(
+                    trashed_to, restore_slot, job_id,
+                    "apply bookkeeping failed before placement")
+                db.update_rename_job(
+                    job_id, status="failed", error_message=error_message,
+                    conflict_replaced_path=None)
+                self._broadcast(job_id)
+                return {"ok": False, "error": error_message}
         # Collision guard: a prior apply (or a file already present in the
         # library) may already occupy this destination — e.g. two different
         # releases of the same title resolve to the identical target path.
@@ -1791,7 +1801,17 @@ class RenameService:
             restore_warning = ("The file that was overwritten could not be "
                                "restored from trash (see server logs).")
             logger.exception("undo: overwrite-original restore best-effort failed")
-        db.update_rename_job(job_id, status="reverted", reverted_at=_now())
+        reverted_ok = db.update_rename_job(
+            job_id, status="reverted", reverted_at=_now())
+        if not reverted_ok:
+            return {
+                "ok": False,
+                "error": (
+                    "Undo restored the source file, but its bookkeeping could "
+                    "not be persisted. Do not retry until the database is healthy."
+                ),
+                "restore_warning": restore_warning,
+            }
         self._broadcast(job_id)
         return {"ok": True, "restore_warning": restore_warning}
 

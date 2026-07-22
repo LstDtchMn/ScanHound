@@ -1,10 +1,12 @@
 """Plex integration endpoints."""
 from __future__ import annotations
 
+import csv
+import io
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
@@ -185,11 +187,24 @@ def _movie_targets_for_scope(reg: ServiceRegistry, scope: str, ids: Optional[Lis
             "title": m.get("title"),
             "rating_key": m.get("rating_key"),
             "imdb_id": m.get("imdb_id"),
+            "library_name": m.get("library_name"),
+            "resolution": m.get("res"),
         })
     return targets
 
 
 class ScanMetadataRequest(BaseModel):
+    scope: str
+    ids: Optional[List[str]] = None
+
+
+class DurableMetadataScanRequest(BaseModel):
+    """Explicit, read-only metadata-inventory scan request.
+
+    ``pilot`` and ``targeted`` require caller-selected Plex keys. ``full`` is
+    intentionally limited to the cached 4K movie set; it never scans TV or
+    starts from a background scheduler.
+    """
     scope: str
     ids: Optional[List[str]] = None
 
@@ -225,6 +240,180 @@ def plex_scan_metadata_cancel(reg: ServiceRegistry = Depends(get_registry)):
 @router.get("/scan-metadata/status")
 def plex_scan_metadata_status(reg: ServiceRegistry = Depends(get_registry)):
     return reg.plex_metadata_scan_job.status_dict()
+
+
+@router.post("/metadata-scans")
+def plex_start_durable_metadata_scan(
+    body: DurableMetadataScanRequest,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    if body.scope not in ("pilot", "full", "targeted"):
+        raise HTTPException(status_code=400, detail="scope must be 'pilot', 'full', or 'targeted'")
+    if body.scope in ("pilot", "targeted") and not body.ids:
+        raise HTTPException(status_code=400, detail="ids are required for pilot or targeted scans")
+
+    targets = _movie_targets_for_scope(
+        reg, "selected" if body.scope in ("pilot", "targeted") else "all", body.ids
+    )
+    targets = [
+        target for target in targets
+        if str(target.get("resolution") or "").lower() in {"2160p", "4k", "uhd"}
+    ]
+    if not targets:
+        raise HTTPException(status_code=400, detail="no eligible 4K movie files were found")
+    try:
+        return reg.plex_metadata_scan_job.start_run(body.scope, targets)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/metadata-scans/{run_uuid}")
+def plex_durable_metadata_scan_status(run_uuid: str, reg: ServiceRegistry = Depends(get_registry)):
+    if not reg.db:
+        raise HTTPException(status_code=503, detail="Database service not initialized")
+    run = reg.db.get_metadata_scan_run(run_uuid)
+    if not run:
+        raise HTTPException(status_code=404, detail="metadata scan run not found")
+    return run
+
+
+@router.get("/metadata-scans/{run_uuid}/items")
+def plex_durable_metadata_scan_items(
+    run_uuid: str, status: Optional[str] = None,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    if not reg.db or not reg.db.get_metadata_scan_run(run_uuid):
+        raise HTTPException(status_code=404, detail="metadata scan run not found")
+    return {"items": reg.db.list_metadata_scan_items(run_uuid, status=status)}
+
+
+def _run_control(operation, run_uuid: str):
+    try:
+        return operation(run_uuid)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/metadata-scans/{run_uuid}/pause")
+def plex_pause_metadata_scan(run_uuid: str, reg: ServiceRegistry = Depends(get_registry)):
+    return _run_control(reg.plex_metadata_scan_job.pause, run_uuid)
+
+
+@router.post("/metadata-scans/{run_uuid}/resume")
+def plex_resume_metadata_scan(run_uuid: str, reg: ServiceRegistry = Depends(get_registry)):
+    return _run_control(reg.plex_metadata_scan_job.resume, run_uuid)
+
+
+@router.post("/metadata-scans/{run_uuid}/cancel")
+def plex_cancel_durable_metadata_scan(
+    run_uuid: str, reg: ServiceRegistry = Depends(get_registry)
+):
+    return _run_control(reg.plex_metadata_scan_job.cancel, run_uuid)
+
+
+@router.post("/metadata-scans/{run_uuid}/retry-failures")
+def plex_retry_metadata_scan_failures(
+    run_uuid: str, reg: ServiceRegistry = Depends(get_registry)
+):
+    return _run_control(reg.plex_metadata_scan_job.retry_failures, run_uuid)
+
+
+@router.get("/media-inventory")
+def plex_media_inventory(
+    q: Optional[str] = None,
+    library: Optional[str] = None,
+    resolution: Optional[str] = None,
+    hdr: Optional[str] = None,
+    hdr10plus_state: Optional[str] = None,
+    dv_layer: Optional[str] = None,
+    dv_profile: Optional[str] = None,
+    scan_state: Optional[str] = None,
+    discrepancy: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 100,
+    sort: str = "title",
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    """Search the read-only local-file metadata inventory.
+
+    This route intentionally exposes only projected technical facts and never
+    raw detector stderr or media-file contents.
+    """
+    if not reg.db:
+        raise HTTPException(status_code=503, detail="Database service not initialized")
+    return reg.db.search_media_inventory(
+        q=q, library=library, resolution=resolution, hdr=hdr,
+        hdr10plus_state=hdr10plus_state, dv_layer=dv_layer, dv_profile=dv_profile,
+        scan_state=scan_state, discrepancy=discrepancy,
+        page=page, page_size=page_size, sort=sort,
+    )
+
+
+@router.get("/media-inventory/facets")
+def plex_media_inventory_facets(reg: ServiceRegistry = Depends(get_registry)):
+    if not reg.db:
+        raise HTTPException(status_code=503, detail="Database service not initialized")
+    return reg.db.media_inventory_facets()
+
+
+def _csv_cell(value) -> str:
+    text = "" if value is None else str(value)
+    if text.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + text
+    return text
+
+
+@router.get("/media-inventory/export.csv")
+def plex_media_inventory_export(
+    q: Optional[str] = None,
+    library: Optional[str] = None,
+    resolution: Optional[str] = None,
+    hdr: Optional[str] = None,
+    hdr10plus_state: Optional[str] = None,
+    dv_layer: Optional[str] = None,
+    dv_profile: Optional[str] = None,
+    scan_state: Optional[str] = None,
+    discrepancy: Optional[str] = None,
+    sort: str = "title",
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    """Export the filtered authenticated inventory with spreadsheet-safe cells."""
+    if not reg.db:
+        raise HTTPException(status_code=503, detail="Database service not initialized")
+    filters = dict(
+        q=q, library=library, resolution=resolution, hdr=hdr,
+        hdr10plus_state=hdr10plus_state, dv_layer=dv_layer, dv_profile=dv_profile,
+        scan_state=scan_state, discrepancy=discrepancy, sort=sort,
+    )
+    first = reg.db.search_media_inventory(**filters, page=1, page_size=500)
+    rows = list(first["items"])
+    pages = (first["total"] + 499) // 500
+    for page in range(2, pages + 1):
+        rows.extend(reg.db.search_media_inventory(**filters, page=page, page_size=500)["items"])
+
+    columns = [
+        "title", "year", "library_name", "resolution", "hdr", "hdr10plus_state",
+        "dv_layer", "dv_profile", "seed_layer", "scan_layer", "discrepancy",
+        "scan_state", "last_scanned_at", "rating_key", "path",
+    ]
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\r\n")
+    writer.writerow(columns)
+    for row in rows:
+        writer.writerow([_csv_cell(row.get(column)) for column in columns])
+    return Response(
+        content=output.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=media-inventory.csv"},
+    )
+
+
+@router.get("/metadata-scans/{run_uuid}/discrepancies")
+def plex_metadata_scan_discrepancies(
+    run_uuid: str, reg: ServiceRegistry = Depends(get_registry)
+):
+    if not reg.db or not reg.db.get_metadata_scan_run(run_uuid):
+        raise HTTPException(status_code=404, detail="metadata scan run not found")
+    return {"items": reg.db.list_metadata_discrepancies(run_uuid)}
 
 
 @router.get("/unmapped-paths")

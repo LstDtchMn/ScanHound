@@ -68,3 +68,6 @@ scanner.log.*
 # Build output (regenerated inside Docker at image-build time — never committed)
 frontend/build/
 backend/frontend/
+
+# Project-local Git worktrees
+.worktrees/

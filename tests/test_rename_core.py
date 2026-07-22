@@ -87,6 +87,67 @@ class TestFileOps:
         fileops.undo_place(str(src), str(dst), "move")
         assert src.exists() and not dst.exists()
 
+    def test_move_undo_uses_durable_no_replace_publication(self, tmp_path, monkeypatch):
+        """Undo must use the same no-overwrite primitive as forward placement.
+
+        ``shutil.move`` has overwrite-capable semantics on POSIX and a
+        check-then-move race.  This guard deliberately fails if that primitive
+        remains reachable.
+        """
+        src = tmp_path / "src.mkv"
+        dst = tmp_path / "lib" / "out.mkv"
+        src.write_text("data")
+        fileops.place_file(str(src), str(dst), "move")
+
+        calls = []
+        real_move = fileops._move_no_replace_durable
+
+        def _tracked_move(source, destination):
+            calls.append((source, destination))
+            return real_move(source, destination)
+
+        monkeypatch.setattr(fileops, "_move_no_replace_durable", _tracked_move)
+        monkeypatch.setattr(
+            fileops.shutil,
+            "move",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("undo used overwrite-capable shutil.move")
+            ),
+        )
+
+        fileops.undo_place(str(src), str(dst), "move")
+
+        assert calls == [(str(dst), str(src))]
+        assert src.read_text() == "data"
+        assert not dst.exists()
+
+    def test_move_undo_exdev_uses_verified_copy_then_durable_unlink(
+            self, tmp_path, monkeypatch):
+        """Cross-volume undo verifies publication before consuming the placed file."""
+        src = tmp_path / "download" / "src.mkv"
+        dst = tmp_path / "library" / "out.mkv"
+        dst.parent.mkdir()
+        dst.write_bytes(b"verified rollback bytes")
+
+        def _exdev(_source, _destination):
+            raise OSError(errno.EXDEV, "simulated cross-device undo")
+
+        unlinked = []
+        real_unlink = fileops._unlink_durable
+
+        def _tracked_unlink(path):
+            unlinked.append(path)
+            return real_unlink(path)
+
+        monkeypatch.setattr(fileops, "_move_no_replace_durable", _exdev)
+        monkeypatch.setattr(fileops, "_unlink_durable", _tracked_unlink)
+
+        fileops.undo_place(str(src), str(dst), "move")
+
+        assert src.read_bytes() == b"verified rollback bytes"
+        assert not dst.exists()
+        assert unlinked == [str(dst)]
+
     def test_copy_verifies_and_keeps_source(self, tmp_path):
         src = tmp_path / "src.mkv"; src.write_bytes(b"hello world")
         dst = tmp_path / "out.mkv"
@@ -867,7 +928,11 @@ class TestAllTrashRoots:
         monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
         roots = fileops.all_trash_roots()
         assert os.path.abspath(fileops._TRASH_ROOT) in roots
-        assert os.path.join("/", ".scanhound-trash") in roots
+        # ``os.name`` is patched to exercise the POSIX branch, but the host
+        # path module remains Windows ``ntpath`` in local Windows runs. Assert
+        # the branch's own fallback construction rather than assuming that a
+        # runtime-platform monkeypatch swaps Python's path implementation.
+        assert fileops._trash_root_for("/") in roots
 
     def test_wiring_makes_trash_on_a_reported_mount_discoverable(self, tmp_path, monkeypatch):
         """Regression for SH-H05: a file trashed under a mount point that
@@ -877,6 +942,10 @@ class TestAllTrashRoots:
         monkeypatch.setattr(os, "name", "posix")
         monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [str(mount)])
         monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(mount / ".scanhound-trash"))
+        # This test exercises POSIX mount-root discovery on a Windows host.
+        # Do not invoke the POSIX directory-fsync syscall against NTFS; its
+        # durability semantics are covered by platform-specific tests.
+        monkeypatch.setattr(fileops, "_fsync_directory", lambda _path: None)
 
         src = mount / "movie.mkv"
         src.write_text("x")
@@ -1076,10 +1145,16 @@ class TestFilesystemFailSafe:
             ),
         )
 
-        with pytest.raises(fileops.UnsupportedFilesystemSafetyError) as caught:
-            fileops.place_file(str(src), str(dst), "move")
-
-        assert caught.value.reason.startswith("directory fsync unavailable")
+        if os.name == "nt":
+            # Windows uses MoveFile write-through rather than POSIX directory
+            # fsync. A post-publication sync fault must still roll the move
+            # back and surface an error without consuming the source.
+            with pytest.raises(OSError, match="unsupported directory fsync"):
+                fileops.place_file(str(src), str(dst), "move")
+        else:
+            with pytest.raises(fileops.UnsupportedFilesystemSafetyError) as caught:
+                fileops.place_file(str(src), str(dst), "move")
+            assert caught.value.reason.startswith("directory fsync unavailable")
         assert src.read_bytes() == b"source-bytes"
         assert not dst.exists()
 
@@ -1097,7 +1172,11 @@ class TestFilesystemFailSafe:
         def fail_after_preflight(path):
             nonlocal calls
             calls += 1
-            if calls == 3:
+            # POSIX preflights both directories before publication, while
+            # Windows relies on MoveFile write-through and reaches its first
+            # directory-sync hook only after publication.
+            fail_on_call = 1 if os.name == "nt" else 3
+            if calls == fail_on_call:
                 raise OSError(errno.EIO, "simulated post-publication sync failure")
             return real_sync(path)
 
@@ -1141,4 +1220,7 @@ class TestFilesystemFailSafe:
         )
         status = fileops.filesystem_safety_status(str(tmp_path))
         assert status["directory_fsync"] is False
-        assert status["source_consuming_move_durability"] is False
+        if os.name == "nt":
+            assert status["source_consuming_move_durability"] == "movefile_write_through"
+        else:
+            assert status["source_consuming_move_durability"] is False
