@@ -227,6 +227,42 @@ def plex_scan_metadata_status(reg: ServiceRegistry = Depends(get_registry)):
     return reg.plex_metadata_scan_job.status_dict()
 
 
+@router.get("/media-inventory")
+def plex_media_inventory(
+    q: Optional[str] = None,
+    library: Optional[str] = None,
+    resolution: Optional[str] = None,
+    hdr: Optional[str] = None,
+    hdr10plus_state: Optional[str] = None,
+    dv_layer: Optional[str] = None,
+    dv_profile: Optional[str] = None,
+    scan_state: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 100,
+    sort: str = "title",
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    """Search the read-only local-file metadata inventory.
+
+    This route intentionally exposes only projected technical facts and never
+    raw detector stderr or media-file contents.
+    """
+    if not reg.db:
+        raise HTTPException(status_code=503, detail="Database service not initialized")
+    return reg.db.search_media_inventory(
+        q=q, library=library, resolution=resolution, hdr=hdr,
+        hdr10plus_state=hdr10plus_state, dv_layer=dv_layer, dv_profile=dv_profile,
+        scan_state=scan_state, page=page, page_size=page_size, sort=sort,
+    )
+
+
+@router.get("/media-inventory/facets")
+def plex_media_inventory_facets(reg: ServiceRegistry = Depends(get_registry)):
+    if not reg.db:
+        raise HTTPException(status_code=503, detail="Database service not initialized")
+    return reg.db.media_inventory_facets()
+
+
 @router.get("/unmapped-paths")
 def unmapped_plex_paths(reg: ServiceRegistry = Depends(get_registry)):
     """Distinct plex_cache path prefixes with no configured

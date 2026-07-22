@@ -70,3 +70,21 @@ def test_scan_run_transitions_are_explicit_and_record_terminal_time(tmp_path):
     assert saved["status"] == "completed"
     assert saved["completed_at"]
     assert db.update_metadata_scan_run(run["run_uuid"], status="not-a-real-status") is False
+
+
+def test_inventory_search_filters_evidence_and_failed_scan_state(tmp_path):
+    db = DatabaseManager(str(tmp_path / "inventory.sqlite"))
+    assert db.upsert_media_inventory({
+        "path": "/movies/fel.mkv", "title": "FEL Film", "resolution": "2160p",
+        "dv_layer": "fel", "hdr10plus_state": "present", "scan_state": "current",
+    })
+    assert db.upsert_media_inventory({
+        "path": "/movies/unreadable.mkv", "title": "Unknown Film", "resolution": "2160p",
+        "hdr10plus_state": "unknown", "scan_state": "failed",
+    })
+
+    fel = db.search_media_inventory(dv_layer="fel", hdr10plus_state="present")
+    failed = db.search_media_inventory(scan_state="failed")
+
+    assert [row["path"] for row in fel["items"]] == ["/movies/fel.mkv"]
+    assert [row["path"] for row in failed["items"]] == ["/movies/unreadable.mkv"]

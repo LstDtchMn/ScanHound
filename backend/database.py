@@ -3873,6 +3873,74 @@ class DatabaseManager:
             item.get("probe_json"), scan_state,
         ), label="upsert_media_inventory") is not None
 
+    def search_media_inventory(self, *, q=None, library=None, resolution=None, hdr=None,
+                               hdr10plus_state=None, dv_layer=None, dv_profile=None,
+                               scan_state=None, page=1, page_size=100, sort="title"):
+        """Search the inventory through a fixed, indexed filter vocabulary.
+
+        ``sort`` is allowlisted rather than interpolated from caller input;
+        all values are bound parameters. The stable path tiebreaker makes CSV,
+        API pagination, and later Kometa reconciliation deterministic.
+        """
+        filter_columns = {
+            "library": ("library_name", library),
+            "resolution": ("resolution", resolution),
+            "hdr": ("hdr", hdr),
+            "hdr10plus_state": ("hdr10plus_state", hdr10plus_state),
+            "dv_layer": ("dv_layer", dv_layer),
+            "dv_profile": ("dv_profile", dv_profile),
+            "scan_state": ("scan_state", scan_state),
+        }
+        clauses, params = [], []
+        for _name, (column, value) in filter_columns.items():
+            if value is not None and value != "":
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if q:
+            clauses.append("(title LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')")
+            escaped = str(q).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            params.extend([f"%{escaped}%", f"%{escaped}%"])
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sort_columns = {
+            "title": "title COLLATE NOCASE",
+            "updated": "updated_at DESC",
+            "resolution": "resolution COLLATE NOCASE",
+            "scan_state": "scan_state COLLATE NOCASE",
+        }
+        order = sort_columns.get(sort, sort_columns["title"])
+        try:
+            page = max(1, int(page))
+            page_size = max(1, min(int(page_size), 500))
+        except (TypeError, ValueError):
+            page, page_size = 1, 100
+        count_row = self._query(
+            "SELECT COUNT(*) FROM media_inventory" + where, tuple(params), one=True, default=None
+        )
+        total = int(count_row[0]) if count_row else 0
+        rows = self._query_dicts(
+            "SELECT path, library_name, rating_key, title, year, resolution, hdr, "
+            "hdr10plus_state, dv_layer, dv_profile, scan_state, sig_mtime, sig_size, "
+            "scan_run_uuid, last_scanned_at, updated_at FROM media_inventory" + where +
+            f" ORDER BY {order}, path ASC LIMIT ? OFFSET ?",
+            tuple(params + [page_size, (page - 1) * page_size]),
+            default=[],
+        )
+        return {"items": rows, "total": total, "page": page, "page_size": page_size}
+
+    def media_inventory_facets(self):
+        """Return safe facet counts for the inventory filter controls."""
+        facets = {}
+        for column in ("library_name", "resolution", "hdr", "hdr10plus_state",
+                       "dv_layer", "dv_profile", "scan_state"):
+            rows = self._query_dicts(
+                f"SELECT {column} AS value, COUNT(*) AS count FROM media_inventory "
+                f"WHERE {column} IS NOT NULL AND {column} != '' GROUP BY {column} "
+                "ORDER BY value COLLATE NOCASE",
+                default=[],
+            )
+            facets[column] = rows
+        return facets
+
     def upsert_dv_scan(self, path, dv_layer, *, title=None, sig_mtime=None,
                        sig_size=None, source="scan", rating_key=None, imdb_id=None):
         """Insert/update a DV-layer record for ``path``. Refreshes last_seen_at;
