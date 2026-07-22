@@ -227,10 +227,11 @@ def test_eta_is_none_before_any_progress():
     assert s["eta_seconds"] is None
 
 
-def test_never_exceeds_bounded_concurrency(tmp_path):
+def test_never_exceeds_default_single_file_concurrency(tmp_path):
     """The per-file pipeline (which includes the expensive dovi_tool step)
     must never run more than 2 files at once -- guards the 'never unbounded
-    parallel dovi_tool' constraint."""
+    parallel dovi_tool' constraint. The inventory default is deliberately one
+    file at a time until a real-mount pilot establishes a safe higher bound."""
     db = _fake_db()
     targets = []
     for i in range(12):
@@ -256,6 +257,5 @@ def test_never_exceeds_bounded_concurrency(tmp_path):
         job.start(targets)
         _wait_until_done(job, timeout=15.0)
 
-    assert state["max"] <= 2
-    assert state["max"] >= 2  # with 12 files it should actually reach the bound
+    assert state["max"] == 1
     assert job.status_dict()["processed"] == 12

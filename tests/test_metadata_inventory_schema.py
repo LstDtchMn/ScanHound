@@ -56,3 +56,17 @@ def test_scan_manifest_rejects_unknown_status_and_duplicate_paths(tmp_path):
     assert db.update_metadata_scan_item(
         run["run_uuid"], "/movies/a.mkv", status="not-a-real-status"
     ) is False
+
+
+def test_scan_run_transitions_are_explicit_and_record_terminal_time(tmp_path):
+    db = DatabaseManager(str(tmp_path / "inventory.sqlite"))
+    run = db.create_metadata_scan_run(scope="pilot", expected_count=0)
+
+    assert db.update_metadata_scan_run(run["run_uuid"], status="running")
+    assert db.get_metadata_scan_run(run["run_uuid"])["started_at"]
+    assert db.update_metadata_scan_run(run["run_uuid"], status="completed")
+
+    saved = db.get_metadata_scan_run(run["run_uuid"])
+    assert saved["status"] == "completed"
+    assert saved["completed_at"]
+    assert db.update_metadata_scan_run(run["run_uuid"], status="not-a-real-status") is False

@@ -3717,6 +3717,31 @@ class DatabaseManager:
         )
         return rows[0] if rows else None
 
+    def update_metadata_scan_run(self, run_uuid, *, status, error_code=None, error_message=None):
+        """Transition one durable scan run through its explicit status vocabulary."""
+        if status not in self._METADATA_SCAN_RUN_STATUSES or not run_uuid:
+            return False
+        terminal = status in {"cancelled", "completed", "failed", "interrupted"}
+        try:
+            with self.transaction() as conn:
+                if not conn:
+                    return False
+                cursor = conn.execute('''
+                    UPDATE metadata_scan_runs
+                    SET status = ?, error_code = ?, error_message = ?,
+                        started_at = CASE WHEN ? = 'running' AND started_at IS NULL
+                            THEN CURRENT_TIMESTAMP ELSE started_at END,
+                        cancelled_at = CASE WHEN ? = 'cancelled' THEN CURRENT_TIMESTAMP
+                            ELSE cancelled_at END,
+                        completed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP
+                            ELSE completed_at END
+                    WHERE run_uuid = ?
+                ''', (status, error_code, error_message, status, status, terminal, run_uuid))
+                return cursor.rowcount == 1
+        except Exception as exc:
+            logger.error("DB Error (update_metadata_scan_run): %s", exc)
+            return False
+
     def create_metadata_scan_items(self, run_uuid, items):
         """Persist a scan manifest before scheduling workers.
 

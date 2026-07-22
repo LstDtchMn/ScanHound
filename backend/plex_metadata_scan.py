@@ -19,7 +19,9 @@ from backend.rename import dv_detect, mediainfo
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONCURRENCY = 2
+# The durable inventory defaults to one file at a time.  It reads but never
+# writes media, yet full HDR/DV parsing can still saturate an SMB share or NAS.
+_MAX_CONCURRENCY = 1
 
 
 class PlexMetadataScanJob:
@@ -41,6 +43,7 @@ class PlexMetadataScanJob:
         self.current_files: list[str] = []
         self.started_at: Optional[float] = None
         self.error: Optional[str] = None
+        self._active_run_uuid: Optional[str] = None
 
     def is_running(self) -> bool:
         with self._lock:
@@ -65,6 +68,40 @@ class PlexMetadataScanJob:
             name="plex-metadata-scan", daemon=True).start()
         return True
 
+    def start_run(self, scope: str, targets: list[dict]) -> dict:
+        """Start a durable, read-only inventory run.
+
+        The complete target manifest is committed before a worker is started,
+        so an interruption leaves retryable evidence instead of an in-memory
+        counter that disappears at process exit.  The legacy ``start`` method
+        stays available for existing API/UI callers until their routes migrate.
+        """
+        with self._lock:
+            if self.status == "running":
+                raise RuntimeError("a metadata scan is already running")
+            run = self._db.create_metadata_scan_run(scope=scope, expected_count=len(targets))
+            if not run:
+                raise RuntimeError("could not create metadata scan run")
+            created = self._db.create_metadata_scan_items(run["run_uuid"], targets)
+            if created != len({item.get("path") for item in targets if item.get("path")}):
+                raise RuntimeError("could not persist complete metadata scan manifest")
+            if not self._db.update_metadata_scan_run(run["run_uuid"], status="running"):
+                raise RuntimeError("could not mark metadata scan running")
+            self._active_run_uuid = run["run_uuid"]
+            self._stop_flag = False
+            self.status = "running"
+            self.processed = self.succeeded = self.failed = 0
+            self.total = created
+            self.current_files = []
+            self.started_at = time.time()
+            self.error = None
+        self._emit()
+        threading.Thread(
+            target=self._run_durable, args=(run["run_uuid"],),
+            name="plex-metadata-inventory", daemon=True,
+        ).start()
+        return self._db.get_metadata_scan_run(run["run_uuid"])
+
     def cancel(self) -> None:
         with self._lock:
             self._stop_flag = True
@@ -85,6 +122,7 @@ class PlexMetadataScanJob:
                 "elapsed_seconds": round(elapsed, 1),
                 "eta_seconds": round(eta, 1) if eta is not None else None,
                 "error": self.error,
+                "run_uuid": self._active_run_uuid,
             }
 
     def _emit(self) -> None:
@@ -114,6 +152,113 @@ class PlexMetadataScanJob:
                 self.status = "error"
                 self.error = str(e)
         self._emit()
+
+    def _run_durable(self, run_uuid: str) -> None:
+        """Process the persisted manifest serially and retain every outcome."""
+        try:
+            for item in self._db.list_metadata_scan_items(run_uuid):
+                with self._lock:
+                    if self._stop_flag:
+                        break
+                self._process_one_durable(run_uuid, item)
+            with self._lock:
+                cancelled = self._stop_flag
+                self.status = "cancelled" if cancelled else "done"
+            self._db.update_metadata_scan_run(
+                run_uuid, status="cancelled" if cancelled else "completed"
+            )
+        except Exception as exc:
+            logger.exception("durable plex metadata scan failed")
+            with self._lock:
+                self.status = "error"
+                self.error = str(exc)
+            self._db.update_metadata_scan_run(
+                run_uuid, status="failed", error_code="worker_error", error_message=str(exc)
+            )
+        finally:
+            self._emit()
+
+    def _process_one_durable(self, run_uuid: str, item: dict) -> None:
+        path = item.get("path")
+        label = item.get("title") or path or "?"
+        with self._lock:
+            self.current_files.append(label)
+        self._db.update_metadata_scan_item(run_uuid, path, status="running")
+        self._emit()
+        succeeded = False
+        try:
+            before = os.stat(path)
+            specs = mediainfo.probe_detailed(path, db=self._db)
+            if not specs or not specs.get("present"):
+                self._db.update_metadata_scan_item(
+                    run_uuid, path, status="failed", failure_stage="ffprobe",
+                    error_code="probe_unavailable", error_message="No usable local-file probe result",
+                )
+                return
+            after = os.stat(path)
+            if (before.st_mtime != after.st_mtime) or (before.st_size != after.st_size):
+                self._db.upsert_media_inventory({
+                    **item, "path": path, "scan_state": "source_changed",
+                    "sig_mtime": after.st_mtime, "sig_size": after.st_size,
+                    "scan_run_uuid": run_uuid,
+                })
+                self._db.update_metadata_scan_item(
+                    run_uuid, path, status="failed", failure_stage="restat",
+                    error_code="source_changed", error_message="File changed while it was analysed",
+                )
+                return
+            if specs.get("hdr") == "Dolby Vision":
+                dv_result = dv_detect.detect_layer(path)
+                if dv_result.get("layer") in {None, "unknown"} or dv_result.get("error"):
+                    self._db.update_metadata_scan_item(
+                        run_uuid, path, status="failed", failure_stage="dovi",
+                        error_code="dv_incomplete", error_message=str(dv_result.get("error") or "unknown"),
+                    )
+                    return
+                specs["dv_layer"] = dv_result.get("layer")
+                if not self._db.upsert_dv_scan(
+                    path, dv_result.get("layer"), title=item.get("title"),
+                    sig_mtime=after.st_mtime, sig_size=after.st_size, source="scan",
+                    rating_key=item.get("rating_key"),
+                ):
+                    self._db.update_metadata_scan_item(
+                        run_uuid, path, status="failed", failure_stage="persist",
+                        error_code="dv_cache_write_failed", error_message="Could not persist DV evidence",
+                    )
+                    return
+            if not self._db.upsert_media_inventory({
+                **item, **specs, "path": path, "scan_state": "current",
+                "sig_mtime": after.st_mtime, "sig_size": after.st_size,
+                "scan_run_uuid": run_uuid,
+            }):
+                self._db.update_metadata_scan_item(
+                    run_uuid, path, status="failed", failure_stage="persist",
+                    error_code="inventory_write_failed", error_message="Could not persist metadata inventory",
+                )
+                return
+            self._db.update_metadata_scan_item(run_uuid, path, status="current")
+            succeeded = True
+        except OSError as exc:
+            self._db.update_metadata_scan_item(
+                run_uuid, path, status="failed", failure_stage="stat",
+                error_code="filesystem_error", error_message=str(exc),
+            )
+        except Exception as exc:
+            logger.exception("durable metadata probe failed for %s", path)
+            self._db.update_metadata_scan_item(
+                run_uuid, path, status="failed", failure_stage="probe",
+                error_code="probe_exception", error_message=str(exc),
+            )
+        finally:
+            with self._lock:
+                self.processed += 1
+                if succeeded:
+                    self.succeeded += 1
+                else:
+                    self.failed += 1
+                if label in self.current_files:
+                    self.current_files.remove(label)
+            self._emit()
 
     def _process_one_tracked(self, item: dict) -> None:
         label = item.get("title") or item.get("path") or "?"
