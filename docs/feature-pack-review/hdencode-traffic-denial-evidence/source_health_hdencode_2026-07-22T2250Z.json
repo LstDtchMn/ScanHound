@@ -1,0 +1,26 @@
+{
+  "captured_at_utc": "2026-07-22T22:50:10Z",
+  "query": "SELECT * FROM source_health WHERE source='hdencode'",
+  "row": {
+    "source": "hdencode",
+    "state": "blocked",
+    "reason_code": "interactive_challenge",
+    "updated_at": "2026-07-22T22:38:21.359242+00:00",
+    "last_success_at": "2026-07-22T22:38:11.073004+00:00",
+    "last_failure_at": "2026-07-22T22:38:21.359242+00:00",
+    "consecutive_failures": 2,
+    "cooldown_until": null
+  },
+  "corroborating_config": {
+    "hdencode_enabled_on_disk": true,
+    "hdencode_enabled_live_api": true,
+    "hdencode_discovery_mode": "rss_shadow"
+  },
+  "corroborating_log_lines": [
+    "[18:38:21] [WARNING] [Download] I'm Gonna Git You Sucka: The source presented an interactive verification challenge that did not clear.",
+    "[18:38:21] [WARNING] [Download] King Arthur: Legend of the Sword: HDEncode is disabled in Settings; no request was made.",
+    "[18:40:02] [WARNING] [Download] Marfa Girl: HDEncode is disabled in Settings; no request was made.",
+    "[18:48:48] [WARNING] [Download] I'm Gonna Git You Sucka: HDEncode is disabled in Settings; no request was made."
+  ],
+  "note": "All application-log bracketed timestamps are America/New_York (container TZ). 18:38:21 local = 22:38:21 UTC, matching source_health.updated_at exactly."
+}
