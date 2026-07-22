@@ -6,6 +6,7 @@ exercise the parsing + fail-safe behavior of the verified recipe.
 """
 from types import SimpleNamespace
 from unittest.mock import patch
+import subprocess
 
 import pytest
 
@@ -131,12 +132,46 @@ class TestDetectLayer:
         assert "info failed" in r["error"]
 
     def test_timeout_is_fail_safe(self, tmp_path):
-        import subprocess
         f = tmp_path / "movie.mkv"; f.write_bytes(b"x")
         with patch("shutil.which", return_value="/usr/local/bin/dovi_tool"), \
              patch("subprocess.run", side_effect=subprocess.TimeoutExpired("dovi_tool", 1)):
             r = dv_detect.detect_layer(str(f))
         assert r["layer"] == dv_detect.LAYER_UNKNOWN and r["error"] == "timeout"
+
+    def test_cancellation_terminates_inflight_extract(self, tmp_path):
+        f = tmp_path / "movie.mkv"; f.write_bytes(b"x")
+
+        class Process:
+            returncode = None
+            terminated = False
+
+            def communicate(self, timeout=None):
+                if self.terminated:
+                    self.returncode = -15
+                    return b"", b""
+                raise subprocess.TimeoutExpired("dovi_tool", timeout)
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.terminated = True
+
+        process = Process()
+        checks = iter([False, True])
+
+        with patch("shutil.which", return_value="/usr/local/bin/dovi_tool"), \
+             patch("subprocess.Popen", return_value=process):
+            r = dv_detect.detect_layer(
+                str(f), cancel_requested=lambda: next(checks, True)
+            )
+
+        assert r == {
+            "layer": dv_detect.LAYER_UNKNOWN,
+            "tool": True,
+            "error": "cancelled",
+        }
+        assert process.terminated is True
 
 
 class TestDependencyStatus:

@@ -313,7 +313,8 @@ def _scan_stream_details(path: str, timeout: int) -> dict:
     }
 
 
-def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
+def probe_detailed(path: str, timeout: int = 30, db=None,
+                   cancel_requested=None) -> Optional[dict]:
     """Return scan-grade technical evidence without changing ``probe_specs``.
 
     Existing rename callers retain the compact/cacheable ``probe_specs``
@@ -346,7 +347,8 @@ def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         }
     elif hdr == "HDR10":
         evidence = hdr10plus_detect.detect_hdr10plus(
-            path, quick_timeout=timeout, full_timeout=max(timeout, 300)
+            path, quick_timeout=timeout, full_timeout=max(timeout, 300),
+            cancel_requested=cancel_requested,
         )
         if evidence.get("state") == "present":
             detailed["hdr"] = "HDR10+"
@@ -355,7 +357,8 @@ def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         # same full-file detector instead of converting that uncertainty into
         # an implicit negative.
         evidence = hdr10plus_detect.detect_hdr10plus(
-            path, quick_timeout=timeout, full_timeout=max(timeout, 300)
+            path, quick_timeout=timeout, full_timeout=max(timeout, 300),
+            cancel_requested=cancel_requested,
         )
     else:
         evidence = {"state": "absent", "method": "not_hdr10_pq", "tool_version": None,

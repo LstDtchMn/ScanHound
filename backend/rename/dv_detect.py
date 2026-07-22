@@ -30,6 +30,8 @@ import shutil
 import subprocess
 import tempfile
 
+from backend.rename.process_control import ProcessCancelled, run_cancellable
+
 logger = logging.getLogger(__name__)
 
 # Container extensions dovi_tool can demux directly. (.m2ts has no clean tag
@@ -43,6 +45,7 @@ _INFO_TIMEOUT = 120
 
 # The parenthetical token(s) after "Profile: N" in `dovi_tool info -s` output.
 _PROFILE_RE = re.compile(r"Profile:\s*([0-9.]+)\s*(?:\(([^)]*)\))?", re.IGNORECASE)
+
 
 # Result layer values:
 #   'fel'       Profile 7 with a Full Enhancement Layer (the prize)
@@ -110,7 +113,7 @@ def _parse_info(summary: str) -> str:
     return best
 
 
-def detect_layer(path: str) -> dict:
+def detect_layer(path: str, *, cancel_requested=None) -> dict:
     """Detect the Dolby Vision enhancement-layer type of a video file.
 
     Returns a dict::
@@ -136,8 +139,11 @@ def detect_layer(path: str) -> dict:
         # Stage 1: extract the RPU. dovi_tool demuxes the container itself —
         # preferred over an ffmpeg pipe, which can drop EL NALs and misreport a
         # true FEL as MEL/P8.
-        ex = subprocess.run([dovi, "extract-rpu", path, "-o", rpu],
-                            capture_output=True, timeout=_EXTRACT_TIMEOUT)
+        ex = run_cancellable(
+            [dovi, "extract-rpu", path, "-o", rpu],
+            timeout=_EXTRACT_TIMEOUT,
+            cancel_requested=cancel_requested,
+        )
         rpu_size = os.path.getsize(rpu)
         if ex.returncode != 0 or not rpu_size:
             err = (ex.stderr or b"").decode("utf-8", "ignore").strip()
@@ -151,14 +157,19 @@ def detect_layer(path: str) -> dict:
         # Stage 2: read the FEL/MEL token from the summary. A failed info call
         # must NOT be parsed as "no Profile line found" (→ false 'none'); the RPU
         # extracted fine, so a failure here is 'unknown'.
-        info = subprocess.run([dovi, "info", "-i", rpu, "-s"],
-                              capture_output=True, timeout=_INFO_TIMEOUT)
+        info = run_cancellable(
+            [dovi, "info", "-i", rpu, "-s"],
+            timeout=_INFO_TIMEOUT,
+            cancel_requested=cancel_requested,
+        )
         if info.returncode != 0:
             ierr = (info.stderr or b"").decode("utf-8", "ignore").strip()
             return {"layer": LAYER_UNKNOWN, "tool": True,
                     "error": f"info failed: {ierr[:180]}" if ierr else "info failed"}
         out = (info.stdout or b"").decode("utf-8", "ignore")
         return {"layer": _parse_info(out), "tool": True, "error": None}
+    except ProcessCancelled:
+        return {"layer": LAYER_UNKNOWN, "tool": True, "error": "cancelled"}
     except subprocess.TimeoutExpired:
         logger.warning("dovi_tool timed out on %s", path)
         return {"layer": LAYER_UNKNOWN, "tool": True, "error": "timeout"}

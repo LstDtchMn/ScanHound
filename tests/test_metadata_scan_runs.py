@@ -1,11 +1,13 @@
 """Persistent run/resume contracts for read-only metadata scanning."""
 
 import json
+import threading
 import time
 
 from backend.database import DatabaseManager
 from backend.plex_metadata_scan import PlexMetadataScanJob
 from backend.rename import mediainfo
+from backend.rename import dv_detect
 
 
 def _wait_for_terminal(db, run_uuid, timeout=3):
@@ -135,3 +137,85 @@ def test_pause_and_cancel_are_distinct_durable_stop_requests(tmp_path):
     job._stop_flag = False
     assert job.cancel(paused["run_uuid"])["status"] == "cancelling"
     assert job._stop_mode == "cancelled"
+
+
+def test_cancel_interrupts_dovi_probe_and_keeps_item_retryable(tmp_path, monkeypatch):
+    media = tmp_path / "movie.mkv"
+    media.write_bytes(b"generated test media")
+    db = DatabaseManager(str(tmp_path / "inventory.sqlite"))
+    entered = threading.Event()
+
+    monkeypatch.setattr(mediainfo, "probe_detailed", lambda path, **_kwargs: {
+        "present": True,
+        "path": path,
+        "resolution": "2160p",
+        "hdr": "Dolby Vision",
+        "hdr10plus_state": "unknown",
+        "dv_layer": "unknown",
+        "video_codec": "HEVC",
+    })
+
+    def cancellable_detect(_path, *, cancel_requested=None):
+        entered.set()
+        assert callable(cancel_requested)
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if cancel_requested():
+                return {"layer": "unknown", "tool": True, "error": "cancelled"}
+            time.sleep(0.01)
+        raise AssertionError("Dolby Vision probe did not observe cancellation")
+
+    monkeypatch.setattr(dv_detect, "detect_layer", cancellable_detect)
+    job = PlexMetadataScanJob(db)
+    run = job.start_run("pilot", [{"path": str(media), "title": "Example"}])
+    assert entered.wait(1)
+
+    job.cancel(run["run_uuid"])
+    terminal = _wait_for_terminal(db, run["run_uuid"])
+
+    assert terminal["status"] == "cancelled"
+    item = db.list_metadata_scan_items(run["run_uuid"])[0]
+    assert item["status"] == "pending"
+    assert job.status_dict()["processed"] == 0
+    assert job.status_dict()["failed"] == 0
+
+
+def test_cancelled_hdr10plus_probe_keeps_item_retryable(tmp_path, monkeypatch):
+    media = tmp_path / "movie.mkv"
+    media.write_bytes(b"generated test media")
+    db = DatabaseManager(str(tmp_path / "inventory.sqlite"))
+    entered = threading.Event()
+
+    def cancellable_probe(path, *, cancel_requested=None, **_kwargs):
+        entered.set()
+        assert callable(cancel_requested)
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if cancel_requested():
+                return {
+                    "present": True,
+                    "path": path,
+                    "resolution": "2160p",
+                    "hdr": "HDR10",
+                    "hdr10plus_state": "unknown",
+                    "hdr10plus_evidence": {
+                        "state": "unknown", "method": "full_extract",
+                        "tool_version": "test", "error": "cancelled",
+                    },
+                }
+            time.sleep(0.01)
+        raise AssertionError("HDR10+ probe did not observe cancellation")
+
+    monkeypatch.setattr(mediainfo, "probe_detailed", cancellable_probe)
+    job = PlexMetadataScanJob(db)
+    run = job.start_run("pilot", [{"path": str(media), "title": "Example"}])
+    assert entered.wait(1)
+
+    job.cancel(run["run_uuid"])
+    terminal = _wait_for_terminal(db, run["run_uuid"])
+
+    assert terminal["status"] == "cancelled"
+    item = db.list_metadata_scan_items(run["run_uuid"])[0]
+    assert item["status"] == "pending"
+    assert job.status_dict()["processed"] == 0
+    assert job.status_dict()["failed"] == 0

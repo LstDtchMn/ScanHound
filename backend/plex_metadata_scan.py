@@ -186,6 +186,10 @@ class PlexMetadataScanJob:
         except Exception:
             logger.exception("plex-metadata-scan progress callback failed")
 
+    def _cancel_requested(self) -> bool:
+        with self._lock:
+            return bool(self._stop_flag)
+
     def _run(self, targets: list[dict]) -> None:
         try:
             with ThreadPoolExecutor(max_workers=_MAX_CONCURRENCY) as pool:
@@ -239,15 +243,22 @@ class PlexMetadataScanJob:
         self._db.update_metadata_scan_item(run_uuid, path, status="running")
         self._emit()
         succeeded = False
+        count_outcome = True
         try:
             before = os.stat(path)
-            specs = mediainfo.probe_detailed(path, db=self._db)
+            specs = mediainfo.probe_detailed(
+                path, db=self._db, cancel_requested=self._cancel_requested
+            )
             if not specs or not specs.get("present"):
                 self._record_failed_inventory(run_uuid, item, path)
                 self._db.update_metadata_scan_item(
                     run_uuid, path, status="failed", failure_stage="ffprobe",
                     error_code="probe_unavailable", error_message="No usable local-file probe result",
                 )
+                return
+            if (specs.get("hdr10plus_evidence") or {}).get("error") == "cancelled":
+                count_outcome = False
+                self._db.update_metadata_scan_item(run_uuid, path, status="pending")
                 return
             after = os.stat(path)
             if (before.st_mtime != after.st_mtime) or (before.st_size != after.st_size):
@@ -262,7 +273,15 @@ class PlexMetadataScanJob:
                 )
                 return
             if specs.get("hdr") == "Dolby Vision":
-                dv_result = dv_detect.detect_layer(path)
+                dv_result = dv_detect.detect_layer(
+                    path, cancel_requested=self._cancel_requested
+                )
+                if dv_result.get("error") == "cancelled":
+                    count_outcome = False
+                    self._db.update_metadata_scan_item(
+                        run_uuid, path, status="pending"
+                    )
+                    return
                 if dv_result.get("layer") in {None, "unknown"} or dv_result.get("error"):
                     self._record_failed_inventory(
                         run_uuid, item, path, before=before, probe=specs
@@ -314,11 +333,12 @@ class PlexMetadataScanJob:
             )
         finally:
             with self._lock:
-                self.processed += 1
-                if succeeded:
-                    self.succeeded += 1
-                else:
-                    self.failed += 1
+                if count_outcome:
+                    self.processed += 1
+                    if succeeded:
+                        self.succeeded += 1
+                    else:
+                        self.failed += 1
                 if label in self.current_files:
                     self.current_files.remove(label)
             self._emit()

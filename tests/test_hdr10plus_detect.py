@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import subprocess
 
 from backend.rename import hdr10plus_detect as subject
 
@@ -55,3 +56,38 @@ def test_full_extract_gives_tool_a_new_output_path(monkeypatch, tmp_path):
     result = subject._full_extract(str(media))
 
     assert result["state"] == "present"
+
+
+def test_full_extract_cancellation_terminates_tool(monkeypatch, tmp_path):
+    media = tmp_path / "movie.mkv"
+    media.write_bytes(b"generated-test-media")
+    monkeypatch.setattr(subject.shutil, "which", lambda name: f"/tools/{name}")
+    monkeypatch.setattr(subject, "_tool_version", lambda *_: "test-version")
+
+    class Process:
+        returncode = None
+        terminated = False
+
+        def communicate(self, timeout=None):
+            if self.terminated:
+                self.returncode = -15
+                return "", ""
+            raise subprocess.TimeoutExpired("hdr10plus_tool", timeout)
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.terminated = True
+
+    process = Process()
+    checks = iter([False, True])
+    monkeypatch.setattr(subject.subprocess, "Popen", lambda *_args, **_kwargs: process)
+
+    result = subject._full_extract(
+        str(media), cancel_requested=lambda: next(checks, True)
+    )
+
+    assert result["state"] == "unknown"
+    assert result["error"] == "cancelled"
+    assert process.terminated is True
