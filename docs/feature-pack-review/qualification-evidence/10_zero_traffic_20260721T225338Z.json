@@ -1,0 +1,22 @@
+{
+  "checked_at": "2026-07-21T22:53:38.861017+00:00",
+  "container_started_at": "2026-07-21T22:51:52.010850758Z",
+  "db_user_version": 6,
+  "db_integrity": "ok",
+  "hdencode_table_counts": {
+    "hdencode_actions": 0,
+    "hdencode_candidate_details": 0,
+    "hdencode_candidate_feeds": 0,
+    "hdencode_candidates": 0,
+    "hdencode_feed_state": 0,
+    "hdencode_hydration_queue": 0,
+    "hdencode_ingest_cycles": 0,
+    "hdencode_shadow_cycles": 0,
+    "hdencode_shadow_misses": 0
+  },
+  "nonzero_hdencode_tables": {},
+  "log_traffic_hits": [],
+  "scheduler_running": true,
+  "maintenance_loop_running": true,
+  "zero_traffic_proven": true
+}

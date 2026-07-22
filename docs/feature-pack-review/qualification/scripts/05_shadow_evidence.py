@@ -127,17 +127,23 @@ def main():
         if has_cycles:
             placeholders = ",".join("?" * len(CYCLE_OUTCOMES))
             totals = con.execute(
-                f"""SELECT COUNT(*) AS cycles,
+                f"""SELECT COUNT(*) AS complete_cycles,
                            MIN(completed_at) AS first_completed_at,
                            MAX(completed_at) AS last_completed_at,
-                           SUM(relevant_miss_count) AS relevant_misses,
                            SUM(rss_requests) AS rss_requests,
                            SUM(listing_requests) AS listing_requests,
-                           SUM(CASE WHEN normal_feeds_complete=1 THEN 1 ELSE 0 END) AS complete_cycles,
                            SUM(CASE WHEN restart_recovery=1 OR catchup_used=1 THEN 1 ELSE 0 END) AS recovery_cycles
-                    FROM hdencode_shadow_cycles WHERE outcome IN ({placeholders})""",
+                    FROM hdencode_shadow_cycles
+                    WHERE outcome IN ({placeholders})
+                      AND normal_feeds_complete=1
+                      AND rss_requests>0
+                      AND listing_requests>0""",
                 CYCLE_OUTCOMES,
             ).fetchone()
+            all_misses = con.execute(
+                "SELECT COALESCE(SUM(relevant_miss_count),0) "
+                "FROM hdencode_shadow_cycles"
+            ).fetchone()[0]
             cycle_rows = [
                 dict(r)
                 for r in con.execute(
@@ -150,6 +156,36 @@ def main():
                     "SELECT COUNT(*) FROM hdencode_shadow_misses"
                 ).fetchone()[0]
         feeds_healthy, feed_detail = _feeds_healthy(con, now, a.max_stale_minutes)
+        auto_action_rows = (
+            con.execute(
+                "SELECT COUNT(*) FROM hdencode_actions "
+                "WHERE requested_by='auto'"
+            ).fetchone()[0]
+            if _table_exists(con, "hdencode_actions")
+            else 0
+        )
+        active_action_rows = (
+            con.execute(
+                "SELECT COUNT(*) FROM hdencode_actions "
+                "WHERE state IN ('queued','retrieving_links','links_ready','submitting')"
+            ).fetchone()[0]
+            if _table_exists(con, "hdencode_actions")
+            else 0
+        )
+        miss_count_mismatches = (
+            con.execute(
+                """SELECT COUNT(*) FROM (
+                       SELECT c.cycle_uuid
+                       FROM hdencode_shadow_cycles c
+                       LEFT JOIN hdencode_shadow_misses m
+                         ON m.cycle_uuid=c.cycle_uuid
+                       GROUP BY c.cycle_uuid,c.relevant_miss_count
+                       HAVING c.relevant_miss_count != COUNT(m.canonical_url)
+                   )"""
+            ).fetchone()[0]
+            if has_cycles and _table_exists(con, "hdencode_shadow_misses")
+            else 0
+        )
     finally:
         con.close()
 
@@ -157,7 +193,7 @@ def main():
         return int(row[key]) if row is not None and row[key] is not None else 0
 
     complete_cycles = _int(totals, "complete_cycles")
-    relevant_misses = _int(totals, "relevant_misses")
+    relevant_misses = int(all_misses or 0) if has_cycles else 0
     recovery_cycles = _int(totals, "recovery_cycles")
     rss_requests = _int(totals, "rss_requests")
     listing_requests = _int(totals, "listing_requests")
@@ -193,6 +229,14 @@ def main():
         reasons.append("normal_feeds_unhealthy_or_stale")
     if integrity != "ok":
         reasons.append(f"integrity_check={integrity}")
+    if user_version != 6:
+        reasons.append(f"unexpected_schema_version={user_version}")
+    if miss_count_mismatches:
+        reasons.append("shadow_miss_count_mismatch")
+    if auto_action_rows:
+        reasons.append("automatic_action_activity_detected")
+    if active_action_rows:
+        reasons.append("active_action_activity_detected")
 
     readiness = {
         "ready": not reasons,
@@ -216,6 +260,17 @@ def main():
         try:
             status = _fetch_status_readiness(a.base_url, a.token)
             app_readiness = status.get("readiness")
+            mode = status.get("mode")
+            safe_defaults = status.get("safe_defaults") or {}
+            if mode != "rss_shadow":
+                reasons.append(f"unsafe_rss_mode={mode}")
+            if safe_defaults.get("rss_auto_grab") is not False:
+                reasons.append("rss_auto_grab_not_disabled")
+            if safe_defaults.get("listing_fallback") is not False:
+                reasons.append("listing_fallback_not_disabled")
+            # Mode/default safety checks occur after the initial readiness dict
+            # is assembled, so recompute the boolean before reconciliation.
+            readiness["ready"] = not reasons
             if isinstance(app_readiness, dict):
                 reconciliation = {
                     "ready_matches": app_readiness.get("ready") == readiness["ready"],
@@ -235,7 +290,26 @@ def main():
         "app_readiness": app_readiness,
         "reconciliation": reconciliation,
         "feed_detail": feed_detail,
-        "gate_passes": readiness["ready"],
+        "safety": {
+            "auto_action_rows": int(auto_action_rows or 0),
+            "active_action_rows": int(active_action_rows or 0),
+            "miss_count_mismatches": int(miss_count_mismatches or 0),
+            "schema_version_expected": 6,
+            "violations": [
+                reason for reason in reasons
+                if reason.startswith((
+                    "unexpected_schema_version",
+                    "shadow_miss_count_mismatch",
+                    "automatic_action_activity",
+                    "active_action_activity",
+                    "unsafe_rss_mode",
+                    "rss_auto_grab",
+                    "listing_fallback",
+                    "integrity_check",
+                ))
+            ],
+        },
+        "gate_passes": not reasons,
     }
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     report = {

@@ -1,0 +1,267 @@
+{
+  "ok": true,
+  "failures": [],
+  "baseline": {
+    "sha256": "195f21f82691d8bcb04c2f1c2558a4d56d294552230b28e4e5ecbc0a3b03fb8f",
+    "integrity_check": "ok",
+    "user_version": 2,
+    "row_counts": {
+      "auth_credentials": 1,
+      "auth_sessions": 11,
+      "background_scan_cache": 2050,
+      "bookmarks": 0,
+      "dismissed_items": 572,
+      "download_results": 313,
+      "downloads": 266,
+      "dv_scan": 4192,
+      "media_probe": 21,
+      "pipeline_verdicts": 52,
+      "plex_cache": 21405,
+      "rename_jobs": 158,
+      "scan_history": 0,
+      "scanned_urls": 170,
+      "scraped_link_map": 1162,
+      "watchlist": 0
+    }
+  },
+  "new_image": "scanhound:feature-pack-a6b4a7b",
+  "old_image": "scanhound:qual-old-0ee5351",
+  "cases": {
+    "current_upgrade_restart": {
+      "first": {
+        "args": [
+          "docker",
+          "run",
+          "--rm",
+          "-v",
+          "C:\\Users\\NLSur\\AppData\\Local\\Temp\\claude\\X--Docker-Apps\\fb8156d3-68f7-43eb-b1b5-19567aae3b77\\scratchpad\\fp-exec\\prod-evidence\\migration-matrix\\current:/qualification",
+          "--entrypoint",
+          "python",
+          "scanhound:feature-pack-a6b4a7b",
+          "-c",
+          "from backend.database import DatabaseManager;db=DatabaseManager('/qualification/production-20260721T222449Z.sqlite3');c=db.get_connection();print(c.execute('PRAGMA user_version').fetchone()[0]);print(c.execute('PRAGMA integrity_check').fetchone()[0]);db.close()"
+        ],
+        "returncode": 0,
+        "stdout": "6\nok\n",
+        "stderr": ""
+      },
+      "second": {
+        "args": [
+          "docker",
+          "run",
+          "--rm",
+          "-v",
+          "C:\\Users\\NLSur\\AppData\\Local\\Temp\\claude\\X--Docker-Apps\\fb8156d3-68f7-43eb-b1b5-19567aae3b77\\scratchpad\\fp-exec\\prod-evidence\\migration-matrix\\current:/qualification",
+          "--entrypoint",
+          "python",
+          "scanhound:feature-pack-a6b4a7b",
+          "-c",
+          "from backend.database import DatabaseManager;db=DatabaseManager('/qualification/production-20260721T222449Z.sqlite3');c=db.get_connection();print(c.execute('PRAGMA user_version').fetchone()[0]);print(c.execute('PRAGMA integrity_check').fetchone()[0]);db.close()"
+        ],
+        "returncode": 0,
+        "stdout": "6\nok\n",
+        "stderr": ""
+      },
+      "after_first": {
+        "sha256": "4a67395046e5a3d94d4e1913778b79233da4c6beab721a734b1a787f69a94ad0",
+        "integrity_check": "ok",
+        "user_version": 6,
+        "row_counts": {
+          "auth_credentials": 1,
+          "auth_sessions": 11,
+          "background_scan_cache": 2050,
+          "bookmarks": 0,
+          "dismissed_items": 572,
+          "download_results": 313,
+          "downloads": 266,
+          "dv_scan": 4192,
+          "hdencode_actions": 0,
+          "hdencode_candidate_details": 0,
+          "hdencode_candidate_feeds": 0,
+          "hdencode_candidates": 0,
+          "hdencode_feed_state": 0,
+          "hdencode_hydration_queue": 0,
+          "hdencode_ingest_cycles": 0,
+          "hdencode_shadow_cycles": 0,
+          "hdencode_shadow_misses": 0,
+          "media_probe": 21,
+          "pipeline_verdicts": 52,
+          "plex_cache": 21405,
+          "rename_jobs": 158,
+          "scan_history": 0,
+          "scanned_urls": 170,
+          "scraped_link_map": 1162,
+          "source_health": 0,
+          "watchlist": 0
+        }
+      },
+      "after_second": {
+        "sha256": "ee3dfabe340501628dbfc028bdfec51b561b7e3d50ca86b850ed1d2d0a9a980a",
+        "integrity_check": "ok",
+        "user_version": 6,
+        "row_counts": {
+          "auth_credentials": 1,
+          "auth_sessions": 11,
+          "background_scan_cache": 2050,
+          "bookmarks": 0,
+          "dismissed_items": 572,
+          "download_results": 313,
+          "downloads": 266,
+          "dv_scan": 4192,
+          "hdencode_actions": 0,
+          "hdencode_candidate_details": 0,
+          "hdencode_candidate_feeds": 0,
+          "hdencode_candidates": 0,
+          "hdencode_feed_state": 0,
+          "hdencode_hydration_queue": 0,
+          "hdencode_ingest_cycles": 0,
+          "hdencode_shadow_cycles": 0,
+          "hdencode_shadow_misses": 0,
+          "media_probe": 21,
+          "pipeline_verdicts": 52,
+          "plex_cache": 21405,
+          "rename_jobs": 158,
+          "scan_history": 0,
+          "scanned_urls": 170,
+          "scraped_link_map": 1162,
+          "source_health": 0,
+          "watchlist": 0
+        }
+      }
+    },
+    "old_image_reopen": {
+      "process": {
+        "args": [
+          "docker",
+          "run",
+          "--rm",
+          "-v",
+          "C:\\Users\\NLSur\\AppData\\Local\\Temp\\claude\\X--Docker-Apps\\fb8156d3-68f7-43eb-b1b5-19567aae3b77\\scratchpad\\fp-exec\\prod-evidence\\migration-matrix\\old-reopen:/qualification",
+          "--entrypoint",
+          "python",
+          "scanhound:qual-old-0ee5351",
+          "-c",
+          "from backend.database import DatabaseManager;db=DatabaseManager('/qualification/production-20260721T222449Z.sqlite3');c=db.get_connection();print(c.execute('PRAGMA user_version').fetchone()[0]);print(c.execute('PRAGMA integrity_check').fetchone()[0]);db.close()"
+        ],
+        "returncode": 0,
+        "stdout": "2\nok\n",
+        "stderr": ""
+      },
+      "observation": {
+        "sha256": "b341ddd9d0fd993e87ff87657c052fc971a7bd3bdaf3984cfe5e824a588d47ba",
+        "integrity_check": "ok",
+        "user_version": 2,
+        "row_counts": {
+          "auth_credentials": 1,
+          "auth_sessions": 11,
+          "background_scan_cache": 2050,
+          "bookmarks": 0,
+          "dismissed_items": 572,
+          "download_results": 313,
+          "downloads": 266,
+          "dv_scan": 4192,
+          "hdencode_actions": 0,
+          "hdencode_candidate_details": 0,
+          "hdencode_candidate_feeds": 0,
+          "hdencode_candidates": 0,
+          "hdencode_feed_state": 0,
+          "hdencode_hydration_queue": 0,
+          "hdencode_ingest_cycles": 0,
+          "hdencode_shadow_cycles": 0,
+          "hdencode_shadow_misses": 0,
+          "media_probe": 21,
+          "pipeline_verdicts": 52,
+          "plex_cache": 21405,
+          "rename_jobs": 158,
+          "scan_history": 0,
+          "scanned_urls": 170,
+          "scraped_link_map": 1162,
+          "source_health": 0,
+          "watchlist": 0
+        }
+      }
+    },
+    "interrupted_migration": [
+      {
+        "delay": 0.14339563650686535,
+        "was_alive": true,
+        "returncode": 137,
+        "stdout": "",
+        "stderr": "",
+        "reopen": {
+          "args": [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            "C:\\Users\\NLSur\\AppData\\Local\\Temp\\claude\\X--Docker-Apps\\fb8156d3-68f7-43eb-b1b5-19567aae3b77\\scratchpad\\fp-exec\\prod-evidence\\migration-matrix\\interrupt-00:/qualification",
+            "--entrypoint",
+            "python",
+            "scanhound:feature-pack-a6b4a7b",
+            "-c",
+            "from backend.database import DatabaseManager;db=DatabaseManager('/qualification/production-20260721T222449Z.sqlite3');c=db.get_connection();print(c.execute('PRAGMA user_version').fetchone()[0]);print(c.execute('PRAGMA integrity_check').fetchone()[0]);db.close()"
+          ],
+          "returncode": 0,
+          "stdout": "6\nok\n",
+          "stderr": ""
+        },
+        "observation": {
+          "sha256": "4a67395046e5a3d94d4e1913778b79233da4c6beab721a734b1a787f69a94ad0",
+          "integrity_check": "ok",
+          "user_version": 6,
+          "row_counts": {
+            "auth_credentials": 1,
+            "auth_sessions": 11,
+            "background_scan_cache": 2050,
+            "bookmarks": 0,
+            "dismissed_items": 572,
+            "download_results": 313,
+            "downloads": 266,
+            "dv_scan": 4192,
+            "hdencode_actions": 0,
+            "hdencode_candidate_details": 0,
+            "hdencode_candidate_feeds": 0,
+            "hdencode_candidates": 0,
+            "hdencode_feed_state": 0,
+            "hdencode_hydration_queue": 0,
+            "hdencode_ingest_cycles": 0,
+            "hdencode_shadow_cycles": 0,
+            "hdencode_shadow_misses": 0,
+            "media_probe": 21,
+            "pipeline_verdicts": 52,
+            "plex_cache": 21405,
+            "rename_jobs": 158,
+            "scan_history": 0,
+            "scanned_urls": 170,
+            "scraped_link_map": 1162,
+            "source_health": 0,
+            "watchlist": 0
+          }
+        }
+      }
+    ],
+    "rollback_restore": {
+      "sha256": "195f21f82691d8bcb04c2f1c2558a4d56d294552230b28e4e5ecbc0a3b03fb8f",
+      "integrity_check": "ok",
+      "user_version": 2,
+      "row_counts": {
+        "auth_credentials": 1,
+        "auth_sessions": 11,
+        "background_scan_cache": 2050,
+        "bookmarks": 0,
+        "dismissed_items": 572,
+        "download_results": 313,
+        "downloads": 266,
+        "dv_scan": 4192,
+        "media_probe": 21,
+        "pipeline_verdicts": 52,
+        "plex_cache": 21405,
+        "rename_jobs": 158,
+        "scan_history": 0,
+        "scanned_urls": 170,
+        "scraped_link_map": 1162,
+        "watchlist": 0
+      }
+    }
+  }
+}

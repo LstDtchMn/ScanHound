@@ -1,0 +1,60 @@
+{
+  "started_at": "2026-07-21T20:47:01.568037+00:00",
+  "parent": "X:\\scanhound-sentinel-qual",
+  "identity": {
+    "path": "X:\\scanhound-sentinel-qual",
+    "device": 12135674639188988708,
+    "mode": "0o777",
+    "platform": "win32"
+  },
+  "tests": {
+    "no_replace": {
+      "supported": true,
+      "destination_preserved": true,
+      "source_exists": true,
+      "source_unchanged": true,
+      "destination_exists": true,
+      "destination_unchanged": true
+    },
+    "hardlink": {
+      "supported": true,
+      "same_inode": true,
+      "same_device": true,
+      "content_equal": true
+    },
+    "file_fsync": {
+      "supported": true
+    },
+    "directory_fsync": {
+      "supported": false,
+      "errno": 13,
+      "error": "[Errno 13] Permission denied: 'X:\\\\scanhound-sentinel-qual\\\\run-e01c89154e1a4324a3ddee445a080d40'"
+    },
+    "manifest_atomic_replace": {
+      "temp_fsync": {
+        "supported": true
+      },
+      "directory_fsync": {
+        "supported": false,
+        "errno": 13,
+        "error": "[Errno 13] Permission denied: 'X:\\\\scanhound-sentinel-qual\\\\run-e01c89154e1a4324a3ddee445a080d40'"
+      },
+      "content": "{\"generation\":1}\n"
+    }
+  },
+  "failures": [],
+  "ok": true,
+  "created_files": [
+    "dst.bin",
+    "fsync.bin",
+    "hardlink-link",
+    "hardlink-original",
+    "manifest.json",
+    "src.bin"
+  ],
+  "cleanup": {
+    "run_removed": true,
+    "parent_empty": true
+  },
+  "finished_at": "2026-07-21T20:47:02.203505+00:00"
+}

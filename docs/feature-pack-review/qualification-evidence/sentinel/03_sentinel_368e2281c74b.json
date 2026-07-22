@@ -1,0 +1,69 @@
+{
+  "started_at": "2026-07-21T20:47:31.484857+00:00",
+  "parent": "/probe/scanhound-sentinel-f",
+  "identity": {
+    "path": "/probe/scanhound-sentinel-f",
+    "device": 1048728,
+    "mode": "0o777",
+    "platform": "linux",
+    "block_size": 2097152,
+    "blocks": 11444122,
+    "free_blocks": 6972483,
+    "name_max": 255
+  },
+  "tests": {
+    "no_replace": {
+      "supported": true,
+      "destination_preserved": true,
+      "errno": 17,
+      "error": "File exists",
+      "source_exists": true,
+      "source_unchanged": true,
+      "destination_exists": true,
+      "destination_unchanged": true
+    },
+    "hardlink": {
+      "supported": true,
+      "same_inode": true,
+      "same_device": true,
+      "content_equal": true
+    },
+    "file_fsync": {
+      "supported": true
+    },
+    "directory_fsync": {
+      "supported": true
+    },
+    "manifest_atomic_replace": {
+      "temp_fsync": {
+        "supported": true
+      },
+      "directory_fsync": {
+        "supported": true
+      },
+      "content": "{\"generation\":1}\n"
+    },
+    "exdev": {
+      "exdev_boundary": true,
+      "errno": 18,
+      "error": "[Errno 18] Invalid cross-device link: '/probe/scanhound-sentinel-f/run-cf77bc691e6f46939e433f1127b9971a/cross.bin' -> '/probe/scanhound-sentinel-x/run-a42a142823524117886439cde9c7d35a/cross.bin'",
+      "source_intact": true
+    }
+  },
+  "failures": [],
+  "ok": true,
+  "created_files": [
+    "cross.bin",
+    "dst.bin",
+    "fsync.bin",
+    "hardlink-link",
+    "hardlink-original",
+    "manifest.json",
+    "src.bin"
+  ],
+  "cleanup": {
+    "run_removed": true,
+    "parent_empty": true
+  },
+  "finished_at": "2026-07-21T20:47:31.666289+00:00"
+}

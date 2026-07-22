@@ -104,9 +104,76 @@ Cleanup verified in-band by the script (`run_removed=true, parent_empty=true`
 on all 8) and the four empty parent dirs removed afterwards — no uncertain-
 cleanup stop condition.
 
+### Objective 7 — migration matrix (runbook step 4) — GREEN
+
+Jesse produced the snapshot. `production-20260721T222449Z.sqlite3`: `user_version=2`,
+16 tables, 30373 rows, integrity ok, schema hash and row counts identical to the
+live source, empty `-wal`.
+
+`02_migration_matrix.py` returned **ok=true, zero failures**:
+
+| Case | Result |
+|---|---|
+| v2 -> v6 upgrade | integrity ok, all pre-existing row counts preserved, 10 tables added |
+| Restart idempotency | identical table set and per-table row counts |
+| Old-image reopen of migrated DB | data intact |
+| Interrupted migration (killed 143 ms into init) | recovered clean, uv=6, integrity ok |
+| Rollback restore | byte-identical to baseline |
+
+**Extra case added beyond the bundle** (`02b_roundtrip_reupgrade.json`): the old
+image downgrades `user_version` 6->2 while leaving the v6 tables in place, so a
+real rollback-then-roll-forward re-runs the migrations against tables that already
+exist. Verified safe — schema hash and per-table row counts identical to a clean
+migration, all production rows preserved.
+
+### Objectives 8-9 — merge and fail-closed deploy — DONE
+
+- Merge commit **`b633e695`** (`--no-ff`, pushed). `--no-ff` chosen deliberately so
+  rollback is `git revert -m 1` rather than a reset requiring a force push.
+- Deployed image `4be9df01` (rebuilt from merged main). Deviation: the first
+  `deploy_failclosed.py` run completed the merge, container stop and config write
+  but its build/start step did not complete, leaving the service down ~11 minutes;
+  a subsequent rebuild brought it up. The image therefore carries no
+  `org.opencontainers.image.revision` label — provenance is main@`b633e695`, whose
+  application code was verified byte-identical to the labelled evidence image
+  `scanhound:feature-pack-a6b4a7b` (only a docs file differs).
+- **Production DB migrated v2 -> v6 in place**: `user_version=6`,
+  `hdencode_shadow_cycles` present, `integrity=ok`.
+- Fail-closed profile verified **still intact after startup** (the app did not
+  rewrite it): auto_rename, auto_grab, hdencode, background_scan all false;
+  discovery mode `listing`; rss auto-grab false.
+
+### Objective 10 — HDEncode zero-traffic proof — PROVEN
+
+`10_zero_traffic_*.json`: all nine `hdencode_*` tables empty (notably
+`hdencode_feed_state`, which gains a row on the first poll of any feed, and
+`hdencode_ingest_cycles`), zero discovery/RSS activity in the container log, while
+the scheduler and maintenance loop are both confirmed running — so this is evidence
+of a working off-switch, not of an idle application. Re-check after the 3 h
+scheduler and 1 h maintenance intervals have each fired to make it airtight.
+
+### Objectives 13-14 — observation automated
+
+Durable evidence directory (outside the checkout, per runbook step 0):
+`X:\Docker Apps\scanhound-qualification-evidence`. Windows Scheduled Task
+"ScanHound Qualification Evidence" runs `run_collection.cmd` every 6 hours,
+verified executing with `LastTaskResult=0`. It reads the production DB read-only
+from a throwaway container (never `docker exec` into the live container, never
+writes) and **exits non-zero on any mandatory stop condition** — a relevant RSS
+miss or a DB integrity failure — so the task shows as failed and the condition
+cannot pass unnoticed. Note: registering the task with `schtasks` produced a
+silently failing task (`-2147024894`, spaces in the path); it was re-registered via
+PowerShell and verified.
+
 ## Blocked — requires Jesse
 
-### Objective 7 — production DB snapshot (runbook step 2)
+### Objective 12 — enable RSS shadow
+
+Needs a session auth token (`sh-auth-token`); Claude cannot mint one without
+handling the app password. Until shadow mode is on, the comparison-cycle counter
+stays at 0 and the seven-day clock has not started.
+
+### Superseded — objective 7 snapshot (runbook step 2)
 
 The snapshot was attempted exactly as the runbook intends, adapted for the
 named-volume DB: a FRESH throwaway container (not an exec into the live one)

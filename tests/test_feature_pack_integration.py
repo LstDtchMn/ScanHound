@@ -25,6 +25,13 @@ class _HealthDb:
     def record_source_failure(self, *_args, **_kwargs):
         return None
 
+    def get_hdencode_feed_state(self, _feed_key):
+        # Added by the readiness-corrections package: scan_once probes feed
+        # state before polling to decide restart_recovery. None -> no
+        # preexisting state -> restart_recovery False (the default these
+        # non-recovery tests expect).
+        return None
+
 
 def test_new_lifespan_cancels_waiting_rss_before_transport_construction(
         monkeypatch):

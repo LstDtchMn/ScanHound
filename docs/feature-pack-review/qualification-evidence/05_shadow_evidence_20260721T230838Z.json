@@ -1,0 +1,55 @@
+{
+  "collected_at": "2026-07-21T23:08:38.692977+00:00",
+  "db": "/dbvol/crawler.db",
+  "summary": {
+    "integrity_check": "ok",
+    "db_user_version": 6,
+    "has_shadow_cycles_table": true,
+    "readiness": {
+      "ready": false,
+      "required_cycles": 20,
+      "successful_cycles": 0,
+      "required_days": 7,
+      "observed_days": 0.0,
+      "relevant_misses": 0,
+      "shadow_miss_rows": 0,
+      "request_reduction_pct": 0.0,
+      "recovery_cycles": 0,
+      "normal_feeds_healthy": false,
+      "first_completed_at": null,
+      "last_completed_at": null,
+      "reasons": [
+        "insufficient_comparison_cycles",
+        "insufficient_observation_days",
+        "request_reduction_not_proven",
+        "restart_or_catchup_recovery_not_proven",
+        "normal_feeds_unhealthy_or_stale"
+      ]
+    },
+    "app_readiness": {
+      "error": "<urlopen error [Errno 111] Connection refused>"
+    },
+    "reconciliation": null,
+    "feed_detail": {
+      "movies_all": {
+        "present": false,
+        "last_status": null,
+        "consecutive_failures": null,
+        "last_checked_at": null,
+        "fresh": false,
+        "healthy": false
+      },
+      "tv_all": {
+        "present": false,
+        "last_status": null,
+        "consecutive_failures": null,
+        "last_checked_at": null,
+        "fresh": false,
+        "healthy": false
+      }
+    },
+    "gate_passes": false
+  },
+  "recent_cycles": [],
+  "note": "Independent DB-derived readiness; when --base-url is given it is reconciled against the app's own GET /rss/status readiness."
+}

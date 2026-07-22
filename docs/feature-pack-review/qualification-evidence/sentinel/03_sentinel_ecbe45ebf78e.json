@@ -1,0 +1,67 @@
+{
+  "started_at": "2026-07-21T20:47:00.800951+00:00",
+  "parent": "F:\\scanhound-sentinel-qual",
+  "identity": {
+    "path": "F:\\scanhound-sentinel-qual",
+    "device": 7552164797608731954,
+    "mode": "0o777",
+    "platform": "win32"
+  },
+  "tests": {
+    "no_replace": {
+      "supported": true,
+      "destination_preserved": true,
+      "source_exists": true,
+      "source_unchanged": true,
+      "destination_exists": true,
+      "destination_unchanged": true
+    },
+    "hardlink": {
+      "supported": true,
+      "same_inode": true,
+      "same_device": true,
+      "content_equal": true
+    },
+    "file_fsync": {
+      "supported": true
+    },
+    "directory_fsync": {
+      "supported": false,
+      "errno": 13,
+      "error": "[Errno 13] Permission denied: 'F:\\\\scanhound-sentinel-qual\\\\run-64509f86328b456197d2541369fa9068'"
+    },
+    "manifest_atomic_replace": {
+      "temp_fsync": {
+        "supported": true
+      },
+      "directory_fsync": {
+        "supported": false,
+        "errno": 13,
+        "error": "[Errno 13] Permission denied: 'F:\\\\scanhound-sentinel-qual\\\\run-64509f86328b456197d2541369fa9068'"
+      },
+      "content": "{\"generation\":1}\n"
+    },
+    "exdev": {
+      "exdev_boundary": true,
+      "errno": 18,
+      "error": "[WinError 17] The system cannot move the file to a different disk drive: 'F:\\\\scanhound-sentinel-qual\\\\run-64509f86328b456197d2541369fa9068\\\\cross.bin' -> 'X:\\\\scanhound-sentinel-qual\\\\run-f42f035e90294b7c9da4b8be6f7b05e2\\\\cross.bin'",
+      "source_intact": true
+    }
+  },
+  "failures": [],
+  "ok": true,
+  "created_files": [
+    "cross.bin",
+    "dst.bin",
+    "fsync.bin",
+    "hardlink-link",
+    "hardlink-original",
+    "manifest.json",
+    "src.bin"
+  ],
+  "cleanup": {
+    "run_removed": true,
+    "parent_empty": true
+  },
+  "finished_at": "2026-07-21T20:47:00.911326+00:00"
+}

@@ -105,12 +105,28 @@ class HDEncodeCandidateService:
             )
         else:
             matches = context.get("plex_matches") or []
-            if len(matches) == 1:
+            identity_basis = str(context.get("identity_basis") or "")
+            year_conflict = bool(
+                row.get("title_year")
+                and row.get("description_year")
+                and row["title_year"] != row["description_year"]
+            )
+            external_identity_basis = identity_basis in {
+                "imdb_id",
+                "tmdb_id",
+            }
+            if (
+                len(matches) == 1
+                and (not year_conflict or external_identity_basis)
+            ):
                 resolved_identity = "exact"
                 decision = self.engine.decide(
                     evidence,
                     existing=matches[0],
                 )
+            elif matches and year_conflict and not external_identity_basis:
+                resolved_identity = "ambiguous"
+                decision = _detail_decision("identity_year_conflict")
             elif len(matches) > 1:
                 resolved_identity = "ambiguous"
                 decision = _detail_decision("identity_ambiguous")
