@@ -454,3 +454,82 @@ Auto-rename remains **NO-GO** until all are true:
 The metadata/Kometa work is not itself a prerequisite for safe file publication,
 but it is a prerequisite for claiming that the 4K inventory and poster tags are
 complete and trustworthy.
+
+## 2026-07-22 implementation update: durable 4K metadata inventory
+
+Implementation branch: `feature/4k-metadata-inventory`
+
+Latest code-tested SHA: `970bcf4d9c5a99cc9540a2d6661a3812e8e71a3b`
+
+This work has not been merged or deployed. No production scan, Plex-label write,
+Kometa run, media move/delete, Auto-rename enablement, auto-grab enablement, or
+RSS-primary enablement was performed.
+
+### Implemented capabilities
+
+- Schema version 7 adds durable scan runs, per-file attempts, a current media
+  inventory, and an immutable `dv_seed_baseline` imported from the legacy seed
+  rows without replacing them with inferred live evidence.
+- Scans are single-file, resumable, pausable, cancellable, and retryable. An
+  interrupted process leaves durable state; startup marks abandoned work as
+  interrupted, and resume processes only pending or retryable files.
+- Local-file analysis records Dolby Vision profile, level, RPU/EL/BL flags,
+  compatibility ID, FEL/MEL classification, HDR10+ present/absent/unknown,
+  HDR/color properties, video codec/profile/level, dimensions, bit depth,
+  chroma and frame rate, mastering/content-light metadata, and all audio and
+  subtitle streams with language/default/forced attributes.
+- HDR10+ detection uses a positive quick-frame shortcut but otherwise performs
+  a bounded full-file `hdr10plus_tool extract`; absence is not asserted from a
+  single frame.
+- Inventory APIs and the `/media-inventory` interface provide text search,
+  facets, scan-state and failure filtering, DV profile/layer filters, HDR10+
+  filters, discrepancy review, evidence detail, durable run controls, and a
+  formula-neutralized CSV export.
+- Seed/live reconciliation preserves the historical claim beside authoritative
+  live evidence. Plex label changes are first generated as a zero-write diff;
+  label application remains a separate explicit operation.
+- The reviewed Kometa handoff uses managed Plex labels for DV FEL, DV MEL,
+  DV P8, and DV P5 overlays. HDR10+ remains directly searchable in ScanHound;
+  Kometa's existing resolution/HDR overlay remains its poster mechanism rather
+  than adding a duplicate custom HDR10+ badge in this change.
+
+### Previously supplied FEL/MEL list
+
+The earlier list was present. The production audit counted 3,729 legacy
+`dv_scan` rows with `source='seed'`; 2,966 matched the then-cached 4K inventory.
+Those rows are now preserved in `dv_seed_baseline` as historical operator
+evidence. They are useful for reconciliation, but they are not proof that the
+current files still have the same DV layer or that every current 4K file was
+scanned. A full authoritative local-file scan remains required.
+
+### Verification at the code-tested SHA
+
+| Check | Result |
+|---|---|
+| Final focused metadata tests | 33 passed, 0 failed |
+| Unrestricted backend suite | 4,026 passed, 4 skipped, 0 failed |
+| Frontend type/accessibility check | 0 errors; 3 pre-existing warnings |
+| Frontend unit tests | 375 passed, 0 failed |
+| Frontend production build | Passed |
+| Docker production build | Passed |
+| Verification image | `sha256:2c0e693a96721fdce7f117b4079d262bf35b96935b1319c1f0162583c06f405a` |
+| Container tools | ffprobe 5.1.9; dovi_tool 2.3.2; hdr10plus_tool 1.7.2 |
+
+The four backend skips are platform/environment conditional. The frontend
+warnings predate this branch and do not concern the new inventory interface.
+
+### Operational decision
+
+The implementation is ready for independent review and a generated-file or
+25–50 movie read-only pilot after deployment, backup, mount/config preflight,
+and explicit operator approval. It is not yet production proof of whole-library
+coverage. The full scan must reconcile expected files against current success,
+current failure, stale, and unscanned counts before any completeness claim.
+
+Kometa coverage is likewise unproven until the pilot/full scan, label dry-run,
+explicit label application, Plex readback, Kometa execution, and stratified
+poster verification have completed.
+
+Auto-rename remains **NO-GO**. This metadata implementation does not close the
+rename audit's remaining undo-journal, lifecycle-owned queue, or application-level
+production-filesystem sentinel evidence gaps.
