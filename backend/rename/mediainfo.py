@@ -210,6 +210,109 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
     return result
 
 
+def _scan_stream_details(path: str, timeout: int) -> dict:
+    """Collect bounded, JSON-safe facts for every media stream."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not os.path.isfile(path):
+        return {}
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "quiet", "-print_format", "json", "-show_format",
+             "-show_streams", path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return {}
+        data = json.loads(result.stdout)
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+        return {}
+
+    streams = data.get("streams") or []
+    video = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+    side_data = video.get("side_data_list") or []
+    dovi = next((entry for entry in side_data if
+                 "dovi" in str(entry.get("side_data_type", "")).lower()
+                 or "dolby vision" in str(entry.get("side_data_type", "")).lower()), None)
+    mastering = [
+        {key: value for key, value in entry.items() if key != "side_data_type"}
+        for entry in side_data
+        if "mastering" in str(entry.get("side_data_type", "")).lower()
+        or "content light" in str(entry.get("side_data_type", "")).lower()
+    ]
+    pix_fmt = str(video.get("pix_fmt") or "")
+    depth_match = re.search(r"p(\d+)(?:le|be)$", pix_fmt)
+
+    def disposition(stream, key):
+        return bool((stream.get("disposition") or {}).get(key, 0))
+
+    audio_streams = []
+    subtitle_streams = []
+    for stream in streams:
+        tags = stream.get("tags") or {}
+        if stream.get("codec_type") == "audio":
+            audio_streams.append({
+                "index": stream.get("index"),
+                "codec": stream.get("codec_name"),
+                "profile": stream.get("profile"),
+                "channels": stream.get("channels"),
+                "channel_layout": stream.get("channel_layout"),
+                "sample_rate": stream.get("sample_rate"),
+                "bit_rate": stream.get("bit_rate"),
+                "language": tags.get("language"),
+                "title": tags.get("title"),
+                "default": disposition(stream, "default"),
+                "forced": disposition(stream, "forced"),
+            })
+        elif stream.get("codec_type") == "subtitle":
+            subtitle_streams.append({
+                "index": stream.get("index"),
+                "codec": stream.get("codec_name"),
+                "language": tags.get("language"),
+                "title": tags.get("title"),
+                "default": disposition(stream, "default"),
+                "forced": disposition(stream, "forced"),
+                "hearing_impaired": disposition(stream, "hearing_impaired"),
+            })
+
+    dolby_vision = None
+    if dovi:
+        dolby_vision = {
+            "profile": str(dovi.get("dv_profile")) if dovi.get("dv_profile") is not None else None,
+            "level": dovi.get("dv_level"),
+            "rpu_present": bool(dovi.get("rpu_present_flag", 0)),
+            "el_present": bool(dovi.get("el_present_flag", 0)),
+            "bl_present": bool(dovi.get("bl_present_flag", 0)),
+            "bl_compatibility_id": dovi.get("dv_bl_signal_compatibility_id"),
+        }
+    return {
+        "dv_profile": dolby_vision.get("profile") if dolby_vision else None,
+        "video_details": {
+            "codec": video.get("codec_name"),
+            "profile": video.get("profile"),
+            "level": video.get("level"),
+            "width": video.get("width"),
+            "height": video.get("height"),
+            "pixel_format": video.get("pix_fmt"),
+            "bit_depth": int(depth_match.group(1)) if depth_match else None,
+            "color_space": video.get("color_space"),
+            "color_transfer": video.get("color_transfer"),
+            "color_primaries": video.get("color_primaries"),
+            "chroma_location": video.get("chroma_location"),
+            "frame_rate": video.get("avg_frame_rate") or video.get("r_frame_rate"),
+            "bit_rate": video.get("bit_rate"),
+            "dolby_vision": dolby_vision,
+            "mastering_metadata": mastering,
+        },
+        "audio_streams": audio_streams,
+        "subtitle_streams": subtitle_streams,
+        "stream_counts": {
+            "video": sum(stream.get("codec_type") == "video" for stream in streams),
+            "audio": len(audio_streams),
+            "subtitle": len(subtitle_streams),
+        },
+    }
+
+
 def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
     """Return scan-grade technical evidence without changing ``probe_specs``.
 
@@ -233,6 +336,8 @@ def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         })
         return detailed
 
+    detailed.update(_scan_stream_details(path, timeout))
+
     hdr = result.get("hdr")
     if hdr == "HDR10+":
         evidence = {
@@ -246,12 +351,12 @@ def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         if evidence.get("state") == "present":
             detailed["hdr"] = "HDR10+"
     elif hdr == "Dolby Vision":
-        # Dolby Vision can coexist with HDR10+ compatibility metadata. Do not
-        # infer its absence merely because the compact probe prioritizes DV.
-        evidence = {
-            "state": "unknown", "method": "dv_requires_full_stream_analysis",
-            "tool_version": None, "error": None,
-        }
+        # Dolby Vision can coexist with HDR10+ compatibility metadata. Run the
+        # same full-file detector instead of converting that uncertainty into
+        # an implicit negative.
+        evidence = hdr10plus_detect.detect_hdr10plus(
+            path, quick_timeout=timeout, full_timeout=max(timeout, 300)
+        )
     else:
         evidence = {"state": "absent", "method": "not_hdr10_pq", "tool_version": None,
                     "error": None}
