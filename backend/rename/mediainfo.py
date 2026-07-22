@@ -15,6 +15,8 @@ import shutil
 import subprocess
 from typing import Optional
 
+from backend.rename import hdr10plus_detect
+
 _CODEC_LABEL = {"hevc": "HEVC", "h265": "HEVC", "avc": "H.264", "h264": "H.264",
                 "av1": "AV1", "vc1": "VC-1", "mpeg2video": "MPEG-2"}
 _AUDIO_LABEL = {"truehd": "TrueHD", "eac3": "EAC3", "ac3": "AC3", "dts": "DTS",
@@ -206,3 +208,54 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         except Exception:
             pass  # cache write failure must never fail the probe itself
     return result
+
+
+def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
+    """Return scan-grade technical evidence without changing ``probe_specs``.
+
+    Existing rename callers retain the compact/cacheable ``probe_specs``
+    contract.  The full-library inventory uses this opt-in function, which
+    preserves the difference between an authoritative HDR10+ negative and an
+    unavailable or incomplete detector.
+    """
+    result = probe_specs(path, timeout=timeout, db=db)
+    if result is None:
+        return None
+
+    detailed = dict(result)
+    if not result.get("present"):
+        detailed.update({
+            "hdr10plus_state": "unknown",
+            "hdr10plus_evidence": {
+                "state": "unknown", "method": "not_present", "tool_version": None,
+                "error": "file_not_present",
+            },
+        })
+        return detailed
+
+    hdr = result.get("hdr")
+    if hdr == "HDR10+":
+        evidence = {
+            "state": "present", "method": "ffprobe_first_frame", "tool_version": None,
+            "error": None,
+        }
+    elif hdr == "HDR10":
+        evidence = hdr10plus_detect.detect_hdr10plus(
+            path, quick_timeout=timeout, full_timeout=max(timeout, 300)
+        )
+        if evidence.get("state") == "present":
+            detailed["hdr"] = "HDR10+"
+    elif hdr == "Dolby Vision":
+        # Dolby Vision can coexist with HDR10+ compatibility metadata. Do not
+        # infer its absence merely because the compact probe prioritizes DV.
+        evidence = {
+            "state": "unknown", "method": "dv_requires_full_stream_analysis",
+            "tool_version": None, "error": None,
+        }
+    else:
+        evidence = {"state": "absent", "method": "not_hdr10_pq", "tool_version": None,
+                    "error": None}
+
+    detailed["hdr10plus_state"] = evidence["state"]
+    detailed["hdr10plus_evidence"] = evidence
+    return detailed

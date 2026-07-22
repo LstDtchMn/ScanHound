@@ -42,6 +42,20 @@ RUN set -eux; \
     apt-get update && apt-get install -y --no-install-recommends mkvtoolnix \
     && rm -rf /var/lib/apt/lists/*
 
+# hdr10plus_tool is used only by the explicit read-only metadata inventory.
+# Pin both release and checksum so a full-file HDR10+ negative is traceable to
+# a known detector binary rather than a mutable "latest" download.
+ARG HDR10PLUS_TOOL_VERSION=1.7.2
+ARG HDR10PLUS_TOOL_SHA256=06385f37a639d61ba21d4be3150c863846933bc3b58110e094d8fc8f1c2249f2
+RUN set -eux; \
+    curl -fsSL -o /tmp/hdr10plus_tool.tar.gz \
+        "https://github.com/quietvoid/hdr10plus_tool/releases/download/${HDR10PLUS_TOOL_VERSION}/hdr10plus_tool-${HDR10PLUS_TOOL_VERSION}-x86_64-unknown-linux-musl.tar.gz"; \
+    echo "${HDR10PLUS_TOOL_SHA256}  /tmp/hdr10plus_tool.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/hdr10plus_tool.tar.gz -C /usr/local/bin; \
+    rm /tmp/hdr10plus_tool.tar.gz; \
+    chmod +x /usr/local/bin/hdr10plus_tool; \
+    hdr10plus_tool --version
+
 WORKDIR /app
 COPY requirements-docker.txt ./
 RUN pip install -r requirements-docker.txt
