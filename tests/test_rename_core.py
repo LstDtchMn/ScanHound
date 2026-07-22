@@ -87,6 +87,67 @@ class TestFileOps:
         fileops.undo_place(str(src), str(dst), "move")
         assert src.exists() and not dst.exists()
 
+    def test_move_undo_uses_durable_no_replace_publication(self, tmp_path, monkeypatch):
+        """Undo must use the same no-overwrite primitive as forward placement.
+
+        ``shutil.move`` has overwrite-capable semantics on POSIX and a
+        check-then-move race.  This guard deliberately fails if that primitive
+        remains reachable.
+        """
+        src = tmp_path / "src.mkv"
+        dst = tmp_path / "lib" / "out.mkv"
+        src.write_text("data")
+        fileops.place_file(str(src), str(dst), "move")
+
+        calls = []
+        real_move = fileops._move_no_replace_durable
+
+        def _tracked_move(source, destination):
+            calls.append((source, destination))
+            return real_move(source, destination)
+
+        monkeypatch.setattr(fileops, "_move_no_replace_durable", _tracked_move)
+        monkeypatch.setattr(
+            fileops.shutil,
+            "move",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("undo used overwrite-capable shutil.move")
+            ),
+        )
+
+        fileops.undo_place(str(src), str(dst), "move")
+
+        assert calls == [(str(dst), str(src))]
+        assert src.read_text() == "data"
+        assert not dst.exists()
+
+    def test_move_undo_exdev_uses_verified_copy_then_durable_unlink(
+            self, tmp_path, monkeypatch):
+        """Cross-volume undo verifies publication before consuming the placed file."""
+        src = tmp_path / "download" / "src.mkv"
+        dst = tmp_path / "library" / "out.mkv"
+        dst.parent.mkdir()
+        dst.write_bytes(b"verified rollback bytes")
+
+        def _exdev(_source, _destination):
+            raise OSError(errno.EXDEV, "simulated cross-device undo")
+
+        unlinked = []
+        real_unlink = fileops._unlink_durable
+
+        def _tracked_unlink(path):
+            unlinked.append(path)
+            return real_unlink(path)
+
+        monkeypatch.setattr(fileops, "_move_no_replace_durable", _exdev)
+        monkeypatch.setattr(fileops, "_unlink_durable", _tracked_unlink)
+
+        fileops.undo_place(str(src), str(dst), "move")
+
+        assert src.read_bytes() == b"verified rollback bytes"
+        assert not dst.exists()
+        assert unlinked == [str(dst)]
+
     def test_copy_verifies_and_keeps_source(self, tmp_path):
         src = tmp_path / "src.mkv"; src.write_bytes(b"hello world")
         dst = tmp_path / "out.mkv"

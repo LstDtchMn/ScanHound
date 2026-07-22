@@ -35,6 +35,8 @@ class PlexMetadataScanJob:
         self._stop_flag = False
         self.status = "idle"
         self.processed = 0
+        self.succeeded = 0
+        self.failed = 0
         self.total = 0
         self.current_files: list[str] = []
         self.started_at: Optional[float] = None
@@ -51,6 +53,8 @@ class PlexMetadataScanJob:
             self._stop_flag = False
             self.status = "running"
             self.processed = 0
+            self.succeeded = 0
+            self.failed = 0
             self.total = len(targets)
             self.current_files = []
             self.started_at = time.time()
@@ -74,6 +78,8 @@ class PlexMetadataScanJob:
             return {
                 "status": self.status,
                 "processed": self.processed,
+                "succeeded": self.succeeded,
+                "failed": self.failed,
                 "total": self.total,
                 "current_files": list(self.current_files),
                 "elapsed_seconds": round(elapsed, 1),
@@ -116,51 +122,71 @@ class PlexMetadataScanJob:
                 return
             self.current_files.append(label)
         self._emit()
+        succeeded = False
         try:
-            self._process_one(item.get("path"))
+            succeeded = self._process_one(item.get("path"))
         finally:
             with self._lock:
                 self.processed += 1
+                if succeeded:
+                    self.succeeded += 1
+                else:
+                    self.failed += 1
                 if label in self.current_files:
                     self.current_files.remove(label)
             self._emit()
 
-    def _process_one(self, path: Optional[str]) -> None:
+    def _process_one(self, path: Optional[str]) -> bool:
         """Probe one file: fast fields always; DV FEL/MEL layer additionally
         when the fast probe reports Dolby Vision and the dv_scan cache for
         this file is stale. Every failure is logged and swallowed -- one bad
         file must never abort the batch."""
         if not path:
-            return
+            return False
         try:
             specs = mediainfo.probe_specs(path, db=self._db)
         except Exception:
             logger.exception("probe_specs failed for %s", path)
-            return
+            return False
         if not specs or not specs.get("present"):
-            return
+            return False
+        try:
+            st = os.stat(path)
+            if not self._db.media_probe_is_current(
+                    path, st.st_mtime, st.st_size):
+                logger.warning("media probe was not persisted for %s", path)
+                return False
+        except Exception:
+            logger.exception("media_probe persistence check failed for %s", path)
+            return False
         if specs.get("hdr") == "Dolby Vision":
-            self._scan_dv_layer(path)
+            return self._scan_dv_layer(path)
+        return True
 
-    def _scan_dv_layer(self, path: str) -> None:
+    def _scan_dv_layer(self, path: str) -> bool:
         try:
             st = os.stat(path)
         except OSError:
-            return
+            return False
         try:
             if self._db.dv_scan_is_current(path, st.st_mtime, st.st_size):
-                return
+                return True
         except Exception:
             logger.exception("dv_scan_is_current check failed for %s", path)
-            return
+            return False
         try:
             result = dv_detect.detect_layer(path)
         except Exception:
             logger.exception("detect_layer failed for %s", path)
-            return
+            return False
+        if result.get("layer") == "unknown" or result.get("error"):
+            logger.warning("DV layer scan incomplete for %s: %s",
+                           path, result.get("error") or "unknown result")
+            return False
         try:
-            self._db.upsert_dv_scan(
+            return bool(self._db.upsert_dv_scan(
                 path=path, dv_layer=result.get("layer"),
-                sig_mtime=st.st_mtime, sig_size=st.st_size, source="metadata-scan")
+                sig_mtime=st.st_mtime, sig_size=st.st_size, source="scan"))
         except Exception:
             logger.exception("upsert_dv_scan failed for %s", path)
+            return False

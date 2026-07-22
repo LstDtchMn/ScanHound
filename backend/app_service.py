@@ -678,17 +678,15 @@ class AppService:
                 # guards, both load-bearing:
                 #
                 #  1. Runs ONLY when new DV detections have landed since the
-                #     last pass (max(scanned_at) rose). A full sync iterates
+                #     last pass (max(last_seen_at) rose). A full sync iterates
                 #     every movie library, so firing it hourly regardless would
                 #     be pure waste. The first pass after startup just records a
                 #     baseline and syncs nothing, so restarting the app never
                 #     kicks off a full-library label pass.
-                #  2. additive_only — never removes a managed label. A movie
-                #     whose path can't be matched this run would otherwise have
-                #     its labels stripped; on a timer, one transient matching
-                #     failure (dropped mount, changed Plex path form) would
-                #     silently wipe DV labels library-wide. Removals stay on the
-                #     manual sync, where a human sees the removed count.
+                #  2. additive_only — never removes labels from an unmatched
+                #     movie. A positive path match may replace a stale managed
+                #     label, while a transient mount/mapping failure cannot wipe
+                #     labels library-wide.
                 latest = self.db.get_latest_dv_scan_at(source="scan")
                 if not hasattr(self, "_last_dv_scan_at"):
                     self._last_dv_scan_at = latest  # baseline only

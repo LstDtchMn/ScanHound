@@ -10,6 +10,7 @@ from backend.plex_metadata_scan import PlexMetadataScanJob
 
 def _fake_db():
     db = MagicMock()
+    db.media_probe_is_current.return_value = True
     db.dv_scan_is_current.return_value = False
     db.upsert_dv_scan.return_value = True
     return db
@@ -69,6 +70,7 @@ def test_dolby_vision_file_triggers_dv_layer_detection(tmp_path):
     mock_detect.assert_called_once_with(str(f))
     db.upsert_dv_scan.assert_called_once()
     assert db.upsert_dv_scan.call_args.kwargs["dv_layer"] == "fel"
+    assert db.upsert_dv_scan.call_args.kwargs["source"] == "scan"
 
 
 def test_non_dolby_vision_file_skips_dv_layer_detection(tmp_path):
@@ -112,7 +114,7 @@ def test_one_bad_file_does_not_abort_the_batch(tmp_path):
     targets = [{"path": str(bad), "title": "Bad"}, {"path": str(good), "title": "Good"}]
 
     def _probe(path, db=None):
-        if "bad" in path:
+        if os.path.basename(path) == "bad.mkv":
             raise RuntimeError("ffprobe exploded")
         return {"present": True, "hdr": "HDR10"}
 
@@ -124,6 +126,46 @@ def test_one_bad_file_does_not_abort_the_batch(tmp_path):
     s = job.status_dict()
     assert s["status"] == "done"
     assert s["processed"] == 2
+    assert s["succeeded"] == 1
+    assert s["failed"] == 1
+
+
+def test_unknown_dv_detection_is_failed_and_not_cached(tmp_path):
+    """A transient dovi_tool failure must remain retryable, not look complete."""
+    db = _fake_db()
+    f = tmp_path / "dv_movie.mkv"
+    f.write_bytes(b"x")
+
+    with patch("backend.plex_metadata_scan.mediainfo.probe_specs",
+               return_value={"present": True, "hdr": "Dolby Vision"}), \
+         patch("backend.plex_metadata_scan.dv_detect.detect_layer",
+               return_value={"layer": "unknown", "tool": True, "error": "timeout"}):
+        job = PlexMetadataScanJob(db)
+        job.start([{"path": str(f), "title": "DV Movie"}])
+        _wait_until_done(job)
+
+    status = job.status_dict()
+    assert status["failed"] == 1
+    assert status["succeeded"] == 0
+    db.upsert_dv_scan.assert_not_called()
+
+
+def test_probe_result_is_failed_when_media_cache_did_not_persist(tmp_path):
+    """The completeness counter must require durable media_probe evidence."""
+    db = _fake_db()
+    db.media_probe_is_current.return_value = False
+    f = tmp_path / "hdr10_movie.mkv"
+    f.write_bytes(b"x")
+
+    with patch("backend.plex_metadata_scan.mediainfo.probe_specs",
+               return_value={"present": True, "hdr": "HDR10"}):
+        job = PlexMetadataScanJob(db)
+        job.start([{"path": str(f), "title": "HDR10 Movie"}])
+        _wait_until_done(job)
+
+    status = job.status_dict()
+    assert status["failed"] == 1
+    assert status["succeeded"] == 0
 
 
 def test_cancel_stops_the_job():

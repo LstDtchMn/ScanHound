@@ -186,6 +186,8 @@ export interface PlexStatus {
 export interface PlexMetadataScanStatus {
   status: 'idle' | 'running' | 'cancelled' | 'done' | 'error';
   processed: number;
+  succeeded: number;
+  failed: number;
   total: number;
   current_files: string[];
   elapsed_seconds: number;

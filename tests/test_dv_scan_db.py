@@ -83,3 +83,21 @@ class TestDvScanDB:
         db.upsert_dv_scan("/lib/A.mkv", "fel", sig_mtime=1.0, sig_size=10)
         assert db.get_dv_scans_by_paths([]) == {}
         assert db.get_dv_scans_by_paths(None) == {}
+
+
+    def test_latest_dv_scan_tracks_updates_to_existing_path(self, db):
+        """A rescan that changes an existing row must wake scheduled label sync."""
+        db.upsert_dv_scan("/lib/a.mkv", "mel", source="scan")
+        with db._lock:
+            db.conn.execute(
+                "UPDATE dv_scan SET scanned_at='2026-01-01 00:00:00', "
+                "last_seen_at='2026-01-01 00:00:00' WHERE path='/lib/a.mkv'"
+            )
+            db.conn.commit()
+
+        before = db.get_latest_dv_scan_at(source="scan")
+        db.upsert_dv_scan("/lib/a.mkv", "fel", source="scan")
+        after = db.get_latest_dv_scan_at(source="scan")
+
+        assert before == "2026-01-01 00:00:00"
+        assert after > before

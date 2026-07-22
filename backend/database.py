@@ -3558,17 +3558,18 @@ class DatabaseManager:
               rating_key, imdb_id), label="upsert_dv_scan") is not None
 
     def get_latest_dv_scan_at(self, source="scan"):
-        """Newest ``scanned_at`` among dv_scan rows for *source*, else None.
+        """Newest ``last_seen_at`` among dv_scan rows for *source*, else None.
 
         Cheap change-detector for the scheduled DV label sync: a value higher
-        than the last one seen means fresh DV detections landed (via
-        dv-import), so a sync is worth running. Fail-safe — any error returns
+        than the last one seen means fresh DV detections landed or an existing
+        file's layer changed, so a sync is worth running. Fail-safe — any error
+        returns
         None, which the caller reads as "nothing new", so a DB hiccup can never
         trigger a spurious full-library label pass.
         """
         try:
             rows = self._query_dicts(
-                'SELECT MAX(scanned_at) AS latest FROM dv_scan WHERE source = ?',
+                'SELECT MAX(last_seen_at) AS latest FROM dv_scan WHERE source = ?',
                 (source,))
             return (rows[0].get("latest") if rows else None) or None
         except Exception as e:

@@ -111,11 +111,13 @@
 
     {#if $plexMetadataScanStatus.status === 'done'}
       <p class="text-xs text-[var(--success)]">
-        Last scan complete -- {$plexMetadataScanStatus.processed} file(s) processed.
+        Last scan complete -- {$plexMetadataScanStatus.succeeded} succeeded,
+        {$plexMetadataScanStatus.failed} failed.
       </p>
     {:else if $plexMetadataScanStatus.status === 'cancelled'}
       <p class="text-xs text-[var(--text-secondary)]">
-        Last scan cancelled at {$plexMetadataScanStatus.processed} / {$plexMetadataScanStatus.total}.
+        Last scan cancelled at {$plexMetadataScanStatus.processed} / {$plexMetadataScanStatus.total};
+        {$plexMetadataScanStatus.failed} failed.
       </p>
     {:else if $plexMetadataScanStatus.status === 'error'}
       <p class="text-xs text-[var(--error)]">Last scan failed: {$plexMetadataScanStatus.error}</p>

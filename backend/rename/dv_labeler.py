@@ -87,13 +87,10 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
                     additive_only=False):
     """Reconcile one movie's managed label. Returns {added, removed, matched}.
 
-    ``additive_only`` adds a missing label but never removes an existing one.
-    Unattended (scheduled) syncs use it: a movie whose path can't be matched
-    this run yields desired=None, which in full-reconcile mode strips its
-    managed labels. That's correct for a deliberate manual sync, but on a timer
-    a transient matching failure (a dropped mount, a changed Plex path form, a
-    mapping gap) would silently wipe DV labels library-wide — and those labels
-    are what the Kometa FEL/MEL overlays key on. Removals stay manual.
+    ``additive_only`` leaves an unmatched movie untouched. A positive path
+    match may still replace a stale managed label so unattended reconciliation
+    converges after an authoritative rescan. A transient matching failure must
+    never strip the labels that Kometa's FEL/MEL overlays depend on.
     """
     norm_paths = _movie_norm_paths(movie, mappings)
     layer = pick_layer(norm_paths, index)
@@ -103,7 +100,7 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     added, removed = [], []
     if desired and desired not in existing_managed:
         added.append(desired)
-    if not additive_only:
+    if not additive_only or layer is not None:
         for stale in existing_managed - ({desired} if desired else set()):
             removed.append(stale)
 
@@ -143,8 +140,9 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
                 additive_only=False):
     """Reconcile every movie against dv_scan (source='scan'). Returns a summary.
 
-    ``additive_only`` never removes a managed label — see reconcile_movie. The
-    scheduled auto-sync passes it; the manual button does not.
+    ``additive_only`` never removes labels from an unmatched movie — see
+    reconcile_movie. The scheduled auto-sync passes it; the manual button does
+    not.
     """
     vocab = _vocab_from_config(config)
     rows = db.get_dv_scans(source="scan", limit=1000000)

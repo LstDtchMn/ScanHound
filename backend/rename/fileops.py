@@ -396,6 +396,15 @@ def _copy_verify_atomic(
             pass
         raise
 
+def _unlink_durable(path: str) -> None:
+    """Remove one directory entry and persist that removal when supported."""
+    directory = os.path.dirname(path) or os.curdir
+    if os.name != "nt":
+        _require_directory_durability(directory, operation="unlink")
+    os.unlink(path)
+    _fsync_directory(directory)
+
+
 def _trash_bucket_name() -> str:
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -1746,11 +1755,16 @@ def undo_place(src: str, dst: str, method: str) -> None:
     if method in ("hardlink", "symlink", "copy"):
         # The original src still exists — just drop the link/copy.
         if os.path.lexists(dst):
-            os.remove(dst)
+            _unlink_durable(dst)
     elif method == "move":
-        # src was consumed; move dst back to it.
-        if os.path.exists(src):
-            raise FileExistsError(f"Original path already occupied: {src}")
         if os.path.isfile(dst):
             os.makedirs(os.path.dirname(src) or ".", exist_ok=True)
-            shutil.move(dst, src)
+            try:
+                _move_no_replace_durable(dst, src)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                # A crash between verified copy and removal leaves a harmless
+                # duplicate. Publication at src still never replaces a racer.
+                _copy_verify_atomic(dst, src)
+                _unlink_durable(dst)

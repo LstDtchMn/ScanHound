@@ -1105,6 +1105,28 @@ class TestApplyUndo:
         assert db.get_rename_job(jid)["status"] == "reverted"
         assert os.path.exists(src) and not os.path.exists(dst)
 
+    def test_undo_reports_failure_when_reverted_status_does_not_persist(
+            self, db, tmp_path, monkeypatch):
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+        assert svc.apply(jid)["ok"] is True
+
+        real_update = db.update_rename_job
+
+        def _update(job_id, **fields):
+            if fields.get("status") == "reverted":
+                return False
+            return real_update(job_id, **fields)
+
+        monkeypatch.setattr(db, "update_rename_job", _update)
+        out = svc.undo(jid)
+
+        assert out["ok"] is False
+        assert "bookkeeping" in out["error"].lower()
+        assert os.path.exists(src)
+
     def test_apply_missing_source_fails(self, db, tmp_path):
         save_to, src = _extracted(tmp_path, "The.Matrix.1999.mkv")
         svc = _service(db, _matrix_search, movie_lib=str(tmp_path / "lib"))
@@ -2289,6 +2311,30 @@ class TestReplaceLibraryDupAndKeepPlex:
         assert os.path.isfile(dup)
         with open(dup, encoding="utf-8") as f:
             assert f.read() == "library-copy"
+
+    def test_replace_library_dup_restores_when_restore_path_is_not_persisted(
+            self, db, tmp_path, monkeypatch):
+        """Do not consume the existing library copy without a durable undo key."""
+        from unittest.mock import patch
+        svc, jid, src, dst, dup = self._setup(db, tmp_path)
+        real_update = db.update_rename_job
+
+        def _update(job_id, **fields):
+            if fields.get("conflict_replaced_path") == dup:
+                return False
+            return real_update(job_id, **fields)
+
+        monkeypatch.setattr(db, "update_rename_job", _update)
+        with patch("backend.rename.conflicts.find_library_duplicate",
+                   return_value={"file_path": dup}):
+            out = svc.apply(jid, conflict_strategy="replace_library_dup")
+
+        assert out["ok"] is False
+        assert "bookkeeping" in out["error"].lower()
+        assert os.path.isfile(dup)
+        assert open(dup, encoding="utf-8").read() == "library-copy"
+        assert os.path.isfile(src)
+        assert not os.path.exists(dst)
 
     def test_undo_replace_library_dup_restores_library(self, db, tmp_path):
         from unittest.mock import patch
