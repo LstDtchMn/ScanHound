@@ -928,7 +928,11 @@ class TestAllTrashRoots:
         monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
         roots = fileops.all_trash_roots()
         assert os.path.abspath(fileops._TRASH_ROOT) in roots
-        assert os.path.join("/", ".scanhound-trash") in roots
+        # ``os.name`` is patched to exercise the POSIX branch, but the host
+        # path module remains Windows ``ntpath`` in local Windows runs. Assert
+        # the branch's own fallback construction rather than assuming that a
+        # runtime-platform monkeypatch swaps Python's path implementation.
+        assert fileops._trash_root_for("/") in roots
 
     def test_wiring_makes_trash_on_a_reported_mount_discoverable(self, tmp_path, monkeypatch):
         """Regression for SH-H05: a file trashed under a mount point that
@@ -938,6 +942,10 @@ class TestAllTrashRoots:
         monkeypatch.setattr(os, "name", "posix")
         monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [str(mount)])
         monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(mount / ".scanhound-trash"))
+        # This test exercises POSIX mount-root discovery on a Windows host.
+        # Do not invoke the POSIX directory-fsync syscall against NTFS; its
+        # durability semantics are covered by platform-specific tests.
+        monkeypatch.setattr(fileops, "_fsync_directory", lambda _path: None)
 
         src = mount / "movie.mkv"
         src.write_text("x")
@@ -1137,10 +1145,16 @@ class TestFilesystemFailSafe:
             ),
         )
 
-        with pytest.raises(fileops.UnsupportedFilesystemSafetyError) as caught:
-            fileops.place_file(str(src), str(dst), "move")
-
-        assert caught.value.reason.startswith("directory fsync unavailable")
+        if os.name == "nt":
+            # Windows uses MoveFile write-through rather than POSIX directory
+            # fsync. A post-publication sync fault must still roll the move
+            # back and surface an error without consuming the source.
+            with pytest.raises(OSError, match="unsupported directory fsync"):
+                fileops.place_file(str(src), str(dst), "move")
+        else:
+            with pytest.raises(fileops.UnsupportedFilesystemSafetyError) as caught:
+                fileops.place_file(str(src), str(dst), "move")
+            assert caught.value.reason.startswith("directory fsync unavailable")
         assert src.read_bytes() == b"source-bytes"
         assert not dst.exists()
 
@@ -1158,7 +1172,11 @@ class TestFilesystemFailSafe:
         def fail_after_preflight(path):
             nonlocal calls
             calls += 1
-            if calls == 3:
+            # POSIX preflights both directories before publication, while
+            # Windows relies on MoveFile write-through and reaches its first
+            # directory-sync hook only after publication.
+            fail_on_call = 1 if os.name == "nt" else 3
+            if calls == fail_on_call:
                 raise OSError(errno.EIO, "simulated post-publication sync failure")
             return real_sync(path)
 
@@ -1202,4 +1220,7 @@ class TestFilesystemFailSafe:
         )
         status = fileops.filesystem_safety_status(str(tmp_path))
         assert status["directory_fsync"] is False
-        assert status["source_consuming_move_durability"] is False
+        if os.name == "nt":
+            assert status["source_consuming_move_durability"] == "movefile_write_through"
+        else:
+            assert status["source_consuming_move_durability"] is False
