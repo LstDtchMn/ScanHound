@@ -20,6 +20,55 @@ def test_inventory_route_filters_local_fel_metadata(tmp_path):
     assert plex_media_inventory_facets(reg=reg)["dv_layer"] == [{"value": "fel", "count": 1}]
 
 
+def test_inventory_lists_cached_4k_movies_before_their_first_local_scan(tmp_path):
+    db = DatabaseManager(str(tmp_path / "inventory.sqlite"))
+    with db.transaction() as conn:
+        conn.executemany(
+            """
+            INSERT INTO plex_cache
+                (key, title, year, res, rating_key, content_type, library_name,
+                 file_path, last_updated)
+            VALUES (?, ?, ?, ?, ?, 'Movies', ?, ?, CURRENT_TIMESTAMP)
+            """,
+            [
+                ("101_movie", "Unscanned UHD", 2025, "2160p", "101", "4K Movies", "/plex/uhd.mkv"),
+                ("102_movie", "HD Movie", 2024, "1080p", "102", "Movies", "/plex/hd.mkv"),
+            ],
+        )
+
+    result = db.search_media_inventory()
+    facets = db.media_inventory_facets()
+
+    assert result["total"] == 1
+    assert result["items"][0]["title"] == "Unscanned UHD"
+    assert result["items"][0]["rating_key"] == "101"
+    assert result["items"][0]["scan_state"] == "unscanned"
+    assert result["items"][0]["hdr10plus_state"] == "unknown"
+    assert facets["scan_state"] == [{"value": "unscanned", "count": 1}]
+
+
+def test_selected_pilot_resolves_public_plex_rating_keys_not_internal_cache_keys():
+    class Db:
+        @staticmethod
+        def list_plex_cache_movies():
+            return [{
+                "key": "101_media-version",
+                "rating_key": "101",
+                "file_path": "/library/plex-source/movie.mkv",
+                "title": "Pilot Movie",
+                "res": "2160p",
+                "library_name": "4K Movies",
+                "imdb_id": "tt0000101",
+            }]
+
+    reg = SimpleNamespace(db=Db(), config={"plex_library_path_mappings": []})
+
+    targets = plex_routes._movie_targets_for_scope(reg, "selected", ["101"])
+
+    assert len(targets) == 1
+    assert targets[0]["rating_key"] == "101"
+
+
 def test_inventory_csv_neutralizes_spreadsheet_formulas(tmp_path):
     db = DatabaseManager(str(tmp_path / "inventory.sqlite"))
     db.upsert_media_inventory({

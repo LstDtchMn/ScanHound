@@ -3966,23 +3966,94 @@ class DatabaseManager:
         ), label="upsert_media_inventory") is not None
 
     _MEDIA_INVENTORY_EVIDENCE_CTE = '''
-        WITH inventory_evidence AS (
-            SELECT mi.*, seed.seed_layer, live.dv_layer AS scan_layer,
+        WITH cached_unscanned_4k AS (
+            SELECT DISTINCT
+                pc.file_path AS path,
+                pc.library_name,
+                pc.rating_key,
+                pc.title,
+                pc.year,
+                pc.res AS resolution,
+                NULL AS hdr,
+                'unknown' AS hdr10plus_state,
+                NULL AS dv_layer,
+                NULL AS dv_profile,
+                'unscanned' AS scan_state,
+                NULL AS sig_mtime,
+                NULL AS sig_size,
+                NULL AS scan_run_uuid,
+                NULL AS probe_json,
+                NULL AS last_scanned_at,
+                pc.last_updated AS updated_at
+            FROM plex_cache AS pc
+            WHERE pc.content_type = 'Movies'
+              AND lower(COALESCE(pc.res, '')) IN ('2160p', '4k', 'uhd')
+              AND pc.file_path IS NOT NULL
+              AND pc.file_path != ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM media_inventory AS existing
+                  WHERE existing.path = pc.file_path
+                     OR (
+                         pc.rating_key IS NOT NULL
+                         AND existing.rating_key = pc.rating_key
+                     )
+              )
+        ),
+        inventory_candidates AS (
+            SELECT path, library_name, rating_key, title, year, resolution, hdr,
+                   hdr10plus_state, dv_layer, dv_profile, scan_state, sig_mtime,
+                   sig_size, scan_run_uuid, probe_json, last_scanned_at, updated_at
+            FROM media_inventory
+            UNION ALL
+            SELECT path, library_name, rating_key, title, year, resolution, hdr,
+                   hdr10plus_state, dv_layer, dv_profile, scan_state, sig_mtime,
+                   sig_size, scan_run_uuid, probe_json, last_scanned_at, updated_at
+            FROM cached_unscanned_4k
+        ),
+        seed_by_rating AS (
+            SELECT rating_key,
+                   CASE WHEN COUNT(DISTINCT lower(seed_layer)) = 1
+                        THEN MIN(lower(seed_layer)) ELSE 'conflict' END AS seed_layer
+            FROM dv_seed_baseline
+            WHERE rating_key IS NOT NULL AND seed_layer IS NOT NULL
+            GROUP BY rating_key
+        ),
+        live_by_rating AS (
+            SELECT rating_key,
+                   CASE WHEN COUNT(DISTINCT lower(dv_layer)) = 1
+                        THEN MIN(lower(dv_layer)) ELSE 'conflict' END AS scan_layer
+            FROM dv_scan
+            WHERE source = 'scan' AND rating_key IS NOT NULL AND dv_layer IS NOT NULL
+            GROUP BY rating_key
+        ),
+        evidence_base AS (
+            SELECT candidate.*,
+                   COALESCE(seed_path.seed_layer, seed_rating.seed_layer) AS seed_layer,
+                   COALESCE(live_path.dv_layer, live_rating.scan_layer) AS scan_layer
+            FROM inventory_candidates AS candidate
+            LEFT JOIN dv_seed_baseline AS seed_path ON seed_path.path = candidate.path
+            LEFT JOIN seed_by_rating AS seed_rating
+                   ON seed_rating.rating_key = candidate.rating_key
+            LEFT JOIN dv_scan AS live_path
+                   ON live_path.path = candidate.path AND live_path.source = 'scan'
+            LEFT JOIN live_by_rating AS live_rating
+                   ON live_rating.rating_key = candidate.rating_key
+        ),
+        inventory_evidence AS (
+            SELECT evidence_base.*,
                 CASE
-                    WHEN seed.seed_layer IS NOT NULL AND live.dv_layer IS NULL
+                    WHEN seed_layer IS NOT NULL AND scan_layer IS NULL
                         THEN 'seed_unverified'
-                    WHEN seed.seed_layer IS NOT NULL AND live.dv_layer IS NOT NULL
-                         AND lower(seed.seed_layer) != lower(live.dv_layer)
-                        THEN 'seed_' || lower(seed.seed_layer) || '_live_' || lower(live.dv_layer)
-                    WHEN seed.seed_layer IS NOT NULL AND live.dv_layer IS NOT NULL
+                    WHEN seed_layer IS NOT NULL AND scan_layer IS NOT NULL
+                         AND lower(seed_layer) != lower(scan_layer)
+                        THEN 'seed_' || lower(seed_layer) || '_live_' || lower(scan_layer)
+                    WHEN seed_layer IS NOT NULL AND scan_layer IS NOT NULL
                         THEN 'verified'
-                    WHEN seed.seed_layer IS NULL AND live.dv_layer IS NOT NULL
+                    WHEN seed_layer IS NULL AND scan_layer IS NOT NULL
                         THEN 'live_only'
                     ELSE 'none'
                 END AS discrepancy
-            FROM media_inventory AS mi
-            LEFT JOIN dv_seed_baseline AS seed ON seed.path = mi.path
-            LEFT JOIN dv_scan AS live ON live.path = mi.path AND live.source = 'scan'
+            FROM evidence_base
         )
     '''
 
@@ -4067,7 +4138,8 @@ class DatabaseManager:
         for column in ("library_name", "resolution", "hdr", "hdr10plus_state",
                        "dv_layer", "dv_profile", "scan_state"):
             rows = self._query_dicts(
-                f"SELECT {column} AS value, COUNT(*) AS count FROM media_inventory "
+                self._MEDIA_INVENTORY_EVIDENCE_CTE +
+                f" SELECT {column} AS value, COUNT(*) AS count FROM inventory_evidence "
                 f"WHERE {column} IS NOT NULL AND {column} != '' GROUP BY {column} "
                 "ORDER BY value COLLATE NOCASE",
                 default=[],

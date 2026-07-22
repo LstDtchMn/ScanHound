@@ -174,8 +174,12 @@ def _movie_targets_for_scope(reg: ServiceRegistry, scope: str, ids: Optional[Lis
     the docker-compose mounts actually expose."""
     movies = reg.db.list_plex_cache_movies() if reg.db else []
     if scope == "selected":
-        wanted = set(ids or [])
-        movies = [m for m in movies if m.get("key") in wanted]
+        wanted = {str(value) for value in (ids or [])}
+        movies = [
+            m for m in movies
+            if str(m.get("rating_key") or "") in wanted
+            or str(m.get("key") or "") in wanted
+        ]
     mappings = reg.config.get("plex_library_path_mappings") if reg.config else None
     targets = []
     for m in movies:
