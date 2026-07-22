@@ -68,8 +68,9 @@ def _full_extract(path: str, timeout: int = 300, cancel_requested=None) -> dict:
         return {"state": "unknown", "method": "full_extract", "tool_version": None,
                 "error": "tool_unavailable"}
 
-    version = _tool_version(tool, timeout, cancel_requested)
+    version = None
     try:
+        version = _tool_version(tool, timeout, cancel_requested)
         with tempfile.TemporaryDirectory(prefix="scanhound-hdr10plus-") as temp_dir:
             output_path = os.path.join(temp_dir, "metadata.json")
             result = run_cancellable(

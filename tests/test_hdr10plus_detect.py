@@ -91,3 +91,33 @@ def test_full_extract_cancellation_terminates_tool(monkeypatch, tmp_path):
     assert result["state"] == "unknown"
     assert result["error"] == "cancelled"
     assert process.terminated is True
+
+
+def test_cancellation_during_tool_version_is_reported_not_raised(monkeypatch, tmp_path):
+    media = tmp_path / "movie.mkv"
+    media.write_bytes(b"generated-test-media")
+    monkeypatch.setattr(subject, "_quick_frame_evidence", lambda *_: False)
+    monkeypatch.setattr(subject.shutil, "which", lambda name: f"/tools/{name}")
+
+    class Process:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            if self.returncode is not None:
+                return "", ""
+            raise subprocess.TimeoutExpired("hdr10plus_tool", timeout)
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(subject.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+
+    result = subject.detect_hdr10plus(
+        str(media), cancel_requested=lambda: True
+    )
+
+    assert result["state"] == "unknown"
+    assert result["error"] == "cancelled"
