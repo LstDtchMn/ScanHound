@@ -53,6 +53,7 @@
     '/watchlist': 'Watchlist',
     '/analytics': 'Analytics',
     '/rss': 'RSS Operations',
+    '/media-inventory': '4K Metadata',
     '/settings': 'Settings'
   };
   let pageTitle = $derived(`${routeTitles[$page.url.pathname] || 'App'} | ScanHound`);

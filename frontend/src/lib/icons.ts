@@ -21,6 +21,7 @@ export const navItems: readonly NavItem[] = [
   { href: '/watchlist', label: 'Watchlist', short: 'Watch', icon: 'bookmark' },
   { href: '/analytics', label: 'Analytics', short: 'Stats', icon: 'chart' },
   { href: '/rss', label: 'RSS Operations', short: 'RSS', icon: 'rss', desktopOnly: true },
+  { href: '/media-inventory', label: '4K Metadata', short: '4K', icon: 'inventory' },
   { href: '/settings', label: 'Settings', short: 'Settings', icon: 'gear' }
 ] as const;
 
@@ -34,6 +35,7 @@ export function navIcon(name: string): string {
     case 'rename': return `<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>`;
     case 'pipeline': return `<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 7l2 2 4-4" /></svg>`;
     case 'rss': return `<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M5 11a8 8 0 018 8M5 5a14 14 0 0114 14M6 19h.01" /></svg>`;
+    case 'inventory': return `<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7h16M4 12h16M4 17h10"/><circle cx="18" cy="17" r="2"/></svg>`;
     default: return '';
   }
 }

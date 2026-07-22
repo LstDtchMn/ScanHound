@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, PlexMetadataScanStatus, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, TrashDeleteResponse, TrashEmptyResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, PlexMetadataScanStatus, MediaInventoryResponse, MediaInventoryFacets, MetadataScanRun, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, TrashDeleteResponse, TrashEmptyResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -283,6 +283,36 @@ export const api = {
   plexScanMetadataCancel: () =>
     request<{ status: string }>('/plex/scan-metadata/cancel', { method: 'POST' }),
   plexScanMetadataStatus: () => request<PlexMetadataScanStatus>('/plex/scan-metadata/status'),
+  getMediaInventory: (params?: Record<string, string>) => {
+    const qs = params ? `?${new URLSearchParams(params).toString()}` : '';
+    return request<MediaInventoryResponse>(`/plex/media-inventory${qs}`);
+  },
+  getMediaInventoryFacets: () =>
+    request<MediaInventoryFacets>('/plex/media-inventory/facets'),
+  downloadMediaInventoryCsv: async (params?: Record<string, string>) => {
+    const qs = params ? `?${new URLSearchParams(params).toString()}` : '';
+    const headers = new Headers();
+    if (authNonce) headers.set('Authorization', `Bearer ${authNonce}`);
+    const response = await fetchWithTimeout(
+      `${apiBase()}/plex/media-inventory/export.csv${qs}`, { headers }, REQUEST_TIMEOUT_MS
+    );
+    if (!response.ok) throw new Error(`CSV export failed: ${response.status}`);
+    return response.blob();
+  },
+  startMetadataInventoryScan: (scope: 'pilot' | 'full' | 'targeted', ids?: string[]) =>
+    request<MetadataScanRun>('/plex/metadata-scans', {
+      method: 'POST', body: JSON.stringify({ scope, ids: ids ?? null })
+    }),
+  getMetadataInventoryScan: (runUuid: string) =>
+    request<MetadataScanRun>(`/plex/metadata-scans/${encodeURIComponent(runUuid)}`),
+  pauseMetadataInventoryScan: (runUuid: string) =>
+    request<MetadataScanRun>(`/plex/metadata-scans/${encodeURIComponent(runUuid)}/pause`, { method: 'POST' }),
+  resumeMetadataInventoryScan: (runUuid: string) =>
+    request<MetadataScanRun>(`/plex/metadata-scans/${encodeURIComponent(runUuid)}/resume`, { method: 'POST' }),
+  cancelMetadataInventoryScan: (runUuid: string) =>
+    request<MetadataScanRun>(`/plex/metadata-scans/${encodeURIComponent(runUuid)}/cancel`, { method: 'POST' }),
+  retryMetadataInventoryFailures: (runUuid: string) =>
+    request<MetadataScanRun>(`/plex/metadata-scans/${encodeURIComponent(runUuid)}/retry-failures`, { method: 'POST' }),
   getUnmappedPlexPaths: () => request<{ prefixes: string[] }>('/plex/unmapped-paths'),
 
   // Downloads

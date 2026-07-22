@@ -195,6 +195,46 @@ export interface PlexMetadataScanStatus {
   error: string | null;
 }
 
+export interface MediaInventoryItem {
+  path: string;
+  library_name: string | null;
+  rating_key: string | null;
+  title: string | null;
+  year: number | null;
+  resolution: string | null;
+  hdr: string | null;
+  hdr10plus_state: 'present' | 'absent' | 'unknown';
+  dv_layer: string | null;
+  dv_profile: string | null;
+  scan_state: 'unscanned' | 'current' | 'stale' | 'failed' | 'source_changed';
+  scan_run_uuid: string | null;
+  last_scanned_at: string | null;
+  seed_layer: string | null;
+  scan_layer: string | null;
+  discrepancy: string;
+}
+
+export interface MediaInventoryResponse {
+  items: MediaInventoryItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export type MediaInventoryFacets = Record<string, Array<{ value: string; count: number }>>;
+
+export interface MetadataScanRun {
+  run_uuid: string;
+  scope: 'pilot' | 'full' | 'targeted';
+  status: 'queued' | 'running' | 'paused' | 'cancelled' | 'completed' | 'failed' | 'interrupted';
+  expected_count: number;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error_code: string | null;
+  error_message: string | null;
+}
+
 export interface HealthResponse {
   status: string;
   version: string;
