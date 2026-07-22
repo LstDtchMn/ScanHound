@@ -3827,6 +3827,85 @@ class DatabaseManager:
             logger.error("DB Error (update_metadata_scan_item): %s", exc)
             return False
 
+    def interrupt_abandoned_metadata_scans(self):
+        """Atomically preserve work left running by an earlier process.
+
+        This is intentionally limited to ``running`` state. A user-paused run
+        remains paused across restart, while an in-flight item becomes
+        explicitly retryable rather than silently returning to pending.
+        """
+        try:
+            with self.transaction() as conn:
+                if not conn:
+                    return 0
+                run_count = conn.execute(
+                    "SELECT COUNT(*) FROM metadata_scan_runs WHERE status = 'running'"
+                ).fetchone()[0]
+                conn.execute('''
+                    UPDATE metadata_scan_items
+                    SET status = 'interrupted', failure_stage = 'process',
+                        error_code = 'process_interrupted',
+                        error_message = 'Scan process ended before this item completed',
+                        completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                    WHERE status = 'running'
+                      AND run_uuid IN (
+                          SELECT run_uuid FROM metadata_scan_runs WHERE status = 'running'
+                      )
+                ''')
+                conn.execute('''
+                    UPDATE metadata_scan_runs
+                    SET status = 'interrupted', error_code = 'process_interrupted',
+                        error_message = 'Scan process ended before the run completed',
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE status = 'running'
+                ''')
+                return int(run_count)
+        except Exception as exc:
+            logger.error("DB Error (interrupt_abandoned_metadata_scans): %s", exc)
+            return 0
+
+    def prepare_metadata_scan_resume(self, run_uuid, *, retry_failed=False):
+        """Reset only resumable manifest rows and queue an existing run.
+
+        Successfully scanned items are immutable for the resumed attempt. A
+        normal resume retries interrupted/cancelled work; ``retry_failed`` also
+        includes terminal probe failures selected by the operator.
+        """
+        if not run_uuid:
+            return 0
+        statuses = ["interrupted", "cancelled"]
+        if retry_failed:
+            statuses.append("failed")
+        placeholders = ",".join("?" for _ in statuses)
+        try:
+            with self.transaction() as conn:
+                if not conn:
+                    return 0
+                run = conn.execute(
+                    "SELECT status FROM metadata_scan_runs WHERE run_uuid = ?", (run_uuid,)
+                ).fetchone()
+                if not run or run[0] == "running":
+                    return 0
+                cursor = conn.execute(f'''
+                    UPDATE metadata_scan_items
+                    SET status = 'pending', failure_stage = NULL, error_code = NULL,
+                        error_message = NULL, completed_at = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE run_uuid = ? AND status IN ({placeholders})
+                ''', (run_uuid, *statuses))
+                reset_count = max(cursor.rowcount, 0)
+                if reset_count == 0:
+                    return 0
+                conn.execute('''
+                    UPDATE metadata_scan_runs
+                    SET status = 'queued', completed_at = NULL, cancelled_at = NULL,
+                        error_code = NULL, error_message = NULL
+                    WHERE run_uuid = ?
+                ''', (run_uuid,))
+                return reset_count
+        except Exception as exc:
+            logger.error("DB Error (prepare_metadata_scan_resume): %s", exc)
+            return 0
+
     def upsert_media_inventory(self, item):
         """Upsert a current, searchable technical-metadata projection."""
         item = item or {}

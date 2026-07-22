@@ -285,6 +285,37 @@ def plex_durable_metadata_scan_items(
     return {"items": reg.db.list_metadata_scan_items(run_uuid, status=status)}
 
 
+def _run_control(operation, run_uuid: str):
+    try:
+        return operation(run_uuid)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/metadata-scans/{run_uuid}/pause")
+def plex_pause_metadata_scan(run_uuid: str, reg: ServiceRegistry = Depends(get_registry)):
+    return _run_control(reg.plex_metadata_scan_job.pause, run_uuid)
+
+
+@router.post("/metadata-scans/{run_uuid}/resume")
+def plex_resume_metadata_scan(run_uuid: str, reg: ServiceRegistry = Depends(get_registry)):
+    return _run_control(reg.plex_metadata_scan_job.resume, run_uuid)
+
+
+@router.post("/metadata-scans/{run_uuid}/cancel")
+def plex_cancel_durable_metadata_scan(
+    run_uuid: str, reg: ServiceRegistry = Depends(get_registry)
+):
+    return _run_control(reg.plex_metadata_scan_job.cancel, run_uuid)
+
+
+@router.post("/metadata-scans/{run_uuid}/retry-failures")
+def plex_retry_metadata_scan_failures(
+    run_uuid: str, reg: ServiceRegistry = Depends(get_registry)
+):
+    return _run_control(reg.plex_metadata_scan_job.retry_failures, run_uuid)
+
+
 @router.get("/media-inventory")
 def plex_media_inventory(
     q: Optional[str] = None,

@@ -40,3 +40,35 @@ def test_durable_scan_endpoint_accepts_only_cached_4k_targets(monkeypatch):
 
     assert result["run_uuid"] == "run-1"
     assert calls == [("full", [{"path": "/movies/uhd.mkv", "resolution": "2160p"}])]
+
+
+def test_durable_scan_control_routes_delegate_by_run_uuid():
+    calls = []
+
+    class Job:
+        def pause(self, run_uuid):
+            calls.append(("pause", run_uuid))
+            return {"status": "pausing", "run_uuid": run_uuid}
+
+        def resume(self, run_uuid):
+            calls.append(("resume", run_uuid))
+            return {"status": "running", "run_uuid": run_uuid}
+
+        def cancel(self, run_uuid):
+            calls.append(("cancel", run_uuid))
+            return {"status": "cancelling", "run_uuid": run_uuid}
+
+        def retry_failures(self, run_uuid):
+            calls.append(("retry", run_uuid))
+            return {"status": "running", "run_uuid": run_uuid}
+
+    reg = SimpleNamespace(plex_metadata_scan_job=Job())
+
+    assert plex_routes.plex_pause_metadata_scan("run-1", reg=reg)["status"] == "pausing"
+    assert plex_routes.plex_resume_metadata_scan("run-1", reg=reg)["status"] == "running"
+    assert plex_routes.plex_cancel_durable_metadata_scan("run-1", reg=reg)["status"] == "cancelling"
+    assert plex_routes.plex_retry_metadata_scan_failures("run-1", reg=reg)["status"] == "running"
+    assert calls == [
+        ("pause", "run-1"), ("resume", "run-1"),
+        ("cancel", "run-1"), ("retry", "run-1"),
+    ]

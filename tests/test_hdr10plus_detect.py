@@ -1,5 +1,8 @@
 """Contracts for conservative, full-file HDR10+ classification."""
 
+import json
+from pathlib import Path
+
 from backend.rename import hdr10plus_detect as subject
 
 
@@ -33,3 +36,22 @@ def test_quick_positive_avoids_full_extract(monkeypatch, tmp_path):
     result = subject.detect_hdr10plus(str(tmp_path / "movie.mkv"))
 
     assert result == {"state": "present", "method": "ffprobe_first_frame", "tool_version": None, "error": None}
+
+
+def test_full_extract_gives_tool_a_new_output_path(monkeypatch, tmp_path):
+    media = tmp_path / "movie.mkv"
+    media.write_bytes(b"generated-test-media")
+    monkeypatch.setattr(subject.shutil, "which", lambda name: f"/tools/{name}")
+    monkeypatch.setattr(subject, "_tool_version", lambda *_: "test-version")
+
+    def fake_run(command, **_kwargs):
+        output = Path(command[command.index("-o") + 1])
+        assert not output.exists(), "hdr10plus_tool output must not be pre-created"
+        output.write_text(json.dumps({"SceneInfo": []}), encoding="utf-8")
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(subject.subprocess, "run", fake_run)
+
+    result = subject._full_extract(str(media))
+
+    assert result["state"] == "present"

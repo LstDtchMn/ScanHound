@@ -61,47 +61,39 @@ def _full_extract(path: str, timeout: int = 300) -> dict:
         return {"state": "unknown", "method": "full_extract", "tool_version": None,
                 "error": "tool_unavailable"}
 
-    output_path = None
     version = _tool_version(tool, timeout)
     try:
-        handle = tempfile.NamedTemporaryFile(prefix="scanhound-hdr10plus-", suffix=".json", delete=False)
-        output_path = handle.name
-        handle.close()
-        result = subprocess.run(
-            [tool, "extract", path, "-o", output_path],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if result.returncode != 0:
-            return {"state": "unknown", "method": "full_extract", "tool_version": version,
-                    "error": "extract_failed"}
-        # A successful full extraction with an emitted JSON payload is positive.
-        # The tool also completes successfully when it parses a stream with no
-        # dynamic metadata, in which case no output payload is produced.
-        if os.path.getsize(output_path) > 0:
-            try:
-                with open(output_path, encoding="utf-8") as output_file:
-                    json.load(output_file)
-            except (OSError, ValueError, json.JSONDecodeError):
+        with tempfile.TemporaryDirectory(prefix="scanhound-hdr10plus-") as temp_dir:
+            output_path = os.path.join(temp_dir, "metadata.json")
+            result = subprocess.run(
+                [tool, "extract", path, "-o", output_path],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if result.returncode != 0:
                 return {"state": "unknown", "method": "full_extract", "tool_version": version,
-                        "error": "invalid_extract_output"}
-            return {"state": "present", "method": "full_extract", "tool_version": version,
+                        "error": "extract_failed"}
+            # A successful full extraction with an emitted JSON payload is positive.
+            # The tool also completes successfully when it parses a stream with no
+            # dynamic metadata, in which case no output payload is produced.
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                try:
+                    with open(output_path, encoding="utf-8") as output_file:
+                        json.load(output_file)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    return {"state": "unknown", "method": "full_extract", "tool_version": version,
+                            "error": "invalid_extract_output"}
+                return {"state": "present", "method": "full_extract", "tool_version": version,
+                        "error": None}
+            return {"state": "absent", "method": "full_extract", "tool_version": version,
                     "error": None}
-        return {"state": "absent", "method": "full_extract", "tool_version": version,
-                "error": None}
     except subprocess.TimeoutExpired:
         return {"state": "unknown", "method": "full_extract", "tool_version": version,
                 "error": "timeout"}
     except OSError:
         return {"state": "unknown", "method": "full_extract", "tool_version": version,
                 "error": "extract_failed"}
-    finally:
-        if output_path:
-            try:
-                os.unlink(output_path)
-            except OSError:
-                pass
 
 
 def detect_hdr10plus(path: str, *, quick_timeout: int = 30, full_timeout: int = 300) -> dict:

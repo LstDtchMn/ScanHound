@@ -8,6 +8,7 @@ whose cache signature has gone stale. Movies only.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -35,6 +36,7 @@ class PlexMetadataScanJob:
         self._progress_cb = progress_cb
         self._lock = threading.Lock()
         self._stop_flag = False
+        self._stop_mode: Optional[str] = None
         self.status = "idle"
         self.processed = 0
         self.succeeded = 0
@@ -44,6 +46,9 @@ class PlexMetadataScanJob:
         self.started_at: Optional[float] = None
         self.error: Optional[str] = None
         self._active_run_uuid: Optional[str] = None
+        interrupt = getattr(self._db, "interrupt_abandoned_metadata_scans", None)
+        if callable(interrupt):
+            interrupt()
 
     def is_running(self) -> bool:
         with self._lock:
@@ -54,6 +59,7 @@ class PlexMetadataScanJob:
             if self.status == "running":
                 return False
             self._stop_flag = False
+            self._stop_mode = None
             self.status = "running"
             self.processed = 0
             self.succeeded = 0
@@ -89,6 +95,7 @@ class PlexMetadataScanJob:
                 raise RuntimeError("could not mark metadata scan running")
             self._active_run_uuid = run["run_uuid"]
             self._stop_flag = False
+            self._stop_mode = None
             self.status = "running"
             self.processed = self.succeeded = self.failed = 0
             self.total = created
@@ -102,9 +109,55 @@ class PlexMetadataScanJob:
         ).start()
         return self._db.get_metadata_scan_run(run["run_uuid"])
 
-    def cancel(self) -> None:
+    def pause(self, run_uuid: Optional[str] = None) -> dict:
         with self._lock:
+            if self.status != "running" or (run_uuid and run_uuid != self._active_run_uuid):
+                raise RuntimeError("metadata scan run is not active")
+            self._stop_mode = "paused"
             self._stop_flag = True
+        return {"status": "pausing", "run_uuid": self._active_run_uuid}
+
+    def cancel(self, run_uuid: Optional[str] = None) -> dict:
+        with self._lock:
+            if run_uuid and run_uuid != self._active_run_uuid:
+                raise RuntimeError("metadata scan run is not active")
+            self._stop_mode = "cancelled"
+            self._stop_flag = True
+        return {"status": "cancelling", "run_uuid": self._active_run_uuid}
+
+    def resume(self, run_uuid: str, *, retry_failed: bool = False) -> dict:
+        """Resume only retryable rows from an existing persisted manifest."""
+        with self._lock:
+            if self.status == "running":
+                raise RuntimeError("a metadata scan is already running")
+            reset = self._db.prepare_metadata_scan_resume(
+                run_uuid, retry_failed=retry_failed
+            )
+            if reset <= 0:
+                raise RuntimeError("metadata scan has no retryable items")
+            if not self._db.update_metadata_scan_run(run_uuid, status="running"):
+                raise RuntimeError("could not mark metadata scan running")
+            items = self._db.list_metadata_scan_items(run_uuid)
+            self._active_run_uuid = run_uuid
+            self._stop_flag = False
+            self._stop_mode = None
+            self.status = "running"
+            self.processed = sum(item["status"] == "current" for item in items)
+            self.succeeded = self.processed
+            self.failed = sum(item["status"] == "failed" for item in items)
+            self.total = len(items)
+            self.current_files = []
+            self.started_at = time.time()
+            self.error = None
+        self._emit()
+        threading.Thread(
+            target=self._run_durable, args=(run_uuid,),
+            name="plex-metadata-inventory", daemon=True,
+        ).start()
+        return self._db.get_metadata_scan_run(run_uuid)
+
+    def retry_failures(self, run_uuid: str) -> dict:
+        return self.resume(run_uuid, retry_failed=True)
 
     def status_dict(self) -> dict:
         with self._lock:
@@ -156,16 +209,16 @@ class PlexMetadataScanJob:
     def _run_durable(self, run_uuid: str) -> None:
         """Process the persisted manifest serially and retain every outcome."""
         try:
-            for item in self._db.list_metadata_scan_items(run_uuid):
+            for item in self._db.list_metadata_scan_items(run_uuid, status="pending"):
                 with self._lock:
                     if self._stop_flag:
                         break
                 self._process_one_durable(run_uuid, item)
             with self._lock:
-                cancelled = self._stop_flag
-                self.status = "cancelled" if cancelled else "done"
+                stop_mode = self._stop_mode if self._stop_flag else None
+                self.status = stop_mode or "done"
             self._db.update_metadata_scan_run(
-                run_uuid, status="cancelled" if cancelled else "completed"
+                run_uuid, status=stop_mode or "completed"
             )
         except Exception as exc:
             logger.exception("durable plex metadata scan failed")
@@ -190,6 +243,7 @@ class PlexMetadataScanJob:
             before = os.stat(path)
             specs = mediainfo.probe_detailed(path, db=self._db)
             if not specs or not specs.get("present"):
+                self._record_failed_inventory(run_uuid, item, path)
                 self._db.update_metadata_scan_item(
                     run_uuid, path, status="failed", failure_stage="ffprobe",
                     error_code="probe_unavailable", error_message="No usable local-file probe result",
@@ -210,6 +264,9 @@ class PlexMetadataScanJob:
             if specs.get("hdr") == "Dolby Vision":
                 dv_result = dv_detect.detect_layer(path)
                 if dv_result.get("layer") in {None, "unknown"} or dv_result.get("error"):
+                    self._record_failed_inventory(
+                        run_uuid, item, path, before=before, probe=specs
+                    )
                     self._db.update_metadata_scan_item(
                         run_uuid, path, status="failed", failure_stage="dovi",
                         error_code="dv_incomplete", error_message=str(dv_result.get("error") or "unknown"),
@@ -221,6 +278,9 @@ class PlexMetadataScanJob:
                     sig_mtime=after.st_mtime, sig_size=after.st_size, source="scan",
                     rating_key=item.get("rating_key"),
                 ):
+                    self._record_failed_inventory(
+                        run_uuid, item, path, before=before, probe=specs
+                    )
                     self._db.update_metadata_scan_item(
                         run_uuid, path, status="failed", failure_stage="persist",
                         error_code="dv_cache_write_failed", error_message="Could not persist DV evidence",
@@ -230,6 +290,7 @@ class PlexMetadataScanJob:
                 **item, **specs, "path": path, "scan_state": "current",
                 "sig_mtime": after.st_mtime, "sig_size": after.st_size,
                 "scan_run_uuid": run_uuid,
+                "probe_json": json.dumps(specs, sort_keys=True, default=str),
             }):
                 self._db.update_metadata_scan_item(
                     run_uuid, path, status="failed", failure_stage="persist",
@@ -239,12 +300,14 @@ class PlexMetadataScanJob:
             self._db.update_metadata_scan_item(run_uuid, path, status="current")
             succeeded = True
         except OSError as exc:
+            self._record_failed_inventory(run_uuid, item, path)
             self._db.update_metadata_scan_item(
                 run_uuid, path, status="failed", failure_stage="stat",
                 error_code="filesystem_error", error_message=str(exc),
             )
         except Exception as exc:
             logger.exception("durable metadata probe failed for %s", path)
+            self._record_failed_inventory(run_uuid, item, path)
             self._db.update_metadata_scan_item(
                 run_uuid, path, status="failed", failure_stage="probe",
                 error_code="probe_exception", error_message=str(exc),
@@ -259,6 +322,23 @@ class PlexMetadataScanJob:
                 if label in self.current_files:
                     self.current_files.remove(label)
             self._emit()
+
+    def _record_failed_inventory(self, run_uuid: str, item: dict, path: str,
+                                 *, before=None, probe: Optional[dict] = None) -> None:
+        """Keep failed/unknown files visible without publishing false negatives."""
+        payload = {
+            **item,
+            **(probe or {}),
+            "path": path,
+            "scan_state": "failed",
+            "hdr10plus_state": (probe or {}).get("hdr10plus_state", "unknown"),
+            "scan_run_uuid": run_uuid,
+            "sig_mtime": getattr(before, "st_mtime", None),
+            "sig_size": getattr(before, "st_size", None),
+            "probe_json": json.dumps(probe, sort_keys=True, default=str) if probe else None,
+        }
+        if not self._db.upsert_media_inventory(payload):
+            logger.error("could not persist failed inventory state for %s", path)
 
     def _process_one_tracked(self, item: dict) -> None:
         label = item.get("title") or item.get("path") or "?"
