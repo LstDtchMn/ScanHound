@@ -14,9 +14,33 @@ from typing import Callable, Iterator, Optional
 class HDEncodeTrafficDenied(RuntimeError):
     """An HDEncode operation was refused before transport activity."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        state: Optional[str] = None,
+        reason_code: Optional[str] = None,
+        cooldown_until: Optional[str] = None,
+        affected_scope: str = "source",
+    ):
         super().__init__(message)
         self.code = code
+        self.state = state
+        self.reason_code = reason_code or code
+        self.cooldown_until = cooldown_until
+        self.affected_scope = affected_scope
+
+    @classmethod
+    def from_decision(cls, decision):
+        return cls(
+            decision.reason_code or decision.state,
+            f"HDEncode traffic is {decision.state}",
+            state=decision.state,
+            reason_code=decision.reason_code,
+            cooldown_until=decision.cooldown_until,
+            affected_scope="source",
+        )
 
 
 class HDEncodeRequestCancelled(HDEncodeTrafficDenied):
@@ -123,6 +147,7 @@ class HDEncodeTrafficCoordinator:
         }
         self._block_streak = 0
         self._local_cooldown_until: Optional[datetime] = None
+        self._local_cooldown_reason: Optional[str] = None
         self._health_cache = {}
         self._health_cache_at = 0.0
         self._metrics = {
@@ -164,6 +189,7 @@ class HDEncodeTrafficCoordinator:
             if context_changed:
                 self._block_streak = 0
                 self._local_cooldown_until = None
+                self._local_cooldown_reason = None
 
     def _enabled(self) -> bool:
         # The application default is enabled.  Missing/partial configuration
@@ -198,11 +224,12 @@ class HDEncodeTrafficCoordinator:
         now = _utcnow()
         with self._state_lock:
             local_until = self._local_cooldown_until
+            local_reason = self._local_cooldown_reason
         if local_until and local_until > now:
             return HDEncodeDecision(
                 True,
                 "cooldown",
-                "local_cooldown",
+                local_reason or "local_cooldown",
                 local_until.isoformat(),
             )
 
@@ -291,10 +318,7 @@ class HDEncodeTrafficCoordinator:
                 self._remove_waiter(waiter)
                 with self._state_lock:
                     self._metrics["denied"][request_class] += 1
-                raise HDEncodeTrafficDenied(
-                    decision.reason_code or decision.state,
-                    f"HDEncode traffic is {decision.state}",
-                )
+                raise HDEncodeTrafficDenied.from_decision(decision)
             with self._priority_condition:
                 if (
                     self._priority_waiters
@@ -347,10 +371,7 @@ class HDEncodeTrafficCoordinator:
         if decision.blocked:
             with self._state_lock:
                 self._metrics["denied"][request_class] += 1
-            raise HDEncodeTrafficDenied(
-                decision.reason_code or decision.state,
-                f"HDEncode traffic is {decision.state}",
-            )
+            raise HDEncodeTrafficDenied.from_decision(decision)
 
         inherited = _REQUEST_PRIORITY.get()
         effective_priority = (
@@ -371,10 +392,7 @@ class HDEncodeTrafficCoordinator:
             if decision.blocked:
                 with self._state_lock:
                     self._metrics["denied"][request_class] += 1
-                raise HDEncodeTrafficDenied(
-                    decision.reason_code or decision.state,
-                    f"HDEncode traffic is {decision.state}",
-                )
+                raise HDEncodeTrafficDenied.from_decision(decision)
             self._wait_for_start(request_class, stop_requested)
             token = _AUTHORIZED_CLASS.set(request_class)
             yield
@@ -415,6 +433,7 @@ class HDEncodeTrafficCoordinator:
             with self._state_lock:
                 self._block_streak = 0
                 self._local_cooldown_until = None
+                self._local_cooldown_reason = None
                 self._health_cache_at = 0.0
                 self._metrics["successes"] += 1
             self._persist_success()
@@ -435,6 +454,7 @@ class HDEncodeTrafficCoordinator:
         until = _utcnow() + timedelta(seconds=seconds)
         with self._state_lock:
             self._local_cooldown_until = until
+            self._local_cooldown_reason = f"http_{status}"
             self._health_cache_at = 0.0
         self._persist_failure("cooldown", f"http_{status}", seconds)
         with self._priority_condition:
@@ -446,16 +466,20 @@ class HDEncodeTrafficCoordinator:
             until.isoformat(),
         )
 
-    def observe_challenge(self, reason_code: str = "interactive_challenge") -> None:
+    def observe_challenge(
+        self, reason_code: str = "interactive_challenge"
+    ) -> HDEncodeDecision:
         seconds = 60 * 60
         until = _utcnow() + timedelta(seconds=seconds)
         with self._state_lock:
             self._metrics["challenges"] += 1
             self._local_cooldown_until = until
+            self._local_cooldown_reason = reason_code
             self._health_cache_at = 0.0
         self._persist_failure("cooldown", reason_code, seconds)
         with self._priority_condition:
             self._priority_condition.notify_all()
+        return HDEncodeDecision(True, "cooldown", reason_code, until.isoformat())
 
     def observe_network_failure(self, reason_code: str) -> None:
         with self._state_lock:

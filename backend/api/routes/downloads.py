@@ -13,6 +13,12 @@ from backend.api.ws import ws_manager
 from backend.download_service import _source_page_kind
 from backend.source_health import record_scrape_outcome
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
+from backend.download_outcome import (
+    deferred_result,
+    is_source_wide_denial,
+    notification_for_result,
+    public_download_result,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/download", tags=["downloads"])
@@ -80,6 +86,9 @@ def _run_grab(dl, reg: ServiceRegistry, req: "DownloadRequest", force: bool = Fa
             progress_callback=_on_progress,
             force=force,
         )
+        outcome = public_download_result(result, title=req.title, url=req.url)
+        ws_manager.broadcast_sync({"type": "download:result", "data": outcome})
+
         # Report the *honest* outcome: only a JDownloader hand-off counts as
         # a delivery. A failed scrape or a clipboard/browser fallback must
         # not look like a successful "Download".
@@ -89,7 +98,7 @@ def _run_grab(dl, reg: ServiceRegistry, req: "DownloadRequest", force: bool = Fa
         if not success:
             ws_manager.broadcast_sync({
                 "type": "notification",
-                "data": {"title": "Download Failed", "body": message, "priority": "high"},
+                "data": notification_for_result(outcome, title=req.title),
             })
         elif method in ("duplicate", "duplicate_similar"):
             ws_manager.broadcast_sync({
@@ -158,24 +167,32 @@ def download_batch(
             def _on_progress(event: str, data: dict):
                 ws_manager.broadcast_sync({"type": event, "data": data})
 
-            # Each item is scraped for its real file-host links before being
-            # sent on. Previously the raw page URLs (e.g. hdencode.org posts)
-            # were forwarded to JDownloader, which can't resolve them.
-            delivered = diverted = failed = skipped = 0
+            delivered = diverted = failed = skipped = deferred = 0
+            outcomes = []
+            blocker = None
             for i, item in enumerate(req.items):
                 ws_manager.broadcast_sync({
                     "type": "download:batch_progress",
                     "data": {"completed": i, "total": total, "current_title": item.title},
                 })
-                res = dl.download_item(
-                    url=item.url, title=item.title, season=item.season,
-                    resolution=item.resolution, size=item.size,
-                    service_type=item.service_type, year=item.year,
-                    hdr=item.hdr, dovi=item.dovi,
-                    progress_callback=_on_progress,
-                )
-                method = (res or {}).get("method")
-                if not (res or {}).get("success"):
+                if blocker is not None:
+                    res = deferred_result(blocker, title=item.title, url=item.url)
+                else:
+                    res = dl.download_item(
+                        url=item.url, title=item.title, season=item.season,
+                        resolution=item.resolution, size=item.size,
+                        service_type=item.service_type, year=item.year,
+                        hdr=item.hdr, dovi=item.dovi,
+                        progress_callback=_on_progress,
+                    )
+                outcome = public_download_result(res, title=item.title, url=item.url)
+                outcomes.append(outcome)
+                ws_manager.broadcast_sync({"type": "download:result", "data": outcome})
+
+                method = outcome.get("method")
+                if outcome.get("deferred"):
+                    deferred += 1
+                elif not outcome.get("success"):
                     failed += 1
                 elif method in ("duplicate", "duplicate_similar"):
                     skipped += 1
@@ -183,12 +200,13 @@ def download_batch(
                     delivered += 1
                 else:
                     diverted += 1
+                if blocker is None and is_source_wide_denial(outcome):
+                    blocker = outcome
+
             ws_manager.broadcast_sync({
                 "type": "download:batch_progress",
                 "data": {"completed": total, "total": total, "current_title": ""},
             })
-            # Honest summary: distinguish JD deliveries, clipboard/browser
-            # diversions, and outright failures instead of "Processed N".
             parts = [f"{delivered} sent to JDownloader"]
             if skipped:
                 parts.append(f"{skipped} already grabbed")
@@ -196,18 +214,42 @@ def download_batch(
                 parts.append(f"{diverted} copied/opened")
             if failed:
                 parts.append(f"{failed} failed")
-            if failed:
-                batch_priority = "high"
+            if deferred:
+                parts.append(f"{deferred} deferred without requests")
+
+            batch_data = {
+                "total": total,
+                "delivered": delivered,
+                "diverted": diverted,
+                "failed": failed,
+                "skipped": skipped,
+                "deferred": deferred,
+                "source_paused": blocker is not None,
+                "block_reason_code": blocker.get("reason_code") if blocker else None,
+                "block_cause_code": blocker.get("cause_code") if blocker else None,
+                "cooldown_until": blocker.get("cooldown_until") if blocker else None,
+                "outcomes": outcomes,
+            }
+            ws_manager.broadcast_sync({"type": "download:batch_result", "data": batch_data})
+
+            if blocker is not None:
+                batch_title, batch_priority = "Batch Download Paused", "high"
+            elif failed:
+                batch_title, batch_priority = "Batch Download — some failed", "high"
             elif diverted:
-                batch_priority = "warning"  # nothing failed, but some only diverted
+                batch_title, batch_priority = "Batch Download", "warning"
             else:
-                batch_priority = "normal"
+                batch_title, batch_priority = "Batch Download", "normal"
             ws_manager.broadcast_sync({
                 "type": "notification",
                 "data": {
-                    "title": "Batch Download" if failed == 0 else "Batch Download — some failed",
+                    "title": batch_title,
                     "body": ", ".join(parts),
                     "priority": batch_priority,
+                    "reason_code": blocker.get("reason_code") if blocker else None,
+                    "cause_code": blocker.get("cause_code") if blocker else None,
+                    "cooldown_until": blocker.get("cooldown_until") if blocker else None,
+                    "deferred": deferred,
                 },
             })
             if delivered:

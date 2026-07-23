@@ -27,6 +27,10 @@ from backend.hdencode_coordinator import (
 from backend.app_service import normalize_title
 from backend.sources.ddlbase import decode_ddlbase_link
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
+from backend.download_outcome import (
+    diagnostic_from_traffic_denial,
+    strong_challenge_markers,
+)
 from backend.source_health import record_scrape_outcome
 
 logger = logging.getLogger(__name__)
@@ -194,6 +198,22 @@ def _normalize_link_url(url: str) -> str:
         return ident.lower()
     except Exception:
         return url.strip().lower()
+
+
+def _extract_requested_host_links(html: str, keyword: str) -> List[str]:
+    """Return unique requested-host links already visible in the page HTML."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    seen: Set[str] = set()
+    links: List[str] = []
+    needle = (keyword or "").lower()
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"]
+        if needle in href.lower() and href not in seen:
+            seen.add(href)
+            links.append(href)
+    return links
 
 
 _ARCHIVE_RE = re.compile(r'\.(rar|zip|7z|tar|gz|bz2|tgz|r\d\d|z\d\d|001)$', re.IGNORECASE)
@@ -1274,12 +1294,7 @@ class DownloadService:
                             "warning",
                         )
             except HDEncodeTrafficDenied as exc:
-                return None, ScrapeDiagnostic(
-                    ScrapeCode.SOURCE_DISABLED,
-                    retryable=False,
-                    affects_source_health=False,
-                    signals=(exc.code,),
-                )
+                return None, diagnostic_from_traffic_denial(exc)
 
             self._recycle_driver()
             if attempt < attempts:
@@ -1451,13 +1466,28 @@ class DownloadService:
                     signals=tuple(signals),
                 )
             if captcha_frames or challenge_markers:
+                decision = None
                 if source_kind == "hdencode":
-                    get_hdencode_coordinator().observe_challenge()
+                    decision = get_hdencode_coordinator().observe_challenge()
                 return ScrapeDiagnostic(
                     ScrapeCode.INTERACTIVE_CHALLENGE,
                     retryable=False,
                     affects_source_health=True,
                     signals=tuple(signals),
+                    stage="verification",
+                    cause_code="interactive_challenge",
+                    cooldown_until=(
+                        decision.cooldown_until if decision is not None else None
+                    ),
+                    transport_attempted=True,
+                    affected_scope="source",
+                    retry_mode="manual_verification",
+                    action_code="verification_required",
+                    health_owner=(
+                        "coordinator"
+                        if source_kind == "hdencode"
+                        else "outcome_recorder"
+                    ),
                 )
             if stage == "access_control":
                 return ScrapeDiagnostic(
@@ -1490,14 +1520,49 @@ class DownloadService:
                 detail=f"Failed to classify the loaded page: {e}",
             )
 
-    def _wait_past_cloudflare(self, driver, timeout: int = 30) -> None:
-        """Compatibility no-op.
-
-        ScanHound does not wait for, solve, or automate interactive challenges.
-        Strong challenge evidence is classified by _log_page_diagnostics(),
-        which establishes a source cooldown through the coordinator.
-        """
-        return
+    def _wait_past_cloudflare(
+        self,
+        driver,
+        timeout: int = 20,
+        *,
+        source_kind: str = "other",
+    ) -> Optional[ScrapeDiagnostic]:
+        """Passively wait for a transient browser check without solving it."""
+        deadline = time.monotonic() + max(0, int(timeout))
+        while True:
+            try:
+                current_url = driver.current_url or ""
+            except Exception:
+                current_url = ""
+            if current_url:
+                network_code = self._browser_error_code(driver, current_url)
+                if network_code:
+                    return ScrapeDiagnostic(
+                        ScrapeCode.BROWSER_NETWORK_ERROR,
+                        retryable=True,
+                        affects_source_health=False,
+                        signals=(network_code,),
+                        stage="navigation",
+                        transport_attempted=True,
+                        retry_mode="immediate",
+                    )
+            try:
+                html = driver.page_source or ""
+            except Exception:
+                html = ""
+            try:
+                title = driver.title or ""
+            except Exception:
+                title = ""
+            if not strong_challenge_markers(html, title):
+                return None
+            if time.monotonic() >= deadline:
+                return self._log_page_diagnostics(
+                    driver,
+                    stage="access_control",
+                    source_kind=source_kind,
+                )
+            time.sleep(0.5)
 
     def scrape_links(self, url: str, service_type: str, progress_callback: Optional[Callable] = None) -> ScrapedLinks:
         """Scrape download links from a page using WebDriver.
@@ -1514,7 +1579,16 @@ class DownloadService:
         source_kind = _source_page_kind(url)
         if source_kind == "hdencode" and not self.config.get("hdencode_enabled", True):
             diagnostic = ScrapeDiagnostic(
-                ScrapeCode.SOURCE_DISABLED, retryable=False, affects_source_health=False
+                ScrapeCode.SOURCE_DISABLED,
+                retryable=False,
+                affects_source_health=False,
+                stage="source_gate",
+                cause_code="source_disabled",
+                transport_attempted=False,
+                affected_scope="source",
+                retry_mode="configuration_change",
+                action_code="open_settings",
+                health_owner="coordinator",
             )
             self._log(f"[HDEncode] {diagnostic.message}", "warning")
             return ScrapedLinks(diagnostic=diagnostic)
@@ -1572,15 +1646,30 @@ class DownloadService:
                     if driver is None:
                         return ScrapedLinks(diagnostic=navigation_diagnostic)
 
-                    # Let any Cloudflare "Just a moment…" challenge resolve
-                    # before we look for page elements.
-                    self._wait_past_cloudflare(driver)
+                    wait_diagnostic = self._wait_past_cloudflare(
+                        driver,
+                        source_kind=source_kind,
+                    )
+                    if wait_diagnostic is not None:
+                        return ScrapedLinks(diagnostic=wait_diagnostic)
 
                     try:
                         page_title = driver.title
                     except Exception:
                         page_title = "?"
                     self._log(f"[HDEncode] Page loaded (title: {page_title!r})")
+
+                    visible_links = _extract_requested_host_links(
+                        driver.page_source,
+                        keyword,
+                    )
+                    if visible_links:
+                        self._log(
+                            f"[HDEncode] Found {len(visible_links)} already-visible "
+                            f"{service_type} link(s)",
+                            "success",
+                        )
+                        return ScrapedLinks(visible_links)
 
                     # HDEncode renamed the reveal button to "View links" (it was
                     # "Access the links"); clicking it POSTs a form that unlocks
@@ -1634,8 +1723,15 @@ class DownloadService:
                         btn_desc = "?"
                     self._log(f"[HDEncode] Access control found ({btn_desc!r}) — clicking")
                     driver.execute_script("arguments[0].scrollIntoView();", access_btn)
-                    time.sleep(0.3)
-                    driver.execute_script("arguments[0].click();", access_btn)
+                    try:
+                        access_btn.click()
+                    except Exception as click_exc:
+                        self._log(
+                            f"[HDEncode] Native click failed "
+                            f"({type(click_exc).__name__}); using JS fallback",
+                            "warning",
+                        )
+                        driver.execute_script("arguments[0].click();", access_btn)
 
                     self._log(f"[HDEncode] Clicked — waiting up to 8s for '{keyword}' links to appear")
                     try:
@@ -1649,14 +1745,10 @@ class DownloadService:
                         )
                         return ScrapedLinks(diagnostic=diagnostic)
 
-                    soup = BeautifulSoup(driver.page_source, 'html.parser')
-                    seen: Set[str] = set()
-                    links: List[str] = []
-                    for a in soup.find_all('a', href=True):
-                        href = a['href']
-                        if keyword in href.lower() and href not in seen:
-                            seen.add(href)
-                            links.append(href)
+                    links = _extract_requested_host_links(
+                        driver.page_source,
+                        keyword,
+                    )
 
                     if links:
                         self._log(f"[HDEncode] Found {len(links)} {service_type} link(s); first: {links[0]}", "success")
@@ -2194,7 +2286,15 @@ class DownloadService:
             "message": "",
             "history_saved": False,
             "reason_code": None,
+            "cause_code": None,
+            "stage": None,
             "retryable": False,
+            "retry_mode": "none",
+            "cooldown_until": None,
+            "transport_attempted": None,
+            "affected_scope": "item",
+            "action_code": None,
+            "deferred": False,
             "signals": [],
         }
 
@@ -2283,10 +2383,9 @@ class DownloadService:
                 if diagnostic is not None:
                     # API/WS-facing result must not expose diagnostic.detail,
                     # which may contain local paths or driver internals.
-                    msg = diagnostic.public_message
-                    result["reason_code"] = diagnostic.code.value
-                    result["retryable"] = diagnostic.retryable
-                    result["signals"] = list(diagnostic.signals)
+                    diagnostic_payload = diagnostic.to_dict()
+                    result.update(diagnostic_payload)
+                    msg = diagnostic_payload["message"]
                 else:
                     msg = (
                         "No download links found on the source page."
@@ -2296,7 +2395,11 @@ class DownloadService:
                 self._log(f"[Download] {title}: {msg}", "warning")
                 result["message"] = msg
                 self._progress("download:no_links", {"title": title, "url": url}, _cb=_cb)
-                self._progress("download:failed", {"title": title, "url": url, "message": msg}, _cb=_cb)
+                self._progress(
+                    "download:failed",
+                    {"title": title, "url": url, **result},
+                    _cb=_cb,
+                )
                 return result
 
         self._progress("download:links_found", {"title": title, "link_count": len(links)}, _cb=_cb)

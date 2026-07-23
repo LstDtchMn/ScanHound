@@ -51,13 +51,17 @@ def effective_health_state(health, *, now=None) -> str:
         if expires <= current:
             return SourceHealthState.DEGRADED.value
     except (TypeError, ValueError):
-        # Invalid metadata cannot justify claiming an active cooldown.
         return SourceHealthState.DEGRADED.value
     return SourceHealthState.COOLDOWN.value
 
 
 def record_scrape_outcome(db, source: str, links) -> None:
-    """Persist a successful scrape or a health-affecting structured failure."""
+    """Persist a successful scrape or a health-affecting structured failure.
+
+    HDEncode traffic-policy events are persisted by the coordinator. Recording
+    those diagnostics here used to increment the failure streak twice and
+    overwrite the one-hour challenge cooldown with NULL.
+    """
     if db is None:
         return
     diagnostic = getattr(links, "diagnostic", None)
@@ -65,12 +69,16 @@ def record_scrape_outcome(db, source: str, links) -> None:
         if links:
             db.record_source_success(source)
             return
+        if (
+            source == "hdencode"
+            and diagnostic is not None
+            and diagnostic.health_owner == "coordinator"
+        ):
+            return
         if diagnostic is not None and diagnostic.code in {
             ScrapeCode.REQUESTED_HOST_MISSING,
             ScrapeCode.NO_FILE_HOST_LINKS,
         }:
-            # The source page loaded successfully; only this host/release lacked
-            # usable links. Clear a stale block/cooldown snapshot.
             db.record_source_success(source)
             return
         state = health_state_for_diagnostic(diagnostic)
@@ -81,5 +89,4 @@ def record_scrape_outcome(db, source: str, links) -> None:
                 diagnostic.code.value,
             )
     except Exception:
-        # Health persistence must never turn a scrape result into an exception.
         return

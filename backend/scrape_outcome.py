@@ -14,6 +14,7 @@ from typing import Iterable, Optional, Sequence
 
 class ScrapeCode(str, Enum):
     SOURCE_DISABLED = "source_disabled"
+    SOURCE_TEMPORARILY_BLOCKED = "source_temporarily_blocked"
     BROWSER_LAUNCH_FAILED = "browser_launch_failed"
     BROWSER_NETWORK_ERROR = "browser_network_error"
     BROWSER_NAVIGATION_FAILED = "browser_navigation_failed"
@@ -26,6 +27,9 @@ class ScrapeCode(str, Enum):
 
 _MESSAGES = {
     ScrapeCode.SOURCE_DISABLED: "HDEncode is disabled in Settings; no request was made.",
+    ScrapeCode.SOURCE_TEMPORARILY_BLOCKED: (
+        "HDEncode is temporarily paused to protect the source; no request was made."
+    ),
     ScrapeCode.BROWSER_LAUNCH_FAILED: "The browser could not start. Check the Chromium/Xvfb service and profile locks.",
     ScrapeCode.BROWSER_NETWORK_ERROR: "Chromium could not reach the source because of a browser network or DNS error.",
     ScrapeCode.BROWSER_NAVIGATION_FAILED: "The browser failed while navigating to the source page.",
@@ -46,6 +50,15 @@ class ScrapeDiagnostic:
     status_code: Optional[int] = None
     signals: Sequence[str] = field(default_factory=tuple)
     detail: str = ""
+    stage: str = "link_retrieval"
+    cause_code: Optional[str] = None
+    cooldown_until: Optional[str] = None
+    transport_attempted: Optional[bool] = None
+    affected_scope: str = "item"
+    retry_mode: str = "none"
+    action_code: Optional[str] = None
+    deferred: bool = False
+    health_owner: str = "outcome_recorder"
 
     @property
     def public_message(self) -> str:
@@ -60,12 +73,20 @@ class ScrapeDiagnostic:
     def to_dict(self) -> dict:
         return {
             "reason_code": self.code.value,
+            "cause_code": self.cause_code,
             "message": self.public_message,
             "retryable": self.retryable,
+            "retry_mode": self.retry_mode,
+            "cooldown_until": self.cooldown_until,
+            "transport_attempted": self.transport_attempted,
+            "affected_scope": self.affected_scope,
+            "action_code": self.action_code,
+            "deferred": self.deferred,
+            "stage": self.stage,
             "affects_source_health": self.affects_source_health,
             "transport": self.transport,
             "status_code": self.status_code,
-            "signals": list(self.signals),
+            "signals": [str(value) for value in self.signals if value is not None],
         }
 
 

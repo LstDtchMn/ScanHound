@@ -4755,8 +4755,11 @@ class DatabaseManager:
                    reason_code = excluded.reason_code,
                    updated_at = excluded.updated_at,
                    last_failure_at = excluded.last_failure_at,
-                   consecutive_failures = source_health.consecutive_failures + 1,
-                   cooldown_until = excluded.cooldown_until""",
+                    consecutive_failures = source_health.consecutive_failures + 1,
+                    cooldown_until = COALESCE(
+                        excluded.cooldown_until,
+                        source_health.cooldown_until
+                    )""",
             (source, state, reason_code, now, now, cooldown_until),
             label="record_source_failure",
         )
