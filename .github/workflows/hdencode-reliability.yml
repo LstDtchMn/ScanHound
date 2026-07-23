@@ -1,0 +1,92 @@
+name: HDEncode reliability feedback
+
+on:
+  push:
+    branches:
+      - fix/hdencode-download-reliability
+  pull_request:
+    paths:
+      - "backend/hdencode_coordinator.py"
+      - "backend/scrape_outcome.py"
+      - "backend/source_health.py"
+      - "backend/database.py"
+      - "backend/download_service.py"
+      - "backend/download_outcome.py"
+      - "backend/api/routes/downloads.py"
+      - "tests/test_hdencode_download_reliability.py"
+      - ".github/workflows/hdencode-reliability.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused-backend:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install backend test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-docker.txt
+          python -m pip install pytest pytest-json-report
+      - name: Compile changed backend
+        run: |
+          python -m compileall -q \
+            backend/hdencode_coordinator.py \
+            backend/scrape_outcome.py \
+            backend/source_health.py \
+            backend/download_outcome.py \
+            backend/download_service.py \
+            backend/api/routes/downloads.py
+      - name: Run focused reliability suite
+        run: |
+          mkdir -p test-artifacts
+          pytest -q \
+            tests/test_hdencode_download_reliability.py \
+            tests/test_hdencode_coordinator.py \
+            tests/test_source_health.py \
+            tests/test_scrape_outcomes.py \
+            --junitxml=test-artifacts/junit.xml \
+            --json-report \
+            --json-report-file=test-artifacts/pytest-report.json
+      - name: Write result manifest
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, platform, subprocess
+          from pathlib import Path
+          manifest = {
+              "schema_version": 1,
+              "commit_sha": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip(),
+              "runner_os": platform.platform(),
+              "python": platform.python_version(),
+              "job": "focused-backend",
+              "matrix_python": os.environ.get("MATRIX_PYTHON", ""),
+          }
+          Path("test-artifacts").mkdir(exist_ok=True)
+          Path("test-artifacts/result-manifest.json").write_text(
+              json.dumps(manifest, indent=2), encoding="utf-8"
+          )
+          PY
+        env:
+          MATRIX_PYTHON: ${{ matrix.python-version }}
+      - name: Upload test feedback
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdencode-reliability-python-${{ matrix.python-version }}
+          path: test-artifacts/
+          retention-days: 30
