@@ -558,49 +558,48 @@ class TestGetDriver:
 
     @patch("backend.download_service.time.sleep", MagicMock())
     @patch("backend.download_service._ensure_selenium")
-    @patch("backend.download_service._uc")
-    def test_retries_chrome_launch_then_succeeds(self, mock_uc, mock_ensure):
+    @patch("backend.download_service.launch_browser")
+    def test_retries_chrome_launch_then_succeeds(self, mock_launch, mock_ensure):
         # "session not created: cannot connect to chrome" on first launch must
         # recycle stale processes and retry, not fail the scrape outright.
+        # Driver creation now goes through browser_adapter.launch_browser, which
+        # returns a (driver, browser_status) tuple.
         svc = _make_service()
         good = MagicMock()
-        mock_uc.Chrome.side_effect = [Exception("session not created"), good]
-        mock_uc.ChromeOptions.return_value = MagicMock()
+        mock_launch.side_effect = [Exception("session not created"), (good, {})]
         svc._kill_stale_chrome = MagicMock()
 
         result = svc.get_driver()
         assert result is good
-        assert mock_uc.Chrome.call_count == 2       # retried once
+        assert mock_launch.call_count == 2       # retried once
         svc._kill_stale_chrome.assert_called_once()  # reaped between attempts
 
     @patch("backend.download_service.time.sleep", MagicMock())
     @patch("backend.download_service._ensure_selenium")
-    @patch("backend.download_service._uc")
-    def test_chrome_launch_failure_raises_after_retries(self, mock_uc, mock_ensure):
+    @patch("backend.download_service.launch_browser")
+    def test_chrome_launch_failure_raises_after_retries(self, mock_launch, mock_ensure):
         svc = _make_service()
-        mock_uc.Chrome.side_effect = Exception("cannot connect to chrome")
-        mock_uc.ChromeOptions.return_value = MagicMock()
+        mock_launch.side_effect = Exception("cannot connect to chrome")
         svc._kill_stale_chrome = MagicMock()
 
         with pytest.raises(Exception, match="cannot connect to chrome"):
             svc.get_driver()
-        assert mock_uc.Chrome.call_count == 3       # bounded to 3 attempts
+        assert mock_launch.call_count == 3       # bounded to 3 attempts
 
     @patch("backend.download_service._ensure_selenium")
-    @patch("backend.download_service._uc")
-    def test_creates_new_driver_if_no_cached(self, mock_uc, mock_ensure):
+    @patch("backend.download_service.launch_browser")
+    def test_creates_new_driver_if_no_cached(self, mock_launch, mock_ensure):
         svc = _make_service()
         mock_driver = MagicMock()
-        mock_uc.Chrome.return_value = mock_driver
-        mock_uc.ChromeOptions.return_value = MagicMock()
+        mock_launch.return_value = (mock_driver, {})
 
         result = svc.get_driver()
         assert result is mock_driver
-        mock_uc.Chrome.assert_called_once()
+        mock_launch.assert_called_once()
 
     @patch("backend.download_service._ensure_selenium")
-    @patch("backend.download_service._uc")
-    def test_recreates_driver_if_stale(self, mock_uc, mock_ensure):
+    @patch("backend.download_service.launch_browser")
+    def test_recreates_driver_if_stale(self, mock_launch, mock_ensure):
         svc = _make_service()
         old_driver = MagicMock()
         # Accessing title on stale driver raises
@@ -608,8 +607,7 @@ class TestGetDriver:
         svc.cached_driver = old_driver
 
         new_driver = MagicMock()
-        mock_uc.Chrome.return_value = new_driver
-        mock_uc.ChromeOptions.return_value = MagicMock()
+        mock_launch.return_value = (new_driver, {})
 
         result = svc.get_driver()
         assert result is new_driver
