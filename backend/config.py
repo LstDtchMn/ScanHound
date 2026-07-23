@@ -97,6 +97,7 @@ class AppConfig(TypedDict, total=False):
     hdencode_browser_profile_dir: str
     download_batch_interval_minutes: int
     download_queue_auto_resume_after_cooldown: bool
+    download_queue_claim_lease_seconds: int
 
     # DDLBase / Cuty.io
     ddlbase_enabled: bool
@@ -469,6 +470,8 @@ _DEFAULT_CONFIG: AppConfig = {
     # Multi-title grabs are deliberately spaced by default. Set 0 for immediate.
     "download_batch_interval_minutes": 10,
     "download_queue_auto_resume_after_cooldown": False,
+    # Fail-stop lease for the single durable queue worker. Tunable without code.
+    "download_queue_claim_lease_seconds": 600,
     "ddlbase_enabled": True,
     "ddlbase_manual_resolution_timeout": 60,
     "cuty_email": "",
@@ -649,6 +652,13 @@ def validate_config(config: dict) -> dict:
         cleaned['download_batch_interval_minutes'] = max(
             0,
             min(120, _safe_int(cleaned['download_batch_interval_minutes'], 10)),
+        )
+    if cleaned.get('download_queue_claim_lease_seconds') is not None:
+        cleaned['download_queue_claim_lease_seconds'] = max(
+            60,
+            min(7200, _safe_int(
+                cleaned['download_queue_claim_lease_seconds'], 600
+            )),
         )
     if cleaned.get('hdencode_browser_adapter') not in (
         None, "selenium_chromium", "uc_chromium"

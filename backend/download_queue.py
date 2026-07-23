@@ -104,9 +104,10 @@ class DownloadQueueService:
         download_service,
         *,
         broadcast: Optional[Callable[[dict], None]] = None,
+        broadcast_flush: Optional[Callable[[dict], bool]] = None,
         on_delivery: Optional[Callable[[], None]] = None,
         poll_seconds: float = 2.0,
-        claim_lease_seconds: float = 600.0,
+        claim_lease_seconds: Optional[float] = None,
         watchdog_poll_seconds: float = 2.0,
         fatal_exit: Optional[Callable[[int], None]] = None,
     ):
@@ -114,9 +115,19 @@ class DownloadQueueService:
         self.db = db
         self.download = download_service
         self.broadcast = broadcast or (lambda _event: None)
+        self.broadcast_flush = broadcast_flush
         self.on_delivery = on_delivery or (lambda: None)
         self.poll_seconds = max(0.2, float(poll_seconds))
-        self.claim_lease_seconds = max(1.0, float(claim_lease_seconds))
+        configured_lease = (
+            claim_lease_seconds
+            if claim_lease_seconds is not None
+            else self.config.get("download_queue_claim_lease_seconds", 600)
+        )
+        try:
+            lease_seconds = float(configured_lease)
+        except (TypeError, ValueError):
+            lease_seconds = 600.0
+        self.claim_lease_seconds = max(60.0, min(7200.0, lease_seconds))
         self.watchdog_poll_seconds = max(0.05, float(watchdog_poll_seconds))
         self._fatal_exit = fatal_exit or os._exit
         self.worker_id = str(uuid.uuid4())
@@ -158,11 +169,21 @@ class DownloadQueueService:
         except Exception:
             logger.debug("download queue broadcast failed", exc_info=True)
 
+    def _emit_flush(self, event_type: str, data: dict) -> bool:
+        message = {"type": event_type, "data": data}
+        if self.broadcast_flush is None:
+            self._emit(event_type, data)
+            return False
+        try:
+            return bool(self.broadcast_flush(message))
+        except Exception:
+            logger.warning("download queue synchronous broadcast failed", exc_info=True)
+            return False
+
     def recover_interrupted(self) -> None:
         if self.db is None:
             return
         now = _utcnow()
-        grace = _iso(now + timedelta(seconds=30))
         with self.db.transaction() as conn:
             if not conn:
                 return
@@ -504,7 +525,7 @@ class DownloadQueueService:
             "download:queue_updated",
             {**recovered, "state": "failed"},
         )
-        self._emit(
+        self._emit_flush(
             "notification",
             {
                 "title": "Download queue operation timed out",
@@ -609,6 +630,10 @@ class DownloadQueueService:
                 WHERE state IN ('scheduled', 'ready')
                   AND scheduled_for IS NOT NULL
                   AND scheduled_for <= ?
+                  AND COALESCE(last_reason_code, '') NOT IN (
+                      'operation_timeout_unknown',
+                      'interrupted_unknown_outcome'
+                  )
                 ORDER BY scheduled_for, sequence_number
                 LIMIT 1
                 """,
@@ -627,6 +652,10 @@ class DownloadQueueService:
                     updated_at = ?
                 WHERE item_uuid = ?
                   AND state IN ('scheduled', 'ready')
+                  AND COALESCE(last_reason_code, '') NOT IN (
+                      'operation_timeout_unknown',
+                      'interrupted_unknown_outcome'
+                  )
                 """,
                 (
                     self.worker_id,
@@ -871,7 +900,7 @@ class DownloadQueueService:
                     item.get("item_uuid"),
                 )
                 return False
-            deferred = conn.execute(
+            conn.execute(
                 """
                 UPDATE download_queue_items
                 SET state = 'waiting_source',
@@ -894,7 +923,7 @@ class DownloadQueueService:
                     item["batch_uuid"],
                     item["source"],
                 ),
-            ).rowcount
+            )
             conn.execute(
                 """
                 UPDATE download_queue_batches
@@ -903,7 +932,6 @@ class DownloadQueueService:
                     cooldown_until = ?,
                     last_reason_code = ?,
                     last_cause_code = ?,
-                    deferred_items = deferred_items + ?,
                     updated_at = ?
                 WHERE batch_uuid = ?
                 """,
@@ -912,7 +940,6 @@ class DownloadQueueService:
                     outcome.get("cooldown_until"),
                     outcome.get("reason_code"),
                     outcome.get("cause_code"),
-                    max(0, int(deferred or 0)),
                     now,
                     item["batch_uuid"],
                 ),
@@ -995,7 +1022,32 @@ class DownloadQueueService:
         )
         for batch in batches:
             until = _parse(batch.get("cooldown_until"))
-            if until and until > now:
+            if until is None or until > now:
+                continue
+            blocked = self.db._query(
+                """
+                SELECT source
+                FROM download_queue_items
+                WHERE batch_uuid = ?
+                  AND state IN ('verification_required', 'waiting_source')
+                  AND cooldown_until = ?
+                  AND queue_reason IN (
+                      'interactive_challenge', 'source_deferred'
+                  )
+                  AND COALESCE(last_reason_code, '') NOT IN (
+                      'operation_timeout_unknown',
+                      'interrupted_unknown_outcome'
+                  )
+                ORDER BY updated_at DESC,
+                    CASE WHEN state = 'verification_required' THEN 0 ELSE 1 END,
+                    sequence_number
+                LIMIT 1
+                """,
+                (batch["batch_uuid"], batch.get("cooldown_until")),
+                one=True,
+                default=None,
+            )
+            if blocked is None:
                 continue
             self._resume_batch(
                 batch["batch_uuid"],
@@ -1004,6 +1056,7 @@ class DownloadQueueService:
                     int(batch.get("interval_seconds") or 0) // 60,
                 ),
                 automated=True,
+                blocked_source=str(blocked["source"]),
             )
 
     def retry_item(self, item_uuid: str) -> dict:
@@ -1020,7 +1073,15 @@ class DownloadQueueService:
                 """
                 UPDATE download_queue_items
                 SET state = 'ready', scheduled_for = ?, cooldown_until = NULL,
-                    queue_reason = 'manual_retry', updated_at = ?
+                    queue_reason = 'manual_retry',
+                    last_reason_code = CASE
+                        WHEN last_reason_code IN (
+                            'operation_timeout_unknown',
+                            'interrupted_unknown_outcome'
+                        ) THEN NULL
+                        ELSE last_reason_code
+                    END,
+                    updated_at = ?
                 WHERE item_uuid = ?
                   AND state IN (
                     'verification_required', 'waiting_source', 'failed',
@@ -1037,6 +1098,7 @@ class DownloadQueueService:
                 """,
                 (now, item["batch_uuid"]),
             )
+            self._refresh_batch_locked(conn, item["batch_uuid"], now)
         self._wake.set()
         updated = self.get_item(item_uuid) or item
         self._emit("download:queue_updated", updated)
@@ -1067,7 +1129,15 @@ class DownloadQueueService:
                     """
                     UPDATE download_queue_items
                     SET state = 'ready', scheduled_for = ?, cooldown_until = NULL,
-                        queue_reason = 'manual_retry', updated_at = ?
+                        queue_reason = 'manual_retry',
+                        last_reason_code = CASE
+                            WHEN last_reason_code IN (
+                                'operation_timeout_unknown',
+                                'interrupted_unknown_outcome'
+                            ) THEN NULL
+                            ELSE last_reason_code
+                        END,
+                        updated_at = ?
                     WHERE item_uuid = ?
                     """,
                     (_iso(cursor), _iso(now), row["item_uuid"]),
@@ -1084,6 +1154,7 @@ class DownloadQueueService:
                     """,
                     (interval * 60, _iso(now), batch_uuid),
                 )
+                self._refresh_batch_locked(conn, batch_uuid, _iso(now))
         self._wake.set()
         return {"scheduled": len(rows), "interval_minutes": interval}
 
@@ -1093,46 +1164,98 @@ class DownloadQueueService:
         *,
         interval_minutes: int,
         automated: bool,
+        blocked_source: Optional[str] = None,
     ) -> dict:
         if not automated:
             self._assert_hdencode_available()
+        elif not blocked_source:
+            raise DownloadQueueError("Automated resume requires a blocked source.")
         interval = max(0, min(120, int(interval_minutes)))
         now = _utcnow()
         with self.db.transaction() as conn:
             if not conn:
                 raise DownloadQueueError("The database is unavailable.")
-            rows = conn.execute(
-                """
-                SELECT item_uuid
-                FROM download_queue_items
-                WHERE batch_uuid = ?
-                  AND state IN (
-                      'verification_required', 'waiting_source', 'failed'
-                  )
-                ORDER BY sequence_number
-                """,
-                (batch_uuid,),
-            ).fetchall()
+            if automated:
+                rows = conn.execute(
+                    """
+                    SELECT item_uuid
+                    FROM download_queue_items
+                    WHERE batch_uuid = ?
+                      AND source = ?
+                      AND state IN (
+                          'verification_required', 'waiting_source'
+                      )
+                      AND queue_reason IN (
+                          'interactive_challenge', 'source_deferred'
+                      )
+                      AND COALESCE(last_reason_code, '') NOT IN (
+                          'operation_timeout_unknown',
+                          'interrupted_unknown_outcome'
+                      )
+                    ORDER BY sequence_number
+                    """,
+                    (batch_uuid, blocked_source),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT item_uuid
+                    FROM download_queue_items
+                    WHERE batch_uuid = ?
+                      AND state IN (
+                          'verification_required', 'waiting_source', 'failed'
+                      )
+                    ORDER BY sequence_number
+                    """,
+                    (batch_uuid,),
+                ).fetchall()
             cursor = now
             for row in rows:
-                conn.execute(
-                    """
-                    UPDATE download_queue_items
-                    SET state = 'ready', scheduled_for = ?, cooldown_until = NULL,
-                        queue_reason = ?, automated_retry_count =
-                            automated_retry_count + ?,
-                        updated_at = ?
-                    WHERE item_uuid = ?
-                    """,
-                    (
-                        _iso(cursor),
-                        "source_deferred" if automated else "manual_retry",
-                        1 if automated else 0,
-                        _iso(now),
-                        row["item_uuid"],
-                    ),
-                )
-                cursor += timedelta(minutes=interval)
+                if automated:
+                    updated = conn.execute(
+                        """
+                        UPDATE download_queue_items
+                        SET state = 'ready', scheduled_for = ?, cooldown_until = NULL,
+                            queue_reason = 'source_deferred',
+                            automated_retry_count = automated_retry_count + 1,
+                            updated_at = ?
+                        WHERE item_uuid = ?
+                          AND source = ?
+                          AND state IN (
+                              'verification_required', 'waiting_source'
+                          )
+                          AND COALESCE(last_reason_code, '') NOT IN (
+                              'operation_timeout_unknown',
+                              'interrupted_unknown_outcome'
+                          )
+                        """,
+                        (
+                            _iso(cursor),
+                            _iso(now),
+                            row["item_uuid"],
+                            blocked_source,
+                        ),
+                    ).rowcount
+                else:
+                    updated = conn.execute(
+                        """
+                        UPDATE download_queue_items
+                        SET state = 'ready', scheduled_for = ?, cooldown_until = NULL,
+                            queue_reason = 'manual_retry',
+                            last_reason_code = CASE
+                                WHEN last_reason_code IN (
+                                    'operation_timeout_unknown',
+                                    'interrupted_unknown_outcome'
+                                ) THEN NULL
+                                ELSE last_reason_code
+                            END,
+                            updated_at = ?
+                        WHERE item_uuid = ?
+                        """,
+                        (_iso(cursor), _iso(now), row["item_uuid"]),
+                    ).rowcount
+                if updated == 1:
+                    cursor += timedelta(minutes=interval)
             conn.execute(
                 """
                 UPDATE download_queue_batches
@@ -1149,6 +1272,7 @@ class DownloadQueueService:
                     batch_uuid,
                 ),
             )
+            self._refresh_batch_locked(conn, batch_uuid, _iso(now))
         self._wake.set()
         batch = self.get_batch(batch_uuid) or {"batch_uuid": batch_uuid}
         self._emit("download:batch_schedule", batch)

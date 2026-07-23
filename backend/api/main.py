@@ -175,7 +175,11 @@ def _init_services(
         backend.db,
         download_svc,
         broadcast=_download_ws_manager.broadcast_sync,
+        broadcast_flush=_download_ws_manager.broadcast_sync_wait,
         on_delivery=_on_queue_delivery,
+        claim_lease_seconds=backend.config.get(
+            "download_queue_claim_lease_seconds", 600
+        ),
     )
     reg._download_queue_service = queue_svc
     queue_svc.start()

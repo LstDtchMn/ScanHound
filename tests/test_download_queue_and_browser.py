@@ -1,8 +1,10 @@
 """Regression coverage for the persistent browser and durable download queue."""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -10,6 +12,7 @@ from fastapi import HTTPException
 import pytest
 
 from backend.api.routes.downloads import remove_download_retry
+from backend.api.ws import ConnectionManager
 from backend.browser_adapter import (
     browser_plan,
     clear_stale_profile_locks,
@@ -272,13 +275,22 @@ def test_claimed_retry_cancel_is_rejected_with_typed_409(tmp_path):
 
 def test_expired_owned_claim_fail_stops_without_automatic_redelivery(tmp_path):
     db = DatabaseManager(str(tmp_path / "expired-claim.db"))
-    fatal_exit = MagicMock()
+    call_order = []
     fake = MagicMock()
+
+    def flush(message):
+        call_order.append(("flush", message))
+        return True
+
+    def fatal_exit(code):
+        call_order.append(("exit", code))
+
     try:
         service = DownloadQueueService(
             {},
             db,
             fake,
+            broadcast_flush=flush,
             fatal_exit=fatal_exit,
         )
         service.schedule_batch([_item(1)], interval_minutes=0, mode="immediate")
@@ -295,7 +307,9 @@ def test_expired_owned_claim_fail_stops_without_automatic_redelivery(tmp_path):
         )
 
         assert service._watchdog_tick() is True
-        fatal_exit.assert_called_once_with(70)
+        assert call_order[0][0] == "flush"
+        assert call_order[0][1]["type"] == "notification"
+        assert call_order[1] == ("exit", 70)
         current = service.get_item(claimed["item_uuid"])
         assert current["state"] == "failed"
         assert current["last_reason_code"] == "operation_timeout_unknown"
@@ -362,3 +376,247 @@ def test_mixed_batch_source_pause_only_defers_matching_source(tmp_path):
         assert fake.download_item.call_count == 1
     finally:
         db.close()
+
+
+def test_auto_resume_scopes_source_and_preserves_unknown_outcome(tmp_path):
+    db = DatabaseManager(str(tmp_path / "auto-resume-poison.db"))
+    fake = MagicMock()
+    items = [
+        _item(1),
+        _item(2),
+        {**_item(3), "url": "https://ddlbase.com/release/3"},
+    ]
+    pause_stamp = "2026-07-23T12:00:00+00:00"
+    expired_cooldown = "2000-01-01T00:00:00+00:00"
+    try:
+        service = DownloadQueueService({}, db, fake)
+        service._coordinator_snapshot = MagicMock(return_value={"blocked": False})
+        batch = service.schedule_batch(
+            items,
+            interval_minutes=0,
+            mode="immediate",
+            auto_resume_after_cooldown=True,
+        )
+        current = service.get_batch(batch["batch_uuid"])
+        hdencode_rows = [row for row in current["items"] if row["source"] == "hdencode"]
+        ddlbase_row = next(row for row in current["items"] if row["source"] == "ddlbase")
+
+        with db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE download_queue_items
+                SET state = 'verification_required',
+                    queue_reason = 'interactive_challenge',
+                    cooldown_until = ?,
+                    last_reason_code = 'interactive_challenge',
+                    updated_at = ?
+                WHERE item_uuid = ?
+                """,
+                (expired_cooldown, pause_stamp, hdencode_rows[0]["item_uuid"]),
+            )
+            conn.execute(
+                """
+                UPDATE download_queue_items
+                SET state = 'waiting_source',
+                    queue_reason = 'source_deferred',
+                    cooldown_until = ?,
+                    last_reason_code = 'source_temporarily_blocked',
+                    updated_at = ?
+                WHERE item_uuid = ?
+                """,
+                (expired_cooldown, pause_stamp, hdencode_rows[1]["item_uuid"]),
+            )
+            conn.execute(
+                """
+                UPDATE download_queue_items
+                SET state = 'failed',
+                    queue_reason = 'manual_retry',
+                    last_reason_code = 'operation_timeout_unknown',
+                    transport_attempted = 1,
+                    updated_at = ?
+                WHERE item_uuid = ?
+                """,
+                (pause_stamp, ddlbase_row["item_uuid"]),
+            )
+            conn.execute(
+                """
+                UPDATE download_queue_batches
+                SET state = 'paused_source',
+                    paused_at = ?,
+                    cooldown_until = ?,
+                    last_reason_code = 'interactive_challenge',
+                    auto_resume_after_cooldown = 1,
+                    auto_resume_used = 0
+                WHERE batch_uuid = ?
+                """,
+                (pause_stamp, expired_cooldown, batch["batch_uuid"]),
+            )
+            service._refresh_batch_locked(conn, batch["batch_uuid"], pause_stamp)
+
+        service._maybe_auto_resume()
+
+        current = service.get_batch(batch["batch_uuid"])
+        by_uuid = {row["item_uuid"]: row for row in current["items"]}
+        assert by_uuid[hdencode_rows[0]["item_uuid"]]["state"] == "ready"
+        assert by_uuid[hdencode_rows[1]["item_uuid"]]["state"] == "ready"
+        poison = by_uuid[ddlbase_row["item_uuid"]]
+        assert poison["state"] == "failed"
+        assert poison["last_reason_code"] == "operation_timeout_unknown"
+        assert current["auto_resume_used"] == 1
+        fake.download_item.assert_not_called()
+    finally:
+        db.close()
+
+
+def test_null_cooldown_batch_does_not_auto_resume(tmp_path):
+    db = DatabaseManager(str(tmp_path / "null-cooldown.db"))
+    try:
+        service = DownloadQueueService({}, db, MagicMock())
+        service._coordinator_snapshot = MagicMock(return_value={"blocked": False})
+        batch = service.schedule_batch(
+            [_item(1)],
+            interval_minutes=0,
+            mode="immediate",
+            auto_resume_after_cooldown=True,
+        )
+        item_uuid = batch["items"][0]["item_uuid"]
+        with db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE download_queue_items
+                SET state = 'waiting_source',
+                    queue_reason = 'source_deferred',
+                    cooldown_until = NULL,
+                    last_reason_code = 'source_temporarily_blocked'
+                WHERE item_uuid = ?
+                """,
+                (item_uuid,),
+            )
+            conn.execute(
+                """
+                UPDATE download_queue_batches
+                SET state = 'paused_source', cooldown_until = NULL,
+                    auto_resume_after_cooldown = 1, auto_resume_used = 0
+                WHERE batch_uuid = ?
+                """,
+                (batch["batch_uuid"],),
+            )
+
+        service._maybe_auto_resume()
+
+        assert service.get_item(item_uuid)["state"] == "waiting_source"
+        assert service.get_batch(batch["batch_uuid"])["auto_resume_used"] == 0
+    finally:
+        db.close()
+
+
+def test_claim_lease_config_override_is_written_to_claim(tmp_path):
+    db = DatabaseManager(str(tmp_path / "lease-config.db"))
+    try:
+        service = DownloadQueueService(
+            {"download_queue_claim_lease_seconds": 123},
+            db,
+            MagicMock(),
+        )
+        service.schedule_batch([_item(1)], interval_minutes=0, mode="immediate")
+        claimed = service._claim_due()
+        assert claimed is not None
+        current = service.get_item(claimed["item_uuid"])
+        attempted = datetime.fromisoformat(current["last_attempt_at"])
+        expires = datetime.fromisoformat(current["claim_expires_at"])
+        assert 122 <= (expires - attempted).total_seconds() <= 124
+    finally:
+        db.close()
+
+
+def test_claim_due_rejects_poison_until_manual_retry(tmp_path):
+    db = DatabaseManager(str(tmp_path / "claim-poison.db"))
+    try:
+        service = DownloadQueueService({}, db, MagicMock())
+        service._assert_hdencode_available = MagicMock()
+        batch = service.schedule_batch([_item(1)], interval_minutes=0, mode="immediate")
+        item_uuid = batch["items"][0]["item_uuid"]
+        db._mutate(
+            """
+            UPDATE download_queue_items
+            SET state = 'ready',
+                last_reason_code = 'operation_timeout_unknown'
+            WHERE item_uuid = ?
+            """,
+            (item_uuid,),
+            label="poison_claim_guard",
+        )
+
+        assert service._claim_due() is None
+        retried = service.retry_item(item_uuid)
+        assert retried["last_reason_code"] is None
+        assert service._claim_due() is not None
+    finally:
+        db.close()
+
+
+def test_manual_retry_refreshes_batch_counters(tmp_path):
+    db = DatabaseManager(str(tmp_path / "retry-counters.db"))
+    try:
+        service = DownloadQueueService({}, db, MagicMock())
+        service._assert_hdencode_available = MagicMock()
+        batch = service.schedule_batch([_item(1)], interval_minutes=0, mode="immediate")
+        item_uuid = batch["items"][0]["item_uuid"]
+        now = "2026-07-23T12:00:00+00:00"
+        with db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE download_queue_items
+                SET state = 'failed', last_reason_code = 'download_failed'
+                WHERE item_uuid = ?
+                """,
+                (item_uuid,),
+            )
+            service._refresh_batch_locked(conn, batch["batch_uuid"], now)
+        assert service.get_batch(batch["batch_uuid"])["failed_items"] == 1
+
+        service.retry_item(item_uuid)
+
+        refreshed = service.get_batch(batch["batch_uuid"])
+        assert refreshed["failed_items"] == 0
+        assert refreshed["items"][0]["state"] == "ready"
+    finally:
+        db.close()
+
+
+def test_websocket_sync_wait_flushes_before_return():
+    manager = ConnectionManager()
+    loop = asyncio.new_event_loop()
+    loop_ready = threading.Event()
+    messages = []
+
+    class FakeWebSocket:
+        async def accept(self):
+            return None
+
+        async def send_json(self, message):
+            messages.append(message)
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop_ready.set()
+        loop.run_forever()
+
+    thread = threading.Thread(target=run_loop, daemon=True)
+    thread.start()
+    assert loop_ready.wait(timeout=2)
+    ws = FakeWebSocket()
+    try:
+        manager.set_loop(loop)
+        asyncio.run_coroutine_threadsafe(manager.connect(ws), loop).result(timeout=2)
+        payload = {"type": "notification", "data": {"title": "Timed out"}}
+        assert manager.broadcast_sync_wait(payload, timeout=1.0) is True
+        assert messages[-1] == payload
+    finally:
+        try:
+            asyncio.run_coroutine_threadsafe(manager.disconnect(ws), loop).result(timeout=2)
+        except Exception:
+            pass
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
