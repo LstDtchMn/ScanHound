@@ -669,11 +669,15 @@ class TestDownloads:
             ]
         })
         assert resp.status_code == 200
-        assert resp.json()["status"] == "started"
+        # Batches are now delegated to the durable download queue, which
+        # schedules them rather than starting them inline.
+        assert resp.json()["status"] == "scheduled"
 
     def test_download_batch_empty_items(self, client):
         resp = client.post("/download/batch", json={"items": []})
-        assert resp.status_code == 200
+        # The durable queue rejects an empty batch; the route surfaces the
+        # scheduler's error as a 409 (via its generic exception handler).
+        assert resp.status_code == 409
 
     def test_download_batch_missing_url(self, client):
         resp = client.post("/download/batch", json={
