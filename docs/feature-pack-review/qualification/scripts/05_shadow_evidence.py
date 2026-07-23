@@ -229,7 +229,11 @@ def main():
         reasons.append("normal_feeds_unhealthy_or_stale")
     if integrity != "ok":
         reasons.append(f"integrity_check={integrity}")
-    if user_version != 6:
+    # Prod schema legitimately advanced 6 -> 7 (4K metadata inventory) -> 8
+    # (HDEncode persistent-browser + durable download queue) via authorized
+    # deploys during the shadow window; 8 is current main. A value other than 8
+    # now signals an unexpected/unauthorized schema change.
+    if user_version != 8:
         reasons.append(f"unexpected_schema_version={user_version}")
     if miss_count_mismatches:
         reasons.append("shadow_miss_count_mismatch")
@@ -294,7 +298,7 @@ def main():
             "auto_action_rows": int(auto_action_rows or 0),
             "active_action_rows": int(active_action_rows or 0),
             "miss_count_mismatches": int(miss_count_mismatches or 0),
-            "schema_version_expected": 6,
+            "schema_version_expected": 8,
             "violations": [
                 reason for reason in reasons
                 if reason.startswith((
