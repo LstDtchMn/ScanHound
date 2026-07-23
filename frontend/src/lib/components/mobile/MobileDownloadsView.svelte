@@ -4,6 +4,7 @@
   import { addToast } from '$lib/stores/notifications';
   import { groupDownloads, type DownloadGroup } from '$lib/downloads/dupes';
   import type { DownloadResult } from '$lib/api/types';
+  import VerificationRetries from '$lib/components/VerificationRetries.svelte';
 
   let results = $state<DownloadResult[]>([]);
   let loaded = $state(false);
@@ -111,7 +112,9 @@
     <button class="px-2 py-1 rounded bg-[var(--bg-tertiary)] text-xs" onclick={clearFinished}>Clear&nbsp;done</button>
   </div>
 
-  <div class="flex-1 overflow-y-auto p-3 space-y-3">
+  <div class="flex-1 overflow-y-auto">
+    <VerificationRetries />
+    <div class="p-3 space-y-3">
     {#if loaded && results.length === 0}
       <p class="text-center text-[var(--text-secondary)] mt-10">No active downloads.</p>
     {/if}
@@ -147,5 +150,6 @@
         {/each}
       </div>
     {/each}
+    </div>
   </div>
 </div>

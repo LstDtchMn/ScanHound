@@ -219,7 +219,7 @@ class DatabaseManager:
     # ── Schema initialization ────────────────────────────────────────
 
     # Schema version — increment when migrations are added.
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     def init_db(self):
         """Initialize database tables and run schema migrations.
@@ -1059,6 +1059,92 @@ class DatabaseManager:
                     ON hdencode_actions(canonical_url)
                     WHERE state IN (
                         'queued', 'retrieving_links', 'links_ready', 'submitting'
+                    )
+                """)
+
+                # Durable download scheduling and verification-retry queue (v8).
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS download_queue_batches (
+                        batch_uuid TEXT PRIMARY KEY,
+                        mode TEXT NOT NULL CHECK(mode IN (
+                            'immediate', 'staggered', 'verification_retry'
+                        )),
+                        interval_seconds INTEGER NOT NULL DEFAULT 0,
+                        state TEXT NOT NULL CHECK(state IN (
+                            'scheduled', 'running', 'paused_source',
+                            'waiting_user', 'completed', 'cancelled'
+                        )),
+                        source TEXT,
+                        total_items INTEGER NOT NULL DEFAULT 0,
+                        completed_items INTEGER NOT NULL DEFAULT 0,
+                        failed_items INTEGER NOT NULL DEFAULT 0,
+                        deferred_items INTEGER NOT NULL DEFAULT 0,
+                        auto_resume_after_cooldown INTEGER NOT NULL DEFAULT 0,
+                        auto_resume_used INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        paused_at TEXT,
+                        cooldown_until TEXT,
+                        last_reason_code TEXT,
+                        last_cause_code TEXT
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS download_queue_items (
+                        item_uuid TEXT PRIMARY KEY,
+                        batch_uuid TEXT NOT NULL REFERENCES download_queue_batches(batch_uuid)
+                            ON DELETE CASCADE,
+                        sequence_number INTEGER NOT NULL,
+                        source TEXT NOT NULL,
+                        canonical_url TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        year INTEGER,
+                        season INTEGER,
+                        resolution TEXT,
+                        size_text TEXT,
+                        hdr TEXT,
+                        dovi INTEGER NOT NULL DEFAULT 0,
+                        service_type TEXT NOT NULL,
+                        queue_reason TEXT NOT NULL CHECK(queue_reason IN (
+                            'user_batch', 'interactive_challenge',
+                            'source_deferred', 'manual_retry'
+                        )),
+                        state TEXT NOT NULL CHECK(state IN (
+                            'scheduled', 'ready', 'claimed', 'waiting_source',
+                            'verification_required', 'completed', 'failed',
+                            'cancelled'
+                        )),
+                        scheduled_for TEXT,
+                        cooldown_until TEXT,
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        automated_retry_count INTEGER NOT NULL DEFAULT 0,
+                        last_attempt_at TEXT,
+                        last_reason_code TEXT,
+                        last_cause_code TEXT,
+                        last_message TEXT,
+                        transport_attempted INTEGER,
+                        claimed_by TEXT,
+                        claim_expires_at TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        cancelled_at TEXT
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_download_queue_due
+                    ON download_queue_items(state, scheduled_for, sequence_number)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_download_queue_batch
+                    ON download_queue_items(batch_uuid, sequence_number)
+                """)
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_download_queue_active_item
+                    ON download_queue_items(source, canonical_url, service_type)
+                    WHERE state IN (
+                        'scheduled', 'ready', 'claimed', 'waiting_source',
+                        'verification_required'
                     )
                 """)
 

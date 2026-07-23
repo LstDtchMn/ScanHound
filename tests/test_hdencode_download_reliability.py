@@ -181,32 +181,27 @@ def test_deferred_result_is_source_wide_and_never_attempted():
     assert is_source_wide_denial(result)
 
 
-def test_batch_stops_transport_after_first_source_wide_failure(monkeypatch):
+def test_batch_route_schedules_durable_queue_without_inline_transport():
     from backend.api.routes import downloads as download_routes
 
-    challenge = {
-        "success": False,
-        "method": "",
-        "link_count": 0,
-        "message": "Verification required.",
-        "reason_code": "interactive_challenge",
-        "cause_code": "interactive_challenge",
-        "stage": "verification",
-        "retryable": False,
-        "retry_mode": "manual_verification",
-        "cooldown_until": "2099-01-01T00:00:00+00:00",
-        "transport_attempted": True,
-        "affected_scope": "source",
-        "action_code": "verification_required",
-        "signals": [],
-    }
     dl = MagicMock()
-    dl.download_item.return_value = challenge
-    reg = SimpleNamespace(download=dl, db=None, scanner=None)
+    queue = MagicMock()
+    queue.schedule_batch.return_value = {
+        "batch_uuid": "batch-1",
+        "total_items": 3,
+        "mode": "staggered",
+        "interval_seconds": 600,
+        "items": [],
+    }
+    reg = SimpleNamespace(
+        download=dl,
+        download_queue=queue,
+        config={
+            "download_batch_interval_minutes": 10,
+            "download_queue_auto_resume_after_cooldown": False,
+        },
+    )
     tasks = BackgroundTasks()
-    events = []
-    monkeypatch.setattr(download_routes.ws_manager, "broadcast_sync", events.append)
-
     request = download_routes.BatchDownloadRequest(items=[
         download_routes.DownloadRequest(
             url=f"https://hdencode.org/release/{index}",
@@ -214,18 +209,24 @@ def test_batch_stops_transport_after_first_source_wide_failure(monkeypatch):
         )
         for index in range(3)
     ])
-    response = download_routes.download_batch(request, tasks, reg)
-    assert response == {"status": "started", "count": 3}
-    task = tasks.tasks[0]
-    task.func(*task.args, **task.kwargs)
 
-    assert dl.download_item.call_count == 1
-    batch_result = next(
-        event for event in events if event.get("type") == "download:batch_result"
-    )
-    assert batch_result["data"]["failed"] == 1
-    assert batch_result["data"]["deferred"] == 2
-    assert all(
-        outcome["transport_attempted"] is False
-        for outcome in batch_result["data"]["outcomes"][1:]
-    )
+    response = download_routes.download_batch(request, tasks, reg)
+
+    assert response == {
+        "status": "scheduled",
+        "count": 3,
+        "batch_uuid": "batch-1",
+        "mode": "staggered",
+        "interval_minutes": 10,
+        "items": [],
+    }
+    assert tasks.tasks == []
+    assert dl.download_item.call_count == 0
+    queue.schedule_batch.assert_called_once()
+    args, kwargs = queue.schedule_batch.call_args
+    assert len(args[0]) == 3
+    assert kwargs == {
+        "interval_minutes": 10,
+        "mode": "staggered",
+        "auto_resume_after_cooldown": False,
+    }

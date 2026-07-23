@@ -54,6 +54,7 @@ jobs:
           mkdir -p test-artifacts
           pytest -q \
             tests/test_hdencode_download_reliability.py \
+            tests/test_download_queue_and_browser.py \
             tests/test_hdencode_coordinator.py \
             tests/test_source_health.py \
             tests/test_scrape_outcomes.py \
@@ -90,3 +91,21 @@ jobs:
           name: hdencode-reliability-python-${{ matrix.python-version }}
           path: test-artifacts/
           retention-days: 30
+
+  frontend:
+    name: Frontend check, unit, and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm run test:unit
+      - run: npm run build

@@ -90,8 +90,14 @@ class AppConfig(TypedDict, total=False):
     # path, so toggling one silently did nothing. Which categories a scan
     # covers is driven by the per-scan flags in scanner_service.py.)
 
-    # Source enablement
+    # Source enablement and HDEncode browser/queue behavior
     hdencode_enabled: bool
+    hdencode_browser_adapter: Literal["selenium_chromium", "uc_chromium"]
+    hdencode_browser_profile_mode: Literal["persistent", "temporary"]
+    hdencode_browser_profile_dir: str
+    download_batch_interval_minutes: int
+    download_queue_auto_resume_after_cooldown: bool
+    download_queue_claim_lease_seconds: int
 
     # DDLBase / Cuty.io
     ddlbase_enabled: bool
@@ -455,6 +461,17 @@ _DEFAULT_CONFIG: AppConfig = {
     "verbose_logging": False,
     "exclude_720p": False,
     "hdencode_enabled": True,
+    # The ordinary Selenium adapter is the production default. The historical
+    # UC adapter remains available as an explicit rollback while A/B evidence is
+    # collected. A persistent profile preserves cookies/storage across restarts.
+    "hdencode_browser_adapter": "selenium_chromium",
+    "hdencode_browser_profile_mode": "persistent",
+    "hdencode_browser_profile_dir": "",
+    # Multi-title grabs are deliberately spaced by default. Set 0 for immediate.
+    "download_batch_interval_minutes": 10,
+    "download_queue_auto_resume_after_cooldown": False,
+    # Fail-stop lease for the single durable queue worker. Tunable without code.
+    "download_queue_claim_lease_seconds": 600,
     "ddlbase_enabled": True,
     "ddlbase_manual_resolution_timeout": 60,
     "cuty_email": "",
@@ -631,6 +648,26 @@ def validate_config(config: dict) -> dict:
         cleaned['upgrade_sensitivity'] = 0
     if _safe_numeric(cleaned.get('upgrade_dv_loss_sensitivity'), 0) < 0:
         cleaned['upgrade_dv_loss_sensitivity'] = 0
+    if cleaned.get('download_batch_interval_minutes') is not None:
+        cleaned['download_batch_interval_minutes'] = max(
+            0,
+            min(120, _safe_int(cleaned['download_batch_interval_minutes'], 10)),
+        )
+    if cleaned.get('download_queue_claim_lease_seconds') is not None:
+        cleaned['download_queue_claim_lease_seconds'] = max(
+            60,
+            min(7200, _safe_int(
+                cleaned['download_queue_claim_lease_seconds'], 600
+            )),
+        )
+    if cleaned.get('hdencode_browser_adapter') not in (
+        None, "selenium_chromium", "uc_chromium"
+    ):
+        cleaned['hdencode_browser_adapter'] = "selenium_chromium"
+    if cleaned.get('hdencode_browser_profile_mode') not in (
+        None, "persistent", "temporary"
+    ):
+        cleaned['hdencode_browser_profile_mode'] = "persistent"
 
     if cleaned.get('plex_refresh_mode') not in (None, "auto", "force_refresh", "cache_only"):
         cleaned['plex_refresh_mode'] = "auto"

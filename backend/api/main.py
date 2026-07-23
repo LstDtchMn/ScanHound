@@ -50,6 +50,7 @@ _REGISTRY_LIFESPAN_FIELDS = (
     "_scanner_service",
     "_plex_service",
     "_download_service",
+    "_download_queue_service",
     "_auto_grab_service",
     "_notification_bridge",
     "_watchlist_manager",
@@ -157,6 +158,31 @@ def _init_services(
     download_svc = DownloadService(backend.config, backend.db, server_mode=True)
     reg._download_service = download_svc
     download_svc.driver_preflight()  # log browser version; warn on drift early
+
+    # Durable download queue: owns staggered batches and verification retries.
+    from backend.download_queue import DownloadQueueService
+    from backend.api.ws import ws_manager as _download_ws_manager
+
+    def _on_queue_delivery() -> None:
+        # Preserve the existing batch route's post-delivery cache annotation.
+        try:
+            scanner_svc.rematch_cache()
+        except Exception:
+            logger.debug("queued post-grab cache re-match skipped", exc_info=True)
+
+    queue_svc = DownloadQueueService(
+        backend.config,
+        backend.db,
+        download_svc,
+        broadcast=_download_ws_manager.broadcast_sync,
+        broadcast_flush=_download_ws_manager.broadcast_sync_wait,
+        on_delivery=_on_queue_delivery,
+        claim_lease_seconds=backend.config.get(
+            "download_queue_claim_lease_seconds", 600
+        ),
+    )
+    reg._download_queue_service = queue_svc
+    queue_svc.start()
 
     # Auto-grab
     auto_grab_svc = AutoGrabService(backend.config, download_svc)
@@ -487,6 +513,11 @@ def _teardown_services(reg: ServiceRegistry) -> None:
     """Gracefully shut down one lifespan, then erase its complete object graph."""
     reg.request_shutdown()  # stop the background results poller
     try:
+        if reg._download_queue_service:
+            try:
+                reg._download_queue_service.stop()
+            except Exception:
+                pass
         if reg._background_scanner:
             try:
                 reg._background_scanner.stop()

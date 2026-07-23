@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -78,6 +79,45 @@ class ConnectionManager:
         loop.call_soon_threadsafe(
             lambda m=msg_copy: asyncio.ensure_future(self.broadcast(m))
         )
+
+    def broadcast_sync_wait(
+        self,
+        message: Dict[str, Any],
+        timeout: float = 2.0,
+    ) -> bool:
+        """Broadcast from a worker thread and wait for the event-loop send.
+
+        This is reserved for fail-stop paths that will immediately terminate the
+        process. Ordinary background updates should continue using broadcast_sync.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return False
+        try:
+            if asyncio.get_running_loop() is loop:
+                loop.create_task(self.broadcast(dict(message)))
+                return False
+        except RuntimeError:
+            pass
+        wait_seconds = max(0.1, float(timeout))
+
+        async def _bounded_broadcast() -> None:
+            await asyncio.wait_for(
+                self.broadcast(dict(message)),
+                timeout=wait_seconds,
+            )
+
+        future = asyncio.run_coroutine_threadsafe(_bounded_broadcast(), loop)
+        try:
+            future.result(timeout=wait_seconds + 0.5)
+            return True
+        except FutureTimeoutError:
+            future.cancel()
+            logger.warning("synchronous WebSocket broadcast timed out")
+        except Exception:
+            future.cancel()
+            logger.warning("synchronous WebSocket broadcast failed", exc_info=True)
+        return False
 
 
 ws_manager = ConnectionManager()

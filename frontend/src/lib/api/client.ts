@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, PlexMetadataScanStatus, MediaInventoryResponse, MediaInventoryFacets, MetadataScanRun, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, TrashDeleteResponse, TrashEmptyResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, PlexMetadataScanStatus, MediaInventoryResponse, MediaInventoryFacets, MetadataScanRun, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, DownloadQueueItem, BrowserStatus, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, TrashDeleteResponse, TrashEmptyResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -323,15 +323,43 @@ export const api = {
       body: JSON.stringify({ url, title, service_type: serviceType, year: year ?? null,
                              resolution, size, hdr, dovi, season: season ?? null })
     }),
-  downloadBatch: (items: { url: string; title: string; year?: number | null; season?: number | null; resolution?: string; size?: string; hdr?: string; dovi?: boolean }[], serviceType = 'Rapidgator') =>
-    request('/download/batch', {
+  downloadBatch: (
+    items: { url: string; title: string; year?: number | null; season?: number | null; resolution?: string; size?: string; hdr?: string; dovi?: boolean }[],
+    serviceType = 'Rapidgator',
+    execution?: { mode?: 'immediate' | 'staggered'; interval_minutes?: number; auto_resume_after_cooldown?: boolean }
+  ) =>
+    request<{ status: string; count: number; batch_uuid: string; mode: string; interval_minutes: number }>('/download/batch', {
       method: 'POST',
-      body: JSON.stringify({ items: items.map(i => ({
-        url: i.url, title: i.title, year: i.year ?? null, season: i.season ?? null,
-        resolution: i.resolution ?? '', size: i.size ?? '', hdr: i.hdr ?? '', dovi: i.dovi ?? false,
-        service_type: serviceType,
-      })) })
+      body: JSON.stringify({
+        items: items.map(i => ({
+          url: i.url, title: i.title, year: i.year ?? null, season: i.season ?? null,
+          resolution: i.resolution ?? '', size: i.size ?? '', hdr: i.hdr ?? '', dovi: i.dovi ?? false,
+          service_type: serviceType,
+        })),
+        execution: execution ?? null
+      })
     }),
+  browserStatus: () => request<BrowserStatus>('/download/browser-status'),
+  downloadRetries: (limit = 250) =>
+    request<{ items: DownloadQueueItem[]; count: number; status: Record<string, unknown> }>(`/download/retries?limit=${limit}`),
+  retryDownloadItem: (itemUuid: string) =>
+    request<DownloadQueueItem>(`/download/retries/${encodeURIComponent(itemUuid)}/retry`, { method: 'POST' }),
+  retryReadyDownloads: (intervalMinutes = 10) =>
+    request<{ scheduled: number; interval_minutes: number }>('/download/retries/retry-ready', {
+      method: 'POST',
+      body: JSON.stringify({ interval_minutes: intervalMinutes })
+    }),
+  removeDownloadRetry: (itemUuid: string) =>
+    request<{ ok: boolean; item_uuid: string }>(`/download/retries/${encodeURIComponent(itemUuid)}`, { method: 'DELETE' }),
+  downloadBatches: (limit = 100) =>
+    request<{ items: Record<string, unknown>[]; count: number }>(`/download/batches?limit=${limit}`),
+  resumeDownloadBatch: (batchUuid: string, intervalMinutes = 10) =>
+    request<Record<string, unknown>>(`/download/batches/${encodeURIComponent(batchUuid)}/resume`, {
+      method: 'POST',
+      body: JSON.stringify({ interval_minutes: intervalMinutes })
+    }),
+  cancelDownloadBatch: (batchUuid: string) =>
+    request<{ ok: boolean; batch_uuid: string }>(`/download/batches/${encodeURIComponent(batchUuid)}`, { method: 'DELETE' }),
   scrapeLinks: (url: string, serviceType = 'Rapidgator', title = '', resolution = '') =>
     request<{ links: string[]; count: number }>('/download/scrape', {
       method: 'POST',

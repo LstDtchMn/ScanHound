@@ -1,6 +1,13 @@
 #!/bin/sh
 set -e
 
+# Resolve the profile through backend.browser_adapter, the same authority the
+# browser launcher uses. This runs before ScanHound starts, so no live browser
+# can legitimately own these exact Singleton* artifacts.
+if ! python -m backend.browser_adapter --cleanup-stale-profile-locks; then
+  echo "[entrypoint] WARNING: browser profile lock cleanup failed" >&2
+fi
+
 # Virtual display so undetected-chromedriver can run a headful Chromium
 # (needed to clear Cloudflare on HDEncode). SUPERVISED — a crashed Xvfb
 # otherwise leaves DISPLAY :99 dead and silently breaks ALL scraping: every
@@ -20,21 +27,6 @@ if command -v Xvfb >/dev/null 2>&1; then
       sleep 2
     done ) &
 fi
-
-# Stale Chromium profile locks. The browser profile lives under the scanhound
-# user's home (/data), which is a PERSISTENT volume — so a container that dies
-# while Chromium is running leaves SingletonLock/Cookie/Socket behind pointing
-# at a DEAD container's hostname+PID (e.g. "36a3997fb5cf-9776"). They survive
-# even a full `compose up --build` recreate. The next Chromium then refuses to
-# start ("The profile appears to be in use by another Chromium process"), and a
-# Chromium that dies during launch surfaces to chromedriver as exactly the same
-# "session not created: chrome not reachable" a dead display produces — so this
-# is a second, independent cause of the identical, easily-misattributed
-# failure. Nothing can legitimately hold the profile at container start, so
-# clearing these here is always safe.
-rm -f /data/.config/chromium/SingletonLock \
-      /data/.config/chromium/SingletonCookie \
-      /data/.config/chromium/SingletonSocket 2>/dev/null || true
 
 # --no-auth only disables the desktop-sidecar nonce (SCANHOUND_AUTH_NONCE) —
 # it does NOT disable the app's own password gate. The bearer-token

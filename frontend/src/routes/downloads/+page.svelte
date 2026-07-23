@@ -9,6 +9,7 @@
   import Badge from '$lib/components/Badge.svelte';
   import Skeleton from '$lib/components/Skeleton.svelte';
   import ErrorCard from '$lib/components/ErrorCard.svelte';
+  import VerificationRetries from '$lib/components/VerificationRetries.svelte';
   import { selectedKeys, results } from '$lib/stores/results';
   import { addToast } from '$lib/stores/notifications';
   import { downloadQueue, batchProgress, downloadHost, type QueueItem } from '$lib/stores/downloads';
@@ -185,6 +186,8 @@
   let statusFilter = $state('all');
   let refreshing = $state(false);
   let collapsedGroups = $state(new Set<string>());
+  let batchIntervalMinutes = $state(10);
+  let batchAutoResume = $state(false);
 
   async function loadHistory() {
     loading = true;
@@ -235,9 +238,16 @@
     }));
 
     try {
-      await api.downloadBatch(items, $downloadHost);
+      const scheduled = await api.downloadBatch(items, $downloadHost, {
+        mode: batchIntervalMinutes === 0 ? 'immediate' : 'staggered',
+        interval_minutes: batchIntervalMinutes,
+        auto_resume_after_cooldown: batchAutoResume
+      });
       queueIds.forEach((q) => downloadQueue.markSent(q.id));
-      addToast('Downloads Started', `Queued ${items.length} item(s) for download.`);
+      const spacing = scheduled.interval_minutes === 0
+        ? 'immediately'
+        : `every ${scheduled.interval_minutes} minutes`;
+      addToast('Downloads Scheduled', `${items.length} item(s), ${spacing}.`);
     } catch (e) {
       queueIds.forEach((q) => downloadQueue.markFailed(q.id));
       addToast('Error', e instanceof Error ? e.message : 'Failed to start downloads.', 'error');
@@ -248,6 +258,7 @@
     switch (status) {
       case 'sending': return 'var(--accent)';
       case 'sent': return 'var(--accent)';
+      case 'waiting': return 'var(--warning)';
       case 'done': return '#22c55e';
       case 'failed': return '#ef4444';
     }
@@ -256,7 +267,8 @@
   function statusLabel(status: QueueItem['status']): string {
     switch (status) {
       case 'sending': return 'Sending...';
-      case 'sent': return 'Sent to JDownloader';
+      case 'sent': return 'Scheduled';
+      case 'waiting': return 'Waiting for verification';
       case 'done': return 'Complete';
       case 'failed': return 'Failed';
     }
@@ -358,6 +370,12 @@
   }
 
   onMount(() => {
+    try {
+      const saved = localStorage.getItem('downloadBatchIntervalMinutes');
+      if (saved !== null) batchIntervalMinutes = Math.max(0, Math.min(120, Number(saved) || 0));
+      batchAutoResume = localStorage.getItem('downloadBatchAutoResume') === 'true';
+    } catch { /* storage is optional */ }
+
     // `mobile` is a live matchMedia store — subscribing (fires immediately with
     // the current value) means a window resized ACROSS the md breakpoint (a
     // desktop browser narrowed then widened) still wires up the desktop view
@@ -394,6 +412,34 @@
     >
       Download Selected ({$selectedKeys.size})
     </button>
+    <label class="text-xs text-[var(--text-secondary)]">
+      Link grabs
+      <select
+        bind:value={batchIntervalMinutes}
+        onchange={() => {
+          try { localStorage.setItem('downloadBatchIntervalMinutes', String(batchIntervalMinutes)); } catch {}
+        }}
+        class="ml-1 px-2 py-2 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-sm text-[var(--text-primary)]"
+      >
+        <option value={0}>Immediate</option>
+        <option value={5}>Every 5 min</option>
+        <option value={10}>Every 10 min</option>
+        <option value={15}>Every 15 min</option>
+        <option value={30}>Every 30 min</option>
+        <option value={60}>Every 60 min</option>
+      </select>
+    </label>
+    <label class="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]">
+      <input
+        type="checkbox"
+        bind:checked={batchAutoResume}
+        onchange={() => {
+          try { localStorage.setItem('downloadBatchAutoResume', String(batchAutoResume)); } catch {}
+        }}
+        class="accent-[var(--accent)]"
+      />
+      Resume once after cooldown
+    </label>
     <input
       type="text"
       bind:value={searchInput}
@@ -419,6 +465,8 @@
     </button>
   </div>
 </div>
+
+<VerificationRetries />
 
 {#if jdInfo}
   <div class="border-b border-[var(--border)]">
