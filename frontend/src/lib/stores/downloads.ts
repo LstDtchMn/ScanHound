@@ -125,7 +125,7 @@ export interface QueueItem {
   id: string;
   title: string;
   url?: string;
-  status: 'sending' | 'sent' | 'done' | 'failed';
+  status: 'sending' | 'sent' | 'waiting' | 'done' | 'failed';
   addedAt: number;
 }
 
@@ -150,6 +150,16 @@ function createDownloadQueue() {
       if (item.url === url && (item.status === 'sending' || item.status === 'sent')) {
         scheduleAutoClear(item.id);
         return { ...item, status: 'done' as const };
+      }
+      return item;
+    }));
+  }
+
+  function markWaitingByUrl(url: string) {
+    if (!url) return;
+    update((q) => q.map((item) => {
+      if (item.url === url && (item.status === 'sending' || item.status === 'sent')) {
+        return { ...item, status: 'waiting' as const };
       }
       return item;
     }));
@@ -188,7 +198,9 @@ function createDownloadQueue() {
   }
 
   function clearCompleted() {
-    update((q) => q.filter((item) => item.status === 'sending' || item.status === 'sent'));
+    update((q) => q.filter((item) =>
+      item.status === 'sending' || item.status === 'sent' || item.status === 'waiting'
+    ));
   }
 
   function scheduleAutoClear(id: string) {
@@ -233,8 +245,26 @@ function createDownloadQueue() {
   // alongside the activeDownload-progress-bar one above; see that comment.
   connection.on('download:complete', (data) => markDoneByUrl((data.url as string) || ''));
   connection.on('download:failed', (data) => markFailedByUrl((data.url as string) || ''));
+  connection.on('download:result', (data) => {
+    const url = (data.url as string) || '';
+    if (data.success) {
+      markDoneByUrl(url);
+    } else if (
+      data.deferred ||
+      data.reason_code === 'interactive_challenge' ||
+      data.reason_code === 'source_temporarily_blocked'
+    ) {
+      markWaitingByUrl(url);
+    } else {
+      markFailedByUrl(url);
+    }
+  });
 
-  return { subscribe, add, markSent, markDone, markFailed, markDoneByUrl, markFailedByUrl, remove, clearCompleted };
+  return {
+    subscribe, add, markSent, markDone, markFailed,
+    markDoneByUrl, markWaitingByUrl, markFailedByUrl,
+    remove, clearCompleted
+  };
 }
 
 export const downloadQueue = createDownloadQueue();

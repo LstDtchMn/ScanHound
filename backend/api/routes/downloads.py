@@ -50,8 +50,23 @@ class DownloadRequest(BaseModel):
     service_type: str = "Rapidgator"
 
 
+class BatchExecution(BaseModel):
+    mode: str = "staggered"
+    interval_minutes: Optional[int] = None
+    auto_resume_after_cooldown: Optional[bool] = None
+
+
 class BatchDownloadRequest(BaseModel):
     items: List[DownloadRequest]
+    execution: Optional[BatchExecution] = None
+
+
+class RetryReadyRequest(BaseModel):
+    interval_minutes: int = 10
+
+
+class ResumeBatchRequest(BaseModel):
+    interval_minutes: int = 10
 
 
 class ScrapeRequest(BaseModel):
@@ -100,6 +115,14 @@ def _run_grab(dl, reg: ServiceRegistry, req: "DownloadRequest", force: bool = Fa
                 "type": "notification",
                 "data": notification_for_result(outcome, title=req.title),
             })
+            if (
+                reg.download_queue is not None
+                and outcome.get("reason_code") in {
+                    "interactive_challenge",
+                    "source_temporarily_blocked",
+                }
+            ):
+                reg.download_queue.enqueue_retry(req, outcome)
         elif method in ("duplicate", "duplicate_similar"):
             ws_manager.broadcast_sync({
                 "type": "notification",
@@ -160,118 +183,144 @@ def download_batch(
     if not dl:
         raise HTTPException(status_code=503, detail="Download service not available")
 
-    total = len(req.items)
+    queue = reg.download_queue
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Download queue not available")
 
-    def _do_batch():
-        try:
-            def _on_progress(event: str, data: dict):
-                ws_manager.broadcast_sync({"type": event, "data": data})
+    execution = req.execution
+    configured_interval = int(reg.config.get("download_batch_interval_minutes", 10) or 0)
+    interval = (
+        configured_interval
+        if execution is None or execution.interval_minutes is None
+        else int(execution.interval_minutes)
+    )
+    mode = (
+        execution.mode
+        if execution is not None
+        else ("immediate" if interval == 0 else "staggered")
+    )
+    auto_resume = (
+        bool(reg.config.get("download_queue_auto_resume_after_cooldown", False))
+        if execution is None or execution.auto_resume_after_cooldown is None
+        else bool(execution.auto_resume_after_cooldown)
+    )
+    try:
+        batch = queue.schedule_batch(
+            [item.model_dump() for item in req.items],
+            interval_minutes=interval,
+            mode=mode,
+            auto_resume_after_cooldown=auto_resume,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {
+        "status": "scheduled",
+        "count": batch.get("total_items", len(req.items)),
+        "batch_uuid": batch.get("batch_uuid"),
+        "mode": batch.get("mode"),
+        "interval_minutes": int(batch.get("interval_seconds") or 0) // 60,
+        "items": batch.get("items", []),
+    }
 
-            delivered = diverted = failed = skipped = deferred = 0
-            outcomes = []
-            blocker = None
-            for i, item in enumerate(req.items):
-                ws_manager.broadcast_sync({
-                    "type": "download:batch_progress",
-                    "data": {"completed": i, "total": total, "current_title": item.title},
-                })
-                if blocker is not None:
-                    res = deferred_result(blocker, title=item.title, url=item.url)
-                else:
-                    res = dl.download_item(
-                        url=item.url, title=item.title, season=item.season,
-                        resolution=item.resolution, size=item.size,
-                        service_type=item.service_type, year=item.year,
-                        hdr=item.hdr, dovi=item.dovi,
-                        progress_callback=_on_progress,
-                    )
-                outcome = public_download_result(res, title=item.title, url=item.url)
-                outcomes.append(outcome)
-                ws_manager.broadcast_sync({"type": "download:result", "data": outcome})
 
-                method = outcome.get("method")
-                if outcome.get("deferred"):
-                    deferred += 1
-                elif not outcome.get("success"):
-                    failed += 1
-                elif method in ("duplicate", "duplicate_similar"):
-                    skipped += 1
-                elif method == "jdownloader":
-                    delivered += 1
-                else:
-                    diverted += 1
-                if blocker is None and is_source_wide_denial(outcome):
-                    blocker = outcome
+@router.get("/browser-status")
+def browser_status(reg: ServiceRegistry = Depends(get_registry)):
+    dl = reg.download
+    if not dl:
+        raise HTTPException(status_code=503, detail="Download service not available")
+    return dl.get_browser_status()
 
-            ws_manager.broadcast_sync({
-                "type": "download:batch_progress",
-                "data": {"completed": total, "total": total, "current_title": ""},
-            })
-            parts = [f"{delivered} sent to JDownloader"]
-            if skipped:
-                parts.append(f"{skipped} already grabbed")
-            if diverted:
-                parts.append(f"{diverted} copied/opened")
-            if failed:
-                parts.append(f"{failed} failed")
-            if deferred:
-                parts.append(f"{deferred} deferred without requests")
 
-            batch_data = {
-                "total": total,
-                "delivered": delivered,
-                "diverted": diverted,
-                "failed": failed,
-                "skipped": skipped,
-                "deferred": deferred,
-                "source_paused": blocker is not None,
-                "block_reason_code": blocker.get("reason_code") if blocker else None,
-                "block_cause_code": blocker.get("cause_code") if blocker else None,
-                "cooldown_until": blocker.get("cooldown_until") if blocker else None,
-                "outcomes": outcomes,
-            }
-            ws_manager.broadcast_sync({"type": "download:batch_result", "data": batch_data})
+@router.get("/retries")
+def list_download_retries(
+    limit: int = 250,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    queue = reg.download_queue
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Download queue not available")
+    items = queue.list_retries(limit=limit)
+    return {"items": items, "count": len(items), "status": queue.status()}
 
-            if blocker is not None:
-                batch_title, batch_priority = "Batch Download Paused", "high"
-            elif failed:
-                batch_title, batch_priority = "Batch Download — some failed", "high"
-            elif diverted:
-                batch_title, batch_priority = "Batch Download", "warning"
-            else:
-                batch_title, batch_priority = "Batch Download", "normal"
-            ws_manager.broadcast_sync({
-                "type": "notification",
-                "data": {
-                    "title": batch_title,
-                    "body": ", ".join(parts),
-                    "priority": batch_priority,
-                    "reason_code": blocker.get("reason_code") if blocker else None,
-                    "cause_code": blocker.get("cause_code") if blocker else None,
-                    "cooldown_until": blocker.get("cooldown_until") if blocker else None,
-                    "deferred": deferred,
-                },
-            })
-            if delivered:
-                _persist_grab_annotations(reg)  # once for the whole batch
-        except Exception as e:
-            public = capture_public_exception(
-                logger, e, code="batch_download_failed",
-                message="The batch download could not be completed.",
-                context="Batch download failed",
-            )
-            for item in req.items:
-                try:
-                    dl.save_to_history(item.url, item.title, item.season, item.resolution, item.size, status="failed", hdr=item.hdr, dovi=item.dovi)
-                except Exception:
-                    pass
-            ws_manager.broadcast_sync({
-                "type": "notification",
-                "data": public.notification_data(title="Batch Failed"),
-            })
 
-    background_tasks.add_task(_do_batch)
-    return {"status": "started", "count": total}
+@router.post("/retries/retry-ready")
+def retry_ready_downloads(
+    req: RetryReadyRequest,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    queue = reg.download_queue
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Download queue not available")
+    try:
+        return queue.retry_ready(req.interval_minutes)
+    except Exception as exc:
+        detail = exc.detail() if hasattr(exc, "detail") else str(exc)
+        raise HTTPException(status_code=409, detail=detail)
+
+
+@router.post("/retries/{item_uuid}/retry")
+def retry_download_item(
+    item_uuid: str,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    queue = reg.download_queue
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Download queue not available")
+    try:
+        return queue.retry_item(item_uuid)
+    except Exception as exc:
+        detail = exc.detail() if hasattr(exc, "detail") else str(exc)
+        raise HTTPException(status_code=409, detail=detail)
+
+
+@router.delete("/retries/{item_uuid}")
+def remove_download_retry(
+    item_uuid: str,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    queue = reg.download_queue
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Download queue not available")
+    return {"ok": queue.cancel_item(item_uuid), "item_uuid": item_uuid}
+
+
+@router.get("/batches")
+def list_download_batches(
+    limit: int = 100,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    queue = reg.download_queue
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Download queue not available")
+    items = queue.list_batches(limit=limit)
+    return {"items": items, "count": len(items)}
+
+
+@router.post("/batches/{batch_uuid}/resume")
+def resume_download_batch(
+    batch_uuid: str,
+    req: ResumeBatchRequest,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    queue = reg.download_queue
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Download queue not available")
+    try:
+        return queue.resume_batch(batch_uuid, req.interval_minutes)
+    except Exception as exc:
+        detail = exc.detail() if hasattr(exc, "detail") else str(exc)
+        raise HTTPException(status_code=409, detail=detail)
+
+
+@router.delete("/batches/{batch_uuid}")
+def cancel_download_batch(
+    batch_uuid: str,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    queue = reg.download_queue
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Download queue not available")
+    return {"ok": queue.cancel_batch(batch_uuid), "batch_uuid": batch_uuid}
 
 
 @router.post("/scrape")

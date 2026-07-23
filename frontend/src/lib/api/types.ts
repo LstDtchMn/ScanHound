@@ -168,6 +168,52 @@ export interface RenameStatus {
   archived: number;
 }
 
+export interface BrowserStatus {
+  adapter: string;
+  profile_mode: string;
+  profile_id?: string | null;
+  browser_name?: string | null;
+  browser_version?: string | null;
+  driver_version?: string | null;
+  headed: boolean;
+  display: string;
+  launch_error?: string | null;
+  session_active: boolean;
+  detected_browser_major?: number | null;
+}
+
+export interface DownloadQueueItem {
+  item_uuid: string;
+  batch_uuid: string;
+  sequence_number: number;
+  source: string;
+  canonical_url: string;
+  title: string;
+  year?: number | null;
+  season?: number | null;
+  resolution?: string | null;
+  size_text?: string | null;
+  hdr?: string | null;
+  dovi: number;
+  service_type: string;
+  queue_reason: string;
+  state: string;
+  scheduled_for?: string | null;
+  cooldown_until?: string | null;
+  attempt_count: number;
+  automated_retry_count: number;
+  last_attempt_at?: string | null;
+  last_reason_code?: string | null;
+  last_cause_code?: string | null;
+  last_message?: string | null;
+  transport_attempted?: number | null;
+  retry_available: boolean;
+  due: boolean;
+  source_state?: string | null;
+  source_reason_code?: string | null;
+  source_cooldown_until?: string | null;
+}
+
 export interface WsMessage {
   type: string;
   data: Record<string, unknown>;

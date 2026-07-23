@@ -101,6 +101,7 @@ class ServiceRegistry:
     _scanner_service: Any = None
     _plex_service: Any = None
     _download_service: Any = None
+    _download_queue_service: Any = None
     _auto_grab_service: Any = None
     _notification_bridge: Any = None
     _watchlist_manager: Any = None
@@ -128,6 +129,10 @@ class ServiceRegistry:
     @property
     def download(self):
         return self._download_service
+
+    @property
+    def download_queue(self):
+        return self._download_queue_service
 
     @property
     def auto_grab(self):

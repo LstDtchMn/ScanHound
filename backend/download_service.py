@@ -31,6 +31,11 @@ from backend.download_outcome import (
     diagnostic_from_traffic_denial,
     strong_challenge_markers,
 )
+from backend.browser_adapter import (
+    browser_plan,
+    launch_browser,
+    safe_status_without_driver,
+)
 from backend.source_health import record_scrape_outcome
 
 logger = logging.getLogger(__name__)
@@ -68,7 +73,6 @@ def fold_name(name: str) -> str:
 
 
 # Lazy imports for optional heavy dependencies
-_uc = None
 _By = None
 _WebDriverWait = None
 _EC = None
@@ -230,14 +234,12 @@ def _is_archive_name(name: str) -> bool:
 
 
 def _ensure_selenium():
-    """Lazy-load Selenium and undetected-chromedriver."""
-    global _uc, _By, _WebDriverWait, _EC
-    if _uc is None:
-        import undetected_chromedriver as uc_mod
+    """Lazy-load Selenium primitives without importing a specific adapter."""
+    global _By, _WebDriverWait, _EC
+    if _By is None:
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
-        _uc = uc_mod
         _By = By
         _WebDriverWait = WebDriverWait
         _EC = EC
@@ -257,6 +259,11 @@ class DownloadService:
 
         # WebDriver
         self.cached_driver = None
+        self._browser_status: Dict[str, Any] = safe_status_without_driver(
+            self.config,
+            chrome_bin=os.environ.get("CHROME_BIN"),
+            system_driver="/usr/bin/chromedriver",
+        )
         self._driver_lock = threading.RLock()
         self._active_scrapes = 0
         self._scrape_count_lock = threading.Lock()
@@ -1048,6 +1055,16 @@ class DownloadService:
         grab is attempted.
         """
         major = self._detect_chrome_major()
+        plan = browser_plan(
+            self.config,
+            chrome_bin=os.environ.get("CHROME_BIN"),
+            system_driver="/usr/bin/chromedriver",
+        )
+        self._log(
+            f"Scraper preflight: adapter={plan.adapter}, "
+            f"profile={plan.profile_mode}",
+            "info",
+        )
         if major:
             self._log(f"Scraper preflight: detected browser major version {major}", "info")
         else:
@@ -1090,51 +1107,46 @@ class DownloadService:
             chrome_bin = os.environ.get("CHROME_BIN")
             system_driver = "/usr/bin/chromedriver"
 
-            # Launch with a bounded retry. Chrome intermittently fails to start
-            # in the container ("session not created: cannot connect to chrome")
-            # — a wedged/orphaned chrome process, a transient Xvfb hiccup, or a
-            # launch race. Observed live as bursts of ~26 back-to-back failures
-            # that killed every scrape until they cleared. Reaping stale
-            # processes + a short backoff lets a fresh launch recover instead of
-            # failing the scrape outright. We hold _driver_lock here, and
-            # scrape_links holds it too, so no other scrape can own a live
-            # driver while we reap.
+            # Launch with a bounded retry. The selected adapter is explicit:
+            # standard Selenium + persistent Chromium profile by default, with
+            # the historical UC path retained only as a configured rollback.
             last_err: Optional[Exception] = None
             for attempt in range(1, 4):
-                options = _uc.ChromeOptions()
-                options.add_argument("--window-size=1920,1080")
-                options.add_argument("--disable-gpu")
-                options.add_argument("--no-sandbox")
-                options.add_argument("--disable-dev-shm-usage")
-                options.add_argument("--start-minimized")
-                if chrome_bin and os.path.exists(chrome_bin):
-                    options.binary_location = chrome_bin
-                # On Linux/Docker, use the apt-installed chromedriver — always
-                # version-matched to the apt chromium, so uc never downloads a
-                # mismatched driver. Windows desktop keeps uc's auto-managed one.
-                uc_kwargs: Dict[str, Any] = {"options": options, "version_main": chrome_ver}
-                if os.path.exists(system_driver):
-                    uc_kwargs["driver_executable_path"] = system_driver
                 try:
-                    self.cached_driver = _uc.Chrome(**uc_kwargs)
+                    self.cached_driver, self._browser_status = launch_browser(
+                        self.config,
+                        chrome_ver=chrome_ver,
+                        chrome_bin=chrome_bin,
+                        system_driver=system_driver,
+                    )
                 except Exception as e:
                     last_err = e
                     self.cached_driver = None
-                    self._log(f"[Scrape] Chrome launch failed "
-                              f"(attempt {attempt}/3): {e}", "warning")
+                    self._browser_status = safe_status_without_driver(
+                        self.config,
+                        chrome_bin=chrome_bin,
+                        system_driver=system_driver,
+                        launch_error=type(e).__name__,
+                    )
+                    self._log(
+                        f"[Scrape] Chrome launch failed "
+                        f"(attempt {attempt}/3): {type(e).__name__}",
+                        "warning",
+                    )
                     self._kill_stale_chrome()
                     time.sleep(min(2 * attempt, 5))
                     continue
-                try:
-                    # Cosmetic on the Windows desktop app; unsupported under the
-                    # container's headless Xvfb display, so make it best-effort.
-                    self.cached_driver.minimize_window()
-                except Exception:
-                    pass
                 return self.cached_driver
             # All attempts failed — surface the real error to the caller so the
             # scrape reports an honest failure (not a silent empty result).
             raise last_err if last_err else RuntimeError("Chrome could not be launched")
+
+    def get_browser_status(self) -> dict:
+        """Return a public-safe browser/adapter snapshot for diagnostics."""
+        status = dict(self._browser_status or {})
+        status["session_active"] = self.cached_driver is not None
+        status["detected_browser_major"] = self._detect_chrome_major()
+        return status
 
     def _kill_stale_chrome(self) -> None:
         """Best-effort reap of orphaned chrome/chromedriver processes that can

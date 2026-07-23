@@ -182,8 +182,13 @@ class SettingsUpdate(BaseModel):
     # (Removed with the dead Settings checkboxes: source_2160p / source_remux /
     # source_tv_packs were accepted and stored but never read by any scan path.)
 
-    # Source enablement
+    # Source enablement and browser/queue controls
     hdencode_enabled: Optional[bool] = None
+    hdencode_browser_adapter: Optional[str] = None
+    hdencode_browser_profile_mode: Optional[str] = None
+    hdencode_browser_profile_dir: Optional[str] = None
+    download_batch_interval_minutes: Optional[int] = None
+    download_queue_auto_resume_after_cooldown: Optional[bool] = None
 
     # DDLBase / Cuty.io
     ddlbase_enabled: Optional[bool] = None
