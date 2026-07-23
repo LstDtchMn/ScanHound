@@ -8,8 +8,10 @@ This module does not attempt to solve or bypass interactive challenges.
 """
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -70,6 +72,82 @@ def _profile_dir(config: Dict[str, Any], mode: str) -> Optional[str]:
     except OSError:
         pass
     return str(path)
+
+
+_PROFILE_LOCK_NAMES = (
+    "SingletonLock",
+    "SingletonCookie",
+    "SingletonSocket",
+)
+
+
+def profile_lock_paths(
+    config: Dict[str, Any],
+    *,
+    chrome_bin: Optional[str] = None,
+    system_driver: Optional[str] = None,
+) -> tuple[Path, ...]:
+    """Return only Chromium's process-lock artifacts for the active profile.
+
+    The browser launcher and Docker startup cleanup must resolve the profile
+    through this same module so a configured path cannot drift from cleanup.
+    Temporary profiles intentionally return no persistent lock paths.
+    """
+    plan = browser_plan(
+        config,
+        chrome_bin=chrome_bin,
+        system_driver=system_driver,
+    )
+    if plan.profile_mode != "persistent" or not plan.profile_dir:
+        return ()
+    root = Path(plan.profile_dir)
+    return tuple(root / name for name in _PROFILE_LOCK_NAMES)
+
+
+def clear_stale_profile_locks(
+    config: Dict[str, Any],
+    *,
+    chrome_bin: Optional[str] = None,
+    system_driver: Optional[str] = None,
+) -> tuple[str, ...]:
+    """Remove only stale Singleton* artifacts from the resolved profile.
+
+    This is safe only before a browser process exists. Docker invokes it from
+    the entrypoint before ScanHound starts; normal browser launches do not
+    remove locks from a potentially live profile.
+    """
+    removed: list[str] = []
+    for path in profile_lock_paths(
+        config,
+        chrome_bin=chrome_bin,
+        system_driver=system_driver,
+    ):
+        try:
+            if os.path.lexists(path):
+                os.unlink(path)
+                removed.append(str(path))
+        except FileNotFoundError:
+            continue
+    return tuple(removed)
+
+
+def _runtime_profile_config() -> Dict[str, Any]:
+    """Load the same persisted profile settings used by the application."""
+    from backend.config import CONFIG_FILE, get_default_config, validate_config
+
+    config: Dict[str, Any] = dict(get_default_config())
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as handle:
+            saved = json.load(handle)
+        if isinstance(saved, dict):
+            config.update(saved)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError):
+        # Startup cleanup remains best-effort, matching the historical shell
+        # behavior. The entrypoint reports a warning if this command fails.
+        pass
+    return validate_config(config)
 
 
 def browser_plan(
@@ -192,3 +270,30 @@ def safe_status_without_driver(
         ),
         launch_error=launch_error,
     )
+
+
+def _main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="ScanHound browser lifecycle helper")
+    parser.add_argument(
+        "--cleanup-stale-profile-locks",
+        action="store_true",
+        help="remove only Singleton* files from the configured persistent profile",
+    )
+    args = parser.parse_args(argv)
+    if not args.cleanup_stale_profile_locks:
+        parser.error("no action requested")
+    config = _runtime_profile_config()
+    paths = profile_lock_paths(config)
+    removed = clear_stale_profile_locks(config)
+    if paths:
+        print(
+            "[browser-profile] checked "
+            f"{paths[0].parent}; removed {len(removed)} stale lock artifact(s)"
+        )
+    else:
+        print("[browser-profile] temporary profile mode; no persistent locks to clean")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.public_errors import capture_public_exception
 from backend.api.ws import ws_manager
+from backend.download_queue import DownloadQueueItemClaimed
 from backend.download_service import _source_page_kind
 from backend.source_health import record_scrape_outcome
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
@@ -281,7 +282,11 @@ def remove_download_retry(
     queue = reg.download_queue
     if queue is None:
         raise HTTPException(status_code=503, detail="Download queue not available")
-    return {"ok": queue.cancel_item(item_uuid), "item_uuid": item_uuid}
+    try:
+        ok = queue.cancel_item(item_uuid)
+    except DownloadQueueItemClaimed as exc:
+        raise HTTPException(status_code=409, detail=exc.detail())
+    return {"ok": ok, "item_uuid": item_uuid}
 
 
 @router.get("/batches")
@@ -320,7 +325,11 @@ def cancel_download_batch(
     queue = reg.download_queue
     if queue is None:
         raise HTTPException(status_code=503, detail="Download queue not available")
-    return {"ok": queue.cancel_batch(batch_uuid), "batch_uuid": batch_uuid}
+    try:
+        ok = queue.cancel_batch(batch_uuid)
+    except DownloadQueueItemClaimed as exc:
+        raise HTTPException(status_code=409, detail=exc.detail())
+    return {"ok": ok, "batch_uuid": batch_uuid}
 
 
 @router.post("/scrape")

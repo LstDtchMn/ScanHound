@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, Iterable, Optional
@@ -72,6 +73,27 @@ class DownloadQueueSourceHeld(DownloadQueueError):
         }
 
 
+class DownloadQueueItemClaimed(DownloadQueueError):
+    """Cancellation was rejected because transport may already be active."""
+
+    def __init__(self, *, item_uuid: Optional[str] = None, batch_uuid: Optional[str] = None):
+        super().__init__("An active queue operation cannot be removed safely.")
+        self.item_uuid = item_uuid
+        self.batch_uuid = batch_uuid
+
+    def detail(self) -> dict:
+        return {
+            "code": "download_queue_item_claimed",
+            "item_uuid": self.item_uuid,
+            "batch_uuid": self.batch_uuid,
+            "retryable": True,
+            "message": (
+                "This item is already being processed. Wait for it to finish "
+                "before removing or retrying it."
+            ),
+        }
+
+
 class DownloadQueueService:
     """One restart-safe worker for scheduled link retrieval and verification retries."""
 
@@ -84,6 +106,9 @@ class DownloadQueueService:
         broadcast: Optional[Callable[[dict], None]] = None,
         on_delivery: Optional[Callable[[], None]] = None,
         poll_seconds: float = 2.0,
+        claim_lease_seconds: float = 600.0,
+        watchdog_poll_seconds: float = 2.0,
+        fatal_exit: Optional[Callable[[int], None]] = None,
     ):
         self.config = config if isinstance(config, dict) else {}
         self.db = db
@@ -91,29 +116,41 @@ class DownloadQueueService:
         self.broadcast = broadcast or (lambda _event: None)
         self.on_delivery = on_delivery or (lambda: None)
         self.poll_seconds = max(0.2, float(poll_seconds))
+        self.claim_lease_seconds = max(1.0, float(claim_lease_seconds))
+        self.watchdog_poll_seconds = max(0.05, float(watchdog_poll_seconds))
+        self._fatal_exit = fatal_exit or os._exit
         self.worker_id = str(uuid.uuid4())
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._fatal_recovery_started = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
         self.recover_interrupted()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._fatal_recovery_started.clear()
         self._thread = threading.Thread(
             target=self._worker,
             name="download-queue",
             daemon=True,
         )
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog,
+            name="download-queue-watchdog",
+            daemon=True,
+        )
         self._thread.start()
+        self._watchdog_thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._wake.set()
-        thread = self._thread
-        if thread and thread.is_alive():
-            thread.join(timeout=5)
+        for thread in (self._thread, self._watchdog_thread):
+            if thread and thread.is_alive():
+                thread.join(timeout=5)
 
     def _emit(self, event_type: str, data: dict) -> None:
         try:
@@ -129,18 +166,36 @@ class DownloadQueueService:
         with self.db.transaction() as conn:
             if not conn:
                 return
+            interrupted_batches = conn.execute(
+                """
+                SELECT DISTINCT batch_uuid
+                FROM download_queue_items
+                WHERE state = 'claimed'
+                """
+            ).fetchall()
+            # A process exit can occur after an external delivery but before
+            # the queue row commits. Never auto-redeliver that unknown outcome.
             conn.execute(
                 """
                 UPDATE download_queue_items
-                SET state = 'scheduled',
-                    scheduled_for = COALESCE(scheduled_for, ?),
+                SET state = 'failed',
+                    queue_reason = 'manual_retry',
+                    last_reason_code = 'interrupted_unknown_outcome',
+                    last_message = ?,
+                    transport_attempted = 1,
                     claimed_by = NULL,
                     claim_expires_at = NULL,
                     updated_at = ?
                 WHERE state = 'claimed'
                 """,
-                (grace, _iso(now)),
+                (
+                    "The previous process stopped during this operation. "
+                    "Review JDownloader before retrying to avoid a duplicate.",
+                    _iso(now),
+                ),
             )
+            for row in interrupted_batches:
+                self._refresh_batch_locked(conn, row["batch_uuid"], _iso(now))
             # Re-space overdue scheduled items by batch. This prevents a burst
             # after a long container outage.
             rows = conn.execute(
@@ -422,11 +477,127 @@ class DownloadQueueService:
             self._wake.wait(self.poll_seconds)
             self._wake.clear()
 
+    def _watchdog(self) -> None:
+        while not self._stop.wait(self.watchdog_poll_seconds):
+            try:
+                if self._watchdog_tick():
+                    return
+            except Exception:
+                logger.exception("download queue watchdog iteration failed")
+
+    def _watchdog_tick(self) -> bool:
+        """Fail-stop one expired owned claim; never start a second claimant.
+
+        ScanHound has one queue worker in one process. If that worker exceeds
+        its lease, the outcome of any external handoff is unknowable. The safe
+        recovery is to persist a manual-review failure, then terminate the
+        stuck process so Docker's restart policy can rebuild the worker. The
+        row is not rescheduled automatically.
+        """
+        if self._fatal_recovery_started.is_set():
+            return False
+        recovered = self._recover_expired_claim()
+        if recovered is None:
+            return False
+        self._fatal_recovery_started.set()
+        self._emit(
+            "download:queue_updated",
+            {**recovered, "state": "failed"},
+        )
+        self._emit(
+            "notification",
+            {
+                "title": "Download queue operation timed out",
+                "body": recovered["last_message"],
+                "priority": "high",
+                "reason_code": recovered["last_reason_code"],
+                "item_uuid": recovered["item_uuid"],
+            },
+        )
+        logger.critical(
+            "download queue claim %s exceeded its lease; exiting for supervised restart",
+            recovered["item_uuid"],
+        )
+        self._fatal_exit(70)
+        return True
+
+    def _recover_expired_claim(self) -> Optional[dict]:
+        if self.db is None:
+            return None
+        now = _iso()
+        with self.db.transaction() as conn:
+            if not conn:
+                return None
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT *
+                FROM download_queue_items
+                WHERE state = 'claimed'
+                  AND claimed_by = ?
+                  AND claim_expires_at IS NOT NULL
+                  AND claim_expires_at <= ?
+                ORDER BY claim_expires_at
+                LIMIT 1
+                """,
+                (self.worker_id, now),
+            ).fetchone()
+            if row is None:
+                return None
+            message = (
+                "The queue operation exceeded its safety lease. Its delivery "
+                "outcome is unknown; review JDownloader before retrying."
+            )
+            updated = conn.execute(
+                """
+                UPDATE download_queue_items
+                SET state = 'failed',
+                    queue_reason = 'manual_retry',
+                    last_reason_code = 'operation_timeout_unknown',
+                    last_message = ?,
+                    transport_attempted = 1,
+                    claimed_by = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = ?
+                WHERE item_uuid = ?
+                  AND state = 'claimed'
+                  AND claimed_by = ?
+                  AND claim_expires_at IS NOT NULL
+                  AND claim_expires_at <= ?
+                """,
+                (
+                    message,
+                    now,
+                    row["item_uuid"],
+                    self.worker_id,
+                    now,
+                ),
+            ).rowcount
+            if updated != 1:
+                return None
+            self._refresh_batch_locked(conn, row["batch_uuid"], now)
+            recovered = dict(row)
+            recovered.update(
+                {
+                    "state": "failed",
+                    "queue_reason": "manual_retry",
+                    "last_reason_code": "operation_timeout_unknown",
+                    "last_message": message,
+                    "transport_attempted": 1,
+                    "claimed_by": None,
+                    "claim_expires_at": None,
+                    "updated_at": now,
+                }
+            )
+            return recovered
+
     def _claim_due(self) -> Optional[dict]:
         if self.db is None:
             return None
         now = _iso()
-        lease = _iso(_utcnow() + timedelta(minutes=10))
+        lease = _iso(
+            _utcnow() + timedelta(seconds=self.claim_lease_seconds)
+        )
         with self.db.transaction() as conn:
             if not conn:
                 return None
@@ -522,10 +693,10 @@ class DownloadQueueService:
                 url=item["canonical_url"],
             )
 
-        self._emit("download:result", outcome)
-
         if outcome.get("success"):
-            self._complete(item, outcome)
+            if not self._complete(item, outcome):
+                return
+            self._emit("download:result", outcome)
             method = outcome.get("method")
             message = outcome.get("message") or f"Sent: {item['title']}"
             if method in ("duplicate", "duplicate_similar"):
@@ -559,25 +730,29 @@ class DownloadQueueService:
             return
 
         if is_source_wide_denial(outcome):
-            self._pause_for_source(item, outcome)
+            if not self._pause_for_source(item, outcome):
+                return
+            self._emit("download:result", outcome)
             self._emit(
                 "notification",
                 notification_for_result(outcome, title=item["title"]),
             )
             return
 
-        self._fail(item, outcome)
+        if not self._fail(item, outcome):
+            return
+        self._emit("download:result", outcome)
         self._emit(
             "notification",
             notification_for_result(outcome, title=item["title"]),
         )
 
-    def _complete(self, item: dict, outcome: dict) -> None:
+    def _complete(self, item: dict, outcome: dict) -> bool:
         now = _iso()
         with self.db.transaction() as conn:
             if not conn:
-                return
-            conn.execute(
+                return False
+            updated = conn.execute(
                 """
                 UPDATE download_queue_items
                 SET state = 'completed',
@@ -590,21 +765,36 @@ class DownloadQueueService:
                     claimed_by = NULL,
                     claim_expires_at = NULL
                 WHERE item_uuid = ?
+                  AND state = 'claimed'
+                  AND claimed_by = ?
                 """,
-                (now, now, outcome.get("message"), item["item_uuid"]),
-            )
+                (
+                    now,
+                    now,
+                    outcome.get("message"),
+                    item["item_uuid"],
+                    self.worker_id,
+                ),
+            ).rowcount
+            if updated != 1:
+                logger.warning(
+                    "ignored stale completion for queue item %s",
+                    item.get("item_uuid"),
+                )
+                return False
             self._refresh_batch_locked(conn, item["batch_uuid"], now)
         self._emit(
             "download:queue_updated",
             {**item, **outcome, "state": "completed"},
         )
+        return True
 
-    def _fail(self, item: dict, outcome: dict) -> None:
+    def _fail(self, item: dict, outcome: dict) -> bool:
         now = _iso()
         with self.db.transaction() as conn:
             if not conn:
-                return
-            conn.execute(
+                return False
+            updated = conn.execute(
                 """
                 UPDATE download_queue_items
                 SET state = 'failed',
@@ -616,6 +806,8 @@ class DownloadQueueService:
                     claimed_by = NULL,
                     claim_expires_at = NULL
                 WHERE item_uuid = ?
+                  AND state = 'claimed'
+                  AND claimed_by = ?
                 """,
                 (
                     now,
@@ -624,23 +816,31 @@ class DownloadQueueService:
                     outcome.get("message"),
                     1 if outcome.get("transport_attempted") else 0,
                     item["item_uuid"],
+                    self.worker_id,
                 ),
-            )
+            ).rowcount
+            if updated != 1:
+                logger.warning(
+                    "ignored stale failure for queue item %s",
+                    item.get("item_uuid"),
+                )
+                return False
             self._refresh_batch_locked(conn, item["batch_uuid"], now)
         self._emit(
             "download:queue_updated",
             {**item, **outcome, "state": "failed"},
         )
+        return True
 
-    def _pause_for_source(self, item: dict, outcome: dict) -> None:
+    def _pause_for_source(self, item: dict, outcome: dict) -> bool:
         now = _iso()
         direct = outcome.get("reason_code") == "interactive_challenge"
         item_state = "verification_required" if direct else "waiting_source"
         item_reason = "interactive_challenge" if direct else "source_deferred"
         with self.db.transaction() as conn:
             if not conn:
-                return
-            conn.execute(
+                return False
+            transitioned = conn.execute(
                 """
                 UPDATE download_queue_items
                 SET state = ?, queue_reason = ?, cooldown_until = ?,
@@ -649,6 +849,8 @@ class DownloadQueueService:
                     claimed_by = NULL, claim_expires_at = NULL,
                     updated_at = ?
                 WHERE item_uuid = ?
+                  AND state = 'claimed'
+                  AND claimed_by = ?
                 """,
                 (
                     item_state,
@@ -660,8 +862,15 @@ class DownloadQueueService:
                     1 if outcome.get("transport_attempted") else 0,
                     now,
                     item["item_uuid"],
+                    self.worker_id,
                 ),
-            )
+            ).rowcount
+            if transitioned != 1:
+                logger.warning(
+                    "ignored stale source pause for queue item %s",
+                    item.get("item_uuid"),
+                )
+                return False
             deferred = conn.execute(
                 """
                 UPDATE download_queue_items
@@ -674,6 +883,7 @@ class DownloadQueueService:
                     transport_attempted = 0,
                     updated_at = ?
                 WHERE batch_uuid = ?
+                  AND source = ?
                   AND state IN ('scheduled', 'ready')
                 """,
                 (
@@ -682,6 +892,7 @@ class DownloadQueueService:
                     "No request was made because the source was paused.",
                     now,
                     item["batch_uuid"],
+                    item["source"],
                 ),
             ).rowcount
             conn.execute(
@@ -718,6 +929,7 @@ class DownloadQueueService:
                 "deferred_count": batch.get("deferred_items", 0),
             },
         )
+        return True
 
     def _refresh_batch_locked(self, conn, batch_uuid: str, now: str) -> None:
         counts = conn.execute(
@@ -951,34 +1163,74 @@ class DownloadQueueService:
 
     def cancel_item(self, item_uuid: str) -> bool:
         now = _iso()
-        ok = self.db._mutate(
-            """
-            UPDATE download_queue_items
-            SET state = 'cancelled', cancelled_at = ?, updated_at = ?
-            WHERE item_uuid = ?
-              AND state NOT IN ('completed', 'cancelled')
-            """,
-            (now, now, item_uuid),
-            label="cancel_download_queue_item",
+        with self.db.transaction() as conn:
+            if not conn:
+                return False
+            row = conn.execute(
+                """
+                SELECT state, batch_uuid
+                FROM download_queue_items
+                WHERE item_uuid = ?
+                """,
+                (item_uuid,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["state"] == "claimed":
+                raise DownloadQueueItemClaimed(item_uuid=item_uuid)
+            updated = conn.execute(
+                """
+                UPDATE download_queue_items
+                SET state = 'cancelled', cancelled_at = ?, updated_at = ?
+                WHERE item_uuid = ?
+                  AND state NOT IN ('claimed', 'completed', 'cancelled')
+                """,
+                (now, now, item_uuid),
+            ).rowcount
+            if updated != 1:
+                return False
+            self._refresh_batch_locked(conn, row["batch_uuid"], now)
+        self._emit(
+            "download:queue_updated",
+            {"item_uuid": item_uuid, "state": "cancelled"},
         )
-        if ok:
-            self._emit(
-                "download:queue_updated",
-                {"item_uuid": item_uuid, "state": "cancelled"},
-            )
-        return bool(ok)
+        return True
 
     def cancel_batch(self, batch_uuid: str) -> bool:
         now = _iso()
         with self.db.transaction() as conn:
             if not conn:
                 return False
+            batch = conn.execute(
+                """
+                SELECT batch_uuid
+                FROM download_queue_batches
+                WHERE batch_uuid = ?
+                """,
+                (batch_uuid,),
+            ).fetchone()
+            if batch is None:
+                return False
+            claimed = conn.execute(
+                """
+                SELECT item_uuid
+                FROM download_queue_items
+                WHERE batch_uuid = ? AND state = 'claimed'
+                LIMIT 1
+                """,
+                (batch_uuid,),
+            ).fetchone()
+            if claimed is not None:
+                raise DownloadQueueItemClaimed(
+                    item_uuid=claimed["item_uuid"],
+                    batch_uuid=batch_uuid,
+                )
             conn.execute(
                 """
                 UPDATE download_queue_items
                 SET state = 'cancelled', cancelled_at = ?, updated_at = ?
                 WHERE batch_uuid = ?
-                  AND state NOT IN ('completed', 'cancelled')
+                  AND state NOT IN ('claimed', 'completed', 'cancelled')
                 """,
                 (now, now, batch_uuid),
             )

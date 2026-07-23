@@ -3,11 +3,24 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from backend.browser_adapter import browser_plan
+from fastapi import HTTPException
+import pytest
+
+from backend.api.routes.downloads import remove_download_retry
+from backend.browser_adapter import (
+    browser_plan,
+    clear_stale_profile_locks,
+    launch_browser,
+    profile_lock_paths,
+)
 from backend.database import DatabaseManager
-from backend.download_queue import DownloadQueueService
+from backend.download_queue import (
+    DownloadQueueItemClaimed,
+    DownloadQueueService,
+)
 
 
 def _item(index: int) -> dict:
@@ -186,5 +199,166 @@ def test_jdownloader_success_preserves_post_delivery_callback(tmp_path):
 
         delivered.assert_called_once_with()
         assert service.get_item(claimed["item_uuid"])["state"] == "completed"
+    finally:
+        db.close()
+
+
+def test_actual_persistent_profile_stale_locks_are_removed_before_launch(
+    tmp_path,
+    monkeypatch,
+):
+    profile = tmp_path / "configured-profile"
+    config = {
+        "hdencode_browser_profile_mode": "persistent",
+        "hdencode_browser_profile_dir": str(profile),
+    }
+    locks = profile_lock_paths(config)
+    assert {path.name for path in locks} == {
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+    }
+    for path in locks:
+        path.write_text("dead-container-lock", encoding="utf-8")
+
+    removed = clear_stale_profile_locks(config)
+    assert set(removed) == {str(path) for path in locks}
+    assert all(not path.exists() for path in locks)
+
+    class FakeDriver:
+        capabilities = {
+            "browserName": "chrome",
+            "browserVersion": "1.0",
+            "chrome": {"chromedriverVersion": "1.0"},
+        }
+
+    import selenium.webdriver
+
+    def fake_chrome(*, service, options):
+        assert all(not path.exists() for path in locks)
+        return FakeDriver()
+
+    monkeypatch.setattr(selenium.webdriver, "Chrome", fake_chrome)
+    driver, status = launch_browser(
+        config,
+        chrome_ver=None,
+        chrome_bin=None,
+        system_driver=None,
+    )
+    assert isinstance(driver, FakeDriver)
+    assert status["profile_mode"] == "persistent"
+
+
+def test_claimed_retry_cancel_is_rejected_with_typed_409(tmp_path):
+    db = DatabaseManager(str(tmp_path / "claimed-cancel.db"))
+    try:
+        service = DownloadQueueService({}, db, MagicMock())
+        service.schedule_batch([_item(1)], interval_minutes=0, mode="immediate")
+        claimed = service._claim_due()
+        assert claimed is not None
+
+        with pytest.raises(DownloadQueueItemClaimed):
+            service.cancel_item(claimed["item_uuid"])
+
+        reg = SimpleNamespace(download_queue=service)
+        with pytest.raises(HTTPException) as captured:
+            remove_download_retry(claimed["item_uuid"], reg=reg)
+        assert captured.value.status_code == 409
+        assert captured.value.detail["code"] == "download_queue_item_claimed"
+        assert service.get_item(claimed["item_uuid"])["state"] == "claimed"
+    finally:
+        db.close()
+
+
+def test_expired_owned_claim_fail_stops_without_automatic_redelivery(tmp_path):
+    db = DatabaseManager(str(tmp_path / "expired-claim.db"))
+    fatal_exit = MagicMock()
+    fake = MagicMock()
+    try:
+        service = DownloadQueueService(
+            {},
+            db,
+            fake,
+            fatal_exit=fatal_exit,
+        )
+        service.schedule_batch([_item(1)], interval_minutes=0, mode="immediate")
+        claimed = service._claim_due()
+        assert claimed is not None
+        db._mutate(
+            """
+            UPDATE download_queue_items
+            SET claim_expires_at = '2000-01-01T00:00:00+00:00'
+            WHERE item_uuid = ?
+            """,
+            (claimed["item_uuid"],),
+            label="expire_test_claim",
+        )
+
+        assert service._watchdog_tick() is True
+        fatal_exit.assert_called_once_with(70)
+        current = service.get_item(claimed["item_uuid"])
+        assert current["state"] == "failed"
+        assert current["last_reason_code"] == "operation_timeout_unknown"
+        assert current["queue_reason"] == "manual_retry"
+
+        stale_success = {
+            "success": True,
+            "method": "jdownloader",
+            "message": "Late completion",
+        }
+        assert service._complete(claimed, stale_success) is False
+        assert service.get_item(claimed["item_uuid"])["state"] == "failed"
+        assert fake.download_item.call_count == 0
+    finally:
+        db.close()
+
+
+def test_mixed_batch_source_pause_only_defers_matching_source(tmp_path):
+    db = DatabaseManager(str(tmp_path / "mixed-source.db"))
+    fake = MagicMock()
+    fake.download_item.return_value = {
+        "success": False,
+        "method": "",
+        "link_count": 0,
+        "message": "Verification required.",
+        "reason_code": "interactive_challenge",
+        "cause_code": "interactive_challenge",
+        "stage": "verification",
+        "retryable": False,
+        "retry_mode": "manual_verification",
+        "cooldown_until": "2099-01-01T00:00:00+00:00",
+        "transport_attempted": True,
+        "affected_scope": "source",
+        "action_code": "verification_required",
+        "signals": [],
+    }
+    items = [
+        _item(1),
+        _item(2),
+        {**_item(3), "url": "https://ddlbase.com/release/3"},
+        {**_item(4), "url": "https://adit-hd.com/threads/4"},
+    ]
+    try:
+        service = DownloadQueueService({}, db, fake)
+        batch = service.schedule_batch(
+            items,
+            interval_minutes=0,
+            mode="immediate",
+        )
+        claimed = service._claim_due()
+        assert claimed is not None
+        assert claimed["source"] == "hdencode"
+        service._execute(claimed)
+
+        current = service.get_batch(batch["batch_uuid"])
+        by_url = {row["canonical_url"]: row for row in current["items"]}
+        assert by_url[items[1]["url"]]["state"] == "waiting_source"
+        assert by_url[items[2]["url"]]["state"] == "scheduled"
+        assert by_url[items[3]["url"]]["state"] == "scheduled"
+
+        next_claim = service._claim_due()
+        assert next_claim is not None
+        assert next_claim["source"] == "ddlbase"
+        assert fake.download_item.call_count == 1
     finally:
         db.close()
