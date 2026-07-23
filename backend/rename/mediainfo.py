@@ -16,6 +16,7 @@ import subprocess
 from typing import Optional
 
 from backend.rename import hdr10plus_detect
+from backend.rename.process_control import ProcessCancelled, run_cancellable
 
 _CODEC_LABEL = {"hevc": "HEVC", "h265": "HEVC", "avc": "H.264", "h264": "H.264",
                 "av1": "AV1", "vc1": "VC-1", "mpeg2video": "MPEG-2"}
@@ -72,7 +73,12 @@ def _cached_dv_layer(path: str, mtime: Optional[float], size: Optional[int], db)
         return None
 
 
-def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
+def probe_specs(
+    path: str,
+    timeout: int = 30,
+    db=None,
+    cancel_requested=None,
+) -> Optional[dict]:
     if not path:
         return None
     if not os.path.exists(path):
@@ -100,13 +106,18 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
     if not ffprobe:
         return None
     try:
-        r = subprocess.run(
+        r = run_cancellable(
             [ffprobe, "-v", "quiet", "-print_format", "json",
              "-show_format", "-show_streams", path],
-            capture_output=True, text=True, timeout=timeout)
+            text=True,
+            timeout=timeout,
+            cancel_requested=cancel_requested,
+        )
         if r.returncode != 0:
             return None
         data = json.loads(r.stdout)
+    except ProcessCancelled:
+        raise
     except Exception:
         return None
 
@@ -153,11 +164,14 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
     # file's hdr stays "Dolby Vision" and never needs this extra call.
     if hdr == "HDR10":
         try:
-            fr = subprocess.run(
+            fr = run_cancellable(
                 [ffprobe, "-v", "quiet", "-print_format", "json",
                  "-show_frames", "-read_intervals", "%+#1",
                  "-select_streams", "v:0", path],
-                capture_output=True, text=True, timeout=timeout)
+                text=True,
+                timeout=timeout,
+                cancel_requested=cancel_requested,
+            )
             if fr.returncode == 0:
                 frame_data = json.loads(fr.stdout)
                 frames = frame_data.get("frames") or []
@@ -169,6 +183,8 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
                             break
                     if hdr == "HDR10+":
                         break
+        except ProcessCancelled:
+            raise
         except Exception:
             pass  # frame probe failure must never fail the whole probe — stays plain HDR10
 
@@ -210,20 +226,28 @@ def probe_specs(path: str, timeout: int = 30, db=None) -> Optional[dict]:
     return result
 
 
-def _scan_stream_details(path: str, timeout: int) -> dict:
+def _scan_stream_details(
+    path: str,
+    timeout: int,
+    cancel_requested=None,
+) -> dict:
     """Collect bounded, JSON-safe facts for every media stream."""
     ffprobe = shutil.which("ffprobe")
     if not ffprobe or not os.path.isfile(path):
         return {}
     try:
-        result = subprocess.run(
+        result = run_cancellable(
             [ffprobe, "-v", "quiet", "-print_format", "json", "-show_format",
              "-show_streams", path],
-            capture_output=True, text=True, timeout=timeout,
+            text=True,
+            timeout=timeout,
+            cancel_requested=cancel_requested,
         )
         if result.returncode != 0:
             return {}
         data = json.loads(result.stdout)
+    except ProcessCancelled:
+        raise
     except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
         return {}
 
@@ -313,7 +337,12 @@ def _scan_stream_details(path: str, timeout: int) -> dict:
     }
 
 
-def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
+def probe_detailed(
+    path: str,
+    timeout: int = 30,
+    db=None,
+    cancel_requested=None,
+) -> Optional[dict]:
     """Return scan-grade technical evidence without changing ``probe_specs``.
 
     Existing rename callers retain the compact/cacheable ``probe_specs``
@@ -321,7 +350,12 @@ def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
     preserves the difference between an authoritative HDR10+ negative and an
     unavailable or incomplete detector.
     """
-    result = probe_specs(path, timeout=timeout, db=db)
+    result = probe_specs(
+        path,
+        timeout=timeout,
+        db=db,
+        cancel_requested=cancel_requested,
+    )
     if result is None:
         return None
 
@@ -336,7 +370,13 @@ def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         })
         return detailed
 
-    detailed.update(_scan_stream_details(path, timeout))
+    detailed.update(
+        _scan_stream_details(
+            path,
+            timeout,
+            cancel_requested=cancel_requested,
+        )
+    )
 
     hdr = result.get("hdr")
     if hdr == "HDR10+":
@@ -346,7 +386,10 @@ def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         }
     elif hdr == "HDR10":
         evidence = hdr10plus_detect.detect_hdr10plus(
-            path, quick_timeout=timeout, full_timeout=max(timeout, 300)
+            path,
+            quick_timeout=timeout,
+            full_timeout=max(timeout, 300),
+            cancel_requested=cancel_requested,
         )
         if evidence.get("state") == "present":
             detailed["hdr"] = "HDR10+"
@@ -355,7 +398,10 @@ def probe_detailed(path: str, timeout: int = 30, db=None) -> Optional[dict]:
         # same full-file detector instead of converting that uncertainty into
         # an implicit negative.
         evidence = hdr10plus_detect.detect_hdr10plus(
-            path, quick_timeout=timeout, full_timeout=max(timeout, 300)
+            path,
+            quick_timeout=timeout,
+            full_timeout=max(timeout, 300),
+            cancel_requested=cancel_requested,
         )
     else:
         evidence = {"state": "absent", "method": "not_hdr10_pq", "tool_version": None,
