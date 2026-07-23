@@ -19,6 +19,7 @@ def _reset_registry():
     registry._scanner_service = None
     registry._plex_service = None
     registry._download_service = None
+    registry._download_queue_service = None
     registry._auto_grab_service = None
     registry._notification_bridge = None
     registry._watchlist_manager = None
@@ -662,18 +663,49 @@ class TestDownloads:
         assert resp.status_code == 200
 
     def test_download_batch_valid(self, client):
-        resp = client.post("/download/batch", json={
-            "items": [
-                {"url": "https://example.com/1.torrent", "title": "Movie 1"},
-                {"url": "https://example.com/2.torrent", "title": "Movie 2"},
-            ]
-        })
+        # Batches are delegated to the durable download queue. App startup runs
+        # a live queue worker + watchdog thread, so mock the queue to assert the
+        # route's request -> schedule -> response mapping without persisting rows
+        # or starting real background browser/download work.
+        items = [
+            {"url": "https://example.com/1.torrent", "title": "Movie 1"},
+            {"url": "https://example.com/2.torrent", "title": "Movie 2"},
+        ]
+        registry.config["download_batch_interval_minutes"] = 10  # pin the default
+        mock_queue = MagicMock()
+        mock_queue.schedule_batch.return_value = {
+            "batch_uuid": "batch-test-uuid",
+            "total_items": 2,
+            "mode": "staggered",
+            "interval_seconds": 600,
+            "items": items,
+        }
+        registry._download_queue_service = mock_queue
+
+        resp = client.post("/download/batch", json={"items": items})
+
         assert resp.status_code == 200
-        assert resp.json()["status"] == "started"
+        body = resp.json()
+        # Response fields are mapped from the scheduled batch.
+        assert body["status"] == "scheduled"
+        assert body["count"] == 2
+        assert body["batch_uuid"] == "batch-test-uuid"
+        assert body["mode"] == "staggered"
+        assert body["interval_minutes"] == 10          # 600s / 60
+        assert body["items"] == items
+        # The route delegated to the durable queue once, with the default
+        # interval (download_batch_interval_minutes=10) and staggered mode.
+        mock_queue.schedule_batch.assert_called_once()
+        args, kwargs = mock_queue.schedule_batch.call_args
+        assert [i["url"] for i in args[0]] == [i["url"] for i in items]
+        assert kwargs["interval_minutes"] == 10
+        assert kwargs["mode"] == "staggered"
 
     def test_download_batch_empty_items(self, client):
         resp = client.post("/download/batch", json={"items": []})
-        assert resp.status_code == 200
+        # The durable queue rejects an empty batch; the route surfaces the
+        # scheduler's error as a 409 (via its generic exception handler).
+        assert resp.status_code == 409
 
     def test_download_batch_missing_url(self, client):
         resp = client.post("/download/batch", json={
