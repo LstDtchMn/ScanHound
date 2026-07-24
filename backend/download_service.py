@@ -1651,7 +1651,7 @@ class DownloadService:
         except Exception:
             forms = []
 
-        safe, labelled, kinds = [], [], []
+        labelled, kinds = [], []
         not_ready = False
         for form in forms:
             try:
@@ -1678,22 +1678,24 @@ class DownloadService:
                 if _reveal_control_not_ready(label):
                     not_ready = True
                     continue
+                if "view link" not in label and "access" not in label:
+                    continue
                 if not _resolves_to_unlock_target(target, base):
                     continue
-                safe.append(el)
-                if "view link" in label or "access" in label:
-                    labelled.append(el)
+                labelled.append(el)
 
         extra = f" forms={len(forms)} candidates={kinds[:6]}"
         if not_ready:
             extra += " not_ready=True"
-        # Prefer an unambiguous labelled control; accept an unlabelled one only
-        # when it is the single safe submit. Never guess between several.
+        # Only a control positively identified as a links control is ever
+        # clicked. Accepting "the single safe submit" instead was what selected
+        # the countdown placeholder: in production that path produced 0 link
+        # retrievals in 14 attempts and picked a wait-state control every time,
+        # so an allowlist loses nothing and cannot be defeated by re-wording or
+        # localizing the placeholder.
         if len(labelled) == 1:
             return _resolved(labelled[0], "unlock-form-labelled", extra)
-        if not labelled and len(safe) == 1:
-            return _resolved(safe[0], "unlock-form-single", extra)
-        if labelled or safe:
+        if labelled:
             return _resolved(None, "unlock-form-ambiguous", extra)
 
         # Label fallback: a submit control named like a links control.

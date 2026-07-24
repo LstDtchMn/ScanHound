@@ -2400,11 +2400,32 @@ class TestFindRevealControl:
         driver.find_elements.return_value = []
         assert _reveal({"presence": btn}, driver) is None
 
-    def test_unlock_form_submit_used_when_label_does_not_match(self):
-        submit = _FakeEl(value="")            # unlabelled submit inside the form
+    def test_unlabelled_submit_is_never_clicked(self):
+        """Only a positively-identified links control is ever activated.
+
+        Accepting "the single safe submit" is what selected the countdown
+        placeholder in production (0 link retrievals in 14 attempts), so an
+        unlabelled control is no longer a candidate at all.
+        """
         driver = MagicMock()
-        driver.find_elements.return_value = [_form([submit])]
-        assert _reveal({}, driver) is submit
+        driver.current_url = "https://hdencode.org/a-release/"
+        driver.find_elements.side_effect = [
+            [_form([_FakeEl(value="")], action="https://hdencode.org/a-release/#unlocked")],
+            [],
+        ]
+        assert _reveal({}, driver) is None
+
+    def test_reworded_placeholder_cannot_be_clicked(self):
+        """The allowlist holds even for wording the blocklist never saw."""
+        driver = MagicMock()
+        driver.current_url = "https://hdencode.org/a-release/"
+        for label in ("Bitte warten…", "Verification delayed - reload the page"):
+            driver.find_elements.side_effect = [
+                [_form([_FakeEl(value=label)],
+                       action="https://hdencode.org/a-release/#unlocked")],
+                [],
+            ]
+            assert _reveal({}, driver) is None, label
 
     def test_formaction_override_is_rejected(self):
         """A submit may override its form's destination — validate the effective one."""
