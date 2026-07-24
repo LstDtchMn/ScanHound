@@ -206,6 +206,42 @@ def test_active_challenge_evidence_is_detected():
     )
 
 
+def test_release_titles_containing_challenge_phrases_are_not_challenges():
+    """A real release can be *named* "Access Denied" or "Just a Moment".
+
+    Matching those as a challenge starts a bogus one-hour source-wide cooldown.
+    A Cloudflare interstitial replaces the page, so its title never carries
+    release metadata — that metadata is what distinguishes the two.
+    """
+    access_denied = (
+        "<html><head><title>Access Denied 2009 1080p BluRay x264 - 8.4 GB</title>"
+        "</head><body><a href='https://rapidgator.net/file/abc'>RG</a></body></html>"
+    )
+    assert strong_challenge_markers(
+        access_denied, "Access Denied 2009 1080p BluRay x264 - 8.4 GB"
+    ) == ()
+
+    just_a_moment = (
+        "<html><head><title>Just a Moment 2021 2160p WEB-DL HEVC - 12.0 GB</title>"
+        "</head><body>release</body></html>"
+    )
+    assert strong_challenge_markers(
+        just_a_moment, "Just a Moment 2021 2160p WEB-DL HEVC - 12.0 GB"
+    ) == ()
+
+    # The guard must not blind the classifier to genuine challenge pages, whose
+    # titles carry no release metadata.
+    assert strong_challenge_markers("<html><body>...</body></html>", "Just a moment...")
+    assert strong_challenge_markers(
+        "<html><head><title>Attention Required! | Cloudflare</title></head>"
+        "<body>...</body></html>"
+    )
+    assert strong_challenge_markers(
+        "<html><head><title>Access denied | hdencode.org used Cloudflare to "
+        "restrict access</title></head><body>...</body></html>"
+    )
+
+
 def test_reason_specific_notification_retains_typed_fields():
     result = {
         "success": False,

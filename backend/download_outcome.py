@@ -1,6 +1,7 @@
 """Public-safe download outcome helpers."""
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping, Optional
 
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
@@ -48,6 +49,18 @@ _CHALLENGE_TITLE_MARKERS = (
 _CHALLENGE_VISIBLE_MARKERS = (
     "checking your browser",
     "verify you are human",
+)
+
+# A release page title can legitimately contain a challenge phrase — there are
+# real releases named "Access Denied" and "Just a Moment" — and treating those
+# as a challenge starts a bogus one-hour source-wide cooldown. A Cloudflare
+# interstitial REPLACES the page, so its title never carries release metadata
+# (resolution, size, codec, source). When that metadata is present the title
+# belongs to a release page and its challenge phrase is not evidence.
+_RELEASE_TITLE_METADATA = re.compile(
+    r"\b(?:\d{3,4}p|\d+(?:\.\d+)?\s*[GM]B|x26[45]|h\.?26[45]|hevc|avc|"
+    r"blu-?ray|web-?dl|webrip|hdrip|bdrip|dvdrip|remux)\b",
+    re.IGNORECASE,
 )
 
 
@@ -121,9 +134,10 @@ def strong_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:
         if matched:
             markers.append(f"iframe:{matched}")
     title_haystack = f"{title_low} {doc_title}".strip()
-    markers.extend(
-        marker for marker in _CHALLENGE_TITLE_MARKERS if marker in title_haystack
-    )
+    if not _RELEASE_TITLE_METADATA.search(title_haystack):
+        markers.extend(
+            marker for marker in _CHALLENGE_TITLE_MARKERS if marker in title_haystack
+        )
     markers.extend(
         marker for marker in _CHALLENGE_VISIBLE_MARKERS if marker in visible
     )
