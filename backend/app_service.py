@@ -867,12 +867,19 @@ class AppService:
             try:
                 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                     file_config = json.load(f)
+                if not isinstance(file_config, dict):
+                    raise ValueError("config root must be a JSON object")
                 config.update(file_config)
                 # Migrate legacy plex_mode → plex_connection_mode
                 if "plex_mode" in config and "plex_connection_mode" not in file_config:
                     config["plex_connection_mode"] = config.pop("plex_mode")
-            except (json.JSONDecodeError, IOError) as e:
-                logger.error(f"Error loading config: {e}, using defaults")
+            except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
+                logger.error(
+                    "Error loading config: %s; using defaults with HDEncode "
+                    "disabled fail-closed",
+                    e,
+                )
+                config["hdencode_enabled"] = False
 
         env_overrides = {
             "plex_url": os.getenv("PLEX_URL"),
@@ -894,6 +901,14 @@ class AppService:
             "pushover_user": os.getenv("PUSHOVER_USER"),
             "pushover_token": os.getenv("PUSHOVER_TOKEN"),
             "webhook_url": os.getenv("WEBHOOK_URL"),
+            # Deployment emergency override. An explicitly supplied value must
+            # opt in with a recognized true token; every other value is False.
+            "hdencode_enabled": (
+                None
+                if os.getenv("SCANHOUND_HDENCODE_ENABLED") is None
+                else os.getenv("SCANHOUND_HDENCODE_ENABLED", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ),
         }
         for key, value in env_overrides.items():
             if value is not None:

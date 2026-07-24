@@ -703,9 +703,8 @@ class TestDownloads:
 
     def test_download_batch_empty_items(self, client):
         resp = client.post("/download/batch", json={"items": []})
-        # The durable queue rejects an empty batch; the route surfaces the
-        # scheduler's error as a 409 (via its generic exception handler).
-        assert resp.status_code == 409
+        # Request-shape validation rejects an empty list before queue execution.
+        assert resp.status_code == 422
 
     def test_download_batch_missing_url(self, client):
         resp = client.post("/download/batch", json={

@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 from typing import Any, Dict, Optional, Tuple
 
 
@@ -80,6 +81,20 @@ _PROFILE_LOCK_NAMES = (
     "SingletonSocket",
 )
 
+_PROFILE_CACHE_LIMIT_BYTES = 256 * 1024 * 1024
+_PROFILE_CACHE_RELATIVE_PATHS = (
+    Path("Default") / "Cache",
+    Path("Default") / "Code Cache",
+    Path("Default") / "GPUCache",
+    Path("Default") / "Media Cache",
+    Path("Default") / "Service Worker" / "CacheStorage",
+    Path("Default") / "Service Worker" / "ScriptCache",
+    Path("ShaderCache"),
+    Path("GrShaderCache"),
+    Path("GraphiteDawnCache"),
+    Path("DawnCache"),
+)
+
 
 def profile_lock_paths(
     config: Dict[str, Any],
@@ -127,6 +142,62 @@ def clear_stale_profile_locks(
                 os.unlink(path)
                 removed.append(str(path))
         except FileNotFoundError:
+            continue
+    return tuple(removed)
+
+
+def _path_size(path: Path) -> int:
+    try:
+        if path.is_symlink() or path.is_file():
+            return int(path.stat().st_size)
+    except OSError:
+        return 0
+    total = 0
+    try:
+        for child in path.rglob("*"):
+            try:
+                if child.is_file() and not child.is_symlink():
+                    total += int(child.stat().st_size)
+            except OSError:
+                continue
+    except OSError:
+        return total
+    return total
+
+
+def prune_profile_caches(
+    config: Dict[str, Any],
+    *,
+    max_bytes: int = _PROFILE_CACHE_LIMIT_BYTES,
+) -> tuple[str, ...]:
+    """Bound known cache-only profile data while retaining cookies/site data.
+
+    This runs only at process startup, before a browser can own the profile.
+    Cookies, Local Storage, IndexedDB, and service-worker registrations are not
+    touched.
+    """
+    plan = browser_plan(config)
+    if plan.profile_mode != "persistent" or not plan.profile_dir:
+        return ()
+    root = Path(plan.profile_dir)
+    candidates = [root / relative for relative in _PROFILE_CACHE_RELATIVE_PATHS]
+    cache_bytes = sum(_path_size(path) for path in candidates if path.exists())
+    if cache_bytes <= max(0, int(max_bytes)):
+        return ()
+
+    removed: list[str] = []
+    for path in candidates:
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+            else:
+                continue
+            removed.append(str(path))
+        except FileNotFoundError:
+            continue
+        except OSError:
             continue
     return tuple(removed)
 
@@ -285,10 +356,12 @@ def _main(argv: Optional[list[str]] = None) -> int:
     config = _runtime_profile_config()
     paths = profile_lock_paths(config)
     removed = clear_stale_profile_locks(config)
+    pruned = prune_profile_caches(config)
     if paths:
         print(
             "[browser-profile] checked "
-            f"{paths[0].parent}; removed {len(removed)} stale lock artifact(s)"
+            f"{paths[0].parent}; removed {len(removed)} stale lock artifact(s), "
+            f"pruned {len(pruned)} cache path(s)"
         )
     else:
         print("[browser-profile] temporary profile mode; no persistent locks to clean")

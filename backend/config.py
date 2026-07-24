@@ -630,9 +630,38 @@ def _safe_numeric(val, default):
         return default
 
 
+def source_enabled(
+    config: dict,
+    key: str,
+    *,
+    missing_default: bool = True,
+) -> bool:
+    """Return a source flag without Python truthiness surprises.
+
+    Missing keys retain the explicit compatibility default. Once a key is
+    present, only the real boolean ``True`` enables source traffic. Strings,
+    numbers, containers, ``None``, malformed values, and a non-dict config all
+    fail closed.
+    """
+    if not isinstance(config, dict):
+        return False
+    if key not in config:
+        return bool(missing_default)
+    return config.get(key) is True
+
+
 def validate_config(config: dict) -> dict:
     """Validate and sanitize configuration values. Returns cleaned config."""
     cleaned = dict(config)
+
+    # Keep validate_config non-additive for partial dictionaries, but normalize
+    # an explicitly-present malformed source switch to the safe disabled state.
+    if "hdencode_enabled" in cleaned:
+        cleaned["hdencode_enabled"] = source_enabled(
+            cleaned,
+            "hdencode_enabled",
+            missing_default=False,
+        )
 
     # Numeric constraints (safe against None and non-numeric strings)
     if _safe_numeric(cleaned.get('min_size_mb'), 0) < 0:

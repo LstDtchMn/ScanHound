@@ -8,6 +8,8 @@ import pkgutil
 import threading
 from typing import Any, Callable, Dict, List, Optional, Type
 
+from backend.config import source_enabled
+
 from .base import (
     SourceBase,
     SourceConfig,
@@ -136,7 +138,11 @@ class SourceRegistry:
         for name in list(self._enabled):
             key = f"{name}_enabled"
             if key in config:
-                enabled = bool(config[key])
+                enabled = source_enabled(
+                    config,
+                    key,
+                    missing_default=self._enabled.get(name, True),
+                )
                 if self._enabled.get(name) != enabled:
                     self.enable_source(name, enabled)
 
