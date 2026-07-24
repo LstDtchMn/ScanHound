@@ -2316,3 +2316,101 @@ def test_remove_package_by_id_single_uuid(download_service, db_manager, monkeypa
     out = download_service.remove_package(rid)
     assert out["ok"] and calls["uuids"] == [111]           # int, not "111"
     assert db_manager.get_download_results() == []
+
+
+# ── HDEncode reveal-control lookup (slow / late-render tolerance) ─────
+
+
+class _FakeEC:
+    """expected_conditions stand-in that tags the condition kind."""
+
+    @staticmethod
+    def element_to_be_clickable(locator):
+        return ("clickable", locator)
+
+    @staticmethod
+    def presence_of_element_located(locator):
+        return ("presence", locator)
+
+
+class _FakeBy:
+    XPATH = "xpath"
+    CSS_SELECTOR = "css"
+
+
+def _fake_wait(results):
+    """WebDriverWait stand-in; results maps kind -> element (absent = timeout)."""
+
+    class _Wait:
+        def __init__(self, driver, timeout):
+            self.timeout = timeout
+
+        def until(self, condition):
+            found = results.get(condition[0])
+            if found is None:
+                raise RuntimeError("timed out")
+            return found
+
+    return _Wait
+
+
+class _FakeEl:
+    def __init__(self, value="", text="", action=None, children=None):
+        self._attrs = {"value": value, "action": action}
+        self.text = text
+        self._children = children or []
+
+    def get_attribute(self, name):
+        return self._attrs.get(name)
+
+    def find_elements(self, by, selector):
+        return self._children
+
+
+def _reveal(results, driver):
+    svc = _make_service()
+    with patch("backend.download_service._WebDriverWait", _fake_wait(results)), \
+         patch("backend.download_service._EC", _FakeEC), \
+         patch("backend.download_service._By", _FakeBy):
+        return svc._find_reveal_control(driver)
+
+
+class TestFindRevealControl:
+    def test_clickable_control_is_used_first(self):
+        btn = _FakeEl(value="View links")
+        assert _reveal({"clickable": btn}, MagicMock()) is btn
+
+    def test_present_but_not_clickable_control_is_used(self):
+        """The late-render case that caused false 'layout changed' failures."""
+        btn = _FakeEl(value="View links")
+        assert _reveal({"presence": btn}, MagicMock()) is btn
+
+    def test_unlock_form_submit_used_when_label_does_not_match(self):
+        submit = _FakeEl(value="")            # unlabelled submit inside the form
+        unlock_form = _FakeEl(
+            action="https://hdencode.org/a-release/#unlocked", children=[submit]
+        )
+        driver = MagicMock()
+        driver.find_elements.return_value = [unlock_form]
+        assert _reveal({}, driver) is submit
+
+    def test_report_form_is_never_selected(self):
+        report_form = _FakeEl(
+            action="https://hdencode.org/a-release/?report=S1cgS4gFht#uwee",
+            children=[_FakeEl(value="Report content")],
+        )
+        driver = MagicMock()
+        driver.find_elements.return_value = [report_form]
+        assert _reveal({}, driver) is None
+
+    def test_label_fallback_matches_link_but_not_report(self):
+        driver = MagicMock()
+        report = _FakeEl(value="Report content")
+        links = _FakeEl(value="Get links")
+        driver.find_elements.side_effect = [[], [report, links]]
+        assert _reveal({}, driver) is links
+
+    def test_returns_none_when_nothing_matches(self):
+        driver = MagicMock()
+        driver.find_elements.return_value = []
+        assert _reveal({}, driver) is None

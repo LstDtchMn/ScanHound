@@ -234,6 +234,14 @@ def _is_archive_name(name: str) -> bool:
     return bool(_ARCHIVE_RE.search((name or "").strip()))
 
 
+# HDEncode's link-reveal control can render late when the site is slow — page
+# loads over 60s have been observed in production, and a release page that
+# reported "no View links button" served the control normally on a later retry.
+# The lookup is therefore bounded but tiered instead of one strict check.
+_REVEAL_CLICKABLE_TIMEOUT = 10
+_REVEAL_PRESENCE_TIMEOUT = 15
+
+
 def _ensure_selenium():
     """Lazy-load Selenium primitives without importing a specific adapter."""
     global _By, _WebDriverWait, _EC
@@ -1511,6 +1519,96 @@ class DownloadService:
                 detail=f"Failed to classify the loaded page: {e}",
             )
 
+    # HDEncode renamed the reveal button to "View links" (it was "Access the
+    # links"); clicking it POSTs a form that unlocks the file-host links on the
+    # same page (#unlocked). A generic //input[@type='submit'] match is
+    # deliberately NOT used — it matched the unrelated "Report content" button.
+    _REVEAL_XPATH = (
+        "//input[@value='View links'] | "
+        "//input[contains(@value, 'View link')] | "
+        "//input[@value='Access the links'] | "
+        "//input[contains(@value, 'Access')] | "
+        "//button[contains(text(), 'View link')] | "
+        "//button[contains(text(), 'Access')]"
+    )
+
+    def _find_reveal_control(self, driver):
+        """Locate HDEncode's link-reveal control, tolerating a slow/late render.
+
+        Production evidence: a release page that reported "no View links button"
+        served the control normally on a later retry, and the site has returned
+        page loads over 60s. One strict ``element_to_be_clickable`` check
+        therefore misses a control that is merely rendering late, or is present
+        but not yet clickable — the caller already has a JS-click fallback that
+        works on a present element.
+
+        Bounded tiers, most specific first:
+
+        1. clickable labelled control (fast path, unchanged behaviour);
+        2. present labelled control (late render / not yet clickable);
+        3. the submit control inside the unlock form — matched by its
+           ``#unlocked`` action, so the "Report content" form can never be
+           selected;
+        4. any submit/button whose label mentions "link" but not "report".
+
+        Returns the element, or ``None`` when nothing matched.
+        """
+        try:
+            return _WebDriverWait(driver, _REVEAL_CLICKABLE_TIMEOUT).until(
+                _EC.element_to_be_clickable((_By.XPATH, self._REVEAL_XPATH))
+            )
+        except Exception:
+            pass
+
+        try:
+            control = _WebDriverWait(driver, _REVEAL_PRESENCE_TIMEOUT).until(
+                _EC.presence_of_element_located((_By.XPATH, self._REVEAL_XPATH))
+            )
+            if control is not None:
+                self._log(
+                    "[HDEncode] Reveal control present but not yet clickable; "
+                    "proceeding with it",
+                    "warning",
+                )
+                return control
+        except Exception:
+            pass
+
+        # Unlock-form-scoped fallback: only the form that posts to #unlocked.
+        try:
+            for form in driver.find_elements(_By.CSS_SELECTOR, "form"):
+                action = (form.get_attribute("action") or "").lower()
+                if "#unlocked" not in action or "report" in action:
+                    continue
+                for el in form.find_elements(
+                    _By.CSS_SELECTOR,
+                    "input[type='submit'], button[type='submit'], button",
+                ):
+                    label = (el.get_attribute("value") or el.text or "").lower()
+                    if "report" in label:
+                        continue
+                    self._log(
+                        f"[HDEncode] Unlock-form control matched (label {label!r})"
+                    )
+                    return el
+        except Exception:
+            pass
+
+        # Label fallback: any submit/button mentioning "link", never "report".
+        try:
+            for el in driver.find_elements(
+                _By.CSS_SELECTOR,
+                "form input[type='submit'], form button[type='submit'], form button",
+            ):
+                label = (el.get_attribute("value") or el.text or "").lower()
+                if "link" in label and "report" not in label:
+                    self._log(f"[HDEncode] Fallback matched control: {label!r}")
+                    return el
+        except Exception:
+            pass
+
+        return None
+
     def _wait_past_cloudflare(
         self,
         driver,
@@ -1666,40 +1764,8 @@ class DownloadService:
                         )
                         return ScrapedLinks(visible_links)
 
-                    # HDEncode renamed the reveal button to "View links" (it was
-                    # "Access the links"); clicking it POSTs a form that unlocks
-                    # the file-host links on the same page (#unlocked).
-                    # The generic //input[@type='submit'] fallback is deliberately
-                    # gone — it matched the unrelated "Report content" button.
-                    access_xpath = (
-                        "//input[@value='View links'] | "
-                        "//input[contains(@value, 'View link')] | "
-                        "//input[@value='Access the links'] | "
-                        "//input[contains(@value, 'Access')] | "
-                        "//button[contains(text(), 'View link')] | "
-                        "//button[contains(text(), 'Access')]"
-                    )
                     self._log("[HDEncode] Looking for the 'View links' button...")
-                    access_btn = None
-                    try:
-                        access_btn = _WebDriverWait(driver, 10).until(
-                            _EC.element_to_be_clickable((_By.XPATH, access_xpath))
-                        )
-                    except Exception:
-                        # Fallback: any submit/button whose label mentions "link"
-                        # but is NOT the "Report content" button.
-                        try:
-                            for el in driver.find_elements(
-                                _By.CSS_SELECTOR,
-                                "form input[type='submit'], form button[type='submit'], form button",
-                            ):
-                                label = (el.get_attribute("value") or el.text or "").lower()
-                                if "link" in label and "report" not in label:
-                                    access_btn = el
-                                    self._log(f"[HDEncode] Fallback matched control: {label!r}")
-                                    break
-                        except Exception:
-                            access_btn = None
+                    access_btn = self._find_reveal_control(driver)
 
                     if not access_btn:
                         self._log(
