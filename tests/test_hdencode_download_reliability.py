@@ -9,6 +9,7 @@ from fastapi import BackgroundTasks
 
 from backend.database import DatabaseManager
 from backend.download_outcome import (
+    challenge_iframe_srcs,
     deferred_result,
     diagnostic_from_traffic_denial,
     is_source_wide_denial,
@@ -142,6 +143,66 @@ def test_challenge_marker_detection_requires_strong_evidence():
     assert not strong_challenge_markers(
         "<html><script>const text = 'verify you are human';</script><article>Release</article></html>",
         "Release (2024)",
+    )
+
+
+def test_dormant_challenge_assets_are_not_evidence():
+    # 1. A normal page that preloads a Turnstile / Cloudflare script (no rendered
+    #    challenge) must NOT be classified as an active challenge.
+    turnstile_preload = (
+        "<html><head>"
+        "<link rel='preload' as='script' "
+        "href='https://challenges.cloudflare.com/turnstile/v0/api.js'>"
+        "<script src='https://challenges.cloudflare.com/turnstile/v0/api.js'></script>"
+        "</head><body><h1>A Movie (2024) 2160p</h1>"
+        "<a href='https://rapidgator.net/file/abc'>Rapidgator</a>"
+        "</body></html>"
+    )
+    assert strong_challenge_markers(turnstile_preload, "A Movie (2024)") == ()
+    assert challenge_iframe_srcs(turnstile_preload) == ()
+
+    # 2. JavaScript that only references cf-chl / recaptcha / turnstile, with no
+    #    rendered challenge iframe, title, or visible message, is not a challenge.
+    dormant_js = (
+        "<html><head><script>"
+        "window.__cfg = {provider: 'turnstile', "
+        "path: '/cdn-cgi/challenge-platform/cf-chl', recaptcha_site_key: 'abc'};"
+        "</script></head><body><article>Release notes</article></body></html>"
+    )
+    assert strong_challenge_markers(dormant_js, "Release (2024)") == ()
+    assert challenge_iframe_srcs(dormant_js) == ()
+
+
+def test_active_challenge_evidence_is_detected():
+    # 3. A rendered challenge iframe is strong evidence.
+    turnstile_iframe = (
+        "<html><body><iframe src='https://challenges.cloudflare.com/cdn-cgi/"
+        "challenge-platform/turnstile/if/ov2/av0/12345'></iframe></body></html>"
+    )
+    assert challenge_iframe_srcs(turnstile_iframe)
+    assert strong_challenge_markers(turnstile_iframe)
+
+    recaptcha_iframe = (
+        "<html><body><iframe title='reCAPTCHA' "
+        "src='https://www.google.com/recaptcha/api2/anchor?k=xyz'></iframe></body></html>"
+    )
+    assert challenge_iframe_srcs(recaptcha_iframe)
+    assert strong_challenge_markers(recaptcha_iframe)
+
+    # 4. A challenge-specific page title is strong evidence — both when supplied
+    #    by the caller and when present only in the document <title>.
+    assert strong_challenge_markers("<html><body>...</body></html>", "Just a moment...")
+    assert strong_challenge_markers(
+        "<html><head><title>Attention Required! | Cloudflare</title></head>"
+        "<body>...</body></html>"
+    )
+
+    # 5. Visible challenge body text is strong evidence.
+    assert strong_challenge_markers(
+        "<html><body><h1>Checking your browser before accessing the site</h1></body></html>"
+    )
+    assert strong_challenge_markers(
+        "<html><body><p>Verify you are human by completing the action below.</p></body></html>"
     )
 
 

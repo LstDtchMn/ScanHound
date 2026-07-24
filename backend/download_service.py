@@ -29,6 +29,8 @@ from backend.app_service import normalize_title
 from backend.sources.ddlbase import decode_ddlbase_link
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 from backend.download_outcome import (
+    CHALLENGE_IFRAME_MARKERS,
+    challenge_iframe_srcs,
     diagnostic_from_traffic_denial,
     strong_challenge_markers,
 )
@@ -139,9 +141,7 @@ def _challenge_iframe_signal(src: str) -> str:
     raw = (src or "").strip()
     low = raw.lower()
     marker = next(
-        (name for name in (
-            "turnstile", "challenges.cloudflare", "recaptcha", "hcaptcha", "captcha"
-        ) if name in low),
+        (name for name in CHALLENGE_IFRAME_MARKERS if name in low),
         "challenge",
     )
 
@@ -1361,13 +1361,9 @@ class DownloadService:
             body_low = body_text.lower()
             try:
                 raw_title = driver.title
-                page_title_low = (
-                    raw_title.lower()
-                    if isinstance(raw_title, str)
-                    else ""
-                )
+                page_title = raw_title if isinstance(raw_title, str) else ""
             except Exception:
-                page_title_low = ""
+                page_title = ""
             network_markers = (
                 "site can't be reached",
                 "site can’t be reached",
@@ -1421,11 +1417,7 @@ class DownloadService:
             if forms:
                 self._log(f"[HDEncode][diag] forms: {forms[:5]}")
 
-            iframes = [i.get("src", "") for i in soup.find_all("iframe") if i.get("src")]
-            captcha_frames = [src for src in iframes if any(
-                marker in src.lower()
-                for marker in ("turnstile", "challenges.cloudflare", "recaptcha", "hcaptcha", "captcha")
-            )]
+            captcha_frames = list(challenge_iframe_srcs(html))
             if captcha_frames:
                 safe_iframe_signals = [
                     _challenge_iframe_signal(src)
@@ -1439,38 +1431,11 @@ class DownloadService:
                 )
 
             low = html.lower()
-            technical_challenge_markers = [
-                marker for marker in (
-                    "cf-chl",
-                    "challenges.cloudflare.com",
-                    "turnstile",
-                    "hcaptcha",
-                    "recaptcha",
-                )
-                if marker in low
-            ]
-            title_challenge_markers = [
-                marker for marker in (
-                    "just a moment",
-                    "attention required",
-                    "checking your browser",
-                    "verify you are human",
-                    "access denied",
-                )
-                if marker in page_title_low
-            ]
-            visible_challenge_markers = [
-                marker for marker in (
-                    "checking your browser",
-                    "verify you are human",
-                )
-                if marker in body_low
-            ]
-            challenge_markers = list(dict.fromkeys(
-                technical_challenge_markers
-                + title_challenge_markers
-                + visible_challenge_markers
-            ))
+            # One shared active-evidence classifier (challenge iframe / title /
+            # visible text). Dormant Turnstile/Cloudflare/reCAPTCHA references in
+            # scripts, preload URLs, JS config, or comments are intentionally NOT
+            # evidence — see backend/download_outcome.strong_challenge_markers.
+            challenge_markers = list(strong_challenge_markers(html, page_title))
             if challenge_markers:
                 signals.extend(challenge_markers)
                 self._log(
