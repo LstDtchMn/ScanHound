@@ -2483,6 +2483,34 @@ class TestFindRevealControl:
         driver.find_elements.side_effect = [[], [report, links]]
         assert _reveal({}, driver) is links
 
+    def test_countdown_placeholder_is_never_clicked(self):
+        """Regression, from production 2026-07-24.
+
+        HDEncode serves the unlock form with its submit reading
+        "Verifying… Please wait" and only later swaps it to "View links".
+        That placeholder posts the same #unlocked endpoint, so it passed every
+        destination check and was clicked as the single safe submit — revealing
+        nothing and reporting the countdown as "no file-host links".
+        """
+        placeholder = _FakeEl(value="Verifying… Please wait")
+        driver = MagicMock()
+        driver.current_url = "https://hdencode.org/a-release/"
+        driver.find_elements.side_effect = [
+            [_form([placeholder], action="https://hdencode.org/a-release/#unlocked")],
+            [placeholder],  # label fallback sees the same control
+        ]
+        assert _reveal({}, driver) is None
+
+    def test_ready_control_still_wins_after_the_countdown(self):
+        """Once the countdown finishes the real control is used normally."""
+        ready = _FakeEl(value="View links")
+        driver = MagicMock()
+        driver.current_url = "https://hdencode.org/a-release/"
+        driver.find_elements.return_value = [
+            _form([ready], action="https://hdencode.org/a-release/#unlocked")
+        ]
+        assert _reveal({}, driver) is ready
+
     def test_returns_none_when_nothing_matches(self):
         driver = MagicMock()
         driver.find_elements.return_value = []
