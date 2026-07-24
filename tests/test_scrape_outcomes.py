@@ -86,9 +86,11 @@ def test_dormant_assets_do_not_invoke_coordinator_or_cooldown(monkeypatch):
     coordinator.observe_challenge.assert_not_called()
 
 
-def test_visible_links_retrieved_despite_dormant_cloudflare_assets(monkeypatch):
-    # 7. Dormant Cloudflare assets alongside real file-host links stay an
-    #    item-level outcome; a false challenge must not block link retrieval.
+def test_dormant_cloudflare_assets_stay_item_level(monkeypatch):
+    # 7. Dormant Cloudflare assets alongside real file-host links classify as an
+    #    ITEM-level outcome, never a source-wide challenge — so link retrieval is
+    #    not blocked. (Scope note: this asserts the classification via
+    #    _log_page_diagnostics; it does not itself drive scrape_links().)
     service = _service()
     coordinator = MagicMock()
     monkeypatch.setattr(
