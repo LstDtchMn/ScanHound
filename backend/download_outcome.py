@@ -64,6 +64,56 @@ _RELEASE_TITLE_METADATA = re.compile(
 )
 
 
+# Cloudflare sets this response header on every Challenge Page type. It is
+# language- and template-independent, so it recognises custom or localized
+# challenge pages that carry none of the English phrases above — and, unlike a
+# dormant Turnstile script, it is only present on an actual interstitial.
+CF_MITIGATED_HEADER = "cf-mitigated"
+CF_MITIGATED_CHALLENGE = "challenge"
+
+
+def cf_mitigated_from_perf_log(entries, *, page_url: str = "") -> Optional[str]:
+    """Return the main document's ``cf-mitigated`` value, or ``None``.
+
+    ``entries`` are raw Chrome performance-log records. Only the top-level
+    document response counts: a sub-resource (an embedded Turnstile widget's
+    own request, say) must never be read as an interstitial challenge.
+
+    ``None`` means "no signal" — no document response, header absent, or the
+    log was unavailable. It never means "no challenge", so callers must fall
+    back to the other evidence rather than treating absence as safety.
+    """
+    import json
+
+    latest: Optional[str] = None
+    matched_page = False
+    for entry in entries or ():
+        try:
+            message = json.loads(entry.get("message") or "{}").get("message") or {}
+        except Exception:
+            continue
+        if message.get("method") != "Network.responseReceived":
+            continue
+        params = message.get("params") or {}
+        if params.get("type") != "Document":
+            continue
+        response = params.get("response") or {}
+        headers = {
+            str(key).lower(): value
+            for key, value in (response.get("headers") or {}).items()
+        }
+        value = headers.get(CF_MITIGATED_HEADER)
+        value = str(value).strip().lower() if value is not None else None
+        # Prefer the response for the requested page; otherwise keep the most
+        # recent document response (a challenge is served at the same URL, and
+        # redirects should resolve to whatever was displayed last).
+        if page_url and response.get("url") == page_url:
+            latest, matched_page = value, True
+        elif not matched_page:
+            latest = value
+    return latest
+
+
 def challenge_iframe_srcs(html: str) -> tuple[str, ...]:
     """Return iframe ``src`` values that identify active challenge infrastructure.
 

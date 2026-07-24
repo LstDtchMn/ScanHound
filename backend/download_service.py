@@ -29,7 +29,9 @@ from backend.app_service import normalize_title
 from backend.sources.ddlbase import decode_ddlbase_link
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 from backend.download_outcome import (
+    CF_MITIGATED_CHALLENGE,
     CHALLENGE_IFRAME_MARKERS,
+    cf_mitigated_from_perf_log,
     challenge_iframe_srcs,
     diagnostic_from_traffic_denial,
     strong_challenge_markers,
@@ -312,6 +314,8 @@ class DownloadService:
 
         # WebDriver
         self.cached_driver = None
+        # Latest navigation's Cloudflare cf-mitigated value (None = no signal).
+        self._last_cf_mitigated: Optional[str] = None
         self._browser_status: Dict[str, Any] = safe_status_without_driver(
             self.config,
             chrome_bin=os.environ.get("CHROME_BIN"),
@@ -1501,14 +1505,24 @@ class DownloadService:
                 signals.append(f"requested_host_present:{str(keyword_present).lower()}")
                 self._log(f"[HDEncode][diag] keyword '{keyword}' present in HTML: {keyword_present}")
 
-            if matched_network:
+            # cf-mitigated is authoritative: Cloudflare sets it on every
+            # Challenge Page type, so it outranks the page heuristics and is
+            # never overridden by them (a custom/localized challenge may carry
+            # no recognised phrase at all). Absence is only "no signal".
+            header_challenge = (
+                getattr(self, "_last_cf_mitigated", None) == CF_MITIGATED_CHALLENGE
+            )
+            if header_challenge:
+                signals.append("cf-mitigated:challenge")
+
+            if matched_network and not header_challenge:
                 return ScrapeDiagnostic(
                     ScrapeCode.BROWSER_NETWORK_ERROR,
                     retryable=True,
                     affects_source_health=False,
                     signals=tuple(signals),
                 )
-            if captcha_frames or challenge_markers:
+            if header_challenge or captcha_frames or challenge_markers:
                 decision = None
                 if source_kind == "hdencode":
                     decision = get_hdencode_coordinator().observe_challenge()
@@ -1683,6 +1697,34 @@ class DownloadService:
 
         return _resolved(None, "none", extra)
 
+    def _capture_cf_mitigated(self, driver) -> Optional[str]:
+        """Drain the navigation's performance log and record its cf-mitigated value.
+
+        Called once per navigation. Draining also bounds the log: the browser
+        session is persistent, so entries would otherwise accumulate across
+        every grab. Returns ``None`` when the log is unavailable (adapter
+        without performance logging, older driver) — that is "no signal", not
+        "no challenge", so page evidence still decides.
+        """
+        value = None
+        try:
+            entries = driver.get_log("performance")
+        except Exception:
+            self._last_cf_mitigated = None
+            return None
+        try:
+            page_url = driver.current_url or ""
+        except Exception:
+            page_url = ""
+        try:
+            value = cf_mitigated_from_perf_log(entries, page_url=page_url)
+        except Exception:
+            value = None
+        self._last_cf_mitigated = value
+        if value:
+            self._log(f"[HDEncode] cf-mitigated header: {value!r}", "warning")
+        return value
+
     def _wait_past_cloudflare(
         self,
         driver,
@@ -1691,6 +1733,16 @@ class DownloadService:
         source_kind: str = "other",
     ) -> Optional[ScrapeDiagnostic]:
         """Passively wait for a transient browser check without solving it."""
+        # Read the navigation's response headers once, before polling the page.
+        # cf-mitigated is authoritative and language-independent, so a custom or
+        # localized Challenge Page is recognised even with no English phrase and
+        # no iframe rendered yet.
+        if self._capture_cf_mitigated(driver) == CF_MITIGATED_CHALLENGE:
+            return self._log_page_diagnostics(
+                driver,
+                stage="access_control",
+                source_kind=source_kind,
+            )
         deadline = time.monotonic() + max(0, int(timeout))
         while True:
             try:
