@@ -242,6 +242,26 @@ def test_release_titles_containing_challenge_phrases_are_not_challenges():
     )
 
 
+def test_stale_release_title_cannot_suppress_a_live_challenge_title():
+    """driver.title and page_source are separate reads.
+
+    During navigation or dynamic replacement they can reflect different moments,
+    so the two title sources are evaluated independently — a release title in
+    one must never discard genuine challenge evidence in the other.
+    """
+    # Live challenge title supplied, stale release <title> still in page_source.
+    assert strong_challenge_markers(
+        "<html><head><title>Access Denied 2009 1080p BluRay x264 - 8.4 GB</title>"
+        "</head><body>...</body></html>",
+        "Just a moment...",
+    )
+    # The reverse: stale release title supplied, live challenge <title> parsed.
+    assert strong_challenge_markers(
+        "<html><head><title>Just a moment...</title></head><body>...</body></html>",
+        "Access Denied 2009 1080p BluRay x264 - 8.4 GB",
+    )
+
+
 def test_reason_specific_notification_retains_typed_fields():
     result = {
         "success": False,

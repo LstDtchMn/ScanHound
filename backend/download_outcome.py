@@ -133,10 +133,18 @@ def strong_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:
         )
         if matched:
             markers.append(f"iframe:{matched}")
-    title_haystack = f"{title_low} {doc_title}".strip()
-    if not _RELEASE_TITLE_METADATA.search(title_haystack):
+    # Evaluate the supplied title and the document <title> INDEPENDENTLY. They
+    # are separate reads and can reflect different moments during navigation or
+    # dynamic replacement, so a stale release title must never suppress a live
+    # challenge title (or vice versa). Fail closed: a challenge phrase in either
+    # source counts, provided that source is not itself a release title.
+    for candidate in dict.fromkeys(
+        part for part in (title_low, doc_title) if part.strip()
+    ):
+        if _RELEASE_TITLE_METADATA.search(candidate):
+            continue
         markers.extend(
-            marker for marker in _CHALLENGE_TITLE_MARKERS if marker in title_haystack
+            marker for marker in _CHALLENGE_TITLE_MARKERS if marker in candidate
         )
     markers.extend(
         marker for marker in _CHALLENGE_VISIBLE_MARKERS if marker in visible
