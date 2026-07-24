@@ -2355,19 +2355,28 @@ def _fake_wait(results):
 
 
 class _FakeEl:
-    def __init__(self, value="", text="", action=None, children=None):
-        self._attrs = {"value": value, "action": action}
+    def __init__(self, value="", text="", action=None, formaction=None,
+                 children=None, submit=True):
+        self._attrs = {"value": value, "action": action, "formaction": formaction}
         self.text = text
         self._children = children or []
+        self.submit = submit
 
     def get_attribute(self, name):
         return self._attrs.get(name)
 
     def find_elements(self, by, selector):
+        # Mirror the real selector: only actual submit controls match.
+        if "submit" in selector:
+            return [c for c in self._children if c.submit]
         return self._children
 
 
-def _reveal(results, driver):
+_PAGE = "https://hdencode.org/a-release/"
+
+
+def _reveal(results, driver, current_url=_PAGE):
+    driver.current_url = current_url
     svc = _make_service()
     with patch("backend.download_service._WebDriverWait", _fake_wait(results)), \
          patch("backend.download_service._EC", _FakeEC), \
@@ -2375,32 +2384,85 @@ def _reveal(results, driver):
         return svc._find_reveal_control(driver)
 
 
+def _form(children, action=f"{_PAGE}#unlocked"):
+    return _FakeEl(action=action, children=children)
+
+
 class TestFindRevealControl:
     def test_clickable_control_is_used_first(self):
         btn = _FakeEl(value="View links")
         assert _reveal({"clickable": btn}, MagicMock()) is btn
 
-    def test_present_but_not_clickable_control_is_used(self):
-        """The late-render case that caused false 'layout changed' failures."""
+    def test_merely_present_control_is_not_activated(self):
+        """Present != safe: it may be hidden/disabled and the caller JS-clicks."""
         btn = _FakeEl(value="View links")
-        assert _reveal({"presence": btn}, MagicMock()) is btn
+        driver = MagicMock()
+        driver.find_elements.return_value = []
+        assert _reveal({"presence": btn}, driver) is None
 
     def test_unlock_form_submit_used_when_label_does_not_match(self):
         submit = _FakeEl(value="")            # unlabelled submit inside the form
-        unlock_form = _FakeEl(
-            action="https://hdencode.org/a-release/#unlocked", children=[submit]
-        )
         driver = MagicMock()
-        driver.find_elements.return_value = [unlock_form]
+        driver.find_elements.return_value = [_form([submit])]
         assert _reveal({}, driver) is submit
 
+    def test_formaction_override_is_rejected(self):
+        """A submit may override its form's destination — validate the effective one."""
+        hijack = _FakeEl(value="", formaction="https://evil.example/steal#unlocked")
+        driver = MagicMock()
+        driver.find_elements.return_value = [_form([hijack])]
+        assert _reveal({}, driver) is None
+
+    def test_cross_origin_form_action_is_rejected(self):
+        submit = _FakeEl(value="View links")
+        driver = MagicMock()
+        driver.find_elements.return_value = [
+            _form([submit], action="https://elsewhere.example/x/#unlocked")
+        ]
+        assert _reveal({}, driver) is None
+
+    def test_fragment_must_be_exactly_unlocked(self):
+        submit = _FakeEl(value="")
+        driver = MagicMock()
+        driver.find_elements.return_value = [
+            _form([submit], action=f"{_PAGE}#unlocked-elsewhere")
+        ]
+        assert _reveal({}, driver) is None
+
+    def test_non_submit_button_is_not_selected(self):
+        driver = MagicMock()
+        driver.find_elements.return_value = [
+            _form([_FakeEl(value="View links", submit=False)])
+        ]
+        assert _reveal({}, driver) is None
+
+    def test_multiple_safe_controls_are_ambiguous(self):
+        driver = MagicMock()
+        driver.find_elements.return_value = [
+            _form([_FakeEl(value=""), _FakeEl(value="")])
+        ]
+        assert _reveal({}, driver) is None
+
+    def test_labelled_control_preferred_over_unlabelled(self):
+        labelled = _FakeEl(value="View links")
+        driver = MagicMock()
+        driver.find_elements.return_value = [_form([_FakeEl(value=""), labelled])]
+        assert _reveal({}, driver) is labelled
+
     def test_report_form_is_never_selected(self):
-        report_form = _FakeEl(
-            action="https://hdencode.org/a-release/?report=S1cgS4gFht#uwee",
-            children=[_FakeEl(value="Report content")],
+        report_form = _form(
+            [_FakeEl(value="Report content")],
+            action=f"{_PAGE}?report=S1cgS4gFht#uwee",
         )
         driver = MagicMock()
         driver.find_elements.return_value = [report_form]
+        assert _reveal({}, driver) is None
+
+    def test_report_labelled_submit_inside_unlock_form_is_skipped(self):
+        driver = MagicMock()
+        driver.find_elements.return_value = [
+            _form([_FakeEl(value="Report content")])
+        ]
         assert _reveal({}, driver) is None
 
     def test_label_fallback_matches_link_but_not_report(self):
