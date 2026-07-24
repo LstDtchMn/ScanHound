@@ -15,7 +15,7 @@ import webbrowser
 from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from backend.database import DatabaseManager
 from backend.config import source_enabled
@@ -232,6 +232,58 @@ def _is_archive_name(name: str) -> bool:
     "downloaded" forever waiting for an extraction that never happens.
     """
     return bool(_ARCHIVE_RE.search((name or "").strip()))
+
+
+# HDEncode's link-reveal control can render late when the site is slow — page
+# loads over 60s have been observed in production, and a release page that
+# reported "no View links button" served the control normally on a later retry.
+# One bounded CLICKABLE budget: a merely-present control may be hidden, disabled
+# or not yet interactive, and the caller JS-clicks whatever this returns, so
+# activating a non-clickable control could fire a handler prematurely.
+_REVEAL_CLICKABLE_TIMEOUT = 15
+
+# Only real submit controls can post the unlock form. A bare `button` selector
+# would also match type="button" and other non-submit controls.
+_REVEAL_SUBMIT_SELECTOR = (
+    "input[type='submit'], button[type='submit'], button:not([type])"
+)
+_UNLOCK_FRAGMENT = "unlocked"
+
+
+def _resolves_to_unlock_target(candidate: str, base: str) -> bool:
+    """True when ``candidate`` resolves to *this document's* unlock endpoint.
+
+    A submit control may override its form's destination via ``formaction``, so
+    the *effective* destination is what must be validated — not the parent
+    form's action. Requires the same origin **and the same document path** as
+    the current page, plus a fragment of exactly ``unlocked``: a substring test
+    would accept ``#unlocked-other``, and origin alone would accept some other
+    page's unlock endpoint.
+    """
+    if not candidate or not base:
+        return False
+    try:
+        resolved = urlparse(urljoin(base, candidate))
+        current = urlparse(base)
+    except Exception:
+        return False
+    if resolved.fragment != _UNLOCK_FRAGMENT:
+        return False
+
+    def _norm(path: str) -> str:
+        return (path or "/").rstrip("/") or "/"
+
+    return (
+        resolved.scheme,
+        resolved.hostname,
+        resolved.port,
+        _norm(resolved.path),
+    ) == (
+        current.scheme,
+        current.hostname,
+        current.port,
+        _norm(current.path),
+    )
 
 
 def _ensure_selenium():
@@ -1511,6 +1563,126 @@ class DownloadService:
                 detail=f"Failed to classify the loaded page: {e}",
             )
 
+    # HDEncode renamed the reveal button to "View links" (it was "Access the
+    # links"); clicking it POSTs a form that unlocks the file-host links on the
+    # same page (#unlocked). A generic //input[@type='submit'] match is
+    # deliberately NOT used — it matched the unrelated "Report content" button.
+    _REVEAL_XPATH = (
+        "//input[@value='View links'] | "
+        "//input[contains(@value, 'View link')] | "
+        "//input[@value='Access the links'] | "
+        "//input[contains(@value, 'Access')] | "
+        "//button[contains(text(), 'View link')] | "
+        "//button[contains(text(), 'Access')]"
+    )
+
+    def _find_reveal_control(self, driver):
+        """Locate HDEncode's link-reveal control, tolerating a slow render.
+
+        Production evidence: a release page reported "no View links button" and
+        the identical page served the control on a later retry; the site has
+        returned page loads over 60s. The lookup therefore gets one generous
+        CLICKABLE budget plus destination-validated fallbacks.
+
+        Tiers, most specific first:
+
+        1. the labelled control, waited for as **clickable**. Presence alone is
+           not enough: a present control may be hidden, disabled or not yet
+           interactive, and the caller JS-clicks whatever is returned, so
+           activating a non-clickable control could fire a handler early.
+        2. a **submit** control whose *effective* destination — its
+           ``formaction`` when present, otherwise its form's ``action`` —
+           resolves to this page's ``#unlocked`` endpoint (same origin, exact
+           fragment). A submit can override its form's destination, so the
+           parent form's action alone proves nothing. Ambiguity yields ``None``
+           rather than a guess.
+        3. a submit control labelled like a links control, never "report".
+
+        Each outcome logs its tier, elapsed time, form count and candidate
+        labels so production evidence can distinguish a late render from a
+        page-shape variant.
+
+        Returns the element, or ``None`` when nothing matched safely.
+        """
+        started = time.monotonic()
+
+        def _resolved(control, tier, extra=""):
+            self._log(
+                f"[HDEncode] reveal-control tier={tier} "
+                f"elapsed={time.monotonic() - started:.1f}s "
+                f"found={control is not None}{extra}"
+            )
+            return control
+
+        try:
+            return _resolved(
+                _WebDriverWait(driver, _REVEAL_CLICKABLE_TIMEOUT).until(
+                    _EC.element_to_be_clickable((_By.XPATH, self._REVEAL_XPATH))
+                ),
+                "clickable",
+            )
+        except Exception:
+            pass
+
+        try:
+            base = driver.current_url or ""
+        except Exception:
+            base = ""
+        try:
+            forms = list(driver.find_elements(_By.CSS_SELECTOR, "form"))
+        except Exception:
+            forms = []
+
+        safe, labelled, kinds = [], [], []
+        for form in forms:
+            try:
+                form_action = form.get_attribute("action") or ""
+                controls = form.find_elements(
+                    _By.CSS_SELECTOR, _REVEAL_SUBMIT_SELECTOR
+                )
+            except Exception:
+                continue
+            for el in controls:
+                try:
+                    # A submit may override its form's destination.
+                    target = el.get_attribute("formaction") or form_action
+                    label = (
+                        el.get_attribute("value") or el.text or ""
+                    ).strip().lower()
+                except Exception:
+                    continue
+                kinds.append((label or "<unlabelled>")[:20])
+                if "report" in label:
+                    continue
+                if not _resolves_to_unlock_target(target, base):
+                    continue
+                safe.append(el)
+                if "view link" in label or "access" in label:
+                    labelled.append(el)
+
+        extra = f" forms={len(forms)} candidates={kinds[:6]}"
+        # Prefer an unambiguous labelled control; accept an unlabelled one only
+        # when it is the single safe submit. Never guess between several.
+        if len(labelled) == 1:
+            return _resolved(labelled[0], "unlock-form-labelled", extra)
+        if not labelled and len(safe) == 1:
+            return _resolved(safe[0], "unlock-form-single", extra)
+        if labelled or safe:
+            return _resolved(None, "unlock-form-ambiguous", extra)
+
+        # Label fallback: a submit control named like a links control.
+        try:
+            for el in driver.find_elements(
+                _By.CSS_SELECTOR, _REVEAL_SUBMIT_SELECTOR
+            ):
+                label = (el.get_attribute("value") or el.text or "").lower()
+                if "link" in label and "report" not in label:
+                    return _resolved(el, "label", extra)
+        except Exception:
+            pass
+
+        return _resolved(None, "none", extra)
+
     def _wait_past_cloudflare(
         self,
         driver,
@@ -1666,40 +1838,8 @@ class DownloadService:
                         )
                         return ScrapedLinks(visible_links)
 
-                    # HDEncode renamed the reveal button to "View links" (it was
-                    # "Access the links"); clicking it POSTs a form that unlocks
-                    # the file-host links on the same page (#unlocked).
-                    # The generic //input[@type='submit'] fallback is deliberately
-                    # gone — it matched the unrelated "Report content" button.
-                    access_xpath = (
-                        "//input[@value='View links'] | "
-                        "//input[contains(@value, 'View link')] | "
-                        "//input[@value='Access the links'] | "
-                        "//input[contains(@value, 'Access')] | "
-                        "//button[contains(text(), 'View link')] | "
-                        "//button[contains(text(), 'Access')]"
-                    )
                     self._log("[HDEncode] Looking for the 'View links' button...")
-                    access_btn = None
-                    try:
-                        access_btn = _WebDriverWait(driver, 10).until(
-                            _EC.element_to_be_clickable((_By.XPATH, access_xpath))
-                        )
-                    except Exception:
-                        # Fallback: any submit/button whose label mentions "link"
-                        # but is NOT the "Report content" button.
-                        try:
-                            for el in driver.find_elements(
-                                _By.CSS_SELECTOR,
-                                "form input[type='submit'], form button[type='submit'], form button",
-                            ):
-                                label = (el.get_attribute("value") or el.text or "").lower()
-                                if "link" in label and "report" not in label:
-                                    access_btn = el
-                                    self._log(f"[HDEncode] Fallback matched control: {label!r}")
-                                    break
-                        except Exception:
-                            access_btn = None
+                    access_btn = self._find_reveal_control(driver)
 
                     if not access_btn:
                         self._log(
