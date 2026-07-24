@@ -5,12 +5,17 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.public_errors import capture_public_exception
 from backend.api.ws import ws_manager
-from backend.download_queue import DownloadQueueItemClaimed
+from backend.download_queue import (
+    DownloadQueueConflict,
+    DownloadQueueError,
+    DownloadQueueItemClaimed,
+    DownloadQueueUnavailable,
+)
 from backend.download_service import _source_page_kind
 from backend.source_health import record_scrape_outcome
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
@@ -58,7 +63,7 @@ class BatchExecution(BaseModel):
 
 
 class BatchDownloadRequest(BaseModel):
-    items: List[DownloadRequest]
+    items: List[DownloadRequest] = Field(min_length=1)
     execution: Optional[BatchExecution] = None
 
 
@@ -212,8 +217,12 @@ def download_batch(
             mode=mode,
             auto_resume_after_cooldown=auto_resume,
         )
-    except Exception as exc:
+    except DownloadQueueConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except DownloadQueueUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except DownloadQueueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return {
         "status": "scheduled",
         "count": batch.get("total_items", len(req.items)),

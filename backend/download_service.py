@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
 from backend.database import DatabaseManager
+from backend.config import source_enabled
 from backend.hdencode_coordinator import (
     HDEncodeTrafficDenied,
     configure_hdencode_coordinator,
@@ -1068,11 +1069,15 @@ class DownloadService:
         if major:
             self._log(f"Scraper preflight: detected browser major version {major}", "info")
         else:
-            self._log(
+            warning = (
                 "Scraper preflight: could NOT detect the browser version — "
-                "undetected-chromedriver may fetch a mismatched driver and break scraping.",
-                "warning",
+                "undetected-chromedriver may fetch a mismatched driver and break scraping."
+                if plan.adapter == "uc_chromium"
+                else
+                "Scraper preflight: could NOT detect the browser version — "
+                "standard Selenium will rely on the installed Chromium/ChromeDriver pairing."
             )
+            self._log(warning, "warning")
 
     def get_driver(self, *, require_hdencode_authorization: bool = False):
         """Get or create a cached WebDriver instance (thread-safe)."""
@@ -1091,21 +1096,30 @@ class DownloadService:
                         pass
                     self.cached_driver = None
 
-            # Detect the installed Chrome/Chromium major version so
-            # undetected-chromedriver fetches a *matching* driver. Without it,
-            # uc grabs the latest driver, which fails when the installed browser
-            # lags (e.g. the container pins Chromium 149 but uc pulled
-            # ChromeDriver 150 -> SessionNotCreatedException, breaking all scrapes).
+            chrome_bin = os.environ.get("CHROME_BIN")
+            system_driver = "/usr/bin/chromedriver"
+            plan = browser_plan(
+                self.config,
+                chrome_bin=chrome_bin,
+                system_driver=system_driver,
+            )
+
+            # UC needs a matching major when it downloads a driver. Standard
+            # Selenium uses the installed system pairing and only needs a clear
+            # diagnostic when version discovery is unavailable.
             chrome_ver = self._detect_chrome_major()
             if chrome_ver:
                 logger.debug("Detected Chrome major version %s", chrome_ver)
-            else:
+            elif plan.adapter == "uc_chromium":
                 logger.warning(
                     "Could not detect Chrome version; undetected-chromedriver "
                     "will guess a driver and may mismatch the browser."
                 )
-            chrome_bin = os.environ.get("CHROME_BIN")
-            system_driver = "/usr/bin/chromedriver"
+            else:
+                logger.warning(
+                    "Could not detect Chrome version; standard Selenium will "
+                    "rely on the installed Chromium/ChromeDriver pairing."
+                )
 
             # Launch with a bounded retry. The selected adapter is explicit:
             # standard Selenium + persistent Chromium profile by default, with
@@ -1589,7 +1603,11 @@ class DownloadService:
         # Classify once by parsed hostname. Query/path text such as
         # `?next=https://ddlbase.com` must not bypass the HDEncode off switch.
         source_kind = _source_page_kind(url)
-        if source_kind == "hdencode" and not self.config.get("hdencode_enabled", True):
+        if source_kind == "hdencode" and not source_enabled(
+            self.config,
+            "hdencode_enabled",
+            missing_default=True,
+        ):
             diagnostic = ScrapeDiagnostic(
                 ScrapeCode.SOURCE_DISABLED,
                 retryable=False,

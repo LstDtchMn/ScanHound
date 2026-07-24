@@ -196,7 +196,8 @@
             </button>
             <button
               class="px-2.5 py-1 rounded bg-[var(--bg-tertiary)] text-xs disabled:opacity-40"
-              disabled={busy !== ''}
+              disabled={busy !== '' || item.state === 'claimed'}
+              title={item.state === 'claimed' ? 'Wait for the active retry to finish' : 'Remove this retry'}
               onclick={() => remove(item)}
             >
               Remove

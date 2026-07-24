@@ -16,6 +16,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from backend.config import source_enabled
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SOURCES = ["HDEncode", "DDLBase", "Adit-HD"]
@@ -137,7 +139,7 @@ class BackgroundScanner:
         """Epoch timestamp of the next scheduled run, or None if disabled."""
         cfg = self._reg.config or {}
         rss_active = (
-            cfg.get("hdencode_enabled", True) is True
+            source_enabled(cfg, "hdencode_enabled", missing_default=True)
             and cfg.get("hdencode_discovery_mode")
             in {"rss_shadow", "rss_primary"}
         )
@@ -163,7 +165,7 @@ class BackgroundScanner:
                 hours = 6
             intervals.append(hours * 3600.0)
         if (
-            cfg.get("hdencode_enabled", True) is True
+            source_enabled(cfg, "hdencode_enabled", missing_default=True)
             and cfg.get("hdencode_discovery_mode")
             in {"rss_shadow", "rss_primary"}
         ):
@@ -208,7 +210,7 @@ class BackgroundScanner:
                 return  # stop requested
             cfg = self._reg.config or {}
             rss_active = (
-                cfg.get("hdencode_enabled", True) is True
+                source_enabled(cfg, "hdencode_enabled", missing_default=True)
                 and cfg.get("hdencode_discovery_mode")
                 in {"rss_shadow", "rss_primary"}
             )
@@ -244,7 +246,7 @@ class BackgroundScanner:
 
         sources = cfg.get("background_scan_sources") or _DEFAULT_SOURCES
         rss_active = (
-            cfg.get("hdencode_enabled", True) is True
+            source_enabled(cfg, "hdencode_enabled", missing_default=True)
             and cfg.get("hdencode_discovery_mode")
             in {"rss_shadow", "rss_primary"}
         )
@@ -286,7 +288,8 @@ class BackgroundScanner:
         )
         try:
             if (
-                "HDEncode" in sources
+                rss_active
+                and "HDEncode" in sources
                 and discovery_mode in {"rss_shadow", "rss_primary"}
             ):
                 from backend.hdencode_rss_service import HDEncodeRSSService
@@ -377,8 +380,14 @@ class BackgroundScanner:
                         "reason": "stale_lifespan",
                     }
             for source in sources:
-                if (str(source).strip().lower() == "hdencode"
-                        and not cfg.get("hdencode_enabled", True)):
+                if (
+                    str(source).strip().lower() == "hdencode"
+                    and not source_enabled(
+                        cfg,
+                        "hdencode_enabled",
+                        missing_default=True,
+                    )
+                ):
                     logger.info("Background scan: HDEncode disabled; skipping without network access")
                     source_results.append({
                         "source": source, "new": 0, "error": None,

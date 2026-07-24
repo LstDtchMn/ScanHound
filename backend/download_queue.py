@@ -57,6 +57,14 @@ class DownloadQueueError(RuntimeError):
     pass
 
 
+class DownloadQueueConflict(DownloadQueueError):
+    """The request conflicts with an already-active durable queue item."""
+
+
+class DownloadQueueUnavailable(DownloadQueueError):
+    """The durable queue cannot accept work because a dependency is absent."""
+
+
 class DownloadQueueSourceHeld(DownloadQueueError):
     def __init__(self, *, reason_code: str, cooldown_until: Optional[str]):
         super().__init__("The source is temporarily paused.")
@@ -180,6 +188,33 @@ class DownloadQueueService:
             logger.warning("download queue synchronous broadcast failed", exc_info=True)
             return False
 
+    def _emit_batch_progress(
+        self,
+        batch_uuid: str,
+        *,
+        current_title: str = "",
+    ) -> None:
+        """Broadcast aggregate durable-batch progress for the existing UI bar."""
+        batch = self.get_batch(batch_uuid)
+        if not batch:
+            return
+        items = batch.get("items") or []
+        total = len(items)
+        if total <= 0:
+            return
+        terminal = {"completed", "failed", "cancelled"}
+        completed = sum(1 for item in items if item.get("state") in terminal)
+        self._emit(
+            "download:batch_progress",
+            {
+                "batch_uuid": batch_uuid,
+                "completed": completed,
+                "total": total,
+                "current_title": current_title,
+                "state": batch.get("state"),
+            },
+        )
+
     def recover_interrupted(self) -> None:
         if self.db is None:
             return
@@ -285,7 +320,7 @@ class DownloadQueueService:
         auto_resume_after_cooldown: bool = False,
     ) -> dict:
         if self.db is None or self.download is None:
-            raise DownloadQueueError("The download queue is unavailable.")
+            raise DownloadQueueUnavailable("The download queue is unavailable.")
         interval = max(0, min(120, int(interval_minutes))) * 60
         mode = "immediate" if interval == 0 or mode == "immediate" else "staggered"
         batch_uuid = str(uuid.uuid4())
@@ -307,7 +342,38 @@ class DownloadQueueService:
         inserted = 0
         with self.db.transaction() as conn:
             if not conn:
-                raise DownloadQueueError("The database is unavailable.")
+                raise DownloadQueueUnavailable("The database is unavailable.")
+            active_rows = conn.execute(
+                """
+                SELECT source, canonical_url, service_type
+                FROM download_queue_items
+                WHERE state IN (
+                    'scheduled', 'waiting_source', 'verification_required',
+                    'ready', 'claimed'
+                )
+                """
+            ).fetchall()
+            active_keys = {
+                (
+                    row["source"],
+                    row["canonical_url"],
+                    row["service_type"],
+                )
+                for row in active_rows
+            }
+            pending = [
+                item
+                for item in unique
+                if (
+                    item["source"],
+                    item["url"],
+                    item["service_type"],
+                ) not in active_keys
+            ]
+            if not pending:
+                raise DownloadQueueConflict(
+                    "Every selected item is already active in the download queue."
+                )
             conn.execute(
                 """
                 INSERT INTO download_queue_batches (
@@ -320,14 +386,14 @@ class DownloadQueueService:
                     batch_uuid,
                     mode,
                     interval,
-                    unique[0]["source"] if len({i["source"] for i in unique}) == 1 else "mixed",
-                    len(unique),
+                    pending[0]["source"] if len({i["source"] for i in pending}) == 1 else "mixed",
+                    len(pending),
                     1 if auto_resume_after_cooldown else 0,
                     _iso(now),
                     _iso(now),
                 ),
             )
-            for index, item in enumerate(unique):
+            for index, item in enumerate(pending):
                 scheduled = now + timedelta(seconds=interval * index)
                 item_uuid = str(uuid.uuid4())
                 cursor = conn.execute(
@@ -367,7 +433,7 @@ class DownloadQueueService:
                     "DELETE FROM download_queue_batches WHERE batch_uuid = ?",
                     (batch_uuid,),
                 )
-                raise DownloadQueueError(
+                raise DownloadQueueConflict(
                     "Every selected item is already active in the download queue."
                 )
             conn.execute(
@@ -385,6 +451,7 @@ class DownloadQueueService:
             "count": inserted,
         }
         self._emit("download:batch_schedule", payload)
+        self._emit_batch_progress(batch_uuid)
         return payload
 
     def enqueue_retry(self, request: Any, outcome: dict) -> dict:
@@ -674,6 +741,10 @@ class DownloadQueueService:
 
     def _execute(self, item: dict) -> None:
         self._emit("download:queue_updated", {**item, "state": "claimed"})
+        self._emit_batch_progress(
+            item["batch_uuid"],
+            current_title=item.get("title") or "",
+        )
 
         def progress(event: str, data: dict) -> None:
             self._emit(event, data)
@@ -816,6 +887,7 @@ class DownloadQueueService:
             "download:queue_updated",
             {**item, **outcome, "state": "completed"},
         )
+        self._emit_batch_progress(item["batch_uuid"])
         return True
 
     def _fail(self, item: dict, outcome: dict) -> bool:
@@ -859,6 +931,7 @@ class DownloadQueueService:
             "download:queue_updated",
             {**item, **outcome, "state": "failed"},
         )
+        self._emit_batch_progress(item["batch_uuid"])
         return True
 
     def _pause_for_source(self, item: dict, outcome: dict) -> bool:
@@ -956,6 +1029,7 @@ class DownloadQueueService:
                 "deferred_count": batch.get("deferred_items", 0),
             },
         )
+        self._emit_batch_progress(item["batch_uuid"])
         return True
 
     def _refresh_batch_locked(self, conn, batch_uuid: str, now: str) -> None:
