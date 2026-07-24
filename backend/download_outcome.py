@@ -26,44 +26,106 @@ _SOURCE_WIDE_REASONS = {
 }
 
 
-def strong_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:
-    """Return only strong technical/title/visible challenge markers."""
-    low = (html or "").lower()
-    title_low = (title or "").lower()
+# Active interactive-challenge evidence. A source-wide challenge must be proven
+# by a RENDERED challenge — a challenge iframe, a challenge page title, or
+# visible challenge body text — never by a dormant reference to challenge
+# infrastructure that appears only inside a <script>, preload URL, JavaScript
+# configuration object, comment, or other non-active raw HTML.
+CHALLENGE_IFRAME_MARKERS = (
+    "turnstile",
+    "challenges.cloudflare",
+    "recaptcha",
+    "hcaptcha",
+    "captcha",
+)
+_CHALLENGE_TITLE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "checking your browser",
+    "verify you are human",
+    "access denied",
+)
+_CHALLENGE_VISIBLE_MARKERS = (
+    "checking your browser",
+    "verify you are human",
+)
+
+
+def challenge_iframe_srcs(html: str) -> tuple[str, ...]:
+    """Return iframe ``src`` values that identify active challenge infrastructure.
+
+    Only a rendered ``<iframe>`` counts. A challenge marker that appears solely
+    inside a ``<script>``, preload URL, JavaScript config object, comment, or any
+    other non-iframe raw-HTML reference is dormant and is never returned.
+    """
     try:
         from bs4 import BeautifulSoup
 
-        visible = " ".join(
-            (BeautifulSoup(html or "", "html.parser").get_text(" ") or "").split()
-        ).lower()
+        soup = BeautifulSoup(html or "", "html.parser")
     except Exception:
-        visible = ""
-    markers = [
-        marker
-        for marker in (
-            "cf-chl",
-            "challenges.cloudflare.com",
-            "turnstile",
-            "hcaptcha",
-            "recaptcha",
+        return ()
+    hits = []
+    for frame in soup.find_all("iframe"):
+        src = frame.get("src") or ""
+        if any(marker in src.lower() for marker in CHALLENGE_IFRAME_MARKERS):
+            hits.append(src)
+    return tuple(hits)
+
+
+def strong_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:
+    """Return active interactive-challenge evidence markers, or ``()`` for none.
+
+    A source-wide interactive challenge requires ACTIVE evidence:
+
+    1. a rendered challenge iframe whose ``src`` identifies Turnstile,
+       Cloudflare Challenges, reCAPTCHA, hCaptcha, or captcha infrastructure;
+    2. a challenge-specific page ``<title>`` (or supplied title) such as
+       "Just a moment", "Attention required", "Checking your browser",
+       "Verify you are human", or "Access denied"; or
+    3. visible challenge body text ("checking your browser",
+       "verify you are human").
+
+    Dormant Turnstile/Cloudflare/reCAPTCHA references that appear only inside a
+    ``<script>``, preload URL, JavaScript config, comment, or other non-active
+    raw HTML are NOT evidence and never yield a challenge classification.
+    """
+    title_low = (title or "").lower()
+    iframe_srcs: tuple[str, ...] = ()
+    doc_title = ""
+    visible = ""
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html or "", "html.parser")
+        iframe_srcs = tuple(
+            frame.get("src") or "" for frame in soup.find_all("iframe")
         )
-        if marker in low
-    ]
+        if soup.title is not None:
+            doc_title = (soup.title.get_text() or "").lower()
+        # Visible text only: drop <script>/<style>/<template>/<noscript> so a JS
+        # string literal (e.g. a Turnstile config containing "verify you are
+        # human") cannot be mistaken for rendered challenge copy.
+        for tag in soup(["script", "style", "template", "noscript"]):
+            tag.decompose()
+        visible = " ".join((soup.get_text(" ") or "").split()).lower()
+    except Exception:
+        pass
+
+    markers: list[str] = []
+    for src in iframe_srcs:
+        low = src.lower()
+        matched = next(
+            (marker for marker in CHALLENGE_IFRAME_MARKERS if marker in low),
+            None,
+        )
+        if matched:
+            markers.append(f"iframe:{matched}")
+    title_haystack = f"{title_low} {doc_title}".strip()
     markers.extend(
-        marker
-        for marker in (
-            "just a moment",
-            "attention required",
-            "checking your browser",
-            "verify you are human",
-            "access denied",
-        )
-        if marker in title_low
+        marker for marker in _CHALLENGE_TITLE_MARKERS if marker in title_haystack
     )
     markers.extend(
-        marker
-        for marker in ("checking your browser", "verify you are human")
-        if marker in visible
+        marker for marker in _CHALLENGE_VISIBLE_MARKERS if marker in visible
     )
     return tuple(dict.fromkeys(markers))
 

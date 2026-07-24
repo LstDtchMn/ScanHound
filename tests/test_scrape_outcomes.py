@@ -61,6 +61,86 @@ def test_page_diagnostics_classifies_interactive_challenge():
     assert diagnostic.affects_source_health is True
 
 
+def test_dormant_assets_do_not_invoke_coordinator_or_cooldown(monkeypatch):
+    # 6. A page that only preloads Cloudflare/Turnstile assets must not call the
+    #    HDEncode coordinator or start a source-wide cooldown.
+    service = _service()
+    coordinator = MagicMock()
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator
+    )
+    driver = MagicMock()
+    driver.page_source = """
+        <html><head>
+        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>
+        </head><body>
+        <article>A Movie (2024) 2160p - release description with no links yet.</article>
+        </body></html>
+    """
+
+    diagnostic = service._log_page_diagnostics(
+        driver, stage="access_control", source_kind="hdencode"
+    )
+
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE
+    coordinator.observe_challenge.assert_not_called()
+
+
+def test_visible_links_retrieved_despite_dormant_cloudflare_assets(monkeypatch):
+    # 7. Dormant Cloudflare assets alongside real file-host links stay an
+    #    item-level outcome; a false challenge must not block link retrieval.
+    service = _service()
+    coordinator = MagicMock()
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator
+    )
+    driver = MagicMock()
+    driver.page_source = """
+        <html><head>
+        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>
+        </head><body>
+        <a href="https://rapidgator.net/file/abc">Rapidgator</a>
+        </body></html>
+    """
+
+    diagnostic = service._log_page_diagnostics(
+        driver, keyword="rapidgator", stage="requested_host", source_kind="hdencode"
+    )
+
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE
+    assert diagnostic.affects_source_health is False
+    coordinator.observe_challenge.assert_not_called()
+
+
+def test_real_interactive_challenge_still_creates_source_wide_outcome(monkeypatch):
+    # 8. A rendered challenge iframe still produces the typed source-wide
+    #    interactive-challenge outcome and invokes the coordinator.
+    service = _service()
+    coordinator = MagicMock()
+    coordinator.observe_challenge.return_value = SimpleNamespace(
+        cooldown_until="2099-01-01T00:00:00+00:00"
+    )
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator
+    )
+    driver = MagicMock()
+    driver.page_source = """
+        <html><body>
+        <iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if"></iframe>
+        </body></html>
+    """
+
+    diagnostic = service._log_page_diagnostics(
+        driver, stage="access_control", source_kind="hdencode"
+    )
+
+    assert diagnostic.code is ScrapeCode.INTERACTIVE_CHALLENGE
+    assert diagnostic.affects_source_health is True
+    assert diagnostic.affected_scope == "source"
+    assert diagnostic.cooldown_until == "2099-01-01T00:00:00+00:00"
+    coordinator.observe_challenge.assert_called_once()
+
+
 def test_page_diagnostics_distinguishes_requested_host_missing():
     service = _service()
     driver = MagicMock()
