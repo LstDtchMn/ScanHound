@@ -9,6 +9,7 @@ from fastapi import BackgroundTasks
 
 from backend.database import DatabaseManager
 from backend.download_outcome import (
+    cf_mitigated_from_perf_log,
     challenge_iframe_srcs,
     deferred_result,
     diagnostic_from_traffic_denial,
@@ -260,6 +261,63 @@ def test_stale_release_title_cannot_suppress_a_live_challenge_title():
         "<html><head><title>Just a moment...</title></head><body>...</body></html>",
         "Access Denied 2009 1080p BluRay x264 - 8.4 GB",
     )
+
+
+def _perf(url, headers, rtype="Document"):
+    import json
+    return {
+        "message": json.dumps(
+            {
+                "message": {
+                    "method": "Network.responseReceived",
+                    "params": {
+                        "type": rtype,
+                        "response": {"url": url, "headers": headers},
+                    },
+                }
+            }
+        )
+    }
+
+
+def test_cf_mitigated_reads_only_the_main_document_response():
+    page = "https://hdencode.org/a-release/"
+
+    # Document response carrying the header.
+    assert (
+        cf_mitigated_from_perf_log(
+            [_perf(page, {"cf-mitigated": "challenge"})], page_url=page
+        )
+        == "challenge"
+    )
+    # Header casing and padding are normalised.
+    assert (
+        cf_mitigated_from_perf_log(
+            [_perf(page, {"CF-Mitigated": " Challenge "})], page_url=page
+        )
+        == "challenge"
+    )
+    # A sub-resource (an embedded Turnstile widget's own request) is NOT the
+    # interstitial and must never be read as one.
+    assert (
+        cf_mitigated_from_perf_log(
+            [
+                _perf(page, {"content-type": "text/html"}),
+                _perf(
+                    "https://challenges.cloudflare.com/turnstile/v0/api.js",
+                    {"cf-mitigated": "challenge"},
+                    rtype="Script",
+                ),
+            ],
+            page_url=page,
+        )
+        is None
+    )
+    # No document response, malformed records, and an empty log are all "no
+    # signal" rather than errors.
+    assert cf_mitigated_from_perf_log([]) is None
+    assert cf_mitigated_from_perf_log([{"message": "not json"}]) is None
+    assert cf_mitigated_from_perf_log(None) is None
 
 
 def test_reason_specific_notification_retains_typed_fields():

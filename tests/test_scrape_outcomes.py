@@ -143,6 +143,91 @@ def test_real_interactive_challenge_still_creates_source_wide_outcome(monkeypatc
     coordinator.observe_challenge.assert_called_once()
 
 
+def _perf_entry(url, headers, *, rtype="Document"):
+    import json
+    return {
+        "message": json.dumps(
+            {
+                "message": {
+                    "method": "Network.responseReceived",
+                    "params": {
+                        "type": rtype,
+                        "response": {"url": url, "status": 403, "headers": headers},
+                    },
+                }
+            }
+        )
+    }
+
+
+PAGE = "https://hdencode.org/a-release/"
+
+
+def test_cf_mitigated_header_detects_localized_challenge(monkeypatch):
+    """A custom/localized Challenge Page carries none of the English phrases.
+
+    The header is authoritative, so it is recognised anyway.
+    """
+    service = _service()
+    coordinator = MagicMock()
+    coordinator.observe_challenge.return_value = SimpleNamespace(cooldown_until=None)
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator
+    )
+    driver = MagicMock()
+    driver.current_url = PAGE
+    driver.title = "Un momento"
+    # No challenge iframe, no English title/body phrase anywhere.
+    driver.page_source = (
+        "<html><head><title>Un momento…</title></head>"
+        "<body><h1>Comprobando su navegador</h1></body></html>"
+    )
+    driver.get_log.return_value = [_perf_entry(PAGE, {"cf-mitigated": "challenge"})]
+
+    assert service._capture_cf_mitigated(driver) == "challenge"
+    diagnostic = service._log_page_diagnostics(
+        driver, stage="access_control", source_kind="hdencode"
+    )
+
+    assert diagnostic.code is ScrapeCode.INTERACTIVE_CHALLENGE
+    assert diagnostic.affected_scope == "source"
+    assert "cf-mitigated:challenge" in diagnostic.signals
+    coordinator.observe_challenge.assert_called_once()
+
+
+def test_cf_mitigated_absent_leaves_page_evidence_in_charge(monkeypatch):
+    """Absence is 'no signal', never 'no challenge' — and never a false positive."""
+    service = _service()
+    coordinator = MagicMock()
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator
+    )
+    driver = MagicMock()
+    driver.current_url = PAGE
+    driver.page_source = (
+        "<html><head>"
+        "<script src='https://challenges.cloudflare.com/turnstile/v0/api.js'></script>"
+        "</head><body><a href='https://rapidgator.net/file/abc'>RG</a></body></html>"
+    )
+    driver.get_log.return_value = [_perf_entry(PAGE, {"content-type": "text/html"})]
+
+    assert service._capture_cf_mitigated(driver) is None
+    diagnostic = service._log_page_diagnostics(
+        driver, keyword="rapidgator", stage="requested_host", source_kind="hdencode"
+    )
+
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE
+    coordinator.observe_challenge.assert_not_called()
+
+
+def test_unavailable_performance_log_is_not_a_challenge():
+    """An adapter without performance logging must fail open to page evidence."""
+    service = _service()
+    driver = MagicMock()
+    driver.get_log.side_effect = Exception("log type 'performance' not found")
+    assert service._capture_cf_mitigated(driver) is None
+
+
 def test_page_diagnostics_distinguishes_requested_host_missing():
     service = _service()
     driver = MagicMock()
