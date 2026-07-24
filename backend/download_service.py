@@ -251,13 +251,14 @@ _UNLOCK_FRAGMENT = "unlocked"
 
 
 def _resolves_to_unlock_target(candidate: str, base: str) -> bool:
-    """True when ``candidate`` resolves to the unlock endpoint of ``base``.
+    """True when ``candidate`` resolves to *this document's* unlock endpoint.
 
     A submit control may override its form's destination via ``formaction``, so
     the *effective* destination is what must be validated — not the parent
-    form's action. Requires the same origin as the current page and a fragment
-    of exactly ``unlocked`` (a substring test would accept ``#unlocked-other``
-    or an unrelated URL that merely contains the word).
+    form's action. Requires the same origin **and the same document path** as
+    the current page, plus a fragment of exactly ``unlocked``: a substring test
+    would accept ``#unlocked-other``, and origin alone would accept some other
+    page's unlock endpoint.
     """
     if not candidate or not base:
         return False
@@ -268,10 +269,20 @@ def _resolves_to_unlock_target(candidate: str, base: str) -> bool:
         return False
     if resolved.fragment != _UNLOCK_FRAGMENT:
         return False
-    return (resolved.scheme, resolved.hostname, resolved.port) == (
+
+    def _norm(path: str) -> str:
+        return (path or "/").rstrip("/") or "/"
+
+    return (
+        resolved.scheme,
+        resolved.hostname,
+        resolved.port,
+        _norm(resolved.path),
+    ) == (
         current.scheme,
         current.hostname,
         current.port,
+        _norm(current.path),
     )
 
 

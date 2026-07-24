@@ -2421,6 +2421,17 @@ class TestFindRevealControl:
         ]
         assert _reveal({}, driver) is None
 
+    def test_other_same_origin_page_unlock_endpoint_is_rejected(self):
+        """Origin alone is not enough — it must be *this* document's endpoint."""
+        driver = MagicMock()
+        driver.find_elements.return_value = [
+            _form(
+                [_FakeEl(value="View links")],
+                action="https://hdencode.org/another-release/#unlocked",
+            )
+        ]
+        assert _reveal({}, driver) is None
+
     def test_fragment_must_be_exactly_unlocked(self):
         submit = _FakeEl(value="")
         driver = MagicMock()
