@@ -240,7 +240,25 @@ def _is_archive_name(name: str) -> bool:
 # One bounded CLICKABLE budget: a merely-present control may be hidden, disabled
 # or not yet interactive, and the caller JS-clicks whatever this returns, so
 # activating a non-clickable control could fire a handler prematurely.
-_REVEAL_CLICKABLE_TIMEOUT = 15
+#
+# PRODUCTION EVIDENCE (2026-07-24): HDEncode serves the unlock form in a
+# not-ready state — its submit reads "Verifying… Please wait" — and only later
+# swaps to "View links". When the real control is present it is clickable in
+# under a second and the links follow; when the countdown is running a 15s
+# budget expired, so the wait must outlast the countdown rather than fall
+# through to a control that cannot reveal anything.
+_REVEAL_CLICKABLE_TIMEOUT = 60
+
+# A control in this state is a placeholder for the real one. Clicking it cannot
+# reveal links, and doing so masks the countdown as a layout failure, so it is
+# never an acceptable fallback target.
+_REVEAL_NOT_READY_MARKERS = ("verifying", "please wait")
+
+
+def _reveal_control_not_ready(label: str) -> bool:
+    """True when a control's label marks it as HDEncode's countdown placeholder."""
+    low = (label or "").lower()
+    return any(marker in low for marker in _REVEAL_NOT_READY_MARKERS)
 
 # Only real submit controls can post the unlock form. A bare `button` selector
 # would also match type="button" and other non-submit controls.
@@ -1634,6 +1652,7 @@ class DownloadService:
             forms = []
 
         safe, labelled, kinds = [], [], []
+        not_ready = False
         for form in forms:
             try:
                 form_action = form.get_attribute("action") or ""
@@ -1654,6 +1673,11 @@ class DownloadService:
                 kinds.append((label or "<unlabelled>")[:20])
                 if "report" in label:
                     continue
+                # The countdown placeholder posts the same unlock form, so it
+                # passes every destination check — it is rejected on its label.
+                if _reveal_control_not_ready(label):
+                    not_ready = True
+                    continue
                 if not _resolves_to_unlock_target(target, base):
                     continue
                 safe.append(el)
@@ -1661,6 +1685,8 @@ class DownloadService:
                     labelled.append(el)
 
         extra = f" forms={len(forms)} candidates={kinds[:6]}"
+        if not_ready:
+            extra += " not_ready=True"
         # Prefer an unambiguous labelled control; accept an unlabelled one only
         # when it is the single safe submit. Never guess between several.
         if len(labelled) == 1:
@@ -1676,12 +1702,17 @@ class DownloadService:
                 _By.CSS_SELECTOR, _REVEAL_SUBMIT_SELECTOR
             ):
                 label = (el.get_attribute("value") or el.text or "").lower()
+                if _reveal_control_not_ready(label):
+                    not_ready = True
+                    continue
                 if "link" in label and "report" not in label:
                     return _resolved(el, "label", extra)
         except Exception:
             pass
 
-        return _resolved(None, "none", extra)
+        # The reveal control exists but is still counting down: report it as
+        # not-yet-ready rather than as a changed layout, and never click it.
+        return _resolved(None, "not-ready" if not_ready else "none", extra)
 
     def _wait_past_cloudflare(
         self,
