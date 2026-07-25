@@ -2321,49 +2321,51 @@ def test_remove_package_by_id_single_uuid(download_service, db_manager, monkeypa
 # ── HDEncode reveal-control lookup (slow / late-render tolerance) ─────
 
 
-class _FakeEC:
-    """expected_conditions stand-in that tags the condition kind."""
-
-    @staticmethod
-    def element_to_be_clickable(locator):
-        return ("clickable", locator)
-
-    @staticmethod
-    def presence_of_element_located(locator):
-        return ("presence", locator)
-
-
 class _FakeBy:
     XPATH = "xpath"
     CSS_SELECTOR = "css"
 
 
-def _fake_wait(results):
-    """WebDriverWait stand-in; results maps kind -> element (absent = timeout)."""
+def _fake_wait(_results=None, polls=1):
+    """WebDriverWait stand-in that actually evaluates the polled predicate.
+
+    ``polls`` mirrors real polling so a page whose control only becomes valid on
+    a later evaluation (the countdown -> ready transition) can be exercised.
+    """
 
     class _Wait:
         def __init__(self, driver, timeout):
+            self.driver = driver
             self.timeout = timeout
 
         def until(self, condition):
-            found = results.get(condition[0])
-            if found is None:
-                raise RuntimeError("timed out")
-            return found
+            for _ in range(max(1, polls)):
+                found = condition(self.driver)
+                if found:
+                    return found
+            raise RuntimeError("timed out")
 
     return _Wait
 
 
 class _FakeEl:
     def __init__(self, value="", text="", action=None, formaction=None,
-                 children=None, submit=True):
+                 children=None, submit=True, displayed=True, enabled=True):
         self._attrs = {"value": value, "action": action, "formaction": formaction}
         self.text = text
         self._children = children or []
         self.submit = submit
+        self._displayed = displayed
+        self._enabled = enabled
 
     def get_attribute(self, name):
         return self._attrs.get(name)
+
+    def is_displayed(self):
+        return self._displayed
+
+    def is_enabled(self):
+        return self._enabled
 
     def find_elements(self, by, selector):
         # Mirror the real selector: only actual submit controls match.
@@ -2375,12 +2377,10 @@ class _FakeEl:
 _PAGE = "https://hdencode.org/a-release/"
 
 
-def _reveal(results, driver, current_url=_PAGE):
+def _reveal(_results, driver, current_url=_PAGE, polls=1):
     driver.current_url = current_url
     svc = _make_service()
-    with patch("backend.download_service._WebDriverWait", _fake_wait(results)), \
-         patch("backend.download_service._EC", _FakeEC), \
-         patch("backend.download_service._By", _FakeBy):
+    with patch("backend.download_service._WebDriverWait", _fake_wait(polls=polls)),          patch("backend.download_service._By", _FakeBy):
         return svc._find_reveal_control(driver)
 
 
@@ -2389,9 +2389,11 @@ def _form(children, action=f"{_PAGE}#unlocked"):
 
 
 class TestFindRevealControl:
-    def test_clickable_control_is_used_first(self):
+    def test_ready_links_control_is_used(self):
         btn = _FakeEl(value="View links")
-        assert _reveal({"clickable": btn}, MagicMock()) is btn
+        driver = MagicMock()
+        driver.find_elements.return_value = [_form([btn])]
+        assert _reveal({}, driver) is btn
 
     def test_merely_present_control_is_not_activated(self):
         """Present != safe: it may be hidden/disabled and the caller JS-clicks."""
@@ -2400,11 +2402,32 @@ class TestFindRevealControl:
         driver.find_elements.return_value = []
         assert _reveal({"presence": btn}, driver) is None
 
-    def test_unlock_form_submit_used_when_label_does_not_match(self):
-        submit = _FakeEl(value="")            # unlabelled submit inside the form
+    def test_unlabelled_submit_is_never_clicked(self):
+        """Only a positively-identified links control is ever activated.
+
+        Accepting "the single safe submit" is what selected the countdown
+        placeholder in production (0 link retrievals in 14 attempts), so an
+        unlabelled control is no longer a candidate at all.
+        """
         driver = MagicMock()
-        driver.find_elements.return_value = [_form([submit])]
-        assert _reveal({}, driver) is submit
+        driver.current_url = "https://hdencode.org/a-release/"
+        driver.find_elements.side_effect = [
+            [_form([_FakeEl(value="")], action="https://hdencode.org/a-release/#unlocked")],
+            [],
+        ]
+        assert _reveal({}, driver) is None
+
+    def test_reworded_placeholder_cannot_be_clicked(self):
+        """The allowlist holds even for wording the blocklist never saw."""
+        driver = MagicMock()
+        driver.current_url = "https://hdencode.org/a-release/"
+        for label in ("Bitte warten…", "Verification delayed - reload the page"):
+            driver.find_elements.side_effect = [
+                [_form([_FakeEl(value=label)],
+                       action="https://hdencode.org/a-release/#unlocked")],
+                [],
+            ]
+            assert _reveal({}, driver) is None, label
 
     def test_formaction_override_is_rejected(self):
         """A submit may override its form's destination — validate the effective one."""
@@ -2447,12 +2470,32 @@ class TestFindRevealControl:
         ]
         assert _reveal({}, driver) is None
 
-    def test_multiple_safe_controls_are_ambiguous(self):
+    def test_multiple_valid_controls_are_ambiguous(self):
+        """Two INDEPENDENTLY VALID controls — the real ambiguity branch.
+
+        Unlabelled controls would fail the allowlist and produce zero
+        candidates, which reaches ``None`` without ever testing ambiguity.
+        """
         driver = MagicMock()
         driver.find_elements.return_value = [
-            _form([_FakeEl(value=""), _FakeEl(value="")])
+            _form([_FakeEl(value="View links"), _FakeEl(value="Access the links")])
         ]
         assert _reveal({}, driver) is None
+
+    def test_preview_and_review_labels_are_not_links_controls(self):
+        """Word-aware matching: a substring test accepted these."""
+        for label in ("Preview links", "Review links"):
+            driver = MagicMock()
+            driver.find_elements.return_value = [_form([_FakeEl(value=label)])]
+            assert _reveal({}, driver) is None, label
+
+    def test_accepted_links_labels(self):
+        for label in ("View link", "View links", "Access the link",
+                      "Access the links"):
+            btn = _FakeEl(value=label)
+            driver = MagicMock()
+            driver.find_elements.return_value = [_form([btn])]
+            assert _reveal({}, driver) is btn, label
 
     def test_labelled_control_preferred_over_unlabelled(self):
         labelled = _FakeEl(value="View links")
@@ -2476,12 +2519,74 @@ class TestFindRevealControl:
         ]
         assert _reveal({}, driver) is None
 
-    def test_label_fallback_matches_link_but_not_report(self):
+    def test_links_label_without_valid_destination_is_rejected(self):
+        """The rule is label AND destination — there is no destination-free path.
+
+        Previously the final label fallback clicked any submit containing
+        "link" without validating where it posted.
+        """
         driver = MagicMock()
-        report = _FakeEl(value="Report content")
-        links = _FakeEl(value="Get links")
-        driver.find_elements.side_effect = [[], [report, links]]
-        assert _reveal({}, driver) is links
+        driver.find_elements.return_value = [
+            _form([_FakeEl(value="View links")], action="https://elsewhere.test/x")
+        ]
+        assert _reveal({}, driver) is None
+
+    def test_generic_access_label_is_not_a_links_control(self):
+        """"Access" alone was too broad — it matches unrelated copy."""
+        driver = MagicMock()
+        driver.find_elements.return_value = [_form([_FakeEl(value="Access denied")])]
+        assert _reveal({}, driver) is None
+
+    def test_hidden_or_disabled_control_is_not_activated(self):
+        """The caller JS-clicks whatever is returned, so it must be interactive."""
+        for kwargs in ({"displayed": False}, {"enabled": False}):
+            driver = MagicMock()
+            driver.find_elements.return_value = [
+                _form([_FakeEl(value="View links", **kwargs)])
+            ]
+            assert _reveal({}, driver) is None, kwargs
+
+    def test_countdown_placeholder_is_never_clicked(self):
+        """Regression, from production 2026-07-24.
+
+        HDEncode serves the unlock form with its submit reading
+        "Verifying… Please wait" and only later swaps it to "View links".
+        That placeholder posts the same #unlocked endpoint, so it passed every
+        destination check and was clicked as the single safe submit — revealing
+        nothing and reporting the countdown as "no file-host links".
+        """
+        placeholder = _FakeEl(value="Verifying… Please wait")
+        driver = MagicMock()
+        driver.current_url = "https://hdencode.org/a-release/"
+        driver.find_elements.side_effect = [
+            [_form([placeholder], action="https://hdencode.org/a-release/#unlocked")],
+            [placeholder],  # label fallback sees the same control
+        ]
+        assert _reveal({}, driver) is None
+
+    def test_ready_control_is_taken_when_the_countdown_finishes(self):
+        """Genuinely polls the transition: placeholder first, ready control later.
+
+        The whole reason the lookup polls (and the budget was raised) is this
+        swap, so it must be exercised across evaluations rather than asserted
+        on a page that was already ready.
+        """
+        placeholder = _FakeEl(value="Verifying… Please wait")
+        ready = _FakeEl(value="View links")
+        driver = MagicMock()
+        # Poll 1 -> countdown; poll 2 -> the control has swapped to ready.
+        driver.find_elements.side_effect = [
+            [_form([placeholder])],
+            [_form([ready])],
+        ]
+        assert _reveal({}, driver, polls=2) is ready
+
+    def test_placeholder_is_not_returned_while_the_countdown_runs(self):
+        """Polling to exhaustion on a page stuck counting down yields nothing."""
+        placeholder = _FakeEl(value="Verifying… Please wait")
+        driver = MagicMock()
+        driver.find_elements.return_value = [_form([placeholder])]
+        assert _reveal({}, driver, polls=3) is None
 
     def test_returns_none_when_nothing_matches(self):
         driver = MagicMock()
