@@ -1716,13 +1716,27 @@ class DownloadService:
             page_url = driver.current_url or ""
         except Exception:
             page_url = ""
+        observed: list = []
         try:
-            value = cf_mitigated_from_perf_log(entries, page_url=page_url)
+            value = cf_mitigated_from_perf_log(
+                entries, page_url=page_url, observed=observed
+            )
         except Exception:
             value = None
         self._last_cf_mitigated = value
         if value:
             self._log(f"[HDEncode] cf-mitigated header: {value!r}", "warning")
+        elif observed and page_url and page_url not in observed:
+            # Documents WERE captured but none was the displayed page, so the
+            # header could not be attributed. Without this the case is silent
+            # and indistinguishable from "the log had nothing in it" — and it
+            # is the one scenario that would leave the signal permanently
+            # inert in production.
+            self._log(
+                "[HDEncode] cf-mitigated: no document response matched the "
+                f"displayed page ({len(observed)} document(s) seen)",
+                "warning",
+            )
         return value
 
     def _wait_past_cloudflare(

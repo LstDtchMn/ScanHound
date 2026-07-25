@@ -84,7 +84,9 @@ def _without_fragment(value: str) -> str:
     return urldefrag(value or "")[0]
 
 
-def cf_mitigated_from_perf_log(entries, *, page_url: str = "") -> Optional[str]:
+def cf_mitigated_from_perf_log(
+    entries, *, page_url: str = "", observed: Optional[list] = None
+) -> Optional[str]:
     """Return the DISPLAYED page's ``cf-mitigated`` value, or ``None``.
 
     ``entries`` are raw Chrome performance-log records.
@@ -102,6 +104,9 @@ def cf_mitigated_from_perf_log(entries, *, page_url: str = "") -> Optional[str]:
     ``None`` means "no signal" — no matching document response, header absent,
     or the log was unavailable. It never means "no challenge", so callers must
     fall back to the other evidence rather than treating absence as safety.
+
+    Pass ``observed`` to collect every document URL seen, so a caller can log
+    the case where documents were captured but none matched the displayed page.
     """
     import json
 
@@ -122,7 +127,13 @@ def cf_mitigated_from_perf_log(entries, *, page_url: str = "") -> Optional[str]:
         if params.get("type") != "Document":
             continue
         response = params.get("response") or {}
-        if _without_fragment(response.get("url") or "") != target:
+        document_url = _without_fragment(response.get("url") or "")
+        if document_url and observed is not None:
+            # Lets the caller see that documents WERE captured but none was the
+            # displayed page, so a silent None can be told apart from "the log
+            # had nothing in it".
+            observed.append(document_url)
+        if document_url != target:
             continue
         headers = {
             str(key).lower(): value

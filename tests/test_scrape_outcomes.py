@@ -241,6 +241,26 @@ def test_consecutive_navigations_do_not_inherit_a_stale_result():
     assert service._last_cf_mitigated is None
 
 
+def test_unmatched_document_response_is_reported_not_silent():
+    """The one case that would leave the signal permanently inert.
+
+    If no document response ever matches the displayed page, the header can
+    never be attributed. That must be visible in the log rather than look
+    identical to an empty performance log.
+    """
+    service = _service()
+    logged = []
+    service._log = lambda message, level="info": logged.append(message)
+    driver = MagicMock()
+    driver.current_url = PAGE
+    driver.get_log.return_value = [
+        _perf_entry("https://hdencode.org/somewhere-else/", {"cf-mitigated": "challenge"})
+    ]
+
+    assert service._capture_cf_mitigated(driver) is None
+    assert any("no document response matched" in m for m in logged)
+
+
 def test_unavailable_performance_log_is_not_a_challenge():
     """An adapter without performance logging must fail open to page evidence."""
     service = _service()
