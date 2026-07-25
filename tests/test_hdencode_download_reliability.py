@@ -280,6 +280,67 @@ def _perf(url, headers, rtype="Document"):
     }
 
 
+def test_cf_mitigated_ignores_an_iframe_document_response():
+    """An IFRAME navigation is also a ``type=Document`` load.
+
+    Verified against a real browser: an outer page with no header and an
+    embedded frame carrying ``cf-mitigated: challenge`` produced TWO
+    ``type=Document`` responses. Attributing the frame's header to the page
+    would turn an embedded widget into a source-wide interstitial.
+    """
+    page = "https://hdencode.org/a-release/"
+    entries = [
+        _perf(page, {"content-type": "text/html"}),
+        _perf(
+            "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/if",
+            {"cf-mitigated": "challenge"},
+        ),
+    ]
+    assert cf_mitigated_from_perf_log(entries, page_url=page) is None
+
+
+def test_cf_mitigated_matches_despite_a_url_fragment():
+    """``driver.current_url`` can carry ``#unlocked``; response URLs never do."""
+    page = "https://hdencode.org/a-release/"
+    entries = [_perf(page, {"cf-mitigated": "challenge"})]
+    assert (
+        cf_mitigated_from_perf_log(entries, page_url=f"{page}#unlocked") == "challenge"
+    )
+
+
+def test_cf_mitigated_ignores_an_unrelated_earlier_document():
+    """A previous page's challenge must not leak into this navigation."""
+    page = "https://hdencode.org/a-release/"
+    entries = [
+        _perf("https://hdencode.org/another-release/", {"cf-mitigated": "challenge"}),
+        _perf(page, {"content-type": "text/html"}),
+    ]
+    assert cf_mitigated_from_perf_log(entries, page_url=page) is None
+
+
+def test_cf_mitigated_resolves_a_redirect_chain_to_the_displayed_url():
+    """Only the finally-displayed URL counts; intermediate hops do not."""
+    page = "https://hdencode.org/a-release/"
+    entries = [
+        _perf("https://hdencode.org/old-path/", {"cf-mitigated": "challenge"}),
+        _perf(page, {"cf-mitigated": "challenge"}),
+    ]
+    assert cf_mitigated_from_perf_log(entries, page_url=page) == "challenge"
+
+    # The displayed URL is clean even though a hop was challenged.
+    entries = [
+        _perf("https://hdencode.org/old-path/", {"cf-mitigated": "challenge"}),
+        _perf(page, {"content-type": "text/html"}),
+    ]
+    assert cf_mitigated_from_perf_log(entries, page_url=page) is None
+
+
+def test_cf_mitigated_requires_a_known_displayed_url():
+    """Without a displayed URL, ownership cannot be proven — fail to no signal."""
+    entries = [_perf("https://hdencode.org/a-release/", {"cf-mitigated": "challenge"})]
+    assert cf_mitigated_from_perf_log(entries) is None
+
+
 def test_cf_mitigated_reads_only_the_main_document_response():
     page = "https://hdencode.org/a-release/"
 

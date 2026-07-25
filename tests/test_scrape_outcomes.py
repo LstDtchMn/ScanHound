@@ -220,6 +220,27 @@ def test_cf_mitigated_absent_leaves_page_evidence_in_charge(monkeypatch):
     coordinator.observe_challenge.assert_not_called()
 
 
+def test_consecutive_navigations_do_not_inherit_a_stale_result():
+    """The browser session is persistent, so state must be per-navigation.
+
+    A challenge on one page must not linger and cool the source down on the
+    next, unrelated grab.
+    """
+    service = _service()
+    driver = MagicMock()
+
+    first = "https://hdencode.org/first-release/"
+    driver.current_url = first
+    driver.get_log.return_value = [_perf_entry(first, {"cf-mitigated": "challenge"})]
+    assert service._capture_cf_mitigated(driver) == "challenge"
+
+    second = "https://hdencode.org/second-release/"
+    driver.current_url = second
+    driver.get_log.return_value = [_perf_entry(second, {"content-type": "text/html"})]
+    assert service._capture_cf_mitigated(driver) is None
+    assert service._last_cf_mitigated is None
+
+
 def test_unavailable_performance_log_is_not_a_challenge():
     """An adapter without performance logging must fail open to page evidence."""
     service = _service()

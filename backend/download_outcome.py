@@ -72,21 +72,45 @@ CF_MITIGATED_HEADER = "cf-mitigated"
 CF_MITIGATED_CHALLENGE = "challenge"
 
 
+def _without_fragment(value: str) -> str:
+    """Return a URL without its fragment.
+
+    ``driver.current_url`` can carry a fragment (the unlock form navigates to
+    ``#unlocked``) while an HTTP response URL never does, so the two must be
+    normalized before they can be compared.
+    """
+    from urllib.parse import urldefrag
+
+    return urldefrag(value or "")[0]
+
+
 def cf_mitigated_from_perf_log(entries, *, page_url: str = "") -> Optional[str]:
-    """Return the main document's ``cf-mitigated`` value, or ``None``.
+    """Return the DISPLAYED page's ``cf-mitigated`` value, or ``None``.
 
-    ``entries`` are raw Chrome performance-log records. Only the top-level
-    document response counts: a sub-resource (an embedded Turnstile widget's
-    own request, say) must never be read as an interstitial challenge.
+    ``entries`` are raw Chrome performance-log records.
 
-    ``None`` means "no signal" — no document response, header absent, or the
-    log was unavailable. It never means "no challenge", so callers must fall
-    back to the other evidence rather than treating absence as safety.
+    ``type == "Document"`` is a *resource* type, not proof of top-level
+    ownership: an **iframe** navigation is also a document load, verified
+    against a real browser — an embedded widget produced its own
+    ``type=Document`` response carrying ``cf-mitigated: challenge`` while the
+    top-level page had no such header. Attributing that to the page would turn
+    an embedded widget into a source-wide interstitial, so the value is taken
+    only from the response whose URL matches the displayed page, compared with
+    fragments removed. There is deliberately **no fallback** to "the most
+    recent document": an unmatched log yields ``None``.
+
+    ``None`` means "no signal" — no matching document response, header absent,
+    or the log was unavailable. It never means "no challenge", so callers must
+    fall back to the other evidence rather than treating absence as safety.
     """
     import json
 
-    latest: Optional[str] = None
-    matched_page = False
+    target = _without_fragment(page_url)
+    if not target:
+        # Without a displayed URL, ownership cannot be proven at all.
+        return None
+
+    matched: Optional[str] = None
     for entry in entries or ():
         try:
             message = json.loads(entry.get("message") or "{}").get("message") or {}
@@ -98,20 +122,17 @@ def cf_mitigated_from_perf_log(entries, *, page_url: str = "") -> Optional[str]:
         if params.get("type") != "Document":
             continue
         response = params.get("response") or {}
+        if _without_fragment(response.get("url") or "") != target:
+            continue
         headers = {
             str(key).lower(): value
             for key, value in (response.get("headers") or {}).items()
         }
         value = headers.get(CF_MITIGATED_HEADER)
-        value = str(value).strip().lower() if value is not None else None
-        # Prefer the response for the requested page; otherwise keep the most
-        # recent document response (a challenge is served at the same URL, and
-        # redirects should resolve to whatever was displayed last).
-        if page_url and response.get("url") == page_url:
-            latest, matched_page = value, True
-        elif not matched_page:
-            latest = value
-    return latest
+        # Later responses for the same URL supersede earlier ones, so a redirect
+        # chain resolves to whatever was finally displayed.
+        matched = str(value).strip().lower() if value is not None else None
+    return matched
 
 
 def challenge_iframe_srcs(html: str) -> tuple[str, ...]:
