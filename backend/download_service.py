@@ -265,7 +265,12 @@ _REVEAL_NOT_READY_MARKERS = ("verifying", "please wait")
 # control. "access" alone was too broad — it matches "Access denied" and other
 # unrelated copy — so the phrase must be the links wording HDEncode actually
 # uses.
-_REVEAL_LABEL_ALLOWLIST = ("view link", "access the link")
+# Word-aware: a substring test also accepted "Preview links" and "Review links",
+# which is the same broad-matching mistake this lookup exists to eliminate.
+_REVEAL_LABEL_PATTERNS = (
+    re.compile(r"\bview\s+links?\b", re.IGNORECASE),
+    re.compile(r"\baccess\s+the\s+links?\b", re.IGNORECASE),
+)
 
 
 def _reveal_control_not_ready(label: str) -> bool:
@@ -276,8 +281,8 @@ def _reveal_control_not_ready(label: str) -> bool:
 
 def _reveal_label_is_links_control(label: str) -> bool:
     """True when a label positively identifies a link-reveal control."""
-    low = (label or "").lower()
-    return any(phrase in low for phrase in _REVEAL_LABEL_ALLOWLIST)
+    text = label or ""
+    return any(pattern.search(text) for pattern in _REVEAL_LABEL_PATTERNS)
 
 
 def _control_is_interactive(element) -> bool:
@@ -1663,10 +1668,14 @@ class DownloadService:
             tier = "not-ready"
         else:
             tier = "none"
+        # not_ready_seen separates "countdown ran then finished" from "the page
+        # was simply slow", so the real countdown duration can be measured and
+        # the temporary 60s ceiling replaced with a tuned value.
         self._log(
             f"[HDEncode] reveal-control tier={tier} "
             f"elapsed={time.monotonic() - started:.1f}s "
             f"found={control is not None} forms={state['forms']} "
+            f"not_ready_seen={state['not_ready']} "
             f"candidates={state['labels'][:6]}"
         )
         return control

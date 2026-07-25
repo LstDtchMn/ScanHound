@@ -2326,8 +2326,12 @@ class _FakeBy:
     CSS_SELECTOR = "css"
 
 
-def _fake_wait(_results=None):
-    """WebDriverWait stand-in that actually evaluates the polled predicate."""
+def _fake_wait(_results=None, polls=1):
+    """WebDriverWait stand-in that actually evaluates the polled predicate.
+
+    ``polls`` mirrors real polling so a page whose control only becomes valid on
+    a later evaluation (the countdown -> ready transition) can be exercised.
+    """
 
     class _Wait:
         def __init__(self, driver, timeout):
@@ -2335,10 +2339,11 @@ def _fake_wait(_results=None):
             self.timeout = timeout
 
         def until(self, condition):
-            found = condition(self.driver)
-            if not found:
-                raise RuntimeError("timed out")
-            return found
+            for _ in range(max(1, polls)):
+                found = condition(self.driver)
+                if found:
+                    return found
+            raise RuntimeError("timed out")
 
     return _Wait
 
@@ -2372,10 +2377,10 @@ class _FakeEl:
 _PAGE = "https://hdencode.org/a-release/"
 
 
-def _reveal(_results, driver, current_url=_PAGE):
+def _reveal(_results, driver, current_url=_PAGE, polls=1):
     driver.current_url = current_url
     svc = _make_service()
-    with patch("backend.download_service._WebDriverWait", _fake_wait()),          patch("backend.download_service._By", _FakeBy):
+    with patch("backend.download_service._WebDriverWait", _fake_wait(polls=polls)),          patch("backend.download_service._By", _FakeBy):
         return svc._find_reveal_control(driver)
 
 
@@ -2465,12 +2470,32 @@ class TestFindRevealControl:
         ]
         assert _reveal({}, driver) is None
 
-    def test_multiple_safe_controls_are_ambiguous(self):
+    def test_multiple_valid_controls_are_ambiguous(self):
+        """Two INDEPENDENTLY VALID controls — the real ambiguity branch.
+
+        Unlabelled controls would fail the allowlist and produce zero
+        candidates, which reaches ``None`` without ever testing ambiguity.
+        """
         driver = MagicMock()
         driver.find_elements.return_value = [
-            _form([_FakeEl(value=""), _FakeEl(value="")])
+            _form([_FakeEl(value="View links"), _FakeEl(value="Access the links")])
         ]
         assert _reveal({}, driver) is None
+
+    def test_preview_and_review_labels_are_not_links_controls(self):
+        """Word-aware matching: a substring test accepted these."""
+        for label in ("Preview links", "Review links"):
+            driver = MagicMock()
+            driver.find_elements.return_value = [_form([_FakeEl(value=label)])]
+            assert _reveal({}, driver) is None, label
+
+    def test_accepted_links_labels(self):
+        for label in ("View link", "View links", "Access the link",
+                      "Access the links"):
+            btn = _FakeEl(value=label)
+            driver = MagicMock()
+            driver.find_elements.return_value = [_form([btn])]
+            assert _reveal({}, driver) is btn, label
 
     def test_labelled_control_preferred_over_unlabelled(self):
         labelled = _FakeEl(value="View links")
@@ -2539,15 +2564,29 @@ class TestFindRevealControl:
         ]
         assert _reveal({}, driver) is None
 
-    def test_ready_control_still_wins_after_the_countdown(self):
-        """Once the countdown finishes the real control is used normally."""
+    def test_ready_control_is_taken_when_the_countdown_finishes(self):
+        """Genuinely polls the transition: placeholder first, ready control later.
+
+        The whole reason the lookup polls (and the budget was raised) is this
+        swap, so it must be exercised across evaluations rather than asserted
+        on a page that was already ready.
+        """
+        placeholder = _FakeEl(value="Verifying… Please wait")
         ready = _FakeEl(value="View links")
         driver = MagicMock()
-        driver.current_url = "https://hdencode.org/a-release/"
-        driver.find_elements.return_value = [
-            _form([ready], action="https://hdencode.org/a-release/#unlocked")
+        # Poll 1 -> countdown; poll 2 -> the control has swapped to ready.
+        driver.find_elements.side_effect = [
+            [_form([placeholder])],
+            [_form([ready])],
         ]
-        assert _reveal({}, driver) is ready
+        assert _reveal({}, driver, polls=2) is ready
+
+    def test_placeholder_is_not_returned_while_the_countdown_runs(self):
+        """Polling to exhaustion on a page stuck counting down yields nothing."""
+        placeholder = _FakeEl(value="Verifying… Please wait")
+        driver = MagicMock()
+        driver.find_elements.return_value = [_form([placeholder])]
+        assert _reveal({}, driver, polls=3) is None
 
     def test_returns_none_when_nothing_matches(self):
         driver = MagicMock()
