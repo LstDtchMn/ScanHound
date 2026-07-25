@@ -240,7 +240,61 @@ def _is_archive_name(name: str) -> bool:
 # One bounded CLICKABLE budget: a merely-present control may be hidden, disabled
 # or not yet interactive, and the caller JS-clicks whatever this returns, so
 # activating a non-clickable control could fire a handler prematurely.
-_REVEAL_CLICKABLE_TIMEOUT = 15
+#
+# PRODUCTION EVIDENCE (2026-07-24): HDEncode serves the unlock form in a
+# not-ready state — its submit reads "Verifying… Please wait" — and only later
+# swaps to "View links". When the real control is present it is clickable in
+# under a second and the links follow; when the countdown is running a 15s
+# budget expired, so the wait must outlast the countdown rather than fall
+# through to a control that cannot reveal anything.
+_REVEAL_CLICKABLE_TIMEOUT = 60
+
+# A control in this state is a placeholder for the real one. Clicking it cannot
+# reveal links, and doing so masks the countdown as a layout failure, so it is
+# never an acceptable fallback target.
+#
+# BEST-EFFORT OBSERVABILITY ONLY — never a safety gate. The allowlist below is
+# what decides whether a control may be clicked; these markers exist so a
+# countdown can be told apart from a genuinely absent control (and, later, so
+# its real duration can be measured). They are English-only and will miss a
+# localized placeholder; that is harmless, because a missed placeholder simply
+# fails the allowlist and is not clicked either way.
+_REVEAL_NOT_READY_MARKERS = ("verifying", "please wait")
+
+# A control is clicked only when its label positively identifies it as a links
+# control. "access" alone was too broad — it matches "Access denied" and other
+# unrelated copy — so the phrase must be the links wording HDEncode actually
+# uses.
+# Word-aware: a substring test also accepted "Preview links" and "Review links",
+# which is the same broad-matching mistake this lookup exists to eliminate.
+_REVEAL_LABEL_PATTERNS = (
+    re.compile(r"\bview\s+links?\b", re.IGNORECASE),
+    re.compile(r"\baccess\s+the\s+links?\b", re.IGNORECASE),
+)
+
+
+def _reveal_control_not_ready(label: str) -> bool:
+    """True when a label looks like a countdown placeholder (diagnostics only)."""
+    low = (label or "").lower()
+    return any(marker in low for marker in _REVEAL_NOT_READY_MARKERS)
+
+
+def _reveal_label_is_links_control(label: str) -> bool:
+    """True when a label positively identifies a link-reveal control."""
+    text = label or ""
+    return any(pattern.search(text) for pattern in _REVEAL_LABEL_PATTERNS)
+
+
+def _control_is_interactive(element) -> bool:
+    """True when a control is displayed and enabled.
+
+    The caller JS-clicks whatever the lookup returns, so a control that is
+    present but hidden or disabled must not be treated as ready.
+    """
+    try:
+        return bool(element.is_displayed() and element.is_enabled())
+    except Exception:
+        return False
 
 # Only real submit controls can post the unlock form. A bare `button` selector
 # would also match type="button" and other non-submit controls.
@@ -1563,67 +1617,75 @@ class DownloadService:
                 detail=f"Failed to classify the loaded page: {e}",
             )
 
-    # HDEncode renamed the reveal button to "View links" (it was "Access the
-    # links"); clicking it POSTs a form that unlocks the file-host links on the
-    # same page (#unlocked). A generic //input[@type='submit'] match is
-    # deliberately NOT used — it matched the unrelated "Report content" button.
-    _REVEAL_XPATH = (
-        "//input[@value='View links'] | "
-        "//input[contains(@value, 'View link')] | "
-        "//input[@value='Access the links'] | "
-        "//input[contains(@value, 'Access')] | "
-        "//button[contains(text(), 'View link')] | "
-        "//button[contains(text(), 'Access')]"
-    )
-
     def _find_reveal_control(self, driver):
-        """Locate HDEncode's link-reveal control, tolerating a slow render.
+        """Locate HDEncode's link-reveal control, or return ``None``.
 
-        Production evidence: a release page reported "no View links button" and
-        the identical page served the control on a later retry; the site has
-        returned page loads over 60s. The lookup therefore gets one generous
-        CLICKABLE budget plus destination-validated fallbacks.
+        ONE rule decides every candidate — there is no fast path that skips it.
+        The control must be a real **submit**, its label must positively
+        identify it as a links control, it must not be a "report" control, and
+        its *effective* destination (its ``formaction`` when present, else its
+        form's ``action``) must resolve to this page's ``#unlocked`` endpoint.
+        Anything ambiguous or unproven yields ``None``.
 
-        Tiers, most specific first:
+        Production evidence (2026-07-24) for why the rule is this strict:
+        HDEncode serves the unlock form in a not-ready state whose submit reads
+        "Verifying… Please wait" and only later swaps to "View links". That
+        placeholder posts the same endpoint, so accepting "the single safe
+        submit" selected it — 0 link retrievals in 14 attempts. Requiring a
+        positive links label makes a re-worded or localized placeholder fail
+        closed instead of being clicked.
 
-        1. the labelled control, waited for as **clickable**. Presence alone is
-           not enough: a present control may be hidden, disabled or not yet
-           interactive, and the caller JS-clicks whatever is returned, so
-           activating a non-clickable control could fire a handler early.
-        2. a **submit** control whose *effective* destination — its
-           ``formaction`` when present, otherwise its form's ``action`` —
-           resolves to this page's ``#unlocked`` endpoint (same origin, exact
-           fragment). A submit can override its form's destination, so the
-           parent form's action alone proves nothing. Ambiguity yields ``None``
-           rather than a guess.
-        3. a submit control labelled like a links control, never "report".
-
-        Each outcome logs its tier, elapsed time, form count and candidate
-        labels so production evidence can distinguish a late render from a
-        page-shape variant.
-
-        Returns the element, or ``None`` when nothing matched safely.
+        The wait polls this predicate, so a control rendering late is taken as
+        soon as it becomes valid and interactive, while a page that never
+        produces one costs the budget and fails item-level.
         """
         started = time.monotonic()
-
-        def _resolved(control, tier, extra=""):
-            self._log(
-                f"[HDEncode] reveal-control tier={tier} "
-                f"elapsed={time.monotonic() - started:.1f}s "
-                f"found={control is not None}{extra}"
-            )
-            return control
+        state = {
+            "forms": 0,
+            "labels": [],
+            "not_ready": False,
+            "rejected_destination": False,
+            "ambiguous": False,
+        }
 
         try:
-            return _resolved(
-                _WebDriverWait(driver, _REVEAL_CLICKABLE_TIMEOUT).until(
-                    _EC.element_to_be_clickable((_By.XPATH, self._REVEAL_XPATH))
-                ),
-                "clickable",
+            control = _WebDriverWait(driver, _REVEAL_CLICKABLE_TIMEOUT).until(
+                lambda d: self._reveal_candidate(d, state)
             )
         except Exception:
-            pass
+            control = None
 
+        if control is not None:
+            tier = "links-control"
+        elif state["ambiguous"]:
+            tier = "ambiguous"
+        elif state["rejected_destination"]:
+            # A links-labelled control exists but does not post this page's
+            # unlock endpoint: the page shape changed, rather than the control
+            # being absent or still counting down.
+            tier = "destination-rejected"
+        elif state["not_ready"]:
+            tier = "not-ready"
+        else:
+            tier = "none"
+        # not_ready_seen separates "countdown ran then finished" from "the page
+        # was simply slow", so the real countdown duration can be measured and
+        # the temporary 60s ceiling replaced with a tuned value.
+        self._log(
+            f"[HDEncode] reveal-control tier={tier} "
+            f"elapsed={time.monotonic() - started:.1f}s "
+            f"found={control is not None} forms={state['forms']} "
+            f"not_ready_seen={state['not_ready']} "
+            f"candidates={state['labels'][:6]}"
+        )
+        return control
+
+    def _reveal_candidate(self, driver, state):
+        """Return the one control safe to click on this page, else ``None``.
+
+        Applied on every poll to every candidate with no exceptions — this is
+        the whole safety boundary.
+        """
         try:
             base = driver.current_url or ""
         except Exception:
@@ -1633,7 +1695,8 @@ class DownloadService:
         except Exception:
             forms = []
 
-        safe, labelled, kinds = [], [], []
+        state["forms"] = len(forms)
+        labels, matches = [], []
         for form in forms:
             try:
                 form_action = form.get_attribute("action") or ""
@@ -1644,44 +1707,37 @@ class DownloadService:
                 continue
             for el in controls:
                 try:
-                    # A submit may override its form's destination.
-                    target = el.get_attribute("formaction") or form_action
                     label = (
                         el.get_attribute("value") or el.text or ""
                     ).strip().lower()
+                    # A submit may override its form's destination.
+                    target = el.get_attribute("formaction") or form_action
                 except Exception:
                     continue
-                kinds.append((label or "<unlabelled>")[:20])
+                labels.append((label or "<unlabelled>")[:20])
                 if "report" in label:
                     continue
-                if not _resolves_to_unlock_target(target, base):
+                if _reveal_control_not_ready(label):
+                    state["not_ready"] = True
                     continue
-                safe.append(el)
-                if "view link" in label or "access" in label:
-                    labelled.append(el)
+                if not _reveal_label_is_links_control(label):
+                    continue
+                if not _resolves_to_unlock_target(target, base):
+                    state["rejected_destination"] = True
+                    continue
+                if not _control_is_interactive(el):
+                    # Present but hidden/disabled. The caller JS-clicks whatever
+                    # is returned, so it must not be activated yet.
+                    state["not_ready"] = True
+                    continue
+                matches.append(el)
 
-        extra = f" forms={len(forms)} candidates={kinds[:6]}"
-        # Prefer an unambiguous labelled control; accept an unlabelled one only
-        # when it is the single safe submit. Never guess between several.
-        if len(labelled) == 1:
-            return _resolved(labelled[0], "unlock-form-labelled", extra)
-        if not labelled and len(safe) == 1:
-            return _resolved(safe[0], "unlock-form-single", extra)
-        if labelled or safe:
-            return _resolved(None, "unlock-form-ambiguous", extra)
-
-        # Label fallback: a submit control named like a links control.
-        try:
-            for el in driver.find_elements(
-                _By.CSS_SELECTOR, _REVEAL_SUBMIT_SELECTOR
-            ):
-                label = (el.get_attribute("value") or el.text or "").lower()
-                if "link" in label and "report" not in label:
-                    return _resolved(el, "label", extra)
-        except Exception:
-            pass
-
-        return _resolved(None, "none", extra)
+        state["labels"] = labels
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            state["ambiguous"] = True
+        return None
 
     def _wait_past_cloudflare(
         self,
