@@ -9,6 +9,7 @@ from fastapi import BackgroundTasks
 
 from backend.database import DatabaseManager
 from backend.download_outcome import (
+    cf_mitigated_from_perf_log,
     challenge_iframe_srcs,
     deferred_result,
     diagnostic_from_traffic_denial,
@@ -262,6 +263,124 @@ def test_stale_release_title_cannot_suppress_a_live_challenge_title():
     )
 
 
+def _perf(url, headers, rtype="Document"):
+    import json
+    return {
+        "message": json.dumps(
+            {
+                "message": {
+                    "method": "Network.responseReceived",
+                    "params": {
+                        "type": rtype,
+                        "response": {"url": url, "headers": headers},
+                    },
+                }
+            }
+        )
+    }
+
+
+def test_cf_mitigated_ignores_an_iframe_document_response():
+    """An IFRAME navigation is also a ``type=Document`` load.
+
+    Verified against a real browser: an outer page with no header and an
+    embedded frame carrying ``cf-mitigated: challenge`` produced TWO
+    ``type=Document`` responses. Attributing the frame's header to the page
+    would turn an embedded widget into a source-wide interstitial.
+    """
+    page = "https://hdencode.org/a-release/"
+    entries = [
+        _perf(page, {"content-type": "text/html"}),
+        _perf(
+            "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/if",
+            {"cf-mitigated": "challenge"},
+        ),
+    ]
+    assert cf_mitigated_from_perf_log(entries, page_url=page) is None
+
+
+def test_cf_mitigated_matches_despite_a_url_fragment():
+    """``driver.current_url`` can carry ``#unlocked``; response URLs never do."""
+    page = "https://hdencode.org/a-release/"
+    entries = [_perf(page, {"cf-mitigated": "challenge"})]
+    assert (
+        cf_mitigated_from_perf_log(entries, page_url=f"{page}#unlocked") == "challenge"
+    )
+
+
+def test_cf_mitigated_ignores_an_unrelated_earlier_document():
+    """A previous page's challenge must not leak into this navigation."""
+    page = "https://hdencode.org/a-release/"
+    entries = [
+        _perf("https://hdencode.org/another-release/", {"cf-mitigated": "challenge"}),
+        _perf(page, {"content-type": "text/html"}),
+    ]
+    assert cf_mitigated_from_perf_log(entries, page_url=page) is None
+
+
+def test_cf_mitigated_resolves_a_redirect_chain_to_the_displayed_url():
+    """Only the finally-displayed URL counts; intermediate hops do not."""
+    page = "https://hdencode.org/a-release/"
+    entries = [
+        _perf("https://hdencode.org/old-path/", {"cf-mitigated": "challenge"}),
+        _perf(page, {"cf-mitigated": "challenge"}),
+    ]
+    assert cf_mitigated_from_perf_log(entries, page_url=page) == "challenge"
+
+    # The displayed URL is clean even though a hop was challenged.
+    entries = [
+        _perf("https://hdencode.org/old-path/", {"cf-mitigated": "challenge"}),
+        _perf(page, {"content-type": "text/html"}),
+    ]
+    assert cf_mitigated_from_perf_log(entries, page_url=page) is None
+
+
+def test_cf_mitigated_requires_a_known_displayed_url():
+    """Without a displayed URL, ownership cannot be proven — fail to no signal."""
+    entries = [_perf("https://hdencode.org/a-release/", {"cf-mitigated": "challenge"})]
+    assert cf_mitigated_from_perf_log(entries) is None
+
+
+def test_cf_mitigated_reads_only_the_main_document_response():
+    page = "https://hdencode.org/a-release/"
+
+    # Document response carrying the header.
+    assert (
+        cf_mitigated_from_perf_log(
+            [_perf(page, {"cf-mitigated": "challenge"})], page_url=page
+        )
+        == "challenge"
+    )
+    # Header casing and padding are normalised.
+    assert (
+        cf_mitigated_from_perf_log(
+            [_perf(page, {"CF-Mitigated": " Challenge "})], page_url=page
+        )
+        == "challenge"
+    )
+    # A sub-resource (an embedded Turnstile widget's own request) is NOT the
+    # interstitial and must never be read as one.
+    assert (
+        cf_mitigated_from_perf_log(
+            [
+                _perf(page, {"content-type": "text/html"}),
+                _perf(
+                    "https://challenges.cloudflare.com/turnstile/v0/api.js",
+                    {"cf-mitigated": "challenge"},
+                    rtype="Script",
+                ),
+            ],
+            page_url=page,
+        )
+        is None
+    )
+    # No document response, malformed records, and an empty log are all "no
+    # signal" rather than errors.
+    assert cf_mitigated_from_perf_log([]) is None
+    assert cf_mitigated_from_perf_log([{"message": "not json"}]) is None
+    assert cf_mitigated_from_perf_log(None) is None
+
+
 def test_reason_specific_notification_retains_typed_fields():
     result = {
         "success": False,
@@ -347,3 +466,97 @@ def test_batch_route_schedules_durable_queue_without_inline_transport():
         "mode": "staggered",
         "auto_resume_after_cooldown": False,
     }
+
+
+def test_cf_mitigated_observation_reports_matched_without_false_warning():
+    """A clean displayed page must report matched, not "nothing matched".
+
+    The parser normalizes fragments; a caller re-deriving the match by testing
+    its own raw ``page_url`` (which carries ``#unlocked`` after the unlock form
+    navigates) against the collected documents would wrongly conclude nothing
+    matched on an ordinary grab.
+    """
+    page = "https://hdencode.org/a-release/"
+    entries = [_perf(page, {"content-type": "text/html"})]
+    obs: dict = {}
+    assert (
+        cf_mitigated_from_perf_log(
+            entries, page_url=f"{page}#unlocked", observation=obs
+        )
+        is None
+    )
+    assert obs["matched"] is True
+    assert obs["unmatched_challenges"] == 0
+    assert obs["documents"] == [page]
+
+
+def test_cf_mitigated_observation_counts_only_unmatched_challenge_headers():
+    """An ordinary iframe document must not raise a warning; a challenged one must."""
+    page = "https://hdencode.org/a-release/"
+
+    quiet = [
+        _perf(page, {"content-type": "text/html"}),
+        _perf("https://ads.example/frame", {"content-type": "text/html"}),
+    ]
+    obs: dict = {}
+    assert cf_mitigated_from_perf_log(quiet, page_url=page, observation=obs) is None
+    assert obs["matched"] is True
+    assert obs["unmatched_challenges"] == 0
+
+    noisy = [
+        _perf(page, {"content-type": "text/html"}),
+        _perf(
+            "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/if",
+            {"cf-mitigated": "challenge"},
+        ),
+    ]
+    obs = {}
+    assert cf_mitigated_from_perf_log(noisy, page_url=page, observation=obs) is None
+    assert obs["matched"] is True
+    assert obs["unmatched_challenges"] == 1
+
+
+def test_post_reveal_click_challenge_is_captured_not_reported_as_missing_links():
+    """Cloudflare can challenge the unlock POST after a clean initial page load.
+
+    The reveal click is a NEW top-level navigation. Without re-running the
+    capture after it, ``_last_cf_mitigated`` keeps the FIRST navigation's value
+    (None) and the run is misreported as "no links found" instead of a
+    source-wide interactive challenge. The challenge page here carries only
+    localized text, so the header is the ONLY evidence.
+    """
+    from unittest.mock import patch
+
+    from backend.download_service import DownloadService
+
+    page = "https://hdencode.org/a-release/"
+    svc = DownloadService(config={}, db=MagicMock())
+
+    driver = MagicMock()
+    driver.current_url = f"{page}#unlocked"
+    driver.title = "Nur einen Moment"          # localized: no English marker
+    driver.page_source = "<html><body><p>Bitte warten</p></body></html>"
+    driver.find_elements.return_value = []
+    svc.cached_driver = driver
+
+    # First drain: clean initial navigation. Second: the challenged unlock POST.
+    driver.get_log.side_effect = [
+        [_perf(page, {"content-type": "text/html"})],
+        [_perf(page, {"cf-mitigated": "challenge"})],
+    ]
+
+    reveal = MagicMock()
+    reveal.get_attribute.return_value = "View links"
+
+    with patch("backend.download_service._ensure_selenium"), \
+            patch.object(svc, "_find_reveal_control", return_value=reveal), \
+            patch("backend.download_service._WebDriverWait"), \
+            patch("backend.download_service._EC"), \
+            patch("backend.download_service._By"):
+        result = svc.scrape_links(page, "Rapidgator")
+
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == ScrapeCode.INTERACTIVE_CHALLENGE
+    assert svc._last_cf_mitigated == "challenge"
+    # Both navigations were drained: the initial one and the post-click one.
+    assert driver.get_log.call_count == 2

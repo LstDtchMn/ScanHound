@@ -275,6 +275,26 @@ def _status(
     }
 
 
+def _enable_performance_log(options: Any) -> bool:
+    """Ask Chrome for network performance logs; failure to SET it is ignored.
+
+    The logs carry the main document's response headers, which is how a
+    Cloudflare Challenge Page is recognised regardless of its language or
+    template. Purely additive: if the adapter rejects the capability here, the
+    browser still launches and challenge detection falls back to page
+    evidence.
+
+    Scope note: this only swallows failures raised while *setting* the
+    capability. A driver that accepts the option and then rejects it during
+    construction still fails the launch — that is outside this helper.
+    """
+    try:
+        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+        return True
+    except Exception:
+        return False
+
+
 def launch_browser(
     config: Dict[str, Any],
     *,
@@ -296,6 +316,7 @@ def launch_browser(
         options = uc.ChromeOptions()
         for arg in args:
             options.add_argument(arg)
+        _enable_performance_log(options)
         if chrome_bin and os.path.exists(chrome_bin):
             options.binary_location = chrome_bin
         kwargs: Dict[str, Any] = {
@@ -314,6 +335,7 @@ def launch_browser(
     options = Options()
     for arg in args:
         options.add_argument(arg)
+    _enable_performance_log(options)
     if chrome_bin and os.path.exists(chrome_bin):
         options.binary_location = chrome_bin
     service = (

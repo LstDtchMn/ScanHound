@@ -64,6 +64,118 @@ _RELEASE_TITLE_METADATA = re.compile(
 )
 
 
+# Cloudflare sets this response header on every Challenge Page type. It is
+# language- and template-independent, so it recognises custom or localized
+# challenge pages that carry none of the English phrases above — and, unlike a
+# dormant Turnstile script, it is only present on an actual interstitial.
+CF_MITIGATED_HEADER = "cf-mitigated"
+CF_MITIGATED_CHALLENGE = "challenge"
+
+
+def _without_fragment(value: str) -> str:
+    """Return a URL without its fragment.
+
+    ``driver.current_url`` can carry a fragment (the unlock form navigates to
+    ``#unlocked``) while an HTTP response URL never does, so the two must be
+    normalized before they can be compared.
+    """
+    from urllib.parse import urldefrag
+
+    return urldefrag(value or "")[0]
+
+
+def cf_mitigated_from_perf_log(
+    entries, *, page_url: str = "", observation: Optional[dict] = None
+) -> Optional[str]:
+    """Return the DISPLAYED page's ``cf-mitigated`` value, or ``None``.
+
+    ``entries`` are raw Chrome performance-log records.
+
+    ``type == "Document"`` is a *resource* type, not proof of top-level
+    ownership: an **iframe** navigation is also a document load, verified
+    against a real browser — an embedded widget produced its own
+    ``type=Document`` response carrying ``cf-mitigated: challenge`` while the
+    top-level page had no such header. Attributing that to the page would turn
+    an embedded widget into a source-wide interstitial, so the value is taken
+    only from the response whose URL matches the displayed page, compared with
+    fragments removed. There is deliberately **no fallback** to "the most
+    recent document": an unmatched log yields ``None``.
+
+    ``None`` means "no signal" — no matching document response, header absent,
+    or the log was unavailable. It never means "no challenge", so callers must
+    fall back to the other evidence rather than treating absence as safety.
+
+    Pass ``observation`` (a dict) to receive telemetry about what was seen:
+
+    ``documents``
+        every document URL encountered, fragment-stripped.
+    ``matched``
+        whether any document response was the displayed page. The caller must
+        NOT re-derive this by testing its own ``page_url`` against
+        ``documents`` — those are normalized here and a raw ``page_url``
+        carrying a fragment (the unlock form navigates to ``#unlocked``) would
+        never compare equal, producing a false "nothing matched" report on a
+        perfectly ordinary grab.
+    ``unmatched_challenges``
+        how many NON-displayed documents carried ``cf-mitigated: challenge``.
+        Only this warrants a warning: an ordinary iframe document with no such
+        header is unremarkable and must stay quiet.
+    """
+    import json
+
+    if observation is not None:
+        observation.setdefault("documents", [])
+        observation.setdefault("matched", False)
+        observation.setdefault("unmatched_challenges", 0)
+
+    target = _without_fragment(page_url)
+    if not target:
+        # Without a displayed URL, ownership cannot be proven at all.
+        return None
+
+    matched: Optional[str] = None
+    for entry in entries or ():
+        try:
+            message = json.loads(entry.get("message") or "{}").get("message") or {}
+        except Exception:
+            continue
+        if message.get("method") != "Network.responseReceived":
+            continue
+        params = message.get("params") or {}
+        if params.get("type") != "Document":
+            continue
+        response = params.get("response") or {}
+        document_url = _without_fragment(response.get("url") or "")
+        if document_url and observation is not None:
+            # Lets the caller see that documents WERE captured but none was the
+            # displayed page, so a silent None can be told apart from "the log
+            # had nothing in it".
+            observation["documents"].append(document_url)
+        headers = {
+            str(key).lower(): value
+            for key, value in (response.get("headers") or {}).items()
+        }
+        value = headers.get(CF_MITIGATED_HEADER)
+        if document_url != target:
+            # A challenge header on a document that is NOT the displayed page
+            # cannot be attributed to the page (that was the iframe blocker),
+            # but it is worth counting: it is the only signal that would
+            # otherwise vanish silently.
+            if (
+                observation is not None
+                and value is not None
+                and str(value).strip().lower() == CF_MITIGATED_CHALLENGE
+            ):
+                observation["unmatched_challenges"] += 1
+            continue
+        if observation is not None:
+            observation["matched"] = True
+        # Later responses for the same URL supersede earlier ones, so a redirect
+        # chain resolves to whatever was finally displayed.
+        matched = str(value).strip().lower() if value is not None else None
+    return matched
+
+
 def challenge_iframe_srcs(html: str) -> tuple[str, ...]:
     """Return iframe ``src`` values that identify active challenge infrastructure.
 
