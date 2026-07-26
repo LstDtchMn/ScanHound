@@ -250,11 +250,14 @@ Remove-Item $tempScript, $tempData -Force -ErrorAction SilentlyContinue
 #     but whether to recreate depends on what the container can currently see
 #     (below). Restoring eight of nine sources beats total blindness; it does
 #     NOT beat a healthy container, so a healthy one is left alone.
-if ($mountExit -eq 2) {
-    Fail ("The critical read-write share ($CriticalKey -> $CriticalTarget) is not " +
-          "mounted and verified. Refusing to create or recreate the container: it " +
-          "would write TV files into a local VM directory, invisible to Plex.") 2
-}
+# Deliberately NOT handled here. "Do not recreate" is correct when the critical
+# share is unverified, but "do not touch the container" is NOT safe: if the
+# container is already blind (WSL bounced, then the share failed to remount) it
+# keeps running with /library/tv bound to a local VM directory and silently
+# writes TV files where Plex will never see them. So the critical-failure path
+# still PROBES the existing container below, and stops it unless its
+# /library/tv is independently identity-verified and writable.
+$criticalHostFailure = ($mountExit -eq 2)
 
 # --- container probe -------------------------------------------------------
 
@@ -297,16 +300,29 @@ while IFS="$(printf '\t')" read -r target share; do
     echo "OK    $target"
 done < "$DATA"
 
-# The critical share must be provably WRITABLE, not merely present. A
-# read-only or stale-handle mount here silently breaks every TV rename.
-probe="$CRITICAL_TARGET/.scanhound-mount-probe.$$"
-if echo scanhound > "$probe" 2>/dev/null && [ -s "$probe" ]; then
-    rm -f "$probe" 2>/dev/null
-    echo "OK    $CRITICAL_TARGET (write probe passed)"
+# The critical share must be provably WRITABLE and DELETABLE, not merely
+# present. A read-only or stale-handle mount silently breaks every TV rename,
+# and this path is a download/extraction/rename destination, so remove()
+# semantics matter as much as write().
+#
+# Gated on identity: never write into a target whose identity check already
+# failed. Writing to an unverified /library/tv is exactly the local-VM-directory
+# accident this script exists to prevent.
+if [ $critical_bad -ne 0 ]; then
+    echo "SKIP  $CRITICAL_TARGET write probe (identity not verified)"
 else
+    probe="$CRITICAL_TARGET/.scanhound-mount-probe.$$"
     rm -f "$probe" 2>/dev/null
-    echo "UNWRITABLE $CRITICAL_TARGET"
-    bad=1; critical_bad=1
+    if echo scanhound > "$probe" 2>/dev/null &&
+       [ -s "$probe" ] &&
+       rm -f "$probe" 2>/dev/null &&
+       [ ! -e "$probe" ]; then
+        echo "OK    $CRITICAL_TARGET (write+delete probe passed)"
+    else
+        rm -f "$probe" 2>/dev/null
+        echo "UNWRITABLE $CRITICAL_TARGET (write, non-empty, delete or absence check failed)"
+        bad=1; critical_bad=1
+    fi
 fi
 
 [ $critical_bad -ne 0 ] && exit 2
@@ -359,9 +375,59 @@ function Invoke-ContainerProbe([int]$TimeoutSec = 90) {
     return $result
 }
 
+# Bounded, checked, VERIFIED stop. Never report "stopped" without proving it:
+# `docker stop | Out-Null` hides a failure and an unreachable daemon alike, and
+# the caller then asserts a safe state that may not exist.
+function Stop-ScanhoundVerified([int]$TimeoutSec = 45) {
+    $job = Start-Job -ScriptBlock {
+        docker stop -t 20 scanhound 2>&1 | Out-Null
+        $LASTEXITCODE
+    }
+    if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
+        Stop-Job $job -ErrorAction SilentlyContinue
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        return "stop-timed-out"
+    }
+    $code = Receive-Job $job
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+
+    # Independently confirm it is no longer running, whatever stop reported.
+    $still = docker ps --filter "name=^scanhound$" --format "{{.Names}}" 2>$null
+    if ($LASTEXITCODE -ne 0) { return "docker-unavailable" }
+    if ($still)              { return "stop-failed" }
+    if ($code -ne 0)         { return "stopped-despite-error" }
+    return "stopped"
+}
+
 $probe = Invoke-ContainerProbe
 Write-Host "Container mount probe: $($probe.Reason)"
 if ($probe.Output) { Write-Host $probe.Output.TrimEnd() }
+
+# Critical host mount unverified: never (re)create, but do not leave a possibly
+# blind container writing into a local directory either.
+if ($criticalHostFailure) {
+    $safe = ($probe.Reason -eq "probed" -and $probe.Code -eq 0)
+    if ($safe) {
+        Fail ("The critical share ($CriticalKey) failed host verification, but the " +
+              "running container's $CriticalTarget is independently identity-verified " +
+              "and writable. Left running; NOT recreated.") 2
+    }
+    if ($probe.Reason -eq "not-running") {
+        Fail ("The critical share ($CriticalKey) is not mounted and verified. " +
+              "Container is not running and was NOT started.") 2
+    }
+    Write-Host "Critical share unverified and the container is not provably safe -- stopping it."
+    $stopState = Stop-ScanhoundVerified
+    Write-Host "Stop result: $stopState"
+    if ($stopState -eq "stopped" -or $stopState -eq "stopped-despite-error") {
+        Fail ("The critical share ($CriticalKey -> $CriticalTarget) is not mounted and " +
+              "verified. The container has been STOPPED (verified not running) to " +
+              "prevent TV writes into a non-NAS directory.") 2
+    }
+    Fail ("The critical share ($CriticalKey -> $CriticalTarget) is not mounted and " +
+          "verified, AND the container could not be confirmed stopped ($stopState). " +
+          "It may still be writing into a non-NAS directory -- intervene manually.") 7
+}
 
 $needsRecreate = $false
 switch ($probe.Reason) {
@@ -409,9 +475,16 @@ if ($needsRecreate) {
             # The critical read-write destination is not proven good. Do not
             # leave the app able to write TV files into a local VM directory.
             Write-Host "Stopping scanhound: the read-write TV destination is not verified."
-            docker stop scanhound | Out-Null
-            Fail ("Post-recreate verification failed for $CriticalTarget. The container " +
-                  "has been STOPPED to prevent writes into a non-NAS directory.") 5
+            $stopState = Stop-ScanhoundVerified
+            Write-Host "Stop result: $stopState"
+            if ($stopState -eq "stopped" -or $stopState -eq "stopped-despite-error") {
+                Fail ("Post-recreate verification failed for $CriticalTarget. The container " +
+                      "has been STOPPED (verified not running) to prevent writes into a " +
+                      "non-NAS directory.") 5
+            }
+            Fail ("Post-recreate verification failed for $CriticalTarget AND the container " +
+                  "could not be confirmed stopped ($stopState). It may still be writing " +
+                  "into a non-NAS directory -- intervene manually.") 7
         }
         Fail "Post-recreate verification failed for one or more read-only sources." 6
     }
