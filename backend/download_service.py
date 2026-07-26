@@ -1772,25 +1772,33 @@ class DownloadService:
             page_url = driver.current_url or ""
         except Exception:
             page_url = ""
-        observed: list = []
+        observation: dict = {}
         try:
             value = cf_mitigated_from_perf_log(
-                entries, page_url=page_url, observed=observed
+                entries, page_url=page_url, observation=observation
             )
         except Exception:
             value = None
         self._last_cf_mitigated = value
         if value:
             self._log(f"[HDEncode] cf-mitigated header: {value!r}", "warning")
-        elif observed and page_url and page_url not in observed:
-            # Documents WERE captured but none was the displayed page, so the
-            # header could not be attributed. Without this the case is silent
-            # and indistinguishable from "the log had nothing in it" — and it
-            # is the one scenario that would leave the signal permanently
-            # inert in production.
+        elif observation.get("unmatched_challenges"):
+            # A challenge header was seen, but on a document that was NOT the
+            # displayed page, so it cannot be attributed to it (that was the
+            # iframe blocker). Worth surfacing — it is the one scenario that
+            # would otherwise leave the signal permanently inert — but it is
+            # deliberately NOT treated as a challenge.
+            #
+            # `matched` comes from the parser rather than being re-derived
+            # here: the parser normalizes URLs, and testing a raw page_url
+            # (which carries `#unlocked` after the reveal form navigates)
+            # against those would report "nothing matched" on ordinary grabs.
             self._log(
-                "[HDEncode] cf-mitigated: no document response matched the "
-                f"displayed page ({len(observed)} document(s) seen)",
+                "[HDEncode] cf-mitigated: challenge header on "
+                f"{observation['unmatched_challenges']} non-displayed "
+                f"document(s); displayed page "
+                f"{'matched' if observation.get('matched') else 'not seen'} "
+                f"({len(observation.get('documents') or ())} document(s) seen)",
                 "warning",
             )
         return value
@@ -1989,6 +1997,26 @@ class DownloadService:
                             "warning",
                         )
                         driver.execute_script("arguments[0].click();", access_btn)
+
+                    # The click submits the unlock form, which is a NEW top-level
+                    # navigation — and Cloudflare can challenge that POST even
+                    # when the initial page load was clean. Without re-running the
+                    # capture here, `_last_cf_mitigated` stays at whatever the
+                    # FIRST navigation set (usually None) and the diagnostics
+                    # below report "no links found" for what is actually a
+                    # source-wide interstitial. This is the normal operating path,
+                    # not an edge case: submitting the form is the whole point.
+                    #
+                    # `_wait_past_cloudflare` is reused rather than a bare
+                    # `_capture_cf_mitigated` so the page-evidence fallback still
+                    # applies to the post-click page. It returns immediately when
+                    # the page carries no challenge markers.
+                    post_click_diagnostic = self._wait_past_cloudflare(
+                        driver,
+                        source_kind=source_kind,
+                    )
+                    if post_click_diagnostic is not None:
+                        return ScrapedLinks(diagnostic=post_click_diagnostic)
 
                     self._log(f"[HDEncode] Clicked — waiting up to 8s for '{keyword}' links to appear")
                     try:

@@ -85,7 +85,7 @@ def _without_fragment(value: str) -> str:
 
 
 def cf_mitigated_from_perf_log(
-    entries, *, page_url: str = "", observed: Optional[list] = None
+    entries, *, page_url: str = "", observation: Optional[dict] = None
 ) -> Optional[str]:
     """Return the DISPLAYED page's ``cf-mitigated`` value, or ``None``.
 
@@ -105,10 +105,28 @@ def cf_mitigated_from_perf_log(
     or the log was unavailable. It never means "no challenge", so callers must
     fall back to the other evidence rather than treating absence as safety.
 
-    Pass ``observed`` to collect every document URL seen, so a caller can log
-    the case where documents were captured but none matched the displayed page.
+    Pass ``observation`` (a dict) to receive telemetry about what was seen:
+
+    ``documents``
+        every document URL encountered, fragment-stripped.
+    ``matched``
+        whether any document response was the displayed page. The caller must
+        NOT re-derive this by testing its own ``page_url`` against
+        ``documents`` — those are normalized here and a raw ``page_url``
+        carrying a fragment (the unlock form navigates to ``#unlocked``) would
+        never compare equal, producing a false "nothing matched" report on a
+        perfectly ordinary grab.
+    ``unmatched_challenges``
+        how many NON-displayed documents carried ``cf-mitigated: challenge``.
+        Only this warrants a warning: an ordinary iframe document with no such
+        header is unremarkable and must stay quiet.
     """
     import json
+
+    if observation is not None:
+        observation.setdefault("documents", [])
+        observation.setdefault("matched", False)
+        observation.setdefault("unmatched_challenges", 0)
 
     target = _without_fragment(page_url)
     if not target:
@@ -128,18 +146,30 @@ def cf_mitigated_from_perf_log(
             continue
         response = params.get("response") or {}
         document_url = _without_fragment(response.get("url") or "")
-        if document_url and observed is not None:
+        if document_url and observation is not None:
             # Lets the caller see that documents WERE captured but none was the
             # displayed page, so a silent None can be told apart from "the log
             # had nothing in it".
-            observed.append(document_url)
-        if document_url != target:
-            continue
+            observation["documents"].append(document_url)
         headers = {
             str(key).lower(): value
             for key, value in (response.get("headers") or {}).items()
         }
         value = headers.get(CF_MITIGATED_HEADER)
+        if document_url != target:
+            # A challenge header on a document that is NOT the displayed page
+            # cannot be attributed to the page (that was the iframe blocker),
+            # but it is worth counting: it is the only signal that would
+            # otherwise vanish silently.
+            if (
+                observation is not None
+                and value is not None
+                and str(value).strip().lower() == CF_MITIGATED_CHALLENGE
+            ):
+                observation["unmatched_challenges"] += 1
+            continue
+        if observation is not None:
+            observation["matched"] = True
         # Later responses for the same URL supersede earlier ones, so a redirect
         # chain resolves to whatever was finally displayed.
         matched = str(value).strip().lower() if value is not None else None

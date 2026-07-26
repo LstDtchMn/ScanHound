@@ -276,13 +276,17 @@ def _status(
 
 
 def _enable_performance_log(options: Any) -> bool:
-    """Ask Chrome for network performance logs; never fail the launch.
+    """Ask Chrome for network performance logs; failure to SET it is ignored.
 
     The logs carry the main document's response headers, which is how a
     Cloudflare Challenge Page is recognised regardless of its language or
-    template. Purely additive: if the adapter rejects the capability the
+    template. Purely additive: if the adapter rejects the capability here, the
     browser still launches and challenge detection falls back to page
     evidence.
+
+    Scope note: this only swallows failures raised while *setting* the
+    capability. A driver that accepts the option and then rejects it during
+    construction still fails the launch — that is outside this helper.
     """
     try:
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
