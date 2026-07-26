@@ -49,13 +49,42 @@ $shares = [ordered]@{
 # `wsl -d docker-desktop -- sh -c "..."` -- multi-layer PowerShell -> wsl.exe
 # -> Linux-shell quoting silently truncates share names containing spaces
 # (confirmed 2026-07-12). A script file sidesteps that entirely.
-$scriptLines = @("#!/bin/sh", "set -e", "")
+# Failures must propagate. The previous form ended each mount with
+#   `... && echo 'OK: x' || echo 'FAILED: x'`
+# which always exits 0 (the `||` branch succeeds), and additionally defeats
+# `set -e` for that line. The result: on 2026-07-25 every one of the nine
+# mounts was absent while the Scheduled Task recorded LastTaskResult 0, so a
+# total outage of all NAS-backed Plex sources AND the read-write TV
+# destination looked healthy for days. `set -e` is therefore deliberately NOT
+# used -- we want every share attempted even if an early one fails -- and a
+# failure counter drives the exit status instead.
+#
+# An empty mountpoint after a "successful" mount is also treated as failure:
+# drvfs can return 0 having mounted nothing useful, which is indistinguishable
+# from success by exit code alone.
+$scriptLines = @("#!/bin/sh", "fail=0", "")
 foreach ($key in $shares.Keys) {
     $share = $shares[$key]
     $scriptLines += "mkdir -p /mnt/nas/$key"
-    $scriptLines += "umount /mnt/nas/$key 2>/dev/null || true"
-    $scriptLines += "mount -t drvfs '\\\\TURTLELANDSRV2\$share' /mnt/nas/$key && echo 'OK: $key' || echo 'FAILED: $key'"
+    $scriptLines += "if [ `"`$(ls -A /mnt/nas/$key 2>/dev/null | head -1)`" ]; then"
+    $scriptLines += "    echo 'OK (already mounted): $key'"
+    $scriptLines += "else"
+    $scriptLines += "    umount /mnt/nas/$key 2>/dev/null"
+    $scriptLines += "    if mount -t drvfs '\\\\TURTLELANDSRV2\$share' /mnt/nas/$key; then"
+    $scriptLines += "        if [ `"`$(ls -A /mnt/nas/$key 2>/dev/null | head -1)`" ]; then"
+    $scriptLines += "            echo 'OK: $key'"
+    $scriptLines += "        else"
+    $scriptLines += "            echo 'FAILED (mounted but empty): $key'"
+    $scriptLines += "            fail=1"
+    $scriptLines += "        fi"
+    $scriptLines += "    else"
+    $scriptLines += "        echo 'FAILED (mount error): $key'"
+    $scriptLines += "        fail=1"
+    $scriptLines += "    fi"
+    $scriptLines += "fi"
 }
+$scriptLines += ""
+$scriptLines += "exit `$fail"
 
 $tempScript = Join-Path $env:TEMP "scanhound-mount-nas.sh"
 ($scriptLines -join "`n") | Out-File -FilePath $tempScript -Encoding ascii -NoNewline
@@ -68,18 +97,77 @@ $wslScriptPath = "/mnt/host/$driveLetter$restOfPath"
 
 Write-Host "Mounting NAS shares inside the docker-desktop WSL2 distro..."
 wsl -d docker-desktop -- sh $wslScriptPath
+$mountExit = $LASTEXITCODE
 
 Remove-Item $tempScript -Force -ErrorAction SilentlyContinue
+
+# Surface the failure to the Scheduled Task's LastTaskResult. Without this the
+# task reports 0 even when nothing mounted, which is exactly how the 2026-07-25
+# outage stayed invisible. Bail out before the container recreate: recreating
+# against missing mount sources bakes empty bind mounts into the new container,
+# which is strictly worse than leaving the old one alone.
+if ($mountExit -ne 0) {
+    Write-Error ("One or more NAS shares failed to mount (exit $mountExit). " +
+                 "Skipping the container recreate -- recreating now would bind " +
+                 "empty directories. Check that TURTLELANDSRV2 is reachable and " +
+                 "that this ran in a session with Windows credentials.")
+    exit $mountExit
+}
 
 # The scanhound container's bind-mount sources are only live if the WSL2
 # mounts already existed at container-(re)create time. If this script runs
 # after the container already started with empty/missing mount sources
 # (e.g. right after a host reboot), recreate it now so it picks up the live
 # mounts. Harmless no-op if the container already has them.
-Write-Host "Recreating the scanhound container to pick up live mounts..."
+# Recreate ONLY when the running container is actually blind to the mounts.
+#
+# Two facts force this shape:
+#   * A bare `docker compose up -d` compares the compose config, finds it
+#     unchanged, prints "Container scanhound Running" and does nothing --
+#     confirmed 2026-07-26. Bind-mount sources are resolved at container-CREATE
+#     time, so a container started while /mnt/nas was empty stays blind for its
+#     entire lifetime no matter how many times the mounts are re-established
+#     underneath it. Only a recreate re-resolves them.
+#   * But this script is registered At Logon AND At Startup. An unconditional
+#     --force-recreate would therefore tear down and rebuild the container on
+#     every single logon, interrupting in-flight downloads, an active metadata
+#     scan, and the RSS shadow collector for no reason.
+#
+# So: probe the container's own view of the mounts, and recreate only if it
+# cannot see them (or is not running at all).
+$mountTargets = @(
+    "/library/tv"
+) + ($shares.Keys | Where-Object { $_ -ne "nas-tv-blackbeard" } |
+     ForEach-Object { "/library/plex-source/$_" })
+
+$needsRecreate = $false
+$running = (docker ps --filter "name=^scanhound$" --format "{{.Names}}" 2>$null)
+if (-not $running) {
+    Write-Host "scanhound is not running -- starting it."
+    $needsRecreate = $true
+} else {
+    foreach ($t in $mountTargets) {
+        $probe = (docker exec scanhound sh -c "ls -A '$t' 2>/dev/null | head -1")
+        if (-not $probe) {
+            Write-Host "Container cannot see $t -- recreate required."
+            $needsRecreate = $true
+            break
+        }
+    }
+}
+
 Push-Location "X:\Docker Apps\ScanHound"
 try {
-    docker compose up -d
+    if ($needsRecreate) {
+        Write-Host "Recreating the scanhound container to pick up live mounts..."
+        docker compose up -d --force-recreate
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "docker compose up -d --force-recreate failed (exit $LASTEXITCODE)."
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "Container already sees all mounts -- leaving it running."
+    }
 } finally {
     Pop-Location
 }
