@@ -314,35 +314,52 @@ buffered code path rather than by ffmpeg's demuxer being better.
 `dv_detect.py`'s warning that the pipe "can drop EL NALs and misreport a FEL as
 MEL" is **not obsolete**.
 
-## 9. Dual-track Profile 7 is unproven in both directions
+## 9. Dual-track Profile 7 — now PROVEN broken on every default path
 
-An earlier draft implied that direct `dovi_tool extract-rpu file.mkv` is safe
-for dual-track P7 and only the pipe is risky. That is not established. The
-Matroska path selects a video track and processes frames for that track, so
-**both** of these require explicit validation on dual-track content:
+The synthetic test this section previously specified has been run
+(2026-07-26). Sample construction: 60 s single-track P7 FEL clip from
+`A History of Violence` → reference RPU extracted (md5 `8bca9ae2…`,
+`Profile: 7 (FEL)`) → `dovi_tool demux` into BL (523.8 MB, **no RPU**) and EL
+(68.1 MB, classifies FEL on its own — the RPU travels entirely with the EL) →
+remuxed with `mkvmerge` v98 as one MKV with two video tracks
+(track 0 = BL 3840×2160, track 1 = EL 1920×1080, the classic dual-track
+shape). ffmpeg 5.1 cannot perform this remux (raw HEVC has no timestamps and
+its Matroska muxer rejects them), which is itself worth knowing: real
+dual-track files are mkvmerge products.
 
-- direct `dovi_tool extract-rpu file.mkv`;
-- `ffmpeg -map ... -c copy -f hevc - | dovi_tool extract-rpu -`.
+Results against the dual-track file:
 
-The correct claim about Fix C is narrow:
+| path | result |
+|---|---|
+| A. direct `dovi_tool extract-rpu dual.mkv` — the production path | **NO RPU** |
+| B. ffmpeg default stream selection → pipe | **NO RPU** |
+| C. explicit BL track (`0:v:0`) → pipe | NO RPU (expected) |
+| D. explicit EL track (`0:v:1`) → pipe | **`Profile: 7 (FEL)`, RPU byte-identical to reference** |
+| A′. `dovi_tool extract-rpu --limit 12 dual.mkv` | **NO RPU** |
 
-> Scratch copying introduces no new demuxing behaviour relative to the existing
-> direct-file path.
+Three conclusions, all now evidence rather than caution:
 
-It does **not** prove dual-track correctness, because the existing direct-file
-path is itself unvalidated there.
+1. **The failure mode is worse than the warned one.** `dv_detect.py` warns of
+   FEL misreported as MEL; the observed behaviour is a dual-track FEL
+   classified as **not Dolby Vision at all** — dovi_tool's Matroska path and
+   ffmpeg's default selection both pick the highest-resolution track (the BL),
+   which carries no RPU. The title silently loses its DV FEL identity.
+2. **Bounded extraction inherits the blindness** (A′), so the `--limit`
+   production candidate MUST be gated behind multi-track detection.
+3. **The cheap ffprobe probe is blind on `v:0` too**: the
+   `DOVI configuration record` side-data appears only on stream idx=1 (the
+   EL). Any cheap-probe implementation must inspect **all** video streams,
+   not the first.
 
-A synthetic dual-track sample can be constructed — `dovi_tool demux` exists
-("Demuxes single track dual layer Dolby Vision into Base layer and Enhancement
-layer files"), so: start from the known single-track P7 FEL source, `demux` to
-separate BL and EL elementary streams, remux them as two MKV video tracks,
-record stream order and metadata, then compare direct MKV extraction, ffmpeg
-default mapping, explicit BL mapping, explicit EL mapping, and any combined
-reconstruction against the reference RPU hash and FEL/MEL summary.
+The fail-closed rule is therefore not optional: ffprobe's video-stream count
+(> 1 → route to `unknown`/special handling) is a cheap and sufficient gate.
+And the special handler is also now proven: extracting the track that carries
+the DOVI configuration record (path D) reproduced the reference RPU
+byte-for-byte.
 
-Until that is done, production should detect multi-HEVC-track inputs cheaply
-and classify them `unknown` or route them to a dedicated detector rather than
-emitting a possibly-wrong FEL/MEL verdict.
+The narrow claim about Fix C stands unchanged: scratch copying introduces no
+new demuxing behaviour relative to the direct path — which now means it
+faithfully reproduces the *broken* dual-track behaviour too.
 
 ## 10. Inventory should reuse `dv_scan`, and axes should fail independently
 
@@ -451,8 +468,12 @@ working tree needs to stay on `main`.
    evidence.
 10. Buffered Matroska input is the preferred engineering fix and is now
     source-justified, but remains unproven.
-11. Dual-track Profile 7 remains unproven for both direct MKV and ffmpeg-pipe
-    approaches.
+11. Dual-track Profile 7 is now PROVEN broken on every default path (§9):
+    direct MKV, the ffmpeg default-selection pipe, and bounded `--limit` all
+    return no RPU — a dual-track FEL silently classifies as not-DV. Only
+    explicit EL-track extraction reproduces the reference RPU byte-for-byte.
+    Multi-video-track detection before classification is mandatory, and the
+    cheap probe must inspect all video streams, not just `v:0`.
 12. No cheap container-level flag distinguishes FEL from MEL; `ffprobe`'s DOVI
     configuration record is identical across P7 subtypes.
 13. Inventory should reuse current `dv_scan` evidence rather than re-derive
