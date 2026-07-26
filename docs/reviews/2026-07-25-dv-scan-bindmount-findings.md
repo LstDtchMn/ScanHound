@@ -322,10 +322,19 @@ The synthetic test this section previously specified has been run
 `Profile: 7 (FEL)`) → `dovi_tool demux` into BL (523.8 MB, **no RPU**) and EL
 (68.1 MB, classifies FEL on its own — the RPU travels entirely with the EL) →
 remuxed with `mkvmerge` v98 as one MKV with two video tracks
-(track 0 = BL 3840×2160, track 1 = EL 1920×1080, the classic dual-track
-shape). ffmpeg 5.1 cannot perform this remux (raw HEVC has no timestamps and
-its Matroska muxer rejects them), which is itself worth knowing: real
-dual-track files are mkvmerge products.
+(track 0 = BL 3840×2160, track 1 = EL 1920×1080). ffmpeg 5.1 cannot perform
+this remux at all — raw HEVC carries no timestamps and its Matroska muxer
+rejects them — so constructing the sample required mkvmerge.
+
+**Scope of this sample.** It reproduces a *separate-BL/EL-track* layout that a
+detector may encounter in legacy, malformed, non-conforming, or deliberately
+constructed files. It is **not** the current conforming Matroska Dolby Vision
+representation: conforming files normally carry the dual-layer information
+within a single video track. An earlier draft called this "the classic
+dual-track shape" and inferred that real dual-track files are mkvmerge
+products — both overstated. The fail-closed policy below does not depend on
+how common the layout is; it depends on the detector being unable to
+distinguish it safely.
 
 Results against the dual-track file:
 
@@ -341,9 +350,30 @@ Three conclusions, all now evidence rather than caution:
 
 1. **The failure mode is worse than the warned one.** `dv_detect.py` warns of
    FEL misreported as MEL; the observed behaviour is a dual-track FEL
-   classified as **not Dolby Vision at all** — dovi_tool's Matroska path and
-   ffmpeg's default selection both pick the highest-resolution track (the BL),
-   which carries no RPU. The title silently loses its DV FEL identity.
+   classified as **not Dolby Vision at all**. The title silently loses its DV
+   FEL identity.
+
+   **The two tools select differently** — a swapped-order test settles it.
+   Re-muxing the same layers as track 0 = EL (1920×1080), track 1 = BL
+   (3840×2160):
+
+   | path | EL-first ordering |
+   |---|---|
+   | direct `dovi_tool` | **`Profile: 7 (FEL)`, RPU byte-identical to reference** |
+   | ffmpeg default selection | NO RPU |
+
+   So `dovi_tool` follows **track order** (it found the RPU once the EL came
+   first), while ffmpeg's default selection follows **resolution** (it still
+   chose the 4K BL). An earlier draft claimed both pick the highest-resolution
+   track; that was wrong for `dovi_tool`, and the original sample could not
+   have distinguished the two rules because BL was simultaneously track 0 and
+   the higher resolution.
+
+   The practical consequence: for `dovi_tool` the danger is muxing-order
+   dependent, so a BL-first file silently fails while an EL-first file
+   happens to work. That is a worse property than a consistent failure, and
+   it is another reason the detector must not rely on default selection at
+   all.
 2. **Bounded extraction inherits the blindness** (A′), so the `--limit`
    production candidate MUST be gated behind multi-track detection.
 3. **The cheap ffprobe probe is blind on `v:0` too**: the
@@ -353,9 +383,35 @@ Three conclusions, all now evidence rather than caution:
 
 The fail-closed rule is therefore not optional: ffprobe's video-stream count
 (> 1 → route to `unknown`/special handling) is a cheap and sufficient gate.
-And the special handler is also now proven: extracting the track that carries
-the DOVI configuration record (path D) reproduced the reference RPU
-byte-for-byte.
+
+The special handler is proven for the metadata use case — extracting the track
+carrying the DOVI configuration record (path D) reproduced the reference RPU
+byte-for-byte — but the configuration record is a **candidate locator, not a
+truth source**. Required handler policy:
+
+1. inspect all relevant HEVC movie streams (ignore attached artwork,
+   thumbnails, and unrelated video objects);
+2. if exactly one stream carries a DOVI configuration record, attempt
+   extraction from that stream;
+3. accept a classification **only if RPU extraction and parsing actually
+   succeed**;
+4. zero candidates, multiple candidates, a stale record, or extraction
+   failure → `unknown`.
+
+`NO RPU` must map to `unknown` — never to "not Dolby Vision" — and must never
+remove or overwrite trusted evidence. For vintage or malformed files with no
+reliable configuration record, stream-count-then-`unknown` remains sufficient
+as the immediate gate.
+
+Combined BL+EL reconstruction is **not** required for detection: explicit EL
+extraction already yields a byte-identical RPU. It would only be needed if
+ScanHound later remuxes, repairs media, validates full dual-layer playback, or
+emits a conforming output bitstream.
+
+Still to test before enabling an EL-selection handler: no DOVI record on
+either stream → `unknown`; multiple streams carrying one → `unknown`; a single
+candidate whose RPU extraction fails → `unknown`; and a separate-track MEL
+sample if the handler will claim MEL support.
 
 The narrow claim about Fix C stands unchanged: scratch copying introduces no
 new demuxing behaviour relative to the direct path — which now means it
