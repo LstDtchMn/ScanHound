@@ -94,8 +94,14 @@ services:
       # credentials needed) and produces a plain Linux path Docker CAN bind
       # from, since it never goes through the broken Windows-path validator.
       # NOT PERSISTENT ACROSS A DOCKER DESKTOP / HOST RESTART on its own --
-      # see scripts/host-detector/mount-nas-shares.ps1 and the matching
-      # Scheduled Task that re-establishes these on startup/logon.
+      # see scripts/mount-nas-shares.ps1 and the matching Scheduled Task
+      # (ScanHound-MountNASShares) that re-establishes these on startup/logon.
+      #
+      # If these directories are EMPTY inside the container, the WSL2 mounts
+      # were missing when the container was created. Re-running the script
+      # fixes it; a plain `docker compose up -d` does NOT, because bind-mount
+      # sources are resolved at container-create time and compose will not
+      # recreate an otherwise-unchanged container.
       - "/mnt/nas/nas-1080p-john-paul-jones:/library/plex-source/nas-1080p-john-paul-jones:ro"
       - "/mnt/nas/nas-1080p-lincoln:/library/plex-source/nas-1080p-lincoln:ro"
       - "/mnt/nas/nas-1080p-faraday:/library/plex-source/nas-1080p-faraday:ro"
