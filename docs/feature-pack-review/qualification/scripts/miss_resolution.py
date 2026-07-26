@@ -1,32 +1,44 @@
 """Retrospective miss-resolution grading for the RSS shadow window.
 
-Jesse's tiered criterion (2026-07-24): a miss that the feed catches up on
-within <=6h is GREEN, 6-24h is YELLOW (acceptable, non-failing), >24h or
-never is RED.
+Jesse's tiered criterion (2026-07-24): a miss the feed catches up on within
+<=6h is GREEN, 6-24h YELLOW (acceptable, non-failing), >24h or never RED.
 
-The hdencode_shadow_misses table records each miss ONCE with no timestamps,
-so it cannot answer this alone. But every cycle's details_json stores the
-full feed_only and listing_only URL lists, which lets resolution be derived
-retrospectively:
+`hdencode_shadow_misses` records each miss once with no timestamps, so it
+cannot answer this alone. Each cycle's details_json stores the full
+`feed_only` and `listing_only` URL lists, which supports retrospective
+grading -- but ONLY with the three-state model below.
 
-  * a URL is MISSING at cycle T if it appears in listing_only at T
-    (listing has it, feed does not);
-  * it is RESOLVED by cycle T' > T when it stops appearing in listing_only:
-    either the feed now has it (it moved to the both/duplicate set, which
-    stores only a count, or to feed_only after leaving the listing window),
-    or the listing dropped it. The first case is overwhelmingly more likely
-    while the item is recent, so this yields an UPPER BOUND on latency;
-  * if it appears in listing_only again later, it was still missing then --
-    the resolution bound restarts from the last sighting.
+WHAT DISAPPEARANCE ACTUALLY MEANS (peer review, 2026-07-26).
+An earlier version of this script treated "the URL left listing_only" as
+resolution and claimed it never graded a miss greener than the evidence
+supports. That was WRONG. Leaving listing_only has three possible causes:
 
-Latency is therefore bracketed: > (last missing sighting - first sighting)
-and <= (first absent cycle - first sighting). Both bounds are reported and
-the TIER is assigned from the upper bound (conservative: never grades a miss
-greener than the evidence supports).
+  1. the feed acquired it -> it moved into the intersection   (resolved)
+  2. the listing dropped it after the feed acquired it        (resolved)
+  3. the listing dropped it while the feed STILL lacks it     (NOT resolved)
+
+Case 3 is a false resolution, and the intersection is stored only as a COUNT,
+so absence from both difference sets cannot distinguish 1/2 from 3. The three
+states this data can actually prove are:
+
+  still in listing_only          -> definitely still missing
+  later appears in feed_only     -> DEFINITELY resolved by that cycle
+  absent from both               -> AMBIGUOUS, cannot close the miss
+
+AMBIGUOUS is reported as its own bucket and must block gate closure, exactly
+like PENDING. It is not evidence of failure either -- it is absence of proof.
+
+CYCLE QUALITY. A partial listing fetch, a parser error, or a cycle killed
+mid-run can manufacture a false disappearance. Only cycles that completed with
+both fetches succeeding are used as absence/resolution observations. (Three
+container recreates on 2026-07-26 killed scans mid-cycle, so this is not
+hypothetical.)
 """
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
+
+GREEN_H, YELLOW_H = 6.0, 24.0
 
 
 def ts(s):
@@ -36,88 +48,104 @@ def ts(s):
 con = sqlite3.connect("file:/dbvol/crawler.db?mode=ro", uri=True)
 con.row_factory = sqlite3.Row
 
-cycles = []
+all_cycles, usable = [], []
 for r in con.execute(
-        "SELECT cycle_uuid, completed_at, details_json FROM hdencode_shadow_cycles "
-        "WHERE details_json IS NOT NULL ORDER BY completed_at"):
+        "SELECT cycle_uuid, completed_at, outcome, normal_feeds_complete, "
+        "rss_requests, listing_requests, details_json "
+        "FROM hdencode_shadow_cycles WHERE details_json IS NOT NULL "
+        "ORDER BY completed_at"):
     try:
         d = json.loads(r["details_json"])
     except Exception:
         continue
-    cycles.append({
-        "uuid": r["cycle_uuid"],
+    c = {
         "at": ts(r["completed_at"]),
         "listing_only": set(d.get("listing_only") or ()),
         "feed_only": set(d.get("feed_only") or ()),
-    })
+        # Mirrors the readiness eligibility rule: a cycle only counts as an
+        # observation if both sides actually completed.
+        "usable": (r["outcome"] in ("success", "relevant_miss")
+                   and r["normal_feeds_complete"] == 1
+                   and (r["rss_requests"] or 0) > 0
+                   and (r["listing_requests"] or 0) > 0),
+    }
+    all_cycles.append(c)
+    if c["usable"]:
+        usable.append(c)
 
 misses = [dict(r) for r in con.execute(
     "SELECT m.canonical_url u, m.title, m.status, s.completed_at at "
     "FROM hdencode_shadow_misses m "
     "JOIN hdencode_shadow_cycles s ON s.cycle_uuid = m.cycle_uuid")]
 
-print(f"cycles with details: {len(cycles)}   recorded misses: {len(misses)}")
-if cycles:
-    gaps = [(cycles[i + 1]["at"] - cycles[i]["at"]).total_seconds() / 60
-            for i in range(len(cycles) - 1)]
-    gaps.sort()
-    print(f"cycle cadence: median {gaps[len(gaps) // 2]:.0f} min, "
+print(f"cycles: {len(all_cycles)} total, {len(usable)} usable as observations "
+      f"({len(all_cycles) - len(usable)} rejected: incomplete/partial/killed)")
+print(f"recorded misses: {len(misses)}")
+if len(usable) > 1:
+    gaps = sorted((usable[i + 1]["at"] - usable[i]["at"]).total_seconds() / 60
+                  for i in range(len(usable) - 1))
+    print(f"usable-cycle cadence: median {gaps[len(gaps) // 2]:.0f} min, "
           f"max {gaps[-1]:.0f} min\n")
 
-def grade(url, first_seen):
-    """Return (last_missing_at, resolved_bound_at, tier)."""
+
+def classify(url, first_seen):
+    """Return (state, hours, detail) using only provable transitions."""
     last_missing = first_seen
-    resolved_at = None
-    for c in cycles:
+    for c in usable:
         if c["at"] <= first_seen:
             continue
         if url in c["listing_only"]:
-            last_missing = c["at"]          # still missing at this cycle
-            resolved_at = None              # any earlier "absent" was a gap
-        elif resolved_at is None:
-            resolved_at = c["at"]           # first absence after a sighting
-    return last_missing, resolved_at
+            last_missing = c["at"]          # still provably missing
+        elif url in c["feed_only"]:
+            # DEFINITIVE: the feed has it and the listing no longer does.
+            return ("resolved", (c["at"] - first_seen).total_seconds() / 3600, "")
+        # absent from both -> ambiguous; keep looking for a feed_only sighting
+
+    newest = usable[-1]["at"] if usable else first_seen
+    unresolved_h = (newest - first_seen).total_seconds() / 3600
+    if last_missing > first_seen:
+        # Observed still-missing at a later cycle, then never provably resolved.
+        if unresolved_h > YELLOW_H:
+            return ("red", unresolved_h, "observed missing, never provably resolved")
+        return ("pending", unresolved_h, "still missing, window too short")
+    if unresolved_h > YELLOW_H:
+        return ("ambiguous", unresolved_h,
+                "left listing_only but never seen in feed_only (>24h)")
+    return ("ambiguous", unresolved_h,
+            "left listing_only but never seen in feed_only (recent)")
 
 
-tiers = {"green": [], "yellow": [], "red": [], "pending": []}
+buckets = {"green": [], "yellow": [], "red": [], "pending": [], "ambiguous": []}
 rows = []
 for m in sorted(misses, key=lambda x: x["at"]):
     first = ts(m["at"])
-    last_missing, resolved = grade(m["u"], first)
-    if resolved is None:
-        upper_h = None
-        # Distinguish "observed unresolved over a long span" from "too recent
-        # to grade": a miss from the latest cycle has zero subsequent cycles,
-        # so calling it RED would fail the window on absence of data. It is
-        # PENDING until later cycles exist; if the unresolved span itself
-        # exceeds 24h, it is a genuine RED regardless.
-        newest = cycles[-1]["at"] if cycles else first
-        span_h = (newest - first).total_seconds() / 3600
-        tier = "red" if span_h > 24 else "pending"
+    state, hours, detail = classify(m["u"], first)
+    if state == "resolved":
+        tier = ("green" if hours <= GREEN_H
+                else "yellow" if hours <= YELLOW_H else "red")
     else:
-        upper_h = (resolved - first).total_seconds() / 3600
-        lower_h = max(0.0, (last_missing - first).total_seconds() / 3600)
-        tier = "green" if upper_h <= 6 else ("yellow" if upper_h <= 24 else "red")
-    tiers[tier].append(m["u"])
-    rows.append((m["at"][:16], m["status"], upper_h, tier, m["title"][:34],
-                 m["u"].rsplit("/", 1)[-1][:40]))
+        tier = state
+    buckets[tier].append((m["u"], detail))
+    rows.append((m["at"][:16], f"{hours:5.1f}", tier, m["title"][:30], detail))
 
-print(f"{'missed at':16} {'status':14} {'<=h':>6}  {'tier':6}  title")
-for at, status, upper, tier, title, slug in rows:
-    h = f"{upper:5.1f}" if upper is not None else " neverr"[:6]
-    print(f"{at:16} {status:14} {h:>6}  {tier.upper():6}  {title}")
+print(f"{'missed at':16} {'hours':>6}  {'tier':10} title")
+for at, h, tier, title, detail in rows:
+    print(f"{at:16} {h:>6}  {tier.upper():10} {title}")
 
-print()
-print("=== VERDICT against the tiered criterion ===")
-print(f"  GREEN  (<=6h)        : {len(tiers['green'])}")
-print(f"  YELLOW (6-24h)       : {len(tiers['yellow'])}")
-print(f"  RED    (>24h/never)  : {len(tiers['red'])}")
-print(f"  PENDING (too recent) : {len(tiers['pending'])}")
-if tiers["red"]:
-    print("\n  RED urls:")
-    for u in tiers["red"]:
-        print("   ", u)
-print("\nNOTE: tier uses the UPPER bound of the resolution bracket, so a miss")
-print("is never graded greener than the evidence supports. 'never' means the")
-print("URL was still in listing_only at its last sighting with no later")
-print("absence observed.")
+print("\n=== VERDICT (only provable transitions) ===")
+for k in ("green", "yellow", "red", "pending", "ambiguous"):
+    print(f"  {k.upper():10}: {len(buckets[k])}")
+
+blocking = len(buckets["pending"]) + len(buckets["ambiguous"])
+print(f"\n  gate-blocking (pending + ambiguous): {blocking}")
+print(f"  gate-failing  (red)                : {len(buckets['red'])}")
+if buckets["ambiguous"]:
+    print("\n  AMBIGUOUS -- left listing_only but never observed in feed_only.")
+    print("  The intersection stores only a count, so these cannot be closed")
+    print("  from current data. Persisting both_urls or a full feed_urls set")
+    print("  per cycle would make them provable going forward.")
+    for u, d in buckets["ambiguous"][:8]:
+        print(f"    {u[-60:]}")
+print("\nGATE: closure requires 0 RED, 0 PENDING and 0 AMBIGUOUS.")
+print("Continue the observation tail past the nominal window end until every")
+print("miss is conclusively classified.")
