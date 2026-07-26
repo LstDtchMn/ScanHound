@@ -119,20 +119,54 @@ if ($mountExit -ne 0) {
 # after the container already started with empty/missing mount sources
 # (e.g. right after a host reboot), recreate it now so it picks up the live
 # mounts. Harmless no-op if the container already has them.
-# --force-recreate is REQUIRED, not defensive. A bare `docker compose up -d`
-# compares the compose config, finds it unchanged, prints "Container scanhound
-# Running" and does nothing -- confirmed 2026-07-26. Bind-mount sources are
-# resolved at container-CREATE time, so a container started while /mnt/nas was
-# empty stays blind to the shares for its entire lifetime no matter how many
-# times the mounts are re-established underneath it. Only a recreate re-resolves
-# them.
-Write-Host "Recreating the scanhound container to pick up live mounts..."
+# Recreate ONLY when the running container is actually blind to the mounts.
+#
+# Two facts force this shape:
+#   * A bare `docker compose up -d` compares the compose config, finds it
+#     unchanged, prints "Container scanhound Running" and does nothing --
+#     confirmed 2026-07-26. Bind-mount sources are resolved at container-CREATE
+#     time, so a container started while /mnt/nas was empty stays blind for its
+#     entire lifetime no matter how many times the mounts are re-established
+#     underneath it. Only a recreate re-resolves them.
+#   * But this script is registered At Logon AND At Startup. An unconditional
+#     --force-recreate would therefore tear down and rebuild the container on
+#     every single logon, interrupting in-flight downloads, an active metadata
+#     scan, and the RSS shadow collector for no reason.
+#
+# So: probe the container's own view of the mounts, and recreate only if it
+# cannot see them (or is not running at all).
+$mountTargets = @(
+    "/library/tv"
+) + ($shares.Keys | Where-Object { $_ -ne "nas-tv-blackbeard" } |
+     ForEach-Object { "/library/plex-source/$_" })
+
+$needsRecreate = $false
+$running = (docker ps --filter "name=^scanhound$" --format "{{.Names}}" 2>$null)
+if (-not $running) {
+    Write-Host "scanhound is not running -- starting it."
+    $needsRecreate = $true
+} else {
+    foreach ($t in $mountTargets) {
+        $probe = (docker exec scanhound sh -c "ls -A '$t' 2>/dev/null | head -1")
+        if (-not $probe) {
+            Write-Host "Container cannot see $t -- recreate required."
+            $needsRecreate = $true
+            break
+        }
+    }
+}
+
 Push-Location "X:\Docker Apps\ScanHound"
 try {
-    docker compose up -d --force-recreate
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "docker compose up -d --force-recreate failed (exit $LASTEXITCODE)."
-        exit $LASTEXITCODE
+    if ($needsRecreate) {
+        Write-Host "Recreating the scanhound container to pick up live mounts..."
+        docker compose up -d --force-recreate
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "docker compose up -d --force-recreate failed (exit $LASTEXITCODE)."
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Host "Container already sees all mounts -- leaving it running."
     }
 } finally {
     Pop-Location
