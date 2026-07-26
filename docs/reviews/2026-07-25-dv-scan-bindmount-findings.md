@@ -209,6 +209,44 @@ Candidate policy, **only after** that corpus comparison:
 - disagreement with the trusted host result → audit queue, do not overwrite;
 - uncertain result → never overwrite trusted evidence.
 
+### Corpus validation — running
+
+Unblocked once the NAS mounts were restored (§11): 451 of the 466 `dv_scan`
+rows carry a FEL/MEL/P8/P5 claim to check against. The comparison runs in
+randomized order under a fixed seed, appends each result immediately, and skips
+already-recorded paths, so a partial run is both representative and resumable.
+
+Acceptance criterion, per review: **zero incorrect classifications among titles
+where the detector returns a verdict.** Returning `unknown` and escalating is
+acceptable; a wrong FEL/MEL/profile answer is not. Results are reported per
+class, never as an aggregate pass rate.
+
+First 19 titles, at `--limit 1`:
+
+| expected | n | agree | disagree | no result |
+|---|---|---|---|---|
+| fel | 5 | 5 | 0 | 0 |
+| mel | 5 | 5 | 0 | 0 |
+| profile8 | 8 | 8 | 0 | 0 |
+| profile5 | 1 | 1 | 0 | 0 |
+
+Mounted runtime so far: median 77 s, p95 316 s, max 316 s, zero timeouts —
+recorded because accuracy alone does not show the operation is *bounded* across
+differing SeekHead and container layouts.
+
+`--limit 1` is deliberately the adversarial baseline: it is the least evidence
+the detector can act on, so a zero-wrong result there is the strongest
+available. It is **not** a recommendation for the production value — that
+should be the largest limit still on the same latency plateau, measured at
+1 / 12 / 32 / 128 on mounted full-size titles once the sweep finishes and is no
+longer competing for the same NAS I/O.
+
+Two cohorts are still missing from the corpus and must be added before
+adoption: titles with delayed or irregular early RPU data (concatenated or
+edited segments, long non-DV intros), and damaged, truncated or unusual
+Matroska layouts — the latter to confirm they yield `unknown` or a typed
+failure rather than a confident wrong verdict.
+
 ## 6. Fix B — buffer the Matroska input (best, unproven)
 
 Given §2, the highest-value engineering fix is to interpose buffering before
@@ -351,12 +389,44 @@ two Alien Romulus copies (the genuine P7 timeouts) carry `dv_incomplete`. The
 55 `pending` rows belong to the earlier cancelled pilot
 (`2b31cffe`, cancelled 2026-07-22), not to a failure.
 
-The mount defect itself is real and unfixed. Per `/proc/self/mountinfo` the
-`nas-*` entries are `ext4` on `/dev/sdd` — that is, `docker-compose.yml` maps
-VM-internal paths (`/mnt/nas/nas-4k-hdr-geronimo:/library/plex-source/...:ro`)
-that are not mounted inside the VM, so Docker created empty directories. This
-is a compose/VM-mount issue, entirely separate from §1–§10, and it is correctly
-reported today.
+### The mount outage itself — root-caused and fixed (PR #33, 2026-07-26)
+
+Per `/proc/self/mountinfo` the `nas-*` entries are `ext4` on `/dev/sdd`: the
+compose file maps VM-internal paths
+(`/mnt/nas/nas-4k-hdr-geronimo:/library/plex-source/...:ro`) that were not
+mounted inside the docker-desktop WSL2 distro, so Docker created empty
+directories. **All nine** shares were down, not just the 4K pair — including
+`/library/tv`, the read-**write** TV download/extract/rename destination.
+Nothing had been lost (that directory was empty, so no writes were misplaced),
+but any TV grab during the outage would have silently succeeded onto the VM
+disk, invisible to Plex.
+
+The mounts are re-established by `scripts/mount-nas-shares.ps1` via a Scheduled
+Task. It had run and recorded `LastTaskResult: 0`. Three defects made a total
+outage look healthy:
+
+1. every generated mount line ended `... && echo 'OK' || echo 'FAILED'`, which
+   always exits 0 and additionally defeats the script's own `set -e`;
+2. the PowerShell wrapper never checked `$LASTEXITCODE` from `wsl`, and
+   `$ErrorActionPreference = "Stop"` does not trap native-executable failures;
+3. `docker compose up -d` compares the compose config, finds it unchanged and
+   does nothing — but bind-mount sources resolve at container-**create** time,
+   so a container started against an empty `/mnt/nas` stays blind for its whole
+   lifetime. `--force-recreate` is required, guarded on the container actually
+   being blind (the task fires At Logon *and* At Startup, so an unconditional
+   recreate would tear the container down on every login).
+
+Tested and discarded: the generator emits four backslashes inside sh
+single-quotes where UNC canonically needs two. drvfs mounts successfully with
+**both** forms, so the mount string was never the defect.
+
+**This was silently blocking the §5 corpus validation**: 463 of the 466 trusted
+`dv_scan` titles live on these shares, including all 160 MEL. Reachability went
+3/466 → 466/466 once the mounts were restored.
+
+Operational note: the Scheduled Task executes the script **from disk**, so a
+checked-out feature branch means the pre-fix script is what actually runs. The
+working tree needs to stay on `main`.
 
 ## Conclusions
 
@@ -373,8 +443,12 @@ reported today.
 7. GPU and Ollama are unrelated.
 8. Local scratch copying is a validated fallback (1800 s timeout → 539 s).
 9. Bounded `--limit` extraction is the cheapest immediate improvement
-   (1800 s timeout → 106 s, no scratch) but is validated on exactly one file
-   and must be checked against the 458-title truth set first.
+   (1800 s timeout → 106 s, no scratch). Corpus validation against the trusted
+   `dv_scan` set is running: 19/19 correct so far across all four classes, zero
+   disagreements. Adoption still requires the full sweep at zero wrong, the two
+   missing edge cohorts, a latency-plateau measurement to pick the production
+   limit, and a short shadow phase before bounded results may update trusted
+   evidence.
 10. Buffered Matroska input is the preferred engineering fix and is now
     source-justified, but remains unproven.
 11. Dual-track Profile 7 remains unproven for both direct MKV and ffmpeg-pipe

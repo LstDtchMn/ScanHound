@@ -169,9 +169,14 @@ authoritative evidence agrees.
 Long-running uncertainty is not evidence of absence. **No time-based decay from
 `unknown` to `absent`.**
 
-This is not hypothetical: two `nas-4k-*` mounts are currently empty inside the
-container (findings §11), so 21 real titles read as unreadable. A decay rule
-would mass-delete correct badges the first time a mount misbehaved.
+This is not hypothetical, and the real case was worse than a decay rule's
+worst assumption. On 2026-07-26 **all nine** NAS shares were found unmounted
+inside the container while the Scheduled Task that mounts them reported
+success (findings §11). Every title on those shares — the large majority of the
+4K library — would have read as unreadable, and a decay rule would have
+mass-deleted their badges. The mount defect is fixed, but the class of failure
+it represents (a whole storage backend silently absent, reported healthy) is
+exactly what `unknown` must absorb without destroying evidence.
 
 Old `unknown` rows instead feed retry candidates, stale-age reporting,
 mount-health diagnostics, coverage alerts, and manual review. Removing labels
