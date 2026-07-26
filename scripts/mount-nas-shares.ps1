@@ -1,4 +1,4 @@
-# Re-establishes the 9 TURTLELANDSRV2 NAS share mounts inside Docker
+﻿# Re-establishes the 9 TURTLELANDSRV2 NAS share mounts inside Docker
 # Desktop's internal WSL2 distro (docker-desktop), so docker-compose.yml's
 # bind mounts under /mnt/nas/... (see the volumes: block) have something real
 # to mount from.
@@ -78,6 +78,35 @@ function Get-ContainerTarget([string]$key) {
     return "/library/plex-source/$key"
 }
 
+# --- timing budget ----------------------------------------------------------
+# Every layer is bounded and the total sits comfortably under the Scheduled
+# Task's ExecutionTimeLimit, so that limit stays a last-resort kill switch and
+# never terminates us mid-recreate or mid-safety-stop.
+#
+#   per readiness probe   15 s   (inside Invoke-Bounded)
+#   readiness gate       240 s
+#   per mount attempt    120 s   x 3 attempts, 15/30 s backoff
+#   post-recreate probes   3 attempts at +5/+10/+20 s
+#   internal deadline    720 s   <-- we exit cleanly before this
+#   scheduler limit      PT15M   <-- hard backstop only
+$ReadinessBudgetSec      = 240
+$MountAttemptTimeoutSec  = 120
+$ProbeTimeoutSec         = 90
+$InternalDeadlineSec     = 720
+$Deadline = [Diagnostics.Stopwatch]::StartNew()
+
+# --- alert state ------------------------------------------------------------
+# Deliberately NOT %TEMP% (cleared, and we may be diagnosing a boot), not the
+# WSL distro, not the container, and above all not a NAS share whose outage is
+# the thing being reported.
+$StateDir = Join-Path $env:ProgramData 'ScanHound'
+
+# Exit codes, kept distinct so alerting can tell the operator responses apart:
+#   1 read-only share(s) unavailable      5 post-recreate critical failure
+#   2 critical share unverified           6 post-recreate read-only failure
+#   3 docker unavailable                  7 could NOT confirm container stopped
+#   4 compose failed                      8 Docker/WSL not ready (usually benign)
+
 # --- single instance -------------------------------------------------------
 # The Scheduled Task is registered At Logon AND At Startup, which can overlap.
 # Two concurrent runs would unmount shares under each other and race on the
@@ -97,12 +126,209 @@ if (-not $haveLock) {
     exit 0
 }
 
-function Fail([string]$message, [int]$code) {
+# --- durable, class-aware failure state -------------------------------------
+# LastTaskResult is not a monitoring surface -- nobody reads it. State is kept
+# per FAILURE CLASS so a standing 'not-ready' can never suppress a later, more
+# severe 'critical-share-unverified'. Flapping is tracked separately, because
+# alerting only on exhaustion would hide a mount that fails once and recovers
+# on attempt two every fifteen minutes.
+function Get-StatePath([string]$class) {
+    if (-not (Test-Path $StateDir)) {
+        New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+    }
+    return (Join-Path $StateDir "mount-state-$class.json")
+}
+
+function Write-FailureState([string]$class, [int]$code, [string]$message) {
+    try {
+        $p = Get-StatePath $class
+        $prev = if (Test-Path $p) { Get-Content $p -Raw | ConvertFrom-Json } else { $null }
+        $now = (Get-Date).ToString('o')
+        $state = [ordered]@{
+            failure_class     = $class
+            first_failure     = if ($prev) { $prev.first_failure } else { $now }
+            latest_failure    = $now
+            last_exit_code    = $code
+            consecutive_fails = if ($prev) { [int]$prev.consecutive_fails + 1 } else { 1 }
+            last_success      = if ($prev) { $prev.last_success } else { $null }
+            message           = $message
+            alerted           = if ($prev) { $prev.alerted } else { $false }
+        }
+        $state | ConvertTo-Json | Set-Content $p -Encoding utf8
+        return $state
+    } catch { return $null }
+}
+
+function Clear-FailureState {
+    # A fully verified healthy run clears every class and reports how long the
+    # outage lasted, so recovery is as visible as failure.
+    try {
+        $now = (Get-Date).ToString('o')
+        Get-ChildItem $StateDir -Filter 'mount-state-*.json' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $s = Get-Content $_.FullName -Raw | ConvertFrom-Json
+                if ($s.first_failure) {
+                    $mins = [math]::Round(((Get-Date) - [datetime]$s.first_failure).TotalMinutes, 1)
+                    Write-Host "RECOVERED from '$($s.failure_class)' after $mins min ($($s.consecutive_fails) failed run(s))."
+                }
+                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+            }
+        $flap = Join-Path $StateDir 'mount-recovered-with-retry.json'
+        if (Test-Path $flap) {
+            $f = Get-Content $flap -Raw | ConvertFrom-Json
+            $recent = @($f.events | Where-Object { [datetime]$_ -gt (Get-Date).AddHours(-24) })
+            if ($recent.Count -ge 3) {
+                Write-Host "FLAPPING: $($recent.Count) runs in 24h needed a retry to succeed."
+            }
+        }
+        $null = $now
+    } catch { }
+}
+
+function Add-RecoveredWithRetry {
+    # Succeeded, but not on the first attempt. Logged rather than alerted; the
+    # 24h count is what escalates.
+    try {
+        $p = Join-Path $StateDir 'mount-recovered-with-retry.json'
+        if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Force -Path $StateDir | Out-Null }
+        $events = if (Test-Path $p) { @((Get-Content $p -Raw | ConvertFrom-Json).events) } else { @() }
+        $events += (Get-Date).ToString('o')
+        $events = @($events | Where-Object { [datetime]$_ -gt (Get-Date).AddDays(-7) })
+        @{ events = $events } | ConvertTo-Json | Set-Content $p -Encoding utf8
+    } catch { }
+}
+
+function Fail([string]$message, [int]$code, [string]$class = 'general') {
     # NOT Write-Error: under $ErrorActionPreference = "Stop" that is a
     # TERMINATING error, so the `exit` below would never run and the intended
     # native exit code would not reach the Scheduled Task's LastTaskResult.
-    [Console]::Error.WriteLine("ERROR: $message")
+    $state = Write-FailureState $class $code $message
+    if ($state) {
+        [Console]::Error.WriteLine(
+            "ERROR [$class] (run $($state.consecutive_fails), since $($state.first_failure)): $message")
+    } else {
+        [Console]::Error.WriteLine("ERROR [$class]: $message")
+    }
     exit $code
+}
+
+# --- bounded child execution ------------------------------------------------
+# Every external command here can hang: wsl.exe against a wedged distro, docker
+# against a wedged daemon, mount against an unreachable NAS. An "overall 4
+# minute budget" is not a budget at all if one invocation never returns, so
+# nothing external is called without its own deadline.
+#
+# Returns @{ Ok; Out; Code; TimedOut }. A timeout is reported, never thrown --
+# callers treat it as a negative result and keep their own budget.
+function Invoke-Bounded {
+    param([string]$File, [string[]]$Args, [int]$TimeoutSec = 15)
+
+    # Resolve through PATH rather than hard-coding 'wsl.exe'/'docker.exe'.
+    # Two reasons: it honours whatever the task's environment actually has, and
+    # it lets the stub harness shadow these with .bat files on PATH -- with a
+    # literal 'wsl.exe' the stubs are silently bypassed and the tests exercise
+    # the REAL binaries (which is exactly what happened the first time).
+    # ProcessStartInfo with UseShellExecute=$false will not run a .bat directly,
+    # so batch shims are invoked through cmd.exe.
+    $resolved = $null
+    try { $resolved = (Get-Command $File -ErrorAction Stop).Source } catch { $resolved = $File }
+
+    # ProcessStartInfo.ArgumentList is .NET Core / PowerShell 6+. This host runs
+    # Windows PowerShell 5.1, where it is NULL -- so arguments must go through
+    # the single Arguments string, quoted by hand. Paths here genuinely contain
+    # spaces ("X:\Docker Apps\ScanHound", %TEMP% under some profiles), so this
+    # is not theoretical.
+    $quote = {
+        param($a)
+        if ($a -match '[\s"]') { '"' + ($a -replace '(\\*)"', '$1$1\"') + '"' } else { $a }
+    }
+
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    if ($resolved -match '\.(bat|cmd)$') {
+        # cmd.exe quoting is its own dialect: given
+        #     /c "C:\has spaces\x.bat" a b
+        # cmd strips the FIRST and LAST quote of the whole tail, mangling the
+        # program path. The documented form wraps the entire command line in an
+        # additional pair:
+        #     /c ""C:\has spaces\x.bat" a b"
+        $inner = @((& $quote $resolved)) + @($Args | ForEach-Object { & $quote $_ })
+        $psi.FileName  = "$env:SystemRoot\System32\cmd.exe"
+        $psi.Arguments = '/c "' + ($inner -join ' ') + '"'
+    } else {
+        $psi.FileName  = $resolved
+        $psi.Arguments = (@($Args | ForEach-Object { & $quote $_ }) -join ' ')
+    }
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow  = $true
+
+    $p = [Diagnostics.Process]::Start($psi)
+    # Read asynchronously: a child that fills a redirected pipe while we block
+    # on WaitForExit deadlocks, which would defeat the timeout entirely.
+    $stdout = $p.StandardOutput.ReadToEndAsync()
+    $stderr = $p.StandardError.ReadToEndAsync()
+
+    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+        # Kill($true) (kill entire tree) is also PowerShell 6+ / .NET Core.
+        # On 5.1, kill the process and sweep its children via CIM -- a hung
+        # `wsl.exe` or `cmd.exe` shim otherwise leaves the real work running.
+        try {
+            Get-CimInstance Win32_Process -Filter "ParentProcessId=$($p.Id)" -ErrorAction SilentlyContinue |
+                ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
+            $p.Kill()
+        } catch { }
+        try { $p.WaitForExit(5000) | Out-Null } catch { }
+        return @{ Ok = $false; Out = ''; Code = -1; TimedOut = $true }
+    }
+    # .Result is available on 5.1; GetAwaiter().GetResult() is fine too, but
+    # keep to the older surface for consistency with the rest of this file.
+    $out = ($stdout.Result + $stderr.Result)
+    return @{ Ok = ($p.ExitCode -eq 0); Out = $out; Code = $p.ExitCode; TimedOut = $false }
+}
+
+# --- readiness gate ---------------------------------------------------------
+# PASSIVE by construction. `wsl -d docker-desktop -e <cmd>` would LAUNCH the
+# distro if it is not running, turning this recovery task into an undocumented
+# Docker Desktop starter -- during boot convergence, a UPS shutdown sequence,
+# a Docker update, or an engine deliberately stopped for maintenance. So we
+# only ever ASK what is already running:
+#
+#   1. docker-desktop appears in `wsl --list --running --quiet`
+#   2. the SERVER answers `docker version --format {{.Server.Version}}`
+#
+# (2) is server-scoped on purpose: a healthy client binary with a dead engine
+# must not pass.
+function Test-DockerReady {
+    # wsl.exe emits UTF-16LE; embedded NULs otherwise defeat the match.
+    # 'wsl', not 'wsl.exe': an exact filename bypasses PATHEXT resolution, so a
+    # .bat shim earlier on PATH would be ignored and the REAL binary run --
+    # which silently defeated the stub harness on the first attempt here.
+    $r = Invoke-Bounded 'wsl' @('--list', '--running', '--quiet') 15
+    if ($r.TimedOut) { return @{ Ready = $false; Why = 'wsl-list-timeout' } }
+    $listed = ($r.Out -replace "`0", '') -split "`r?`n" | ForEach-Object { $_.Trim() }
+    if ($listed -notcontains 'docker-desktop') {
+        return @{ Ready = $false; Why = 'distro-not-running' }
+    }
+    $d = Invoke-Bounded 'docker' @('version', '--format', '{{.Server.Version}}') 15
+    if ($d.TimedOut) { return @{ Ready = $false; Why = 'docker-version-timeout' } }
+    if (-not $d.Ok)  { return @{ Ready = $false; Why = 'docker-server-unreachable' } }
+    return @{ Ready = $true; Why = "server $($d.Out.Trim())" }
+}
+
+# Overall gate: poll until ready or the budget expires. Short-circuits the
+# moment both checks pass, so the common case costs one round of probes.
+function Wait-DockerReady([int]$BudgetSec = 240, [int]$PollSec = 10) {
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
+    $last = $null
+    while ($true) {
+        $s = Test-DockerReady
+        if ($s.Ready) { return $s }
+        $last = $s
+        if ($deadline.Elapsed.TotalSeconds + $PollSec -ge $BudgetSec) { break }
+        Start-Sleep -Seconds $PollSec
+    }
+    return $last
 }
 
 try {
@@ -123,6 +349,7 @@ DATA="$1"
 CRITICAL_KEY="nas-tv-blackbeard"
 fail=0
 critical_fail=0
+deterministic=0
 
 # 0 = mounted and correct, 1 = not a mountpoint, 2 = wrong fs type,
 # 3 = mounted but a DIFFERENT share
@@ -179,8 +406,13 @@ while IFS="$(printf '\t')" read -r key share; do
     if [ $rc -eq 3 ]; then
         # A DIFFERENT share is mounted here. Do not silently remount over it --
         # that hides a configuration error and could unmount something in use.
+        #
+        # DETERMINISTIC, so it gets its own class: the caller must not sleep
+        # through a retry ladder for a condition that will be identical in 30
+        # seconds. `deterministic` outranks a generic failure in the exit code.
         printf '  %-32s FAILED (wrong share mounted at this target)\n' "$key"
         fail=1
+        deterministic=1
         [ "$key" = "$CRITICAL_KEY" ] && critical_fail=1
         continue
     fi
@@ -216,6 +448,10 @@ if [ $critical_fail -ne 0 ]; then
     echo "RESULT: the CRITICAL read-write share failed"
     exit 2
 fi
+if [ $deterministic -ne 0 ]; then
+    echo "RESULT: deterministic failure (wrong share at a target) -- retrying cannot help"
+    exit 3
+fi
 if [ $fail -ne 0 ]; then
     echo "RESULT: one or more read-only shares failed"
     exit 1
@@ -235,9 +471,60 @@ function ConvertTo-WslPath([string]$winPath) {
     return "/mnt/host/$drive$rest"
 }
 
-Write-Host "Mounting NAS shares inside the docker-desktop WSL2 distro..."
-wsl -d docker-desktop -- sh (ConvertTo-WslPath $tempScript) (ConvertTo-WslPath $tempData)
-$mountExit = $LASTEXITCODE
+# --- gate on readiness BEFORE touching a single mount -----------------------
+# The 2026-07-26 outage was exactly this: the task fired 80 s after boot, the
+# WSL2 distro was not up, every mount failed, and with no retry the NAS library
+# and /library/tv stayed offline until a human noticed.
+$ready = Wait-DockerReady -BudgetSec $ReadinessBudgetSec
+if (-not $ready.Ready) {
+    Remove-Item $tempScript, $tempData -Force -ErrorAction SilentlyContinue
+    # DISTINCT from a mount failure: "Docker is not up yet" is usually benign
+    # and self-correcting; "the NAS is unreachable" needs a human. They must
+    # not share an exit code, or the alerting cannot tell them apart.
+    Fail ("Docker/WSL not ready after $ReadinessBudgetSec s ($($ready.Why)). " +
+          "No mount was attempted. This is a readiness failure, not a mount " +
+          "failure; the scheduler will retry.") 8 'not-ready'
+}
+Write-Host "Readiness: docker-desktop running, $($ready.Why)."
+
+# --- mount, retrying only what can plausibly be transient --------------------
+# 3 attempts TOTAL (initial + 2 retries), 15 s then 30 s backoff.
+#
+# Exit 2 (critical share) and 3 (wrong share / identity mismatch) are
+# DETERMINISTIC: a wrong share mounted at a target will still be wrong in 30
+# seconds, so sleeping through the ladder just delays the alert. Only a generic
+# failure (exit 1) or a hung invocation is retried.
+$mountExit = $null
+$attempt = 0
+$backoff = @(15, 30)
+while ($true) {
+    $attempt++
+    Write-Host "Mounting NAS shares inside the docker-desktop WSL2 distro (attempt $attempt/3)..."
+    $m = Invoke-Bounded 'wsl' @(
+        '-d', 'docker-desktop', '--', 'sh',
+        (ConvertTo-WslPath $tempScript), (ConvertTo-WslPath $tempData)
+    ) $MountAttemptTimeoutSec
+    if ($m.Out) { Write-Host $m.Out.TrimEnd() }
+
+    if ($m.TimedOut) {
+        Write-Host "  attempt $attempt timed out after $MountAttemptTimeoutSec s"
+        $mountExit = 1
+    } else {
+        $mountExit = $m.Code
+    }
+
+    if ($mountExit -eq 0) { break }
+    if ($mountExit -eq 2 -or $mountExit -eq 3) {
+        Write-Host "  deterministic failure (exit $mountExit) -- not retrying"
+        break
+    }
+    if ($attempt -ge 3) { break }
+    if ($Deadline.Elapsed.TotalSeconds -gt ($InternalDeadlineSec - 120)) {
+        Write-Host "  internal deadline near -- stopping retries"
+        break
+    }
+    Start-Sleep -Seconds $backoff[$attempt - 1]
+}
 
 Remove-Item $tempScript, $tempData -Force -ErrorAction SilentlyContinue
 
@@ -410,11 +697,11 @@ if ($criticalHostFailure) {
     if ($safe) {
         Fail ("The critical share ($CriticalKey) failed host verification, but the " +
               "running container's $CriticalTarget is independently identity-verified " +
-              "and writable. Left running; NOT recreated.") 2
+              "and writable. Left running; NOT recreated.") 2 'critical-share-unverified'
     }
     if ($probe.Reason -eq "not-running") {
         Fail ("The critical share ($CriticalKey) is not mounted and verified. " +
-              "Container is not running and was NOT started.") 2
+              "Container is not running and was NOT started.") 2 'critical-share-unverified'
     }
     Write-Host "Critical share unverified and the container is not provably safe -- stopping it."
     $stopState = Stop-ScanhoundVerified
@@ -422,11 +709,11 @@ if ($criticalHostFailure) {
     if ($stopState -eq "stopped" -or $stopState -eq "stopped-despite-error") {
         Fail ("The critical share ($CriticalKey -> $CriticalTarget) is not mounted and " +
               "verified. The container has been STOPPED (verified not running) to " +
-              "prevent TV writes into a non-NAS directory.") 2
+              "prevent TV writes into a non-NAS directory.") 2 'critical-share-unverified'
     }
     Fail ("The critical share ($CriticalKey -> $CriticalTarget) is not mounted and " +
           "verified, AND the container could not be confirmed stopped ($stopState). " +
-          "It may still be writing into a non-NAS directory -- intervene manually.") 7
+          "It may still be writing into a non-NAS directory -- intervene manually.") 7 'stop-unconfirmed'
 }
 
 $needsRecreate = $false
@@ -434,7 +721,7 @@ switch ($probe.Reason) {
     "not-running"        { Write-Host "scanhound is not running -- starting it."; $needsRecreate = $true }
     "timeout"            { Write-Host "Probe timed out (wedged container/daemon) -- recreating."; $needsRecreate = $true }
     "copy-failed"        { Write-Host "Could not copy the probe in -- recreating."; $needsRecreate = $true }
-    "docker-unavailable" { Fail "Docker is not available; cannot verify or recreate." 3 }
+    "docker-unavailable" { Fail "Docker is not available; cannot verify or recreate." 3 'docker-unavailable' }
     "probed"             {
         if ($probe.Code -ne 0) {
             Write-Host "Container cannot see one or more shares -- recreate required."
@@ -456,7 +743,7 @@ if ($needsRecreate) {
         Write-Host "Recreating the scanhound container to pick up live mounts..."
         docker compose up -d --force-recreate
         if ($LASTEXITCODE -ne 0) {
-            Fail "docker compose up -d --force-recreate failed (exit $LASTEXITCODE)." 4
+            Fail "docker compose up -d --force-recreate failed (exit $LASTEXITCODE)." 4 'compose-failed'
         }
     } finally {
         Pop-Location
@@ -465,8 +752,19 @@ if ($needsRecreate) {
     # THE completion gate. Compose exiting 0 proves a container started, not
     # that its nine bind mounts resolve to the intended shares or that the
     # read-write destination is writable.
-    Start-Sleep -Seconds 5
-    $post = Invoke-ContainerProbe
+    #
+    # Verification is retried at +5/+10/+20 s because a container can still be
+    # settling after Compose returns. These retries must NEVER trigger another
+    # recreate -- repeating force-recreate in one run adds churn, not recovery,
+    # and the next scheduled invocation re-enters the whole state machine
+    # anyway (seeing a healthy container if the first recreate actually worked).
+    $post = $null
+    foreach ($wait in @(5, 10, 20)) {
+        Start-Sleep -Seconds $wait
+        $post = Invoke-ContainerProbe
+        if ($post.Reason -eq 'probed' -and $post.Code -eq 0) { break }
+        Write-Host "Post-recreate verification not yet good ($($post.Reason)/$($post.Code)); retrying."
+    }
     Write-Host "Post-recreate verification: $($post.Reason)"
     if ($post.Output) { Write-Host $post.Output.TrimEnd() }
 
@@ -480,13 +778,13 @@ if ($needsRecreate) {
             if ($stopState -eq "stopped" -or $stopState -eq "stopped-despite-error") {
                 Fail ("Post-recreate verification failed for $CriticalTarget. The container " +
                       "has been STOPPED (verified not running) to prevent writes into a " +
-                      "non-NAS directory.") 5
+                      "non-NAS directory.") 5 'critical-share-unverified'
             }
             Fail ("Post-recreate verification failed for $CriticalTarget AND the container " +
                   "could not be confirmed stopped ($stopState). It may still be writing " +
-                  "into a non-NAS directory -- intervene manually.") 7
+                  "into a non-NAS directory -- intervene manually.") 7 'stop-unconfirmed'
         }
-        Fail "Post-recreate verification failed for one or more read-only sources." 6
+        Fail "Post-recreate verification failed for one or more read-only sources." 6 'readonly-shares'
     }
     Write-Host "Post-recreate verification passed: all nine targets identity-verified."
 }
@@ -494,8 +792,15 @@ if ($needsRecreate) {
 Remove-Item $probeScriptPath, $probeDataPath -Force -ErrorAction SilentlyContinue
 
 if ($mountExit -ne 0) {
-    Fail "One or more read-only shares are still unavailable (see the log above)." 1
+    Fail "One or more read-only shares are still unavailable (see the log above)." 1 'readonly-shares'
 }
+
+# Fully verified healthy run: clear every failure class and report how long any
+# outage lasted, so recovery is as visible as failure. Flapping (succeeded, but
+# only after a retry) is recorded separately -- it would otherwise be invisible
+# to exhaustion-only alerting.
+if ($attempt -gt 1) { Add-RecoveredWithRetry }
+Clear-FailureState
 
 Write-Host "Done."
 exit 0

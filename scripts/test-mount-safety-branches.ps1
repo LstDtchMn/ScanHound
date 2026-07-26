@@ -11,11 +11,23 @@ $stub   = Join-Path $PSScriptRoot "test-stub"
 $script = Join-Path $PSScriptRoot "mount-nas-shares.ps1"
 
 function Run-Case {
-    param($Name, $WslRc, $Ps, $ExecRc, $StopRc, $PsAfter, $ExpectExit, $ExpectText)
+    param($Name, $WslRc, $Ps, $ExecRc, $StopRc, $PsAfter, $ExpectExit, $ExpectText,
+          $WslRunning = 'docker-desktop', $DockerServerRc = 0)
 
     Remove-Item "$env:TEMP\sh_stub_stopped.flag" -Force -ErrorAction SilentlyContinue
-    # fake wsl: returns the host-stage exit code we want to simulate
-    Set-Content "$stub\wsl.bat" "@echo off`r`nexit /b $WslRc" -Encoding ascii
+    # Fake wsl: must answer BOTH the passive readiness probe
+    # (`--list --running --quiet`) and the mount invocation. Writing only an
+    # unconditional `exit /b` made every readiness check look like a failure.
+    $wsl = @(
+        '@echo off'
+        'if "%1"=="--list" ('
+        "    if not `"$WslRunning`"==`"`" echo $WslRunning"
+        '    exit /b 0'
+        ')'
+        "exit /b $WslRc"
+    ) -join "`r`n"
+    Set-Content "$stub\wsl.bat" $wsl -Encoding ascii
+    $env:SH_STUB_DOCKER_SERVER_RC = $DockerServerRc
 
     $env:SH_STUB_PS       = $Ps
     $env:SH_STUB_EXEC_RC  = $ExecRc
@@ -69,6 +81,27 @@ Run-Case -Name "9b. stop returns 0 but container still up -> stop-failed, exit 7
 Run-Case -Name "6c. critical host failure + container not running -> no start" `
          -WslRc 2 -Ps "" -ExecRc 0 -StopRc 0 -PsAfter "" `
          -ExpectExit 2 -ExpectText "was NOT started"
+
+Write-Output "=== readiness gate (the 2026-07-26 boot failure) ===`n"
+
+# The distro is not running. The probe must report NOT READY and must not
+# attempt any mount -- and must NOT launch the distro to find out.
+Run-Case -Name "R1. distro not running -> not-ready (exit 8), no mount attempted" `
+         -WslRc 0 -Ps "scanhound" -ExecRc 0 -StopRc 0 -PsAfter "" `
+         -WslRunning "" `
+         -ExpectExit 8 -ExpectText "No mount was attempted"
+
+# Distro up but the ENGINE is dead: a healthy client must not pass the gate.
+Run-Case -Name "R2. distro up but docker server dead -> not-ready, not mount-failed" `
+         -WslRc 0 -Ps "scanhound" -ExecRc 0 -StopRc 0 -PsAfter "" `
+         -DockerServerRc 1 `
+         -ExpectExit 8 -ExpectText "docker-server-unreachable"
+
+# A deterministic wrong-share condition must fail fast, not sleep through the
+# 15s/30s backoff ladder.
+Run-Case -Name "R3. wrong share (deterministic) -> not retried" `
+         -WslRc 3 -Ps "scanhound" -ExecRc 0 -StopRc 0 -PsAfter "" `
+         -ExpectExit 1 -ExpectText "deterministic failure (exit 3) -- not retrying"
 
 Remove-Item "$stub\wsl.bat" -Force -ErrorAction SilentlyContinue
 Remove-Item "$env:TEMP\sh_stub_stopped.flag" -Force -ErrorAction SilentlyContinue

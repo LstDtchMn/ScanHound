@@ -6,6 +6,14 @@ REM   SH_STUB_EXEC_RC  = exit code for `docker exec` (the container probe)
 REM   SH_STUB_STOP_RC  = exit code for `docker stop`
 REM   SH_STUB_PS_AFTER = names printed by `docker ps` AFTER a stop was issued
 REM                      (lets us simulate "stop returned 0 but it's still up")
+REM   SH_STUB_DOCKER_SERVER_RC = exit code for `docker version` -- the
+REM                      server-scoped readiness probe. Non-zero simulates a
+REM                      live client with a dead engine, which must read as
+REM                      NOT READY rather than ready.
+if "%1"=="version" (
+    if "%SH_STUB_DOCKER_SERVER_RC%"=="0" echo 99.9.9-stub
+    exit /b %SH_STUB_DOCKER_SERVER_RC%
+)
 if "%1"=="ps" (
     if exist "%TEMP%\sh_stub_stopped.flag" (
         if not "%SH_STUB_PS_AFTER%"=="" echo %SH_STUB_PS_AFTER%
