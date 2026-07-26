@@ -29,7 +29,9 @@ from backend.app_service import normalize_title
 from backend.sources.ddlbase import decode_ddlbase_link
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 from backend.download_outcome import (
+    CF_MITIGATED_CHALLENGE,
     CHALLENGE_IFRAME_MARKERS,
+    cf_mitigated_from_perf_log,
     challenge_iframe_srcs,
     diagnostic_from_traffic_denial,
     strong_challenge_markers,
@@ -366,6 +368,8 @@ class DownloadService:
 
         # WebDriver
         self.cached_driver = None
+        # Latest navigation's Cloudflare cf-mitigated value (None = no signal).
+        self._last_cf_mitigated: Optional[str] = None
         self._browser_status: Dict[str, Any] = safe_status_without_driver(
             self.config,
             chrome_bin=os.environ.get("CHROME_BIN"),
@@ -1555,14 +1559,24 @@ class DownloadService:
                 signals.append(f"requested_host_present:{str(keyword_present).lower()}")
                 self._log(f"[HDEncode][diag] keyword '{keyword}' present in HTML: {keyword_present}")
 
-            if matched_network:
+            # cf-mitigated is authoritative: Cloudflare sets it on every
+            # Challenge Page type, so it outranks the page heuristics and is
+            # never overridden by them (a custom/localized challenge may carry
+            # no recognised phrase at all). Absence is only "no signal".
+            header_challenge = (
+                getattr(self, "_last_cf_mitigated", None) == CF_MITIGATED_CHALLENGE
+            )
+            if header_challenge:
+                signals.append("cf-mitigated:challenge")
+
+            if matched_network and not header_challenge:
                 return ScrapeDiagnostic(
                     ScrapeCode.BROWSER_NETWORK_ERROR,
                     retryable=True,
                     affects_source_health=False,
                     signals=tuple(signals),
                 )
-            if captcha_frames or challenge_markers:
+            if header_challenge or captcha_frames or challenge_markers:
                 decision = None
                 if source_kind == "hdencode":
                     decision = get_hdencode_coordinator().observe_challenge()
@@ -1739,6 +1753,56 @@ class DownloadService:
             state["ambiguous"] = True
         return None
 
+    def _capture_cf_mitigated(self, driver) -> Optional[str]:
+        """Drain the navigation's performance log and record its cf-mitigated value.
+
+        Called once per navigation. Draining also bounds the log: the browser
+        session is persistent, so entries would otherwise accumulate across
+        every grab. Returns ``None`` when the log is unavailable (adapter
+        without performance logging, older driver) — that is "no signal", not
+        "no challenge", so page evidence still decides.
+        """
+        value = None
+        try:
+            entries = driver.get_log("performance")
+        except Exception:
+            self._last_cf_mitigated = None
+            return None
+        try:
+            page_url = driver.current_url or ""
+        except Exception:
+            page_url = ""
+        observation: dict = {}
+        try:
+            value = cf_mitigated_from_perf_log(
+                entries, page_url=page_url, observation=observation
+            )
+        except Exception:
+            value = None
+        self._last_cf_mitigated = value
+        if value:
+            self._log(f"[HDEncode] cf-mitigated header: {value!r}", "warning")
+        elif observation.get("unmatched_challenges"):
+            # A challenge header was seen, but on a document that was NOT the
+            # displayed page, so it cannot be attributed to it (that was the
+            # iframe blocker). Worth surfacing — it is the one scenario that
+            # would otherwise leave the signal permanently inert — but it is
+            # deliberately NOT treated as a challenge.
+            #
+            # `matched` comes from the parser rather than being re-derived
+            # here: the parser normalizes URLs, and testing a raw page_url
+            # (which carries `#unlocked` after the reveal form navigates)
+            # against those would report "nothing matched" on ordinary grabs.
+            self._log(
+                "[HDEncode] cf-mitigated: challenge header on "
+                f"{observation['unmatched_challenges']} non-displayed "
+                f"document(s); displayed page "
+                f"{'matched' if observation.get('matched') else 'not seen'} "
+                f"({len(observation.get('documents') or ())} document(s) seen)",
+                "warning",
+            )
+        return value
+
     def _wait_past_cloudflare(
         self,
         driver,
@@ -1747,6 +1811,16 @@ class DownloadService:
         source_kind: str = "other",
     ) -> Optional[ScrapeDiagnostic]:
         """Passively wait for a transient browser check without solving it."""
+        # Read the navigation's response headers once, before polling the page.
+        # cf-mitigated is authoritative and language-independent, so a custom or
+        # localized Challenge Page is recognised even with no English phrase and
+        # no iframe rendered yet.
+        if self._capture_cf_mitigated(driver) == CF_MITIGATED_CHALLENGE:
+            return self._log_page_diagnostics(
+                driver,
+                stage="access_control",
+                source_kind=source_kind,
+            )
         deadline = time.monotonic() + max(0, int(timeout))
         while True:
             try:
@@ -1923,6 +1997,26 @@ class DownloadService:
                             "warning",
                         )
                         driver.execute_script("arguments[0].click();", access_btn)
+
+                    # The click submits the unlock form, which is a NEW top-level
+                    # navigation — and Cloudflare can challenge that POST even
+                    # when the initial page load was clean. Without re-running the
+                    # capture here, `_last_cf_mitigated` stays at whatever the
+                    # FIRST navigation set (usually None) and the diagnostics
+                    # below report "no links found" for what is actually a
+                    # source-wide interstitial. This is the normal operating path,
+                    # not an edge case: submitting the form is the whole point.
+                    #
+                    # `_wait_past_cloudflare` is reused rather than a bare
+                    # `_capture_cf_mitigated` so the page-evidence fallback still
+                    # applies to the post-click page. It returns immediately when
+                    # the page carries no challenge markers.
+                    post_click_diagnostic = self._wait_past_cloudflare(
+                        driver,
+                        source_kind=source_kind,
+                    )
+                    if post_click_diagnostic is not None:
+                        return ScrapedLinks(diagnostic=post_click_diagnostic)
 
                     self._log(f"[HDEncode] Clicked — waiting up to 8s for '{keyword}' links to appear")
                     try:
