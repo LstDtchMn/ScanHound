@@ -71,6 +71,10 @@ class ScanStage(str, Enum):
     LISTING = "listing"
     DETAIL_FETCH = "detail_fetch"
     DETAIL_PARSE = "detail_parse"
+    #: Between a successful detail result and item construction. A Stop can
+    #: strand a post here: the worker finished, but the main loop broke before
+    #: consuming its result.
+    DETAIL_TO_ITEM_HANDOFF = "detail_to_item_handoff"
     MEDIA_ITEM_CONSTRUCTION = "media_item_construction"
 
 
@@ -93,6 +97,15 @@ class DiscardCode(str, Enum):
     DETAIL_CANCELLED_BEFORE_START = "detail_cancelled_before_start"
     DETAIL_CANCELLED_AFTER_START = "detail_cancelled_after_start"
     MEDIA_ITEM_EXCEPTION = "media_item_exception"
+    #: The detail succeeded; the scan stopped before its result was consumed.
+    #: NOT a cancellation - the work completed - and NOT a failure.
+    MEDIA_ITEM_ABANDONED_ON_STOP = "media_item_abandoned_on_stop"
+
+    #: A post whose lifecycle could not be determined at reconciliation. This is
+    #: a BOOKKEEPING DEFECT, never evidence that the post was cancelled.
+    #: Labelling these as cancellation would balance the books by inventing a
+    #: cause - the same error as a green test asserting the wrong invariant.
+    TERMINAL_OUTCOME_MISSING = "terminal_outcome_missing"
 
     # -- declared, currently unreachable (see module docstring) -----------
     MISSING_REQUIRED_TITLE = "missing_required_title"
@@ -118,6 +131,7 @@ STAGE_FOR_CODE: Dict[DiscardCode, ScanStage] = {
     DiscardCode.DETAIL_CANCELLED_BEFORE_START: ScanStage.DETAIL_FETCH,
     DiscardCode.DETAIL_CANCELLED_AFTER_START: ScanStage.DETAIL_FETCH,
     DiscardCode.MEDIA_ITEM_EXCEPTION: ScanStage.MEDIA_ITEM_CONSTRUCTION,
+    DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP: ScanStage.DETAIL_TO_ITEM_HANDOFF,
     DiscardCode.MISSING_REQUIRED_TITLE: ScanStage.MEDIA_ITEM_CONSTRUCTION,
     DiscardCode.MISSING_REQUIRED_URL: ScanStage.MEDIA_ITEM_CONSTRUCTION,
     DiscardCode.INVALID_METADATA: ScanStage.MEDIA_ITEM_CONSTRUCTION,
@@ -151,6 +165,8 @@ _MESSAGES: Dict[DiscardCode, str] = {
     DiscardCode.DETAIL_CANCELLED_BEFORE_START: "The scan stopped before this release was looked at.",
     DiscardCode.DETAIL_CANCELLED_AFTER_START: "The scan stopped while this release was being processed.",
     DiscardCode.MEDIA_ITEM_EXCEPTION: "The page was read but the release could not be assembled.",
+    DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP: "The page was read successfully, but the scan stopped before the release was added.",
+    DiscardCode.TERMINAL_OUTCOME_MISSING: "The scan could not determine what happened to this release; this is an instrumentation gap, not a known outcome.",
     DiscardCode.MISSING_REQUIRED_TITLE: "The release had no usable title.",
     DiscardCode.MISSING_REQUIRED_URL: "The release had no usable URL.",
     DiscardCode.INVALID_METADATA: "The release metadata failed validation.",
@@ -229,6 +245,17 @@ class ScanStageCounters:
 
     media_item_created: int = 0
     media_item_construction_failed: int = 0
+    #: Detail succeeded but the scan stopped before the result was consumed.
+    #: A real lifecycle state, not a failure and not a cancellation.
+    media_item_abandoned_on_stop: int = 0
+
+    #: Instrumentation gaps, split by how far the post actually got. Kept as
+    #: their own terms so the equations stay usable for detecting OTHER losses,
+    #: while the defect stays named rather than absorbed into a
+    #: plausible-looking bucket.
+    scheduled_terminal_missing: int = 0
+    detail_terminal_missing: int = 0
+    media_item_terminal_missing: int = 0
 
     reasons: Dict[str, int] = field(default_factory=dict)
     stages: Dict[str, int] = field(default_factory=dict)
@@ -280,22 +307,39 @@ class ScanStageCounters:
         exception_type: Optional[str] = None,
         parser_version: Optional[str] = None,
         content_fingerprint: Optional[str] = None,
+        lifecycle_started: Optional[bool] = None,
     ) -> None:
         """Record one discarded post at a FACTUAL stage.
 
         ``stage`` is supplied by the caller because only the event site knows
         where it happened; the code-to-stage map is a fallback for callers that
-        genuinely have no better information.
+        genuinely have no better information. ``lifecycle_started`` lets an
+        instrumentation gap be filed against the equation it actually breaks.
         """
         actual = stage or default_stage_for(code)
+        post_data = actual in (
+            ScanStage.DETAIL_TO_ITEM_HANDOFF,
+            ScanStage.MEDIA_ITEM_CONSTRUCTION,
+        )
         with self._lock:
-            if code in _CANCELLED_BEFORE_START:
+            if code is DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP:
+                self.media_item_abandoned_on_stop += 1
+            elif code is DiscardCode.TERMINAL_OUTCOME_MISSING:
+                # File the gap against the equation it actually breaks, so a
+                # post that never ran does not masquerade as started work.
+                if post_data:
+                    self.media_item_terminal_missing += 1
+                elif lifecycle_started is False:
+                    self.scheduled_terminal_missing += 1
+                else:
+                    self.detail_terminal_missing += 1
+            elif code in _CANCELLED_BEFORE_START:
                 self.detail_cancelled_before_start += 1
             elif code in _CANCELLED_AFTER_START:
                 self.detail_cancelled_after_start += 1
             elif code in _RAISED:
                 self.detail_raised_exception += 1
-            elif actual is ScanStage.MEDIA_ITEM_CONSTRUCTION:
+            elif post_data:
                 self.media_item_construction_failed += 1
             else:
                 self.detail_returned_none += 1
@@ -367,10 +411,14 @@ class ScanStageCounters:
         Returns rather than raises: a bookkeeping bug must never break a scan.
         """
         errors: List[str] = []
-        scheduled = self.detail_started + self.detail_cancelled_before_start
+        scheduled = (
+            self.detail_started
+            + self.detail_cancelled_before_start
+            + self.scheduled_terminal_missing
+        )
         if self.detail_scheduled != scheduled:
             errors.append(
-                "detail_scheduled=%d != started+cancelled_before_start=%d"
+                "detail_scheduled=%d != started+cancelled_before_start+terminal_missing=%d"
                 % (self.detail_scheduled, scheduled)
             )
         started = (
@@ -378,16 +426,23 @@ class ScanStageCounters:
             + self.detail_returned_none
             + self.detail_raised_exception
             + self.detail_cancelled_after_start
+            + self.detail_terminal_missing
         )
         if self.detail_started != started:
             errors.append(
-                "detail_started=%d != data+none+exception+cancelled_after_start=%d"
-                % (self.detail_started, started)
+                "detail_started=%d != data+none+exception+cancelled_after_start"
+                "+terminal_missing=%d" % (self.detail_started, started)
             )
-        constructed = self.media_item_created + self.media_item_construction_failed
+        constructed = (
+            self.media_item_created
+            + self.media_item_construction_failed
+            + self.media_item_abandoned_on_stop
+            + self.media_item_terminal_missing
+        )
         if self.detail_returned_data != constructed:
             errors.append(
-                "detail_returned_data=%d != created+construction_failed=%d"
+                "detail_returned_data=%d != created+construction_failed"
+                "+abandoned_on_stop+terminal_missing=%d"
                 % (self.detail_returned_data, constructed)
             )
         discards = (
@@ -395,7 +450,11 @@ class ScanStageCounters:
             + self.detail_raised_exception
             + self.detail_cancelled_before_start
             + self.detail_cancelled_after_start
+            + self.scheduled_terminal_missing
+            + self.detail_terminal_missing
             + self.media_item_construction_failed
+            + self.media_item_abandoned_on_stop
+            + self.media_item_terminal_missing
         )
         tallied = sum(self.reasons.values())
         if tallied != discards:
@@ -427,6 +486,10 @@ class ScanStageCounters:
             "detail_raised_exception": self.detail_raised_exception,
             "media_item_created": self.media_item_created,
             "media_item_construction_failed": self.media_item_construction_failed,
+            "media_item_abandoned_on_stop": self.media_item_abandoned_on_stop,
+            "scheduled_terminal_missing": self.scheduled_terminal_missing,
+            "detail_terminal_missing": self.detail_terminal_missing,
+            "media_item_terminal_missing": self.media_item_terminal_missing,
             "detail_parse_success_ratio": round(self.detail_parse_success_ratio, 4),
             "media_item_construction_success_ratio": round(
                 self.media_item_construction_success_ratio, 4
@@ -466,7 +529,10 @@ class PostOutcome:
     Every method is no-throw: a recorder fault must not reach scan control flow.
     """
 
-    __slots__ = ("_counters", "_url", "_source", "_category", "_booked", "_lock")
+    __slots__ = (
+        "_counters", "_url", "_source", "_category",
+        "_started", "_data_returned", "_booked", "_terminal_code", "_lock",
+    )
 
     def __init__(
         self,
@@ -480,29 +546,64 @@ class PostOutcome:
         self._url = url
         self._source = source
         self._category = category
+        self._started = False
+        self._data_returned = False
         self._booked = False
+        self._terminal_code: Optional[str] = None
         self._lock = threading.Lock()
 
     @property
-    def booked(self) -> bool:
-        """True once a terminal event has been recorded for this post."""
-        return self._booked
+    def url(self) -> str:
+        return self._url
 
-    def _claim(self) -> bool:
+    @property
+    def booked(self) -> bool:
+        """Whether a terminal event exists. Convenience for the ordinary path.
+
+        Reconciliation must use :meth:`snapshot` instead - it needs several
+        lifecycle fields read together, and assembling those from separate
+        unlocked reads is not a synchronization contract.
+        """
+        with self._lock:
+            return self._booked
+
+    def snapshot(self) -> "OutcomeSnapshot":
+        """An atomic lifecycle view, taken under the ticket lock.
+
+        Post-drain reconciliation reads this while workers may still be
+        finishing, so it must not be assembled from separate unlocked reads.
+        """
+        with self._lock:
+            return OutcomeSnapshot(
+                url=self._url,
+                started=self._started,
+                data_returned=self._data_returned,
+                terminal_booked=self._booked,
+                terminal_code=self._terminal_code,
+            )
+
+    def _claim(self, code: Optional[DiscardCode]) -> bool:
         with self._lock:
             if self._booked:
                 return False
             self._booked = True
+            self._terminal_code = code.value if code is not None else "item_created"
             return True
 
     def note_started(self) -> None:
+        """Idempotent: a retry inside the worker must not re-count the post."""
         try:
+            with self._lock:
+                if self._started:
+                    return
+                self._started = True
             if self._counters is not None:
                 self._counters.note_started()
         except Exception:  # pragma: no cover - recorder must never escape
             pass
 
     def note_http_request(self, count: int = 1) -> None:
+        """Not idempotent by design: each retry is a real extra request."""
         try:
             if self._counters is not None:
                 self._counters.note_http_request(count)
@@ -510,8 +611,13 @@ class PostOutcome:
             pass
 
     def data_returned(self) -> None:
-        """Detail data came back. Not terminal: construction may still fail."""
+        """Detail data came back. Idempotent, and NOT terminal - construction,
+        abandonment on Stop, or a gap may still follow."""
         try:
+            with self._lock:
+                if self._data_returned:
+                    return
+                self._data_returned = True
             if self._counters is not None:
                 self._counters.note_detail_data()
         except Exception:  # pragma: no cover
@@ -519,7 +625,7 @@ class PostOutcome:
 
     def item_created(self) -> None:
         try:
-            if self._claim() and self._counters is not None:
+            if self._claim(None) and self._counters is not None:
                 self._counters.note_item_created()
         except Exception:  # pragma: no cover
             pass
@@ -532,10 +638,11 @@ class PostOutcome:
         exception_type: Optional[str] = None,
         parser_version: Optional[str] = None,
         content_fingerprint: Optional[str] = None,
+        lifecycle_started: Optional[bool] = None,
     ) -> bool:
         """Book the terminal outcome. Returns False if one was already booked."""
         try:
-            if not self._claim():
+            if not self._claim(code):
                 return False
             if self._counters is not None:
                 self._counters.note_discard(
@@ -547,7 +654,67 @@ class PostOutcome:
                     exception_type=exception_type,
                     parser_version=parser_version,
                     content_fingerprint=content_fingerprint,
+                    lifecycle_started=lifecycle_started,
                 )
             return True
         except Exception:  # pragma: no cover
             return False
+
+    # -- post-drain reconciliation ---------------------------------------
+
+    def reconcile(
+        self,
+        *,
+        was_cancelled: bool = False,
+        completed_with_data: bool = False,
+        exception_type: Optional[str] = None,
+    ) -> Optional[DiscardCode]:
+        """Close a ticket after the executor has drained. Returns what was
+        booked, or None if the ticket already had a terminal event.
+
+        Every branch here names a REAL lifecycle state. Nothing is labelled
+        cancellation to make the books balance - an undetermined ticket becomes
+        TERMINAL_OUTCOME_MISSING, which is honest about being a defect.
+        """
+        state = self.snapshot()
+        if state.terminal_booked:
+            return None
+
+        if was_cancelled:
+            # future.cancel() returned True: it never ran.
+            code, stage = DiscardCode.DETAIL_CANCELLED_BEFORE_START, ScanStage.DETAIL_FETCH
+        elif exception_type is not None:
+            # Completed exceptionally with nothing recorded by the worker.
+            code, stage = DiscardCode.UNKNOWN, ScanStage.DETAIL_PARSE
+        elif state.data_returned or completed_with_data:
+            # The detail SUCCEEDED; the scan stopped before its result was used.
+            # Not a failure, not a cancellation.
+            code, stage = (
+                DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP,
+                ScanStage.DETAIL_TO_ITEM_HANDOFF,
+            )
+        elif state.started:
+            # Ran, returned falsy, booked nothing: an uninstrumented scraper.
+            code, stage = DiscardCode.DETAIL_EMPTY, ScanStage.DETAIL_PARSE
+        else:
+            # Lifecycle genuinely unknown. Name the gap; do not invent a cause.
+            code, stage = DiscardCode.TERMINAL_OUTCOME_MISSING, ScanStage.DETAIL_FETCH
+
+        booked = self.discard(
+            code,
+            stage=stage,
+            exception_type=exception_type,
+            lifecycle_started=state.started,
+        )
+        return code if booked else None
+
+
+@dataclass(frozen=True)
+class OutcomeSnapshot:
+    """Immutable lifecycle view of a PostOutcome, taken under its lock."""
+
+    url: str
+    started: bool
+    data_returned: bool
+    terminal_booked: bool
+    terminal_code: Optional[str]

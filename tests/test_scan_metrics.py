@@ -259,8 +259,12 @@ class TestTaxonomy:
             assert message_for(code)
 
     def test_known_codes_have_an_expected_stage(self):
+        # UNKNOWN and TERMINAL_OUTCOME_MISSING are deliberately absent: neither
+        # has a natural stage, and defaulting one would hide where it happened.
+        stageless = {DiscardCode.UNKNOWN, DiscardCode.TERMINAL_OUTCOME_MISSING}
         for code in DiscardCode:
-            if code is DiscardCode.UNKNOWN:
+            if code in stageless:
+                assert code not in STAGE_FOR_CODE
                 continue
             assert isinstance(STAGE_FOR_CODE[code], ScanStage)
 
@@ -418,4 +422,199 @@ class TestReporting:
         c = ScanStageCounters()
         assert c.end_to_end_item_yield == 1.0
         assert c.detail_parse_success_ratio == 1.0
+        assert c.conservation_errors() == []
+
+
+class TestAbandonedOnStop:
+    """A worker can finish successfully and still have its result unused."""
+
+    def test_successful_detail_stranded_by_stop_has_its_own_state(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/stranded")
+        t.note_started()
+        t.data_returned()
+        # Stop breaks the main loop before the result is consumed
+        assert t.reconcile() is DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP
+
+        assert c.media_item_abandoned_on_stop == 1
+        assert c.media_item_created == 0
+        assert c.media_item_construction_failed == 0
+        # it is NOT a cancellation: the work completed
+        assert c.detail_cancelled_after_start == 0
+        assert c.conservation_errors() == []
+
+    def test_abandoned_result_does_not_create_an_item(self):
+        """Behaviour preservation: metrics must not manufacture a release."""
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/x")
+        t.note_started()
+        t.data_returned()
+        t.reconcile()
+        assert c.media_item_created == 0
+
+
+class TestPostDrainReconciliation:
+    def test_cancelled_future_books_before_start_only(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/c")
+        assert t.reconcile(was_cancelled=True) is DiscardCode.DETAIL_CANCELLED_BEFORE_START
+
+        assert c.detail_cancelled_before_start == 1
+        assert c.detail_started == 0
+        assert c.detail_http_requests == 0
+        assert c.conservation_errors() == []
+
+    def test_already_booked_ticket_is_left_alone(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/b")
+        t.note_started()
+        t.discard(DiscardCode.DETAIL_NO_FILENAME, stage=ScanStage.DETAIL_PARSE)
+
+        assert t.reconcile() is None
+        assert c.reasons == {"detail_no_filename": 1}
+        assert c.conservation_errors() == []
+
+    def test_uninstrumented_falsy_result_gets_generic_fallback(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/f")
+        t.note_started()
+        assert t.reconcile() is DiscardCode.DETAIL_EMPTY
+        assert c.reasons == {"detail_empty": 1}
+        assert c.conservation_errors() == []
+
+    def test_unexpected_worker_exception_books_bounded_unknown(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/e")
+        t.note_started()
+        assert t.reconcile(exception_type="ValueError") is DiscardCode.UNKNOWN
+
+        assert c.reasons == {"unknown": 1}
+        assert c.samples[0].exception_type == "ValueError"
+        assert c.conservation_errors() == []
+
+    def test_undetermined_ticket_is_never_labelled_cancellation(self):
+        """Balancing the books by inventing a cause is the error to avoid."""
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/?")
+        # never started, never cancelled: lifecycle genuinely unknown
+        assert t.reconcile() is DiscardCode.TERMINAL_OUTCOME_MISSING
+
+        assert c.detail_cancelled_before_start == 0
+        assert c.detail_cancelled_after_start == 0
+        assert c.reasons == {"terminal_outcome_missing": 1}
+        # filed against the equation it actually breaks: never started
+        assert c.scheduled_terminal_missing == 1
+        assert c.detail_started == 0
+        assert c.conservation_errors() == []
+
+    def test_mixed_stop_cohort_balances(self):
+        """10 scheduled: 1 released, 1 stranded, 3 ran and failed, 5 never ran."""
+        c = ScanStageCounters()
+        c.note_scheduled(10)
+
+        done = PostOutcome(c, url="https://e.test/1")
+        done.note_started()
+        done.data_returned()
+        done.item_created()
+
+        stranded = PostOutcome(c, url="https://e.test/2")
+        stranded.note_started()
+        stranded.data_returned()
+
+        failed = []
+        for i in range(3):
+            t = PostOutcome(c, url="https://e.test/f%d" % i)
+            t.note_started()
+            t.discard(DiscardCode.DETAIL_NO_FILENAME, stage=ScanStage.DETAIL_PARSE)
+            failed.append(t)
+
+        never = [PostOutcome(c, url="https://e.test/n%d" % i) for i in range(5)]
+
+        stranded.reconcile()
+        for t in never:
+            t.reconcile(was_cancelled=True)
+
+        assert c.detail_scheduled == 10
+        assert c.detail_started == 5
+        assert c.detail_cancelled_before_start == 5
+        assert c.media_item_created == 1
+        assert c.media_item_abandoned_on_stop == 1
+        assert c.conservation_errors() == []
+
+
+class TestTicketLifecycle:
+    def test_note_started_is_idempotent(self):
+        c = ScanStageCounters()
+        t = PostOutcome(c, url="https://e.test/i")
+        t.note_started()
+        t.note_started()
+        assert c.detail_started == 1
+
+    def test_data_returned_is_idempotent(self):
+        c = ScanStageCounters()
+        t = PostOutcome(c, url="https://e.test/j")
+        t.note_started()
+        t.data_returned()
+        t.data_returned()
+        assert c.detail_returned_data == 1
+
+    def test_http_requests_are_not_idempotent(self):
+        """Each retry is a real extra request and must be counted."""
+        c = ScanStageCounters()
+        t = PostOutcome(c, url="https://e.test/k")
+        t.note_started()
+        t.note_http_request()
+        t.note_http_request()
+        t.note_http_request()
+        assert c.detail_http_requests == 3
+
+    def test_snapshot_reports_the_lifecycle(self):
+        c = ScanStageCounters()
+        t = PostOutcome(c, url="https://e.test/s")
+        assert t.snapshot().started is False
+        t.note_started()
+        t.data_returned()
+        s = t.snapshot()
+        assert (s.started, s.data_returned, s.terminal_booked) == (True, True, False)
+        t.discard(DiscardCode.MEDIA_ITEM_EXCEPTION, stage=ScanStage.MEDIA_ITEM_CONSTRUCTION)
+        s = t.snapshot()
+        assert s.terminal_booked is True
+        assert s.terminal_code == "media_item_exception"
+
+    def test_snapshot_records_item_creation_as_terminal(self):
+        c = ScanStageCounters()
+        t = PostOutcome(c, url="https://e.test/t")
+        t.note_started()
+        t.data_returned()
+        t.item_created()
+        assert t.snapshot().terminal_code == "item_created"
+
+    def test_reconcile_races_still_book_once(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/race2")
+        t.note_started()
+        t.data_returned()
+        start = threading.Event()
+        results = []
+
+        def go():
+            start.wait()
+            results.append(t.reconcile())
+
+        ts = [threading.Thread(target=go) for _ in range(4)]
+        for th in ts:
+            th.start()
+        start.set()
+        for th in ts:
+            th.join()
+
+        assert len([r for r in results if r is not None]) == 1
         assert c.conservation_errors() == []
