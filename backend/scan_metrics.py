@@ -66,6 +66,10 @@ TAXONOMY_VERSION = 1
 
 MAX_SAMPLES_PER_REASON = 5
 
+#: Second bound, so a pathological cycle cannot write an unbounded sample set
+#: even across many distinct (reason, kind, stage) combinations.
+MAX_SAMPLES_PER_CYCLE = 60
+
 
 class ScanStage(str, Enum):
     LISTING = "listing"
@@ -80,6 +84,21 @@ class ScanStage(str, Enum):
     #: rather than defaulted, so an omission cannot masquerade as a parse
     #: failure and send the investigation to the wrong layer.
     UNSPECIFIED = "unspecified"
+
+
+class FutureTerminalState(str, Enum):
+    """The only states a Future may be reconciled from.
+
+    An exhaustive enum rather than combinable booleans, because a real Future
+    cannot be both cancelled and carrying data. Booleans made that contradiction
+    representable, and normalizing data on a cancelled future incremented
+    detail_returned_data while booking CANCELLED_BEFORE_START.
+    """
+
+    CANCELLED_BEFORE_START = "cancelled_before_start"
+    COMPLETED_WITH_DATA = "completed_with_data"
+    COMPLETED_FALSEY = "completed_falsey"
+    COMPLETED_EXCEPTION = "completed_exception"
 
 
 class TerminalKind(str, Enum):
@@ -104,6 +123,10 @@ class TerminalKind(str, Enum):
     CONSTRUCTION_FAILED = "construction_failed"
     ABANDONED_ON_STOP = "abandoned_on_stop"
     TERMINAL_MISSING = "terminal_missing"
+    #: No factual kind was supplied and none can be inferred. Never guess a
+    #: content-failure bucket for an ambiguous event - that is how a green
+    #: equation ends up describing something that did not happen.
+    UNSPECIFIED = "unspecified"
 
 
 class DiscardCode(str, Enum):
@@ -166,21 +189,6 @@ STAGE_FOR_CODE: Dict[DiscardCode, ScanStage] = {
     DiscardCode.SOURCE_BLOCKED: ScanStage.DETAIL_FETCH,
 }
 
-#: Codes that mean "the scan was stopped", split by whether work had begun.
-_CANCELLED_BEFORE_START = {DiscardCode.DETAIL_CANCELLED_BEFORE_START}
-_CANCELLED_AFTER_START = {
-    DiscardCode.DETAIL_CANCELLED_AFTER_START,
-    DiscardCode.DETAIL_CANCELLED_BEFORE_REQUEST,
-    DiscardCode.DETAIL_CANCELLED_IN_COORDINATOR,
-    DiscardCode.DETAIL_RETRY_SLEEP_CANCELLED,
-}
-#: Codes raised as exceptions rather than returned as absent data.
-_RAISED = {
-    DiscardCode.DETAIL_PARSE_EXCEPTION,
-    DiscardCode.DETAIL_TRAFFIC_DENIED,
-    DiscardCode.SOURCE_BLOCKED,
-}
-
 _MESSAGES: Dict[DiscardCode, str] = {
     DiscardCode.DETAIL_CANCELLED_BEFORE_REQUEST: "The scan stopped before this release's page was requested.",
     DiscardCode.DETAIL_CANCELLED_IN_COORDINATOR: "The scan stopped while waiting for a request slot.",
@@ -228,7 +236,9 @@ DEFAULT_KIND_FOR_CODE: Dict[DiscardCode, TerminalKind] = {
     DiscardCode.INVALID_METADATA: TerminalKind.CONSTRUCTION_FAILED,
     DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP: TerminalKind.ABANDONED_ON_STOP,
     DiscardCode.TERMINAL_OUTCOME_MISSING: TerminalKind.TERMINAL_MISSING,
-    DiscardCode.UNKNOWN: TerminalKind.RETURNED_NONE,
+    # UNKNOWN is deliberately ABSENT: it may be an exception, a falsy return or
+    # a construction failure, and picking one silently asserts a lifecycle that
+    # was never observed.
 }
 
 #: An operator pressing Stop is not a content failure.
@@ -238,7 +248,7 @@ _STOP_KINDS = {
     TerminalKind.ABANDONED_ON_STOP,
 }
 #: A bookkeeping defect is not a content failure either.
-_GAP_KINDS = {TerminalKind.TERMINAL_MISSING}
+_GAP_KINDS = {TerminalKind.TERMINAL_MISSING, TerminalKind.UNSPECIFIED}
 
 
 def default_stage_for(code: DiscardCode) -> ScanStage:
@@ -251,8 +261,14 @@ def default_stage_for(code: DiscardCode) -> ScanStage:
 
 
 def default_kind_for(code: DiscardCode) -> TerminalKind:
-    """Fallback only. Callers supply the factual terminal kind."""
-    return DEFAULT_KIND_FOR_CODE.get(code, TerminalKind.RETURNED_NONE)
+    """Fallback only. Callers supply the factual terminal kind.
+
+    Returns UNSPECIFIED for anything unmapped, which files the event as an
+    instrumentation gap rather than asserting a content failure that was never
+    observed. A new reason code added without a kind must show up as a gap, not
+    quietly inflate the returned-none bucket.
+    """
+    return DEFAULT_KIND_FOR_CODE.get(code, TerminalKind.UNSPECIFIED)
 
 
 @dataclass(frozen=True)
@@ -262,6 +278,7 @@ class DiscardSample:
     canonical_url: str
     stage: str
     reason_code: str
+    terminal_kind: str = TerminalKind.UNSPECIFIED.value
     source: str = ""
     category: str = ""
     exception_type: Optional[str] = None
@@ -277,6 +294,7 @@ class DiscardSample:
             "canonical_url": self.canonical_url,
             "stage": self.stage,
             "reason_code": self.reason_code,
+            "terminal_kind": self.terminal_kind,
             "source": self.source,
             "category": self.category,
             "exception_type": self.exception_type,
@@ -324,6 +342,9 @@ class ScanStageCounters:
     #: their own terms so the equations stay usable for detecting OTHER losses,
     #: while the defect stays named rather than absorbed into a
     #: plausible-looking bucket.
+    #: reconcile() called without a terminal future state. A wiring defect.
+    reconcile_misuse: int = 0
+
     scheduled_terminal_missing: int = 0
     detail_terminal_missing: int = 0
     media_item_terminal_missing: int = 0
@@ -333,6 +354,9 @@ class ScanStageCounters:
     kinds: Dict[str, int] = field(default_factory=dict)
     samples: List[DiscardSample] = field(default_factory=list)
 
+    _sample_counts: Dict[tuple, int] = field(
+        default_factory=dict, repr=False, compare=False
+    )
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
@@ -398,7 +422,7 @@ class ScanStageCounters:
         with self._lock:
             if kind is TerminalKind.ABANDONED_ON_STOP:
                 self.media_item_abandoned_on_stop += 1
-            elif kind is TerminalKind.TERMINAL_MISSING:
+            elif kind in _GAP_KINDS:
                 # File the gap against the equation it actually breaks, so a
                 # post that never ran does not masquerade as started work.
                 if post_data:
@@ -422,12 +446,22 @@ class ScanStageCounters:
             self.reasons[key] = self.reasons.get(key, 0) + 1
             self.stages[actual.value] = self.stages.get(actual.value, 0) + 1
             self.kinds[kind.value] = self.kinds.get(kind.value, 0) + 1
-            if self.reasons[key] <= MAX_SAMPLES_PER_REASON and url:
+            # Cap per (reason, kind, stage): capping by reason alone meant the
+            # first five returned-none UNKNOWNs starved a later exceptional
+            # UNKNOWN of any sample at all.
+            bucket = (key, kind.value, actual.value)
+            self._sample_counts[bucket] = self._sample_counts.get(bucket, 0) + 1
+            if (
+                url
+                and self._sample_counts[bucket] <= MAX_SAMPLES_PER_REASON
+                and len(self.samples) < MAX_SAMPLES_PER_CYCLE
+            ):
                 self.samples.append(
                     DiscardSample(
                         canonical_url=url,
                         stage=actual.value,
                         reason_code=key,
+                        terminal_kind=kind.value,
                         source=source,
                         category=category,
                         exception_type=exception_type,
@@ -435,6 +469,16 @@ class ScanStageCounters:
                         content_fingerprint=content_fingerprint,
                     )
                 )
+
+    def note_reconcile_misuse(self) -> None:
+        """A reconcile() call that supplied no terminal future state.
+
+        Counted, never silently ignored: it means the wiring reconciled a post
+        whose future had not finished, which would race the worker's own
+        recording.
+        """
+        with self._lock:
+            self.reconcile_misuse += 1
 
     def note_cancelled_before_start(self, count: int) -> None:
         """Book futures the Stop press cancelled before any worker ran them.
@@ -516,15 +560,27 @@ class ScanStageCounters:
 
     @property
     def eligible_for_health_scoring(self) -> bool:
-        """False when Stop or instrumentation gaps distort the picture.
+        """Whether this cycle may inform parser-health judgements.
 
-        A cancelled scan's low yield is not parser degradation and must not
-        feed a future circuit breaker.
+        Requires actual observations and books that balance. No observations is
+        not evidence of perfect health, and a cycle whose own bookkeeping is
+        broken cannot be evidence of anything. A cancelled scan's low yield is
+        not parser degradation and must never feed a circuit breaker.
         """
         groups = self.outcome_groups()
         return (
-            groups["operator_stop_outcomes"] == 0
+            self.detail_started > 0
+            and groups["operator_stop_outcomes"] == 0
             and groups["instrumentation_gaps"] == 0
+            and not self.conservation_errors()
+        )
+
+    @property
+    def eligible_for_construction_scoring(self) -> bool:
+        """Construction health additionally needs a construction attempt."""
+        return (
+            self.eligible_for_health_scoring
+            and self.media_item_construction_attempted > 0
         )
 
     def conservation_errors(self) -> List[str]:
@@ -586,6 +642,15 @@ class ScanStageCounters:
         staged = sum(self.stages.values())
         if staged != tallied:
             errors.append("stage tally=%d != reason tally=%d" % (staged, tallied))
+        # outcome_groups() and eligible_for_health_scoring are derived from
+        # kinds, so an unconserved kind tally leaves grouping and health
+        # eligibility wrong while everything else reads clean.
+        kinded = sum(self.kinds.values())
+        if kinded != tallied:
+            errors.append("kind tally=%d != reason tally=%d" % (kinded, tallied))
+        grouped = sum(self.outcome_groups().values())
+        if grouped != kinded:
+            errors.append("group tally=%d != kind tally=%d" % (grouped, kinded))
         return errors
 
     def to_dict(self) -> dict:
@@ -609,6 +674,7 @@ class ScanStageCounters:
             "media_item_created": self.media_item_created,
             "media_item_construction_failed": self.media_item_construction_failed,
             "media_item_abandoned_on_stop": self.media_item_abandoned_on_stop,
+            "reconcile_misuse": self.reconcile_misuse,
             "scheduled_terminal_missing": self.scheduled_terminal_missing,
             "detail_terminal_missing": self.detail_terminal_missing,
             "media_item_terminal_missing": self.media_item_terminal_missing,
@@ -624,6 +690,7 @@ class ScanStageCounters:
             "kinds": dict(self.kinds),
             "outcome_groups": self.outcome_groups(),
             "eligible_for_health_scoring": self.eligible_for_health_scoring,
+            "eligible_for_construction_scoring": self.eligible_for_construction_scoring,
             "samples": [s.to_dict() for s in self.samples],
             "conservation_errors": self.conservation_errors(),
         }
@@ -635,8 +702,9 @@ class ScanStageCounters:
             self.detail_started,
             self.detail_http_requests,
         )
+        errors = self.conservation_errors()
         if not self.reasons:
-            return head
+            return head + ("; metrics_errors=%d" % len(errors) if errors else "")
         groups = self.outcome_groups()
         top = sorted(self.reasons.items(), key=lambda kv: (-kv[1], kv[0]))
         detail = ", ".join("%s=%d" % (code, n) for code, n in top)
@@ -647,6 +715,8 @@ class ScanStageCounters:
             parts.append("stopped=%d" % groups["operator_stop_outcomes"])
         if groups["instrumentation_gaps"]:
             parts.append("instrumentation gaps=%d" % groups["instrumentation_gaps"])
+        if errors:
+            parts.append("metrics_errors=%d" % len(errors))
         return "; ".join(parts) + " [" + detail + "]"
 
 
@@ -664,7 +734,8 @@ class PostOutcome:
 
     __slots__ = (
         "_counters", "_url", "_source", "_category",
-        "_started", "_data_returned", "_booked", "_terminal_code", "_lock",
+        "_started", "_data_returned", "_booked", "_terminal_code",
+        "_exception_type", "_lock",
     )
 
     def __init__(
@@ -683,6 +754,7 @@ class PostOutcome:
         self._data_returned = False
         self._booked = False
         self._terminal_code: Optional[str] = None
+        self._exception_type: Optional[str] = None
         self._lock = threading.Lock()
 
     @property
@@ -797,83 +869,77 @@ class PostOutcome:
 
     # -- post-drain reconciliation ---------------------------------------
 
-    def reconcile(
-        self,
-        *,
-        future_cancelled: bool = False,
-        future_completed: bool = False,
-        future_returned_data: bool = False,
-        exception_type: Optional[str] = None,
-        was_cancelled: bool = False,
-        completed_with_data: bool = False,
-    ) -> Optional[DiscardCode]:
+    def reconcile(self, state: Optional[FutureTerminalState] = None) -> Optional[DiscardCode]:
         """Close a ticket against a TERMINAL future state.
 
-        PRECONDITION: only call this for a future that is cancelled or
-        completed. A running future is still transitioning between started and
-        data-returned, and an atomic snapshot of a moving lifecycle is still a
-        snapshot of a moving lifecycle. The only permitted pre-drain call is for
-        a future whose ``cancel()`` returned True, because it can never start.
+        ``state`` is REQUIRED and exhaustive. Passing nothing means terminality
+        was never established, so the ticket is NOT claimed and no terminal
+        event is booked - a premature call must not steal the claim from a
+        worker that is still running and about to record its exact branch. The
+        misuse is counted separately via :attr:`reconcile_misuse`.
 
-        Facts proven by the future are normalized into the ticket first: a
-        completed non-cancelled future proves its worker ran, and a truthy
-        result proves data came back, even if the worker failed to record
-        either. Both transitions are idempotent, so backfilling is safe.
+        Facts the future proves are normalized first: a completed non-cancelled
+        future proves its worker ran, and a data-carrying result proves data
+        came back, even if the worker recorded neither. Both transitions are
+        idempotent, so backfilling is safe. A cancelled future is never
+        backfilled - it never ran.
 
         Every branch names a REAL lifecycle state. Nothing is labelled
-        cancellation to balance the books - an undetermined ticket becomes
-        TERMINAL_OUTCOME_MISSING, which is honest about being a defect.
+        cancellation to balance the books.
         """
-        # Back-compat aliases for the earlier signature.
-        cancelled = future_cancelled or was_cancelled
-        has_data = future_returned_data or completed_with_data
-        completed = future_completed or has_data or exception_type is not None
-
-        # -- normalize facts the future proves, before classifying -----------
-        if completed and not cancelled:
-            self.note_started()          # idempotent
-        if has_data:
-            self.data_returned()         # idempotent
-
-        state = self.snapshot()
-        if state.terminal_booked:
+        if state is None:
+            # Not terminal (or the caller did not say). Leave the ticket open.
+            self._note_misuse()
             return None
 
-        if cancelled:
-            # future.cancel() returned True: it never ran.
+        if state is not FutureTerminalState.CANCELLED_BEFORE_START:
+            self.note_started()                              # idempotent
+        if state is FutureTerminalState.COMPLETED_WITH_DATA:
+            self.data_returned()                             # idempotent
+
+        snap = self.snapshot()
+        if snap.terminal_booked:
+            return None
+
+        if state is FutureTerminalState.CANCELLED_BEFORE_START:
             code = DiscardCode.DETAIL_CANCELLED_BEFORE_START
             stage = ScanStage.DETAIL_FETCH
             kind = TerminalKind.CANCELLED_BEFORE_START
-        elif exception_type is not None:
-            # Completed exceptionally with nothing recorded by the worker. The
-            # reason is unknown but the LIFECYCLE is not: it raised.
+        elif state is FutureTerminalState.COMPLETED_EXCEPTION:
+            # The reason is unknown; the LIFECYCLE is not - it raised.
             code = DiscardCode.UNKNOWN
             stage = ScanStage.UNSPECIFIED
             kind = TerminalKind.RAISED_EXCEPTION
-        elif state.data_returned:
+        elif snap.data_returned:
             # The detail SUCCEEDED; the scan stopped before its result was used.
             code = DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP
             stage = ScanStage.DETAIL_TO_ITEM_HANDOFF
             kind = TerminalKind.ABANDONED_ON_STOP
-        elif state.started:
+        else:
             # Ran, returned falsy, booked nothing: an uninstrumented scraper.
             code = DiscardCode.DETAIL_EMPTY
             stage = ScanStage.DETAIL_PARSE
             kind = TerminalKind.RETURNED_NONE
-        else:
-            # Lifecycle genuinely unknown. Name the gap; do not invent a cause.
-            code = DiscardCode.TERMINAL_OUTCOME_MISSING
-            stage = ScanStage.UNSPECIFIED
-            kind = TerminalKind.TERMINAL_MISSING
 
         booked = self.discard(
             code,
             stage=stage,
-            exception_type=exception_type,
-            lifecycle_started=state.started,
+            exception_type=self._exception_type,
+            lifecycle_started=snap.started,
             terminal_kind=kind,
         )
         return code if booked else None
+
+    def note_exception_type(self, exception_type: Optional[str]) -> None:
+        """Attach a bounded exception class name for the diagnostic sample."""
+        self._exception_type = exception_type
+
+    def _note_misuse(self) -> None:
+        try:
+            if self._counters is not None:
+                self._counters.note_reconcile_misuse()
+        except Exception:  # pragma: no cover
+            pass
 
 
 @dataclass(frozen=True)

@@ -6,8 +6,11 @@ instrumentation is losing events and every ratio built on it is a lie.
 import threading
 
 from backend.scan_metrics import (
+    MAX_SAMPLES_PER_CYCLE,
     MAX_SAMPLES_PER_REASON,
     TerminalKind,
+    FutureTerminalState,
+    default_kind_for,
     default_stage_for,
     STAGE_FOR_CODE,
     TAXONOMY_VERSION,
@@ -331,9 +334,9 @@ class TestBoundedSamples:
             content_fingerprint="deadbeef",
         )
         assert set(c.samples[0].to_dict()) == {
-            "canonical_url", "stage", "reason_code", "source", "category",
-            "exception_type", "taxonomy_version", "parser_version",
-            "content_fingerprint",
+            "canonical_url", "stage", "reason_code", "terminal_kind",
+            "source", "category", "exception_type", "taxonomy_version",
+            "parser_version", "content_fingerprint",
         }
 
 
@@ -445,7 +448,7 @@ class TestAbandonedOnStop:
         t.note_started()
         t.data_returned()
         # Stop breaks the main loop before the result is consumed
-        assert t.reconcile() is DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP
+        assert t.reconcile(FutureTerminalState.COMPLETED_WITH_DATA) is DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP
 
         assert c.media_item_abandoned_on_stop == 1
         assert c.media_item_created == 0
@@ -461,7 +464,7 @@ class TestAbandonedOnStop:
         t = PostOutcome(c, url="https://e.test/x")
         t.note_started()
         t.data_returned()
-        t.reconcile()
+        t.reconcile(FutureTerminalState.COMPLETED_WITH_DATA)
         assert c.media_item_created == 0
 
 
@@ -470,7 +473,7 @@ class TestPostDrainReconciliation:
         c = ScanStageCounters()
         c.note_scheduled()
         t = PostOutcome(c, url="https://e.test/c")
-        assert t.reconcile(was_cancelled=True) is DiscardCode.DETAIL_CANCELLED_BEFORE_START
+        assert t.reconcile(FutureTerminalState.CANCELLED_BEFORE_START) is DiscardCode.DETAIL_CANCELLED_BEFORE_START
 
         assert c.detail_cancelled_before_start == 1
         assert c.detail_started == 0
@@ -484,7 +487,7 @@ class TestPostDrainReconciliation:
         t.note_started()
         t.discard(DiscardCode.DETAIL_NO_FILENAME, stage=ScanStage.DETAIL_PARSE)
 
-        assert t.reconcile() is None
+        assert t.reconcile(FutureTerminalState.COMPLETED_FALSEY) is None
         assert c.reasons == {"detail_no_filename": 1}
         assert c.conservation_errors() == []
 
@@ -493,7 +496,7 @@ class TestPostDrainReconciliation:
         c.note_scheduled()
         t = PostOutcome(c, url="https://e.test/f")
         t.note_started()
-        assert t.reconcile() is DiscardCode.DETAIL_EMPTY
+        assert t.reconcile(FutureTerminalState.COMPLETED_FALSEY) is DiscardCode.DETAIL_EMPTY
         assert c.reasons == {"detail_empty": 1}
         assert c.conservation_errors() == []
 
@@ -502,26 +505,31 @@ class TestPostDrainReconciliation:
         c.note_scheduled()
         t = PostOutcome(c, url="https://e.test/e")
         t.note_started()
-        assert t.reconcile(exception_type="ValueError") is DiscardCode.UNKNOWN
+        t.note_exception_type("ValueError")
+        assert t.reconcile(FutureTerminalState.COMPLETED_EXCEPTION) is DiscardCode.UNKNOWN
 
         assert c.reasons == {"unknown": 1}
         assert c.samples[0].exception_type == "ValueError"
         assert c.conservation_errors() == []
 
-    def test_undetermined_ticket_is_never_labelled_cancellation(self):
-        """Balancing the books by inventing a cause is the error to avoid."""
+    def test_reconcile_without_terminal_state_does_not_claim(self):
+        """A premature call must not steal the claim from a running worker."""
         c = ScanStageCounters()
         c.note_scheduled()
         t = PostOutcome(c, url="https://e.test/?")
-        # never started, never cancelled: lifecycle genuinely unknown
-        assert t.reconcile() is DiscardCode.TERMINAL_OUTCOME_MISSING
 
-        assert c.detail_cancelled_before_start == 0
-        assert c.detail_cancelled_after_start == 0
-        assert c.reasons == {"terminal_outcome_missing": 1}
-        # filed against the equation it actually breaks: never started
-        assert c.scheduled_terminal_missing == 1
-        assert c.detail_started == 0
+        assert t.reconcile() is None
+        assert t.reconcile(state=None) is None
+        assert t.booked is False
+        assert c.reconcile_misuse == 2
+        assert c.reasons == {}
+
+        # the worker can still record its own exact branch afterwards
+        t.note_started()
+        assert t.discard(
+            DiscardCode.DETAIL_NO_FILENAME, stage=ScanStage.DETAIL_PARSE
+        ) is True
+        assert c.reasons == {"detail_no_filename": 1}
         assert c.conservation_errors() == []
 
     def test_mixed_stop_cohort_balances(self):
@@ -547,9 +555,9 @@ class TestPostDrainReconciliation:
 
         never = [PostOutcome(c, url="https://e.test/n%d" % i) for i in range(5)]
 
-        stranded.reconcile()
+        stranded.reconcile(FutureTerminalState.COMPLETED_WITH_DATA)
         for t in never:
-            t.reconcile(was_cancelled=True)
+            t.reconcile(FutureTerminalState.CANCELLED_BEFORE_START)
 
         assert c.detail_scheduled == 10
         assert c.detail_started == 5
@@ -617,7 +625,7 @@ class TestTicketLifecycle:
 
         def go():
             start.wait()
-            results.append(t.reconcile())
+            results.append(t.reconcile(FutureTerminalState.COMPLETED_WITH_DATA))
 
         ts = [threading.Thread(target=go) for _ in range(4)]
         for th in ts:
@@ -639,7 +647,8 @@ class TestTerminalKindIndependence:
         c.note_scheduled()
         t = PostOutcome(c, url="https://e.test/x")
         t.note_started()
-        t.reconcile(future_completed=True, exception_type="ValueError")
+        t.note_exception_type("ValueError")
+        t.reconcile(FutureTerminalState.COMPLETED_EXCEPTION)
 
         assert c.detail_raised_exception == 1
         assert c.detail_returned_none == 0
@@ -691,7 +700,7 @@ class TestFutureFactNormalization:
         c = ScanStageCounters()
         c.note_scheduled()
         t = PostOutcome(c, url="https://e.test/b")
-        t.reconcile(future_completed=True, future_returned_data=True)
+        t.reconcile(FutureTerminalState.COMPLETED_WITH_DATA)
 
         assert c.detail_started == 1
         assert c.detail_returned_data == 1
@@ -702,7 +711,8 @@ class TestFutureFactNormalization:
         c = ScanStageCounters()
         c.note_scheduled()
         t = PostOutcome(c, url="https://e.test/e")
-        t.reconcile(future_completed=True, exception_type="RuntimeError")
+        t.note_exception_type("RuntimeError")
+        t.reconcile(FutureTerminalState.COMPLETED_EXCEPTION)
 
         assert c.detail_started == 1
         assert c.detail_raised_exception == 1
@@ -712,7 +722,7 @@ class TestFutureFactNormalization:
         c = ScanStageCounters()
         c.note_scheduled()
         t = PostOutcome(c, url="https://e.test/f")
-        assert t.reconcile(future_completed=True) is DiscardCode.DETAIL_EMPTY
+        assert t.reconcile(FutureTerminalState.COMPLETED_FALSEY) is DiscardCode.DETAIL_EMPTY
 
         assert c.detail_started == 1
         assert c.scheduled_terminal_missing == 0
@@ -722,14 +732,14 @@ class TestFutureFactNormalization:
         c = ScanStageCounters()
         c.note_scheduled()
         PostOutcome(c, url="https://e.test/h").reconcile(
-            future_completed=True, future_returned_data=True
+            FutureTerminalState.COMPLETED_WITH_DATA
         )
         assert c.detail_http_requests == 0
 
     def test_cancelled_future_is_not_backfilled_as_started(self):
         c = ScanStageCounters()
         c.note_scheduled()
-        PostOutcome(c, url="https://e.test/c").reconcile(future_cancelled=True)
+        PostOutcome(c, url="https://e.test/c").reconcile(FutureTerminalState.CANCELLED_BEFORE_START)
         assert c.detail_started == 0
         assert c.conservation_errors() == []
 
@@ -796,3 +806,176 @@ class TestPopulationSeparation:
         line = c.summary_line()
         assert "failures=1" in line
         assert "stopped=1" in line
+
+
+class TestTerminalStateEnforcement:
+    def test_contradictory_future_facts_are_unrepresentable(self):
+        """A future cannot be both cancelled and carrying data."""
+        for state in FutureTerminalState:
+            c = ScanStageCounters()
+            c.note_scheduled()
+            PostOutcome(c, url="u").reconcile(state)
+            if state is FutureTerminalState.CANCELLED_BEFORE_START:
+                assert c.detail_started == 0
+                assert c.detail_returned_data == 0
+            else:
+                assert c.detail_started == 1
+            assert c.conservation_errors() == []
+
+    def test_every_state_normalizes_its_lifecycle(self):
+        expected = {
+            FutureTerminalState.CANCELLED_BEFORE_START:
+                DiscardCode.DETAIL_CANCELLED_BEFORE_START,
+            FutureTerminalState.COMPLETED_WITH_DATA:
+                DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP,
+            FutureTerminalState.COMPLETED_FALSEY: DiscardCode.DETAIL_EMPTY,
+            FutureTerminalState.COMPLETED_EXCEPTION: DiscardCode.UNKNOWN,
+        }
+        for state, code in expected.items():
+            c = ScanStageCounters()
+            c.note_scheduled()
+            assert PostOutcome(c, url="u").reconcile(state) is code
+            assert c.conservation_errors() == []
+
+
+class TestNoPlausibleDefaultKind:
+    def test_unknown_without_kind_is_an_instrumentation_gap(self):
+        """An ambiguous event must never land in a content-failure bucket."""
+        assert default_kind_for(DiscardCode.UNKNOWN) is TerminalKind.UNSPECIFIED
+
+        c = ScanStageCounters()
+        c.note_scheduled()
+        c.note_started()
+        c.note_discard(DiscardCode.UNKNOWN, url="u")
+
+        assert c.detail_returned_none == 0
+        assert c.outcome_groups()["instrumentation_gaps"] == 1
+        assert c.outcome_groups()["failures"] == 0
+        assert c.eligible_for_health_scoring is False
+        assert c.conservation_errors() == []
+
+    def test_explicit_kinds_still_route(self):
+        for kind, attr in (
+            (TerminalKind.RETURNED_NONE, "detail_returned_none"),
+            (TerminalKind.RAISED_EXCEPTION, "detail_raised_exception"),
+        ):
+            c = ScanStageCounters()
+            c.note_scheduled()
+            c.note_started()
+            c.note_discard(DiscardCode.UNKNOWN, terminal_kind=kind, url="u")
+            assert getattr(c, attr) == 1
+
+
+class TestKindConservationAndSamples:
+    def test_sample_carries_terminal_kind(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        c.note_started()
+        c.note_discard(
+            DiscardCode.DETAIL_NO_FILENAME,
+            terminal_kind=TerminalKind.RETURNED_NONE,
+            url="u",
+        )
+        assert c.samples[0].to_dict()["terminal_kind"] == "returned_none"
+
+    def test_same_reason_at_three_kinds_keeps_a_sample_each(self):
+        """Capping by reason alone starved later kinds of any example."""
+        c = ScanStageCounters()
+        for kind in (
+            TerminalKind.RETURNED_NONE,
+            TerminalKind.RAISED_EXCEPTION,
+            TerminalKind.CONSTRUCTION_FAILED,
+        ):
+            for i in range(10):
+                c.note_scheduled()
+                c.note_started()
+                if kind is TerminalKind.CONSTRUCTION_FAILED:
+                    c.note_detail_data()
+                c.note_discard(
+                    DiscardCode.UNKNOWN,
+                    terminal_kind=kind,
+                    url="https://e.test/%s%d" % (kind.value, i),
+                )
+        kinds_sampled = {s.terminal_kind for s in c.samples}
+        assert kinds_sampled == {
+            "returned_none", "raised_exception", "construction_failed",
+        }
+        assert c.conservation_errors() == []
+
+    def test_cycle_sample_cap_bounds_a_pathological_scan(self):
+        c = ScanStageCounters()
+        for i in range(400):
+            c.note_scheduled()
+            c.note_started()
+            c.note_discard(
+                DiscardCode.DETAIL_NO_FILENAME,
+                terminal_kind=TerminalKind.RETURNED_NONE,
+                url="https://e.test/%d" % i,
+            )
+        assert len(c.samples) <= MAX_SAMPLES_PER_CYCLE
+        assert c.reasons["detail_no_filename"] == 400
+
+
+class TestHealthEligibility:
+    def test_zero_observations_is_not_perfect_health(self):
+        c = ScanStageCounters()
+        assert c.detail_parse_success_ratio == 1.0
+        assert c.eligible_for_health_scoring is False
+
+    def test_imbalance_makes_a_cycle_ineligible(self):
+        c = ScanStageCounters()
+        c.note_scheduled(5)
+        c.note_started()
+        c.note_detail_data()
+        c.note_item_created()
+        assert c.conservation_errors()
+        assert c.eligible_for_health_scoring is False
+
+    def test_clean_measured_cycle_is_eligible(self):
+        c = ScanStageCounters()
+        c.note_scheduled(2)
+        c.note_started()
+        c.note_detail_data()
+        c.note_item_created()
+        c.note_started()
+        c.note_discard(
+            DiscardCode.DETAIL_NO_FILENAME,
+            terminal_kind=TerminalKind.RETURNED_NONE,
+            url="u",
+        )
+        assert c.conservation_errors() == []
+        assert c.eligible_for_health_scoring is True
+        assert c.eligible_for_construction_scoring is True
+
+    def test_construction_scoring_needs_an_attempt(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        c.note_started()
+        c.note_discard(
+            DiscardCode.DETAIL_NO_FILENAME,
+            terminal_kind=TerminalKind.RETURNED_NONE,
+            url="u",
+        )
+        assert c.eligible_for_health_scoring is True
+        assert c.eligible_for_construction_scoring is False
+
+
+class TestLoudOnImbalance:
+    def test_summary_surfaces_conservation_failure(self):
+        c = ScanStageCounters()
+        c.note_scheduled(5)
+        c.note_started()
+        c.note_discard(
+            DiscardCode.DETAIL_NO_FILENAME,
+            terminal_kind=TerminalKind.RETURNED_NONE,
+            url="u",
+        )
+        assert "metrics_errors=" in c.summary_line()
+
+    def test_clean_summary_says_nothing_about_errors(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        c.note_started()
+        c.note_detail_data()
+        c.note_item_created()
+        assert "metrics_errors" not in c.summary_line()
