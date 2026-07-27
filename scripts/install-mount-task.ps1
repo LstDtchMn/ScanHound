@@ -31,12 +31,22 @@ param(
     [string]$ExpectedCommit,
 
     [string]$SourceRepo = 'X:\Docker Apps\ScanHound',
+    [string]$RootDir    = 'C:\ProgramData\ScanHound',
     [string]$DeployDir  = 'C:\ProgramData\ScanHound\deploy',
     [string]$BackupDir  = 'C:\ProgramData\ScanHound\backup',
     [string]$RunDir     = 'C:\ProgramData\ScanHound\run'
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Uninitialised variables become $null silently in PowerShell, which is exactly
+# how the manifest came to record null blob ids after a rename: the assignment
+# moved to $scriptObj/$composeObj while the manifest still read $scriptBlob.
+# Strict mode turns that class of typo into an error instead of a quiet wrong
+# value in a one-time provenance record.
+Set-StrictMode -Version 2.0
+
+$utf8NoBom = New-Object Text.UTF8Encoding($false)
 
 $TaskName = 'ScanHound-MountNASShares'
 $Sid      = 'S-1-5-21-2209700402-3938720563-1532606968-1001'
@@ -193,15 +203,31 @@ if (-not $isElevated) {
 # 2. Validate the SOURCE before it is allowed to become the deployment
 # ---------------------------------------------------------------------------
 
-foreach ($f in @($SrcScript, $SrcCompose)) {
-    if (-not (Test-Path -LiteralPath $f)) { throw "Missing source input: $f" }
-}
+# NOTE: no working-tree existence check. Deployment content comes entirely from
+# the approved commit's object tree, so requiring the files to exist in the
+# CURRENT checkout would reject a perfectly valid approved commit whenever the
+# tree happens to be on a different branch -- an operability trap with no
+# security value.
 
-# Pinned git.exe must itself be trustworthy before it is used to establish
-# provenance for anything else.
-Assert-AdminOnlyPath $GitExe    -Quiet
-Assert-AdminOnlyPath $IcaclsExe -Quiet
-Write-Output "tools   : $GitExe"
+# Pinned tools must themselves be trustworthy before they are used to establish
+# provenance for anything else -- and the check has to cover the CHAIN, not just
+# the file. Assert-AdminOnlyPath alone examines the named object; a protected
+# executable inside a directory an ordinary user can rewrite is not protected.
+function Assert-PinnedTool([string]$path, [string]$label) {
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.Extension -ne '.exe') { throw "$label at '$path' is not an .exe." }
+    $root = [IO.Path]::GetPathRoot($item.FullName)
+    $cur  = $item.FullName
+    while ($cur -and $cur.TrimEnd('\') -ne $root.TrimEnd('\')) {
+        Assert-AdminOnlyPath $cur -Quiet
+        $parent = Split-Path $cur -Parent
+        if (-not $parent -or $parent -eq $cur) { break }
+        $cur = $parent
+    }
+    Write-Output "tool    : $path (chain verified)"
+}
+Assert-PinnedTool $GitExe    'git.exe'
+Assert-PinnedTool $IcaclsExe 'icacls.exe'
 
 # $ExpectedCommit is the authority. HEAD is reported for context only, and a
 # mismatch is surfaced rather than silently deploying whatever is checked out.
@@ -365,12 +391,61 @@ function New-SecureDeployedFile([string]$path, [byte[]]$bytes) {
     [IO.File]::WriteAllBytes($path, $bytes)
 }
 
-# Directories first, and PROVEN, before anything is created inside them.
+# THE COMMON PARENT IS PART OF THE BOUNDARY.
+#
+# Hardening only the three children is insufficient: Windows permits deleting
+# or renaming an object when the caller holds DELETE on it OR delete-child on
+# its PARENT. An ordinary account with DeleteSubdirectoriesAndFiles on
+# C:\ProgramData\ScanHound could therefore remove and re-create `deploy`,
+# `backup` or `run` wholesale, no matter how perfectly the children themselves
+# deny writes -- taking the elevated task script, the pinned recipe, the
+# rollback inputs and the root-executed staging payloads with them.
+#
+# Also: the ancestor chain is checked for reparse points BEFORE any icacls
+# runs. icacls without /L follows a junction, so hardening a redirected path
+# would have applied an elevated ACL change to somebody else's directory and
+# only been noticed by the assertion afterwards.
+function Assert-SafeAncestry([string]$path) {
+    $root = [IO.Path]::GetPathRoot($path)
+    $cur  = $path
+    while ($cur -and $cur.TrimEnd('\') -ne $root.TrimEnd('\')) {
+        if (Test-Path -LiteralPath $cur) {
+            $node = Get-Item -LiteralPath $cur -Force
+            if ($node.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw ("'$cur' in the path of '$path' is a reparse point. Refusing to apply " +
+                       "elevated ACL changes through a redirection.")
+            }
+        }
+        $parent = Split-Path $cur -Parent
+        if (-not $parent -or $parent -eq $cur) { break }
+        $cur = $parent
+    }
+}
+
+# Prove the chain before touching anything.
+foreach ($d in @($RootDir, $DeployDir, $BackupDir, $RunDir)) { Assert-SafeAncestry $d }
+
+# The protected ROOT first. Everything below inherits its protection against
+# delete-child, which is the right the children cannot defend against
+# themselves.
+New-Item -ItemType Directory -Force $RootDir | Out-Null
+Invoke-Icacls $RootDir '/setowner'     'BUILTIN\Administrators'
+Invoke-Icacls $RootDir '/inheritance:r'
+Invoke-Icacls $RootDir '/grant'        'BUILTIN\Administrators:(OI)(CI)(F)'
+Invoke-Icacls $RootDir '/grant'        '*S-1-5-18:(OI)(CI)(F)'
+Invoke-Icacls $RootDir '/grant'        "*$($Sid):(OI)(CI)(RX)"
+Assert-AdminOnlyPath $RootDir
+
 # $RunDir holds shell payloads wsl.exe executes as root, so it is an
 # elevated-execution input exactly like the deploy directory.
+#
+# NOTE the absence of /T. Recursing an elevated ACL change over pre-existing,
+# not-yet-validated content is the same mistake as writing before hardening:
+# a planted reparse-point descendant would be followed. Payload files get
+# their descriptor individually, at creation, from New-SecureDeployedFile.
 foreach ($dir in @($DeployDir, $BackupDir, $RunDir)) {
     New-Item -ItemType Directory -Force $dir | Out-Null
-    Invoke-Icacls $dir '/setowner'     'BUILTIN\Administrators' '/T'
+    Invoke-Icacls $dir '/setowner'     'BUILTIN\Administrators'
     Invoke-Icacls $dir '/inheritance:r'
     Invoke-Icacls $dir '/grant'        'BUILTIN\Administrators:(OI)(CI)(F)'
     Invoke-Icacls $dir '/grant'        '*S-1-5-18:(OI)(CI)(F)'
@@ -378,8 +453,8 @@ foreach ($dir in @($DeployDir, $BackupDir, $RunDir)) {
 # The task account gets READ ONLY on deploy/backup, and NOTHING on staging: a
 # SID ACE cannot distinguish the elevated token from the unelevated one, so the
 # write right must simply not be granted.
-Invoke-Icacls $DeployDir '/grant' "*$($Sid):(OI)(CI)(RX)" '/T'
-Invoke-Icacls $BackupDir '/grant' "*$($Sid):(OI)(CI)(RX)" '/T'
+Invoke-Icacls $DeployDir '/grant' "*$($Sid):(OI)(CI)(RX)"
+Invoke-Icacls $BackupDir '/grant' "*$($Sid):(OI)(CI)(RX)"
 
 Assert-AdminOnlyPath $DeployDir
 Assert-AdminOnlyPath $BackupDir
@@ -393,7 +468,7 @@ $manifest = [ordered]@{
     stage         = 'Stage 0 - scheduler settings + stable deployment path'
     source_repo   = $SourceRepo
     source_commit = $srcCommit
-    source_blobs  = @{ 'mount-nas-shares.ps1' = $scriptBlob; 'docker-compose.yml' = $composeBlob }
+    source_blobs  = @{ 'mount-nas-shares.ps1' = $scriptObj.Blob; 'docker-compose.yml' = $composeObj.Blob }
     source_branch = $srcBranch
     files         = @(
         [ordered]@{ name = 'mount-nas-shares.ps1'
@@ -407,7 +482,6 @@ $manifest = [ordered]@{
 # The manifest is itself an elevated-trust input -- rollback verifies the
 # deployed script against it -- so it gets the same create-harden-assert-write
 # treatment as the payloads rather than a bare Out-File.
-$utf8NoBom = New-Object Text.UTF8Encoding($false)
 New-SecureDeployedFile $Manifest ($utf8NoBom.GetBytes(($manifest | ConvertTo-Json -Depth 5)))
 
 # Lock the deployment: an unprivileged user must not be able to replace the
@@ -427,9 +501,6 @@ New-SecureDeployedFile $Manifest ($utf8NoBom.GetBytes(($manifest | ConvertTo-Jso
 # Re-assert AFTER writing, recursively: the pre-write pass proved the
 # directories, this proves every artifact that now sits in them (including the
 # manifest) still carries an admin-only descriptor and is not a reparse point.
-Assert-AdminOnlyPath $DeployDir -Recurse
-Assert-AdminOnlyPath $BackupDir -Recurse
-Assert-AdminOnlyPath $RunDir
 
 Write-Output "deployed: $DeployDir"
 foreach ($e in $manifest.files) { Write-Output "          $($e.name)  $($e.sha256.Substring(0,16))..." }
@@ -451,7 +522,12 @@ New-Item -ItemType Directory -Force $BackupDir | Out-Null
 $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
 $backup = Join-Path $BackupDir "$TaskName.$stamp.xml"
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Export-ScheduledTask -TaskName $TaskName | Out-File -FilePath $backup -Encoding utf8
+    # Through the secure helper, not Out-File: this XML is later consumed by an
+    # ELEVATED rollback, so it is a trust input with the same requirements as
+    # the deployed script. A new file's owner comes from the creating token,
+    # not from the parent -- the reasoning already applied to the payloads
+    # applies here too.
+    New-SecureDeployedFile $backup ($utf8NoBom.GetBytes((Export-ScheduledTask -TaskName $TaskName)))
     Write-Output "backup  : $backup"
 } else {
     Write-Output "backup  : none (no existing task)"
@@ -549,8 +625,20 @@ Register-ScheduledTask -TaskName $TaskName -Action $action `
     -Trigger @($tBoot, $tLogon, $tTime) -Settings $settings `
     -Principal $principal -Description $desc -Force | Out-Null
 
-Export-ScheduledTask -TaskName $TaskName |
-    Out-File -FilePath (Join-Path $DeployDir "$TaskName.installed.xml") -Encoding utf8
+# Evidence rather than an elevated input, but it lives in the deployment
+# directory, so it gets the same descriptor -- otherwise the claim that every
+# artifact there was proven would be false.
+$installedXmlPath = Join-Path $DeployDir "$TaskName.installed.xml"
+New-SecureDeployedFile $installedXmlPath ($utf8NoBom.GetBytes((Export-ScheduledTask -TaskName $TaskName)))
+
+# NOW every artifact exists -- payloads, manifest, backup XML and installed XML
+# -- so this is the first point at which a recursive assertion can honestly
+# claim to cover the whole deployment. Running it earlier (as the previous
+# version did) proved only what happened to exist at that moment.
+Assert-AdminOnlyPath $RootDir
+Assert-AdminOnlyPath $DeployDir -Recurse
+Assert-AdminOnlyPath $BackupDir -Recurse
+Assert-AdminOnlyPath $RunDir    -Recurse
 
 # ---------------------------------------------------------------------------
 # 6. Assert the INSTALLED task, not the intent
