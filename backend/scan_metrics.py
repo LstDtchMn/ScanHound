@@ -251,6 +251,11 @@ _STOP_KINDS = {
 _GAP_KINDS = {TerminalKind.TERMINAL_MISSING, TerminalKind.UNSPECIFIED}
 
 
+def joint_key(stage: ScanStage, kind: TerminalKind) -> str:
+    """Key for the joint stage x kind distribution."""
+    return "%s|%s" % (stage.value, kind.value)
+
+
 def default_stage_for(code: DiscardCode) -> ScanStage:
     """Fallback only. Callers supply the factual stage at the event site.
 
@@ -310,8 +315,10 @@ def _as_count(counters, value) -> int:
     A recorder must never propagate a TypeError into scan control flow.
     """
     try:
+        if isinstance(value, float) and value != int(value):
+            raise ValueError("non-integral count")
         return int(value)
-    except (TypeError, ValueError):
+    except Exception:
         try:
             with counters._lock:
                 counters.recorder_faults += 1
@@ -361,7 +368,8 @@ class ScanStageCounters:
     #: reconcile() called without a terminal future state. A wiring defect.
     reconcile_misuse: int = 0
     #: A release was created after its ticket was already closed. A wiring
-    #: defect, and invisible to the equations unless counted explicitly.
+    #: defect, and invisible to the equations unless counted explicitly. It is
+    #: still a REAL SHIPPED RELEASE - see media_items_emitted.
     media_item_created_after_terminal: int = 0
     #: Public recorder calls that raised internally and were swallowed.
     recorder_faults: int = 0
@@ -373,6 +381,12 @@ class ScanStageCounters:
     reasons: Dict[str, int] = field(default_factory=dict)
     stages: Dict[str, int] = field(default_factory=dict)
     kinds: Dict[str, int] = field(default_factory=dict)
+    #: The JOINT distribution, keyed "stage|kind". Marginal stage and kind
+    #: totals cannot tell a source outage from a parser regression: 100 fetch
+    #: failures and 100 parse failures both read as returned_none, and every
+    #: derived value was identical. Correlation is the thing that distinguishes
+    #: them, so it has to be recorded, not reconstructed.
+    terminal_counts: Dict[str, int] = field(default_factory=dict)
     samples: List[DiscardSample] = field(default_factory=list)
 
     _sample_counts: Dict[tuple, int] = field(
@@ -498,6 +512,8 @@ class ScanStageCounters:
             self.reasons[key] = self.reasons.get(key, 0) + 1
             self.stages[actual.value] = self.stages.get(actual.value, 0) + 1
             self.kinds[kind.value] = self.kinds.get(kind.value, 0) + 1
+            joint = joint_key(actual, kind)
+            self.terminal_counts[joint] = self.terminal_counts.get(joint, 0) + 1
             # Cap per (reason, kind, stage): capping by reason alone meant the
             # first five returned-none UNKNOWNs starved a later exceptional
             # UNKNOWN of any sample at all.
@@ -549,6 +565,8 @@ class ScanStageCounters:
             self.stages[stage] = self.stages.get(stage, 0) + count
             kind = TerminalKind.CANCELLED_BEFORE_START.value
             self.kinds[kind] = self.kinds.get(kind, 0) + count
+            joint = joint_key(ScanStage.DETAIL_FETCH, TerminalKind.CANCELLED_BEFORE_START)
+            self.terminal_counts[joint] = self.terminal_counts.get(joint, 0) + count
 
     # -- reporting --------------------------------------------------------
     #
@@ -595,7 +613,8 @@ class ScanStageCounters:
                 reasons=dict(self.reasons),
                 stages=dict(self.stages),
                 kinds=dict(self.kinds),
-                sample_count=len(self.samples),
+                terminal_counts=dict(self.terminal_counts),
+                samples=tuple(self.samples),
             )
 
     def outcome_groups(self) -> Dict[str, int]:
@@ -634,15 +653,8 @@ class ScanStageCounters:
         return eligible_for_construction_scoring_of(self.snapshot_counts())
 
     def to_dict(self) -> dict:
-        """Serialize from ONE snapshot.
-
-        Previously this called four readers that each took their own view, so a
-        single published row could contradict itself.
-        """
-        snap = self.snapshot_counts()
-        with self._lock:
-            samples = [sample.to_dict() for sample in self.samples]
-        return dict_of(snap, samples)
+        """Serialize from ONE snapshot, counters and samples together."""
+        return dict_of(self.snapshot_counts())
 
     def summary_line(self) -> str:
         return summary_line_of(self.snapshot_counts())
@@ -679,7 +691,10 @@ class CountersSnapshot:
     reasons: Dict[str, int]
     stages: Dict[str, int]
     kinds: Dict[str, int]
-    sample_count: int
+    terminal_counts: Dict[str, int]
+    #: Copied under the SAME lock as the counters. Taking them separately let a
+    #: published row carry a sample whose reason was absent from its own totals.
+    samples: tuple
 
 
 def outcome_groups_of(snap: CountersSnapshot) -> Dict[str, int]:
@@ -705,21 +720,69 @@ def outcome_groups_of(snap: CountersSnapshot) -> Dict[str, int]:
     return groups
 
 
+def _joint(snap: CountersSnapshot, stage: ScanStage, kind: TerminalKind) -> int:
+    return snap.terminal_counts.get(joint_key(stage, kind), 0)
+
+
+def detail_fetch_failed_of(snap: CountersSnapshot) -> int:
+    """Posts lost at FETCH - the source did not deliver a usable page.
+
+    Kept separate from parse failure because a breaker fed by a combined number
+    quarantines the parser during a source outage.
+    """
+    return _joint(snap, ScanStage.DETAIL_FETCH, TerminalKind.RETURNED_NONE) + _joint(
+        snap, ScanStage.DETAIL_FETCH, TerminalKind.RAISED_EXCEPTION
+    )
+
+
+def detail_reached_parse_of(snap: CountersSnapshot) -> int:
+    """Posts whose page arrived and was handed to the parser."""
+    return (
+        snap.detail_returned_data
+        + _joint(snap, ScanStage.DETAIL_PARSE, TerminalKind.RETURNED_NONE)
+        + _joint(snap, ScanStage.DETAIL_PARSE, TerminalKind.RAISED_EXCEPTION)
+    )
+
+
 def detail_parse_success_ratio_of(snap: CountersSnapshot) -> float:
     """Of the posts that actually REACHED parsing, how many yielded data.
 
-    Cancellations and instrumentation gaps are excluded from the denominator:
-    including them made a total source outage and a total parser regression
-    produce an identical number.
+    The denominator is drawn from the JOINT distribution. Using the marginal
+    returned-none and raised-exception totals merged fetch-stage and parse-stage
+    outcomes, so a total source outage and a total parser regression produced
+    identical values in every derived metric.
     """
-    attempted = (
-        snap.detail_returned_data
-        + snap.detail_returned_none
-        + snap.detail_raised_exception
-    )
+    attempted = detail_reached_parse_of(snap)
     if attempted <= 0:
         return 1.0
     return snap.detail_returned_data / float(attempted)
+
+
+def media_items_emitted_of(snap: CountersSnapshot) -> int:
+    """Releases that ACTUALLY SHIPPED, however the ticket was accounted.
+
+    Per-post conservation uses the ticket outcome; operator-facing yield must
+    use this. A scan that appended 40 items after ticket closure was reporting
+    zero produced.
+    """
+    return snap.media_item_created + snap.media_item_created_after_terminal
+
+
+def stop_safe_item_yield_of(snap: CountersSnapshot) -> Optional[float]:
+    """Output yield with Stop-affected posts removed from the denominator.
+
+    end_to_end_item_yield is the honest ACTUAL yield and still counts posts
+    cancelled after start and successful results stranded by Stop - which makes
+    it unsafe to feed to a health breaker on a cancelled scan.
+    """
+    denominator = (
+        snap.detail_started
+        - snap.detail_cancelled_after_start
+        - snap.media_item_abandoned_on_stop
+    )
+    if denominator <= 0:
+        return None
+    return media_items_emitted_of(snap) / float(denominator)
 
 
 def construction_success_ratio_of(snap: CountersSnapshot) -> float:
@@ -850,7 +913,7 @@ def conservation_errors_of(snap: CountersSnapshot) -> List[str]:
     return errors
 
 
-def dict_of(snap: CountersSnapshot, samples: List[dict]) -> dict:
+def dict_of(snap: CountersSnapshot) -> dict:
     groups = outcome_groups_of(snap)
     return {
         "taxonomy_version": TAXONOMY_VERSION,
@@ -893,7 +956,12 @@ def dict_of(snap: CountersSnapshot, samples: List[dict]) -> dict:
         "outcome_groups": groups,
         "eligible_for_health_scoring": eligible_for_health_scoring_of(snap),
         "eligible_for_construction_scoring": eligible_for_construction_scoring_of(snap),
-        "samples": samples,
+        "samples": [sample.to_dict() for sample in snap.samples],
+        "terminal_counts": dict(snap.terminal_counts),
+        "detail_fetch_failed": detail_fetch_failed_of(snap),
+        "detail_reached_parse": detail_reached_parse_of(snap),
+        "media_items_emitted": media_items_emitted_of(snap),
+        "stop_safe_item_yield": stop_safe_item_yield_of(snap),
         "conservation_errors": conservation_errors_of(snap),
     }
 
@@ -989,6 +1057,7 @@ class PostOutcome:
                 data_returned=self._data_returned,
                 terminal_booked=self._booked,
                 terminal_code=self._terminal_code,
+                exception_type=self._exception_type,
             )
 
     def _claim(self, code: Optional[DiscardCode]) -> bool:
@@ -1169,15 +1238,24 @@ class PostOutcome:
         booked = self.discard(
             code,
             stage=stage,
-            exception_type=self._exception_type,
+            exception_type=snap.exception_type,
             lifecycle_started=snap.started,
             terminal_kind=kind,
         )
         return code if booked else None
 
     def note_exception_type(self, exception_type: Optional[str]) -> None:
-        """Attach a bounded exception class name for the diagnostic sample."""
-        self._exception_type = exception_type
+        """Attach a bounded exception class name for the diagnostic sample.
+
+        Written under the ticket lock and read from the snapshot, so a race
+        cannot attach one post's exception class to another post's sample.
+        """
+        try:
+            bounded = None if exception_type is None else str(exception_type)[:80]
+        except Exception:  # pragma: no cover
+            bounded = None
+        with self._lock:
+            self._exception_type = bounded
 
     def _note_misuse(self) -> None:
         try:
@@ -1196,3 +1274,4 @@ class OutcomeSnapshot:
     data_returned: bool
     terminal_booked: bool
     terminal_code: Optional[str]
+    exception_type: Optional[str] = None
