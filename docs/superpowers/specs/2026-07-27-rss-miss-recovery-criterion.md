@@ -248,15 +248,56 @@ This is not an argument against promotion. It is a limit that must be written
 down, because revision 1 implied the stop condition "survives", and after
 promotion it does not survive; it stops being evaluated.
 
-**Options, for the decision owner:**
+**Decided 2026-07-27 by Jesse: option 2 — add the audit, then promote.**
+Revision 1 and revision 2's first draft placed this out of scope. It is now
+**in scope**, and promotion does not happen without it. See
+[Post-promotion audit](#post-promotion-audit).
 
-1. Accept it — promotion is a one-time certification, and monitoring reverts to
-   whatever non-shadow signals exist.
-2. Add a low-frequency audit — periodically run a listing scan under
-   `rss_primary` purely to record a comparison. Costs a small number of extra
-   requests; restores ongoing detection.
+Measured cost of each path, from 94 eligible cycles (median 32 listing requests
++ 2 feed requests per cycle, ~20 cycles/day):
 
-Option 2 is a separate change and is **not** part of this spec.
+| path | requests/day | ongoing miss detection |
+|---|---|---|
+| stay in shadow | ~680 | yes |
+| promote, no audit | ~40 (−94%) | **none** |
+| **promote + daily audit** | **~72 (−89%)** | **yes** |
+
+The audit trades 5 percentage points of request reduction for keeping the
+detector alive.
+
+---
+
+## Post-promotion audit
+
+**In scope as of the 2026-07-27 decision. Promotion is gated on it.**
+
+Under `rss_primary`, run a full listing scan on a fixed interval — default 24 h,
+config key `hdencode_rss_audit_interval_hours` — purely to produce a comparison.
+
+Two changes:
+
+1. **[background_scanner.py:400](../../backend/background_scanner.py)** — when
+   the interval has elapsed, do not skip the listing source. Scan the normal
+   page count rather than the single fallback page, so the comparison is against
+   a complete listing set.
+2. **[background_scanner.py:449](../../backend/background_scanner.py)** — widen
+   the recording condition from `discovery_mode == "rss_shadow"` to *shadow mode
+   **or** this cycle is an audit*. The comparison, miss rows, and six-state
+   classification are otherwise unchanged, so the same criterion that gated
+   promotion keeps evaluating afterwards.
+
+Audit cycles are marked in `details_json` so they are distinguishable from
+shadow cycles in analysis, and they must satisfy the same structural eligibility
+rules to count.
+
+**On detection, the audit reports — it does not act.** A post-promotion miss
+raises the readiness reasons and fires a Gotify notification. It does **not**
+automatically demote to `rss_shadow`.
+
+Automatic demotion is deliberately excluded: it is a behaviour change that would
+let a single anomalous cycle silently revert discovery mode, and reverting is a
+production settings change, which is Jesse's call by standing rule. Whether to
+add it later is an open item, recorded here rather than decided silently.
 
 ---
 
@@ -298,16 +339,45 @@ positive `feed_only` sighting already exists, which remains valid evidence.
 
 ## Implementation sequence
 
-Ordered per review. **`rss_primary` is not enabled at any point in steps 1–5.**
+Review's ordering is kept in full. **Decided 2026-07-27: the six steps are
+batched into two deployments**, because every step through 5 is either
+read-only or additive — none can change discovery behaviour — and each
+deployment costs a container recreate.
+
+**`rss_primary` is not enabled at any point before the settings flip, which is
+a production settings change and therefore Jesse's alone.**
+
+### Deployment 1 — steps 1–5, all inert
 
 | step | change | risk |
 |---|---|---|
-| 1 | Cycle-eligibility correction only (structural, per finding 2) | low — correctness fix, stands alone |
+| 1 | Cycle-eligibility correction (structural, per finding 2) | low — correctness fix, stands alone |
 | 2 | Read-only recount + reconciliation table | none — no behaviour change |
 | 3 | Full `rss_urls` telemetry in `details_json` | low — additive write |
-| 4 | Six-state recovery helper + unit tests | none — not yet wired to the gate |
+| 4 | Six-state recovery helper + unit tests | none — not wired to the gate |
 | 5 | Read-only live evaluation; report all six counts | none — reported, not enforced |
-| 6 | Wire to the gate; promotion **only** if `recovered_late`, `pending`, `unrecovered`, `evidence_gap` are all 0 | gated on step 5 evidence |
+
+Mode stays `rss_shadow` throughout. Nothing here can promote anything.
+
+**Gate:** review the live six-state counts before continuing. Deployment 2 does
+not proceed unless `recovered_late`, `pending`, `unrecovered` and `evidence_gap`
+are all 0.
+
+### Deployment 2 — step 6 plus the audit
+
+| step | change | risk |
+|---|---|---|
+| 6 | Wire the six-state result to the gate | behaviour change, gated on deployment 1 evidence |
+| 7 | Post-promotion audit (interval listing scan + widened recording condition) | additive; costs ~32 extra requests/day |
+
+Mode **still** stays `rss_shadow` on deploy. Verify the gate now reports ready
+and that an audit-marked cycle records a comparison correctly.
+
+### The flip — Jesse only
+
+Set `hdencode_discovery_mode = rss_primary`. Confirm the first cycle runs rather
+than skipping with `primary_not_ready`, and confirm the first audit cycle
+produces a comparison.
 
 Step 1 is independently correct and can land alone even if the rest is rejected.
 
@@ -348,9 +418,21 @@ Step 1 is independently correct and can land alone even if the rest is rejected.
 
 ---
 
-## Open question for the decision owner
+## Decisions made 2026-07-27
 
-Given finding 4 — that promotion ends shadow comparison — the choice is between
-promoting on a one-time certification, or first adding a post-promotion audit so
-that miss detection continues. That decision belongs to Jesse and is not made
-here.
+Both taken by Jesse after finding 4 was confirmed in code.
+
+1. **Add the post-promotion audit, then promote.** Promotion on a one-time
+   certification was rejected. The audit is now in scope and promotion is gated
+   on it. Cost: ~72 requests/day instead of ~40, against ~680 today.
+2. **Review's six-step order in full, batched into two deployments.** Steps 1–5
+   ship together because none of them can change behaviour; the live six-state
+   counts are reviewed before deployment 2 wires the gate.
+
+## Open items — recorded, not decided
+
+- **Automatic demotion** on a post-promotion miss. Currently the audit reports
+  and notifies only. Adding auto-demotion would let one anomalous cycle revert
+  discovery mode without a human, and mode is a production setting.
+- **Audit interval.** Defaulted to 24 h. Shorter tightens detection latency and
+  costs proportionally more requests.
