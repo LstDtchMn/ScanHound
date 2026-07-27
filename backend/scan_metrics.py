@@ -304,6 +304,22 @@ class DiscardSample:
         }
 
 
+def _as_count(counters, value) -> int:
+    """Coerce a caller-supplied count, recording a fault rather than raising.
+
+    A recorder must never propagate a TypeError into scan control flow.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            with counters._lock:
+                counters.recorder_faults += 1
+        except Exception:  # pragma: no cover
+            pass
+        return 0
+
+
 @dataclass
 class ScanStageCounters:
     """Non-overlapping per-stage counters for one scan run.
@@ -344,6 +360,11 @@ class ScanStageCounters:
     #: plausible-looking bucket.
     #: reconcile() called without a terminal future state. A wiring defect.
     reconcile_misuse: int = 0
+    #: A release was created after its ticket was already closed. A wiring
+    #: defect, and invisible to the equations unless counted explicitly.
+    media_item_created_after_terminal: int = 0
+    #: Public recorder calls that raised internally and were swallowed.
+    recorder_faults: int = 0
 
     scheduled_terminal_missing: int = 0
     detail_terminal_missing: int = 0
@@ -365,6 +386,7 @@ class ScanStageCounters:
 
     def note_scheduled(self, count: int = 1) -> None:
         """Posts handed to the executor. Not yet attempted work."""
+        count = _as_count(self, count)
         if count <= 0:
             return
         with self._lock:
@@ -377,6 +399,7 @@ class ScanStageCounters:
 
     def note_http_request(self, count: int = 1) -> None:
         """One outbound detail request. A started post may make several."""
+        count = _as_count(self, count)
         if count <= 0:
             return
         with self._lock:
@@ -389,6 +412,17 @@ class ScanStageCounters:
     def note_item_created(self) -> None:
         with self._lock:
             self.media_item_created += 1
+
+    def note_created_after_terminal(self) -> None:
+        """A release shipped, but the ticket had already been closed.
+
+        Named and conserved rather than dropped: ABANDONED_ON_STOP occupies the
+        same slot in the returned-data equation, so a silently discarded
+        creation was cancelled out one-for-one and the books stayed clean while
+        a genuinely shipped release went uncounted.
+        """
+        with self._lock:
+            self.media_item_created_after_terminal += 1
 
     # -- discards ---------------------------------------------------------
 
@@ -413,8 +447,26 @@ class ScanStageCounters:
         genuinely have no better information. ``lifecycle_started`` lets an
         instrumentation gap be filed against the equation it actually breaks.
         """
-        actual = stage or default_stage_for(code)
-        kind = terminal_kind or default_kind_for(code)
+        # Coerce and validate BEFORE taking the lock. note_discard performs
+        # five mutations under one lock; a raise partway through used to leave
+        # the object permanently inconsistent with no way to tell which post
+        # caused the drift.
+        try:
+            code = DiscardCode(code)
+        except (ValueError, TypeError):
+            code = DiscardCode.UNKNOWN
+        try:
+            actual = ScanStage(stage) if stage is not None else default_stage_for(code)
+        except (ValueError, TypeError):
+            actual = ScanStage.UNSPECIFIED
+        try:
+            kind = (
+                TerminalKind(terminal_kind)
+                if terminal_kind is not None
+                else default_kind_for(code)
+            )
+        except (ValueError, TypeError):
+            kind = TerminalKind.UNSPECIFIED
         post_data = actual in (
             ScanStage.DETAIL_TO_ITEM_HANDOFF,
             ScanStage.MEDIA_ITEM_CONSTRUCTION,
@@ -486,6 +538,7 @@ class ScanStageCounters:
         Must never touch detail_started or detail_http_requests: no request was
         made and no work began.
         """
+        count = _as_count(self, count)
         if count <= 0:
             return
         with self._lock:
@@ -498,226 +551,377 @@ class ScanStageCounters:
             self.kinds[kind] = self.kinds.get(kind, 0) + count
 
     # -- reporting --------------------------------------------------------
+    #
+    # EVERY reader works from ONE atomic snapshot. Reading the counters and the
+    # three dicts unlocked produced two failures, both measured: a RuntimeError
+    # ("dictionary changed size during iteration") escaping a public method -
+    # the one thing this module promises cannot happen - and phantom
+    # conservation errors on 99.9% of concurrent reads, because the equations
+    # compared a newer left-hand side against an older right-hand side. The
+    # loudest "the instrumentation is lying" signal fired because the READER
+    # was lying.
+    #
+    # The lock is not reentrant, so the arithmetic lives in module-level pure
+    # functions over a snapshot and no public reader takes the lock twice.
+
+    def snapshot_counts(self) -> "CountersSnapshot":
+        """One consistent view of every counter, taken under the lock."""
+        with self._lock:
+            return CountersSnapshot(
+                listing_pages_requested=self.listing_pages_requested,
+                listing_pages_succeeded=self.listing_pages_succeeded,
+                listing_urls_discovered=self.listing_urls_discovered,
+                listing_urls_new=self.listing_urls_new,
+                listing_urls_skipped_cached=self.listing_urls_skipped_cached,
+                listing_blocked_pages=self.listing_blocked_pages,
+                listing_early_stopped=bool(self.listing_early_stopped),
+                detail_scheduled=self.detail_scheduled,
+                detail_started=self.detail_started,
+                detail_http_requests=self.detail_http_requests,
+                detail_cancelled_before_start=self.detail_cancelled_before_start,
+                detail_cancelled_after_start=self.detail_cancelled_after_start,
+                detail_returned_data=self.detail_returned_data,
+                detail_returned_none=self.detail_returned_none,
+                detail_raised_exception=self.detail_raised_exception,
+                media_item_created=self.media_item_created,
+                media_item_construction_failed=self.media_item_construction_failed,
+                media_item_abandoned_on_stop=self.media_item_abandoned_on_stop,
+                media_item_created_after_terminal=self.media_item_created_after_terminal,
+                reconcile_misuse=self.reconcile_misuse,
+                recorder_faults=self.recorder_faults,
+                scheduled_terminal_missing=self.scheduled_terminal_missing,
+                detail_terminal_missing=self.detail_terminal_missing,
+                media_item_terminal_missing=self.media_item_terminal_missing,
+                reasons=dict(self.reasons),
+                stages=dict(self.stages),
+                kinds=dict(self.kinds),
+                sample_count=len(self.samples),
+            )
+
+    def outcome_groups(self) -> Dict[str, int]:
+        return outcome_groups_of(self.snapshot_counts())
+
+    def conservation_errors(self) -> List[str]:
+        return conservation_errors_of(self.snapshot_counts())
 
     @property
     def detail_parse_success_ratio(self) -> float:
-        """Of the posts a worker actually started, how many yielded data."""
-        if self.detail_started <= 0:
-            return 1.0
-        return self.detail_returned_data / float(self.detail_started)
+        return detail_parse_success_ratio_of(self.snapshot_counts())
 
     @property
     def media_item_construction_attempted(self) -> int:
-        """Posts construction was actually TRIED on.
-
-        Excludes results stranded by Stop and instrumentation gaps: neither was
-        a construction attempt, and counting them would report a healthy
-        constructor as failing on any cancelled scan.
-        """
-        return self.media_item_created + self.media_item_construction_failed
+        snap = self.snapshot_counts()
+        return snap.media_item_created + snap.media_item_construction_failed
 
     @property
     def media_item_construction_success_ratio(self) -> float:
-        """Of the posts construction was attempted on, how many succeeded."""
-        attempted = self.media_item_construction_attempted
-        if attempted <= 0:
-            return 1.0
-        return self.media_item_created / float(attempted)
+        return construction_success_ratio_of(self.snapshot_counts())
 
     @property
     def end_to_end_item_yield(self) -> float:
-        """Of the posts actually started, how many became releases."""
-        if self.detail_started <= 0:
-            return 1.0
-        return self.media_item_created / float(self.detail_started)
+        return end_to_end_item_yield_of(self.snapshot_counts())
 
     @property
-    def requests_per_started_post(self) -> float:
-        if self.detail_started <= 0:
-            return 0.0
-        return self.detail_http_requests / float(self.detail_started)
-
-    def outcome_groups(self) -> Dict[str, int]:
-        """Split discards into populations that must not be conflated.
-
-        A parser-regression threshold that counts an operator pressing Stop, or
-        counts our own bookkeeping gaps, measures the wrong thing.
-        """
-        groups = {"failures": 0, "operator_stop_outcomes": 0, "instrumentation_gaps": 0}
-        for name, count in self.kinds.items():
-            try:
-                kind = TerminalKind(name)
-            except ValueError:  # pragma: no cover - unknown kind stays visible
-                groups["instrumentation_gaps"] += count
-                continue
-            if kind in _STOP_KINDS:
-                groups["operator_stop_outcomes"] += count
-            elif kind in _GAP_KINDS:
-                groups["instrumentation_gaps"] += count
-            else:
-                groups["failures"] += count
-        return groups
+    def requests_per_started_post(self) -> Optional[float]:
+        return requests_per_started_post_of(self.snapshot_counts())
 
     @property
     def eligible_for_health_scoring(self) -> bool:
-        """Whether this cycle may inform parser-health judgements.
-
-        Requires actual observations and books that balance. No observations is
-        not evidence of perfect health, and a cycle whose own bookkeeping is
-        broken cannot be evidence of anything. A cancelled scan's low yield is
-        not parser degradation and must never feed a circuit breaker.
-        """
-        groups = self.outcome_groups()
-        return (
-            self.detail_started > 0
-            and groups["operator_stop_outcomes"] == 0
-            and groups["instrumentation_gaps"] == 0
-            and not self.conservation_errors()
-        )
+        return eligible_for_health_scoring_of(self.snapshot_counts())
 
     @property
     def eligible_for_construction_scoring(self) -> bool:
-        """Construction health additionally needs a construction attempt."""
-        return (
-            self.eligible_for_health_scoring
-            and self.media_item_construction_attempted > 0
-        )
-
-    def conservation_errors(self) -> List[str]:
-        """Imbalances, as text. Empty means the books balance.
-
-        Returns rather than raises: a bookkeeping bug must never break a scan.
-        """
-        errors: List[str] = []
-        scheduled = (
-            self.detail_started
-            + self.detail_cancelled_before_start
-            + self.scheduled_terminal_missing
-        )
-        if self.detail_scheduled != scheduled:
-            errors.append(
-                "detail_scheduled=%d != started+cancelled_before_start+terminal_missing=%d"
-                % (self.detail_scheduled, scheduled)
-            )
-        started = (
-            self.detail_returned_data
-            + self.detail_returned_none
-            + self.detail_raised_exception
-            + self.detail_cancelled_after_start
-            + self.detail_terminal_missing
-        )
-        if self.detail_started != started:
-            errors.append(
-                "detail_started=%d != data+none+exception+cancelled_after_start"
-                "+terminal_missing=%d" % (self.detail_started, started)
-            )
-        constructed = (
-            self.media_item_created
-            + self.media_item_construction_failed
-            + self.media_item_abandoned_on_stop
-            + self.media_item_terminal_missing
-        )
-        if self.detail_returned_data != constructed:
-            errors.append(
-                "detail_returned_data=%d != created+construction_failed"
-                "+abandoned_on_stop+terminal_missing=%d"
-                % (self.detail_returned_data, constructed)
-            )
-        discards = (
-            self.detail_returned_none
-            + self.detail_raised_exception
-            + self.detail_cancelled_before_start
-            + self.detail_cancelled_after_start
-            + self.scheduled_terminal_missing
-            + self.detail_terminal_missing
-            + self.media_item_construction_failed
-            + self.media_item_abandoned_on_stop
-            + self.media_item_terminal_missing
-        )
-        tallied = sum(self.reasons.values())
-        if tallied != discards:
-            errors.append(
-                "reason tally=%d != discard counters=%d" % (tallied, discards)
-            )
-        staged = sum(self.stages.values())
-        if staged != tallied:
-            errors.append("stage tally=%d != reason tally=%d" % (staged, tallied))
-        # outcome_groups() and eligible_for_health_scoring are derived from
-        # kinds, so an unconserved kind tally leaves grouping and health
-        # eligibility wrong while everything else reads clean.
-        kinded = sum(self.kinds.values())
-        if kinded != tallied:
-            errors.append("kind tally=%d != reason tally=%d" % (kinded, tallied))
-        grouped = sum(self.outcome_groups().values())
-        if grouped != kinded:
-            errors.append("group tally=%d != kind tally=%d" % (grouped, kinded))
-        return errors
+        return eligible_for_construction_scoring_of(self.snapshot_counts())
 
     def to_dict(self) -> dict:
-        return {
-            "taxonomy_version": TAXONOMY_VERSION,
-            "listing_pages_requested": self.listing_pages_requested,
-            "listing_pages_succeeded": self.listing_pages_succeeded,
-            "listing_urls_discovered": self.listing_urls_discovered,
-            "listing_urls_new": self.listing_urls_new,
-            "listing_urls_skipped_cached": self.listing_urls_skipped_cached,
-            "listing_blocked_pages": self.listing_blocked_pages,
-            "listing_early_stopped": bool(self.listing_early_stopped),
-            "detail_scheduled": self.detail_scheduled,
-            "detail_started": self.detail_started,
-            "detail_http_requests": self.detail_http_requests,
-            "detail_cancelled_before_start": self.detail_cancelled_before_start,
-            "detail_cancelled_after_start": self.detail_cancelled_after_start,
-            "detail_returned_data": self.detail_returned_data,
-            "detail_returned_none": self.detail_returned_none,
-            "detail_raised_exception": self.detail_raised_exception,
-            "media_item_created": self.media_item_created,
-            "media_item_construction_failed": self.media_item_construction_failed,
-            "media_item_abandoned_on_stop": self.media_item_abandoned_on_stop,
-            "reconcile_misuse": self.reconcile_misuse,
-            "scheduled_terminal_missing": self.scheduled_terminal_missing,
-            "detail_terminal_missing": self.detail_terminal_missing,
-            "media_item_terminal_missing": self.media_item_terminal_missing,
-            "detail_parse_success_ratio": round(self.detail_parse_success_ratio, 4),
-            "media_item_construction_success_ratio": round(
-                self.media_item_construction_success_ratio, 4
-            ),
-            "end_to_end_item_yield": round(self.end_to_end_item_yield, 4),
-            "requests_per_started_post": round(self.requests_per_started_post, 4),
-            "media_item_construction_attempted": self.media_item_construction_attempted,
-            "reasons": dict(self.reasons),
-            "stages": dict(self.stages),
-            "kinds": dict(self.kinds),
-            "outcome_groups": self.outcome_groups(),
-            "eligible_for_health_scoring": self.eligible_for_health_scoring,
-            "eligible_for_construction_scoring": self.eligible_for_construction_scoring,
-            "samples": [s.to_dict() for s in self.samples],
-            "conservation_errors": self.conservation_errors(),
-        }
+        """Serialize from ONE snapshot.
+
+        Previously this called four readers that each took their own view, so a
+        single published row could contradict itself.
+        """
+        snap = self.snapshot_counts()
+        with self._lock:
+            samples = [sample.to_dict() for sample in self.samples]
+        return dict_of(snap, samples)
 
     def summary_line(self) -> str:
-        """One aggregated line per phase. Never one per post."""
-        head = "%d/%d started details produced releases (%d requests)" % (
-            self.media_item_created,
-            self.detail_started,
-            self.detail_http_requests,
+        return summary_line_of(self.snapshot_counts())
+
+
+@dataclass(frozen=True)
+class CountersSnapshot:
+    """An immutable, self-consistent view of one scan's counters."""
+
+    listing_pages_requested: int
+    listing_pages_succeeded: int
+    listing_urls_discovered: int
+    listing_urls_new: int
+    listing_urls_skipped_cached: int
+    listing_blocked_pages: int
+    listing_early_stopped: bool
+    detail_scheduled: int
+    detail_started: int
+    detail_http_requests: int
+    detail_cancelled_before_start: int
+    detail_cancelled_after_start: int
+    detail_returned_data: int
+    detail_returned_none: int
+    detail_raised_exception: int
+    media_item_created: int
+    media_item_construction_failed: int
+    media_item_abandoned_on_stop: int
+    media_item_created_after_terminal: int
+    reconcile_misuse: int
+    recorder_faults: int
+    scheduled_terminal_missing: int
+    detail_terminal_missing: int
+    media_item_terminal_missing: int
+    reasons: Dict[str, int]
+    stages: Dict[str, int]
+    kinds: Dict[str, int]
+    sample_count: int
+
+
+def outcome_groups_of(snap: CountersSnapshot) -> Dict[str, int]:
+    """Split discards into populations that must not be conflated.
+
+    A parser-regression threshold that counts an operator pressing Stop, or
+    counts our own bookkeeping gaps, measures the wrong thing.
+    """
+    groups = {"failures": 0, "operator_stop_outcomes": 0, "instrumentation_gaps": 0}
+    for name, count in snap.kinds.items():
+        try:
+            kind = TerminalKind(name)
+        except (ValueError, TypeError):
+            # An unparseable key is itself a bookkeeping defect, not a failure.
+            groups["instrumentation_gaps"] += count
+            continue
+        if kind in _STOP_KINDS:
+            groups["operator_stop_outcomes"] += count
+        elif kind in _GAP_KINDS:
+            groups["instrumentation_gaps"] += count
+        else:
+            groups["failures"] += count
+    return groups
+
+
+def detail_parse_success_ratio_of(snap: CountersSnapshot) -> float:
+    """Of the posts that actually REACHED parsing, how many yielded data.
+
+    Cancellations and instrumentation gaps are excluded from the denominator:
+    including them made a total source outage and a total parser regression
+    produce an identical number.
+    """
+    attempted = (
+        snap.detail_returned_data
+        + snap.detail_returned_none
+        + snap.detail_raised_exception
+    )
+    if attempted <= 0:
+        return 1.0
+    return snap.detail_returned_data / float(attempted)
+
+
+def construction_success_ratio_of(snap: CountersSnapshot) -> float:
+    attempted = snap.media_item_created + snap.media_item_construction_failed
+    if attempted <= 0:
+        return 1.0
+    return snap.media_item_created / float(attempted)
+
+
+def end_to_end_item_yield_of(snap: CountersSnapshot) -> float:
+    if snap.detail_started <= 0:
+        return 1.0
+    return snap.media_item_created / float(snap.detail_started)
+
+
+def requests_per_started_post_of(snap: CountersSnapshot) -> Optional[float]:
+    """None when there is nothing to divide - never 0.0, which is a real value
+    inside this metric's normal range and would be indistinguishable from a
+    scan that genuinely made no requests."""
+    if snap.detail_started <= 0:
+        return None
+    return snap.detail_http_requests / float(snap.detail_started)
+
+
+def eligible_for_health_scoring_of(snap: CountersSnapshot) -> bool:
+    """Whether this cycle may inform parser-health judgements.
+
+    Requires observations and books that balance. No observations is not
+    evidence of perfect health, and a cycle whose own bookkeeping is broken is
+    not evidence of anything. Stop outcomes are excluded from the RATIO
+    DENOMINATORS rather than vetoing the cycle - one routine cancellation used
+    to silence the very regression these counters exist to catch.
+    """
+    groups = outcome_groups_of(snap)
+    return (
+        snap.detail_started > 0
+        and groups["instrumentation_gaps"] == 0
+        and snap.reconcile_misuse == 0
+        and snap.media_item_created_after_terminal == 0
+        and snap.recorder_faults == 0
+        and not conservation_errors_of(snap)
+    )
+
+
+def eligible_for_construction_scoring_of(snap: CountersSnapshot) -> bool:
+    attempted = snap.media_item_created + snap.media_item_construction_failed
+    return eligible_for_health_scoring_of(snap) and attempted > 0
+
+
+def conservation_errors_of(snap: CountersSnapshot) -> List[str]:
+    """Imbalances, as text. Empty means the books balance.
+
+    Returns rather than raises: a bookkeeping bug must never break a scan.
+    """
+    errors: List[str] = []
+    scheduled = (
+        snap.detail_started
+        + snap.detail_cancelled_before_start
+        + snap.scheduled_terminal_missing
+    )
+    if snap.detail_scheduled != scheduled:
+        errors.append(
+            "detail_scheduled=%d != started+cancelled_before_start+terminal_missing=%d"
+            % (snap.detail_scheduled, scheduled)
         )
-        errors = self.conservation_errors()
-        if not self.reasons:
-            return head + ("; metrics_errors=%d" % len(errors) if errors else "")
-        groups = self.outcome_groups()
-        top = sorted(self.reasons.items(), key=lambda kv: (-kv[1], kv[0]))
-        detail = ", ".join("%s=%d" % (code, n) for code, n in top)
-        parts = [head]
-        if groups["failures"]:
-            parts.append("failures=%d" % groups["failures"])
-        if groups["operator_stop_outcomes"]:
-            parts.append("stopped=%d" % groups["operator_stop_outcomes"])
-        if groups["instrumentation_gaps"]:
-            parts.append("instrumentation gaps=%d" % groups["instrumentation_gaps"])
-        if errors:
-            parts.append("metrics_errors=%d" % len(errors))
-        return "; ".join(parts) + " [" + detail + "]"
+    started = (
+        snap.detail_returned_data
+        + snap.detail_returned_none
+        + snap.detail_raised_exception
+        + snap.detail_cancelled_after_start
+        + snap.detail_terminal_missing
+    )
+    if snap.detail_started != started:
+        errors.append(
+            "detail_started=%d != data+none+exception+cancelled_after_start"
+            "+terminal_missing=%d" % (snap.detail_started, started)
+        )
+    constructed = (
+        snap.media_item_created
+        + snap.media_item_construction_failed
+        + snap.media_item_abandoned_on_stop
+        + snap.media_item_terminal_missing
+    )
+    if snap.detail_returned_data != constructed:
+        errors.append(
+            "detail_returned_data=%d != created+construction_failed"
+            "+abandoned_on_stop+terminal_missing=%d"
+            % (snap.detail_returned_data, constructed)
+        )
+    discards = (
+        snap.detail_returned_none
+        + snap.detail_raised_exception
+        + snap.detail_cancelled_before_start
+        + snap.detail_cancelled_after_start
+        + snap.scheduled_terminal_missing
+        + snap.detail_terminal_missing
+        + snap.media_item_construction_failed
+        + snap.media_item_abandoned_on_stop
+        + snap.media_item_terminal_missing
+    )
+    tallied = sum(snap.reasons.values())
+    if tallied != discards:
+        errors.append("reason tally=%d != discard counters=%d" % (tallied, discards))
+    staged = sum(snap.stages.values())
+    if staged != tallied:
+        errors.append("stage tally=%d != reason tally=%d" % (staged, tallied))
+    kinded = sum(snap.kinds.values())
+    if kinded != tallied:
+        errors.append("kind tally=%d != reason tally=%d" % (kinded, tallied))
+    # Every recorded key must parse back to its enum. The old group-vs-kind
+    # check could not fail by construction, and silently absorbed an unparseable
+    # kind into instrumentation_gaps with clean books.
+    for label, mapping, enum_cls in (
+        ("reason", snap.reasons, DiscardCode),
+        ("stage", snap.stages, ScanStage),
+        ("kind", snap.kinds, TerminalKind),
+    ):
+        for key in mapping:
+            try:
+                enum_cls(key)
+            except (ValueError, TypeError):
+                errors.append("unrecognised %s key %r" % (label, key))
+    if snap.media_item_created_after_terminal:
+        errors.append(
+            "media_item_created_after_terminal=%d releases shipped after their "
+            "ticket closed" % snap.media_item_created_after_terminal
+        )
+    return errors
+
+
+def dict_of(snap: CountersSnapshot, samples: List[dict]) -> dict:
+    groups = outcome_groups_of(snap)
+    return {
+        "taxonomy_version": TAXONOMY_VERSION,
+        "listing_pages_requested": snap.listing_pages_requested,
+        "listing_pages_succeeded": snap.listing_pages_succeeded,
+        "listing_urls_discovered": snap.listing_urls_discovered,
+        "listing_urls_new": snap.listing_urls_new,
+        "listing_urls_skipped_cached": snap.listing_urls_skipped_cached,
+        "listing_blocked_pages": snap.listing_blocked_pages,
+        "listing_early_stopped": snap.listing_early_stopped,
+        "detail_scheduled": snap.detail_scheduled,
+        "detail_started": snap.detail_started,
+        "detail_http_requests": snap.detail_http_requests,
+        "detail_cancelled_before_start": snap.detail_cancelled_before_start,
+        "detail_cancelled_after_start": snap.detail_cancelled_after_start,
+        "detail_returned_data": snap.detail_returned_data,
+        "detail_returned_none": snap.detail_returned_none,
+        "detail_raised_exception": snap.detail_raised_exception,
+        "media_item_created": snap.media_item_created,
+        "media_item_construction_failed": snap.media_item_construction_failed,
+        "media_item_abandoned_on_stop": snap.media_item_abandoned_on_stop,
+        "media_item_created_after_terminal": snap.media_item_created_after_terminal,
+        "media_item_construction_attempted": (
+            snap.media_item_created + snap.media_item_construction_failed
+        ),
+        "reconcile_misuse": snap.reconcile_misuse,
+        "recorder_faults": snap.recorder_faults,
+        "scheduled_terminal_missing": snap.scheduled_terminal_missing,
+        "detail_terminal_missing": snap.detail_terminal_missing,
+        "media_item_terminal_missing": snap.media_item_terminal_missing,
+        "detail_parse_success_ratio": round(detail_parse_success_ratio_of(snap), 4),
+        "media_item_construction_success_ratio": round(
+            construction_success_ratio_of(snap), 4
+        ),
+        "end_to_end_item_yield": round(end_to_end_item_yield_of(snap), 4),
+        "requests_per_started_post": requests_per_started_post_of(snap),
+        "reasons": dict(snap.reasons),
+        "stages": dict(snap.stages),
+        "kinds": dict(snap.kinds),
+        "outcome_groups": groups,
+        "eligible_for_health_scoring": eligible_for_health_scoring_of(snap),
+        "eligible_for_construction_scoring": eligible_for_construction_scoring_of(snap),
+        "samples": samples,
+        "conservation_errors": conservation_errors_of(snap),
+    }
+
+
+def summary_line_of(snap: CountersSnapshot) -> str:
+    """One aggregated line per phase. Never one per post."""
+    head = "%d/%d started details produced releases (%d requests)" % (
+        snap.media_item_created,
+        snap.detail_started,
+        snap.detail_http_requests,
+    )
+    errors = conservation_errors_of(snap)
+    if not snap.reasons:
+        return head + ("; metrics_errors=%d" % len(errors) if errors else "")
+    groups = outcome_groups_of(snap)
+    top = sorted(snap.reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+    detail = ", ".join("%s=%d" % (code, n) for code, n in top)
+    parts = [head]
+    if groups["failures"]:
+        parts.append("failures=%d" % groups["failures"])
+    if groups["operator_stop_outcomes"]:
+        parts.append("stopped=%d" % groups["operator_stop_outcomes"])
+    gaps = groups["instrumentation_gaps"] + snap.reconcile_misuse
+    if gaps:
+        parts.append("instrumentation gaps=%d" % gaps)
+    if errors:
+        parts.append("metrics_errors=%d" % len(errors))
+    return "; ".join(parts) + " [" + detail + "]"
 
 
 class PostOutcome:
@@ -788,12 +992,25 @@ class PostOutcome:
             )
 
     def _claim(self, code: Optional[DiscardCode]) -> bool:
+        # Resolve the label BEFORE claiming: computing it inside the critical
+        # section meant a bad code poisoned the ticket with terminal_code=None
+        # and disarmed both the retry and the outer fallback.
+        try:
+            label = DiscardCode(code).value if code is not None else "item_created"
+        except (ValueError, TypeError):
+            label = DiscardCode.UNKNOWN.value
         with self._lock:
             if self._booked:
                 return False
             self._booked = True
-            self._terminal_code = code.value if code is not None else "item_created"
+            self._terminal_code = label
             return True
+
+    def _release_claim(self) -> None:
+        """Undo a claim whose recording failed, so the post stays diagnosable."""
+        with self._lock:
+            self._booked = False
+            self._terminal_code = None
 
     def note_started(self) -> None:
         """Idempotent: a retry inside the worker must not re-count the post."""
@@ -828,12 +1045,24 @@ class PostOutcome:
         except Exception:  # pragma: no cover
             pass
 
-    def item_created(self) -> None:
+    def item_created(self) -> bool:
+        """Book a shipped release. False if the ticket was already closed.
+
+        Symmetric with :meth:`discard` on purpose. Previously this was the only
+        increment gated on winning the claim, and a lost claim dropped the event
+        with no return value and no counter - so a scan that shipped 40 releases
+        could report zero with perfectly clean books.
+        """
         try:
-            if self._claim(None) and self._counters is not None:
-                self._counters.note_item_created()
+            if self._claim(None):
+                if self._counters is not None:
+                    self._counters.note_item_created()
+                return True
+            if self._counters is not None:
+                self._counters.note_created_after_terminal()
+            return False
         except Exception:  # pragma: no cover
-            pass
+            return False
 
     def discard(
         self,
@@ -864,7 +1093,10 @@ class PostOutcome:
                     terminal_kind=terminal_kind,
                 )
             return True
-        except Exception:  # pragma: no cover
+        except Exception:  # pragma: no cover - recorder must never escape
+            # Give the claim back. A recorder fault must not permanently
+            # silence a post - the exact outcome this module exists to prevent.
+            self._release_claim()
             return False
 
     # -- post-drain reconciliation ---------------------------------------
@@ -905,16 +1137,29 @@ class PostOutcome:
             code = DiscardCode.DETAIL_CANCELLED_BEFORE_START
             stage = ScanStage.DETAIL_FETCH
             kind = TerminalKind.CANCELLED_BEFORE_START
+        elif state is FutureTerminalState.COMPLETED_EXCEPTION and snap.data_returned:
+            # The scraper produced its dict and the worker raised downstream.
+            # Nothing was lost at parse; the failure is on the construction side.
+            code = DiscardCode.MEDIA_ITEM_EXCEPTION
+            stage = ScanStage.MEDIA_ITEM_CONSTRUCTION
+            kind = TerminalKind.CONSTRUCTION_FAILED
         elif state is FutureTerminalState.COMPLETED_EXCEPTION:
             # The reason is unknown; the LIFECYCLE is not - it raised.
             code = DiscardCode.UNKNOWN
             stage = ScanStage.UNSPECIFIED
             kind = TerminalKind.RAISED_EXCEPTION
-        elif snap.data_returned:
+        elif state is FutureTerminalState.COMPLETED_WITH_DATA:
             # The detail SUCCEEDED; the scan stopped before its result was used.
             code = DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP
             stage = ScanStage.DETAIL_TO_ITEM_HANDOFF
             kind = TerminalKind.ABANDONED_ON_STOP
+        elif snap.data_returned:
+            # The future says falsy, the ticket says data. A real contradiction:
+            # name it as an instrumentation gap rather than inventing an
+            # operator Stop that never happened.
+            code = DiscardCode.TERMINAL_OUTCOME_MISSING
+            stage = ScanStage.DETAIL_TO_ITEM_HANDOFF
+            kind = TerminalKind.TERMINAL_MISSING
         else:
             # Ran, returned falsy, booked nothing: an uninstrumented scraper.
             code = DiscardCode.DETAIL_EMPTY
