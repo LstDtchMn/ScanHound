@@ -476,9 +476,24 @@ if ($needsRecreate) {
     Write-Host "Recreating the scanhound container to pick up live mounts..."
     Write-Host "  compose file: $ComposeFile"
     Write-Host "  project dir : $ComposeProjectDir"
-    docker compose -f $ComposeFile --project-directory $ComposeProjectDir up -d --force-recreate
+
+    # --no-build and --pull never close the last mutable-source tail. Pinning
+    # the recipe alone is not sufficient: the service declares BOTH
+    # `build: .` and `image: scanhound:latest`, and --project-directory still
+    # points at the working tree, so a MISSING local image would let Compose
+    # build a recovery-time image from whatever branch happens to be checked
+    # out. --pull never additionally stops a registry image from silently
+    # replacing the locally validated one.
+    #
+    # Recovery must only ever restart what was already reviewed and built.
+    # A missing image is a deployment problem for a human, not something a
+    # recovery script should paper over.
+    docker compose -f $ComposeFile --project-directory $ComposeProjectDir `
+        up -d --force-recreate --no-build --pull never
     if ($LASTEXITCODE -ne 0) {
-        Fail "docker compose up -d --force-recreate failed (exit $LASTEXITCODE)." 4
+        Fail ("docker compose up -d --force-recreate --no-build --pull never failed " +
+              "(exit $LASTEXITCODE). If the scanhound:latest image is missing, that is " +
+              "deliberate: recovery never builds from the working tree.") 4
     }
 
     # THE completion gate. Compose exiting 0 proves a container started, not

@@ -1,11 +1,17 @@
 # Stage 0 installer for ScanHound-MountNASShares.
 #
-# Registers the scheduled task from a deterministic definition, then EXPORTS
-# the installed task and asserts every security-critical field -- because a
-# registration command returning success is not evidence of what got installed.
+# ONE elevated operation: deploy the reviewed bundle to a stable location,
+# hash it, lock it down, register the task, then EXPORT the installed task and
+# assert every security-critical field -- because a registration command
+# returning success is not evidence of what got installed.
 #
-# Must run elevated: a task with RunLevel=Highest cannot be registered from a
-# non-elevated shell (verified 2026-07-26: "Access is denied").
+# Deployment and registration are deliberately not separable. Splitting them
+# lets the deployed script drift from the task that points at it, which is the
+# exact class of "undiscoverable configuration" this installer exists to end.
+#
+# Must run elevated: a RunLevel=Highest task cannot be registered from a
+# non-elevated shell (verified 2026-07-26: "Access is denied"), and the deploy
+# directory is intentionally not user-writable.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File install-mount-task.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File install-mount-task.ps1 -WhatIf
@@ -14,108 +20,200 @@
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [string]$DeployDir = 'C:\ProgramData\ScanHound\deploy',
-    [string]$BackupDir = 'C:\ProgramData\ScanHound\backup'
+    [string]$SourceRepo = 'X:\Docker Apps\ScanHound',
+    [string]$DeployDir  = 'C:\ProgramData\ScanHound\deploy',
+    [string]$BackupDir  = 'C:\ProgramData\ScanHound\backup'
 )
 
 $ErrorActionPreference = 'Stop'
 
 $TaskName = 'ScanHound-MountNASShares'
 $Sid      = 'S-1-5-21-2209700402-3938720563-1532606968-1001'
-$Deployed = Join-Path $DeployDir 'mount-nas-shares.ps1'
-$Compose  = Join-Path $DeployDir 'docker-compose.yml'
-$Manifest = Join-Path $DeployDir 'MANIFEST.json'
 
-# --- preconditions ---------------------------------------------------------
+$SrcScript  = Join-Path $SourceRepo 'scripts\mount-nas-shares.ps1'
+$SrcCompose = Join-Path $SourceRepo 'docker-compose.yml'
+$Deployed   = Join-Path $DeployDir  'mount-nas-shares.ps1'
+$Compose    = Join-Path $DeployDir  'docker-compose.yml'
+$Manifest   = Join-Path $DeployDir  'MANIFEST.json'
 
-# Every precondition below is read-only, so none of them may be suppressed by
-# a dry run. $WhatIfPreference propagates into nested calls inside cmdlets like
+# Every precondition below is read-only, so none may be suppressed by a dry
+# run. $WhatIfPreference propagates into nested calls inside cmdlets like
 # Get-FileHash (an advanced function in 5.1), which made the integrity check
 # return an EMPTY hash under -WhatIf instead of verifying anything. Clear it
-# for the precondition block and restore it before ShouldProcess is consulted.
-$requestedWhatIf = $WhatIfPreference
+# for validation and restore it before anything mutates.
+$requestedWhatIf  = $WhatIfPreference
 $WhatIfPreference = $false
 
-# -WhatIf must be runnable unelevated so preconditions can be checked without
-# admin rights; only the actual registration requires elevation.
+# ---------------------------------------------------------------------------
+# 1. Elevation
+# ---------------------------------------------------------------------------
+
 $principalCheck = New-Object Security.Principal.WindowsPrincipal(
     [Security.Principal.WindowsIdentity]::GetCurrent())
 $isElevated = $principalCheck.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isElevated) {
     if ($requestedWhatIf) {
-        Write-Warning "Not elevated -- checking preconditions only. Registration would fail."
+        Write-Warning "Not elevated -- validating only. Deployment and registration would fail."
     } else {
         $WhatIfPreference = $requestedWhatIf
-        throw "Not elevated. Registering a RunLevel=Highest task requires an elevated shell."
+        throw "Not elevated. Deploying and registering this task requires an elevated shell."
     }
 }
 
-foreach ($f in @($Deployed, $Compose, $Manifest)) {
-    if (-not (Test-Path -LiteralPath $f)) { throw "Missing deployment input: $f" }
+# ---------------------------------------------------------------------------
+# 2. Validate the SOURCE before it is allowed to become the deployment
+# ---------------------------------------------------------------------------
+
+foreach ($f in @($SrcScript, $SrcCompose)) {
+    if (-not (Test-Path -LiteralPath $f)) { throw "Missing source input: $f" }
 }
 
-# Mechanical dependency gate: refuse to register against a script that is not
-# the PR #35-era hardened version. Identity verification is its defining
-# feature; without it, a wrong share can be mounted and reported healthy.
-$deployedText = Get-Content -LiteralPath $Deployed -Raw
+Push-Location $SourceRepo
+try {
+    $srcCommit = (& git rev-parse HEAD 2>$null)
+    $srcBranch = (& git rev-parse --abbrev-ref HEAD 2>$null)
+    $dirty     = (& git status --porcelain -- scripts/mount-nas-shares.ps1 docker-compose.yml 2>$null)
+} finally { Pop-Location }
+
+if ($dirty) {
+    throw ("Refusing to deploy: tracked inputs have uncommitted changes, so the " +
+           "deployed bundle could not be traced to a commit.`n$dirty")
+}
+if (-not $srcCommit) { throw "Could not resolve the source commit in $SourceRepo." }
+
+Write-Output "source  : $SourceRepo"
+Write-Output "commit  : $srcCommit ($srcBranch)"
+
+# Mechanical dependency gates, so requirements are ENFORCED rather than
+# remembered. Each marker stands for a property whose absence is dangerous.
+$srcText = Get-Content -LiteralPath $SrcScript -Raw
+
+# PR #35: mount identity verification. Without it a wrong share can be mounted
+# and reported healthy -- the failure this whole effort exists to prevent.
 foreach ($marker in @('verify_identity', 'path=UNC', 'Stop-ScanhoundVerified')) {
-    if ($deployedText -notmatch [regex]::Escape($marker)) {
-        throw "Deployed script lacks '$marker' -- refusing to register a pre-PR#35 script."
+    if ($srcText -notmatch [regex]::Escape($marker)) {
+        throw "Source script lacks '$marker' -- refusing to deploy a pre-PR#35 script."
     }
 }
-if ($deployedText -notmatch [regex]::Escape('--project-directory')) {
-    throw "Deployed script still recreates from the working tree -- refusing to register."
+
+# Stage 0: the recreate must not read its recipe from the mutable working tree.
+if ($srcText -notmatch [regex]::Escape('--project-directory')) {
+    throw "Source script still recreates from the working tree -- refusing to deploy."
 }
 
-# Hashes must match what was recorded at deploy time. An empty hash is treated
-# as a hard failure rather than a mismatch, so a verification step that fails
-# to run can never be mistaken for one that ran and disagreed.
-$mf = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json
-foreach ($entry in $mf.files) {
-    $path = Join-Path $DeployDir $entry.name
-    $have = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+# --project-directory pins the recipe but still resolves relative paths against
+# the working tree, so a MISSING local image would let Compose build recovery
+# from checked-out source. These two flags are what actually close that tail.
+foreach ($marker in @('--no-build', '--pull never')) {
+    if ($srcText -notmatch [regex]::Escape($marker)) {
+        throw ("Source script lacks '$marker' -- a recovery run could build from the " +
+               "working tree or pull over the validated image. Refusing to deploy.")
+    }
+}
+
+# The deployed script must point at the deploy directory it is being installed
+# into; a script hard-coded to a different path would be silently inert.
+if ($srcText -notmatch [regex]::Escape($DeployDir)) {
+    throw "Source script does not reference $DeployDir -- its Compose pin targets elsewhere."
+}
+
+Write-Output "gates   : PR#35 markers + Compose pinning + no-build/no-pull  OK"
+
+if ($requestedWhatIf) {
+    Write-Output "`n-WhatIf: source validated; nothing deployed, nothing registered."
+    return
+}
+
+# ---------------------------------------------------------------------------
+# 3. Deploy
+# ---------------------------------------------------------------------------
+
+$WhatIfPreference = $requestedWhatIf   # honour the caller from here on
+
+New-Item -ItemType Directory -Force $DeployDir | Out-Null
+Copy-Item $SrcScript  $Deployed -Force
+Copy-Item $SrcCompose $Compose  -Force
+
+$manifest = [ordered]@{
+    deployed_at   = (Get-Date).ToString('o')
+    stage         = 'Stage 0 - scheduler settings + stable deployment path'
+    source_repo   = $SourceRepo
+    source_commit = $srcCommit
+    source_branch = $srcBranch
+    files         = @(
+        [ordered]@{ name = 'mount-nas-shares.ps1'
+                    sha256 = (Get-FileHash $Deployed -Algorithm SHA256).Hash
+                    source_path = 'scripts/mount-nas-shares.ps1' },
+        [ordered]@{ name = 'docker-compose.yml'
+                    sha256 = (Get-FileHash $Compose -Algorithm SHA256).Hash
+                    source_path = 'docker-compose.yml' }
+    )
+}
+$manifest | ConvertTo-Json -Depth 5 | Out-File $Manifest -Encoding utf8
+
+# Lock the deployment: an unprivileged user must not be able to replace the
+# script an elevated scheduled task executes. Read+execute for the task's
+# account, write only for administrators. Mutable state deliberately lives in
+# the PARENT directory, never here.
+& icacls.exe $DeployDir /inheritance:r /q                                  | Out-Null
+& icacls.exe $DeployDir /grant 'BUILTIN\Administrators:(OI)(CI)(F)' /q     | Out-Null
+& icacls.exe $DeployDir /grant '*S-1-5-18:(OI)(CI)(F)' /q                  | Out-Null
+& icacls.exe $DeployDir /grant "*$($Sid):(OI)(CI)(RX)" /T /q               | Out-Null
+
+Write-Output "deployed: $DeployDir"
+foreach ($e in $manifest.files) { Write-Output "          $($e.name)  $($e.sha256.Substring(0,16))..." }
+
+# Verify what actually landed, rather than trusting the copy.
+foreach ($e in $manifest.files) {
+    $have = (Get-FileHash (Join-Path $DeployDir $e.name) -Algorithm SHA256).Hash
     if ([string]::IsNullOrWhiteSpace($have)) {
-        throw "Could not compute a hash for $path -- refusing to proceed unverified."
+        throw "Could not hash $($e.name) after deployment -- refusing to proceed unverified."
     }
-    if ($have -ne $entry.sha256) {
-        throw "Hash mismatch for $($entry.name):`n  manifest: $($entry.sha256)`n  on disk : $have"
-    }
-    Write-Output "hash OK  $($entry.name)  $($entry.sha256.Substring(0,16))..."
+    if ($have -ne $e.sha256) { throw "Post-deploy hash mismatch for $($e.name)." }
 }
 
-# Preconditions are done; honour the caller's dry-run choice from here on.
-$WhatIfPreference = $requestedWhatIf
-
-# --- backup ----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 4. Back up the task being replaced
+# ---------------------------------------------------------------------------
 
 New-Item -ItemType Directory -Force $BackupDir | Out-Null
 $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
 $backup = Join-Path $BackupDir "$TaskName.$stamp.xml"
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Export-ScheduledTask -TaskName $TaskName | Out-File -FilePath $backup -Encoding utf8
-    Write-Output "backed up existing task -> $backup"
+    Write-Output "backup  : $backup"
 } else {
-    Write-Output "no existing task to back up"
+    Write-Output "backup  : none (no existing task)"
 }
 
-# --- definition ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 5. Definition
+# ---------------------------------------------------------------------------
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Deployed`""
 
 # Boot: delayed. On the 2026-07-26 boot Docker's backend did not accept IPC
 # until T+119 s; the task previously fired at T+80 s and never retried.
+#
+# NOTE the InteractiveToken limitation: this trigger only fires when the
+# account already holds an interactive session, so it is opportunistic, not
+# unattended pre-logon recovery. The logon and time triggers carry the load.
 $tBoot = New-ScheduledTaskTrigger -AtStartup
 $tBoot.Delay = 'PT3M'
 
-# Logon: with LogonType=Interactive this is the trigger that actually fires
-# when the account logs in after startup, so it is a real recovery trigger.
 $tLogon = New-ScheduledTaskTrigger -AtLogOn -User $Sid
 $tLogon.Delay = 'PT1M'
 
-# EXACTLY ONE trigger owns repetition. A dedicated time trigger also starts the
-# periodic schedule at registration rather than at the next reboot.
-$tTime = New-ScheduledTaskTrigger -Once -At ([datetime]'2026-07-26T00:00:00') `
+# EXACTLY ONE trigger owns repetition, and its start boundary is computed at
+# install time, never hard-coded. A boundary already in the past is not a clean
+# "starts now": it is a MISSED occurrence, so the first firing falls to
+# StartWhenAvailable's queueing (documented to add up to ~10 minutes) rather
+# than to the schedule. A boundary just ahead gives a real, assertable first
+# run -- and a date literal would have rotted the moment this was re-run on a
+# later day.
+$triggerStart = (Get-Date).AddSeconds(90)
+$tTime = New-ScheduledTaskTrigger -Once -At $triggerStart `
     -RepetitionInterval (New-TimeSpan -Minutes 15)
 
 $settings = New-ScheduledTaskSettingsSet `
@@ -138,14 +236,16 @@ $desc = @"
 Re-mounts the 9 TURTLELANDSRV2 NAS shares inside Docker Desktop's WSL2 distro,
 verifies each mount's identity, and recovers the scanhound container.
 
-Stage 0 (2026-07-26): runs from the stable deployed bundle under
-$DeployDir -- NOT the git working tree -- with scheduler-owned retry
-(3 x 5 min), a 3-minute boot delay, and one 15-minute recovery trigger.
-Requires the PR #35-era hardened script (gated by this installer).
+Stage 0 (2026-07-26): runs from the stable deployed bundle under $DeployDir --
+NOT the git working tree -- with scheduler-owned retry (3 x 5 min), a 3-minute
+boot delay, and one 15-minute recovery trigger. Deployed from commit $srcCommit.
+
+LIMITATION: LogonType=Interactive means every trigger requires an existing
+interactive session for this account. There is no unattended pre-logon recovery.
 "@
 
 if (-not $PSCmdlet.ShouldProcess($TaskName, 'Register scheduled task')) {
-    Write-Output "`n-WhatIf: preconditions passed; task NOT registered."
+    Write-Output "`n-WhatIf: bundle deployed; task NOT registered."
     return
 }
 
@@ -156,7 +256,9 @@ Register-ScheduledTask -TaskName $TaskName -Action $action `
 Export-ScheduledTask -TaskName $TaskName |
     Out-File -FilePath (Join-Path $DeployDir "$TaskName.installed.xml") -Encoding utf8
 
-# --- assert the INSTALLED task, not the intent -----------------------------
+# ---------------------------------------------------------------------------
+# 6. Assert the INSTALLED task, not the intent
+# ---------------------------------------------------------------------------
 
 $t   = Get-ScheduledTask -TaskName $TaskName
 $xml = [xml](Export-ScheduledTask -TaskName $TaskName)
@@ -173,7 +275,7 @@ function Assert-Field($label, $actual, $expected) {
 Write-Output "`n=== installed-task assertions ==="
 Assert-Field 'action.Execute'              $t.Actions[0].Execute 'powershell.exe'
 Assert-Field 'action targets deployed'     ($t.Actions[0].Arguments -like "*$Deployed*") 'True'
-Assert-Field 'action avoids working tree'  ($t.Actions[0].Arguments -notlike '*X:\Docker Apps*') 'True'
+Assert-Field 'action avoids working tree'  ($t.Actions[0].Arguments -notlike "*$SourceRepo*") 'True'
 Assert-Field 'principal.UserId'            $t.Principal.UserId $Sid
 Assert-Field 'principal.LogonType'         $t.Principal.LogonType 'Interactive'
 Assert-Field 'principal.RunLevel'          $t.Principal.RunLevel 'Highest'
@@ -189,27 +291,45 @@ Assert-Field 'WakeToRun'                   $t.Settings.WakeToRun 'False'
 Assert-Field 'Enabled'                     $t.Settings.Enabled 'True'
 
 $bootDelay = $xml.SelectSingleNode('//t:BootTrigger/t:Delay', $ns)
-Assert-Field 'BootTrigger.Delay'           $(if ($bootDelay) { $bootDelay.InnerText } else { '<none>' }) 'PT3M'
+Assert-Field 'BootTrigger.Delay' $(if ($bootDelay) { $bootDelay.InnerText } else { '<none>' }) 'PT3M'
 
-# The spec's key structural requirement: exactly one trigger repeats.
+# The key structural requirement: exactly one trigger repeats.
 $repeaters = $xml.SelectNodes('//t:Triggers/*/t:Repetition/t:Interval', $ns)
-Assert-Field 'triggers owning repetition'  $repeaters.Count 1
+Assert-Field 'triggers owning repetition' $repeaters.Count 1
 if ($repeaters.Count -eq 1) {
-    Assert-Field 'repetition interval'     $repeaters[0].InnerText 'PT15M'
+    Assert-Field 'repetition interval'      $repeaters[0].InnerText 'PT15M'
     $dur = $xml.SelectSingleNode('//t:Triggers/*/t:Repetition/t:Duration', $ns)
     Assert-Field 'repetition is indefinite' $(if ($dur) { $dur.InnerText } else { '<none>' }) '<none>'
 }
 
+# A PT15M interval in the XML does not prove the trigger has a useful next
+# firing time. Assert the schedule is actually armed.
+$next = (Get-ScheduledTaskInfo -TaskName $TaskName).NextRunTime
+if (-not $next) {
+    Write-Output ("FAIL  {0,-32} {1}" -f 'NextRunTime present', '<null>')
+    $fail += 'NextRunTime is null -- the periodic schedule is not armed'
+} else {
+    Assert-Field 'NextRunTime in the future' ($next -gt (Get-Date)) 'True'
+    Assert-Field 'NextRunTime within 16 min' ($next -le (Get-Date).AddMinutes(16)) 'True'
+    Write-Output ("      {0,-32} {1:yyyy-MM-dd HH:mm:ss}" -f 'next run at', $next)
+}
+
+# The deployment must still match what was just recorded.
+foreach ($e in $manifest.files) {
+    $have = (Get-FileHash (Join-Path $DeployDir $e.name) -Algorithm SHA256).Hash
+    Assert-Field "deployed hash $($e.name)" $have $e.sha256
+}
+
 Write-Output ""
 if ($fail.Count -gt 0) {
-    Write-Output "=== $($fail.Count) ASSERTION FAILURE(S) ==="
+    Write-Output "=== $($fail.Count) ASSERTION FAILURE(S) -- REGISTRATION FAILED OPERATIONALLY ==="
     $fail | ForEach-Object { Write-Output "  $_" }
-    Write-Output "`nRoll back with: scripts\rollback-mount-task.ps1 -BackupXml `"$backup`""
+    Write-Output "`nRoll back FIRST, then troubleshoot:"
+    Write-Output "  powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath\..\rollback-mount-task.ps1`" -BackupXml `"$backup`""
     exit 1
 }
 
 Write-Output "=== all assertions passed ==="
 Write-Output "installed XML: $(Join-Path $DeployDir "$TaskName.installed.xml")"
 Write-Output "backup       : $backup"
-Write-Output "next run     : $((Get-ScheduledTaskInfo -TaskName $TaskName).NextRunTime)"
 exit 0
