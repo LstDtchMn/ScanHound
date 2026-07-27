@@ -44,6 +44,51 @@ $Manifest   = Join-Path $DeployDir  'MANIFEST.json'
 $requestedWhatIf  = $WhatIfPreference
 $WhatIfPreference = $false
 
+# --- helpers ---------------------------------------------------------------
+
+# icacls reports failure through its EXIT CODE, not through PowerShell errors,
+# and piping it to Out-Null discards that. A silently failed lockdown would
+# leave the deployment world-writable while the installer printed success --
+# the fail-open shape this whole effort exists to eliminate.
+function Invoke-Icacls {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$IcaclsArgs)
+    $out = & icacls.exe @IcaclsArgs /q 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls failed (exit $LASTEXITCODE): icacls $($IcaclsArgs -join ' ')`n$out"
+    }
+}
+
+# Proves a directory is genuinely locked, rather than assuming the grants took.
+# Checks OWNERSHIP too: an owner can always rewrite the DACL, so a directory
+# owned by an unprivileged account is not protected no matter what it grants.
+function Assert-AdminOnlyDirectory {
+    param([string]$Path)
+
+    $trusted = @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\TrustedInstaller')
+    $writeRights = [Security.AccessControl.FileSystemRights]::Write         -bor
+                   [Security.AccessControl.FileSystemRights]::Modify        -bor
+                   [Security.AccessControl.FileSystemRights]::FullControl   -bor
+                   [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                   [Security.AccessControl.FileSystemRights]::TakeOwnership -bor
+                   [Security.AccessControl.FileSystemRights]::Delete
+
+    $acl = Get-Acl -LiteralPath $Path
+    if ($trusted -notcontains $acl.Owner) {
+        throw ("$Path is owned by '$($acl.Owner)'. An owner can rewrite the DACL, so " +
+               "every restriction on it is advisory. Ownership must be Administrators.")
+    }
+    foreach ($ace in $acl.Access) {
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+        if ($trusted -contains $ace.IdentityReference.Value) { continue }
+        if (([int]$ace.FileSystemRights -band [int]$writeRights) -ne 0) {
+            throw ("$Path grants '$($ace.FileSystemRights)' to " +
+                   "'$($ace.IdentityReference)'. An unprivileged principal must not be " +
+                   "able to modify anything an elevated task reads or executes.")
+        }
+    }
+    Write-Output "locked  : $Path (owner $($acl.Owner), no non-admin write)"
+}
+
 # ---------------------------------------------------------------------------
 # 1. Elevation
 # ---------------------------------------------------------------------------
@@ -155,10 +200,26 @@ $manifest | ConvertTo-Json -Depth 5 | Out-File $Manifest -Encoding utf8
 # script an elevated scheduled task executes. Read+execute for the task's
 # account, write only for administrators. Mutable state deliberately lives in
 # the PARENT directory, never here.
-& icacls.exe $DeployDir /inheritance:r /q                                  | Out-Null
-& icacls.exe $DeployDir /grant 'BUILTIN\Administrators:(OI)(CI)(F)' /q     | Out-Null
-& icacls.exe $DeployDir /grant '*S-1-5-18:(OI)(CI)(F)' /q                  | Out-Null
-& icacls.exe $DeployDir /grant "*$($Sid):(OI)(CI)(RX)" /T /q               | Out-Null
+#
+# Both directories are hardened, not just the deploy one: rollback registers a
+# task definition read from the backup directory VERBATIM and elevated, so a
+# writable backup directory is an privilege-escalation path -- plant an XML,
+# wait for someone to roll back, get an arbitrary elevated task.
+#
+# OWNERSHIP IS PART OF THE LOCK. An object's owner can always rewrite its DACL
+# (WRITE_DAC is implicit for owners), so leaving these directories owned by the
+# unprivileged account makes every grant below advisory. Ownership moves to
+# Administrators first, and is asserted afterwards.
+foreach ($dir in @($DeployDir, $BackupDir)) {
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    Invoke-Icacls $dir '/setowner'     'BUILTIN\Administrators' '/T'
+    Invoke-Icacls $dir '/inheritance:r'
+    Invoke-Icacls $dir '/grant'        'BUILTIN\Administrators:(OI)(CI)(F)'
+    Invoke-Icacls $dir '/grant'        '*S-1-5-18:(OI)(CI)(F)'
+    Invoke-Icacls $dir '/grant'        "*$($Sid):(OI)(CI)(RX)" '/T'
+}
+Assert-AdminOnlyDirectory $DeployDir
+Assert-AdminOnlyDirectory $BackupDir
 
 Write-Output "deployed: $DeployDir"
 foreach ($e in $manifest.files) { Write-Output "          $($e.name)  $($e.sha256.Substring(0,16))..." }
@@ -212,9 +273,23 @@ $tLogon.Delay = 'PT1M'
 # than to the schedule. A boundary just ahead gives a real, assertable first
 # run -- and a date literal would have rotted the moment this was re-run on a
 # later day.
+#
+# THE REPETITION INTERVAL *IS* THE RETRY INTERVAL. This was 15 minutes while we
+# believed RestartOnFailure would retry a failed run 3 times at 5-minute spacing.
+# It does not: proved 2026-07-26 with a disposable task carrying no repeating
+# trigger, so a second run could only have been a restart. RestartOnFailure was
+# present on the registered task (Count=3 Interval=PT1M), the action exited 42,
+# LastTaskResult recorded 42 so Windows SAW the failure -- and over four minutes
+# there was exactly ONE run and zero restarts. RestartOnFailure covers a task
+# failing to LAUNCH, not an action returning nonzero.
+#
+# So 5 minutes here reproduces the recovery cadence the design intended, by the
+# only mechanism that actually works. RestartCount is kept because it still
+# covers genuine launch failures, but nothing depends on it.
+$RepetitionMinutes = 5
 $triggerStart = (Get-Date).AddSeconds(90)
 $tTime = New-ScheduledTaskTrigger -Once -At $triggerStart `
-    -RepetitionInterval (New-TimeSpan -Minutes 15)
+    -RepetitionInterval (New-TimeSpan -Minutes $RepetitionMinutes)
 
 $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
@@ -237,8 +312,12 @@ Re-mounts the 9 TURTLELANDSRV2 NAS shares inside Docker Desktop's WSL2 distro,
 verifies each mount's identity, and recovers the scanhound container.
 
 Stage 0 (2026-07-26): runs from the stable deployed bundle under $DeployDir --
-NOT the git working tree -- with scheduler-owned retry (3 x 5 min), a 3-minute
-boot delay, and one 15-minute recovery trigger. Deployed from commit $srcCommit.
+NOT the git working tree -- with a 3-minute boot delay and one $RepetitionMinutes-minute
+recovery trigger. Deployed from commit $srcCommit.
+
+RETRY COMES FROM THE REPEATING TRIGGER, NOT FROM RestartOnFailure: the latter
+was measured on this host NOT to fire on a nonzero action exit (only on a
+launch failure), so the repetition interval is the real retry interval.
 
 LIMITATION: LogonType=Interactive means every trigger requires an existing
 interactive session for this account. There is no unattended pre-logon recovery.
@@ -297,7 +376,7 @@ Assert-Field 'BootTrigger.Delay' $(if ($bootDelay) { $bootDelay.InnerText } else
 $repeaters = $xml.SelectNodes('//t:Triggers/*/t:Repetition/t:Interval', $ns)
 Assert-Field 'triggers owning repetition' $repeaters.Count 1
 if ($repeaters.Count -eq 1) {
-    Assert-Field 'repetition interval'      $repeaters[0].InnerText 'PT15M'
+    Assert-Field 'repetition interval'      $repeaters[0].InnerText "PT$($RepetitionMinutes)M"
     $dur = $xml.SelectSingleNode('//t:Triggers/*/t:Repetition/t:Duration', $ns)
     Assert-Field 'repetition is indefinite' $(if ($dur) { $dur.InnerText } else { '<none>' }) '<none>'
 }
@@ -310,7 +389,8 @@ if (-not $next) {
     $fail += 'NextRunTime is null -- the periodic schedule is not armed'
 } else {
     Assert-Field 'NextRunTime in the future' ($next -gt (Get-Date)) 'True'
-    Assert-Field 'NextRunTime within 16 min' ($next -le (Get-Date).AddMinutes(16)) 'True'
+    Assert-Field "NextRunTime within $($RepetitionMinutes + 1) min" `
+        ($next -le (Get-Date).AddMinutes($RepetitionMinutes + 1)) 'True'
     Write-Output ("      {0,-32} {1:yyyy-MM-dd HH:mm:ss}" -f 'next run at', $next)
 }
 
@@ -322,10 +402,30 @@ foreach ($e in $manifest.files) {
 
 Write-Output ""
 if ($fail.Count -gt 0) {
+    # An assertion failure means the task IS registered but is not the task that
+    # was reviewed. Leaving it enabled while a human reads the error would let a
+    # wrong definition fire on its own schedule, so disable it immediately and
+    # let rollback restore the previous one deliberately.
     Write-Output "=== $($fail.Count) ASSERTION FAILURE(S) -- REGISTRATION FAILED OPERATIONALLY ==="
     $fail | ForEach-Object { Write-Output "  $_" }
+
+    try {
+        Disable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
+        Write-Output "`nThe task has been DISABLED so the unverified definition cannot fire."
+    } catch {
+        Write-Output "`nWARNING: could not disable the task: $($_.Exception.Message)"
+        Write-Output "Disable it by hand before anything else."
+    }
+
+    # $PSScriptRoot, not "$PSCommandPath\..", which is not a resolvable path.
+    $rollbackScript = Join-Path $PSScriptRoot 'rollback-mount-task.ps1'
     Write-Output "`nRoll back FIRST, then troubleshoot:"
-    Write-Output "  powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath\..\rollback-mount-task.ps1`" -BackupXml `"$backup`""
+    if ($backup -and (Test-Path -LiteralPath $backup)) {
+        Write-Output "  powershell -NoProfile -ExecutionPolicy Bypass -File `"$rollbackScript`" -BackupXml `"$backup`""
+    } else {
+        Write-Output "  (no prior task existed, so there is nothing to restore --"
+        Write-Output "   unregister it instead: Unregister-ScheduledTask -TaskName $TaskName)"
+    }
     exit 1
 }
 

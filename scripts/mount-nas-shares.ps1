@@ -258,8 +258,45 @@ echo "RESULT: all $processed shares mounted and identity-verified"
 exit 0
 '@
 
-$tempData   = Join-Path $env:TEMP "scanhound-mount-nas.data"
-$tempScript = Join-Path $env:TEMP "scanhound-mount-nas.sh"
+# These two files are handed to `wsl -d docker-desktop -- sh`, which executes
+# them AS ROOT inside the distro. A fixed path under %TEMP% is therefore a
+# swap window: any process running as this user -- including an UNELEVATED one,
+# while this script runs elevated under the Scheduled Task -- could replace the
+# payload between write and execute and get root in the distro.
+#
+# New-SecureStagingDir returns a fresh randomly-named directory whose ACL grants
+# only the current user, Administrators and SYSTEM, with inheritance broken so
+# no ambient grant survives. Random naming also removes the predictable-path
+# pre-creation trick.
+function New-SecureStagingDir {
+    $root = Join-Path $env:ProgramData 'ScanHound\run'
+    New-Item -ItemType Directory -Force $root | Out-Null
+    $dir = Join-Path $root ([Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force $dir | Out-Null
+
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    & icacls.exe $dir /inheritance:r /q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not harden staging directory $dir (inheritance)." }
+    foreach ($grant in @("*$me`:(OI)(CI)(F)", 'BUILTIN\Administrators:(OI)(CI)(F)', '*S-1-5-18:(OI)(CI)(F)')) {
+        & icacls.exe $dir /grant $grant /q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not harden staging directory $dir (grant $grant)." }
+    }
+
+    # Prove it, rather than assuming the grants took. A staging directory that
+    # is still writable by others must stop the run, not be used anyway.
+    $trusted = @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\TrustedInstaller',
+                 [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    foreach ($ace in (Get-Acl -LiteralPath $dir).Access) {
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+        if ($trusted -contains $ace.IdentityReference.Value) { continue }
+        throw "Staging directory $dir still grants access to '$($ace.IdentityReference)'."
+    }
+    return $dir
+}
+
+$stagingDir = New-SecureStagingDir
+$tempData   = Join-Path $stagingDir "mount-nas.data"
+$tempScript = Join-Path $stagingDir "mount-nas.sh"
 # The data file MUST end with a newline. Without it POSIX `read` returns
 # non-zero on the final record and the consuming loop drops it -- silently, and
 # always the last share, which is the critical read-write TV destination. The
@@ -281,6 +318,8 @@ Write-Host "Mounting NAS shares inside the docker-desktop WSL2 distro..."
 wsl -d docker-desktop -- sh (ConvertTo-WslPath $tempScript) (ConvertTo-WslPath $tempData) $shares.Count
 $mountExit = $LASTEXITCODE
 
+# The whole staging directory is removed in the finally block, which also
+# covers the early-exit paths this line never reached.
 Remove-Item $tempScript, $tempData -Force -ErrorAction SilentlyContinue
 
 # Partial-failure policy, stated deliberately rather than by omission:
@@ -402,8 +441,11 @@ foreach ($key in $shares.Keys) {
     $probeData += "$(Get-ContainerTarget $key)`t$($shares[$key])"
 }
 
-$probeScriptPath = Join-Path $env:TEMP "scanhound-probe-mounts.sh"
-$probeDataPath   = Join-Path $env:TEMP "scanhound-probe-mounts.data"
+# Same staging directory, same reason: these are docker-cp'd into the container
+# and executed there, so a predictable user-writable source path is a swap
+# window. Reuses the hardened per-run directory created above.
+$probeScriptPath = Join-Path $stagingDir "probe-mounts.sh"
+$probeDataPath   = Join-Path $stagingDir "probe-mounts.data"
 ($probeScript -replace "`r`n", "`n") | Out-File -FilePath $probeScriptPath -Encoding ascii -NoNewline
 # Trailing newline required -- see the host-side note. The dropped record here
 # was /library/tv, which made the write-probe's identity gate vacuous.
@@ -584,10 +626,8 @@ if ($needsRecreate) {
         }
         Fail "Post-recreate verification failed for one or more read-only sources." 6
     }
-    Write-Host "Post-recreate verification passed: all nine targets identity-verified."
+    Write-Host "Post-recreate verification passed: all $ExpectedTargets targets identity-verified."
 }
-
-Remove-Item $probeScriptPath, $probeDataPath -Force -ErrorAction SilentlyContinue
 
 if ($mountExit -ne 0) {
     Fail "One or more read-only shares are still unavailable (see the log above)." 1
@@ -598,6 +638,13 @@ exit 0
 
 }
 finally {
+    # Cleanup belongs here, not on the success path: `Fail` exits, and every
+    # early exit would otherwise leave the staged root-executed payloads on
+    # disk. PowerShell runs finally on `exit` from inside try, so this covers
+    # all of them.
+    if ($stagingDir -and (Test-Path -LiteralPath $stagingDir)) {
+        Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
     if ($haveLock) {
         $mutex.ReleaseMutex()
         $mutex.Dispose()
