@@ -1015,3 +1015,99 @@ class TestLoudOnImbalance:
         c.note_detail_data()
         c.note_item_created()
         assert "metrics_errors" not in c.summary_line()
+
+
+class TestFetchVersusParseHealth:
+    """A source outage and a parser regression must not read the same.
+
+    Expected values here are hardcoded independently of DEFAULT_KIND_FOR_CODE
+    and STAGE_FOR_CODE, so inverting those tables cannot make this pass.
+    """
+
+    def _cohort(self, code, stage, n=100):
+        c = ScanStageCounters()
+        for i in range(n):
+            c.note_scheduled()
+            c.note_started()
+            c.note_discard(
+                code,
+                stage=stage,
+                terminal_kind=TerminalKind.RETURNED_NONE,
+                url="https://e.test/%d" % i,
+            )
+        return c
+
+    def test_equal_cohorts_same_kind_differ_in_parse_health(self):
+        fetch = self._cohort(
+            DiscardCode.DETAIL_NO_USABLE_RESPONSE, ScanStage.DETAIL_FETCH
+        )
+        parse = self._cohort(DiscardCode.DETAIL_NO_FILENAME, ScanStage.DETAIL_PARSE)
+
+        # identical size, identical TerminalKind, identical marginal totals
+        assert fetch.detail_returned_none == parse.detail_returned_none == 100
+        assert fetch.kinds == parse.kinds
+
+        # ...but the parser is only implicated in one of them
+        assert fetch.detail_parse_success_ratio == 1.0
+        assert parse.detail_parse_success_ratio == 0.0
+        assert fetch.conservation_errors() == []
+        assert parse.conservation_errors() == []
+
+    def test_fetch_and_parse_populations_are_reported_separately(self):
+        fetch = self._cohort(
+            DiscardCode.DETAIL_NO_USABLE_RESPONSE, ScanStage.DETAIL_FETCH
+        )
+        payload = fetch.to_dict()
+        assert payload["detail_fetch_failed"] == 100
+        assert payload["detail_reached_parse"] == 0
+
+    def test_emitted_output_counts_releases_that_actually_shipped(self):
+        """A release appended after ticket closure still shipped."""
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="u")
+        t.note_started()
+        t.data_returned()
+        t.reconcile(FutureTerminalState.COMPLETED_WITH_DATA)
+        t.item_created()
+
+        payload = c.to_dict()
+        assert payload["media_item_created"] == 0
+        assert payload["media_items_emitted"] == 1, "it really shipped"
+        assert payload["media_item_created_after_terminal"] == 1
+
+    def test_stop_safe_yield_excludes_stop_affected_posts(self):
+        c = ScanStageCounters()
+        c.note_scheduled(2)
+        c.note_started()
+        c.note_detail_data()
+        c.note_item_created()
+        c.note_started()
+        c.note_detail_data()
+        c.note_discard(
+            DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP,
+            stage=ScanStage.DETAIL_TO_ITEM_HANDOFF,
+            terminal_kind=TerminalKind.ABANDONED_ON_STOP,
+            url="u",
+        )
+        payload = c.to_dict()
+        # actual yield counts the stranded post; the stop-safe one does not
+        assert payload["end_to_end_item_yield"] == 0.5
+        assert payload["stop_safe_item_yield"] == 1.0
+        assert c.conservation_errors() == []
+
+    def test_to_dict_publishes_one_moment(self):
+        """Counters and samples must come from the same snapshot."""
+        c = ScanStageCounters()
+        c.note_scheduled()
+        c.note_started()
+        c.note_discard(
+            DiscardCode.DETAIL_NO_FILENAME,
+            terminal_kind=TerminalKind.RETURNED_NONE,
+            url="u",
+        )
+        payload = c.to_dict()
+        sampled = {s["reason_code"] for s in payload["samples"]}
+        assert sampled <= set(payload["reasons"]), (
+            "a published sample referenced a reason absent from its own totals"
+        )
