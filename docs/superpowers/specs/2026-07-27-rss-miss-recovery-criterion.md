@@ -1,10 +1,58 @@
 # RSS qualification: replace the absolute miss gate with a recovery criterion
 
 **Date:** 2026-07-27
-**Revision:** 2 — revised against peer review of `c9214d7`. Four required changes applied.
-**Status:** design, for peer review. No code changed. Nothing enabled.
+**Revision:** 4 — parked. (Rev 2 fixed four review findings; rev 3 recorded Jesse's
+decisions; rev 4 parks the whole track. The rev-2 header value was stale and is
+corrected here — a defect the peer review caught.)
 **Branch:** `agent/rss-miss-recovery-criterion` (off the parked Stage 0 branch)
 **Decision owner:** Jesse.
+
+> ## STATUS: PAUSED / SUPERSEDED BY THE LISTING DETAIL-DISCARD INVESTIGATION
+>
+> **Parked 2026-07-27 by Jesse, endorsed by peer review. Do not implement any
+> part of this document, including the structural-eligibility correction, until
+> the discard defect is fixed and a fresh observation window exists.**
+>
+> **Why.** The evidence this criterion gates on is not what the document assumed.
+> `compare_shadow` receives `items` — the surviving `MediaItem` objects from
+> `run_scan` — as its listing side ([background_scanner.py:463](../../backend/background_scanner.py)),
+> not listing-page membership. Measured on six consecutive live cycles, roughly
+> **128 detail pages are fetched per cycle and 1–4 survive**:
+>
+> ```
+> Skipped 850 previously scanned URLs
+> Found 128 posts, processing details...
+> Processing complete: 2 items created from 128 posts
+> ```
+>
+> So the seven-day certification compared a 100-URL feed snapshot against 1–4
+> releases per cycle. Every miss-rate, coverage and request-reduction conclusion
+> below is computed from that residue and **must not qualify promotion**.
+>
+> **What survives.** The 23 positive `feed_only` recoveries remain true
+> observations about those 23 URLs, as do feed uptime, restart/catch-up evidence,
+> raw cycle history, and the six ineligible-cycle diagnoses. What does not
+> survive: miss rate, absence of permanent misses, representative coverage,
+> listing-vs-RSS completeness, and the request-reduction percentage.
+>
+> **Structural eligibility must not ship alone.** It establishes transport-level
+> completion only. It cannot see that the listing evidence was destroyed after
+> the requests succeeded, so shipping it would make semantically empty cycles
+> look formally eligible. Preserve it as one half of a future predicate:
+> `transport_eligible AND comparison_evidence_complete`.
+>
+> **The architecture this document assumes is also wrong.** Listing membership
+> must be captured *before* detail processing, and only `listing_only` URLs then
+> need relevance classification — which is both more correct and cheaper than
+> detail-fetching every duplicate. Any resumed work starts from that, not from
+> the implementation sketch below.
+>
+> **Resumption requires:** discard root-caused and fixed; durable per-stage scan
+> telemetry with bounded reason codes; listing membership decoupled from detail
+> success; a new qualification epoch with a cutoff timestamp; and a fresh window
+> of at least 7 days / 20 eligible cycles with zero unexplained detail loss.
+>
+> Everything below is retained as the record of the reasoning, not as a plan.
 
 ---
 
