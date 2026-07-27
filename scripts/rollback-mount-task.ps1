@@ -156,20 +156,50 @@ foreach ($ace in $dacl.Access) {
                "'$($ace.IdentityReference)' -- refusing to point a restored elevated task at it.")
     }
 }
-# And it must still be the bytes the installer recorded.
+# And it must still be the bytes the installer recorded. MANDATORY, and
+# fail-closed at every step. The previous version wrapped this in
+# `if (Test-Path ...) { if ($ent) { ... } }`, so a missing manifest, a missing
+# files array or a missing script entry all skipped the check entirely -- the
+# property was described as required and implemented as optional. Anything that
+# prevents the comparison from happening must refuse, exactly like a mismatch.
 $manifestPath = Join-Path (Split-Path $DeployedScript -Parent) 'MANIFEST.json'
-if (Test-Path -LiteralPath $manifestPath) {
-    $mf  = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    $ent = $mf.files | Where-Object { $_.name -eq 'mount-nas-shares.ps1' } | Select-Object -First 1
-    if ($ent) {
-        $have = (Get-FileHash -LiteralPath $DeployedScript -Algorithm SHA256).Hash
-        if ($have -ne $ent.sha256) {
-            throw ("Deployed script no longer matches its manifest hash " +
-                   "(manifest $($ent.sha256), on disk $have). Refusing to restore against it.")
-        }
-        Write-Output "deployed target verified against manifest ($($ent.sha256.Substring(0,16))...)"
+if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    throw ("Deployment manifest not found at $manifestPath. Without it the deployed script " +
+           "cannot be verified, so there is nothing safe to point a restored task at.")
+}
+$mfItem = Get-Item -LiteralPath $manifestPath -Force
+if ($mfItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    throw "Deployment manifest '$manifestPath' is a reparse point."
+}
+$mfAcl = Get-Acl -LiteralPath $manifestPath
+if ($trusted -notcontains $mfAcl.Owner) {
+    throw "Deployment manifest is owned by '$($mfAcl.Owner)', not an admin principal."
+}
+foreach ($ace in $mfAcl.Access) {
+    if ($ace.AccessControlType -ne 'Allow') { continue }
+    if ($trusted -contains $ace.IdentityReference.Value) { continue }
+    if (Test-WriteShapedRight $ace.FileSystemRights) {
+        throw ("Deployment manifest grants '$($ace.FileSystemRights)' to " +
+               "'$($ace.IdentityReference)', so its recorded hashes are attacker-controllable.")
     }
 }
+try { $mf = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }
+catch { throw "Deployment manifest is not valid JSON: $manifestPath" }
+if (-not $mf.files) { throw "Deployment manifest has no 'files' array: $manifestPath" }
+$ent = $mf.files | Where-Object { $_.name -eq 'mount-nas-shares.ps1' } | Select-Object -First 1
+if (-not $ent)      { throw "Deployment manifest has no entry for mount-nas-shares.ps1." }
+if ($ent.sha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+    throw "Deployment manifest records a malformed hash for mount-nas-shares.ps1: '$($ent.sha256)'"
+}
+$have = (Get-FileHash -LiteralPath $DeployedScript -Algorithm SHA256).Hash
+if ([string]::IsNullOrWhiteSpace($have)) {
+    throw "Could not hash $DeployedScript -- refusing to restore against an unverified target."
+}
+if ($have -ne $ent.sha256) {
+    throw ("Deployed script no longer matches its manifest hash " +
+           "(manifest $($ent.sha256), on disk $have). Refusing to restore against it.")
+}
+Write-Output "deployed target verified against manifest ($($ent.sha256.Substring(0,16))...)"
 
 $content = Get-Content -LiteralPath $resolvedXml -Raw
 try { $xml = [xml]$content } catch { throw "Backup is not valid XML: $resolvedXml" }

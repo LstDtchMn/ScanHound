@@ -20,6 +20,16 @@
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
+    # MANDATORY, full 40-character SHA. The commit to deploy must be supplied
+    # from OUTSIDE mutable repository state: the repo is writable by the
+    # ordinary account, so a same-user process could move HEAD or its branch
+    # and have the elevated installer faithfully deploy -- and certify -- an
+    # attacker-selected commit. Content addressing only authenticates once the
+    # expected id is fixed independently. HEAD is now informational only.
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$ExpectedCommit,
+
     [string]$SourceRepo = 'X:\Docker Apps\ScanHound',
     [string]$DeployDir  = 'C:\ProgramData\ScanHound\deploy',
     [string]$BackupDir  = 'C:\ProgramData\ScanHound\backup',
@@ -30,6 +40,17 @@ $ErrorActionPreference = 'Stop'
 
 $TaskName = 'ScanHound-MountNASShares'
 $Sid      = 'S-1-5-21-2209700402-3938720563-1532606968-1001'
+
+# Elevated native dependencies are pinned for the same reason the runtime
+# task's are: an elevated process must not run whichever git.exe or icacls.exe
+# happens to be first on an ambient PATH.
+$IcaclsExe = Join-Path $env:SystemRoot 'System32\icacls.exe'
+$GitExe    = @(
+    'C:\Program Files\Git\cmd\git.exe',
+    'C:\Program Files\Git\bin\git.exe',
+    'C:\Program Files (x86)\Git\cmd\git.exe'
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if (-not $GitExe) { throw "git.exe not found at any pinned location. Refusing to resolve it via PATH." }
 
 $SrcScript  = Join-Path $SourceRepo 'scripts\mount-nas-shares.ps1'
 $SrcCompose = Join-Path $SourceRepo 'docker-compose.yml'
@@ -53,10 +74,50 @@ $WhatIfPreference = $false
 # the fail-open shape this whole effort exists to eliminate.
 function Invoke-Icacls {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$IcaclsArgs)
-    $out = & icacls.exe @IcaclsArgs /q 2>&1
+    $out = & $script:IcaclsExe @IcaclsArgs /q 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "icacls failed (exit $LASTEXITCODE): icacls $($IcaclsArgs -join ' ')`n$out"
     }
+}
+
+# Runs git with replacement objects DISABLED and returns raw bytes.
+#
+# Two separate problems this solves. First, git honours refs/replace/ by
+# default in almost every command, so anyone who can write the repository can
+# change what `rev-parse` resolves and what `cat-file` prints --
+# --no-replace-objects is the documented way to see the original object.
+# Second, capturing native output through the PowerShell pipeline decodes it as
+# text, drops the native line framing and re-synthesises newlines; that is not
+# a byte-exact blob, whatever the surrounding comments claim. Reading
+# StandardOutput.BaseStream gives the actual bytes.
+function Invoke-GitBytes {
+    param([string[]]$GitArgs)
+
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName               = $script:GitExe
+    $psi.WorkingDirectory       = $script:SourceRepo
+    $psi.UseShellExecute        = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $true
+    # PowerShell 5.1 has no ArgumentList on ProcessStartInfo; these arguments
+    # are all literal SHAs, fixed flags and repo-relative paths with no spaces.
+    $psi.Arguments = (@('--no-replace-objects') + $GitArgs) -join ' '
+
+    $p = [Diagnostics.Process]::Start($psi)
+    $ms = New-Object IO.MemoryStream
+    $p.StandardOutput.BaseStream.CopyTo($ms)
+    $err = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+    if ($p.ExitCode -ne 0) {
+        throw "git $($GitArgs -join ' ') failed (exit $($p.ExitCode)): $err"
+    }
+    return $ms.ToArray()
+}
+
+function Invoke-GitText {
+    param([string[]]$GitArgs)
+    return ([Text.Encoding]::UTF8.GetString((Invoke-GitBytes $GitArgs))).Trim()
 }
 
 # Proves a directory is genuinely locked, rather than assuming the grants took.
@@ -136,21 +197,31 @@ foreach ($f in @($SrcScript, $SrcCompose)) {
     if (-not (Test-Path -LiteralPath $f)) { throw "Missing source input: $f" }
 }
 
-Push-Location $SourceRepo
-try {
-    $srcCommit = (& git rev-parse HEAD 2>$null)
-    $srcBranch = (& git rev-parse --abbrev-ref HEAD 2>$null)
-    $dirty     = (& git status --porcelain -- scripts/mount-nas-shares.ps1 docker-compose.yml 2>$null)
-} finally { Pop-Location }
+# Pinned git.exe must itself be trustworthy before it is used to establish
+# provenance for anything else.
+Assert-AdminOnlyPath $GitExe    -Quiet
+Assert-AdminOnlyPath $IcaclsExe -Quiet
+Write-Output "tools   : $GitExe"
 
-if ($dirty) {
-    throw ("Refusing to deploy: tracked inputs have uncommitted changes, so the " +
-           "deployed bundle could not be traced to a commit.`n$dirty")
+# $ExpectedCommit is the authority. HEAD is reported for context only, and a
+# mismatch is surfaced rather than silently deploying whatever is checked out.
+$srcCommit = $ExpectedCommit
+$headNow   = Invoke-GitText @('rev-parse', 'HEAD')
+$srcBranch = Invoke-GitText @('rev-parse', '--abbrev-ref', 'HEAD')
+
+# The commit must exist and actually BE a commit in this repository.
+$objType = Invoke-GitText @('cat-file', '-t', $srcCommit)
+if ($objType -ne 'commit') {
+    throw "$srcCommit is a '$objType', not a commit, in $SourceRepo."
 }
-if (-not $srcCommit) { throw "Could not resolve the source commit in $SourceRepo." }
 
 Write-Output "source  : $SourceRepo"
-Write-Output "commit  : $srcCommit ($srcBranch)"
+Write-Output "deploy  : $srcCommit  (APPROVED, supplied out-of-band)"
+if ($headNow -ne $srcCommit) {
+    Write-Output "note    : working tree HEAD is $headNow ($srcBranch) -- NOT used; the approved commit governs."
+} else {
+    Write-Output "head    : matches ($srcBranch)"
+}
 
 # DEPLOY FROM GIT'S OBJECT STORE, NOT FROM THE WORKING TREE.
 #
@@ -168,28 +239,33 @@ Write-Output "commit  : $srcCommit ($srcBranch)"
 # attempt -- hashing the working-tree bytes and comparing to the blob id --
 # could not work anyway: git applies the autocrlf filter, so working-tree bytes
 # legitimately hash differently from the stored object (measured on this repo).
-function Get-CommittedText {
+function Get-CommittedBlob {
     param([string]$RepoRelative)
 
-    Push-Location $SourceRepo
-    try {
-        $blobSha = (& git rev-parse "${srcCommit}:$RepoRelative" 2>$null)
-        if (-not $blobSha) { throw "Could not resolve $RepoRelative at $srcCommit." }
-        # -p prints the object exactly as stored (LF endings, no filters).
-        $lines = & git cat-file -p $blobSha.Trim() 2>$null
-        if ($LASTEXITCODE -ne 0) { throw "git cat-file failed for $RepoRelative at $srcCommit." }
-    } finally { Pop-Location }
+    $blobSha = Invoke-GitText @('rev-parse', "${srcCommit}:$RepoRelative")
+    if ($blobSha -notmatch '^[0-9a-f]{40}$') {
+        throw "Unexpected blob id '$blobSha' for $RepoRelative at $srcCommit."
+    }
+    $type = Invoke-GitText @('cat-file', '-t', $blobSha)
+    if ($type -ne 'blob') { throw "$RepoRelative at $srcCommit is a '$type', not a blob." }
 
-    # Stored objects use LF; keep it. PowerShell and Compose both accept LF.
-    return (($lines -join "`n") + "`n"), $blobSha.Trim()
+    $declared = [int](Invoke-GitText @('cat-file', '-s', $blobSha))
+    $bytes    = Invoke-GitBytes @('cat-file', 'blob', $blobSha)
+    if ($bytes.Length -ne $declared) {
+        throw ("Byte-count mismatch extracting $RepoRelative`: git reports $declared bytes, " +
+               "the stream produced $($bytes.Length). Refusing to deploy a partial object.")
+    }
+    return @{ Bytes = $bytes; Blob = $blobSha; Size = $declared }
 }
 
-$scriptText, $scriptBlob   = Get-CommittedText -RepoRelative 'scripts/mount-nas-shares.ps1'
-$composeText, $composeBlob = Get-CommittedText -RepoRelative 'docker-compose.yml'
-Write-Output "content : from git objects $($scriptBlob.Substring(0,8)) / $($composeBlob.Substring(0,8)) at $($srcCommit.Substring(0,8))"
+$scriptObj  = Get-CommittedBlob -RepoRelative 'scripts/mount-nas-shares.ps1'
+$composeObj = Get-CommittedBlob -RepoRelative 'docker-compose.yml'
+Write-Output ("content : blobs {0} ({1} B) / {2} ({3} B), byte-exact from the object store" -f
+              $scriptObj.Blob.Substring(0,8), $scriptObj.Size,
+              $composeObj.Blob.Substring(0,8), $composeObj.Size)
 
-# Every gate below runs against the COMMITTED content, never a working-tree read.
-$srcText = $scriptText
+# Every gate below runs against the COMMITTED bytes, never a working-tree read.
+$srcText = [Text.Encoding]::UTF8.GetString($scriptObj.Bytes)
 
 # PR #35: mount identity verification. Without it a wrong share can be mounted
 # and reported healthy -- the failure this whole effort exists to prevent.
@@ -250,14 +326,67 @@ if ($requestedWhatIf) {
 
 $WhatIfPreference = $requestedWhatIf   # honour the caller from here on
 
-New-Item -ItemType Directory -Force $DeployDir | Out-Null
-# Write the COMMITTED content read above. Copy-Item would reopen the
-# user-writable working tree and reintroduce the swap window this whole
-# section exists to close. UTF8 without BOM: a BOM would change the bytes
-# relative to the git object and break any later content comparison.
-$utf8NoBom = New-Object Text.UTF8Encoding($false)
-[IO.File]::WriteAllText($Deployed, $scriptText,  $utf8NoBom)
-[IO.File]::WriteAllText($Compose,  $composeText, $utf8NoBom)
+# THE DESTINATION IS SECURED BEFORE THE FIRST BYTE IS WRITTEN.
+#
+# Writing first and hardening afterwards left a window in which an unelevated
+# process could alter the deployed script, recipe or manifest and have the
+# manifest certify the result. Worse, a pre-planted REPARSE POINT at
+# deploy\mount-nas-shares.ps1 would have been followed by an elevated
+# WriteAllText -- an arbitrary-file-overwrite primitive -- with the reparse
+# assertion only noticing after the damage.
+#
+# Order is now: harden and assert the directory, destroy any pre-existing
+# payload path WITHOUT following it, create each file with CreateNew, harden
+# and assert the file, and only then write.
+function Remove-PayloadPathUnsafeToKeep([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.PSIsContainer) {
+        # A directory where a file belongs, or a junction: remove the entry
+        # itself. Directory.Delete does not traverse a reparse point.
+        [IO.Directory]::Delete($item.FullName, $false)
+    } else {
+        # File.Delete removes the link, never the link's target.
+        [IO.File]::Delete($item.FullName)
+    }
+}
+
+function New-SecureDeployedFile([string]$path, [byte[]]$bytes) {
+    Remove-PayloadPathUnsafeToKeep $path
+    # CreateNew fails outright if anything reappeared in the meantime.
+    $fs = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $fs.Dispose()
+    Invoke-Icacls $path '/setowner' 'BUILTIN\Administrators'
+    Invoke-Icacls $path '/inheritance:r'
+    Invoke-Icacls $path '/grant'    'BUILTIN\Administrators:(F)'
+    Invoke-Icacls $path '/grant'    '*S-1-5-18:(F)'
+    Invoke-Icacls $path '/grant'    "*$($script:Sid):(RX)"
+    Assert-AdminOnlyPath $path -Quiet
+    [IO.File]::WriteAllBytes($path, $bytes)
+}
+
+# Directories first, and PROVEN, before anything is created inside them.
+# $RunDir holds shell payloads wsl.exe executes as root, so it is an
+# elevated-execution input exactly like the deploy directory.
+foreach ($dir in @($DeployDir, $BackupDir, $RunDir)) {
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    Invoke-Icacls $dir '/setowner'     'BUILTIN\Administrators' '/T'
+    Invoke-Icacls $dir '/inheritance:r'
+    Invoke-Icacls $dir '/grant'        'BUILTIN\Administrators:(OI)(CI)(F)'
+    Invoke-Icacls $dir '/grant'        '*S-1-5-18:(OI)(CI)(F)'
+}
+# The task account gets READ ONLY on deploy/backup, and NOTHING on staging: a
+# SID ACE cannot distinguish the elevated token from the unelevated one, so the
+# write right must simply not be granted.
+Invoke-Icacls $DeployDir '/grant' "*$($Sid):(OI)(CI)(RX)" '/T'
+Invoke-Icacls $BackupDir '/grant' "*$($Sid):(OI)(CI)(RX)" '/T'
+
+Assert-AdminOnlyPath $DeployDir
+Assert-AdminOnlyPath $BackupDir
+Assert-AdminOnlyPath $RunDir
+
+New-SecureDeployedFile $Deployed $scriptObj.Bytes
+New-SecureDeployedFile $Compose  $composeObj.Bytes
 
 $manifest = [ordered]@{
     deployed_at   = (Get-Date).ToString('o')
@@ -275,7 +404,11 @@ $manifest = [ordered]@{
                     source_path = 'docker-compose.yml' }
     )
 }
-$manifest | ConvertTo-Json -Depth 5 | Out-File $Manifest -Encoding utf8
+# The manifest is itself an elevated-trust input -- rollback verifies the
+# deployed script against it -- so it gets the same create-harden-assert-write
+# treatment as the payloads rather than a bare Out-File.
+$utf8NoBom = New-Object Text.UTF8Encoding($false)
+New-SecureDeployedFile $Manifest ($utf8NoBom.GetBytes(($manifest | ConvertTo-Json -Depth 5)))
 
 # Lock the deployment: an unprivileged user must not be able to replace the
 # script an elevated scheduled task executes. Read+execute for the task's
@@ -291,25 +424,9 @@ $manifest | ConvertTo-Json -Depth 5 | Out-File $Manifest -Encoding utf8
 # (WRITE_DAC is implicit for owners), so leaving these directories owned by the
 # unprivileged account makes every grant below advisory. Ownership moves to
 # Administrators first, and is asserted afterwards.
-# $RunDir is hardened here too, not left to the runtime script: it holds shell
-# payloads that wsl.exe executes AS ROOT, so it is an elevated-execution input
-# exactly like the deploy directory. Pre-hardening it also means the mount
-# script can ASSERT the root rather than having to create it securely itself.
-foreach ($dir in @($DeployDir, $BackupDir, $RunDir)) {
-    New-Item -ItemType Directory -Force $dir | Out-Null
-    Invoke-Icacls $dir '/setowner'     'BUILTIN\Administrators' '/T'
-    Invoke-Icacls $dir '/inheritance:r'
-    Invoke-Icacls $dir '/grant'        'BUILTIN\Administrators:(OI)(CI)(F)'
-    Invoke-Icacls $dir '/grant'        '*S-1-5-18:(OI)(CI)(F)'
-}
-# The task account gets READ ONLY on deploy/backup, and NOTHING on the staging
-# root. Granting it write would hand the documented attacker -- an unelevated
-# process running as this same user -- the ability to swap a payload the task
-# then executes as root. A SID ACE cannot distinguish the elevated token from
-# the unelevated one, so the right must simply not be granted.
-Invoke-Icacls $DeployDir '/grant' "*$($Sid):(OI)(CI)(RX)" '/T'
-Invoke-Icacls $BackupDir '/grant' "*$($Sid):(OI)(CI)(RX)" '/T'
-
+# Re-assert AFTER writing, recursively: the pre-write pass proved the
+# directories, this proves every artifact that now sits in them (including the
+# manifest) still carries an admin-only descriptor and is not a reparse point.
 Assert-AdminOnlyPath $DeployDir -Recurse
 Assert-AdminOnlyPath $BackupDir -Recurse
 Assert-AdminOnlyPath $RunDir

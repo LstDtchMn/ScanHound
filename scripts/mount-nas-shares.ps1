@@ -114,17 +114,57 @@ function Assert-PinnedExe([string]$path, [string]$label) {
     # path to somewhere that was never checked.
     $trusted = @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\TrustedInstaller')
 
-    # Walk the executable and its ancestors, but STOP BEFORE THE VOLUME ROOT.
-    # Measured: C:\ grants Authenticated Users AppendData -- the standard
-    # Windows ACL letting ordinary users create new top-level folders. That is
-    # CreateDirectories, not permission to alter C:\Windows or anything under
-    # it, so including the root rejected every executable on a normal install
-    # (verified: wsl.exe, docker.exe and powershell.exe all failed). A check
-    # that rejects the correct configuration is as useless as one that accepts
-    # everything; the meaningful chain is the executable through its real
-    # containing directories.
-    $root = [IO.Path]::GetPathRoot($item.FullName)
-    $cur  = $item.FullName
+    # Walk the executable and its ancestors under the STRICT mask, then check
+    # the volume root separately under RELAXED semantics.
+    #
+    # Measured: C:\ grants Authenticated Users AppendData. On a directory that
+    # bit is CreateDirectories -- permission to make a new top-level folder,
+    # not to alter C:\Windows or anything already under it. Applying the strict
+    # file mask there rejected every executable on a normal install (verified:
+    # wsl.exe, docker.exe and powershell.exe all failed), and a check that
+    # rejects the correct configuration is as useless as one that accepts
+    # everything.
+    #
+    # But skipping the root entirely would miss grants that genuinely matter
+    # there -- Delete, DeleteSubdirectoriesAndFiles, ChangePermissions,
+    # TakeOwnership, WriteAttributes, WriteExtendedAttributes -- so the root is
+    # checked with only the two child-creation bits permitted.
+    $root     = [IO.Path]::GetPathRoot($item.FullName)
+    $rootItem = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    if ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "${label}: volume root '$root' is a reparse point."
+    }
+    $R = [Security.AccessControl.FileSystemRights]
+    # What would actually be dangerous AT THE ROOT: deleting or re-permissioning
+    # entries in it, which reaches C:\Windows. Creating a new sibling folder
+    # does not.
+    $rootDangerous = [int]($R::Delete -bor $R::DeleteSubdirectoriesAndFiles -bor
+                           $R::ChangePermissions -bor $R::TakeOwnership)
+    foreach ($ace in (Get-Acl -LiteralPath $root).Access) {
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+        if ($trusted -contains $ace.IdentityReference.Value) { continue }
+
+        # INHERIT-ONLY ACEs grant nothing on the object itself; they are
+        # templates applied to children when those are created. Measured on
+        # this host: every alarming-looking root ACE (CREATOR OWNER GENERIC_ALL,
+        # Authenticated Users 0xE0010000) is InheritOnly. Counting them made
+        # the check reject wsl.exe, docker.exe and powershell.exe -- the second
+        # time a root check rejected the correct configuration.
+        if (($ace.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+            continue
+        }
+        # AppContainer capability SIDs (S-1-15-*) are sandboxed package
+        # identities, not user principals, and are not the threat model here.
+        if ($ace.IdentityReference.Value -like 'S-1-15-*') { continue }
+
+        if (([int]$ace.FileSystemRights -band $rootDangerous) -ne 0) {
+            throw ("${label}: volume root '$root' grants '$($ace.FileSystemRights)' to " +
+                   "'$($ace.IdentityReference)' -- delete/permission rights at the root " +
+                   "reach the protected directories below it.")
+        }
+    }
+
+    $cur = $item.FullName
     while ($cur -and $cur.TrimEnd('\') -ne $root.TrimEnd('\')) {
         $node = Get-Item -LiteralPath $cur -Force -ErrorAction Stop
         if ($node.Attributes -band [IO.FileAttributes]::ReparsePoint) {
