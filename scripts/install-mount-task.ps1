@@ -66,6 +66,28 @@ $GitExe    = @(
 ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 if (-not $GitExe) { throw "git.exe not found at any pinned location. Refusing to resolve it via PATH." }
 
+# PARAMETER CONTAINMENT. The whole parent-boundary argument is that the three
+# working directories sit beneath a root this installer protects. Overrides
+# could put a child somewhere else entirely -- hardening RootDir while the
+# deployed script lives under a user-writable parent, still replaceable through
+# that parent's delete-child right. Defaults are coherent; this makes the
+# guarantee true under overrides too, rather than only for one invocation.
+$canonRoot = [IO.Path]::GetFullPath($RootDir).TrimEnd('\')
+$seenChild = @{}
+foreach ($childPath in @($DeployDir, $BackupDir, $RunDir)) {
+    $full = [IO.Path]::GetFullPath($childPath).TrimEnd('\')
+    if ($full -eq $canonRoot) {
+        throw "'$childPath' resolves to the root itself; it must be a distinct child of $canonRoot."
+    }
+    if (-not $full.StartsWith($canonRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "'$childPath' resolves to '$full', which is not beneath '$canonRoot'."
+    }
+    if ($seenChild.ContainsKey($full)) {
+        throw "'$childPath' duplicates another directory parameter ('$full')."
+    }
+    $seenChild[$full] = $true
+}
+
 $SrcScript  = Join-Path $SourceRepo 'scripts\mount-nas-shares.ps1'
 $SrcCompose = Join-Path $SourceRepo 'docker-compose.yml'
 $Deployed   = Join-Path $DeployDir  'mount-nas-shares.ps1'
@@ -297,6 +319,29 @@ if ($commitId -ne $srcCommit) {
     throw ("Object-identity check FAILED for the commit: the object stored as $srcCommit " +
            "hashes to $commitId. The object database is corrupt or tampered with.")
 }
+
+# THE TREES THAT BIND THE COMMIT TO THE PATHS.
+#
+# Verifying the commit and the two blobs individually is NOT sufficient. The
+# commit does not reference blobs directly -- it names a root tree, which names
+# subtrees, which map path entries to blob ids. A tampered tree can therefore
+# point `scripts/mount-nas-shares.ps1` at some OTHER perfectly valid blob while
+# every identity check above still passes: the commit bytes are untouched, the
+# substituted blob is a real object, and its bytes hash to its own id.
+#
+# fsck reports "hash mismatch" for any stored object whose content does not
+# hash to its database id, so running it rooted at the approved commit covers
+# the intervening trees. The direct commit/blob calculations are kept as
+# defence in depth rather than replaced.
+# Verified on this host: git 2.52.0.windows.1 accepts this exact form, exit 0,
+# ~0.9 s.
+$fsckOut = & $GitExe --no-replace-objects fsck --full --no-dangling --no-reflogs $srcCommit 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw ("git fsck FAILED for the object graph reachable from $srcCommit (exit " +
+           "$LASTEXITCODE). The object database cannot be trusted to bind the approved " +
+           "commit to the deployed paths.`n$fsckOut")
+}
+Write-Output "fsck    : object graph verified from $($srcCommit.Substring(0,8))"
 
 Write-Output "source  : $SourceRepo"
 Write-Output "deploy  : $srcCommit  (APPROVED, supplied out-of-band)"
@@ -609,6 +654,10 @@ $PowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powe
 if (-not (Test-Path -LiteralPath $PowerShellExe -PathType Leaf)) {
     throw "Windows PowerShell not found at the pinned path '$PowerShellExe'."
 }
+# Same chain-aware assertion as git/icacls: this is the interpreter an elevated
+# task will run 288 times a day, so "it exists" is a weaker claim than the one
+# made for the installer's own tools.
+Assert-PinnedTool $PowerShellExe 'powershell.exe (task action)'
 $action = New-ScheduledTaskAction -Execute $PowerShellExe `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Deployed`""
 
@@ -801,37 +850,53 @@ if ($fail.Count -gt 0) {
 
 Write-Output "=== all assertions passed -- enabling ==="
 
-# ONLY NOW. Everything above ran against a disabled task, so no unverified
-# definition could ever have fired. Enabling is the last mutation, and its
-# effect is then re-read and asserted rather than assumed.
-Enable-ScheduledTask -TaskName $TaskName | Out-Null
+# ONLY NOW, and the whole phase is exception-guarded.
+#
+# Handling only the $post assertion list was not enough: Enable-ScheduledTask
+# can change state and then fail, and the reads and property accesses that
+# follow can throw on their own (strict mode makes a missing property
+# terminating). Any of those would have exited the installer with the task
+# ENABLED and its verification incomplete -- precisely the state this design
+# forbids. The catch attempts the re-disable unconditionally: harmless if the
+# enable never took effect, essential if it did.
+try {
+    Enable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
 
-$final = Get-ScheduledTask -TaskName $TaskName
-$post  = @()
-if ("$($final.Settings.Enabled)" -ne 'True') { $post += "Enabled = '$($final.Settings.Enabled)'" }
+    $final = Get-ScheduledTask     -TaskName $TaskName -ErrorAction Stop
+    $info  = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
 
-# A PT5M interval in the XML does not prove the schedule is armed; only a real
-# NextRunTime does. Checked after enabling, because a disabled task has none.
-# StartWhenAvailable is why an elapsed boundary is acceptable: the trigger's
-# start may well have passed while the assertions above were running.
-$next = (Get-ScheduledTaskInfo -TaskName $TaskName).NextRunTime
-if (-not $next) {
-    $post += 'NextRunTime is null -- the periodic schedule is not armed'
-} else {
-    Write-Output ("PASS  {0,-32} {1:yyyy-MM-dd HH:mm:ss}" -f 'next run at', $next)
-    if ($next -gt (Get-Date).AddMinutes($RepetitionMinutes + 2)) {
-        $post += "NextRunTime $next is more than one interval away"
+    $post = @()
+    if ("$($final.Settings.Enabled)" -ne 'True') { $post += "Enabled = '$($final.Settings.Enabled)'" }
+
+    # A PT5M interval in the XML does not prove the schedule is armed; only a
+    # real NextRunTime does. Checked after enabling, because a disabled task
+    # has none. StartWhenAvailable is why a boundary that elapsed during
+    # validation is acceptable -- but a NextRunTime far in the PAST would mean
+    # the schedule is not really live, so it is bounded on both sides.
+    $next = $info.NextRunTime
+    if (-not $next) {
+        $post += 'NextRunTime is null -- the periodic schedule is not armed'
+    } else {
+        Write-Output ("PASS  {0,-32} {1:yyyy-MM-dd HH:mm:ss}" -f 'next run at', $next)
+        if ($next -gt (Get-Date).AddMinutes($RepetitionMinutes + 2)) {
+            $post += "NextRunTime $next is more than one interval away"
+        }
+        if ($next -lt (Get-Date).AddMinutes(-2)) {
+            $post += "NextRunTime $next is in the past -- the schedule is stale, not armed"
+        }
     }
-}
 
-if ($post.Count -gt 0) {
-    Write-Output "`n=== POST-ENABLE ASSERTION FAILURE(S) ==="
-    $post | ForEach-Object { Write-Output "  $_" }
+    if ($post.Count -gt 0) { throw ($post -join '; ') }
+}
+catch {
+    Write-Output "`n=== POST-ENABLE FAILURE ==="
+    Write-Output "  $($_.Exception.Message)"
     try {
         Disable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
-        Write-Output "The task has been DISABLED again."
+        Write-Output "The task has been DISABLED again; it cannot fire unverified."
     } catch {
-        Write-Output "WARNING: could not re-disable the task: $($_.Exception.Message)"
+        Write-Output "CRITICAL: could not re-disable the task: $($_.Exception.Message)"
+        Write-Output "Disable it BY HAND immediately: Disable-ScheduledTask -TaskName $TaskName"
     }
     exit 1
 }
