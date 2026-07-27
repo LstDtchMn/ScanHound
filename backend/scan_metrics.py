@@ -76,6 +76,34 @@ class ScanStage(str, Enum):
     #: consuming its result.
     DETAIL_TO_ITEM_HANDOFF = "detail_to_item_handoff"
     MEDIA_ITEM_CONSTRUCTION = "media_item_construction"
+    #: No factual stage was supplied and none can be inferred. Kept visible
+    #: rather than defaulted, so an omission cannot masquerade as a parse
+    #: failure and send the investigation to the wrong layer.
+    UNSPECIFIED = "unspecified"
+
+
+class TerminalKind(str, Enum):
+    """WHAT happened to a post's lifecycle - independent of stage and reason.
+
+    Three dimensions answer three questions and none may be derived from
+    another::
+
+        stage         where was the post?
+        terminal_kind what happened to its lifecycle?
+        reason_code   which factual branch was observed?
+
+    Deriving the conservation bucket from the reason code let an exceptional
+    UNKNOWN be booked as "returned none": the equations balanced while the
+    semantics were false.
+    """
+
+    CANCELLED_BEFORE_START = "cancelled_before_start"
+    CANCELLED_AFTER_START = "cancelled_after_start"
+    RETURNED_NONE = "returned_none"
+    RAISED_EXCEPTION = "raised_exception"
+    CONSTRUCTION_FAILED = "construction_failed"
+    ABANDONED_ON_STOP = "abandoned_on_stop"
+    TERMINAL_MISSING = "terminal_missing"
 
 
 class DiscardCode(str, Enum):
@@ -179,9 +207,52 @@ def message_for(code: DiscardCode) -> str:
     return _MESSAGES.get(code, _MESSAGES[DiscardCode.UNKNOWN])
 
 
+#: Expected lifecycle outcome per code. A DEFAULT and a test oracle only -
+#: callers supply the factual kind, because one reason can end a post's life in
+#: different ways (UNKNOWN may be an exception OR a falsy return).
+DEFAULT_KIND_FOR_CODE: Dict[DiscardCode, TerminalKind] = {
+    DiscardCode.DETAIL_CANCELLED_BEFORE_REQUEST: TerminalKind.CANCELLED_AFTER_START,
+    DiscardCode.DETAIL_CANCELLED_IN_COORDINATOR: TerminalKind.CANCELLED_AFTER_START,
+    DiscardCode.DETAIL_RETRY_SLEEP_CANCELLED: TerminalKind.CANCELLED_AFTER_START,
+    DiscardCode.DETAIL_CANCELLED_AFTER_START: TerminalKind.CANCELLED_AFTER_START,
+    DiscardCode.DETAIL_CANCELLED_BEFORE_START: TerminalKind.CANCELLED_BEFORE_START,
+    DiscardCode.DETAIL_TRAFFIC_DENIED: TerminalKind.RAISED_EXCEPTION,
+    DiscardCode.DETAIL_PARSE_EXCEPTION: TerminalKind.RAISED_EXCEPTION,
+    DiscardCode.SOURCE_BLOCKED: TerminalKind.RAISED_EXCEPTION,
+    DiscardCode.DETAIL_NO_USABLE_RESPONSE: TerminalKind.RETURNED_NONE,
+    DiscardCode.DETAIL_NO_FILENAME: TerminalKind.RETURNED_NONE,
+    DiscardCode.DETAIL_EMPTY: TerminalKind.RETURNED_NONE,
+    DiscardCode.MEDIA_ITEM_EXCEPTION: TerminalKind.CONSTRUCTION_FAILED,
+    DiscardCode.MISSING_REQUIRED_TITLE: TerminalKind.CONSTRUCTION_FAILED,
+    DiscardCode.MISSING_REQUIRED_URL: TerminalKind.CONSTRUCTION_FAILED,
+    DiscardCode.INVALID_METADATA: TerminalKind.CONSTRUCTION_FAILED,
+    DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP: TerminalKind.ABANDONED_ON_STOP,
+    DiscardCode.TERMINAL_OUTCOME_MISSING: TerminalKind.TERMINAL_MISSING,
+    DiscardCode.UNKNOWN: TerminalKind.RETURNED_NONE,
+}
+
+#: An operator pressing Stop is not a content failure.
+_STOP_KINDS = {
+    TerminalKind.CANCELLED_BEFORE_START,
+    TerminalKind.CANCELLED_AFTER_START,
+    TerminalKind.ABANDONED_ON_STOP,
+}
+#: A bookkeeping defect is not a content failure either.
+_GAP_KINDS = {TerminalKind.TERMINAL_MISSING}
+
+
 def default_stage_for(code: DiscardCode) -> ScanStage:
-    """Fallback only. Callers supply the factual stage at the event site."""
-    return STAGE_FOR_CODE.get(code, ScanStage.DETAIL_PARSE)
+    """Fallback only. Callers supply the factual stage at the event site.
+
+    Returns UNSPECIFIED rather than a plausible guess: silently defaulting a
+    stageless code to DETAIL_PARSE would file it against the wrong layer.
+    """
+    return STAGE_FOR_CODE.get(code, ScanStage.UNSPECIFIED)
+
+
+def default_kind_for(code: DiscardCode) -> TerminalKind:
+    """Fallback only. Callers supply the factual terminal kind."""
+    return DEFAULT_KIND_FOR_CODE.get(code, TerminalKind.RETURNED_NONE)
 
 
 @dataclass(frozen=True)
@@ -259,6 +330,7 @@ class ScanStageCounters:
 
     reasons: Dict[str, int] = field(default_factory=dict)
     stages: Dict[str, int] = field(default_factory=dict)
+    kinds: Dict[str, int] = field(default_factory=dict)
     samples: List[DiscardSample] = field(default_factory=list)
 
     _lock: threading.Lock = field(
@@ -308,8 +380,9 @@ class ScanStageCounters:
         parser_version: Optional[str] = None,
         content_fingerprint: Optional[str] = None,
         lifecycle_started: Optional[bool] = None,
+        terminal_kind: Optional[TerminalKind] = None,
     ) -> None:
-        """Record one discarded post at a FACTUAL stage.
+        """Record one discarded post at a FACTUAL stage and terminal kind.
 
         ``stage`` is supplied by the caller because only the event site knows
         where it happened; the code-to-stage map is a fallback for callers that
@@ -317,14 +390,15 @@ class ScanStageCounters:
         instrumentation gap be filed against the equation it actually breaks.
         """
         actual = stage or default_stage_for(code)
+        kind = terminal_kind or default_kind_for(code)
         post_data = actual in (
             ScanStage.DETAIL_TO_ITEM_HANDOFF,
             ScanStage.MEDIA_ITEM_CONSTRUCTION,
         )
         with self._lock:
-            if code is DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP:
+            if kind is TerminalKind.ABANDONED_ON_STOP:
                 self.media_item_abandoned_on_stop += 1
-            elif code is DiscardCode.TERMINAL_OUTCOME_MISSING:
+            elif kind is TerminalKind.TERMINAL_MISSING:
                 # File the gap against the equation it actually breaks, so a
                 # post that never ran does not masquerade as started work.
                 if post_data:
@@ -333,13 +407,13 @@ class ScanStageCounters:
                     self.scheduled_terminal_missing += 1
                 else:
                     self.detail_terminal_missing += 1
-            elif code in _CANCELLED_BEFORE_START:
+            elif kind is TerminalKind.CANCELLED_BEFORE_START:
                 self.detail_cancelled_before_start += 1
-            elif code in _CANCELLED_AFTER_START:
+            elif kind is TerminalKind.CANCELLED_AFTER_START:
                 self.detail_cancelled_after_start += 1
-            elif code in _RAISED:
+            elif kind is TerminalKind.RAISED_EXCEPTION:
                 self.detail_raised_exception += 1
-            elif post_data:
+            elif kind is TerminalKind.CONSTRUCTION_FAILED:
                 self.media_item_construction_failed += 1
             else:
                 self.detail_returned_none += 1
@@ -347,6 +421,7 @@ class ScanStageCounters:
             key = code.value
             self.reasons[key] = self.reasons.get(key, 0) + 1
             self.stages[actual.value] = self.stages.get(actual.value, 0) + 1
+            self.kinds[kind.value] = self.kinds.get(kind.value, 0) + 1
             if self.reasons[key] <= MAX_SAMPLES_PER_REASON and url:
                 self.samples.append(
                     DiscardSample(
@@ -375,6 +450,8 @@ class ScanStageCounters:
             self.reasons[key] = self.reasons.get(key, 0) + count
             stage = ScanStage.DETAIL_FETCH.value
             self.stages[stage] = self.stages.get(stage, 0) + count
+            kind = TerminalKind.CANCELLED_BEFORE_START.value
+            self.kinds[kind] = self.kinds.get(kind, 0) + count
 
     # -- reporting --------------------------------------------------------
 
@@ -386,11 +463,22 @@ class ScanStageCounters:
         return self.detail_returned_data / float(self.detail_started)
 
     @property
+    def media_item_construction_attempted(self) -> int:
+        """Posts construction was actually TRIED on.
+
+        Excludes results stranded by Stop and instrumentation gaps: neither was
+        a construction attempt, and counting them would report a healthy
+        constructor as failing on any cancelled scan.
+        """
+        return self.media_item_created + self.media_item_construction_failed
+
+    @property
     def media_item_construction_success_ratio(self) -> float:
-        """Of the posts that yielded data, how many became releases."""
-        if self.detail_returned_data <= 0:
+        """Of the posts construction was attempted on, how many succeeded."""
+        attempted = self.media_item_construction_attempted
+        if attempted <= 0:
             return 1.0
-        return self.media_item_created / float(self.detail_returned_data)
+        return self.media_item_created / float(attempted)
 
     @property
     def end_to_end_item_yield(self) -> float:
@@ -404,6 +492,40 @@ class ScanStageCounters:
         if self.detail_started <= 0:
             return 0.0
         return self.detail_http_requests / float(self.detail_started)
+
+    def outcome_groups(self) -> Dict[str, int]:
+        """Split discards into populations that must not be conflated.
+
+        A parser-regression threshold that counts an operator pressing Stop, or
+        counts our own bookkeeping gaps, measures the wrong thing.
+        """
+        groups = {"failures": 0, "operator_stop_outcomes": 0, "instrumentation_gaps": 0}
+        for name, count in self.kinds.items():
+            try:
+                kind = TerminalKind(name)
+            except ValueError:  # pragma: no cover - unknown kind stays visible
+                groups["instrumentation_gaps"] += count
+                continue
+            if kind in _STOP_KINDS:
+                groups["operator_stop_outcomes"] += count
+            elif kind in _GAP_KINDS:
+                groups["instrumentation_gaps"] += count
+            else:
+                groups["failures"] += count
+        return groups
+
+    @property
+    def eligible_for_health_scoring(self) -> bool:
+        """False when Stop or instrumentation gaps distort the picture.
+
+        A cancelled scan's low yield is not parser degradation and must not
+        feed a future circuit breaker.
+        """
+        groups = self.outcome_groups()
+        return (
+            groups["operator_stop_outcomes"] == 0
+            and groups["instrumentation_gaps"] == 0
+        )
 
     def conservation_errors(self) -> List[str]:
         """Imbalances, as text. Empty means the books balance.
@@ -496,8 +618,12 @@ class ScanStageCounters:
             ),
             "end_to_end_item_yield": round(self.end_to_end_item_yield, 4),
             "requests_per_started_post": round(self.requests_per_started_post, 4),
+            "media_item_construction_attempted": self.media_item_construction_attempted,
             "reasons": dict(self.reasons),
             "stages": dict(self.stages),
+            "kinds": dict(self.kinds),
+            "outcome_groups": self.outcome_groups(),
+            "eligible_for_health_scoring": self.eligible_for_health_scoring,
             "samples": [s.to_dict() for s in self.samples],
             "conservation_errors": self.conservation_errors(),
         }
@@ -511,10 +637,17 @@ class ScanStageCounters:
         )
         if not self.reasons:
             return head
+        groups = self.outcome_groups()
         top = sorted(self.reasons.items(), key=lambda kv: (-kv[1], kv[0]))
-        return head + "; discarded: " + ", ".join(
-            "%s=%d" % (code, n) for code, n in top
-        )
+        detail = ", ".join("%s=%d" % (code, n) for code, n in top)
+        parts = [head]
+        if groups["failures"]:
+            parts.append("failures=%d" % groups["failures"])
+        if groups["operator_stop_outcomes"]:
+            parts.append("stopped=%d" % groups["operator_stop_outcomes"])
+        if groups["instrumentation_gaps"]:
+            parts.append("instrumentation gaps=%d" % groups["instrumentation_gaps"])
+        return "; ".join(parts) + " [" + detail + "]"
 
 
 class PostOutcome:
@@ -639,6 +772,7 @@ class PostOutcome:
         parser_version: Optional[str] = None,
         content_fingerprint: Optional[str] = None,
         lifecycle_started: Optional[bool] = None,
+        terminal_kind: Optional[TerminalKind] = None,
     ) -> bool:
         """Book the terminal outcome. Returns False if one was already booked."""
         try:
@@ -655,6 +789,7 @@ class PostOutcome:
                     parser_version=parser_version,
                     content_fingerprint=content_fingerprint,
                     lifecycle_started=lifecycle_started,
+                    terminal_kind=terminal_kind,
                 )
             return True
         except Exception:  # pragma: no cover
@@ -665,46 +800,78 @@ class PostOutcome:
     def reconcile(
         self,
         *,
+        future_cancelled: bool = False,
+        future_completed: bool = False,
+        future_returned_data: bool = False,
+        exception_type: Optional[str] = None,
         was_cancelled: bool = False,
         completed_with_data: bool = False,
-        exception_type: Optional[str] = None,
     ) -> Optional[DiscardCode]:
-        """Close a ticket after the executor has drained. Returns what was
-        booked, or None if the ticket already had a terminal event.
+        """Close a ticket against a TERMINAL future state.
 
-        Every branch here names a REAL lifecycle state. Nothing is labelled
-        cancellation to make the books balance - an undetermined ticket becomes
+        PRECONDITION: only call this for a future that is cancelled or
+        completed. A running future is still transitioning between started and
+        data-returned, and an atomic snapshot of a moving lifecycle is still a
+        snapshot of a moving lifecycle. The only permitted pre-drain call is for
+        a future whose ``cancel()`` returned True, because it can never start.
+
+        Facts proven by the future are normalized into the ticket first: a
+        completed non-cancelled future proves its worker ran, and a truthy
+        result proves data came back, even if the worker failed to record
+        either. Both transitions are idempotent, so backfilling is safe.
+
+        Every branch names a REAL lifecycle state. Nothing is labelled
+        cancellation to balance the books - an undetermined ticket becomes
         TERMINAL_OUTCOME_MISSING, which is honest about being a defect.
         """
+        # Back-compat aliases for the earlier signature.
+        cancelled = future_cancelled or was_cancelled
+        has_data = future_returned_data or completed_with_data
+        completed = future_completed or has_data or exception_type is not None
+
+        # -- normalize facts the future proves, before classifying -----------
+        if completed and not cancelled:
+            self.note_started()          # idempotent
+        if has_data:
+            self.data_returned()         # idempotent
+
         state = self.snapshot()
         if state.terminal_booked:
             return None
 
-        if was_cancelled:
+        if cancelled:
             # future.cancel() returned True: it never ran.
-            code, stage = DiscardCode.DETAIL_CANCELLED_BEFORE_START, ScanStage.DETAIL_FETCH
+            code = DiscardCode.DETAIL_CANCELLED_BEFORE_START
+            stage = ScanStage.DETAIL_FETCH
+            kind = TerminalKind.CANCELLED_BEFORE_START
         elif exception_type is not None:
-            # Completed exceptionally with nothing recorded by the worker.
-            code, stage = DiscardCode.UNKNOWN, ScanStage.DETAIL_PARSE
-        elif state.data_returned or completed_with_data:
+            # Completed exceptionally with nothing recorded by the worker. The
+            # reason is unknown but the LIFECYCLE is not: it raised.
+            code = DiscardCode.UNKNOWN
+            stage = ScanStage.UNSPECIFIED
+            kind = TerminalKind.RAISED_EXCEPTION
+        elif state.data_returned:
             # The detail SUCCEEDED; the scan stopped before its result was used.
-            # Not a failure, not a cancellation.
-            code, stage = (
-                DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP,
-                ScanStage.DETAIL_TO_ITEM_HANDOFF,
-            )
+            code = DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP
+            stage = ScanStage.DETAIL_TO_ITEM_HANDOFF
+            kind = TerminalKind.ABANDONED_ON_STOP
         elif state.started:
             # Ran, returned falsy, booked nothing: an uninstrumented scraper.
-            code, stage = DiscardCode.DETAIL_EMPTY, ScanStage.DETAIL_PARSE
+            code = DiscardCode.DETAIL_EMPTY
+            stage = ScanStage.DETAIL_PARSE
+            kind = TerminalKind.RETURNED_NONE
         else:
             # Lifecycle genuinely unknown. Name the gap; do not invent a cause.
-            code, stage = DiscardCode.TERMINAL_OUTCOME_MISSING, ScanStage.DETAIL_FETCH
+            code = DiscardCode.TERMINAL_OUTCOME_MISSING
+            stage = ScanStage.UNSPECIFIED
+            kind = TerminalKind.TERMINAL_MISSING
 
         booked = self.discard(
             code,
             stage=stage,
             exception_type=exception_type,
             lifecycle_started=state.started,
+            terminal_kind=kind,
         )
         return code if booked else None
 

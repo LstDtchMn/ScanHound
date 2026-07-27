@@ -7,6 +7,8 @@ import threading
 
 from backend.scan_metrics import (
     MAX_SAMPLES_PER_REASON,
+    TerminalKind,
+    default_stage_for,
     STAGE_FOR_CODE,
     TAXONOMY_VERSION,
     DiscardCode,
@@ -140,9 +142,16 @@ class TestStageIndependence:
             c = ScanStageCounters()
             c.note_scheduled()
             c.note_started()
+            kind = TerminalKind.RETURNED_NONE
             if stage is ScanStage.MEDIA_ITEM_CONSTRUCTION:
                 c.note_detail_data()
-            c.note_discard(DiscardCode.UNKNOWN, stage=stage, url="https://e.test/u")
+                kind = TerminalKind.CONSTRUCTION_FAILED
+            c.note_discard(
+                DiscardCode.UNKNOWN,
+                stage=stage,
+                terminal_kind=kind,
+                url="https://e.test/u",
+            )
 
             assert c.stages == {stage.value: 1}, "stage must follow the event site"
             assert c.samples[0].stage == stage.value
@@ -160,6 +169,7 @@ class TestStageIndependence:
         c.note_discard(
             DiscardCode.DETAIL_EMPTY,
             stage=ScanStage.MEDIA_ITEM_CONSTRUCTION,
+            terminal_kind=TerminalKind.CONSTRUCTION_FAILED,
             url="https://e.test/o",
         )
         assert c.stages == {"media_item_construction": 1}
@@ -618,3 +628,171 @@ class TestTicketLifecycle:
 
         assert len([r for r in results if r is not None]) == 1
         assert c.conservation_errors() == []
+
+
+class TestTerminalKindIndependence:
+    """What happened to the lifecycle is not derivable from why."""
+
+    def test_exceptional_unknown_counts_as_raised_not_returned_none(self):
+        """The reason may be unknown; the lifecycle is not."""
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/x")
+        t.note_started()
+        t.reconcile(future_completed=True, exception_type="ValueError")
+
+        assert c.detail_raised_exception == 1
+        assert c.detail_returned_none == 0
+        assert c.reasons == {"unknown": 1}
+        assert c.kinds == {"raised_exception": 1}
+        assert c.conservation_errors() == []
+
+    def test_same_reason_can_end_a_life_three_ways(self):
+        for kind, attr in (
+            (TerminalKind.RAISED_EXCEPTION, "detail_raised_exception"),
+            (TerminalKind.RETURNED_NONE, "detail_returned_none"),
+            (TerminalKind.CONSTRUCTION_FAILED, "media_item_construction_failed"),
+        ):
+            c = ScanStageCounters()
+            c.note_scheduled()
+            c.note_started()
+            if kind is TerminalKind.CONSTRUCTION_FAILED:
+                c.note_detail_data()
+            c.note_discard(DiscardCode.UNKNOWN, terminal_kind=kind, url="u")
+            assert getattr(c, attr) == 1
+            assert c.conservation_errors() == []
+
+
+class TestUnspecifiedStage:
+    def test_stageless_codes_do_not_default_to_parse(self):
+        for code in (DiscardCode.UNKNOWN, DiscardCode.TERMINAL_OUTCOME_MISSING):
+            assert default_stage_for(code) is ScanStage.UNSPECIFIED
+
+    def test_omission_stays_visible_in_the_tally(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        c.note_started()
+        c.note_discard(DiscardCode.UNKNOWN, url="https://e.test/n")
+        assert c.stages == {"unspecified": 1}
+        assert c.samples[0].stage == "unspecified"
+
+    def test_explicit_stage_still_wins(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        c.note_started()
+        c.note_discard(
+            DiscardCode.UNKNOWN, stage=ScanStage.DETAIL_FETCH, url="https://e.test/s"
+        )
+        assert c.stages == {"detail_fetch": 1}
+
+
+class TestFutureFactNormalization:
+    def test_completed_with_data_backfills_started_and_data(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/b")
+        t.reconcile(future_completed=True, future_returned_data=True)
+
+        assert c.detail_started == 1
+        assert c.detail_returned_data == 1
+        assert c.media_item_abandoned_on_stop == 1
+        assert c.conservation_errors() == []
+
+    def test_completed_exception_backfills_started(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/e")
+        t.reconcile(future_completed=True, exception_type="RuntimeError")
+
+        assert c.detail_started == 1
+        assert c.detail_raised_exception == 1
+        assert c.conservation_errors() == []
+
+    def test_completed_falsy_is_not_mistaken_for_never_started(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="https://e.test/f")
+        assert t.reconcile(future_completed=True) is DiscardCode.DETAIL_EMPTY
+
+        assert c.detail_started == 1
+        assert c.scheduled_terminal_missing == 0
+        assert c.conservation_errors() == []
+
+    def test_backfill_does_not_invent_http_requests(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        PostOutcome(c, url="https://e.test/h").reconcile(
+            future_completed=True, future_returned_data=True
+        )
+        assert c.detail_http_requests == 0
+
+    def test_cancelled_future_is_not_backfilled_as_started(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        PostOutcome(c, url="https://e.test/c").reconcile(future_cancelled=True)
+        assert c.detail_started == 0
+        assert c.conservation_errors() == []
+
+
+class TestPopulationSeparation:
+    def test_stop_does_not_read_as_construction_failure(self):
+        """9 stranded results + 1 built = 100% construction success."""
+        c = ScanStageCounters()
+        c.note_scheduled(10)
+        for _ in range(10):
+            c.note_started()
+            c.note_detail_data()
+        c.note_item_created()
+        for i in range(9):
+            c.note_discard(
+                DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP,
+                stage=ScanStage.DETAIL_TO_ITEM_HANDOFF,
+                url="https://e.test/s%d" % i,
+            )
+
+        assert c.media_item_construction_attempted == 1
+        assert c.media_item_construction_success_ratio == 1.0
+        assert c.conservation_errors() == []
+
+    def test_groups_keep_failures_stop_and_gaps_apart(self):
+        c = ScanStageCounters()
+        c.note_scheduled(3)
+        c.note_started()
+        c.note_discard(DiscardCode.DETAIL_NO_FILENAME, url="a")
+        c.note_started()
+        c.note_discard(
+            DiscardCode.DETAIL_CANCELLED_AFTER_START,
+            stage=ScanStage.DETAIL_FETCH,
+            url="b",
+        )
+        c.note_started()
+        c.note_discard(DiscardCode.TERMINAL_OUTCOME_MISSING, url="c")
+
+        assert c.outcome_groups() == {
+            "failures": 1,
+            "operator_stop_outcomes": 1,
+            "instrumentation_gaps": 1,
+        }
+        assert c.conservation_errors() == []
+
+    def test_stopped_scan_is_ineligible_for_health_scoring(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        c.note_started()
+        c.note_discard(DiscardCode.DETAIL_NO_FILENAME, url="a")
+        assert c.eligible_for_health_scoring is True
+
+        c.note_scheduled()
+        c.note_cancelled_before_start(1)
+        assert c.eligible_for_health_scoring is False
+
+    def test_summary_does_not_call_stop_outcomes_failures(self):
+        c = ScanStageCounters()
+        c.note_scheduled(2)
+        c.note_started()
+        c.note_discard(DiscardCode.DETAIL_NO_FILENAME, url="a")
+        c.note_cancelled_before_start(1)
+
+        line = c.summary_line()
+        assert "failures=1" in line
+        assert "stopped=1" in line
