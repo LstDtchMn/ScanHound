@@ -78,6 +78,19 @@ function Get-ContainerTarget([string]$key) {
     return "/library/plex-source/$key"
 }
 
+# --- stable Compose inputs -------------------------------------------------
+# This script may recreate the container. Reading docker-compose.yml from the
+# working tree meant a branch checkout could silently change WHICH service
+# definition a recovery run deployed -- volumes, networks, restart policy --
+# without review. Pin the recipe to the deployed, hashed copy instead.
+#
+# --project-directory still points at the working tree because the compose
+# file's relative paths (./data) must resolve to the LIVE application data
+# directory, which is gitignored and therefore unaffected by branch checkouts.
+# Only the recipe is pinned; the data it names is deliberately not moved.
+$ComposeFile       = "C:\ProgramData\ScanHound\deploy\docker-compose.yml"
+$ComposeProjectDir = "X:\Docker Apps\ScanHound"
+
 # --- single instance -------------------------------------------------------
 # The Scheduled Task is registered At Logon AND At Startup, which can overlap.
 # Two concurrent runs would unmount shares under each other and race on the
@@ -451,15 +464,21 @@ if ($needsRecreate -and $mountExit -ne 0 -and $probe.Reason -eq "probed" -and $p
 }
 
 if ($needsRecreate) {
-    Push-Location "X:\Docker Apps\ScanHound"
-    try {
-        Write-Host "Recreating the scanhound container to pick up live mounts..."
-        docker compose up -d --force-recreate
-        if ($LASTEXITCODE -ne 0) {
-            Fail "docker compose up -d --force-recreate failed (exit $LASTEXITCODE)." 4
-        }
-    } finally {
-        Pop-Location
+    # Fail closed. A recreate without the reviewed recipe is precisely the
+    # unreviewed-config-reaches-production path this pinning exists to close,
+    # so a missing bundle must stop the recreate rather than fall back to the
+    # working tree.
+    if (-not (Test-Path -LiteralPath $ComposeFile)) {
+        Fail ("Deployed Compose recipe not found at $ComposeFile -- refusing to " +
+              "recreate from the mutable working tree. Redeploy the bundle.") 4
+    }
+
+    Write-Host "Recreating the scanhound container to pick up live mounts..."
+    Write-Host "  compose file: $ComposeFile"
+    Write-Host "  project dir : $ComposeProjectDir"
+    docker compose -f $ComposeFile --project-directory $ComposeProjectDir up -d --force-recreate
+    if ($LASTEXITCODE -ne 0) {
+        Fail "docker compose up -d --force-recreate failed (exit $LASTEXITCODE)." 4
     }
 
     # THE completion gate. Compose exiting 0 proves a container started, not
