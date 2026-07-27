@@ -107,18 +107,44 @@ function Assert-PinnedExe([string]$path, [string]$label) {
     if ($item.Extension -ne '.exe') {
         throw "$label at '$path' is not an .exe (found '$($item.Extension)')."
     }
-    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-        throw "$label at '$path' is a reparse point; it may redirect elsewhere."
-    }
-    # Not user-writable: a pinned path an attacker can overwrite is not pinned.
+    # The EXECUTABLE and its whole directory chain, not just the immediate
+    # parent's allow ACEs. A file can retain an explicit write ACE inside an
+    # otherwise-protected directory, an unexpected owner implicitly holds
+    # WRITE_DAC, and a junction anywhere up the chain redirects the "pinned"
+    # path to somewhere that was never checked.
     $trusted = @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\TrustedInstaller')
-    foreach ($ace in (Get-Acl -LiteralPath $item.DirectoryName).Access) {
-        if ($ace.AccessControlType -ne 'Allow') { continue }
-        if ($trusted -contains $ace.IdentityReference.Value) { continue }
-        if (Test-WriteShapedRight $ace.FileSystemRights) {
-            throw ("$label lives in '$($item.DirectoryName)', which grants " +
-                   "'$($ace.FileSystemRights)' to '$($ace.IdentityReference)'.")
+
+    # Walk the executable and its ancestors, but STOP BEFORE THE VOLUME ROOT.
+    # Measured: C:\ grants Authenticated Users AppendData -- the standard
+    # Windows ACL letting ordinary users create new top-level folders. That is
+    # CreateDirectories, not permission to alter C:\Windows or anything under
+    # it, so including the root rejected every executable on a normal install
+    # (verified: wsl.exe, docker.exe and powershell.exe all failed). A check
+    # that rejects the correct configuration is as useless as one that accepts
+    # everything; the meaningful chain is the executable through its real
+    # containing directories.
+    $root = [IO.Path]::GetPathRoot($item.FullName)
+    $cur  = $item.FullName
+    while ($cur -and $cur.TrimEnd('\') -ne $root.TrimEnd('\')) {
+        $node = Get-Item -LiteralPath $cur -Force -ErrorAction Stop
+        if ($node.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "${label}: '$cur' in the path of '$path' is a reparse point."
         }
+        $acl = Get-Acl -LiteralPath $cur
+        if ($trusted -notcontains $acl.Owner) {
+            throw "${label}: '$cur' is owned by '$($acl.Owner)', which implicitly controls its DACL."
+        }
+        foreach ($ace in $acl.Access) {
+            if ($ace.AccessControlType -ne 'Allow') { continue }
+            if ($trusted -contains $ace.IdentityReference.Value) { continue }
+            if (Test-WriteShapedRight $ace.FileSystemRights) {
+                throw ("${label}: '$cur' grants '$($ace.FileSystemRights)' to " +
+                       "'$($ace.IdentityReference)', so '$path' is not effectively pinned.")
+            }
+        }
+        $parent = Split-Path $cur -Parent
+        if (-not $parent -or $parent -eq $cur) { break }
+        $cur = $parent
     }
 }
 
@@ -433,6 +459,32 @@ function Initialize-SecureRunRoot {
     Assert-AdminOwnedNoUserWrite $RunRoot 'Staging root'
 }
 
+# Windows does NOT inherit an object's owner from its parent directory -- a new
+# file's owner comes from the creating token's default owner. An elevated
+# admin token usually yields BUILTIN\Administrators, but "usually" is not a
+# security property, and an owner implicitly holds WRITE_DAC: it can re-grant
+# itself write access even where no write ACE exists. So every staged payload
+# is created empty, given an explicit admin-only descriptor, and PROVEN before
+# any content is written into it.
+function New-SecureStagedFile([string]$path) {
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force
+    }
+    # CreateNew: fail rather than reuse anything that appeared underneath us.
+    $fs = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $fs.Dispose()
+
+    foreach ($a in @(@('/setowner','BUILTIN\Administrators'), @('/inheritance:r'),
+                     @('/grant','BUILTIN\Administrators:(F)'),
+                     @('/grant','*S-1-5-18:(F)'))) {
+        & icacls.exe $path @a /q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls failed hardening staged file $path ($($a -join ' '))." }
+    }
+    Assert-NoReparsePoint $path 'Staged file'
+    Assert-AdminOwnedNoUserWrite $path 'Staged file'
+    return $path
+}
+
 function New-SecureStagingDir {
     Initialize-SecureRunRoot
     $dir = Join-Path $RunRoot ([Guid]::NewGuid().ToString('N'))
@@ -456,8 +508,8 @@ function New-SecureStagingDir {
 }
 
 $stagingDir = New-SecureStagingDir
-$tempData   = Join-Path $stagingDir "mount-nas.data"
-$tempScript = Join-Path $stagingDir "mount-nas.sh"
+$tempData   = New-SecureStagedFile (Join-Path $stagingDir "mount-nas.data")
+$tempScript = New-SecureStagedFile (Join-Path $stagingDir "mount-nas.sh")
 # The data file MUST end with a newline. Without it POSIX `read` returns
 # non-zero on the final record and the consuming loop drops it -- silently, and
 # always the last share, which is the critical read-write TV destination. The
@@ -471,55 +523,6 @@ function ConvertTo-WslPath([string]$winPath) {
     $rest  = $winPath.Substring(2).Replace('\', '/')
     return "/mnt/host/$drive$rest"
 }
-
-Write-Host "Mounting NAS shares inside the docker-desktop WSL2 distro..."
-# The expected record count is passed in so the shell can assert it examined
-# every share. Derived from the same $shares list that produced the data file,
-# so the two can never disagree about how many there should be.
-#
-# IN-DISTRO TIMEOUT. Killing wsl.exe on the Windows side does not prove the
-# Linux-side shell stopped, and Task Scheduler's ExecutionTimeLimit is only an
-# outer watchdog over the Windows task host -- it has NOT been shown to reach
-# into the VM. Without this, a wedged mount could outlive its invocation and
-# still be running when the 5-minute repeater fires again.
-#
-# BusyBox timeout, not GNU: verified on this host it takes `-s SIG -k SECS SECS`
-# (no --long-options, no `s` suffix) and exits 15 on timeout -- distinct from
-# this script's own 0/1/2, so a timeout can never be mistaken for a verdict.
-# 240 s leaves wide margin under the PT15M outer limit.
-$MountTimeoutSec = 240
-# Keys are [a-z0-9-] by construction, so a space-separated list is unambiguous
-# and needs no quoting through the PowerShell -> wsl.exe -> sh layers.
-$ExpectedKeys = ($shares.Keys -join ' ')
-& $WslExe -d docker-desktop -- timeout -s TERM -k 5 $MountTimeoutSec `
-    sh (ConvertTo-WslPath $tempScript) (ConvertTo-WslPath $tempData) $shares.Count $ExpectedKeys
-$mountExit = $LASTEXITCODE
-if ($mountExit -eq 15) {
-    Fail ("The in-distro mount stage exceeded $MountTimeoutSec s and was terminated. No " +
-          "share verdict is trustworthy from this run; the scheduler will retry.") 8
-}
-
-# The whole staging directory is removed in the finally block, which also
-# covers the early-exit paths this line never reached.
-Remove-Item $tempScript, $tempData -Force -ErrorAction SilentlyContinue
-
-# Partial-failure policy, stated deliberately rather than by omission:
-#
-#   * critical share failed  -> never touch the container. Recreating would
-#     bind /library/tv to a local VM directory and the app would write TV
-#     files somewhere Plex cannot see. Hard stop.
-#   * only read-only shares failed -> still a failure and still exits nonzero,
-#     but whether to recreate depends on what the container can currently see
-#     (below). Restoring eight of nine sources beats total blindness; it does
-#     NOT beat a healthy container, so a healthy one is left alone.
-# Deliberately NOT handled here. "Do not recreate" is correct when the critical
-# share is unverified, but "do not touch the container" is NOT safe: if the
-# container is already blind (WSL bounced, then the share failed to remount) it
-# keeps running with /library/tv bound to a local VM directory and silently
-# writes TV files where Plex will never see them. So the critical-failure path
-# still PROBES the existing container below, and stops it unless its
-# /library/tv is independently identity-verified and writable.
-$criticalHostFailure = ($mountExit -eq 2)
 
 # --- container probe -------------------------------------------------------
 
@@ -647,8 +650,8 @@ foreach ($key in $shares.Keys) {
 # Same staging directory, same reason: these are docker-cp'd into the container
 # and executed there, so a predictable user-writable source path is a swap
 # window. Reuses the hardened per-run directory created above.
-$probeScriptPath = Join-Path $stagingDir "probe-mounts.sh"
-$probeDataPath   = Join-Path $stagingDir "probe-mounts.data"
+$probeScriptPath = New-SecureStagedFile (Join-Path $stagingDir "probe-mounts.sh")
+$probeDataPath   = New-SecureStagedFile (Join-Path $stagingDir "probe-mounts.data")
 ($probeScript -replace "`r`n", "`n") | Out-File -FilePath $probeScriptPath -Encoding ascii -NoNewline
 # Trailing newline required -- see the host-side note. The dropped record here
 # was /library/tv, which made the write-probe's identity gate vacuous.
@@ -705,8 +708,15 @@ function Invoke-ContainerProbe([int]$TimeoutSec = 90) {
 # `docker stop | Out-Null` hides a failure and an unreachable daemon alike, and
 # the caller then asserts a safe state that may not exist.
 function Stop-ScanhoundVerified([int]$TimeoutSec = 45) {
-    $job = Start-Job -ScriptBlock {
-        & $DockerExe stop -t 20 scanhound 2>&1 | Out-Null
+    # $DockerExe MUST be passed in. A Start-Job scriptblock runs in a separate
+    # PowerShell process and inherits none of the caller's variables, so the
+    # bare reference this replaced expanded to $null -- i.e. the safety stop
+    # invoked nothing at all. Verified empirically: $DockerExe is empty inside
+    # a job. The outer `docker ps` check meant the failure was reported honestly
+    # rather than claimed as a stop, but the container was never stopped.
+    $job = Start-Job -ArgumentList $DockerExe -ScriptBlock {
+        param($dockerExe)
+        & $dockerExe stop -t 20 scanhound 2>&1 | Out-Null
         $LASTEXITCODE
     }
     if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
@@ -724,6 +734,89 @@ function Stop-ScanhoundVerified([int]$TimeoutSec = 45) {
     if ($code -ne 0)         { return "stopped-despite-error" }
     return "stopped"
 }
+
+Write-Host "Mounting NAS shares inside the docker-desktop WSL2 distro..."
+# The expected record count is passed in so the shell can assert it examined
+# every share. Derived from the same $shares list that produced the data file,
+# so the two can never disagree about how many there should be.
+#
+# IN-DISTRO TIMEOUT. Killing wsl.exe on the Windows side does not prove the
+# Linux-side shell stopped, and Task Scheduler's ExecutionTimeLimit is only an
+# outer watchdog over the Windows task host -- it has NOT been shown to reach
+# into the VM. Without this, a wedged mount could outlive its invocation and
+# still be running when the 5-minute repeater fires again.
+#
+# BusyBox timeout, not GNU: verified on this host it takes `-s SIG -k SECS SECS`
+# (no --long-options, no `s` suffix) and exits 15 on timeout -- distinct from
+# this script's own 0/1/2, so a timeout can never be mistaken for a verdict.
+# 240 s leaves wide margin under the PT15M outer limit.
+$MountTimeoutSec = 240
+# Keys are [a-z0-9-] by construction, so a space-separated list is unambiguous
+# and needs no quoting through the PowerShell -> wsl.exe -> sh layers.
+$ExpectedKeys = ($shares.Keys -join ' ')
+& $WslExe -d docker-desktop -- timeout -s TERM -k 5 $MountTimeoutSec `
+    sh (ConvertTo-WslPath $tempScript) (ConvertTo-WslPath $tempData) $shares.Count $ExpectedKeys
+$mountExit = $LASTEXITCODE
+
+# ALLOWLIST, not a special case for the one timeout code that was measured.
+# The host shell's verdict space is exactly {0 = all verified, 1 = read-only
+# share failed, 2 = critical/coverage failure}. Anything else -- 15 from a
+# BusyBox TERM timeout, 137 from a SIGKILL escalation, 126/127 from a failed
+# exec, a WSL interruption -- is an INFRASTRUCTURE outcome, not a statement
+# about the shares.
+#
+# Treating only 15 as indeterminate left every other value falling through to
+# ordinary handling, where `$criticalHostFailure = ($mountExit -eq 2)` is
+# false. A blind container could then be recreated on the strength of a result
+# that never described the mounts at all. An unrecognised result must never
+# authorise a recreate.
+if ($mountExit -notin @(0, 1, 2)) {
+    $why = if ($mountExit -eq 15) { "exceeded $MountTimeoutSec s and was terminated" }
+           else { "returned $mountExit, which is not one of its defined verdicts (0/1/2)" }
+    Write-Host "The in-distro mount stage $why."
+    Write-Host "Treating this as INDETERMINATE: no recreate will be attempted from an unknown result."
+
+    # The container may still be running against local directories, so the
+    # critical destination has to be proven independently or the container
+    # stopped -- exactly the critical path, reached without a share verdict.
+    $ind = Invoke-ContainerProbe
+    if ($ind.Reason -eq "probed" -and $ind.Code -eq 0) {
+        Fail ("Mount stage indeterminate, but the running container still proves all nine " +
+              "targets including $CriticalTarget. Left running; NOT recreated. The scheduler " +
+              "will retry.") 8
+    }
+    Write-Host "Container cannot prove $CriticalTarget after an indeterminate mount stage."
+    $stopState = Stop-ScanhoundVerified
+    Write-Host "Stop result: $stopState"
+    if ($stopState -eq "stopped" -or $stopState -eq "stopped-despite-error" -or $stopState -eq "not-running") {
+        Fail ("Mount stage indeterminate and $CriticalTarget unproven; the container is not " +
+              "running, so nothing can write into a non-NAS directory. Scheduler will retry.") 8
+    }
+    Fail ("Mount stage indeterminate, $CriticalTarget unproven, and the container could not be " +
+          "confirmed stopped. MANUAL INTERVENTION REQUIRED.") 7
+}
+
+# The whole staging directory is removed in the finally block, which also
+# covers the early-exit paths this line never reached.
+Remove-Item $tempScript, $tempData -Force -ErrorAction SilentlyContinue
+
+# Partial-failure policy, stated deliberately rather than by omission:
+#
+#   * critical share failed  -> never touch the container. Recreating would
+#     bind /library/tv to a local VM directory and the app would write TV
+#     files somewhere Plex cannot see. Hard stop.
+#   * only read-only shares failed -> still a failure and still exits nonzero,
+#     but whether to recreate depends on what the container can currently see
+#     (below). Restoring eight of nine sources beats total blindness; it does
+#     NOT beat a healthy container, so a healthy one is left alone.
+# Deliberately NOT handled here. "Do not recreate" is correct when the critical
+# share is unverified, but "do not touch the container" is NOT safe: if the
+# container is already blind (WSL bounced, then the share failed to remount) it
+# keeps running with /library/tv bound to a local VM directory and silently
+# writes TV files where Plex will never see them. So the critical-failure path
+# still PROBES the existing container below, and stops it unless its
+# /library/tv is independently identity-verified and writable.
+$criticalHostFailure = ($mountExit -eq 2)
 
 $probe = Invoke-ContainerProbe
 Write-Host "Container mount probe: $($probe.Reason)"

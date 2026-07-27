@@ -1,4 +1,4 @@
-# Stage 0 installer for ScanHound-MountNASShares.
+﻿# Stage 0 installer for ScanHound-MountNASShares.
 #
 # ONE elevated operation: deploy the reviewed bundle to a stable location,
 # hash it, lock it down, register the task, then EXPORT the installed task and
@@ -152,9 +152,44 @@ if (-not $srcCommit) { throw "Could not resolve the source commit in $SourceRepo
 Write-Output "source  : $SourceRepo"
 Write-Output "commit  : $srcCommit ($srcBranch)"
 
-# Mechanical dependency gates, so requirements are ENFORCED rather than
-# remembered. Each marker stands for a property whose absence is dangerous.
-$srcText = Get-Content -LiteralPath $SrcScript -Raw
+# DEPLOY FROM GIT'S OBJECT STORE, NOT FROM THE WORKING TREE.
+#
+# The previous flow validated $SrcScript by one read and let Copy-Item REOPEN
+# it later. The repository is writable by the ordinary account while this
+# installer runs elevated, so an unelevated same-user process could swap the
+# file between validation and copy -- and because the manifest hashed whatever
+# was copied, the post-copy check would have certified the attacker's content
+# as the deployed truth. Same trust-boundary shape as the staging exploit:
+# elevated reader, user-writable source, validation separated from use.
+#
+# Rather than race that window, remove it: the content comes from the committed
+# object at $srcCommit, which is immutable and content-addressed. The working
+# tree is never read for deployment, so there is nothing to swap. The earlier
+# attempt -- hashing the working-tree bytes and comparing to the blob id --
+# could not work anyway: git applies the autocrlf filter, so working-tree bytes
+# legitimately hash differently from the stored object (measured on this repo).
+function Get-CommittedText {
+    param([string]$RepoRelative)
+
+    Push-Location $SourceRepo
+    try {
+        $blobSha = (& git rev-parse "${srcCommit}:$RepoRelative" 2>$null)
+        if (-not $blobSha) { throw "Could not resolve $RepoRelative at $srcCommit." }
+        # -p prints the object exactly as stored (LF endings, no filters).
+        $lines = & git cat-file -p $blobSha.Trim() 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "git cat-file failed for $RepoRelative at $srcCommit." }
+    } finally { Pop-Location }
+
+    # Stored objects use LF; keep it. PowerShell and Compose both accept LF.
+    return (($lines -join "`n") + "`n"), $blobSha.Trim()
+}
+
+$scriptText, $scriptBlob   = Get-CommittedText -RepoRelative 'scripts/mount-nas-shares.ps1'
+$composeText, $composeBlob = Get-CommittedText -RepoRelative 'docker-compose.yml'
+Write-Output "content : from git objects $($scriptBlob.Substring(0,8)) / $($composeBlob.Substring(0,8)) at $($srcCommit.Substring(0,8))"
+
+# Every gate below runs against the COMMITTED content, never a working-tree read.
+$srcText = $scriptText
 
 # PR #35: mount identity verification. Without it a wrong share can be mounted
 # and reported healthy -- the failure this whole effort exists to prevent.
@@ -216,14 +251,20 @@ if ($requestedWhatIf) {
 $WhatIfPreference = $requestedWhatIf   # honour the caller from here on
 
 New-Item -ItemType Directory -Force $DeployDir | Out-Null
-Copy-Item $SrcScript  $Deployed -Force
-Copy-Item $SrcCompose $Compose  -Force
+# Write the COMMITTED content read above. Copy-Item would reopen the
+# user-writable working tree and reintroduce the swap window this whole
+# section exists to close. UTF8 without BOM: a BOM would change the bytes
+# relative to the git object and break any later content comparison.
+$utf8NoBom = New-Object Text.UTF8Encoding($false)
+[IO.File]::WriteAllText($Deployed, $scriptText,  $utf8NoBom)
+[IO.File]::WriteAllText($Compose,  $composeText, $utf8NoBom)
 
 $manifest = [ordered]@{
     deployed_at   = (Get-Date).ToString('o')
     stage         = 'Stage 0 - scheduler settings + stable deployment path'
     source_repo   = $SourceRepo
     source_commit = $srcCommit
+    source_blobs  = @{ 'mount-nas-shares.ps1' = $scriptBlob; 'docker-compose.yml' = $composeBlob }
     source_branch = $srcBranch
     files         = @(
         [ordered]@{ name = 'mount-nas-shares.ps1'

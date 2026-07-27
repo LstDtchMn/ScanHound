@@ -1,7 +1,15 @@
-﻿# Roll ScanHound-MountNASShares back to a previously exported task definition.
+﻿# SCHEDULER-DEFINITION rollback for ScanHound-MountNASShares.
 #
-# Restores the task only. The deployed bundle under C:\ProgramData\ScanHound\deploy
-# is left in place; a restored pre-Stage-0 task simply stops pointing at it.
+# Restores the previous TRIGGERS, SETTINGS and PRINCIPAL. It deliberately does
+# NOT restore the previous ACTION: the action is a safety invariant, not
+# configuration that should be allowed to regress. Every restore points at the
+# current reviewed deployed script, whatever the backup said.
+#
+# THIS IS NOT A CODE ROLLBACK. It cannot return you to an older version of
+# mount-nas-shares.ps1 -- the installer overwrites the deployed bundle in place
+# and no prior versioned bundle is kept. If code rollback is ever needed, the
+# answer is versioned hashed bundles (e.g. ...\releases\<commit>\), not
+# trusting a historical action out of a backup file.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File rollback-mount-task.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File rollback-mount-task.ps1 -BackupXml <path>
@@ -124,6 +132,44 @@ foreach ($ace in $facl.Access) {
 #
 # The action is therefore REWRITTEN to the canonical form rather than
 # validated-and-trusted -- a validator can be argued with; a rewrite cannot.
+
+# Rewriting the action to a canonical path is only safe if that target actually
+# exists and is itself trustworthy -- otherwise rollback cheerfully registers a
+# task pointing at a missing or tampered script.
+if (-not (Test-Path -LiteralPath $DeployedScript -PathType Leaf)) {
+    throw ("Canonical deployed script not found: $DeployedScript. Run install-mount-task.ps1 " +
+           "(elevated) first -- there is nothing safe to point the restored task at.")
+}
+$depItem = Get-Item -LiteralPath $DeployedScript -Force
+if ($depItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    throw "Canonical deployed script '$DeployedScript' is a reparse point."
+}
+$dacl = Get-Acl -LiteralPath $DeployedScript
+if ($trusted -notcontains $dacl.Owner) {
+    throw "Canonical deployed script is owned by '$($dacl.Owner)', not an admin principal."
+}
+foreach ($ace in $dacl.Access) {
+    if ($ace.AccessControlType -ne 'Allow') { continue }
+    if ($trusted -contains $ace.IdentityReference.Value) { continue }
+    if (Test-WriteShapedRight $ace.FileSystemRights) {
+        throw ("Canonical deployed script grants '$($ace.FileSystemRights)' to " +
+               "'$($ace.IdentityReference)' -- refusing to point a restored elevated task at it.")
+    }
+}
+# And it must still be the bytes the installer recorded.
+$manifestPath = Join-Path (Split-Path $DeployedScript -Parent) 'MANIFEST.json'
+if (Test-Path -LiteralPath $manifestPath) {
+    $mf  = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $ent = $mf.files | Where-Object { $_.name -eq 'mount-nas-shares.ps1' } | Select-Object -First 1
+    if ($ent) {
+        $have = (Get-FileHash -LiteralPath $DeployedScript -Algorithm SHA256).Hash
+        if ($have -ne $ent.sha256) {
+            throw ("Deployed script no longer matches its manifest hash " +
+                   "(manifest $($ent.sha256), on disk $have). Refusing to restore against it.")
+        }
+        Write-Output "deployed target verified against manifest ($($ent.sha256.Substring(0,16))...)"
+    }
+}
 
 $content = Get-Content -LiteralPath $resolvedXml -Raw
 try { $xml = [xml]$content } catch { throw "Backup is not valid XML: $resolvedXml" }
