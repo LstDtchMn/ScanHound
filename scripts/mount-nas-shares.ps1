@@ -133,9 +133,11 @@ $hostScript = @'
 # Mount each share and PROVE it, or fail loudly. Never infers a mount from
 # directory contents. Exit 0 only if every share is identity-verified.
 DATA="$1"
+EXPECTED="$2"
 CRITICAL_KEY="nas-tv-blackbeard"
 fail=0
 critical_fail=0
+processed=0
 
 # 0 = mounted and correct, 1 = not a mountpoint, 2 = wrong fs type,
 # 3 = mounted but a DIFFERENT share
@@ -167,8 +169,16 @@ verify_identity() {
 }
 
 echo "=== mounting and verifying NAS shares ==="
-while IFS="$(printf '\t')" read -r key share; do
+# `|| [ -n "$key" ]` is load-bearing. POSIX read returns NON-ZERO when it hits
+# EOF on a final line with no terminating newline, having already assigned the
+# variables -- so a plain `while read` SILENTLY DROPS THE LAST RECORD. That
+# record is nas-tv-blackbeard, the critical read-write TV destination, because
+# it is last in the ordered share list. Reproduced 2026-07-26 in bash, dash and
+# the docker-desktop distro's BusyBox ash: eight shares verified, the ninth
+# never examined, and the script still printed success and exited 0.
+while IFS="$(printf '\t')" read -r key share || [ -n "$key" ]; do
     [ -n "$key" ] || continue
+    processed=$((processed + 1))
     target="/mnt/nas/$key"
     mkdir -p "$target"
 
@@ -225,6 +235,17 @@ while IFS="$(printf '\t')" read -r key share; do
     printf '  %-32s OK (mounted and verified, %s entries)\n' "$key" "$n"
 done < "$DATA"
 
+# Coverage assertion. The two fixes above close ONE way records get dropped;
+# this closes the CLASS. A share that was never examined must never be able to
+# masquerade as a share that passed, whatever the cause -- truncated input,
+# encoding damage, a read that stops early. Treated as CRITICAL because the
+# dropped record may BE the critical share, and we cannot know which it was.
+if [ "$processed" -ne "$EXPECTED" ]; then
+    echo "RESULT: coverage check FAILED -- examined $processed of $EXPECTED shares."
+    echo "        Some share was never checked, so no share can be trusted."
+    exit 2
+fi
+
 if [ $critical_fail -ne 0 ]; then
     echo "RESULT: the CRITICAL read-write share failed"
     exit 2
@@ -233,13 +254,18 @@ if [ $fail -ne 0 ]; then
     echo "RESULT: one or more read-only shares failed"
     exit 1
 fi
-echo "RESULT: all nine shares mounted and identity-verified"
+echo "RESULT: all $processed shares mounted and identity-verified"
 exit 0
 '@
 
 $tempData   = Join-Path $env:TEMP "scanhound-mount-nas.data"
 $tempScript = Join-Path $env:TEMP "scanhound-mount-nas.sh"
-($dataLines  -join "`n") | Out-File -FilePath $tempData   -Encoding ascii -NoNewline
+# The data file MUST end with a newline. Without it POSIX `read` returns
+# non-zero on the final record and the consuming loop drops it -- silently, and
+# always the last share, which is the critical read-write TV destination. The
+# shell loops are now independently robust to this and assert their coverage,
+# but the input is written correctly in the first place.
+(($dataLines -join "`n") + "`n") | Out-File -FilePath $tempData -Encoding ascii -NoNewline
 ($hostScript -replace "`r`n", "`n") | Out-File -FilePath $tempScript -Encoding ascii -NoNewline
 
 function ConvertTo-WslPath([string]$winPath) {
@@ -249,7 +275,10 @@ function ConvertTo-WslPath([string]$winPath) {
 }
 
 Write-Host "Mounting NAS shares inside the docker-desktop WSL2 distro..."
-wsl -d docker-desktop -- sh (ConvertTo-WslPath $tempScript) (ConvertTo-WslPath $tempData)
+# The expected record count is passed in so the shell can assert it examined
+# every share. Derived from the same $shares list that produced the data file,
+# so the two can never disagree about how many there should be.
+wsl -d docker-desktop -- sh (ConvertTo-WslPath $tempScript) (ConvertTo-WslPath $tempData) $shares.Count
 $mountExit = $LASTEXITCODE
 
 Remove-Item $tempScript, $tempData -Force -ErrorAction SilentlyContinue
@@ -280,12 +309,20 @@ $probeScript = @'
 # intended 9p share -- not to an empty local directory that merely looks like
 # one. Same identity rule as the host side.
 DATA="$1"
+EXPECTED="$2"
 CRITICAL_TARGET="/library/tv"
+processed=0
+critical_seen=0
 bad=0
 critical_bad=0
 
-while IFS="$(printf '\t')" read -r target share; do
+# `|| [ -n "$target" ]`: see the host-side note. Without it the final record --
+# /library/tv, the critical destination -- is silently never examined, which
+# left critical_bad at 0 and made the "identity verified" gate below vacuous.
+while IFS="$(printf '\t')" read -r target share || [ -n "$target" ]; do
     [ -n "$target" ] || continue
+    processed=$((processed + 1))
+    [ "$target" = "$CRITICAL_TARGET" ] && critical_seen=1
     if ! mountpoint -q "$target" 2>/dev/null; then
         echo "BLIND $target (not a mountpoint)"
         bad=1; [ "$target" = "$CRITICAL_TARGET" ] && critical_bad=1
@@ -321,7 +358,16 @@ done < "$DATA"
 # Gated on identity: never write into a target whose identity check already
 # failed. Writing to an unverified /library/tv is exactly the local-VM-directory
 # accident this script exists to prevent.
-if [ $critical_bad -ne 0 ]; then
+# `critical_seen` is the fix for a vacuous guard. Gating only on
+# `critical_bad -ne 0` asked "did the identity check FAIL?", which is answered
+# "no" both when the check passed AND when it never ran. On 2026-07-26 it never
+# ran (dropped final record), so this branch wrote into an UNVERIFIED
+# /library/tv -- a local ext4 directory -- succeeded, and printed OK. Requiring
+# proof that the check actually ran turns "unknown" back into "not verified".
+if [ $critical_seen -eq 0 ]; then
+    echo "SKIP  $CRITICAL_TARGET write probe (target was never examined)"
+    bad=1; critical_bad=1
+elif [ $critical_bad -ne 0 ]; then
     echo "SKIP  $CRITICAL_TARGET write probe (identity not verified)"
 else
     probe="$CRITICAL_TARGET/.scanhound-mount-probe.$$"
@@ -338,6 +384,13 @@ else
     fi
 fi
 
+# Same coverage assertion as the host stage: a target that was never examined
+# must not be able to pass for one that was.
+if [ "$processed" -ne "$EXPECTED" ]; then
+    echo "COVERAGE FAILED -- examined $processed of $EXPECTED targets"
+    exit 2
+fi
+
 [ $critical_bad -ne 0 ] && exit 2
 [ $bad -ne 0 ] && exit 1
 exit 0
@@ -352,11 +405,15 @@ foreach ($key in $shares.Keys) {
 $probeScriptPath = Join-Path $env:TEMP "scanhound-probe-mounts.sh"
 $probeDataPath   = Join-Path $env:TEMP "scanhound-probe-mounts.data"
 ($probeScript -replace "`r`n", "`n") | Out-File -FilePath $probeScriptPath -Encoding ascii -NoNewline
-($probeData -join "`n")              | Out-File -FilePath $probeDataPath   -Encoding ascii -NoNewline
+# Trailing newline required -- see the host-side note. The dropped record here
+# was /library/tv, which made the write-probe's identity gate vacuous.
+(($probeData -join "`n") + "`n")     | Out-File -FilePath $probeDataPath   -Encoding ascii -NoNewline
 
 # Bounded: a wedged Docker daemon or container makes `docker exec` HANG rather
 # than return, which would leave the Scheduled Task running forever. Distinguish
 # the outcomes -- "empty output" is not a diagnosis.
+$ExpectedTargets = $probeData.Count
+
 function Invoke-ContainerProbe([int]$TimeoutSec = 90) {
     $result = [pscustomobject]@{ Code = -1; Output = ""; Reason = "" }
 
@@ -369,9 +426,14 @@ function Invoke-ContainerProbe([int]$TimeoutSec = 90) {
     docker cp $probeDataPath scanhound:/tmp/scanhound-probe-mounts.data 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { $result.Reason = "copy-failed"; return $result }
 
-    $job = Start-Job -ScriptBlock {
+    # -ArgumentList, because a Start-Job scriptblock does not inherit the
+    # caller's scope: $ExpectedTargets would silently be $null inside it, and
+    # the probe's coverage assertion would then compare against an empty
+    # string and fail every run.
+    $job = Start-Job -ArgumentList $ExpectedTargets -ScriptBlock {
+        param($expected)
         $out = docker exec scanhound sh /tmp/scanhound-probe-mounts.sh `
-                   /tmp/scanhound-probe-mounts.data 2>&1
+                   /tmp/scanhound-probe-mounts.data $expected 2>&1
         [pscustomobject]@{ Out = ($out | Out-String); Code = $LASTEXITCODE }
     }
     if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
