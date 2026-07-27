@@ -785,16 +785,52 @@ class TestPopulationSeparation:
         }
         assert c.conservation_errors() == []
 
-    def test_stopped_scan_is_ineligible_for_health_scoring(self):
+    def test_a_cancellation_does_not_silence_a_real_regression(self):
+        """Stop outcomes leave the denominators, they do not veto the cycle.
+
+        Vetoing meant one routine cancellation silenced the exact parser
+        regression these counters exist to catch - and since the pipeline stops
+        early once it has enough releases, plausibly no real cycle would ever
+        have been health-scored.
+        """
+        c = ScanStageCounters()
+        for _ in range(127):
+            c.note_scheduled()
+            c.note_started()
+            c.note_discard(
+                DiscardCode.DETAIL_NO_FILENAME,
+                terminal_kind=TerminalKind.RETURNED_NONE,
+                url="a",
+            )
+        assert c.eligible_for_health_scoring is True
+        assert c.detail_parse_success_ratio == 0.0
+
+        # one cancelled post must not change either answer
+        c.note_scheduled()
+        c.note_cancelled_before_start(1)
+        assert c.eligible_for_health_scoring is True
+        assert c.detail_parse_success_ratio == 0.0
+        assert c.conservation_errors() == []
+
+    def test_instrumentation_gaps_do_disqualify(self):
+        """A cycle whose own bookkeeping is broken is evidence of nothing."""
         c = ScanStageCounters()
         c.note_scheduled()
         c.note_started()
-        c.note_discard(DiscardCode.DETAIL_NO_FILENAME, url="a")
-        assert c.eligible_for_health_scoring is True
-
-        c.note_scheduled()
-        c.note_cancelled_before_start(1)
+        c.note_discard(DiscardCode.UNKNOWN, url="a")   # no factual kind
         assert c.eligible_for_health_scoring is False
+
+    def test_shipped_but_uncounted_release_disqualifies(self):
+        c = ScanStageCounters()
+        c.note_scheduled()
+        t = PostOutcome(c, url="u")
+        t.note_started()
+        t.data_returned()
+        t.reconcile(FutureTerminalState.COMPLETED_WITH_DATA)
+        assert t.item_created() is False
+        assert c.media_item_created_after_terminal == 1
+        assert c.eligible_for_health_scoring is False
+        assert any("created_after_terminal" in e for e in c.conservation_errors())
 
     def test_summary_does_not_call_stop_outcomes_failures(self):
         c = ScanStageCounters()
