@@ -1,4 +1,4 @@
-# Re-establishes the 9 TURTLELANDSRV2 NAS share mounts inside Docker
+﻿# Re-establishes the 9 TURTLELANDSRV2 NAS share mounts inside Docker
 # Desktop's internal WSL2 distro (docker-desktop), so docker-compose.yml's
 # bind mounts under /mnt/nas/... (see the volumes: block) have something real
 # to mount from.
@@ -73,6 +73,55 @@ $shares = [ordered]@{
 $CriticalKey    = "nas-tv-blackbeard"
 $CriticalTarget = "/library/tv"
 
+# --- pinned executables ----------------------------------------------------
+# Resolved by ABSOLUTE PATH, never by name. This runs as an elevated Scheduled
+# Task 288 times a day; resolving `wsl` or `docker` through PATH means anything
+# that can prepend a directory to PATH -- or drop a wsl.bat in an earlier one --
+# chooses what runs elevated. Both directories below are writable only by
+# TrustedInstaller/SYSTEM/Administrators (verified 2026-07-26).
+$WslExe    = Join-Path $env:SystemRoot 'System32\wsl.exe'
+$DockerExe = 'C:\Program Files\Docker\Docker\resources\bin\docker.exe'
+
+# Write-shaped rights, tested with ATOMIC flags only.
+#
+# The first version of this OR'd the COMPOSITE rights (Write|Modify|FullControl)
+# into a mask and AND-ed against it. That is wrong: Modify and FullControl
+# CONTAIN the read bits, so `ReadAndExecute -band Modify` is non-zero and every
+# read-only ACE matched. The check therefore said "writable" about everything,
+# including BUILTIN\Users' normal ReadAndExecute on C:\Windows\System32 -- a
+# check that answers yes to all inputs is not a check, and it would have made
+# the installer fail on its own correctly-hardened deploy directory.
+function Test-WriteShapedRight([Security.AccessControl.FileSystemRights]$rights) {
+    $R = [Security.AccessControl.FileSystemRights]
+    $mask = [int]($R::WriteData -bor $R::AppendData -bor $R::WriteExtendedAttributes -bor
+                  $R::WriteAttributes -bor $R::Delete -bor $R::DeleteSubdirectoriesAndFiles -bor
+                  $R::ChangePermissions -bor $R::TakeOwnership)
+    return (([int]$rights -band $mask) -ne 0)
+}
+
+function Assert-PinnedExe([string]$path, [string]$label) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "$label not found at the pinned path '$path'."
+    }
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.Extension -ne '.exe') {
+        throw "$label at '$path' is not an .exe (found '$($item.Extension)')."
+    }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "$label at '$path' is a reparse point; it may redirect elsewhere."
+    }
+    # Not user-writable: a pinned path an attacker can overwrite is not pinned.
+    $trusted = @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\TrustedInstaller')
+    foreach ($ace in (Get-Acl -LiteralPath $item.DirectoryName).Access) {
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+        if ($trusted -contains $ace.IdentityReference.Value) { continue }
+        if (Test-WriteShapedRight $ace.FileSystemRights) {
+            throw ("$label lives in '$($item.DirectoryName)', which grants " +
+                   "'$($ace.FileSystemRights)' to '$($ace.IdentityReference)'.")
+        }
+    }
+}
+
 function Get-ContainerTarget([string]$key) {
     if ($key -eq $CriticalKey) { return $CriticalTarget }
     return "/library/plex-source/$key"
@@ -120,6 +169,11 @@ function Fail([string]$message, [int]$code) {
 
 try {
 
+# Fail before doing anything if a pinned executable is missing, is not a real
+# .exe, is a reparse point, or sits in a user-writable directory.
+Assert-PinnedExe $WslExe    'wsl.exe'
+Assert-PinnedExe $DockerExe 'docker.exe'
+
 # --- host side: mount + prove identity inside the WSL2 distro ---------------
 
 # Passed as a data file rather than generated per-share, and read with a tab
@@ -134,10 +188,13 @@ $hostScript = @'
 # directory contents. Exit 0 only if every share is identity-verified.
 DATA="$1"
 EXPECTED="$2"
+EXPECTED_KEYS="$3"   # space-separated; keys are delimiter-safe by construction
 CRITICAL_KEY="nas-tv-blackbeard"
 fail=0
 critical_fail=0
 processed=0
+critical_seen=0
+seen_keys=""
 
 # 0 = mounted and correct, 1 = not a mountpoint, 2 = wrong fs type,
 # 3 = mounted but a DIFFERENT share
@@ -179,6 +236,24 @@ echo "=== mounting and verifying NAS shares ==="
 while IFS="$(printf '\t')" read -r key share || [ -n "$key" ]; do
     [ -n "$key" ] || continue
     processed=$((processed + 1))
+
+    # MEMBERSHIP, not just cardinality. A count-only check passes when one
+    # expected record is omitted and another is duplicated or substituted --
+    # the count matches while a real share went unexamined. Reject anything
+    # unexpected, reject repeats, and record what was actually seen so the
+    # exact expected set can be proven at the end.
+    case " $EXPECTED_KEYS " in
+        *" $key "*) ;;
+        *) printf '  %-32s FAILED (unexpected key not in the expected set)\n' "$key"
+           fail=1; critical_fail=1; continue ;;
+    esac
+    case " $seen_keys " in
+        *" $key "*) printf '  %-32s FAILED (duplicate record)\n' "$key"
+                    fail=1; critical_fail=1; continue ;;
+    esac
+    seen_keys="$seen_keys $key"
+    [ "$key" = "$CRITICAL_KEY" ] && critical_seen=1
+
     target="/mnt/nas/$key"
     mkdir -p "$target"
 
@@ -235,14 +310,28 @@ while IFS="$(printf '\t')" read -r key share || [ -n "$key" ]; do
     printf '  %-32s OK (mounted and verified, %s entries)\n' "$key" "$n"
 done < "$DATA"
 
-# Coverage assertion. The two fixes above close ONE way records get dropped;
-# this closes the CLASS. A share that was never examined must never be able to
-# masquerade as a share that passed, whatever the cause -- truncated input,
-# encoding damage, a read that stops early. Treated as CRITICAL because the
-# dropped record may BE the critical share, and we cannot know which it was.
+# Coverage assertion, in three parts. Count alone is not enough: it is
+# satisfied by an omission paired with a duplicate or substitution. Membership
+# and uniqueness are enforced in the loop; what remains is proving that EVERY
+# expected key was actually seen. Treated as CRITICAL throughout, because an
+# unexamined share may BE the critical one and we cannot know which.
+missing=""
+for want in $EXPECTED_KEYS; do
+    case " $seen_keys " in
+        *" $want "*) ;;
+        *) missing="$missing $want" ;;
+    esac
+done
+if [ -n "$missing" ]; then
+    echo "RESULT: coverage FAILED -- expected share(s) never examined:$missing"
+    exit 2
+fi
 if [ "$processed" -ne "$EXPECTED" ]; then
-    echo "RESULT: coverage check FAILED -- examined $processed of $EXPECTED shares."
-    echo "        Some share was never checked, so no share can be trusted."
+    echo "RESULT: coverage FAILED -- examined $processed records, expected $EXPECTED."
+    exit 2
+fi
+if [ $critical_seen -eq 0 ]; then
+    echo "RESULT: coverage FAILED -- the critical share $CRITICAL_KEY was never examined."
     exit 2
 fi
 
@@ -258,40 +347,112 @@ echo "RESULT: all $processed shares mounted and identity-verified"
 exit 0
 '@
 
-# These two files are handed to `wsl -d docker-desktop -- sh`, which executes
-# them AS ROOT inside the distro. A fixed path under %TEMP% is therefore a
-# swap window: any process running as this user -- including an UNELEVATED one,
-# while this script runs elevated under the Scheduled Task -- could replace the
-# payload between write and execute and get root in the distro.
+# These two files are handed to wsl.exe, which executes them AS ROOT inside the
+# distro. A predictable path under %TEMP% was therefore a swap window.
 #
-# New-SecureStagingDir returns a fresh randomly-named directory whose ACL grants
-# only the current user, Administrators and SYSTEM, with inheritance broken so
-# no ambient grant survives. Random naming also removes the predictable-path
-# pre-creation trick.
-function New-SecureStagingDir {
-    $root = Join-Path $env:ProgramData 'ScanHound\run'
-    New-Item -ItemType Directory -Force $root | Out-Null
-    $dir = Join-Path $root ([Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Force $dir | Out-Null
+# The FIRST attempt at this granted the current user Full Control and then
+# treated that user as trusted while verifying -- which defended against every
+# principal EXCEPT the one in the stated threat model. The documented attacker
+# is "an unelevated process running as the same user, while the task runs
+# elevated", and an allow-ACE for that user's SID does not distinguish the
+# elevated token from the same user's medium-integrity process. Reproduced:
+# an unelevated process replaced the staged payload with the grant in place.
+#
+# Ownership matters for the same reason it did for the deploy directory: an
+# owner can rewrite the DACL, so a directory owned by the task user is not
+# protected by its own grants.
+#
+# Correct boundary: Administrators + SYSTEM write; the task user gets READ ONLY
+# (it must still read nothing here -- wsl.exe reads under the elevated token) --
+# and the owner is Administrators. An unelevated same-user process can then
+# neither modify the payload nor re-grant itself the right to.
+$RunRoot = Join-Path $env:ProgramData 'ScanHound\run'
 
-    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    & icacls.exe $dir /inheritance:r /q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Could not harden staging directory $dir (inheritance)." }
-    foreach ($grant in @("*$me`:(OI)(CI)(F)", 'BUILTIN\Administrators:(OI)(CI)(F)', '*S-1-5-18:(OI)(CI)(F)')) {
-        & icacls.exe $dir /grant $grant /q | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Could not harden staging directory $dir (grant $grant)." }
+function Assert-NoReparsePoint([string]$path, [string]$label) {
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "$label '$path' is a reparse point. A junction/symlink here redirects a trusted path."
     }
+}
 
-    # Prove it, rather than assuming the grants took. A staging directory that
-    # is still writable by others must stop the run, not be used anyway.
-    $trusted = @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\TrustedInstaller',
-                 [Security.Principal.WindowsIdentity]::GetCurrent().Name)
-    foreach ($ace in (Get-Acl -LiteralPath $dir).Access) {
+# Every path component beneath a hardened root must itself be an ordinary
+# directory: a lexical "inside the root" check is meaningless if a component is
+# a junction pointing elsewhere.
+function Assert-NoReparseInChain([string]$path, [string]$root, [string]$label) {
+    $cur = (Resolve-Path -LiteralPath $path).ProviderPath
+    $end = (Resolve-Path -LiteralPath $root).ProviderPath.TrimEnd('\')
+    while ($cur -and $cur.Length -ge $end.Length) {
+        Assert-NoReparsePoint $cur $label
+        if ($cur.TrimEnd('\') -eq $end) { break }
+        $cur = Split-Path $cur -Parent
+    }
+}
+
+function Assert-AdminOwnedNoUserWrite([string]$path, [string]$label) {
+    $trusted = @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\TrustedInstaller')
+    $acl = Get-Acl -LiteralPath $path
+    if ($trusted -notcontains $acl.Owner) {
+        throw "$label '$path' is owned by '$($acl.Owner)'; an owner can rewrite its DACL."
+    }
+    foreach ($ace in $acl.Access) {
         if ($ace.AccessControlType -ne 'Allow') { continue }
         if ($trusted -contains $ace.IdentityReference.Value) { continue }
-        throw "Staging directory $dir still grants access to '$($ace.IdentityReference)'."
+        if (Test-WriteShapedRight $ace.FileSystemRights) {
+            throw ("$label '$path' grants '$($ace.FileSystemRights)' to " +
+                   "'$($ace.IdentityReference)' -- an unelevated process could swap a payload " +
+                   "this script executes as root.")
+        }
     }
-    return $dir
+}
+
+function Initialize-SecureRunRoot {
+    $elevated = (New-Object Security.Principal.WindowsPrincipal(
+        [Security.Principal.WindowsIdentity]::GetCurrent())
+        ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    if (-not (Test-Path -LiteralPath $RunRoot)) {
+        if (-not $elevated) {
+            throw ("Staging root $RunRoot does not exist and creating it securely requires " +
+                   "elevation. Run install-mount-task.ps1 elevated once, or run this script " +
+                   "from an elevated shell.")
+        }
+        New-Item -ItemType Directory -Force $RunRoot | Out-Null
+    }
+    Assert-NoReparsePoint $RunRoot 'Staging root'
+
+    if ($elevated) {
+        foreach ($a in @(@('/setowner','BUILTIN\Administrators'), @('/inheritance:r'),
+                         @('/grant','BUILTIN\Administrators:(OI)(CI)(F)'),
+                         @('/grant','*S-1-5-18:(OI)(CI)(F)'))) {
+            & icacls.exe $RunRoot @a /q | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls failed hardening $RunRoot ($($a -join ' '))." }
+        }
+    }
+    # Asserted whether or not we just applied it: a pre-existing hostile or
+    # merely unhardened root must stop the run.
+    Assert-AdminOwnedNoUserWrite $RunRoot 'Staging root'
+}
+
+function New-SecureStagingDir {
+    Initialize-SecureRunRoot
+    $dir = Join-Path $RunRoot ([Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    try {
+        foreach ($a in @(@('/setowner','BUILTIN\Administrators'), @('/inheritance:r'),
+                         @('/grant','BUILTIN\Administrators:(OI)(CI)(F)'),
+                         @('/grant','*S-1-5-18:(OI)(CI)(F)'))) {
+            & icacls.exe $dir @a /q | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls failed hardening $dir ($($a -join ' '))." }
+        }
+        Assert-NoReparseInChain $dir $RunRoot 'Staging path'
+        Assert-AdminOwnedNoUserWrite $dir 'Staging directory'
+        return $dir
+    } catch {
+        # Cleanup belongs here too: if hardening throws, the caller never
+        # receives the path, so the outer finally cannot remove it.
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
 }
 
 $stagingDir = New-SecureStagingDir
@@ -315,8 +476,28 @@ Write-Host "Mounting NAS shares inside the docker-desktop WSL2 distro..."
 # The expected record count is passed in so the shell can assert it examined
 # every share. Derived from the same $shares list that produced the data file,
 # so the two can never disagree about how many there should be.
-wsl -d docker-desktop -- sh (ConvertTo-WslPath $tempScript) (ConvertTo-WslPath $tempData) $shares.Count
+#
+# IN-DISTRO TIMEOUT. Killing wsl.exe on the Windows side does not prove the
+# Linux-side shell stopped, and Task Scheduler's ExecutionTimeLimit is only an
+# outer watchdog over the Windows task host -- it has NOT been shown to reach
+# into the VM. Without this, a wedged mount could outlive its invocation and
+# still be running when the 5-minute repeater fires again.
+#
+# BusyBox timeout, not GNU: verified on this host it takes `-s SIG -k SECS SECS`
+# (no --long-options, no `s` suffix) and exits 15 on timeout -- distinct from
+# this script's own 0/1/2, so a timeout can never be mistaken for a verdict.
+# 240 s leaves wide margin under the PT15M outer limit.
+$MountTimeoutSec = 240
+# Keys are [a-z0-9-] by construction, so a space-separated list is unambiguous
+# and needs no quoting through the PowerShell -> wsl.exe -> sh layers.
+$ExpectedKeys = ($shares.Keys -join ' ')
+& $WslExe -d docker-desktop -- timeout -s TERM -k 5 $MountTimeoutSec `
+    sh (ConvertTo-WslPath $tempScript) (ConvertTo-WslPath $tempData) $shares.Count $ExpectedKeys
 $mountExit = $LASTEXITCODE
+if ($mountExit -eq 15) {
+    Fail ("The in-distro mount stage exceeded $MountTimeoutSec s and was terminated. No " +
+          "share verdict is trustworthy from this run; the scheduler will retry.") 8
+}
 
 # The whole staging directory is removed in the finally block, which also
 # covers the early-exit paths this line never reached.
@@ -349,9 +530,11 @@ $probeScript = @'
 # one. Same identity rule as the host side.
 DATA="$1"
 EXPECTED="$2"
+EXPECTED_TARGETS="$3"
 CRITICAL_TARGET="/library/tv"
 processed=0
 critical_seen=0
+seen_targets=""
 bad=0
 critical_bad=0
 
@@ -361,6 +544,16 @@ critical_bad=0
 while IFS="$(printf '\t')" read -r target share || [ -n "$target" ]; do
     [ -n "$target" ] || continue
     processed=$((processed + 1))
+    # Membership + uniqueness, same reasoning as the host stage.
+    case " $EXPECTED_TARGETS " in
+        *" $target "*) ;;
+        *) echo "UNEXPECTED $target (not in the expected target set)"
+           bad=1; critical_bad=1; continue ;;
+    esac
+    case " $seen_targets " in
+        *" $target "*) echo "DUPLICATE $target"; bad=1; critical_bad=1; continue ;;
+    esac
+    seen_targets="$seen_targets $target"
     [ "$target" = "$CRITICAL_TARGET" ] && critical_seen=1
     if ! mountpoint -q "$target" 2>/dev/null; then
         echo "BLIND $target (not a mountpoint)"
@@ -423,10 +616,20 @@ else
     fi
 fi
 
-# Same coverage assertion as the host stage: a target that was never examined
-# must not be able to pass for one that was.
+# Same three-part coverage assertion as the host stage.
+missing=""
+for want in $EXPECTED_TARGETS; do
+    case " $seen_targets " in
+        *" $want "*) ;;
+        *) missing="$missing $want" ;;
+    esac
+done
+if [ -n "$missing" ]; then
+    echo "COVERAGE FAILED -- target(s) never examined:$missing"
+    exit 2
+fi
 if [ "$processed" -ne "$EXPECTED" ]; then
-    echo "COVERAGE FAILED -- examined $processed of $EXPECTED targets"
+    echo "COVERAGE FAILED -- examined $processed records, expected $EXPECTED"
     exit 2
 fi
 
@@ -454,28 +657,34 @@ $probeDataPath   = Join-Path $stagingDir "probe-mounts.data"
 # Bounded: a wedged Docker daemon or container makes `docker exec` HANG rather
 # than return, which would leave the Scheduled Task running forever. Distinguish
 # the outcomes -- "empty output" is not a diagnosis.
-$ExpectedTargets = $probeData.Count
+$ExpectedTargets    = $probeData.Count
+# Container targets are also delimiter-safe (/library/... with no spaces).
+$ExpectedTargetList = (($shares.Keys | ForEach-Object { Get-ContainerTarget $_ }) -join ' ')
 
 function Invoke-ContainerProbe([int]$TimeoutSec = 90) {
     $result = [pscustomobject]@{ Code = -1; Output = ""; Reason = "" }
 
-    $running = docker ps --filter "name=^scanhound$" --format "{{.Names}}" 2>$null
+    $running = & $DockerExe ps --filter "name=^scanhound$" --format "{{.Names}}" 2>$null
     if ($LASTEXITCODE -ne 0) { $result.Reason = "docker-unavailable"; return $result }
     if (-not $running)       { $result.Reason = "not-running";        return $result }
 
-    docker cp $probeScriptPath scanhound:/tmp/scanhound-probe-mounts.sh 2>$null | Out-Null
+    & $DockerExe cp $probeScriptPath scanhound:/tmp/scanhound-probe-mounts.sh 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { $result.Reason = "copy-failed"; return $result }
-    docker cp $probeDataPath scanhound:/tmp/scanhound-probe-mounts.data 2>$null | Out-Null
+    & $DockerExe cp $probeDataPath scanhound:/tmp/scanhound-probe-mounts.data 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { $result.Reason = "copy-failed"; return $result }
 
     # -ArgumentList, because a Start-Job scriptblock does not inherit the
     # caller's scope: $ExpectedTargets would silently be $null inside it, and
     # the probe's coverage assertion would then compare against an empty
     # string and fail every run.
-    $job = Start-Job -ArgumentList $ExpectedTargets -ScriptBlock {
-        param($expected)
-        $out = docker exec scanhound sh /tmp/scanhound-probe-mounts.sh `
-                   /tmp/scanhound-probe-mounts.data $expected 2>&1
+    # $DockerExe is passed in explicitly: a Start-Job scriptblock runs in a
+    # SEPARATE PowerShell process that inherits neither the caller's variables
+    # nor a trustworthy PATH, so a bare `docker` here would silently reopen the
+    # command-resolution hole the pinning closes everywhere else.
+    $job = Start-Job -ArgumentList $ExpectedTargets, $DockerExe, $ExpectedTargetList -ScriptBlock {
+        param($expected, $dockerExe, $expectedList)
+        $out = & $dockerExe exec scanhound sh /tmp/scanhound-probe-mounts.sh `
+                   /tmp/scanhound-probe-mounts.data $expected $expectedList 2>&1
         [pscustomobject]@{ Out = ($out | Out-String); Code = $LASTEXITCODE }
     }
     if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
@@ -497,7 +706,7 @@ function Invoke-ContainerProbe([int]$TimeoutSec = 90) {
 # the caller then asserts a safe state that may not exist.
 function Stop-ScanhoundVerified([int]$TimeoutSec = 45) {
     $job = Start-Job -ScriptBlock {
-        docker stop -t 20 scanhound 2>&1 | Out-Null
+        & $DockerExe stop -t 20 scanhound 2>&1 | Out-Null
         $LASTEXITCODE
     }
     if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
@@ -509,7 +718,7 @@ function Stop-ScanhoundVerified([int]$TimeoutSec = 45) {
     Remove-Job $job -Force -ErrorAction SilentlyContinue
 
     # Independently confirm it is no longer running, whatever stop reported.
-    $still = docker ps --filter "name=^scanhound$" --format "{{.Names}}" 2>$null
+    $still = & $DockerExe ps --filter "name=^scanhound$" --format "{{.Names}}" 2>$null
     if ($LASTEXITCODE -ne 0) { return "docker-unavailable" }
     if ($still)              { return "stop-failed" }
     if ($code -ne 0)         { return "stopped-despite-error" }
@@ -592,7 +801,7 @@ if ($needsRecreate) {
     # Recovery must only ever restart what was already reviewed and built.
     # A missing image is a deployment problem for a human, not something a
     # recovery script should paper over.
-    docker compose -f $ComposeFile --project-directory $ComposeProjectDir `
+    & $DockerExe compose -f $ComposeFile --project-directory $ComposeProjectDir `
         up -d --force-recreate --no-build --pull never
     if ($LASTEXITCODE -ne 0) {
         Fail ("docker compose up -d --force-recreate --no-build --pull never failed " +

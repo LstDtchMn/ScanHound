@@ -22,7 +22,8 @@
 param(
     [string]$SourceRepo = 'X:\Docker Apps\ScanHound',
     [string]$DeployDir  = 'C:\ProgramData\ScanHound\deploy',
-    [string]$BackupDir  = 'C:\ProgramData\ScanHound\backup'
+    [string]$BackupDir  = 'C:\ProgramData\ScanHound\backup',
+    [string]$RunDir     = 'C:\ProgramData\ScanHound\run'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,16 +62,32 @@ function Invoke-Icacls {
 # Proves a directory is genuinely locked, rather than assuming the grants took.
 # Checks OWNERSHIP too: an owner can always rewrite the DACL, so a directory
 # owned by an unprivileged account is not protected no matter what it grants.
-function Assert-AdminOnlyDirectory {
-    param([string]$Path)
+# Works on FILES as well as directories, and recurses. A directory-only check
+# is insufficient: a file created before the new DACL can retain an explicit
+# write ACE of its own, and a reparse point anywhere in the chain defeats a
+# lexical "inside the hardened root" argument. Every artifact an elevated task
+# reads or executes gets proven individually.
+# Write-shaped rights, tested with ATOMIC flags only. Composite rights (Modify,
+# FullControl) CONTAIN the read bits, so masking against them made every
+# read-only ACE look writable -- including the deliberate ReadAndExecute grant
+# this installer itself applies, which would have made it fail on its own
+# correctly-hardened directory during the elevated run.
+function Test-WriteShapedRight([Security.AccessControl.FileSystemRights]$rights) {
+    $R = [Security.AccessControl.FileSystemRights]
+    $mask = [int]($R::WriteData -bor $R::AppendData -bor $R::WriteExtendedAttributes -bor
+                  $R::WriteAttributes -bor $R::Delete -bor $R::DeleteSubdirectoriesAndFiles -bor
+                  $R::ChangePermissions -bor $R::TakeOwnership)
+    return (([int]$rights -band $mask) -ne 0)
+}
+
+function Assert-AdminOnlyPath {
+    param([string]$Path, [switch]$Recurse, [switch]$Quiet)
 
     $trusted = @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\TrustedInstaller')
-    $writeRights = [Security.AccessControl.FileSystemRights]::Write         -bor
-                   [Security.AccessControl.FileSystemRights]::Modify        -bor
-                   [Security.AccessControl.FileSystemRights]::FullControl   -bor
-                   [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
-                   [Security.AccessControl.FileSystemRights]::TakeOwnership -bor
-                   [Security.AccessControl.FileSystemRights]::Delete
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "$Path is a reparse point; a junction/symlink here redirects a trusted path."
+    }
 
     $acl = Get-Acl -LiteralPath $Path
     if ($trusted -notcontains $acl.Owner) {
@@ -80,13 +97,19 @@ function Assert-AdminOnlyDirectory {
     foreach ($ace in $acl.Access) {
         if ($ace.AccessControlType -ne 'Allow') { continue }
         if ($trusted -contains $ace.IdentityReference.Value) { continue }
-        if (([int]$ace.FileSystemRights -band [int]$writeRights) -ne 0) {
+        if (Test-WriteShapedRight $ace.FileSystemRights) {
             throw ("$Path grants '$($ace.FileSystemRights)' to " +
                    "'$($ace.IdentityReference)'. An unprivileged principal must not be " +
                    "able to modify anything an elevated task reads or executes.")
         }
     }
-    Write-Output "locked  : $Path (owner $($acl.Owner), no non-admin write)"
+    if (-not $Quiet) { Write-Output "locked  : $Path (owner $($acl.Owner), no non-admin write)" }
+
+    if ($Recurse -and $item.PSIsContainer) {
+        foreach ($child in (Get-ChildItem -LiteralPath $Path -Force -Recurse)) {
+            Assert-AdminOnlyPath -Path $child.FullName -Quiet
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -156,6 +179,23 @@ foreach ($marker in @('--no-build', '--pull never')) {
     }
 }
 
+# Executables must be pinned by absolute path, and the in-distro timeout must
+# be present. Both matter more once the task fires every 5 minutes elevated:
+# PATH resolution turns into a recurring elevated-execution hazard, and without
+# the in-distro timeout a wedged mount can outlive its run and overlap the next.
+foreach ($marker in @('$WslExe', '$DockerExe', 'Assert-PinnedExe', 'timeout -s TERM -k 5')) {
+    if ($srcText -notmatch [regex]::Escape($marker)) {
+        throw ("Source script lacks '$marker' -- executables must be pinned and the " +
+               "in-distro timeout present before an elevated repeater is installed.")
+    }
+}
+# And no bare invocations may survive alongside the pins.
+foreach ($bad in @('wsl -d docker-desktop -- sh', 'docker compose -f $ComposeFile')) {
+    if ($srcText -match [regex]::Escape($bad)) {
+        throw "Source script still contains an unpinned invocation: '$bad'."
+    }
+}
+
 # The deployed script must point at the deploy directory it is being installed
 # into; a script hard-coded to a different path would be silently inert.
 if ($srcText -notmatch [regex]::Escape($DeployDir)) {
@@ -210,16 +250,28 @@ $manifest | ConvertTo-Json -Depth 5 | Out-File $Manifest -Encoding utf8
 # (WRITE_DAC is implicit for owners), so leaving these directories owned by the
 # unprivileged account makes every grant below advisory. Ownership moves to
 # Administrators first, and is asserted afterwards.
-foreach ($dir in @($DeployDir, $BackupDir)) {
+# $RunDir is hardened here too, not left to the runtime script: it holds shell
+# payloads that wsl.exe executes AS ROOT, so it is an elevated-execution input
+# exactly like the deploy directory. Pre-hardening it also means the mount
+# script can ASSERT the root rather than having to create it securely itself.
+foreach ($dir in @($DeployDir, $BackupDir, $RunDir)) {
     New-Item -ItemType Directory -Force $dir | Out-Null
     Invoke-Icacls $dir '/setowner'     'BUILTIN\Administrators' '/T'
     Invoke-Icacls $dir '/inheritance:r'
     Invoke-Icacls $dir '/grant'        'BUILTIN\Administrators:(OI)(CI)(F)'
     Invoke-Icacls $dir '/grant'        '*S-1-5-18:(OI)(CI)(F)'
-    Invoke-Icacls $dir '/grant'        "*$($Sid):(OI)(CI)(RX)" '/T'
 }
-Assert-AdminOnlyDirectory $DeployDir
-Assert-AdminOnlyDirectory $BackupDir
+# The task account gets READ ONLY on deploy/backup, and NOTHING on the staging
+# root. Granting it write would hand the documented attacker -- an unelevated
+# process running as this same user -- the ability to swap a payload the task
+# then executes as root. A SID ACE cannot distinguish the elevated token from
+# the unelevated one, so the right must simply not be granted.
+Invoke-Icacls $DeployDir '/grant' "*$($Sid):(OI)(CI)(RX)" '/T'
+Invoke-Icacls $BackupDir '/grant' "*$($Sid):(OI)(CI)(RX)" '/T'
+
+Assert-AdminOnlyPath $DeployDir -Recurse
+Assert-AdminOnlyPath $BackupDir -Recurse
+Assert-AdminOnlyPath $RunDir
 
 Write-Output "deployed: $DeployDir"
 foreach ($e in $manifest.files) { Write-Output "          $($e.name)  $($e.sha256.Substring(0,16))..." }
@@ -251,7 +303,14 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 # 5. Definition
 # ---------------------------------------------------------------------------
 
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+# Absolute interpreter path, not 'powershell.exe' by name: the action runs
+# elevated 288 times a day, and a name is resolved through a PATH this script
+# does not control.
+$PowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+if (-not (Test-Path -LiteralPath $PowerShellExe -PathType Leaf)) {
+    throw "Windows PowerShell not found at the pinned path '$PowerShellExe'."
+}
+$action = New-ScheduledTaskAction -Execute $PowerShellExe `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Deployed`""
 
 # Boot: delayed. On the 2026-07-26 boot Docker's backend did not accept IPC
@@ -352,7 +411,8 @@ function Assert-Field($label, $actual, $expected) {
 }
 
 Write-Output "`n=== installed-task assertions ==="
-Assert-Field 'action.Execute'              $t.Actions[0].Execute 'powershell.exe'
+Assert-Field 'action count'                $t.Actions.Count 1
+Assert-Field 'action.Execute (pinned)'     $t.Actions[0].Execute $PowerShellExe
 Assert-Field 'action targets deployed'     ($t.Actions[0].Arguments -like "*$Deployed*") 'True'
 Assert-Field 'action avoids working tree'  ($t.Actions[0].Arguments -notlike "*$SourceRepo*") 'True'
 Assert-Field 'principal.UserId'            $t.Principal.UserId $Sid
