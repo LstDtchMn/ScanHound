@@ -156,6 +156,87 @@ function Invoke-GitText {
     return ([Text.Encoding]::UTF8.GetString((Invoke-GitBytes $GitArgs))).Trim()
 }
 
+# Parses a raw git tree object into its entries.
+#
+# Binary format, one entry after another with no separators:
+#   <octal mode ASCII><space><name bytes><NUL><20 raw bytes of SHA-1>
+function Get-GitTreeEntries {
+    param([byte[]]$Bytes)
+
+    $entries = @()
+    $i = 0
+    while ($i -lt $Bytes.Length) {
+        $sp = $i
+        while ($sp -lt $Bytes.Length -and $Bytes[$sp] -ne 0x20) { $sp++ }
+        if ($sp -ge $Bytes.Length) { throw "Malformed tree object: no space after mode." }
+        $mode = [Text.Encoding]::ASCII.GetString($Bytes, $i, $sp - $i)
+
+        $nul = $sp + 1
+        while ($nul -lt $Bytes.Length -and $Bytes[$nul] -ne 0x00) { $nul++ }
+        if ($nul -ge $Bytes.Length) { throw "Malformed tree object: no NUL after name." }
+        # Names are stored as raw bytes; UTF8 is correct for this repository.
+        $name = [Text.Encoding]::UTF8.GetString($Bytes, $sp + 1, $nul - $sp - 1)
+
+        if ($nul + 20 -ge $Bytes.Length + 0 -and $nul + 21 -gt $Bytes.Length) {
+            throw "Malformed tree object: truncated object id for '$name'."
+        }
+        $oid = ''
+        for ($k = 0; $k -lt 20; $k++) { $oid += $Bytes[$nul + 1 + $k].ToString('x2') }
+
+        $entries += [pscustomobject]@{ Mode = $mode; Name = $name; Id = $oid }
+        $i = $nul + 21
+    }
+    return $entries
+}
+
+# Resolves a repo-relative path to a blob id by WALKING AND VERIFYING the tree
+# chain from the already-captured commit bytes.
+#
+# This replaces `git rev-parse <commit>:<path>`, which cannot be trusted here:
+# fsck is a point-in-time consistency check, not a lock, so a same-user process
+# can present an altered tree during rev-parse and restore the authentic one
+# afterwards -- leaving the installer holding a substituted but independently
+# valid blob that passes every other check. Walking the chain ourselves means
+# each object is authenticated from its own captured bytes, so a mutation after
+# capture is irrelevant and malformed bytes at an expected object name fail the
+# recomputed-id test.
+function Resolve-VerifiedBlobId {
+    param([byte[]]$CommitBytes, [string]$RepoRelative)
+
+    # The commit object begins with "tree <40-hex>\n".
+    $head = [Text.Encoding]::ASCII.GetString($CommitBytes, 0, [Math]::Min(64, $CommitBytes.Length))
+    if ($head -notmatch '^tree ([0-9a-f]{40})') {
+        throw "Commit object does not begin with a tree header; refusing to resolve $RepoRelative."
+    }
+    $treeId = $Matches[1]
+
+    $parts = $RepoRelative -split '/'
+    for ($d = 0; $d -lt $parts.Count; $d++) {
+        $treeBytes = Invoke-GitBytes @('cat-file', 'tree', $treeId)
+        $computed  = Get-GitObjectId -Type 'tree' -Bytes $treeBytes
+        if ($computed -ne $treeId) {
+            throw ("Tree-identity check FAILED resolving ${RepoRelative}: object $treeId " +
+                   "hashes to $computed. The object database is corrupt or was mutated.")
+        }
+        $entry = Get-GitTreeEntries -Bytes $treeBytes |
+                 Where-Object { $_.Name -eq $parts[$d] } | Select-Object -First 1
+        if (-not $entry) {
+            throw "Path '$RepoRelative' not found: '$($parts[$d])' is absent from tree $treeId."
+        }
+        if ($d -eq $parts.Count - 1) {
+            if ($entry.Mode -notmatch '^100') {
+                throw "'$RepoRelative' is mode $($entry.Mode), not a regular file blob."
+            }
+            return $entry.Id
+        }
+        if ($entry.Mode -ne '40000') {
+            throw "'$($parts[$d])' in '$RepoRelative' is mode $($entry.Mode), not a tree."
+        }
+        $treeId = $entry.Id
+    }
+    throw "Unreachable: failed to resolve $RepoRelative."
+}
+
 # git's object id is SHA1("<type> <length>\0" + content). Recomputing it lets
 # the installer verify that the bytes it received really are the object it
 # asked for, rather than trusting a writable database's own bookkeeping.
@@ -335,13 +416,19 @@ if ($commitId -ne $srcCommit) {
 # defence in depth rather than replaced.
 # Verified on this host: git 2.52.0.windows.1 accepts this exact form, exit 0,
 # ~0.9 s.
-$fsckOut = & $GitExe --no-replace-objects fsck --full --no-dangling --no-reflogs $srcCommit 2>&1
-if ($LASTEXITCODE -ne 0) {
-    throw ("git fsck FAILED for the object graph reachable from $srcCommit (exit " +
-           "$LASTEXITCODE). The object database cannot be trusted to bind the approved " +
-           "commit to the deployed paths.`n$fsckOut")
-}
-Write-Output "fsck    : object graph verified from $($srcCommit.Substring(0,8))"
+# Run through the SAME helper as every other git call, so it inherits the
+# pinned executable, --no-replace-objects, a checked exit code and -- the point
+# here -- WorkingDirectory = $SourceRepo. Invoking `& $GitExe` directly made
+# fsck run in the CALLER's current directory, so the approved command would
+# have failed outright when launched from, say, C:\Windows\System32. Fail-safe,
+# but it made "the graph is always verified" depend on where Jesse happened to
+# be standing.
+#
+# NOTE fsck is now DIAGNOSTIC ONLY, not load-bearing. It is a point-in-time
+# consistency test, not a lock, so it cannot bind a path resolution that
+# happens afterwards. Resolve-VerifiedBlobId carries that proof instead.
+[void](Invoke-GitBytes @('fsck', '--full', '--no-dangling', '--no-reflogs', $srcCommit))
+Write-Output "fsck    : object graph consistent from $($srcCommit.Substring(0,8)) (diagnostic)"
 
 Write-Output "source  : $SourceRepo"
 Write-Output "deploy  : $srcCommit  (APPROVED, supplied out-of-band)"
@@ -370,7 +457,10 @@ if ($headNow -ne $srcCommit) {
 function Get-CommittedBlob {
     param([string]$RepoRelative)
 
-    $blobSha = Invoke-GitText @('rev-parse', "${srcCommit}:$RepoRelative")
+    # Resolved by walking the VERIFIED tree chain from the captured commit
+    # bytes, not by `git rev-parse <commit>:<path>` -- see Resolve-VerifiedBlobId
+    # for why that resolution cannot be trusted here.
+    $blobSha = Resolve-VerifiedBlobId -CommitBytes $script:commitBytes -RepoRelative $RepoRelative
     if ($blobSha -notmatch '^[0-9a-f]{40}$') {
         throw "Unexpected blob id '$blobSha' for $RepoRelative at $srcCommit."
     }
