@@ -13,8 +13,12 @@
 # non-elevated shell (verified 2026-07-26: "Access is denied"), and the deploy
 # directory is intentionally not user-writable.
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File install-mount-task.ps1
-#   powershell -NoProfile -ExecutionPolicy Bypass -File install-mount-task.ps1 -WhatIf
+#   powershell -NoProfile -ExecutionPolicy Bypass -File install-mount-task.ps1 -ExpectedCommit <40-hex-sha>
+#   powershell -NoProfile -ExecutionPolicy Bypass -File install-mount-task.ps1 -ExpectedCommit <40-hex-sha> -WhatIf
+#
+# -ExpectedCommit is MANDATORY and must be supplied out-of-band (not read from
+# HEAD). Get it from the reviewed branch head after review, never from the
+# working tree at run time.
 #
 # Rollback: scripts\rollback-mount-task.ps1
 
@@ -130,6 +134,20 @@ function Invoke-GitText {
     return ([Text.Encoding]::UTF8.GetString((Invoke-GitBytes $GitArgs))).Trim()
 }
 
+# git's object id is SHA1("<type> <length>\0" + content). Recomputing it lets
+# the installer verify that the bytes it received really are the object it
+# asked for, rather than trusting a writable database's own bookkeeping.
+function Get-GitObjectId {
+    param([string]$Type, [byte[]]$Bytes)
+    $header = [Text.Encoding]::ASCII.GetBytes("$Type $($Bytes.Length)`0")
+    $buf    = New-Object byte[] ($header.Length + $Bytes.Length)
+    [Array]::Copy($header, 0, $buf, 0, $header.Length)
+    [Array]::Copy($Bytes,  0, $buf, $header.Length, $Bytes.Length)
+    $sha1 = [Security.Cryptography.SHA1]::Create()
+    try { return (($sha1.ComputeHash($buf) | ForEach-Object { $_.ToString('x2') }) -join '') }
+    finally { $sha1.Dispose() }
+}
+
 # Proves a directory is genuinely locked, rather than assuming the grants took.
 # Checks OWNERSHIP too: an owner can always rewrite the DACL, so a directory
 # owned by an unprivileged account is not protected no matter what it grants.
@@ -149,6 +167,37 @@ function Test-WriteShapedRight([Security.AccessControl.FileSystemRights]$rights)
                   $R::WriteAttributes -bor $R::Delete -bor $R::DeleteSubdirectoriesAndFiles -bor
                   $R::ChangePermissions -bor $R::TakeOwnership)
     return (([int]$rights -band $mask) -ne 0)
+}
+
+# Applies an EXACT protected descriptor, replacing whatever was there.
+#
+# `/inheritance:r` removes only INHERITED aces and `/grant` ADDS to the
+# existing dacl, so the previous sequence could not produce the descriptor it
+# claimed. Measured: an explicit user Modify ace planted beforehand SURVIVED
+# /inheritance:r + /grant intact. Assert-AdminOnlyPath would then throw --
+# fail-safe, but the installer would have been asserting a state it never
+# actually applied.
+#
+# Building a fresh DirectorySecurity (rather than editing Get-Acl's result)
+# guarantees no pre-existing rule is carried forward, including ones from
+# principals this code has never heard of -- which is precisely the class an
+# allowlist of /remove targets cannot cover.
+function Set-ExactAdminDacl {
+    param([string]$Path, [string]$ReadOnlySid)
+
+    $sec = New-Object Security.AccessControl.DirectorySecurity
+    $sec.SetAccessRuleProtection($true, $false)   # protect; discard inherited
+    $sec.SetOwner((New-Object Security.Principal.NTAccount('BUILTIN\Administrators')))
+    foreach ($id in @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')) {
+        $sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            $id, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    }
+    if ($ReadOnlySid) {
+        $sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier($ReadOnlySid)),
+            'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    }
+    Set-Acl -Path $Path -AclObject $sec
 }
 
 function Assert-AdminOnlyPath {
@@ -240,6 +289,14 @@ $objType = Invoke-GitText @('cat-file', '-t', $srcCommit)
 if ($objType -ne 'commit') {
     throw "$srcCommit is a '$objType', not a commit, in $SourceRepo."
 }
+# The commit object's own identity, for the same reason as the blobs: the
+# approved SHA is only meaningful if the object it names really hashes to it.
+$commitBytes = Invoke-GitBytes @('cat-file', 'commit', $srcCommit)
+$commitId    = Get-GitObjectId -Type 'commit' -Bytes $commitBytes
+if ($commitId -ne $srcCommit) {
+    throw ("Object-identity check FAILED for the commit: the object stored as $srcCommit " +
+           "hashes to $commitId. The object database is corrupt or tampered with.")
+}
 
 Write-Output "source  : $SourceRepo"
 Write-Output "deploy  : $srcCommit  (APPROVED, supplied out-of-band)"
@@ -280,6 +337,22 @@ function Get-CommittedBlob {
     if ($bytes.Length -ne $declared) {
         throw ("Byte-count mismatch extracting $RepoRelative`: git reports $declared bytes, " +
                "the stream produced $($bytes.Length). Refusing to deploy a partial object.")
+    }
+
+    # OBJECT IDENTITY, not merely type and size. The ordinary account can write
+    # this repository's object database, and "git says it is a blob of N bytes"
+    # is a weaker claim than "these bytes hash to the object id we asked for".
+    # Recomputing the id closes that gap without trusting git to police itself.
+    #
+    # NOTE this is a different computation from the earlier abandoned attempt,
+    # which hashed WORKING-TREE bytes and could never match because git applies
+    # the autocrlf filter on the way in. These are the stored object bytes, so
+    # the hash is the object id by definition.
+    $computed = Get-GitObjectId -Type 'blob' -Bytes $bytes
+    if ($computed -ne $blobSha) {
+        throw ("Object-identity check FAILED for ${RepoRelative}: the extracted bytes hash to " +
+               "$computed but were requested as $blobSha. The object database is corrupt or " +
+               "has been tampered with. Refusing to deploy.")
     }
     return @{ Bytes = $bytes; Blob = $blobSha; Size = $declared }
 }
@@ -429,11 +502,7 @@ foreach ($d in @($RootDir, $DeployDir, $BackupDir, $RunDir)) { Assert-SafeAncest
 # delete-child, which is the right the children cannot defend against
 # themselves.
 New-Item -ItemType Directory -Force $RootDir | Out-Null
-Invoke-Icacls $RootDir '/setowner'     'BUILTIN\Administrators'
-Invoke-Icacls $RootDir '/inheritance:r'
-Invoke-Icacls $RootDir '/grant'        'BUILTIN\Administrators:(OI)(CI)(F)'
-Invoke-Icacls $RootDir '/grant'        '*S-1-5-18:(OI)(CI)(F)'
-Invoke-Icacls $RootDir '/grant'        "*$($Sid):(OI)(CI)(RX)"
+Set-ExactAdminDacl -Path $RootDir -ReadOnlySid $Sid
 Assert-AdminOnlyPath $RootDir
 
 # $RunDir holds shell payloads wsl.exe executes as root, so it is an
@@ -443,19 +512,15 @@ Assert-AdminOnlyPath $RootDir
 # not-yet-validated content is the same mistake as writing before hardening:
 # a planted reparse-point descendant would be followed. Payload files get
 # their descriptor individually, at creation, from New-SecureDeployedFile.
-foreach ($dir in @($DeployDir, $BackupDir, $RunDir)) {
-    New-Item -ItemType Directory -Force $dir | Out-Null
-    Invoke-Icacls $dir '/setowner'     'BUILTIN\Administrators'
-    Invoke-Icacls $dir '/inheritance:r'
-    Invoke-Icacls $dir '/grant'        'BUILTIN\Administrators:(OI)(CI)(F)'
-    Invoke-Icacls $dir '/grant'        '*S-1-5-18:(OI)(CI)(F)'
-}
 # The task account gets READ ONLY on deploy/backup, and NOTHING on staging: a
 # SID ACE cannot distinguish the elevated token from the unelevated one, so the
 # write right must simply not be granted.
-Invoke-Icacls $DeployDir '/grant' "*$($Sid):(OI)(CI)(RX)"
-Invoke-Icacls $BackupDir '/grant' "*$($Sid):(OI)(CI)(RX)"
-
+New-Item -ItemType Directory -Force $DeployDir | Out-Null
+New-Item -ItemType Directory -Force $BackupDir | Out-Null
+New-Item -ItemType Directory -Force $RunDir    | Out-Null
+Set-ExactAdminDacl -Path $DeployDir -ReadOnlySid $Sid
+Set-ExactAdminDacl -Path $BackupDir -ReadOnlySid $Sid
+Set-ExactAdminDacl -Path $RunDir
 Assert-AdminOnlyPath $DeployDir
 Assert-AdminOnlyPath $BackupDir
 Assert-AdminOnlyPath $RunDir
@@ -595,7 +660,18 @@ $settings = New-ScheduledTaskSettingsSet `
 $settings.DisallowStartIfOnBatteries = $false
 $settings.AllowHardTerminate         = $true   # explicit; do not rely on the default
 $settings.WakeToRun                  = $false
-$settings.Enabled                    = $true
+# REGISTERED DISABLED ON PURPOSE.
+#
+# Everything between registration and the final verdict can throw -- exporting
+# the task, securely creating the evidence XML, four recursive filesystem
+# assertions, re-reading the task, parsing its XML. A terminating error in any
+# of them skips the disable-on-failure branch further down, and the previous
+# version would have left an UNVERIFIED elevated task enabled with its first
+# trigger already ~90 seconds out. Catching every exception narrows that
+# window; registering disabled removes it. The task is enabled at the very end,
+# only after every check has passed, and the enabled/armed state is then
+# re-read and asserted.
+$settings.Enabled                    = $false
 
 $principal = New-ScheduledTaskPrincipal -Id 'Author' -UserId $Sid `
     -LogonType Interactive -RunLevel Highest
@@ -673,7 +749,8 @@ Assert-Field 'AllowHardTerminate'          $t.Settings.AllowHardTerminate 'True'
 Assert-Field 'ExecutionTimeLimit'          $t.Settings.ExecutionTimeLimit 'PT15M'
 Assert-Field 'MultipleInstances'           $t.Settings.MultipleInstances 'IgnoreNew'
 Assert-Field 'WakeToRun'                   $t.Settings.WakeToRun 'False'
-Assert-Field 'Enabled'                     $t.Settings.Enabled 'True'
+# Deliberately still disabled at this point -- see the registration comment.
+Assert-Field 'Enabled (pre-verdict)'       $t.Settings.Enabled 'False'
 
 $bootDelay = $xml.SelectSingleNode('//t:BootTrigger/t:Delay', $ns)
 Assert-Field 'BootTrigger.Delay' $(if ($bootDelay) { $bootDelay.InnerText } else { '<none>' }) 'PT3M'
@@ -685,19 +762,6 @@ if ($repeaters.Count -eq 1) {
     Assert-Field 'repetition interval'      $repeaters[0].InnerText "PT$($RepetitionMinutes)M"
     $dur = $xml.SelectSingleNode('//t:Triggers/*/t:Repetition/t:Duration', $ns)
     Assert-Field 'repetition is indefinite' $(if ($dur) { $dur.InnerText } else { '<none>' }) '<none>'
-}
-
-# A PT15M interval in the XML does not prove the trigger has a useful next
-# firing time. Assert the schedule is actually armed.
-$next = (Get-ScheduledTaskInfo -TaskName $TaskName).NextRunTime
-if (-not $next) {
-    Write-Output ("FAIL  {0,-32} {1}" -f 'NextRunTime present', '<null>')
-    $fail += 'NextRunTime is null -- the periodic schedule is not armed'
-} else {
-    Assert-Field 'NextRunTime in the future' ($next -gt (Get-Date)) 'True'
-    Assert-Field "NextRunTime within $($RepetitionMinutes + 1) min" `
-        ($next -le (Get-Date).AddMinutes($RepetitionMinutes + 1)) 'True'
-    Write-Output ("      {0,-32} {1:yyyy-MM-dd HH:mm:ss}" -f 'next run at', $next)
 }
 
 # The deployment must still match what was just recorded.
@@ -735,7 +799,46 @@ if ($fail.Count -gt 0) {
     exit 1
 }
 
-Write-Output "=== all assertions passed ==="
+Write-Output "=== all assertions passed -- enabling ==="
+
+# ONLY NOW. Everything above ran against a disabled task, so no unverified
+# definition could ever have fired. Enabling is the last mutation, and its
+# effect is then re-read and asserted rather than assumed.
+Enable-ScheduledTask -TaskName $TaskName | Out-Null
+
+$final = Get-ScheduledTask -TaskName $TaskName
+$post  = @()
+if ("$($final.Settings.Enabled)" -ne 'True') { $post += "Enabled = '$($final.Settings.Enabled)'" }
+
+# A PT5M interval in the XML does not prove the schedule is armed; only a real
+# NextRunTime does. Checked after enabling, because a disabled task has none.
+# StartWhenAvailable is why an elapsed boundary is acceptable: the trigger's
+# start may well have passed while the assertions above were running.
+$next = (Get-ScheduledTaskInfo -TaskName $TaskName).NextRunTime
+if (-not $next) {
+    $post += 'NextRunTime is null -- the periodic schedule is not armed'
+} else {
+    Write-Output ("PASS  {0,-32} {1:yyyy-MM-dd HH:mm:ss}" -f 'next run at', $next)
+    if ($next -gt (Get-Date).AddMinutes($RepetitionMinutes + 2)) {
+        $post += "NextRunTime $next is more than one interval away"
+    }
+}
+
+if ($post.Count -gt 0) {
+    Write-Output "`n=== POST-ENABLE ASSERTION FAILURE(S) ==="
+    $post | ForEach-Object { Write-Output "  $_" }
+    try {
+        Disable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
+        Write-Output "The task has been DISABLED again."
+    } catch {
+        Write-Output "WARNING: could not re-disable the task: $($_.Exception.Message)"
+    }
+    exit 1
+}
+
+Write-Output "PASS  Enabled                          True"
+Write-Output ""
 Write-Output "installed XML: $(Join-Path $DeployDir "$TaskName.installed.xml")"
 Write-Output "backup       : $backup"
+Write-Output "deployed from: $srcCommit"
 exit 0
