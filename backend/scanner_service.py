@@ -144,6 +144,39 @@ def _res_rank(res) -> int:
     return _RES_RANK.get((res or "").strip().lower(), 0)
 
 
+# ── Full-disc policy exclusion ────────────────────────────────────────
+#
+# HDEncode publishes two shapes of release. A normal encode lists a
+# ``Filename:`` field — one video file. A full-disc rip does not, because a
+# whole disc is not a single file; it lists only a size. ``scrape_details``
+# requires the filename and returns None without logging when it is absent, so
+# full-disc releases were never turned into items, never cached, counted as new
+# again on the next cycle, and re-downloaded forever. Measured 2026-07-27:
+# 0 of 2432 catalogued HDEncode releases were full-disc, and ~124 detail pages
+# were re-fetched every cycle for nothing.
+#
+# The operator does not want 45-91 GB disc images, so they are excluded by
+# policy BEFORE any page is downloaded — recognised from the listing title,
+# which already carries the marker.
+
+#: Anchored, case-insensitive, and tolerant of whitespace inside the brackets.
+#: Deliberately NOT applied to the URL slug: the slug for "[BD]Sorority..." is
+#: "bdsorority...", so a substring test there would also match a genuine release
+#: whose title merely begins with those letters.
+_FULL_DISC_TITLE_RE = re.compile(r"^\s*\[\s*BD\s*\]", re.IGNORECASE)
+
+
+def is_full_disc_title(title: Optional[str]) -> bool:
+    """True when a listing title marks a full-disc release.
+
+    Matches only the bracketed ``[BD]`` prefix. ``BD Movie Title`` and
+    ``Some BDRip Movie`` are ordinary releases and must not match.
+    """
+    if not title:
+        return False
+    return bool(_FULL_DISC_TITLE_RE.match(title))
+
+
 # ── ScannerService ────────────────────────────────────────────────────
 
 class ScannerService:
@@ -189,6 +222,10 @@ class ScannerService:
         # True when the last crawl stopped early at cached content — the scanner
         # then never saw deeper pages, so it must NOT purge against this crawl.
         self._last_crawl_early_stopped: bool = False
+        #: Full-disc releases excluded by policy this crawl: rows the caller
+        #: persists, plus the total (new + already-known) for reporting.
+        self._last_crawl_policy_excluded_new: List[Dict] = []
+        self._last_crawl_policy_excluded_count: int = 0
         self._last_crawl_request_count: int = 0
 
         # Download history
@@ -469,6 +506,16 @@ class ScannerService:
         all_posts = await self._crawl_pages(
             sources, pages, base_url, scraper, loop, previously_scanned, early_stop)
 
+        # Remember policy exclusions durably. Without this they look new on every
+        # cycle, which keeps blocking early-stop even though the wasted detail
+        # downloads have already stopped.
+        new_exclusions = getattr(self, "_last_crawl_policy_excluded_new", None)
+        if new_exclusions and self.db:
+            try:
+                self.db.record_policy_exclusions(new_exclusions)
+            except Exception:
+                logger.exception("Failed to persist full-disc policy exclusions")
+
         if self.stop_scan_flag:
             return
 
@@ -586,6 +633,8 @@ class ScannerService:
         self, sources: List[Dict], pages: int, base_url: str,
         scraper, loop, previously_scanned: Optional[Set[str]] = None,
         early_stop: bool = False,
+        policy_excluded: Optional[Set[str]] = None,
+        skip_full_disc: Optional[bool] = None,
     ) -> List[Dict]:
         """Crawl listing pages from all sources and collect post URLs.
 
@@ -611,8 +660,24 @@ class ScannerService:
         """
         all_posts = []
         skip_urls = previously_scanned or set()
+        # Explicit arguments win (tests pass them); otherwise read the live
+        # policy, the same way scan_threads is resolved.
+        if skip_full_disc is None:
+            skip_full_disc = bool(self.config.get("hdencode_skip_full_disc", True))
+        if policy_excluded is None and skip_full_disc and self.db:
+            try:
+                policy_excluded = self.db.get_policy_excluded_urls("hdencode")
+            except Exception:
+                logger.debug("Could not load policy exclusions", exc_info=True)
+                policy_excluded = set()
+        known_excluded = policy_excluded or set()
         seen_post_urls: Set[str] = set()  # O(1) dedup instead of O(n) list scan
         skipped_count = 0
+        # Full-disc releases the operator excludes by policy. Split by whether
+        # this crawl is seeing them for the first time — the two cases differ
+        # for early-stop, see the comment at the exclusion branch.
+        policy_excluded_new: List[Dict] = []
+        policy_excluded_known = 0
         early_stopped = False
         total_pages = len(sources) * pages
         current_page = 0
@@ -717,6 +782,9 @@ class ScannerService:
                     page_new = 0     # of those, ones not already seen/skipped
                     for post in posts:
                         post_url = post.get('href', '')
+                        # The listing already carries the full-disc marker, so
+                        # the policy decision can be made without a download.
+                        post_title = post.get_text(" ", strip=True)
                         if post_url.startswith('/'):
                             if source_id == "ddlbase":
                                 post_url = f"https://ddlbase.com{post_url}"
@@ -732,6 +800,29 @@ class ScannerService:
                         seen_post_urls.add(post_url)
                         if post_url in skip_urls:
                             skipped_count += 1
+                            continue
+                        if (skip_full_disc and source_id == "hdencode"
+                                and is_full_disc_title(post_title)):
+                            # Excluded by policy BEFORE any detail fetch, so it
+                            # costs nothing and can never reach the parser that
+                            # cannot represent it.
+                            if post_url in known_excluded:
+                                policy_excluded_known += 1
+                            else:
+                                # A FIRST sighting is genuinely new listing
+                                # content and MUST count toward page_new.
+                                # Without this, a page holding a few new
+                                # full-disc releases looks fully-seen, early-stop
+                                # fires, and real releases deeper in the listing
+                                # are never reached — trading one silent loss
+                                # for another.
+                                page_new += 1
+                                policy_excluded_new.append({
+                                    'url': post_url,
+                                    'title': post_title,
+                                    'source': source_id,
+                                    'category': source_category,
+                                })
                             continue
                         page_new += 1
                         all_posts.append({'url': post_url, 'type': source_type_hint, 'source': source_id, 'category': source_category})
@@ -762,6 +853,20 @@ class ScannerService:
 
         if skipped_count:
             self._log(f"Skipped {skipped_count} previously scanned URLs")
+        # Deliberately at INFO and aggregated. A silent skip is precisely what
+        # hid the original defect for months: the pages returned HTTP 200,
+        # source health stayed green, and nothing at any log level said the
+        # releases were being dropped.
+        total_excluded = len(policy_excluded_new) + policy_excluded_known
+        if total_excluded:
+            self._log(
+                f"Policy-excluded {total_excluded} full-disc release(s) before "
+                f"detail fetch ({len(policy_excluded_new)} newly seen); "
+                f"set hdencode_skip_full_disc=false to ingest them"
+            )
+        #: Rows the caller should persist so they are recognised next cycle.
+        self._last_crawl_policy_excluded_new = policy_excluded_new
+        self._last_crawl_policy_excluded_count = total_excluded
 
         # Expose every listing URL seen this crawl (new + skipped) so callers can
         # refresh "last seen" on still-listed items without re-scraping them.
