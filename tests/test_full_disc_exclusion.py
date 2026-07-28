@@ -369,12 +369,17 @@ def test_known_exclusions_alone_can_settle_the_crawl(monkeypatch):
 
 def test_exclusion_survives_and_last_seen_advances(db_manager):
     """first_seen_at is preserved, last_seen_at advances, one row only."""
-    url = "https://hdencode.org/bdpersist/"
-    row = {"url": url, "title": "[BD]Persist", "source": "hdencode",
+    raw = "https://hdencode.org/bdpersist/"        # written with a trailing slash
+    canonical = "https://hdencode.org/bdpersist"   # stored canonically
+    row = {"url": raw, "title": "[BD]Persist", "source": "hdencode",
            "category": "4k"}
 
     db_manager.record_policy_exclusions([row])
-    assert db_manager.get_policy_excluded_urls("hdencode") == {url}
+    # The store normalises at its own boundary, so a caller that forgets to
+    # canonicalise cannot create a variant row. This assertion previously
+    # expected the raw value back, which was itself the evidence that the
+    # invariant was only a convention.
+    assert db_manager.get_policy_excluded_urls("hdencode") == {canonical}
 
     # age the row deterministically rather than relying on wall-clock drift
     conn = db_manager.get_connection()
