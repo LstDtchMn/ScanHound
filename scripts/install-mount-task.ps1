@@ -865,6 +865,23 @@ $ns  = New-Object Xml.XmlNamespaceManager($xml.NameTable)
 $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
 
 $fail = @()
+
+# Windows resolves a SID-registered principal back to its display name, so
+# comparing the returned UserId literally against the SID can NEVER pass -- the
+# task was correct and the assertion was wrong. Compare IDENTITIES, not strings.
+function Resolve-PrincipalSid([string]$value) {
+    if (-not $value) { return '' }
+    if ($value -match '^S-1-') { return $value }
+    try {
+        return (New-Object Security.Principal.NTAccount($value)
+               ).Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        # Unresolvable: return it unchanged so the assertion fails loudly rather
+        # than silently passing something we could not identify.
+        return $value
+    }
+}
+
 function Assert-Field($label, $actual, $expected) {
     $ok = ("$actual" -eq "$expected")
     Write-Output ("{0}  {1,-32} {2}" -f $(if ($ok) { 'PASS' } else { 'FAIL' }), $label, $actual)
@@ -876,7 +893,7 @@ Assert-Field 'action count'                $t.Actions.Count 1
 Assert-Field 'action.Execute (pinned)'     $t.Actions[0].Execute $PowerShellExe
 Assert-Field 'action targets deployed'     ($t.Actions[0].Arguments -like "*$Deployed*") 'True'
 Assert-Field 'action avoids working tree'  ($t.Actions[0].Arguments -notlike "*$SourceRepo*") 'True'
-Assert-Field 'principal.UserId'            $t.Principal.UserId $Sid
+Assert-Field 'principal.UserId (SID)'      (Resolve-PrincipalSid $t.Principal.UserId) $Sid
 Assert-Field 'principal.LogonType'         $t.Principal.LogonType 'Interactive'
 Assert-Field 'principal.RunLevel'          $t.Principal.RunLevel 'Highest'
 Assert-Field 'RestartCount'                $t.Settings.RestartCount 3
