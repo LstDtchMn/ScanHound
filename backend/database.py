@@ -10,6 +10,8 @@ import sqlite3
 import os
 import datetime
 import logging
+
+from backend.url_identity import canonicalize_listing_url
 import time
 import threading
 import uuid
@@ -998,6 +1000,29 @@ class DatabaseManager:
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_hdencode_shadow_completed
                     ON hdencode_shadow_cycles(completed_at, outcome)
+                """)
+                # Listing URLs excluded by operator policy before any detail
+                # fetch. Durable ON PURPOSE: an in-memory skip stops the wasted
+                # downloads but leaves the URL looking new every cycle, which
+                # keeps blocking early-stop forever.
+                #
+                # Deliberately NOT named as a general listing ledger — it holds
+                # ONLY policy exclusions. A half-populated table called a ledger
+                # would invite a later reader to assume it is complete.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS listing_policy_exclusions (
+                        canonical_url TEXT PRIMARY KEY,
+                        source TEXT NOT NULL,
+                        category TEXT,
+                        listing_title TEXT,
+                        policy_reason TEXT NOT NULL,
+                        first_seen_at TEXT NOT NULL,
+                        last_seen_at TEXT NOT NULL
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_listing_policy_excl_source
+                    ON listing_policy_exclusions(source, policy_reason)
                 """)
                 for _column, _declaration in (
                     ("imdb_id", "TEXT"),
@@ -3273,6 +3298,64 @@ class DatabaseManager:
         """Check if a URL has been seen in a previous scan."""
         return self._query('SELECT 1 FROM scanned_urls WHERE url = ?', (url,),
                            one=True, default=None) is not None
+
+    def get_policy_excluded_urls(self, source: str = "hdencode") -> set:
+        """URLs already known to be excluded by policy, for skip decisions."""
+        rows = self._query_dicts(
+            "SELECT canonical_url FROM listing_policy_exclusions WHERE source = ?",
+            (source,), default=[])
+        # Canonicalise on read as well as write, so a row written before this
+        # invariant existed still matches.
+        return {canonicalize_listing_url(row["canonical_url"]) for row in rows}
+
+    def record_policy_exclusions(self, rows) -> int:
+        """Upsert observed policy exclusions. Returns the number written.
+
+        first_seen_at is preserved on re-observation; last_seen_at advances, so
+        an exclusion that leaves the listing can be aged out later without
+        losing when it was first seen.
+        """
+        rows = list(rows or [])
+        if not rows:
+            return 0
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        written = 0
+        seen = set()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            for row in rows:
+                # Canonicalise HERE, at the storage boundary, so the store is
+                # canonical BY CONSTRUCTION rather than because one caller
+                # remembered to normalise first. A second writer (RSS) must not
+                # be able to break the invariant.
+                url = canonicalize_listing_url((row or {}).get("url"))
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                written += 1
+                conn.execute(
+                    """INSERT INTO listing_policy_exclusions (
+                        canonical_url, source, category, listing_title,
+                        policy_reason, first_seen_at, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(canonical_url) DO UPDATE SET
+                        last_seen_at = excluded.last_seen_at,
+                        listing_title = excluded.listing_title""",
+                    (url, str(row.get("source") or "hdencode"),
+                     row.get("category"), row.get("title"),
+                     str(row.get("reason") or "listing_policy_excluded_full_disc"),
+                     now, now),
+                )
+        # The number actually written, not len(rows): empty and duplicate
+        # identities would otherwise overstate it to any caller that trusts it.
+        return written
+
+    def count_policy_exclusions(self, source: str = "hdencode") -> int:
+        row = self._query(
+            "SELECT COUNT(*) AS n FROM listing_policy_exclusions WHERE source = ?",
+            (source,), one=True, default=None)
+        return int(row["n"]) if row else 0
 
     def get_scanned_urls(self):
         """Get all previously scanned URLs as a set for fast membership testing."""

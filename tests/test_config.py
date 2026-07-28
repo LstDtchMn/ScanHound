@@ -134,6 +134,7 @@ EXPECTED_DEFAULT_KEYS = {
     # HDEncode RSS-primary readiness / fallback (PR H)
     "hdencode_rss_shadow_min_cycles", "hdencode_rss_shadow_min_days",
     "hdencode_rss_auto_grab_enabled", "hdencode_rss_listing_fallback_enabled",
+    "hdencode_skip_full_disc",
     # HDEncode persistent browser + durable download queue (Commits 2-4)
     "hdencode_browser_adapter", "hdencode_browser_profile_mode",
     "hdencode_browser_profile_dir", "download_batch_interval_minutes",

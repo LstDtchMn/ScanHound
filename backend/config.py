@@ -123,6 +123,7 @@ class AppConfig(TypedDict, total=False):
     hdencode_rss_shadow_compare_enabled: bool
     hdencode_rss_hydration_limit: int
     hdencode_rss_listing_fallback_enabled: bool
+    hdencode_skip_full_disc: bool
     hdencode_rss_auto_grab_enabled: bool
     hdencode_rss_shadow_min_cycles: int
     hdencode_rss_shadow_min_days: int
@@ -490,6 +491,11 @@ _DEFAULT_CONFIG: AppConfig = {
     "hdencode_rss_shadow_compare_enabled": True,
     "hdencode_rss_hydration_limit": 10,
     "hdencode_rss_listing_fallback_enabled": False,
+    # Full-disc releases carry no Filename field, so the detail parser cannot
+    # represent them. Excluded before any download. Setting this False does
+    # NOT ingest them - the parser is unchanged - it only routes them back
+    # down the old silent-failure path and restores the wasted downloads.
+    "hdencode_skip_full_disc": True,
     "hdencode_rss_auto_grab_enabled": False,
     "hdencode_rss_shadow_min_cycles": 20,
     "hdencode_rss_shadow_min_days": 7,
