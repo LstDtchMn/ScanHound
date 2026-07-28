@@ -408,3 +408,182 @@ def test_every_observed_exclusion_is_persisted_not_just_new(monkeypatch):
     observed = scanner._last_crawl_policy_excluded_observed
     assert len(observed) == 1
     assert observed[0]["url"] == canonicalize_listing_url(bd)
+
+
+# ── B1: current-crawl duplicates are not the discovery frontier ───────
+
+def test_repeated_link_page_cannot_stop_before_deeper_new_content(monkeypatch):
+    """A page whose links merely repeat earlier ones is NOT evidence that the
+    durable frontier was reached.
+
+    An earlier guard used global set non-emptiness plus page_posts, so one
+    unrelated historical exclusion made a duplicate page look fully-known and
+    hid genuinely new releases on the next page.
+    """
+    a = "https://hdencode.org/a/"
+    b = "https://hdencode.org/b/"
+    unrelated_bd = canonicalize_listing_url("https://hdencode.org/bdold/")
+
+    page1 = _page([(a, "A 2024 2160p")])
+    page2 = _page([(a, "A 2024 2160p")])          # repeat only
+    page3 = _page([(b, "B 2024 2160p")])          # genuinely new
+
+    scanner = _shell()
+    scraper = _Scraper([page1, page2, page3])
+    posts = _crawl(scanner, scraper, monkeypatch, pages=3,
+                   previously_scanned=set(),      # no ordinary cache
+                   early_stop=True,
+                   policy_excluded={unrelated_bd},
+                   skip_full_disc=True)
+
+    assert scanner._last_crawl_early_stopped is False
+    assert scraper.calls == 3, "stopped before reaching page 3"
+    assert b in [p["url"] for p in posts], "genuinely new release was hidden"
+
+
+def test_sticky_post_repeated_across_pages_does_not_establish_frontier(monkeypatch):
+    """A pinned/header post repeating on every page must not end the crawl."""
+    sticky = "https://hdencode.org/pinned/"
+    page1 = _page([(sticky, "Pinned Notice"), ("https://hdencode.org/x/", "X 2024")])
+    page2 = _page([(sticky, "Pinned Notice")])           # sticky only
+    page3 = _page([("https://hdencode.org/y/", "Y 2024")])
+
+    scanner = _shell()
+    scraper = _Scraper([page1, page2, page3])
+    posts = _crawl(scanner, scraper, monkeypatch, pages=3,
+                   previously_scanned=set(), early_stop=True,
+                   skip_full_disc=True)
+
+    assert scraper.calls == 3
+    assert "https://hdencode.org/y/" in [p["url"] for p in posts]
+
+
+def test_a_fully_known_page_still_stops(monkeypatch):
+    """The guard must still do its job: an all-cached page ends the crawl."""
+    cached = "https://hdencode.org/cached/"
+    page1 = _page([(cached, "Cached 2024")])
+    page2 = _page([("https://hdencode.org/deep/", "Deep 2024")])
+
+    scanner = _shell()
+    scraper = _Scraper([page1, page2])
+    _crawl(scanner, scraper, monkeypatch, pages=2,
+           previously_scanned={cached}, early_stop=True, skip_full_disc=True)
+
+    assert scanner._last_crawl_early_stopped is True
+    assert scraper.calls == 1
+
+
+# ── B2: the INFO line must never promise ingestion ────────────────────
+
+def test_info_line_never_claims_disabling_ingests(monkeypatch):
+    scanner = _shell()
+    _crawl(scanner, _Scraper([_page([
+        ("https://hdencode.org/bdi/", "[BD]I 2024"),
+    ])])  , monkeypatch, skip_full_disc=True)
+
+    line = [c.args[0] for c in scanner._log.call_args_list
+            if "full-disc" in str(c.args[0])][0]
+    assert "ingest them" not in line
+    assert "=false" not in line
+    assert "unsupported" in line
+
+
+def test_warning_and_info_cannot_contradict(monkeypatch):
+    """Both surfaces must agree that ingestion is unsupported."""
+    on = _shell()
+    _crawl(on, _Scraper([_page([("https://hdencode.org/bdc/", "[BD]C")])]),
+           monkeypatch, skip_full_disc=True)
+    off = _shell()
+    _crawl(off, _Scraper([_page([("https://hdencode.org/bdc/", "[BD]C")])]),
+           monkeypatch, skip_full_disc=False)
+
+    info = " ".join(str(c.args[0]) for c in on._log.call_args_list)
+    warn = " ".join(str(c.args[0]) for c in off._log.call_args_list)
+    assert "unsupported" in info
+    assert "still fail to parse" in warn
+    assert "to ingest them" not in info + warn
+
+
+def test_no_hdencode_warning_for_other_sources(monkeypatch):
+    """A DDLBase-only crawl cannot warn about HDEncode full discs."""
+    other = dict(_SOURCE, source="ddlbase")
+    scanner = _shell()
+    _crawl(scanner, _Scraper([_page([
+        ("https://ddlbase.com/post/x/", "Something 2024"),
+    ])]), monkeypatch, skip_full_disc=False, source=other)
+
+    assert not [c for c in scanner._log.call_args_list
+                if "full-disc" in str(c.args[0])]
+
+
+# ── B3: canonical identity is an invariant, not a convention ──────────
+
+def test_same_crawl_url_variants_count_once(monkeypatch):
+    """Two raw variants of one release collapse to one row in the store, so the
+    reported count must not say two."""
+    scanner = _shell()
+    _crawl(scanner, _Scraper([_page([
+        ("https://hdencode.org/bdv/", "[BD]V 2024"),
+        ("https://hdencode.org/bdv/?utm=x", "[BD]V 2024"),
+        ("https://hdencode.org/bdv#frag", "[BD]V 2024"),
+    ])]), monkeypatch, skip_full_disc=True)
+
+    assert scanner._last_crawl_policy_excluded_count == 1
+    assert len(scanner._last_crawl_policy_excluded_new) == 1
+    assert len(scanner._last_crawl_policy_excluded_observed) == 1
+
+
+def test_storage_boundary_canonicalises_regardless_of_caller(db_manager):
+    """The store must be canonical BY CONSTRUCTION - a careless second writer
+    (RSS, later) must not be able to create variant rows."""
+    variants = [
+        "https://hdencode.org/bdz/",
+        "https://hdencode.org/bdz",
+        "https://hdencode.org/bdz/?utm=x",
+        "https://hdencode.org/bdz/#frag",
+        "https://HDEncode.org/bdz/",
+    ]
+    written = db_manager.record_policy_exclusions(
+        [{"url": v, "title": "[BD]Z", "source": "hdencode"} for v in variants])
+
+    assert written == 1, "returned count must reflect unique rows written"
+    conn = db_manager.get_connection()
+    rows = conn.execute(
+        "SELECT COUNT(*) AS n FROM listing_policy_exclusions").fetchone()
+    assert rows["n"] == 1
+    assert db_manager.get_policy_excluded_urls("hdencode") == {
+        "https://hdencode.org/bdz"}
+
+
+def test_empty_urls_do_not_inflate_the_write_count(db_manager):
+    written = db_manager.record_policy_exclusions([
+        {"url": "", "title": "junk", "source": "hdencode"},
+        {"url": None, "title": "junk", "source": "hdencode"},
+        {"url": "https://hdencode.org/bdreal/", "title": "[BD]Real",
+         "source": "hdencode"},
+    ])
+    assert written == 1
+
+
+def test_second_cycle_treats_every_variant_as_known(db_manager, monkeypatch):
+    """Round trip: variants written, reloaded, and all recognised next crawl."""
+    db_manager.record_policy_exclusions([
+        {"url": "https://hdencode.org/bdw/?utm=x", "title": "[BD]W",
+         "source": "hdencode"}])
+    known = db_manager.get_policy_excluded_urls("hdencode")
+
+    scanner = _shell()
+    _crawl(scanner, _Scraper([_page([
+        ("https://hdencode.org/bdw", "[BD]W 2024"),        # bare
+        ("https://hdencode.org/bdw/#x", "[BD]W 2024"),     # fragment
+    ])]), monkeypatch, skip_full_disc=True, policy_excluded=known)
+
+    assert scanner._last_crawl_policy_excluded_new == []
+    assert scanner._last_crawl_policy_excluded_count == 1
+
+
+def test_repository_root_has_no_stray_file():
+    """A stray empty file named 0 was committed once by shell redirection."""
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assert not os.path.exists(os.path.join(root, "0"))

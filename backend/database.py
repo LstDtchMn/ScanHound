@@ -10,6 +10,8 @@ import sqlite3
 import os
 import datetime
 import logging
+
+from backend.url_identity import canonicalize_listing_url
 import time
 import threading
 import uuid
@@ -3302,7 +3304,9 @@ class DatabaseManager:
         rows = self._query_dicts(
             "SELECT canonical_url FROM listing_policy_exclusions WHERE source = ?",
             (source,), default=[])
-        return {row["canonical_url"] for row in rows}
+        # Canonicalise on read as well as write, so a row written before this
+        # invariant existed still matches.
+        return {canonicalize_listing_url(row["canonical_url"]) for row in rows}
 
     def record_policy_exclusions(self, rows) -> int:
         """Upsert observed policy exclusions. Returns the number written.
@@ -3315,13 +3319,21 @@ class DatabaseManager:
         if not rows:
             return 0
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        written = 0
+        seen = set()
         with self.transaction() as conn:
             if not conn:
                 raise RuntimeError("Database unavailable")
             for row in rows:
-                url = (row or {}).get("url")
-                if not url:
+                # Canonicalise HERE, at the storage boundary, so the store is
+                # canonical BY CONSTRUCTION rather than because one caller
+                # remembered to normalise first. A second writer (RSS) must not
+                # be able to break the invariant.
+                url = canonicalize_listing_url((row or {}).get("url"))
+                if not url or url in seen:
                     continue
+                seen.add(url)
+                written += 1
                 conn.execute(
                     """INSERT INTO listing_policy_exclusions (
                         canonical_url, source, category, listing_title,
@@ -3335,7 +3347,9 @@ class DatabaseManager:
                      str(row.get("reason") or "listing_policy_excluded_full_disc"),
                      now, now),
                 )
-        return len(rows)
+        # The number actually written, not len(rows): empty and duplicate
+        # identities would otherwise overstate it to any caller that trusts it.
+        return written
 
     def count_policy_exclusions(self, source: str = "hdencode") -> int:
         row = self._query(

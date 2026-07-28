@@ -11,6 +11,7 @@ import time
 import threading
 import requests
 from bs4 import BeautifulSoup
+from backend.url_identity import canonicalize_listing_url
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -164,33 +165,6 @@ def _res_rank(res) -> int:
 #: "bdsorority...", so a substring test there would also match a genuine release
 #: whose title merely begins with those letters.
 _FULL_DISC_TITLE_RE = re.compile(r"^\s*\[\s*BD\s*\]", re.IGNORECASE)
-
-
-def canonicalize_listing_url(url: Optional[str]) -> str:
-    """Stable identity for a listing post, for the exclusion store.
-
-    Collapses trailing-slash, query, fragment and scheme/host case variance, so
-    the same release cannot occupy two exclusion rows or read as new again under
-    a variant.
-
-    SCOPE LIMIT, deliberate: this is applied to the exclusion store ONLY, not to
-    the ordinary ``skip_urls`` comparison. ``background_scan_cache`` and
-    ``scanned_urls`` hold raw hrefs, so canonicalising one side of that
-    comparison would silently break existing cache hits and re-scrape the whole
-    catalogue. Canonicalising everywhere is a larger change that must migrate
-    those stores in the same commit.
-    """
-    if not url:
-        return ""
-    try:
-        from urllib.parse import urlsplit, urlunsplit
-        parts = urlsplit(url.strip())
-        path = parts.path.rstrip("/") or "/"
-        return urlunsplit((
-            parts.scheme.lower(), parts.netloc.lower(), path, "", "",
-        ))
-    except Exception:
-        return url.strip()
 
 
 def is_full_disc_title(title: Optional[str]) -> bool:
@@ -698,7 +672,9 @@ class ScannerService:
             # build a ScannerService via __new__ and never set config or db.
             cfg = getattr(self, "config", None) or {}
             skip_full_disc = bool(cfg.get("hdencode_skip_full_disc", True))
-        if not skip_full_disc:
+        if not skip_full_disc and any(
+            (src or {}).get("source", "hdencode") == "hdencode" for src in sources
+        ):
             # Not "ingest them": detail_scraper still requires a Filename field
             # that full-disc pages do not have, so disabling the policy simply
             # routes them back down the old silent-failure path and restores the
@@ -728,6 +704,10 @@ class ScannerService:
         # for early-stop, see the comment at the exclusion branch.
         policy_excluded_new: List[Dict] = []
         policy_excluded_observed: List[Dict] = []
+        #: Canonical identities already classified this crawl. Two raw variants
+        #: of one release collapse to one row in the store, so counting them
+        #: twice would make the reported count disagree with the database.
+        seen_exclusion_canonical: Set[str] = set()
         policy_excluded_known = 0
         early_stopped = False
         total_pages = len(sources) * pages
@@ -830,7 +810,13 @@ class ScannerService:
                     posts = self._select_posts(soup, source_id)
 
                     page_posts = 0   # non-empty post URLs found on this page
-                    page_new = 0     # of those, ones not already seen/skipped
+                    # Unique URLs FIRST SEEN on this page. Deliberately excludes
+                    # current-crawl duplicates: a sticky or repeated link is not
+                    # evidence that the durable discovery frontier was reached,
+                    # and counting it as such stopped the crawl before genuinely
+                    # new releases on the next page.
+                    page_unique = 0
+                    page_new = 0     # of those, ones not already durably known
                     for post in posts:
                         post_url = post.get('href', '')
                         # The listing already carries the full-disc marker, so
@@ -849,6 +835,7 @@ class ScannerService:
                         if post_url in seen_post_urls:
                             continue
                         seen_post_urls.add(post_url)
+                        page_unique += 1
                         if post_url in skip_urls:
                             skipped_count += 1
                             continue
@@ -865,6 +852,11 @@ class ScannerService:
                                 'source': source_id,
                                 'category': source_category,
                             }
+                            if canonical in seen_exclusion_canonical:
+                                # A second raw variant of a release already
+                                # classified this crawl. One release, one count.
+                                continue
+                            seen_exclusion_canonical.add(canonical)
                             # Every sighting is persisted so last_seen_at can
                             # advance; only the first counts as new.
                             policy_excluded_observed.append(row)
@@ -888,14 +880,14 @@ class ScannerService:
                     # we've reached content already cached/seen — deeper pages are
                     # older still, so stop crawling this source. Only with a skip
                     # set in play (otherwise every page looks "all new").
-                    # A persisted exclusion is prior observation just as much
-                    # as an ordinary cached URL. Requiring skip_urls meant a
-                    # listing whose only known content was excluded releases
-                    # never settled, and every configured page was re-crawled
-                    # forever.
-                    has_prior_baseline = bool(skip_urls or known_excluded)
-                    if (early_stop and has_prior_baseline
-                            and page_posts > 0 and page_new == 0):
+                    # Stop only when every unique URL first seen on THIS page
+                    # was already durably known - via the ordinary cache or the
+                    # persisted exclusion store, which is prior observation just
+                    # as much. Because page_unique = page_new + durably-known, a
+                    # zero page_new with a non-zero page_unique IS that
+                    # condition. Using page_posts here let a page of pure
+                    # current-crawl duplicates masquerade as the frontier.
+                    if early_stop and page_unique > 0 and page_new == 0:
                         self._log(f"{source_name}: reached previously-cached content at page {page_num}, stopping")
                         early_stopped = True
                         break
@@ -923,10 +915,14 @@ class ScannerService:
         # releases were being dropped.
         total_excluded = len(policy_excluded_new) + policy_excluded_known
         if total_excluded:
+            # No flag instruction here on purpose. This line previously ended
+            # "set hdencode_skip_full_disc=false to ingest them", which is false:
+            # the parser cannot represent a full disc, so disabling the policy
+            # produces no releases and only restores the wasted downloads.
             self._log(
                 f"Policy-excluded {total_excluded} full-disc release(s) before "
                 f"detail fetch ({len(policy_excluded_new)} newly seen); "
-                f"set hdencode_skip_full_disc=false to ingest them"
+                f"full-disc ingestion is unsupported"
             )
         #: EVERY exclusion observed this crawl — persisted so last_seen_at
         #: advances. The ``_new`` subset drives page_new and the "newly seen"
