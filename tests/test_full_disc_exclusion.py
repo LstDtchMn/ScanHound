@@ -146,13 +146,25 @@ def test_ordinary_releases_are_unaffected(monkeypatch):
     assert len(posts) == 5
 
 
-def test_disabling_the_policy_ingests_them(monkeypatch):
-    """The escape hatch has to work, or the setting is a lie."""
+def test_disabling_the_policy_schedules_legacy_processing_not_ingestion(monkeypatch):
+    """Disabling the policy does NOT ingest full discs.
+
+    detail_scraper still requires a Filename field these pages do not have, so
+    the flag only routes them back down the old silent-failure path. An earlier
+    version of this test asserted the URL was returned and called that proof the
+    escape hatch "works" — it proved scheduling, not ingestion.
+    """
+    scanner = _shell()
     scraper = _Scraper([_page([
         ("https://hdencode.org/bdfull-disc/", "[BD]Full.Disc.2024"),
     ])])
-    posts = _crawl(_shell(), scraper, monkeypatch, skip_full_disc=False)
-    assert len(posts) == 1
+    posts = _crawl(scanner, scraper, monkeypatch, skip_full_disc=False)
+
+    assert len(posts) == 1, "scheduled for the legacy path"
+    warnings = [c for c in scanner._log.call_args_list
+                if len(c.args) > 1 and c.args[1] == "warning"]
+    assert warnings, "disabling an unsupported policy must warn"
+    assert "still fail to parse" in warnings[0].args[0]
 
 
 def test_non_hdencode_sources_are_unaffected(monkeypatch):
@@ -174,7 +186,10 @@ def test_new_exclusions_are_exposed_for_persistence(monkeypatch):
     _crawl(scanner, scraper, monkeypatch, skip_full_disc=True)
 
     rows = scanner._last_crawl_policy_excluded_new
+    # stored under the canonical identity, with the raw href kept alongside
     assert {r["url"] for r in rows} == {
+        "https://hdencode.org/bda", "https://hdencode.org/bdb"}
+    assert {r["raw_url"] for r in rows} == {
         "https://hdencode.org/bda/", "https://hdencode.org/bdb/"}
     assert all(r["title"].startswith("[BD]") for r in rows)
     assert scanner._last_crawl_policy_excluded_count == 2
@@ -262,3 +277,134 @@ def test_exclusions_do_not_force_deep_crawling_forever(monkeypatch):
 
     assert second._last_crawl_early_stopped is True
     assert scraper2.calls == 1
+
+
+# ── canonical identity ────────────────────────────────────────────────
+
+from backend.scanner_service import canonicalize_listing_url
+
+
+@pytest.mark.parametrize("a,b", [
+    ("https://hdencode.org/bda/", "https://hdencode.org/bda"),
+    ("https://hdencode.org/bda/", "https://hdencode.org/bda/?utm=x"),
+    ("https://hdencode.org/bda/", "https://hdencode.org/bda/#frag"),
+    ("https://hdencode.org/bda/", "https://HDEncode.org/bda/"),
+    ("https://hdencode.org/bda/", "HTTPS://hdencode.org/bda/"),
+])
+def test_url_variants_collapse_to_one_identity(a, b):
+    assert canonicalize_listing_url(a) == canonicalize_listing_url(b)
+
+
+def test_distinct_posts_stay_distinct():
+    assert (canonicalize_listing_url("https://hdencode.org/bda/")
+            != canonicalize_listing_url("https://hdencode.org/bdb/"))
+
+
+# ── the no-silent-skip contract ───────────────────────────────────────
+
+def test_exclusions_produce_exactly_one_aggregate_info_line(monkeypatch):
+    """A mutation deleting this log would otherwise survive the whole suite,
+    recreating the observability failure this work exists to end."""
+    entries = [("https://hdencode.org/bd%d/" % i, "[BD]Disc %d" % i)
+               for i in range(20)]
+    scanner = _shell()
+    _crawl(scanner, _Scraper([_page(entries)]), monkeypatch, skip_full_disc=True)
+
+    lines = [c.args[0] for c in scanner._log.call_args_list
+             if "full-disc" in str(c.args[0])]
+    assert len(lines) == 1, "aggregate once per crawl, never per release"
+    assert "20" in lines[0]
+    assert "newly seen" in lines[0]
+    assert "before detail fetch" in lines[0]
+
+
+def test_zero_exclusions_emits_no_policy_line(monkeypatch):
+    scanner = _shell()
+    _crawl(scanner, _Scraper([_page([
+        ("https://hdencode.org/ordinary/", "Ordinary 2024 2160p"),
+    ])]), monkeypatch, skip_full_disc=True)
+    assert not [c for c in scanner._log.call_args_list
+                if "full-disc" in str(c.args[0])]
+
+
+def test_known_only_crawl_still_reports_the_count(monkeypatch):
+    scanner = _shell()
+    _crawl(scanner, _Scraper([_page([
+        ("https://hdencode.org/bda/", "[BD]A"),
+    ])]), monkeypatch, skip_full_disc=True,
+        policy_excluded={canonicalize_listing_url("https://hdencode.org/bda/")})
+
+    lines = [c.args[0] for c in scanner._log.call_args_list
+             if "full-disc" in str(c.args[0])]
+    assert len(lines) == 1
+    assert "0 newly seen" in lines[0]
+
+
+# ── exclusion-only early-stop (no ordinary cached baseline) ───────────
+
+def test_known_exclusions_alone_can_settle_the_crawl(monkeypatch):
+    """The persisted exclusion store IS prior observation.
+
+    Requiring a non-empty ordinary skip_urls meant a listing whose only known
+    content was excluded releases never settled, and every configured page was
+    re-crawled every cycle — the waste this work exists to remove.
+    """
+    bd = "https://hdencode.org/bdonly/"
+    page1 = _page([(bd, "[BD]Only.Known.Disc")])
+    page2 = _page([("https://hdencode.org/deeper/", "Deeper 2024")])
+
+    scanner = _shell()
+    scraper = _Scraper([page1, page2])
+    _crawl(scanner, scraper, monkeypatch, pages=2,
+           previously_scanned=set(),                 # no ordinary cache at all
+           early_stop=True,
+           policy_excluded={canonicalize_listing_url(bd)},
+           skip_full_disc=True)
+
+    assert scanner._last_crawl_early_stopped is True
+    assert scraper.calls == 1, "re-crawled despite having no new content"
+
+
+# ── durable round-trip through a real database ────────────────────────
+
+def test_exclusion_survives_and_last_seen_advances(db_manager):
+    """first_seen_at is preserved, last_seen_at advances, one row only."""
+    url = "https://hdencode.org/bdpersist/"
+    row = {"url": url, "title": "[BD]Persist", "source": "hdencode",
+           "category": "4k"}
+
+    db_manager.record_policy_exclusions([row])
+    assert db_manager.get_policy_excluded_urls("hdencode") == {url}
+
+    # age the row deterministically rather than relying on wall-clock drift
+    conn = db_manager.get_connection()
+    conn.execute(
+        "UPDATE listing_policy_exclusions SET first_seen_at=?, last_seen_at=?",
+        ("2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00"))
+    conn.commit()
+
+    db_manager.record_policy_exclusions([row])
+
+    cur = conn.execute(
+        "SELECT canonical_url, first_seen_at, last_seen_at, source, "
+        "policy_reason, COUNT(*) AS n FROM listing_policy_exclusions")
+    got = cur.fetchone()
+    assert got["n"] == 1, "re-observation must upsert, not duplicate"
+    assert got["first_seen_at"] == "2020-01-01T00:00:00+00:00"
+    assert got["last_seen_at"] > got["first_seen_at"], "last_seen_at froze"
+    assert got["policy_reason"] == "listing_policy_excluded_full_disc"
+
+
+def test_every_observed_exclusion_is_persisted_not_just_new(monkeypatch):
+    """Known exclusions must reach the persistence payload too, or last_seen_at
+    can never advance for anything already in the store."""
+    bd = "https://hdencode.org/bdknown2/"
+    scanner = _shell()
+    _crawl(scanner, _Scraper([_page([(bd, "[BD]Known")])]), monkeypatch,
+           skip_full_disc=True,
+           policy_excluded={canonicalize_listing_url(bd)})
+
+    assert scanner._last_crawl_policy_excluded_new == []
+    observed = scanner._last_crawl_policy_excluded_observed
+    assert len(observed) == 1
+    assert observed[0]["url"] == canonicalize_listing_url(bd)

@@ -166,6 +166,33 @@ def _res_rank(res) -> int:
 _FULL_DISC_TITLE_RE = re.compile(r"^\s*\[\s*BD\s*\]", re.IGNORECASE)
 
 
+def canonicalize_listing_url(url: Optional[str]) -> str:
+    """Stable identity for a listing post, for the exclusion store.
+
+    Collapses trailing-slash, query, fragment and scheme/host case variance, so
+    the same release cannot occupy two exclusion rows or read as new again under
+    a variant.
+
+    SCOPE LIMIT, deliberate: this is applied to the exclusion store ONLY, not to
+    the ordinary ``skip_urls`` comparison. ``background_scan_cache`` and
+    ``scanned_urls`` hold raw hrefs, so canonicalising one side of that
+    comparison would silently break existing cache hits and re-scrape the whole
+    catalogue. Canonicalising everywhere is a larger change that must migrate
+    those stores in the same commit.
+    """
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(url.strip())
+        path = parts.path.rstrip("/") or "/"
+        return urlunsplit((
+            parts.scheme.lower(), parts.netloc.lower(), path, "", "",
+        ))
+    except Exception:
+        return url.strip()
+
+
 def is_full_disc_title(title: Optional[str]) -> bool:
     """True when a listing title marks a full-disc release.
 
@@ -224,6 +251,7 @@ class ScannerService:
         self._last_crawl_early_stopped: bool = False
         #: Full-disc releases excluded by policy this crawl: rows the caller
         #: persists, plus the total (new + already-known) for reporting.
+        self._last_crawl_policy_excluded_observed: List[Dict] = []
         self._last_crawl_policy_excluded_new: List[Dict] = []
         self._last_crawl_policy_excluded_count: int = 0
         self._last_crawl_request_count: int = 0
@@ -509,10 +537,13 @@ class ScannerService:
         # Remember policy exclusions durably. Without this they look new on every
         # cycle, which keeps blocking early-stop even though the wasted detail
         # downloads have already stopped.
-        new_exclusions = getattr(self, "_last_crawl_policy_excluded_new", None)
-        if new_exclusions and self.db:
+        observed = getattr(self, "_last_crawl_policy_excluded_observed", None)
+        if observed and getattr(self, "db", None):
             try:
-                self.db.record_policy_exclusions(new_exclusions)
+                # ALL observed rows: the upsert preserves first_seen_at and
+                # advances last_seen_at. Persisting only the new ones left
+                # last_seen_at frozen at first sighting forever.
+                self.db.record_policy_exclusions(observed)
             except Exception:
                 logger.exception("Failed to persist full-disc policy exclusions")
 
@@ -663,20 +694,40 @@ class ScannerService:
         # Explicit arguments win (tests pass them); otherwise read the live
         # policy, the same way scan_threads is resolved.
         if skip_full_disc is None:
-            skip_full_disc = bool(self.config.get("hdencode_skip_full_disc", True))
-        if policy_excluded is None and skip_full_disc and self.db:
+            # getattr, not a bare attribute read: several existing test doubles
+            # build a ScannerService via __new__ and never set config or db.
+            cfg = getattr(self, "config", None) or {}
+            skip_full_disc = bool(cfg.get("hdencode_skip_full_disc", True))
+        if not skip_full_disc:
+            # Not "ingest them": detail_scraper still requires a Filename field
+            # that full-disc pages do not have, so disabling the policy simply
+            # routes them back down the old silent-failure path and restores the
+            # repeated-download waste. Loud on purpose.
+            self._log(
+                "hdencode_skip_full_disc is disabled: full-disc releases will be "
+                "fetched and will still fail to parse (no Filename field). This "
+                "restores the repeated-download waste and produces no releases.",
+                "warning",
+            )
+        db = getattr(self, "db", None)
+        if policy_excluded is None and skip_full_disc and db:
             try:
-                policy_excluded = self.db.get_policy_excluded_urls("hdencode")
+                policy_excluded = db.get_policy_excluded_urls("hdencode")
             except Exception:
                 logger.debug("Could not load policy exclusions", exc_info=True)
                 policy_excluded = set()
-        known_excluded = policy_excluded or set()
+        # Canonicalise the incoming set too: a caller, or a row written
+        # before canonicalisation existed, may supply raw hrefs.
+        known_excluded = {
+            canonicalize_listing_url(u) for u in (policy_excluded or set())
+        }
         seen_post_urls: Set[str] = set()  # O(1) dedup instead of O(n) list scan
         skipped_count = 0
         # Full-disc releases the operator excludes by policy. Split by whether
         # this crawl is seeing them for the first time — the two cases differ
         # for early-stop, see the comment at the exclusion branch.
         policy_excluded_new: List[Dict] = []
+        policy_excluded_observed: List[Dict] = []
         policy_excluded_known = 0
         early_stopped = False
         total_pages = len(sources) * pages
@@ -806,7 +857,18 @@ class ScannerService:
                             # Excluded by policy BEFORE any detail fetch, so it
                             # costs nothing and can never reach the parser that
                             # cannot represent it.
-                            if post_url in known_excluded:
+                            canonical = canonicalize_listing_url(post_url)
+                            row = {
+                                'url': canonical,
+                                'raw_url': post_url,
+                                'title': post_title,
+                                'source': source_id,
+                                'category': source_category,
+                            }
+                            # Every sighting is persisted so last_seen_at can
+                            # advance; only the first counts as new.
+                            policy_excluded_observed.append(row)
+                            if canonical in known_excluded:
                                 policy_excluded_known += 1
                             else:
                                 # A FIRST sighting is genuinely new listing
@@ -817,12 +879,7 @@ class ScannerService:
                                 # are never reached — trading one silent loss
                                 # for another.
                                 page_new += 1
-                                policy_excluded_new.append({
-                                    'url': post_url,
-                                    'title': post_title,
-                                    'source': source_id,
-                                    'category': source_category,
-                                })
+                                policy_excluded_new.append(row)
                             continue
                         page_new += 1
                         all_posts.append({'url': post_url, 'type': source_type_hint, 'source': source_id, 'category': source_category})
@@ -831,7 +888,14 @@ class ScannerService:
                     # we've reached content already cached/seen — deeper pages are
                     # older still, so stop crawling this source. Only with a skip
                     # set in play (otherwise every page looks "all new").
-                    if early_stop and skip_urls and page_posts > 0 and page_new == 0:
+                    # A persisted exclusion is prior observation just as much
+                    # as an ordinary cached URL. Requiring skip_urls meant a
+                    # listing whose only known content was excluded releases
+                    # never settled, and every configured page was re-crawled
+                    # forever.
+                    has_prior_baseline = bool(skip_urls or known_excluded)
+                    if (early_stop and has_prior_baseline
+                            and page_posts > 0 and page_new == 0):
                         self._log(f"{source_name}: reached previously-cached content at page {page_num}, stopping")
                         early_stopped = True
                         break
@@ -864,7 +928,10 @@ class ScannerService:
                 f"detail fetch ({len(policy_excluded_new)} newly seen); "
                 f"set hdencode_skip_full_disc=false to ingest them"
             )
-        #: Rows the caller should persist so they are recognised next cycle.
+        #: EVERY exclusion observed this crawl — persisted so last_seen_at
+        #: advances. The ``_new`` subset drives page_new and the "newly seen"
+        #: count only.
+        self._last_crawl_policy_excluded_observed = policy_excluded_observed
         self._last_crawl_policy_excluded_new = policy_excluded_new
         self._last_crawl_policy_excluded_count = total_excluded
 
