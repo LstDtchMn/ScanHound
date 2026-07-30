@@ -748,8 +748,20 @@ if (-not (Test-Path -LiteralPath $PowerShellExe -PathType Leaf)) {
 # task will run 288 times a day, so "it exists" is a weaker claim than the one
 # made for the installer's own tools.
 Assert-PinnedTool $PowerShellExe 'powershell.exe (task action)'
+# -WindowStyle Hidden: the task repeats every 5 minutes under an INTERACTIVE
+# logon type, so without this it paints a console window on the desktop every
+# 5 minutes, forever - reported from the desktop on 2026-07-30. Interactive is
+# not negotiable (the script mounts into the docker-desktop WSL2 distro and
+# needs the user's session), so the window is suppressed instead of the logon
+# type being changed.
+#
+# HONEST LIMITATION: this does not make the launch perfectly invisible.
+# powershell.exe still allocates a console before it parses -WindowStyle, so a
+# brief flash can remain. It removes the seconds-long visible window, not
+# necessarily every frame of it. Fully flash-free needs a wrapper process,
+# which is more moving parts than this is worth.
 $action = New-ScheduledTaskAction -Execute $PowerShellExe `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Deployed`""
+    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Deployed`""
 
 # Boot: delayed. On the 2026-07-26 boot Docker's backend did not accept IPC
 # until T+119 s; the task previously fired at T+80 s and never retried.
