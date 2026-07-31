@@ -98,3 +98,9 @@ Dependency-driven, most entangled first:
 12. **Auto-rename supervised-run plan**
 
 Blocked on Jesse: watchdog hide flags (needs J4), all merges and deploys.
+
+---
+
+> **SUPERSEDED 2026-07-31** by `2026-07-31-plan-rev2-AUTHORITATIVE.md`.
+> In particular the full-disc/RSS-miss reasoning in this file is WRONG and was
+> retracted; see rev2 section 1.1. Jesse's 22 decisions are unchanged.

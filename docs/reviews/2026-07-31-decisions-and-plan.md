@@ -214,3 +214,10 @@ cannot explain it away.
 
 The pattern worth challenging: **three of these are me asserting a conclusion
 before verifying it on the surface where it was checkable.**
+
+---
+
+> **SUPERSEDED 2026-07-31** by `2026-07-31-plan-rev2-AUTHORITATIVE.md`
+> following ChatGPT review of `ade5348` (verdict: revision required).
+> Retained only as the record of what was believed before review.
+> Do not execute from this file.
