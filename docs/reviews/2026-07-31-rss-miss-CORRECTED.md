@@ -263,3 +263,21 @@ estimate from a single 9.6-day window.** It establishes that upstream omission
 is non-zero. It does not establish the rate. A clean post-change window should
 measure it against the full actionable listing population before any threshold
 is fixed.
+
+---
+
+# DECISIONS — Jesse, 2026-07-31
+
+**1. Criterion design: HYBRID.** RSS for discovery, plus an infrequent listing
+sweep purely to catch upstream omissions. Chosen over zero-RED (likely
+unachievable given ~1-in-100 upstream omission) and over a bare RED allowance
+(which would silently miss releases with nothing watching).
+
+The sample-size caveat stands and must be respected when the gate is built:
+1 in 100 is a point estimate from one 9.6-day window. It establishes that
+upstream omission is non-zero, not what the rate is.
+
+**2. Sequencing: finish Track A before Track B.** Narrowed A2 resilience work,
+then the lag-aware gate designed around the hybrid. Note this is a deliberate
+departure from rev 2.1's "rename outranks RSS after preservation" priority —
+Jesse's call, made with that priority stated.
