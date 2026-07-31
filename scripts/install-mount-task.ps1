@@ -792,10 +792,19 @@ $tLogon.Delay = 'PT1M'
 # there was exactly ONE run and zero restarts. RestartOnFailure covers a task
 # failing to LAUNCH, not an action returning nonzero.
 #
-# So 5 minutes here reproduces the recovery cadence the design intended, by the
-# only mechanism that actually works. RestartCount is kept because it still
-# covers genuine launch failures, but nothing depends on it.
-$RepetitionMinutes = 5
+# So the interval here IS the retry mechanism, by the only mechanism that
+# actually works. RestartCount is kept because it still covers genuine launch
+# failures, but nothing depends on it.
+#
+# 60 minutes, chosen deliberately on 2026-07-30 and not to be lowered casually
+# back to a "safer" small number without re-reading this: the boot and logon
+# triggers each fire exactly ONCE, so this interval is the entire recovery
+# budget after both have failed. At 60 the 2026-07-26 failure mode -- Docker's
+# backend not accepting IPC until T+119 s -- self-repairs within an hour rather
+# than within five minutes. That hour is a deliberate trade for not painting
+# the desktop 288 times a day; it is not an accident, and it is the reason the
+# window-hiding fix alone was not considered sufficient.
+$RepetitionMinutes = 60
 $triggerStart = (Get-Date).AddSeconds(90)
 $tTime = New-ScheduledTaskTrigger -Once -At $triggerStart `
     -RepetitionInterval (New-TimeSpan -Minutes $RepetitionMinutes)
@@ -927,7 +936,17 @@ Assert-Field 'BootTrigger.Delay' $(if ($bootDelay) { $bootDelay.InnerText } else
 $repeaters = $xml.SelectNodes('//t:Triggers/*/t:Repetition/t:Interval', $ns)
 Assert-Field 'triggers owning repetition' $repeaters.Count 1
 if ($repeaters.Count -eq 1) {
-    Assert-Field 'repetition interval'      $repeaters[0].InnerText "PT$($RepetitionMinutes)M"
+    # Compare DURATION, not spelling. Task Scheduler normalises the ISO 8601
+    # interval it stores: 5 minutes round-trips as PT5M, but 60 minutes comes
+    # back as PT1H, so the old string equality would have failed the install
+    # for a correctly-registered task the moment the interval stopped being a
+    # sub-hour value. Parse both sides and compare elapsed minutes.
+    $isoActual = $repeaters[0].InnerText
+    $minActual = -1
+    try   { $minActual = [int][System.Xml.XmlConvert]::ToTimeSpan($isoActual).TotalMinutes }
+    catch { $minActual = -1 }
+    Assert-Field "repetition interval (minutes, raw '$isoActual')" `
+                 $minActual $RepetitionMinutes
     $dur = $xml.SelectSingleNode('//t:Triggers/*/t:Repetition/t:Duration', $ns)
     Assert-Field 'repetition is indefinite' $(if ($dur) { $dur.InnerText } else { '<none>' }) '<none>'
 }
