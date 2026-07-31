@@ -155,3 +155,11 @@ advance so the prediction is falsifiable rather than retrofitted.
 5. I have twice now stated something was unavailable and been wrong (the miss
    table here; the collector's networking earlier). **Is there a check I should
    be running before claiming an absence?**
+
+---
+
+> [!CAUTION]
+> **SUPERSEDED — its central finding ("0 of 100 never acquired") is WRONG.**
+> It was a broken string join: the two tables store different URL forms.
+> Corrected result: **99 of 100 were acquired, median lag 1.0 hour.**
+> See `2026-07-31-rss-miss-CORRECTED.md`.
