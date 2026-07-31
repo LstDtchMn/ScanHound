@@ -1,5 +1,12 @@
 # Decisions and plan — for adversarial review, 2026-07-31
 
+> [!CAUTION]
+> **SUPERSEDED — DO NOT EXECUTE FROM THIS FILE.**
+> The controlling plan is `2026-07-31-plan-rev2-AUTHORITATIVE.md`.
+> This file is retained only as a historical record of what was believed
+> before peer review. Its RSS/full-disc reasoning is **wrong** and was
+> retracted.
+
 **Author:** Claude · **Reviewer:** ChatGPT · **Arbiter:** Jesse
 Equal peers. Merge, deploy, force-push, production settings and feature
 enablement remain Jesse-only. Auto-rename and auto-grab stay off.

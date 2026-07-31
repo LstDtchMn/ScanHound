@@ -1,7 +1,14 @@
 # Decision record — 2026-07-31
 
+> [!CAUTION]
+> **SUPERSEDED — DO NOT EXECUTE FROM THIS FILE.**
+> The controlling plan is `2026-07-31-plan-rev2-AUTHORITATIVE.md`.
+> This file is retained only as a historical record of what was believed
+> before peer review. Its RSS/full-disc reasoning is **wrong** and was
+> retracted.
+
 All decisions made by Jesse in one sitting, collected before any work began.
-This file is the authority for what was agreed. Nothing here was inferred.
+~~This file is the authority for what was agreed.~~ **NO LONGER THE AUTHORITY — see the caution above.** Nothing here was inferred.
 
 **Guardrails unchanged:** merge, deploy, force-push, production settings and
 feature enablement remain Jesse-only. Auto-rename and auto-grab stay off.

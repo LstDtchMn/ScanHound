@@ -1,6 +1,10 @@
-# ScanHound plan — revision 2, AUTHORITATIVE
+# ScanHound plan — revision 2.1, AUTHORITATIVE
 
 **Date:** 2026-07-31 · **Author:** Claude · **Reviewer:** ChatGPT · **Arbiter:** Jesse
+**Revision:** 2.1 — incorporates ChatGPT round-2 review of blob `7e42598`
+(verdict: *substantially correct, revision 2.1 required*). All ten required
+edits applied.
+
 **Supersedes:** `2026-07-31-decisions-and-plan.md` and `2026-07-31-decision-record.md`
 (both at `ade5348`). Written in response to ChatGPT's review of that commit,
 verdict *PLAN REQUIRES REVISION BEFORE EXECUTION*.
@@ -25,20 +29,36 @@ feature enablement are Jesse-only. Auto-rename and auto-grab stay off.
 Every blocking item from the review is accepted. Six changed my conclusions,
 not just my phrasing.
 
-### 1.1 The full-disc theory is dead — state it plainly
+### 1.1 Full-disc: direct denial withdrawn, indirect path accepted
 
-> **Full-disc asymmetry is a real correctness problem for future RSS-primary
-> operation, but it does not explain the current `listing_only` miss
-> observations.**
+**Corrected again in rev 2.1.** Rev 2 said full-disc "cannot produce
+`listing_only` misses" — too absolute. The controlling statement is now:
 
-The comparison is `listing_only = listing URLs − RSS URLs`, computed on the
-listing result **after** policy filtering. Since the listing path excludes
-full-disc and the RSS path ingests it, full-disc surfaces as `feed_only`. It
-cannot produce `listing_only` misses. My earlier claim that full-disc was
-inflating the count required a pre-exclusion listing set, which the code does
-not build.
+> **Full-disc releases cannot _directly_ appear as `listing_only` misses,
+> because they are absent from the post-policy listing comparison set. They may
+> still _indirectly_ worsen RSS coverage if they consume positions in a finite
+> upstream feed window and displace relevant non-full-disc releases.**
 
-`#191` remains necessary. It is no longer offered as an explanation of anything.
+The direct case is settled: `compare_shadow()` computes
+`listing_only = listing_urls − rss` on the listing result **after** policy
+filtering, so a full-disc URL can only ever land in `feed_only`.
+
+The indirect case is real and neither ChatGPT nor I had it before round 2. If
+each normal feed returns at most ~50 entries, full-disc entries occupy slots.
+A wanted release pushed past the window boundary is present in the listing,
+absent from the finite RSS response, and lands in `listing_only`. The full-disc
+URL never appears there — but it helped put something else there.
+
+**Two separate concerns, never to be conflated again:**
+
+| | Concern | Fixed by |
+|---|---|---|
+| **Population parity** | Listing and RSS apply the same policy | `#191` |
+| **Window sufficiency** | Feeds deep enough, or polling frequent enough, that wanted releases do not age out | **Not `#191`** |
+
+**`#191` cannot repair finite-window displacement.** Filtering full-disc out
+*after* the feed is fetched does not make HDEncode return the 51st entry. Any
+claim that it does is wrong, and this document does not make it.
 
 ### 1.2 "97 titles" was never supported by the measurement
 
@@ -92,13 +112,24 @@ current reliability rate.
 
 ## 2. Where I would add to the review, not dispute it
 
-**Adopt the rename gate wholesale.** ChatGPT's sequence — classify failures,
-prove no unexplained source loss, deterministic old-fail/new-pass tests, fault
-injection, copy-only rehearsal on the real storage surfaces, hash verification,
-then one sacrificial backed-up file — is materially safer than Jesse's
-"supervised manual run soon." Jesse's *intent* (a watched run, nothing
-unattended) is preserved; the gate in front of it is much stronger. I am
-flagging this as a change in substance so Jesse can object.
+**The rename gate is MANDATORY BY DEFAULT — reclassified in rev 2.1.** Rev 2
+framed it as a substance change Jesse might object to. Round 2 corrected that
+framing and I accept it: the gate is **a safety precondition to the supervised
+run Jesse already authorised**, not a new product decision and not an optional
+recommendation. His intent — one watched run, nothing unattended — is unchanged;
+the gate defines the minimum evidence required before that intent can be carried
+out safely.
+
+Default, not negotiable by me:
+- no real library file until the gate passes;
+- one sacrificial, backed-up file after it passes;
+- explicit stop conditions;
+- no unattended expansion.
+
+**Jesse as arbiter may explicitly waive any gate.** A waiver is recorded as
+deliberate risk acceptance naming the missing evidence and the possible
+consequence. **I will not offer a waiver as a peer alternative** merely because
+the original wording said "soon."
 
 **Fail-closed readiness is the more important half of §6.** Fixing the address
 without changing the grading behaviour would produce a gate that works today and
@@ -112,7 +143,130 @@ the scraper layer, not a documentary-specific check.
 
 ---
 
-## 3. Execution order (ChatGPT's phases, adopted)
+## 3. Execution order — rev 2.1: serial preservation, then parallel tracks
+
+RSS diagnosis and rename forensics are largely independent and are no longer
+expressed as one queue.
+
+### Serial first — preservation and precedence (blocks everything)
+
+1. Rename execution and real-file testing stay **frozen**.
+2. Snapshot the RSS shadow evidence as **one atomic bundle**: database copy
+   **plus WAL state**, qualification output, branch and commit, active
+   configuration, container image digest, service version, collection
+   timestamp, cycle range included, and a **checksum manifest**. Partial or
+   mutually uninterpretable snapshots are worthless.
+3. Repair the precedence chain. *(done in rev 2.1 — banners now at the top of
+   both superseded files, contradictory authority wording struck.)*
+
+**Do not delay step 2.** RSS evidence is time-dependent and degrades. After
+preservation, rename work carries the higher consequence and takes priority,
+because it can affect real files while RSS guards a metric and a future
+decision.
+
+### Track A — RSS evidence and qualification
+
+**A1. Unique-miss analysis.** Per distinct actionable missed canonical URL:
+title, media type, quality/category, actionable status, first and last miss
+timestamps, usable cycles missed, first provable RSS observation, recovery
+latency, whether it appeared in a normal feed, whether only in catch-up,
+whether canonicalisation differed, whether it remained in the listing after RSS
+acquired it, and final classification.
+
+**Preserve the existing three-state rule.** Still in `listing_only` = missing;
+later observed in `feed_only` = provably acquired; absent from both = **ambiguous,
+not resolved**. Disappearance is not resolution.
+
+**A2. Per-cycle metrics.** Normal and catch-up entry counts by feed, newest and
+oldest publication timestamp by feed, **observed feed depth in seconds**, poll
+gap since the previous usable cycle, **coverage margin = feed depth − poll gap**,
+listing counts by source, the three URL sets, **the count and proportion of
+full-disc entries in each upstream normal feed** (this measures §1.1's indirect
+path), HTTP/parser outcome, and cycle kind.
+
+**A3. Causal classification.** Every unique miss lands in exactly one bucket:
+publication lag · finite-window displacement · taxonomy omission · catch-up-only
+coverage · identity mismatch · parser/transport failure · persistent upstream
+omission · ambiguous with current evidence.
+
+**A4. Suitability is more than URL discovery.** RSS-primary also requires that
+candidates survive identity parsing, relevance classification, hydration,
+duplicate/library comparison and safe action preparation. A URL arriving
+eventually is insufficient if it cannot reach the same actionable decision the
+listing path produced.
+
+**A5. Predeclared promotion thresholds — written BEFORE the new window opens.**
+Zero RED persistent actionable misses; zero PENDING at closure; zero AMBIGUOUS
+at closure unless Jesse explicitly accepts the evidence limitation; no negative
+coverage margin at ordinary cadence, or a proven catch-up that closes it;
+accepted latency stated in hours; acceptable classification/hydration failure
+rate stated in advance; minimum usable cycles and wall-clock duration;
+restart-recovery evidence; and **no pass when application reconciliation is
+unavailable**. Without these written first, the analysis can describe data but
+cannot produce a disciplined verdict.
+
+**A6.** Collector networking repair (§1.3) and **fail-closed** readiness —
+both, or neither.
+
+**A7.** Population symmetry (`#191`), then a **fresh** qualification window.
+Pre-change and post-change cycles are never merged.
+
+`#191` acceptance: full-disc candidates cannot enter classification, hydration
+or actions; the exclusion is counted and observable; listing and RSS policy
+reasons use the same canonical identity; **the change does not claim to increase
+upstream feed depth**.
+
+### Track B — Rename safety
+
+**B1. Evidence-availability audit FIRST.** `rename_jobs` is a single mutable row
+per job, not an event ledger. Bucket only by fields actually retained or
+reliably reconstructable; mark everything else **unknown** rather than inferring
+it; document what cannot be recovered.
+
+*Probably recoverable:* current status, present path values, `move_method` where
+populated, current error category, collision category, timestamps, package
+grouping, and a weak same/cross-volume inference from current mappings.
+
+*Not honestly recoverable without another source:* commit range per job, attempt
+count, full transition history, definitive volume topology at failure time,
+post-failure filesystem state, historical hash integrity. Search retained logs,
+database backups and prior review artifacts for corroboration; **record the gap
+where none exists.**
+
+**B2.** Identify any currently reproducible failure path, commit-pinned.
+**B3.** Deterministic old-fail/new-pass tests plus fault injection around
+temporary copy, publication, source disposal, database commit, process crash,
+and restart recovery.
+**B4. Add a durable rename event ledger** before future testing: attempt UUID,
+job id, application version and commit, operation method, source and
+destination, filesystem/mount and volume identity, pre-operation existence/size/
+hash, each state transition, publication result, source-disposal result,
+database commit result, post-operation existence/size/hash, exception type and
+normalised error code, restart-recovery outcome.
+**B5.** Copy-only rehearsal on the real storage surfaces, hashes verified.
+**B6.** Restart and recovery invariants.
+**B7.** One sacrificial, backed-up real file — **only** after B1–B6 pass.
+
+### Track C — Security controls (independent; may run in parallel)
+
+Repository-wide, history-aware secret review explicitly covering **generated
+artifacts, deployment scripts, workflow files, and container/environment
+templates**; CI secret scanning on pushes and pull requests; a reviewed
+allowlist with comments and ownership; externalise and rotate the plaintext
+Gotify token; and **a documented response procedure for a true positive**.
+
+### Track D — Independent product work (no measured surface touched)
+
+TV resolution filter + 720p chip · surface the full-disc setting in the UI ·
+HDR10+ labels (`#185`) · documentary design pass · `#192` doc correction.
+Scraper structural-failure detection (`#184`-adjacent) belongs here and should
+be a property of the **scraper layer**, not a documentary-specific check: an
+unexpected template returning zero must raise an error, never a successful
+empty scan.
+
+---
+
+## 3b. Superseded serial phases (rev 2, retained for traceability)
 
 ### Phase 1 — Freeze and preserve
 1. Rename execution and real-file testing stay frozen.
@@ -187,19 +341,22 @@ design pass. None touch RSS evidence or rename safety. They can run in any gap.
 
 ---
 
-## 5. What review round 2 should attack
+## 5. What review round 3 should attack
 
-1. **Is §1.1 now stated correctly**, or have I over-corrected — is there any
-   path by which full-disc contaminates `listing_only` that neither of us has
-   considered?
-2. **Phase 2 step 7** — is the distinct-URL analysis list sufficient to
-   distinguish "RSS is fixable" from "RSS is structurally unsuitable"?
-3. **Phase 4** — is bucketing historical rename failures actually achievable
-   from the data retained, or am I promising an analysis the records cannot
-   support? If the commit range per job was never recorded, step 14 may be
-   undeliverable as written.
-4. **§2 first paragraph** — I strengthened Jesse's rename decision beyond what
-   he asked for. Is that the right call, or should the gate be presented to him
-   as a choice rather than folded in?
-5. **Phase ordering** — Phases 2 and 4 are independent. Should rename diagnosis
-   run first, given it guards real files while RSS guards only a metric?
+1. **§1.1's indirect path is now accepted but unmeasured.** A2 adds
+   "count and proportion of full-disc entries in each upstream normal feed" to
+   quantify it. Is that the right measurement, or does proving displacement
+   require reconstructing the feed window at each poll?
+2. **A5 thresholds.** Are "zero PENDING, zero AMBIGUOUS at closure" achievable
+   in practice, or so strict that no window can ever pass and the criterion
+   becomes theatre?
+3. **B1's honesty test.** I have committed to marking unrecoverable dimensions
+   as unknown. Is there a risk the surviving buckets are so thin that the
+   analysis cannot support *any* rename conclusion — and if so, does the event
+   ledger (B4) become a hard prerequisite rather than an improvement?
+4. **Track C/D parallelism.** I assert security and UI work touch no measured
+   surface. Is that true of the UI work, given it ships in the same image and a
+   deploy restarts the container mid-RSS-window?
+5. **The priority rule.** After preservation I put rename ahead of RSS on
+   consequence. Does that hold when RSS evidence continues to accumulate and
+   degrade while rename work is frozen anyway?
