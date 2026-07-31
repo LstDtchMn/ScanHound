@@ -222,3 +222,44 @@ remains live.
   fit — and to be revalidated over a clean window including a restart.
 - Bucket A being zero supports first-observation lag but proves nothing about
   feed-depth headroom.
+
+---
+
+# ADDENDUM 2 — the RED release diagnosed
+
+`https://hdencode.org/pallichattambi-2026-2160p-sonyliv-web-dl-dd5-1-atmos-h-265-cptn5dw-8-7-gb`
+
+| Check | Result |
+|---|---|
+| Alternate URL / identity variants in candidates | **0** |
+| Feed-membership rows in ANY feed | **0** |
+| Feeds that exist and could have carried it | `movies_all`, `movies_2160p` (12 feeds total) |
+
+Not an identity mismatch, not a catch-up-only acquisition, not a timing artifact.
+**HDEncode never placed this release in any RSS feed.** It appeared on the
+listing pages only.
+
+Classification: **persistent upstream omission** — ChatGPT's bucket 7, and the
+only true instance among the 100.
+
+## Why this matters for the gate design
+
+The proposed readiness criterion requires **zero RED**. This finding says zero
+RED may be **unachievable**: roughly 1 in 100 releases never enters the feeds at
+all, through no fault of ScanHound's polling, canonicalisation or coverage.
+
+That is a genuine product decision, not a bug to fix:
+
+- **Zero RED** means RSS-primary can never qualify while upstream omits anything.
+- **A small RED allowance** (e.g. "under 2% of actionable discoveries, none of
+  them a title the user bookmarked") makes qualification possible but concedes
+  that RSS-primary will silently miss the occasional release.
+- **A hybrid** — RSS for discovery, with a low-frequency listing sweep purely to
+  catch upstream omissions — keeps most of the ~89% request saving while closing
+  the gap. This is the option I would put in front of Jesse.
+
+Sample size caveat, stated plainly: **one release out of 100 is a 1% point
+estimate from a single 9.6-day window.** It establishes that upstream omission
+is non-zero. It does not establish the rate. A clean post-change window should
+measure it against the full actionable listing population before any threshold
+is fixed.
