@@ -144,3 +144,81 @@ before trusting a zero**.
 
 Nothing was built on the wrong finding. No code, no `#191`, no reprioritisation.
 The damage was confined to a document, which this replaces.
+
+---
+
+# ADDENDUM — round-4 review items resolved
+
+Two authorized items completed. Both corrected me further.
+
+## A. It is POLLING lag, not PUBLICATION lag
+
+The reviewer was right that `first_seen_at` is an ingestion timestamp and that I
+had assumed a publication mechanism without measuring it. Measured:
+
+```
+pub_date AFTER the miss  (upstream had not published) :  0
+pub_date BEFORE the miss (published, we had not polled): 99
+pub_date offset: min -1.1h   median -0.2h   max -0.0h
+```
+
+**HDEncode had already published all 99** — a median of roughly twelve minutes
+before the listing comparison ran. ScanHound then ingested them about an hour
+later.
+
+Corrected mechanism: **RSS observation/polling lag.** The upstream feed is not
+behind; our poll schedule is. This is a scheduling problem, materially more
+tractable than either coverage loss or upstream latency.
+
+Wording accepted throughout: "ScanHound had not yet observed the release through
+the qualified RSS feeds at the time of the listing comparison."
+
+## B. The unmatched release is RED, not noise
+
+```
+url        : tambi-2026-2160p-sonyliv-web-dl-dd5-1-atmos-h-265-cptn5dw-8-7-gb
+miss cycle : 2026-07-30T02:26:28Z
+snapshot   : 2026-07-31T21:09:38Z
+age at close: 42.7 hours  ->  RED (> 24h boundary)
+```
+
+I called this "1% noise." **Withdrawn.** At 42.7 hours it is nearly twice the red
+threshold with ample subsequent cycles — a genuine persistent miss requiring
+diagnosis, not a rounding error. The reviewer was right to refuse the framing.
+
+Lead worth following: it is a **SonyLIV 2160p** release, an unusual source. That
+is a taxonomy signal, and it is the one identity for which taxonomy omission
+remains live.
+
+## Wording corrections adopted
+
+- "This is not a coverage failure" -> the dominant cause of recorded misses is
+  bounded RSS **observation** lag; one identity remains RED pending diagnosis.
+- "RSS carries essentially everything" -> RSS acquired 99 of 100 normalized
+  actionable miss identities in this frozen window.
+- "Taxonomy is dead" -> not supported for the 99; **still live for the one**.
+- "Finite-window displacement is not supported" -> not the cause of the 99;
+  window sufficiency under outage and burst remains open for focused A2.
+- "1% noise" -> withdrawn entirely.
+
+## Still outstanding (authorized, not started)
+
+1. Feed attribution for the 99 via `hdencode_candidate_feeds` — which feed
+   acquired each, and whether any were catch-up-only.
+2. Focused A2: coverage margin, outage and burst resilience.
+3. Lag-aware readiness gate: pending / green / yellow / red / ambiguous state
+   model replacing `cumulative_misses > 0 => not ready`.
+4. Diagnose the RED release against raw feed evidence.
+5. Commit the read-only analysis script and canonicaliser for reproducibility —
+   the reviewer's point that two opposite conclusions came from the same
+   evidence, so prose is not sufficient.
+
+## Accepted without reservation
+
+- No per-grab listing confirmation is needed. My auto-grab concern was
+  unfounded; discovery lag does not create stale-absence action. Auto-grab keeps
+  its own separate safety gate and **remains off**.
+- 6h green / 24h red retained — predeclared before this result, so not a post-hoc
+  fit — and to be revalidated over a clean window including a restart.
+- Bucket A being zero supports first-observation lag but proves nothing about
+  feed-depth headroom.
