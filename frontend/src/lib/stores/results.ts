@@ -77,12 +77,33 @@ export const resolutionFilter = writable<string[]>([]);
 export function toggleResolutionFilter(key: string) {
   resolutionFilter.update((r) => (r.includes(key) ? r.filter((x) => x !== key) : [...r, key]));
 }
+/** UHD is spelled both '4K' and '2160p' in the catalogue and the chip is
+ *  labelled '4K', so an exact match hid every '2160p' item. Measured on the
+ *  production DB 2026-07-30: 242 of 395 4K movies (61%) were unreachable via
+ *  the 4K chip. filename_utils normalises 4k/uhd to '2160p' on parse, so the
+ *  unfilterable share was growing with every new release; 1080p was immune
+ *  only because parser and chip agree on that spelling.
+ *  Unknown spellings pass through unchanged so they stay filterable by their
+ *  own value rather than vanishing. Mirror of canonical_resolution() in
+ *  backend/api/routes/results.py — keep in sync. */
+const RES_CANONICAL: Record<string, string> = {
+  '2160p': '4K', '4k': '4K', uhd: '4K',
+  '1080p': '1080p', '1080i': '1080p',
+  '720p': '720p',
+  '480p': '480p'
+};
+export function canonicalResolution(res: string | null | undefined): string | null {
+  if (!res) return null;
+  return RES_CANONICAL[String(res).trim().toLowerCase()] ?? String(res);
+}
 /** The filter keys an item satisfies. A TV show keys ONLY as 'TV' (never by
  *  resolution) so the 4K/1080p filters are movies-only; a movie keys by its
- *  resolution. Matches backend _resolution_keys. */
+ *  CANONICAL resolution, so '2160p' and '4K' are one facet.
+ *  Matches backend _resolution_keys. */
 export function resolutionKeysFor(i: ScanResult): string[] {
   if (i.category === 'tv' || i.season != null) return ['TV'];
-  return i.resolution ? [i.resolution] : [];
+  const c = canonicalResolution(i.resolution);
+  return c ? [c] : [];
 }
 /** Date-range filter bounds, "YYYY-MM-DD" strings; '' means off. Session-only
  *  (not persisted), same as genre/language filters. Inclusive on both ends —
@@ -784,7 +805,12 @@ export const filteredResults = derived(
       items = items.filter((i) => resolutionKeysFor(i).some((k) => rset.has(k)));
     }
     // Quick-filter chips (AND-combined with the above)
-    if ($quick.includes('4k')) items = items.filter((i) => i.resolution === '4K');
+    // Same two-spelling bug as resolutionKeysFor: an exact match on '4K' against
+    // a field that also holds '2160p'. NOT routed through resolutionKeysFor —
+    // that folds TV to ['TV'], which would drop TV from the quick 4K chip that
+    // currently includes it. Same canonicalisation, different facet; mirrors the
+    // backend quick-filter branch in api/routes/results.py.
+    if ($quick.includes('4k')) items = items.filter((i) => canonicalResolution(i.resolution) === '4K');
     if ($quick.includes('hdrdv')) items = items.filter((i) => i.dovi || (!!i.hdr && i.hdr !== 'SDR'));
     if ($quick.includes('inplex')) items = items.filter(hasPlexCopy);
     // Read from the live bookmarkedTitles set, not the item's server-snapshotted
