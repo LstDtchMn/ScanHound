@@ -504,9 +504,35 @@ def _within(path: str, base: str) -> bool:
     inputs. Shared by the SPA static-file guard below and the path-confinement
     checks in backend/api/routes/rename.py (A3) — one containment rule for
     every "does this resolved path stay inside its allowed root" check.
+
+    SYMLINKS ARE RESOLVED FIRST (2026-07-31 security review). ``normpath`` is
+    purely lexical: it collapses ``..`` without touching the filesystem, so a
+    symlink sitting INSIDE ``base`` and pointing outside it satisfied the old
+    string rule and the file was served. Measured against this function with a
+    17-payload traversal corpus: 16 payloads were correctly contained —
+    including absolute ``/etc/passwd``, repeated ``../``, encoded forms, and
+    the sibling-prefix case — and the symlink was the single escape.
+
+    Exploiting it required the ability to create a symlink inside the served
+    root inside the container, which is baked into the image and written by no
+    user input, so this is defence in depth rather than a reachable hole. It is
+    fixed anyway because the containment rule is shared with the file-move
+    paths, where attacker-influenced names from Plex, JDownloader and scraped
+    metadata do reach the filesystem.
+
+    ``realpath`` is applied to BOTH sides: resolving only the candidate would
+    break every deployment whose root is itself reached through a symlink.
+    It does not raise for missing paths (it resolves as far as it can), which
+    matters because rename.py checks destinations before they exist.
     """
     import os as _os
-    return path == base or path.startswith(base + _os.sep)
+    try:
+        real_path = _os.path.realpath(path)
+        real_base = _os.path.realpath(base)
+    except (OSError, ValueError):
+        # Fail CLOSED: an unresolvable path is not proven to be contained.
+        return False
+    return real_path == real_base or real_path.startswith(real_base + _os.sep)
 
 
 def _teardown_services(reg: ServiceRegistry) -> None:
@@ -562,10 +588,34 @@ def create_app(
         logger.info("Shutting down ScanHound API")
         _teardown_services(registry)
 
+    # Interactive API docs are OFF unless explicitly switched on (2026-07-31
+    # security review). Measured before this change: an unauthenticated caller
+    # on the shared `proxy` Docker network got HTTP 200 from /openapi.json and
+    # /docs while every data route correctly returned 401. The schema is not
+    # secret in itself — the repository is public — but it hands anything that
+    # can reach the container a complete, current map of every route and
+    # parameter, which is exactly the reconnaissance step that precedes probing
+    # the routes that DO hold data. docker-compose.yml already records that
+    # every container on `proxy` can reach scanhound:9721 directly, bypassing
+    # NPM and Cloudflare Access, so "only reachable east-west" is not a
+    # mitigation here; it is the threat model.
+    #
+    # Opt-in rather than opt-out, and defaulting to closed, so a future
+    # deployment cannot expose the schema by forgetting to set something.
+    # Local import: this module does not import os at module scope (the other
+    # os users below do the same), and referencing a bare `os` here raises
+    # NameError at application startup rather than anywhere a test would look.
+    import os as _os_env
+    _docs_enabled = _os_env.environ.get("SCANHOUND_ENABLE_API_DOCS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
     app = FastAPI(
         title="ScanHound API",
         version=__version__,
         lifespan=lifespan,
+        docs_url="/docs" if _docs_enabled else None,
+        redoc_url="/redoc" if _docs_enabled else None,
+        openapi_url="/openapi.json" if _docs_enabled else None,
     )
 
     app.add_middleware(
