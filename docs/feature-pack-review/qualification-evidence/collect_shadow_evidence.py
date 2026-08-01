@@ -33,7 +33,18 @@ from pathlib import Path
 EVIDENCE = Path(__file__).resolve().parent
 SCRIPTS = Path(r"X:/Docker Apps/ScanHound/docs/feature-pack-review/qualification/scripts")
 TOKEN_FILE = EVIDENCE / "auth-token.txt"
-BASE_URL = "http://127.0.0.1:9721"
+# The evidence collector runs the app image via `docker run`, so 127.0.0.1
+# inside that ephemeral container is ITS OWN loopback — nothing listens there.
+# The scanhound container publishes no host port either (9721/tcp, unmapped), so
+# there is no host address that would have worked; publishing one would not have
+# fixed this. It must join the same Docker network and address the service by
+# name — the pattern notify() below already uses for Gotify.
+#
+# Verified 2026-08-01: `docker run --entrypoint python scanhound:latest` against
+# http://127.0.0.1:9721/health → URLError [Errno 111] Connection refused;
+# with --network proxy against http://scanhound:9721/health → HTTP 200.
+APP_NETWORK = "proxy"
+BASE_URL = "http://scanhound:9721"
 DB_VOLUME = "scanhound_scanhound_db"
 IMAGE = "scanhound:latest"
 LOG = EVIDENCE / "shadow-window.log"
@@ -96,6 +107,7 @@ def log_line(text):
 def main():
     cmd = [
         "docker", "run", "--rm",
+        "--network", APP_NETWORK,
         "-v", f"{DB_VOLUME}:/dbvol:ro",
         "-v", f"{SCRIPTS}:/scripts:ro",
         "-v", f"{EVIDENCE}:/out",
@@ -104,11 +116,14 @@ def main():
         "--db", "/dbvol/crawler.db",
         "--evidence-dir", "/out",
     ]
-    # Optional: reconcile against the app's own readiness report.
+    # Reconcile against the app's own readiness report. Requested whenever a
+    # token exists; once requested it is REQUIRED, not advisory — see below.
+    reconciliation_requested = False
     if TOKEN_FILE.is_file():
         token = TOKEN_FILE.read_text(encoding="utf-8").strip()
         if token:
             cmd += ["--base-url", BASE_URL, "--token", token]
+            reconciliation_requested = True
 
     p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT)
@@ -142,12 +157,47 @@ def main():
         f"cycles={cycles}/20 days={days:.2f}/7 misses={misses} recovery={recovery} "
         f"reduction={reduction}% feeds_healthy={feeds} integrity={integrity} ready={ready}"
     )
+    app = summary.get("app_readiness")
+    log_line(
+        "reconciliation: "
+        + ("not requested (no auth token)" if not reconciliation_requested
+           else f"error={app.get('error')}" if isinstance(app, dict) and app.get("error")
+           else f"ready_matches={app.get('ready_matches')}" if isinstance(app, dict)
+           else "no result")
+    )
+
+    # ── fail-closed reconciliation (design rev 2.1 §10) ──────────────────
+    # The DB-derived readiness and the app's own /rss/status readiness are two
+    # independent computations of the same thing. Once reconciliation is
+    # requested, a missing or disagreeing cross-check must BLOCK the gate.
+    #
+    # It was previously advisory: `app_readiness` was recorded and then never
+    # consulted, so `if ready:` could pass the gate on the DB computation alone.
+    # Combined with the broken container networking above, that cross-check had
+    # in fact NEVER succeeded — and nothing said so. An unverifiable pass is not
+    # a pass.
+    reconciliation_blockers = []
+    if reconciliation_requested:
+        if not isinstance(app, dict):
+            reconciliation_blockers.append(
+                "readiness reconciliation produced no result")
+        elif app.get("error"):
+            reconciliation_blockers.append(
+                f"readiness reconciliation failed: {app['error']}")
+        elif app.get("ready_matches") is False:
+            reconciliation_blockers.append(
+                "DB-derived readiness DISAGREES with the app's own /rss/status "
+                "readiness — one of the two is wrong")
+        elif app.get("ready_matches") is not True:
+            reconciliation_blockers.append(
+                "readiness reconciliation did not report a comparison")
 
     stop = []
     if misses:
         stop.append(f"RELEVANT RSS MISS x{misses}")
     if integrity != "ok":
         stop.append(f"DB INTEGRITY {integrity}")
+    stop.extend(reconciliation_blockers)
     safety = summary.get("safety") or {}
     for violation in safety.get("violations") or []:
         stop.append(str(violation))
