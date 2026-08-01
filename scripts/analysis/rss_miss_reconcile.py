@@ -158,9 +158,8 @@ def main() -> int:
         # warning and returned 0, so a caller could act on a non-authoritative
         # result. A warning is not a failure.
         if not args.allow_missing_attribution:
-            print("
-ABORT: hdencode_candidate_feeds is absent, so no claim about "
-                  "feed population is supported. Re-run with "
+            print("\nABORT: hdencode_candidate_feeds is absent, so no claim "
+                  "about feed population is supported. Re-run with "
                   "--allow-missing-attribution to produce a NON-AUTHORITATIVE "
                   "result.", file=sys.stderr)
             return 3
@@ -212,6 +211,7 @@ ABORT: hdencode_candidate_feeds is absent, so no claim about "
     newest_ts = _ts(newest)
 
     buckets: Counter = Counter()
+    normal_vs_global: list[float] = []
     feeds: Counter = Counter()
     lags: list[float] = []
     pub_offsets: list[float] = []
@@ -235,7 +235,15 @@ ABORT: hdencode_candidate_feeds is absent, so no claim about "
                                "age_hours": round(age, 1) if age else None, "state": state})
             continue
 
-        got_at = _ts(entry["first_seen"])
+        # The gate is defined around NORMAL-feed acquisition, so the headline
+        # latency must come from first_normal_at - not global candidate
+        # first_seen_at, which can reflect a catch-up feed. The design said this
+        # from rev 2; the code did not do it until now. Both are reported so the
+        # difference is visible rather than assumed to be zero.
+        global_at = _ts(entry["first_seen"])
+        got_at = entry.get("first_normal_at") or global_at
+        if global_at and got_at and global_at != got_at:
+            normal_vs_global.append(_hours(got_at, global_at))
         if not (miss_at and got_at):
             buckets["? untimed"] += 1
             continue
@@ -293,7 +301,16 @@ ABORT: hdencode_candidate_feeds is absent, so no claim about "
     for name in sorted(buckets):
         print(f"  {name:36} {buckets[name]:4d}")
 
-    print("\nACQUISITION LAG (hours after the miss)")
+    print("\nNORMAL-FEED vs GLOBAL ACQUISITION")
+    if normal_vs_global:
+        print(f"  {len(normal_vs_global)} identities where first-normal-feed "
+              f"membership differs from global first_seen "
+              f"(max {max(normal_vs_global):+.2f} h)")
+    else:
+        print("  none - first normal-feed membership equals global acquisition "
+              "for every identity, so the headline lag is unchanged by this fix")
+
+    print("\nACQUISITION LAG (from first NORMAL-feed membership, hours after the miss)")
     print(" ", stats(lags) or "none")
 
     print("\nPUBLICATION OFFSET (negative = feed already had it when we compared)")

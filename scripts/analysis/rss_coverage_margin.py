@@ -43,6 +43,10 @@ from collections import defaultdict
 
 NORMAL_FEEDS = ("movies_all", "tv_all")
 
+# Only these reset the successful-observation clock. Anything else - including
+# an outcome added later - fails closed and does NOT reset it.
+SUCCESS_OUTCOMES = {"changed", "not_modified", "304", "unchanged"}
+
 
 def _ts(value):
     if not value:
@@ -128,6 +132,7 @@ def main() -> int:
         rows = members[feed]
 
         depths, margins, gaps, per_cycle, recon_delta = [], [], [], [], []
+        spans, exact_only = [], []
         prev = None            # last SUCCESSFUL observation, not last attempt
         failures = 0
         for when, count, outcome, changed in cycles:
@@ -137,7 +142,9 @@ def main() -> int:
             # in the optimistic direction, on the analysis whose whole purpose
             # was to find pessimistic cases. A 304 does reset it: the server
             # confirmed the representation we already hold.
-            succeeded = (outcome or "").lower() != "failed"
+            # Explicit allowlist. `!= "failed"` would silently treat a future
+            # unknown outcome as a successful observation and reset the clock.
+            succeeded = (outcome or "").lower() in SUCCESS_OUTCOMES
             if not succeeded:
                 failures += 1
                 continue
@@ -146,11 +153,27 @@ def main() -> int:
             live = [p for a, b, p in rows if a <= when <= b]
             # Validate the reconstruction rather than trust it: a changed body
             # recorded N entries, so the reconstruction must produce N members.
+            mismatch = bool(changed and count and len(live) != count)
             if changed and count:
                 recon_delta.append(len(live) - count)
-            depth = ((max(live) - min(live)).total_seconds() / 3600.0
-                     if len(live) >= 2 else None)
-            margin = (depth - gap) if (depth is not None and gap is not None) else None
+            # BODY SPAN is newest-minus-oldest. OPERATIONAL HORIZON is how far
+            # back the body reaches FROM THE OBSERVATION, which is what actually
+            # protects against an outage. Since observation happens at or after
+            # the newest publication, horizon >= span, so the previously
+            # published margins were CONSERVATIVE - understated, not overstated.
+            span = ((max(live) - min(live)).total_seconds() / 3600.0
+                    if len(live) >= 2 else None)
+            horizon = ((when - min(live)).total_seconds() / 3600.0
+                       if live else None)
+            depth = horizon
+            if span is not None:
+                spans.append(span)
+            margin = (horizon - gap) if (horizon is not None and gap is not None) else None
+            # Mismatched bodies are recorded but kept OUT of the authoritative
+            # margin set: an overcount inflates the horizon, so a margin derived
+            # from one may be better than reality.
+            if margin is not None and not mismatch:
+                exact_only.append(margin)
             if depth is not None:
                 depths.append(depth)
             if gap is not None:
@@ -178,7 +201,10 @@ def main() -> int:
                          "p50": _pct(margins, .5), "p95": _pct(margins, .95)},
             "nonpositive_margin_cycles": len(nonpositive),
             "margin_at_longest_gap_h": at_worst,
-            "minimum_observed_feed_horizon_h": _pct(depths, 0),
+            "minimum_observed_coverage_horizon_h": _pct(depths, 0),
+            "body_span_h": {"min": _pct(spans, 0), "p50": _pct(spans, .5)},
+            "margin_exact_cycles_only_h": {"min": _pct(exact_only, 0),
+                                           "p5": _pct(exact_only, .05)},
             "failed_polls": failures,
             "reconstruction_exact_pct": (
                 round(100.0 * sum(1 for d in recon_delta if d == 0) / len(recon_delta), 1)
@@ -196,10 +222,15 @@ def main() -> int:
         print(f"  MARGIN min/p5/p50      : {m['min']} / {m['p5']} / {m['p50']} h")
         print(f"  cycles with margin <= 0: {len(nonpositive)}")
         print(f"  margin at longest gap  : {at_worst} h")
-        print(f"  min observed horizon   : {feed_report['minimum_observed_feed_horizon_h']} h "
+        print(f"  min coverage horizon   : {feed_report['minimum_observed_coverage_horizon_h']} h "
               f"(an OBSERVED feed horizon - NOT a guaranteed outage tolerance)")
         print(f"  failed polls excluded  : {failures}")
         print(f"  reconstruction exact   : {feed_report['reconstruction_exact_pct']}%")
+        eo = feed_report["margin_exact_cycles_only_h"]
+        print(f"  MARGIN, exact cycles   : min {eo['min']} / p5 {eo['p5']} h "
+              f"(mismatched cycles excluded)")
+        bs = feed_report["body_span_h"]
+        print(f"  body span (not horizon): min {bs['min']} / p50 {bs['p50']} h")
 
     # ── busiest publication burst, which sizes the sweep ───────────────────
     print("\nPUBLICATION BURST (sizes the hybrid sweep)")
