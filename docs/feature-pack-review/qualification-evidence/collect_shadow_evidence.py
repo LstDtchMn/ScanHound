@@ -54,11 +54,11 @@ LOG = EVIDENCE / "shadow-window.log"
 # DB read above). The app token is read at runtime from the WUD compose file
 # (an existing token under the admin account, which is the phone's account) --
 # no additional copy of the secret is written anywhere.
-# The qualification window boundary, read from the same file the app uses
-# so the collector and the app scope identically. Empty until a fresh
-# window is deliberately started; empty means BLOCKED, never "count
-# everything ever recorded".
-WINDOW_FILE = EVIDENCE / "window-start-at.txt"
+# NOTE: the qualification window boundary is NOT passed from here. It is
+# durable state in the database, which the evidence script reads directly.
+# Passing it as a flag or a file would reintroduce exactly the hazard the
+# boundary lock exists to prevent: an edit that silently moves the line
+# deciding which evidence counts.
 
 WUD_COMPOSE = Path(r"X:/Docker Apps/Whats up docker/docker-compose.yml")
 GOTIFY_URL = "http://gotify:80"
@@ -161,10 +161,6 @@ def main():
         "--db", "/dbvol/crawler.db",
         "--evidence-dir", "/out",
     ]
-    if WINDOW_FILE.is_file():
-        window = WINDOW_FILE.read_text(encoding="utf-8").strip()
-        if window:
-            cmd += ["--window-start-at", window]
     # Reconcile against the app's own readiness report. This is a PREREQUISITE
     # of qualification, not an enhancement: the whole value of the cross-check
     # is that it is independent of the DB-derived computation, so "no
@@ -226,9 +222,13 @@ def main():
     blockers = reconciliation_blockers(
         app, missing_credentials=missing_credentials, token_name=TOKEN_FILE.name)
 
+    # Alert text names WHICH category fired. A historical-evidence
+    # discrepancy or a row-level integrity fault must never read as a
+    # current-window RSS miss — they demand different responses, and the
+    # push notification is often all anyone sees.
     stop = []
     if misses:
-        stop.append(f"RELEVANT RSS MISS x{misses}")
+        stop.append(f"RELEVANT RSS MISS x{misses} IN THE CURRENT WINDOW")
     if integrity != "ok":
         stop.append(f"DB INTEGRITY {integrity}")
     stop.extend(blockers)

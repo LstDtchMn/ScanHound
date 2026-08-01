@@ -278,7 +278,9 @@ def test_readiness_requires_cycles_days_and_two_healthy_normal_feeds(tmp_path):
 
     # Scoped to a window covering this test's synthetic cycles: readiness
     # now fails closed when no qualification window has been started.
-    window = (now - timedelta(days=9)).isoformat()
+    # Durable safety state: start the window, do not just configure it.
+    window = db.start_qualification_window(
+        (now - timedelta(days=9)).isoformat())["window_start_at"]
     readiness = db.get_hdencode_rss_readiness(
         min_cycles=20,
         min_days=7,

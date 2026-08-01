@@ -125,7 +125,10 @@ def test_readiness_counts_comparisons_not_ingest_rows(tmp_path):
     # blocks rather than counting every cycle ever recorded. This test is
     # about comparison-vs-ingest accounting, so it scopes to a window that
     # covers its own synthetic cycles.
-    window = (now - timedelta(days=9)).isoformat()
+    # The boundary is durable safety state, so it must be STARTED, not merely
+    # supplied as configuration — configuration is only cross-checked.
+    window = db.start_qualification_window(
+        (now - timedelta(days=9)).isoformat())["window_start_at"]
     readiness = db.get_hdencode_rss_readiness(
         min_cycles=20, min_days=7, window_start_at=window)
     assert readiness["ready"] is True

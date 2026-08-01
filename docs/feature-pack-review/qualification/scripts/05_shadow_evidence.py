@@ -146,7 +146,28 @@ def main():
     # SQL. completed_at is TEXT with a +00:00 offset, so a "...Z" or
     # bare-date value would compare lexicographically against a
     # different shape and silently select the wrong rows.
+    # The boundary comes from DURABLE STATE in the database, not from a
+    # flag or a file. Reading it here keeps this implementation fully
+    # independent of the app's code while guaranteeing both scope to the
+    # SAME boundary — an operator cannot move the line by editing
+    # anything this script is handed. --window-start-at remains only as
+    # a test override.
     window_start = _normalize_window_start(a.window_start_at, now)
+    if not window_start:
+        try:
+            _probe = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                if _table_exists(_probe, "hdencode_qualification_window"):
+                    _row = _probe.execute(
+                        "SELECT window_start_at FROM hdencode_qualification_window "
+                        "WHERE superseded_at IS NULL ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                    if _row:
+                        window_start = _normalize_window_start(_row[0], now)
+            finally:
+                _probe.close()
+        except sqlite3.Error:
+            window_start = None      # fail closed
     window_scope = " AND completed_at >= ?" if window_start else ""
     window_params = (window_start,) if window_start else ()
 
@@ -295,6 +316,16 @@ def main():
     # now signals an unexpected/unauthorized schema change.
     if user_version != 8:
         reasons.append(f"unexpected_schema_version={user_version}")
+    # DATABASE INTEGRITY, not qualification evidence. This is deliberately
+    # unscoped: a per-cycle count that disagrees with its own miss rows is
+    # corruption wherever it occurs, and it stays globally blocking. It is
+    # NOT a current-window RSS miss, and the distinct reason code keeps the
+    # two from being read as the same thing.
+    #
+    # The three categories that must stay visibly separate:
+    #   relevant_misses_detected     current-window RSS miss -> qualification
+    #   historical_evidence_not_...  previous window          -> diagnostic only
+    #   shadow_miss_count_mismatch   row-level corruption     -> integrity
     if miss_count_mismatches:
         reasons.append("shadow_miss_count_mismatch")
     if auto_action_rows:
