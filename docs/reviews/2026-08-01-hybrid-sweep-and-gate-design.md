@@ -1,168 +1,209 @@
-# Hybrid sweep + lag-aware gate — design
+# Hybrid sweep + lag-aware gate — design rev 2
 
 **Date:** 2026-08-01 · **Author:** Claude · **Reviewer:** ChatGPT · **Arbiter:** Jesse
-**Closeout steps 4–6.** Design only — no code written, nothing deployed.
-**Supersedes** the fixed page-1 sweep, which the burst measurement disproved.
+**Closeout steps 4–6, revision 2.** Design only — no code, nothing deployed.
+**Rev 1 superseded**: it used per-identity `pending_sweep` (structurally
+impossible), a 1-hour overlap (unjustified), a page cap with no continuation
+(unrecoverable), and sized the sweep with a burst figure measured from the wrong
+dataset.
 
 ---
 
-## 1. Why the previous design failed
+## 1. Withdrawn from rev 1
 
-| Claim I published | Measured truth |
+| Rev 1 claim | Status |
 |---|---|
-| `tv_all` depth 9.8 h | **min 1.29 h** (p5 4.18, p50 10.86) |
-| margin +4.0 h, both safe | **min −0.95 h — two cycles negative** |
-| outage headroom 9.8 h | **1.29 h** |
-| page 1 sufficient at 6 h | busiest 6 h published **134 releases**; page 1 holds ~30 |
+| 134-item burst sizes the sweep | **Withdrawn.** Measured from `hdencode_candidates` — the RSS-ingested union. The sweep traverses *listing pages*. Wrong population. |
+| `pending_sweep` per identity | **Withdrawn.** An upstream omission is unknown until the sweep finds it, so no identity row exists to mark pending. |
+| 1-hour overlap | **Withdrawn.** Judgement, not measurement. Start at one full sweep interval. |
+| Page cap = incomplete, retry | **Insufficient.** Without continuation, a backlog larger than the cap restarts at page 1 forever. |
 
-The 9.8 h was one current snapshot standing in for a history. Page 1 is short by
-more than 4× against the observed peak — and a fixed page count fails *silently*,
-which is the same shape as the full-disc bug.
+The watermark architecture survives — it never depended on the burst number,
+which is exactly its advantage over a fixed depth.
 
-`movies_all` is materially healthier: min depth 4.81 h, min margin +2.74 h, zero
-negative cycles. **`tv_all` is the binding constraint** and carries 63% of misses.
-
----
-
-## 2. Watermark-based variable-depth sweep
-
-**Cadence:** every 6 hours (Jesse, unchanged — the cadence survived, the depth
-rule did not).
-
-Per listing source (4K Movies, Remux Movies, TV Packs):
-
-1. Read `last_successful_sweep_boundary` — the newest publication time proven
-   covered by a **completed** sweep.
-2. Crawl from page 1 forward.
-3. Stop when the crawler reaches items older than that boundary **minus a
-   safety overlap** (proposed: 1 h, to absorb out-of-order and backdated posts).
-4. Process every actionable item found.
-5. **Advance the watermark only after every required source crossed its
-   boundary.** Partial success advances nothing.
-6. On page cap, parser error, transport error or cancellation: mark the sweep
-   **incomplete**, keep the old watermark, alert, retry. Do **not** count it as
-   coverage.
-7. Record: pages crawled, oldest publication reached, boundary crossed y/n,
-   discoveries per source, RSS-missing items recovered, request count, duration,
-   failure reason.
-
-**Page cap is a circuit breaker, not a completion criterion.** Hitting it means
-*incomplete*, never *done*. Proposed cap 15 pages (~450 items, 3.4× the observed
-peak) purely to bound a runaway.
-
-**Cost profile:** page 1 only during quiet periods — which is almost always,
-since the crawl averages 3.5 new items per cycle. Depth is spent only when
-actually needed.
-
-### Why this is required rather than preferable
-
-A fixed page count is sized to the busiest window *observed in one 9.6-day
-sample*. The watermark is sized to **what actually happened since the last
-success**, so a burst, a late start, or a skipped run all self-correct. Nothing
-has to predict the peak.
+**Also corrected in the measurement scripts** (commit `573f3de`): failed polls no
+longer reset the observation gap; the reconstruction is validated against
+recorded entry counts; `outage_headroom` renamed to
+`minimum_observed_feed_horizon_h`; missing attribution now exits nonzero.
 
 ---
 
-## 3. TV polls more often than movies
+## 2. Measured basis
 
-**Jesse's decision, from the measurement.** `tv_all` is ~4× shallower than
-`movies_all` at the tail (1.29 h vs 4.81 h minimum) and produced the only two
-negative-margin cycles. Treating both feeds identically ignores a measured
-difference.
+| Feed | min depth | min margin | negative cycles | reconstruction exact |
+|---|---|---|---|---|
+| `movies_all` | 4.81 h | +2.74 h | 0 | 100.0% |
+| `tv_all` | **1.29 h** | **−0.95 h** | **2** | 98.8% |
 
-Proposed: **TV every 30 minutes, movies unchanged at ~1.2 h.**
+Saturation: 100% of changed HTTP-200 bodies held 50 persisted candidates
+(`movies_all` 171/171, `tv_all` 172/172).
 
-Rationale: halving the TV gap moves the worst observed margin from −0.95 h to
-roughly +0.25 h — the two negative cycles become non-negative. It does not create
-headroom for a long outage; that is the sweep's job.
-
-**Open — needs measurement, not assumption:** whether a 30-minute TV poll changes
-`tv_all`'s observed depth. If HDEncode regenerates on a timer, depth is
-independent of our polling. If it regenerates on write, more frequent polling
-sees shallower bodies and gains less than expected.
+`tv_all` is the binding constraint: shallowest, the only feed with negative
+margin, and it carries 63% of misses.
 
 ---
 
-## 4. Two state models, deliberately separate
+## 3. Sweep — watermark, variable depth
 
-Collapsing these was the original gate's mistake.
+**Cadence:** every 6 hours (Jesse).
 
-### 4.1 RSS acquisition state — measures the FEED
+### 3.1 Per-source durable state
 
-| State | Meaning |
-|---|---|
-| `pending` | listing saw it; accepted latency not yet elapsed |
-| `green` | acquired by a **normal** feed within 6 h |
-| `yellow` | acquired 6–24 h |
-| `red` | no normal-feed acquisition after 24 h |
-| `ambiguous` | evidence cannot establish identity or acquisition |
+Each listing source (4K Movies, Remux Movies, TV Packs) owns independent state:
+`coverage_through`, prior successful sweep id, last successful start/completion,
+oldest item reached, overlap used, continuation state, health.
 
-### 4.2 Hybrid coverage state — measures the PRODUCT
+One source failing degrades **overall hybrid health** but must not force healthy
+sources to re-crawl forever.
 
-| State | Meaning |
-|---|---|
-| `covered_by_rss` | RSS acquired it inside the band |
-| `covered_by_sweep` | the listing sweep recovered it |
-| `pending_sweep` | RSS missed it; next sweep not yet run |
-| `unresolved` | neither path has it and both have had their chance |
-| `ambiguous` | cannot be established |
+### 3.2 Boundary — defined by sweep START, not newest item
 
-**A RED RSS item recovered by a complete sweep is an RSS-health metric, not an
-uncovered release.** That distinction is the whole point of the hybrid: it lets
-RSS be imperfect without the product losing anything.
+For a source sweep started at `S`:
 
-Persist per identity: normalised URL, first/last miss time, miss cycle UUID,
-first acquiring feed, first acquisition time, resolution latency, terminal
-classification, **evidence version and canonicaliser version**.
+```
+stop target   = prior coverage_through − overlap
+on success    → coverage_through = S
+```
+
+Deriving the boundary from the newest item seen would let a quiet period ratchet
+coverage forward without evidence. `S` is what we can prove we looked at.
+
+Advance **only** when the prior target was crossed, every discovered identity was
+**durably persisted**, and the parser completed without structural uncertainty.
+Advance after durable candidate persistence — **not** after hydration or action.
+
+### 3.3 Overlap = one full sweep interval (6 h) initially
+
+Rev 1's 1 hour was invented. Six hours is deliberately generous; reduce only once
+measured disorder supports it.
+
+**Measure during qualification**, per source: `listing first_observed_at −
+displayed publication time`, and page-order inversions. Choose the overlap from
+the observed tail plus clock skew.
+
+**Stated limitation:** no finite overlap is safe against arbitrary backdating.
+Monitor that assumption rather than assume it away.
+
+### 3.4 Four stop signals, not one
+
+1. cross the timestamp boundary minus overlap
+2. cross a durable known-URL frontier
+3. one complete older page containing no unseen identities
+4. periodic deeper audit sweep for late insertions
+
+### 3.5 Page cap = circuit breaker WITH continuation
+
+Cap 15 pages per **attempt**, never a total recovery ceiling.
+
+On cap, persist continuation state — target boundary, oldest timestamp reached,
+anchor URL / crawl-session ledger, attempt count — then schedule a bounded
+continuation resuming with overlap. Escalate after a predeclared attempt count.
+Operator-authorised deep catch-up permitted.
+
+Without this, a backlog exceeding the cap can never be cleared.
+
+### 3.6 Bootstrap
+
+No prior watermark: crawl each source to **at least 24 h before qualification
+start**, persist every identity, fail **incomplete** if the cap is hit first, set
+`coverage_through = S` only on success.
 
 ---
 
-## 5. Promotion requirements
+## 4. TV polls more often — a qualification experiment
 
-- minimum clean cycles and wall-clock duration
-- **zero hybrid `unresolved`**
-- zero hybrid `ambiguous`
-- zero expired `pending_sweep`
-- all normal feeds healthy and fresh
-- every sweep in the window crossed its watermark
+**30 minutes for TV**, movies unchanged (~1.2 h). A *controlled qualification
+parameter*, not a proven configuration.
+
+Rev 1's claim that halving cadence moves the worst margin from −0.95 h to +0.25 h
+is a **counterfactual on the same observed body**, not an expected production
+result. Labelled as such.
+
+Measure: 200/304 ratio, acquisition-lag distribution, successful-observation gap,
+minimum observed feed horizon, denials and rate limits, coordinator contention,
+request cost.
+
+Failure or restart requires **adaptive immediate recovery** — not waiting out the
+next 30-minute tick.
+
+**Still open:** if HDEncode regenerates feeds on a timer rather than on write,
+faster polling only sees shallower bodies and gains nothing.
+
+---
+
+## 5. Three state models
+
+### 5.1 RSS acquisition state — measures the FEED
+
+`pending` (<6 h) · `green` (normal-feed acquisition ≤6 h) · `yellow` (6–24 h) ·
+`red` (no normal-feed acquisition after 24 h) · `ambiguous`
+
+Latency measured from **first normal-feed membership**, not global candidate
+`first_seen_at`, because the gate is defined around normal-feed acquisition.
+
+### 5.2 Identity coverage state — measures the PRODUCT
+
+`covered_by_rss` · `covered_by_sweep` · `rss_red_covered_by_sweep` ·
+`ambiguous_identity` · `processing_failed`
+
+A RED RSS item recovered by a complete sweep is an **RSS-health metric, not an
+uncovered release**. That distinction is the point of the hybrid.
+
+### 5.3 Source interval state — replaces `pending_sweep`
+
+Per source, not per identity, because an undiscovered release has no row:
+
+`current` · `due` · `running` · `incomplete` · `overdue` · `degraded` · `unknown`
+
+```
+due_at     = last successful coverage_through + 6 h
+overdue_at = due_at + 1 h execution grace
+```
+
+The 7-hour boundary is **aggregate source freshness**, not a per-identity timer.
+
+---
+
+## 6. Promotion requirements
+
+- every required source interval `current`; no `incomplete` or `overdue` sweep
+- all sweep discoveries durably entered into the candidate pipeline
+- no `ambiguous_identity`, no persistence failure
+- **no watermark advance after partial persistence**
 - restart recovery proven
-- **one induced outage or skipped poll, recovered**
-- request reduction still positive **after sweep cost**
+- one induced missed poll recovered
+- one induced incomplete sweep recovered
 - application/database reconciliation **fail-closed**
+- request-cost floor met (below)
 - auto-grab remains **off**
 
-Yellow is surfaced, never silently counted as green.
+---
+
+## 7. Request cost — floor predeclared, number measured
+
+Deferring the *measured* number is correct; deferring the *acceptance rule* was
+not. Predeclared now:
+
+- **baseline:** matched listing-only operation over the same window
+- **counted:** all HDEncode HTTP requests including retries and sweep continuations
+- **minimum:** ≥50% fewer requests than baseline
+- **target:** 70% reduction
+- **hard conditions:** no increase in missed actionable discoveries; no
+  coordinator or rate-limit breach
+
+Falling below 50% fails promotion regardless of coverage.
 
 ---
 
-## 6. Request cost — the honest position
+## 8. Open questions
 
-RSS-primary claimed ~89% request reduction. The sweep spends some back.
-
-Measured inputs: 172 normal-feed polls per feed over 9.6 days (~18/day each);
-the listing crawl early-stops at page 1 on most cycles.
-
-**I have not computed the net figure**, because it depends on the watermark's
-real behaviour — how often a sweep needs more than page 1 — and that cannot be
-derived from a window in which no sweep ran. It must be **measured during the
-qualification window**, not estimated now.
-
-Stating it as unknown rather than producing a plausible number, because a
-plausible number here would be exactly the kind of unverified figure that has
-gone wrong three times this session.
-
----
-
-## 7. What I want attacked
-
-1. **Is the 1-hour safety overlap right?** Chosen by judgement, not measurement.
-   Are backdated or out-of-order posts common enough on HDEncode to need more?
-2. **The 30-minute TV poll may gain nothing** if depth is independent of polling
-   frequency. Is there a way to establish that from retained evidence, or does it
-   need an experiment?
-3. **Is a 15-page circuit breaker sane** given the observed 134-item peak, or does
-   it risk masking a genuine runaway?
-4. **`pending_sweep` expiry** — I have not proposed a duration. Should it be the
-   sweep interval plus one, or absolute?
-5. **Is deferring the request-cost number defensible**, or should promotion
-   require a predeclared floor even if measured later?
+1. Is `coverage_through = S` right, or should it be the start of the *oldest page
+   fetched* to be conservative under long crawls?
+2. Stop signal 3 requires "one complete older page with no unseen identities" — on
+   a quiet source that is page 1 every time. Sufficient, or does it need a
+   minimum page floor?
+3. Should the 24-hour bootstrap be longer for TV given `tv_all`'s 1.29 h horizon?
+4. Is 7-hour `overdue_at` right when a failed attempt plus continuation could
+   plausibly exceed 1 h of grace?
+5. The listing-page burst still needs measuring from listing evidence. Block
+   implementation, or run alongside?
