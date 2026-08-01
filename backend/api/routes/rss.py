@@ -165,6 +165,7 @@ def _readiness(reg: ServiceRegistry) -> dict:
     return reg.db.get_hdencode_rss_readiness(
         min_cycles=config.get("hdencode_rss_shadow_min_cycles", 20),
         min_days=config.get("hdencode_rss_shadow_min_days", 7),
+        window_start_at=config.get("hdencode_rss_window_start_at") or None,
     )
 
 
