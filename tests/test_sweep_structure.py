@@ -71,24 +71,48 @@ class TestStructureLost:
         assert v.is_failure
 
 
-class TestVolumeAnomaly:
+class TestVolumeAnomalyIsDisabledUntilCalibrated:
+    """REGRESSION (review ruling). The 0.5 fraction was CHOSEN, not measured.
+    An invented constant must not be able to create a mandatory stop — or clear
+    one — before listing-volume evidence exists (§7)."""
+
+    def test_a_volume_collapse_does_NOT_fire_by_default(self):
+        assert judge(posts_found=3, expected_typical=25).structure is PageStructure.OK
+
+    def test_the_detector_still_works_when_explicitly_enabled(self):
+        v = judge(posts_found=3, expected_typical=25, volume_anomaly_enabled=True)
+        assert v.structure is PageStructure.VOLUME_ANOMALY
+        assert v.is_failure
+
+    def test_zero_post_detection_is_UNAFFECTED_by_the_switch(self):
+        """The categorical signal — 'this source always has posts and now has
+        none' — carries no invented threshold, so it stays on."""
+        v = judge(posts_found=0, selector_tier=None, expected_typical=25)
+        assert v.structure is PageStructure.STRUCTURE_LOST
+        assert v.is_failure
+
+
+class TestVolumeAnomalyWhenEnabled:
+    def _judge(self, **kw):
+        return judge(volume_anomaly_enabled=True, **kw)
+
     def test_a_collapse_in_volume_is_structural_not_a_quiet_day(self):
-        v = judge(posts_found=3, expected_typical=25)
+        v = self._judge(posts_found=3, expected_typical=25)
         assert v.structure is PageStructure.VOLUME_ANOMALY
         assert v.is_failure
 
     def test_a_normal_dip_is_not_flagged(self):
-        assert judge(posts_found=20, expected_typical=25).structure is PageStructure.OK
+        assert self._judge(posts_found=20, expected_typical=25).structure is PageStructure.OK
 
     def test_the_floor_is_exactly_half(self):
-        assert judge(posts_found=13, expected_typical=25).structure is PageStructure.OK
-        assert judge(posts_found=12, expected_typical=25).structure is \
+        assert self._judge(posts_found=13, expected_typical=25).structure is PageStructure.OK
+        assert self._judge(posts_found=12, expected_typical=25).structure is \
             PageStructure.VOLUME_ANOMALY
 
     def test_volume_anomaly_outranks_degraded(self):
         """A page that fell back to tier 2 AND collapsed in volume is a failure,
         not a warning — the worse fact governs."""
-        v = judge(posts_found=2, selector_tier=2, expected_typical=25)
+        v = self._judge(posts_found=2, selector_tier=2, expected_typical=25)
         assert v.structure is PageStructure.VOLUME_ANOMALY
 
 

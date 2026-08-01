@@ -60,6 +60,24 @@ class PostedTime:
         """The oldest the post could actually be, given rounding."""
         return self.absolute - dt.timedelta(seconds=self.granularity_seconds)
 
+    @property
+    def newest_possible(self) -> dt.datetime:
+        """The most recent the post could actually be.
+
+        Listing times round DOWN ("2 days ago" means an age in [2d, 3d)), so the
+        true publication time lies in ``(earliest_possible, absolute]`` and the
+        newest it can be is exactly the derived absolute.
+
+        THIS is the edge a completion proof must use. Asking whether the OLDEST
+        possible time crossed the target only establishes that the post MIGHT be
+        old enough; proving the sweep reached the target requires the whole
+        possible interval to be at or beyond it, which means the newest edge.
+        Using the oldest edge let a sweep complete — and advance
+        ``coverage_through`` — on an interval it had not actually traversed.
+        Caught in review.
+        """
+        return self.absolute
+
 
 def parse_posted(text: str, observed_at: dt.datetime) -> Optional[PostedTime]:
     """Parse a listing block's relative post time. None when absent/unparseable.
@@ -144,23 +162,26 @@ def evaluate_completion(
             + ", ".join(f"p{p.page_index}" for p in empty_mid[:3])
         )
 
-    # A: the timestamp boundary. Uses earliest_possible so a coarse reading is
-    # treated as the OLDEST it might be — refusing to claim we crossed a
-    # boundary we might not have.
+    # A: the timestamp boundary. Uses newest_possible — the LATEST the deepest
+    # observed post could be. Only when that edge is at or before the target is
+    # the ENTIRE possible interval past the boundary, which is what "we swept
+    # back this far" actually claims. The earlier edge would prove only that the
+    # post might be old enough, and a might is not a completion.
     timed = [p.oldest_posted for p in pages if p.oldest_posted is not None]
     if not timed:
         blocking.append("no page yielded a parseable post time")
     else:
-        oldest = min(timed, key=lambda t: t.earliest_possible)
-        if oldest.earliest_possible <= stop_target:
+        oldest = min(timed, key=lambda t: t.newest_possible)
+        if oldest.newest_possible <= stop_target:
             reasons.append(
-                f"timestamp target crossed (oldest {oldest.raw!r} "
-                f"→ ≤ {oldest.earliest_possible.isoformat(timespec='seconds')})"
+                f"timestamp target crossed (deepest post {oldest.raw!r} is at "
+                f"latest {oldest.newest_possible.isoformat(timespec='seconds')})"
             )
         else:
             blocking.append(
-                f"timestamp target NOT crossed (oldest {oldest.raw!r} still after "
-                f"{stop_target.isoformat(timespec='seconds')})"
+                f"timestamp target NOT crossed (deepest post {oldest.raw!r} could be "
+                f"as recent as {oldest.newest_possible.isoformat(timespec='seconds')}, "
+                f"after {stop_target.isoformat(timespec='seconds')})"
             )
 
     # B + C: a complete page, past page 1, containing nothing this SOURCE has not

@@ -48,12 +48,13 @@ class TestParsePosted:
         assert p.raw == "Posted 2 days ago"
         assert p.granularity_seconds == 86400
 
-    def test_earliest_possible_widens_by_granularity(self):
-        """A 'days'-granular reading could be 24h older than it appears. The
-        sweep must reason with the oldest it MIGHT be, never the midpoint."""
+    def test_the_reading_spans_an_interval_not_a_point(self):
+        """Listing times round DOWN, so '2 days ago' means an age in [2d, 3d):
+        the true publication time lies in (earliest_possible, absolute]."""
         p = posted("Posted 2 days ago")
         assert p.absolute == NOW - dt.timedelta(days=2)
         assert p.earliest_possible == NOW - dt.timedelta(days=3)
+        assert p.newest_possible == p.absolute
 
 
 # ─────────────────────────── conjunctive completion ────────────────────────
@@ -144,14 +145,41 @@ class TestCompletion:
         assert v.incomplete
         assert any("parseable post time" in b for b in v.blocking)
 
-    def test_coarse_granularity_does_not_over_claim_the_boundary(self):
-        """'2 days ago' against a 47-hour target: the midpoint would cross it,
-        but the earliest-possible reading refuses to claim that."""
-        target = NOW - dt.timedelta(hours=47)
+    def test_the_whole_possible_interval_must_be_past_the_target(self):
+        """REGRESSION (review blocker 2). A reading whose OLDEST edge crosses the
+        target but whose NEWEST edge does not proves only that the post MIGHT be
+        old enough — and a might is not a completion.
+
+        'Posted 2 days ago' means the true time is in (NOW-3d, NOW-2d]. Against a
+        2.5-day target, the oldest edge (NOW-3d) is past it but the newest edge
+        (NOW-2d) is not, so the post could genuinely be NOW-2.1d — inside the
+        interval we would be claiming to have swept. The old rule completed here
+        and advanced coverage_through over ground it had never traversed."""
+        page = PageOutcome(page_index=1, parsed_ok=True, posts_found=30,
+                           new_identities=0, oldest_posted=posted("Posted 2 days ago"))
+        target = NOW - dt.timedelta(days=2, hours=12)
+        v = evaluate_completion([page], stop_target=target,
+                                all_persisted=True, page_cap=15)
+        assert v.incomplete
+        assert any("could be as recent as" in b for b in v.blocking)
+
+    def test_it_completes_once_the_newest_edge_also_clears_the_target(self):
+        """The companion: push the target back past the newest edge and the same
+        reading now genuinely proves the crossing."""
+        page = PageOutcome(page_index=1, parsed_ok=True, posts_found=30,
+                           new_identities=0, oldest_posted=posted("Posted 2 days ago"))
+        v = evaluate_completion([page], stop_target=NOW - dt.timedelta(days=1, hours=12),
+                                all_persisted=True, page_cap=15)
+        assert v.complete, v.blocking
+
+    def test_a_fine_grained_reading_needs_no_extra_margin(self):
+        """Hour granularity: a 48-hour reading against a 47-hour target clears,
+        because the newest possible time is 48 h and that is already past."""
         v = evaluate_completion([_page(idx=1, new=0, age_hours=48),
                                  _page(idx=2, new=0, age_hours=48)],
-                                stop_target=target, all_persisted=True, page_cap=15)
-        assert v.complete  # 48h reading, earliest 49h, comfortably past 47h
+                                stop_target=NOW - dt.timedelta(hours=47),
+                                all_persisted=True, page_cap=15)
+        assert v.complete, v.blocking
 
     def test_no_pages_is_incomplete(self):
         v = evaluate_completion([], stop_target=TARGET, all_persisted=True, page_cap=15)

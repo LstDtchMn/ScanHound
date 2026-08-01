@@ -83,6 +83,29 @@ class TestLagAwareness:
         v = cls(published_at=hours(8), first_normal_at=None)
         assert v.rss_state is RssAcquisition.YELLOW
 
+    def test_YELLOW_without_first_normal_at_is_NOT_covered_by_rss(self):
+        """REGRESSION (review blocker 1). YELLOW is reached two different ways:
+        from a measured normal-feed latency, and from an item simply AGEING past
+        the band without being acquired at all. Coverage was keyed off the
+        colour, so the second kind was reported as 'acquired through the normal
+        feed' — a hidden miss that could pass a false promotion."""
+        v = cls(published_at=hours(8), first_normal_at=None, first_sweep_at=None)
+        assert v.rss_state is RssAcquisition.YELLOW
+        assert v.coverage_state is not IdentityCoverage.COVERED_BY_RSS
+        assert not v.is_covered
+        assert v.is_gap
+
+    def test_RED_without_first_normal_at_is_not_covered_either(self):
+        v = cls(published_at=hours(60), first_normal_at=None, first_sweep_at=None)
+        assert not v.is_covered and v.is_gap
+
+    def test_coverage_follows_the_observation_not_the_colour(self):
+        """Same colour, opposite coverage — the distinction the bug erased."""
+        acquired = cls(published_at=hours(30), first_normal_at=hours(20))
+        never = cls(published_at=hours(8), first_normal_at=None)
+        assert acquired.rss_state is never.rss_state is RssAcquisition.YELLOW
+        assert acquired.is_covered and not never.is_covered
+
     def test_the_real_track_a_shape_scores_green(self):
         """~1 h observation lag on a normal feed. This is what 99 of the 100
         'shadow misses' actually were, and it must not read as a problem."""
