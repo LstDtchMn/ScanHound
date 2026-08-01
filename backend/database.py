@@ -221,7 +221,7 @@ class DatabaseManager:
     # ── Schema initialization ────────────────────────────────────────
 
     # Schema version — increment when migrations are added.
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 9
 
     def init_db(self):
         """Initialize database tables and run schema migrations.
@@ -1170,6 +1170,92 @@ class DatabaseManager:
                     WHERE state IN (
                         'scheduled', 'ready', 'claimed', 'waiting_source',
                         'verification_required'
+                    )
+                """)
+
+                # ── Hybrid listing sweep (v9) ────────────────────────────
+                # Three tables, deliberately separate, because conflating them
+                # is what broke the earlier design:
+                #
+                #  listing_source_ledger  proves LISTING TRAVERSAL history.
+                #      A URL known only through RSS proves nothing about how
+                #      deep we crawled a listing source, so candidate storage
+                #      cannot serve as the known-URL frontier.
+                #  hdencode_sweep_sessions  one logical session per attempt
+                #      chain. `started_at` is preserved across continuation,
+                #      restart and lease reacquisition - it is what
+                #      coverage_through commits to, so resetting it would let a
+                #      long crawl claim coverage it never proved.
+                #  hdencode_source_coverage  the durable per-source watermark
+                #      plus lease. Advanced ONLY on conjunctive completion.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS listing_source_ledger (
+                        source_key TEXT NOT NULL,
+                        canonical_url TEXT NOT NULL,
+                        raw_url TEXT NOT NULL,
+                        canonicalizer_version TEXT NOT NULL,
+                        first_observed_at TEXT NOT NULL,
+                        last_observed_at TEXT NOT NULL,
+                        displayed_published_at TEXT,
+                        first_page_index INTEGER,
+                        last_page_index INTEGER,
+                        title_snapshot TEXT,
+                        status_snapshot TEXT,
+                        sweep_session_uuid TEXT,
+                        persisted INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (source_key, canonical_url)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_listing_ledger_recency
+                    ON listing_source_ledger(source_key, displayed_published_at)
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_sweep_sessions (
+                        sweep_session_uuid TEXT PRIMARY KEY,
+                        source_key TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        prior_coverage_through TEXT,
+                        overlap_hours REAL NOT NULL,
+                        stop_target TEXT,
+                        continuation_frontier_at TEXT,
+                        continuation_anchor_url TEXT,
+                        pages_crawled INTEGER NOT NULL DEFAULT 0,
+                        oldest_reached_at TEXT,
+                        attempt_count INTEGER NOT NULL DEFAULT 1,
+                        lease_owner TEXT,
+                        lease_expires_at TEXT,
+                        terminal_status TEXT,
+                        failure_reason TEXT,
+                        completed_at TEXT,
+                        discoveries INTEGER NOT NULL DEFAULT 0,
+                        rss_missing_recovered INTEGER NOT NULL DEFAULT 0,
+                        request_count INTEGER NOT NULL DEFAULT 0
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_sweep_sessions_source
+                    ON hdencode_sweep_sessions(source_key, started_at)
+                """)
+                # One ACTIVE session per source. A partial unique index is the
+                # enforcement, not a convention someone has to remember.
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_sweep_session_active
+                    ON hdencode_sweep_sessions(source_key)
+                    WHERE terminal_status IS NULL
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_source_coverage (
+                        source_key TEXT PRIMARY KEY,
+                        coverage_through TEXT,
+                        last_success_session_uuid TEXT,
+                        last_success_started_at TEXT,
+                        last_success_completed_at TEXT,
+                        last_attempt_at TEXT,
+                        bootstrap_complete INTEGER NOT NULL DEFAULT 0,
+                        interval_state TEXT NOT NULL DEFAULT 'unknown',
+                        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT
                     )
                 """)
 
