@@ -347,6 +347,7 @@ class HDEncodeActionService:
         readiness = self.db.get_hdencode_rss_readiness(
             min_cycles=self.config.get("hdencode_rss_shadow_min_cycles", 20),
             min_days=self.config.get("hdencode_rss_shadow_min_days", 7),
+            window_start_at=self.config.get("hdencode_rss_window_start_at") or None,
         )
         if not readiness.get("ready"):
             return []

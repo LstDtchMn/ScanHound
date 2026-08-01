@@ -2151,7 +2151,27 @@ class DatabaseManager:
             "unknown_counts":{key:int((unknown[key] if unknown else 0) or 0) for key in ("dv","hdr","identity","year_conflict")},
         }
 
-    def get_hdencode_shadow_summary(self):
+    def get_hdencode_shadow_summary(self, *, window_start_at=None):
+        """Aggregate shadow-cycle evidence, optionally scoped to one window.
+
+        ``window_start_at`` is an ISO timestamp; only cycles completed at or
+        after it count. Without it this aggregates EVERY row ever recorded,
+        which is what made "start a completely fresh qualification window"
+        impossible to satisfy: on 2026-08-01 the live table held 206 rows going
+        back to 07-22, so a freshly deployed build would have reported
+        observed_days=10.67 and successful_cycles=148 from pre-fix evidence,
+        while 101 pre-fix relevant misses blocked the gate permanently. Both
+        directions wrong at once.
+
+        The rule the plan repeats — never pool pre- and post-change cycles —
+        needs a mechanism, not just a policy. This is it. Old rows are kept, so
+        the previous window stays available for forensics; it simply stops
+        counting toward the current one.
+        """
+        scope, params = "", []
+        if window_start_at:
+            scope = " AND completed_at >= ?"
+            params = [str(window_start_at)]
         # Readiness evidence is derived only from structurally eligible cycles:
         # both normal feeds completed and both comparison sides made at least
         # one request.  Incomplete/degenerate rows must not stretch the
@@ -2167,18 +2187,20 @@ class DatabaseManager:
                WHERE outcome IN ('success','relevant_miss')
                  AND normal_feeds_complete=1
                  AND rss_requests>0
-                 AND listing_requests>0""",
-            one=True,default=None)
+                 AND listing_requests>0""" + scope,
+            tuple(params),one=True,default=None)
         # A relevant miss is a mandatory stop condition even when the cycle was
-        # otherwise incomplete, so miss accounting deliberately spans every row.
+        # otherwise incomplete, so miss accounting deliberately spans every row
+        # IN THE WINDOW — the eligibility filter above is deliberately not
+        # applied, but the window boundary is.
         misses=self._query(
             "SELECT SUM(relevant_miss_count) AS relevant_misses "
-            "FROM hdencode_shadow_cycles",
-            one=True,default=None)
+            "FROM hdencode_shadow_cycles WHERE 1=1" + scope,
+            tuple(params),one=True,default=None)
         latest=self._query(
-            "SELECT * FROM hdencode_shadow_cycles "
-            "ORDER BY completed_at DESC LIMIT 1",
-            one=True,default=None)
+            "SELECT * FROM hdencode_shadow_cycles WHERE 1=1" + scope +
+            " ORDER BY completed_at DESC LIMIT 1",
+            tuple(params),one=True,default=None)
         listing=int((eligible["listing_requests"] if eligible else 0) or 0)
         rss=int((eligible["rss_requests"] if eligible else 0) or 0)
         reduction=(100.0*(listing-rss)/listing) if listing>0 else 0.0
@@ -2192,10 +2214,13 @@ class DatabaseManager:
             "request_reduction_pct":round(reduction,2),
             "recovery_cycles":int((eligible["recovery_cycles"] if eligible else 0) or 0),
             "latest":dict(latest) if latest is not None else None,
+            "window_start_at":str(window_start_at) if window_start_at else None,
         }
 
-    def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180):
-        required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days)); summary=self.get_hdencode_shadow_summary()
+    def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180,
+                                   window_start_at=None):
+        required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days))
+        summary=self.get_hdencode_shadow_summary(window_start_at=window_start_at)
         first=summary.get("first_completed_at"); last=summary.get("last_completed_at"); observed_days=0.0
         try:
             first_dt=datetime.datetime.fromisoformat(first); last_dt=datetime.datetime.fromisoformat(last)
@@ -2221,7 +2246,12 @@ class DatabaseManager:
         if summary["request_reduction_pct"]<=0: reasons.append("request_reduction_not_proven")
         if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
         if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")
-        return {"ready":not reasons,"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
+        # FAIL-CLOSED. With no window boundary this aggregates every cycle ever
+        # recorded, so a freshly deployed build would inherit the previous
+        # window's duration and cycle count as if it had earned them. Absent
+        # scoping is not a reason to accept unscoped evidence.
+        if not window_start_at: reasons.append("qualification_window_not_started")
+        return {"ready":not reasons,"window_start_at":summary.get("window_start_at"),"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
 
     # ── HDEncode candidate actions ─────────────────────────────────────
 

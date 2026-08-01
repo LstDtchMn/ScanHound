@@ -276,9 +276,13 @@ def test_readiness_requires_cycles_days_and_two_healthy_normal_feeds(tmp_path):
                 ),
             )
 
+    # Scoped to a window covering this test's synthetic cycles: readiness
+    # now fails closed when no qualification window has been started.
+    window = (now - timedelta(days=9)).isoformat()
     readiness = db.get_hdencode_rss_readiness(
         min_cycles=20,
         min_days=7,
+        window_start_at=window,
     )
     assert readiness["ready"] is True
     assert readiness["normal_feeds_healthy"] is True
@@ -291,6 +295,7 @@ def test_readiness_requires_cycles_days_and_two_healthy_normal_feeds(tmp_path):
     readiness = db.get_hdencode_rss_readiness(
         min_cycles=20,
         min_days=7,
+        window_start_at=window,
     )
     assert readiness["ready"] is False
     assert "normal_feeds_unhealthy_or_stale" in readiness["reasons"]

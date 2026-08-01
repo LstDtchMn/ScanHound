@@ -101,6 +101,9 @@ class HDEncodeRSSService:
             min_days=self.config.get(
                 "hdencode_rss_shadow_min_days", 7
             ),
+            window_start_at=self.config.get(
+                "hdencode_rss_window_start_at"
+            ) or None,
         )
         if mode == "rss_primary" and not readiness["ready"]:
             cycle = {
@@ -403,6 +406,9 @@ class HDEncodeRSSService:
                 min_days=self.config.get(
                     "hdencode_rss_shadow_min_days", 7
                 ),
+                window_start_at=self.config.get(
+                    "hdencode_rss_window_start_at"
+                ) or None,
             ),
         }
 
