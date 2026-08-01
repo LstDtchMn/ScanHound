@@ -12,6 +12,10 @@ import threading
 import requests
 from bs4 import BeautifulSoup
 from backend.url_identity import canonicalize_listing_url
+from backend.release_policy import (  # noqa: F401  (re-exported for callers)
+    REASON_LISTING_FULL_DISC,
+    is_full_disc_title,
+)
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -159,23 +163,12 @@ def _res_rank(res) -> int:
 # The operator does not want 45-91 GB disc images, so they are excluded by
 # policy BEFORE any page is downloaded — recognised from the listing title,
 # which already carries the marker.
-
-#: Anchored, case-insensitive, and tolerant of whitespace inside the brackets.
-#: Deliberately NOT applied to the URL slug: the slug for "[BD]Sorority..." is
-#: "bdsorority...", so a substring test there would also match a genuine release
-#: whose title merely begins with those letters.
-_FULL_DISC_TITLE_RE = re.compile(r"^\s*\[\s*BD\s*\]", re.IGNORECASE)
-
-
-def is_full_disc_title(title: Optional[str]) -> bool:
-    """True when a listing title marks a full-disc release.
-
-    Matches only the bracketed ``[BD]`` prefix. ``BD Movie Title`` and
-    ``Some BDRip Movie`` are ordinary releases and must not match.
-    """
-    if not title:
-        return False
-    return bool(_FULL_DISC_TITLE_RE.match(title))
+#
+# The predicate itself lives in backend/release_policy.py because the RSS path
+# must apply the IDENTICAL rule. Two independently-written copies of one rule is
+# precisely how this codebase's two URL canonicalisers drifted (one stripped the
+# trailing slash, one appended it) and silently broke every join between them.
+# Re-exported here so existing callers keep working.
 
 
 # ── ScannerService ────────────────────────────────────────────────────
