@@ -13,7 +13,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { canonicalResolution, resolutionKeysFor } from './results';
-import type { ScanResult } from '$lib/types';
+import type { ScanResult } from '$lib/api/types';
 
 const movie = (resolution: string | null): ScanResult =>
   ({ url: 'u', title: 't', resolution } as unknown as ScanResult);
