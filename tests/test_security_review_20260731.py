@@ -42,17 +42,33 @@ def _client(monkeypatch, docs_env=None):
 class TestApiDocsExposure:
     @pytest.mark.parametrize("path", ["/openapi.json", "/docs", "/redoc"])
     def test_docs_are_not_served_by_default(self, monkeypatch, path):
-        """THE REGRESSION. Before the fix these returned 200 to an
-        unauthenticated caller. The SPA catch-all now answers instead, so the
-        schema is never emitted: assert on content type, not just status, since
-        the catch-all returns 200 with index.html for unknown paths."""
+        """THE REGRESSION. Before the fix these returned 200 with the API
+        schema to an unauthenticated caller.
+
+        The property is that the SCHEMA IS NEVER EMITTED — not what status or
+        content type carries the refusal. An earlier version of this test
+        asserted `application/json` was absent, reasoning that the SPA catch-all
+        would answer with index.html. That is a PROXY for the property and it
+        depends on the environment: with no built frontend the catch-all is not
+        mounted, the request 404s with `{"detail":"not found"}`, and the
+        assertion trips even though nothing leaked. CI has no frontend build, so
+        it failed there while passing locally.
+
+        Worse, the real checks below were gated behind `status_code == 200`, so
+        on the 404 path they never ran at all — the test could only fail for the
+        wrong reason and could never pass for the right one.
+
+        Assert the property directly, at any status."""
         with _client(monkeypatch) as c:
             r = c.get(path)
-            assert "application/json" not in r.headers.get("content-type", "") or path != "/openapi.json"
-            if r.status_code == 200:
-                body = r.text.lower()
-                assert '"openapi"' not in body, f"{path} still served the API schema"
-                assert "swagger-ui" not in body, f"{path} still served Swagger UI"
+            body = r.text.lower()
+            assert '"openapi"' not in body, f"{path} served the API schema"
+            assert "swagger-ui" not in body, f"{path} served Swagger UI"
+            assert "redoc" not in body or path != "/redoc", f"{path} served ReDoc"
+            assert r.status_code != 200 or "text/html" in r.headers.get(
+                "content-type", ""), (
+                f"{path} returned 200 with {r.headers.get('content-type')!r}; "
+                "only the SPA catch-all may answer these paths successfully")
 
     def test_docs_can_be_enabled_deliberately(self, monkeypatch):
         """The escape hatch must actually work, or someone will disable the
