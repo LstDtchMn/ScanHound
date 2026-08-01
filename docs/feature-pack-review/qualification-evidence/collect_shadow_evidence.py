@@ -104,6 +104,45 @@ def log_line(text):
         f.write(line + "\n")
 
 
+def reconciliation_blockers(app_readiness, *, missing_credentials,
+                            token_name="auth-token.txt"):
+    """Return the reasons the readiness cross-check must stop qualification.
+
+    Pure and importable so it can be tested directly rather than inferred from
+    the surrounding script — a gate whose only proof is a code read is the
+    situation that produced this defect in the first place.
+
+    The DB-derived readiness and the app's own /rss/status readiness are two
+    INDEPENDENT computations of the same thing. A missing, failed or disagreeing
+    cross-check blocks — unconditionally.
+
+    Two separate ways this used to fail open, both caught in review:
+      1. `app_readiness` was recorded and then never consulted, so `if ready:`
+         passed the gate on the DB computation alone. Combined with the broken
+         container networking, that cross-check had in fact NEVER succeeded —
+         and nothing said so.
+      2. The check was then made conditional on a token existing, so a missing
+         auth-token.txt silently downgraded the run to DB-only.
+
+    Independence is the entire value of the cross-check, so "we had no
+    credentials" is not a lesser failure than "the check disagreed". An
+    unverifiable pass is not a pass.
+    """
+    if missing_credentials:
+        return [f"NO AUTH TOKEN at {token_name} — the independent readiness "
+                "cross-check could not run; qualification requires it"]
+    if not isinstance(app_readiness, dict):
+        return ["readiness reconciliation produced no result"]
+    if app_readiness.get("error"):
+        return [f"readiness reconciliation failed: {app_readiness['error']}"]
+    if app_readiness.get("ready_matches") is False:
+        return ["DB-derived readiness DISAGREES with the app's own /rss/status "
+                "readiness — one of the two is wrong"]
+    if app_readiness.get("ready_matches") is not True:
+        return ["readiness reconciliation did not report a comparison"]
+    return []
+
+
 def main():
     cmd = [
         "docker", "run", "--rm",
@@ -172,47 +211,17 @@ def main():
            else "no result")
     )
 
-    # ── fail-closed reconciliation (design rev 2.1 §10) ──────────────────
-    # The DB-derived readiness and the app's own /rss/status readiness are two
-    # independent computations of the same thing. A missing, failed or
-    # disagreeing cross-check BLOCKS the gate — UNCONDITIONALLY.
-    #
-    # Two separate ways this used to fail open, both caught in review:
-    #   1. `app_readiness` was recorded and then never consulted, so `if ready:`
-    #      passed the gate on the DB computation alone. Combined with the broken
-    #      container networking above, that cross-check had in fact NEVER
-    #      succeeded — and nothing said so.
-    #   2. The check was then made conditional on a token existing, so a missing
-    #      auth-token.txt silently downgraded the run to DB-only.
-    #
-    # Independence is the entire value of the cross-check, so "we had no
-    # credentials" is not a lesser failure than "the check disagreed".
-    # An unverifiable pass is not a pass.
-    reconciliation_blockers = []
-    if missing_credentials:
-        reconciliation_blockers.append(
-            f"NO AUTH TOKEN at {TOKEN_FILE.name} — the independent readiness "
-            "cross-check could not run; qualification requires it")
-    elif not isinstance(app, dict):
-        reconciliation_blockers.append(
-            "readiness reconciliation produced no result")
-    elif app.get("error"):
-        reconciliation_blockers.append(
-            f"readiness reconciliation failed: {app['error']}")
-    elif app.get("ready_matches") is False:
-        reconciliation_blockers.append(
-            "DB-derived readiness DISAGREES with the app's own /rss/status "
-            "readiness — one of the two is wrong")
-    elif app.get("ready_matches") is not True:
-        reconciliation_blockers.append(
-            "readiness reconciliation did not report a comparison")
+    # Fail-closed reconciliation (design rev 2.1 §10) — see the function's
+    # docstring for the two ways this used to fail open.
+    blockers = reconciliation_blockers(
+        app, missing_credentials=missing_credentials, token_name=TOKEN_FILE.name)
 
     stop = []
     if misses:
         stop.append(f"RELEVANT RSS MISS x{misses}")
     if integrity != "ok":
         stop.append(f"DB INTEGRITY {integrity}")
-    stop.extend(reconciliation_blockers)
+    stop.extend(blockers)
     safety = summary.get("safety") or {}
     for violation in safety.get("violations") or []:
         stop.append(str(violation))
