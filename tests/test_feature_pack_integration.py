@@ -44,11 +44,25 @@ def test_new_lifespan_cancels_waiting_rss_before_transport_construction(
     coordinator.configure({"hdencode_enabled": True}, _HealthDb())
     coordinator._semaphores["rss"].acquire()
 
+    # Record WHICH THREAD constructed a client, not merely that one was
+    # constructed. `transport.cloudscraper` is process-global, so this patch is
+    # visible to every live thread — and tests/test_api_routes.py leaves the
+    # app's background threads running after its TestClient lifespan exits
+    # (background-scanner, jd-results-poller, download-queue and five more,
+    # confirmed with a thread-leak probe across 16 tests). One of those
+    # occasionally builds a client inside this window, which failed the global
+    # assertion in ~2 of 10 full-suite runs while the worker had correctly been
+    # cancelled and constructed nothing.
+    #
+    # The property under test is about THIS test's worker: a cancelled request
+    # must not construct a transport. A foreign thread's construction is
+    # unrelated to that property, so attributing constructions makes the test
+    # measure what it claims to.
     constructors = []
     monkeypatch.setattr(
         transport.cloudscraper,
         "create_scraper",
-        lambda: constructors.append("constructed") or object(),
+        lambda: constructors.append(threading.current_thread().name) or object(),
     )
     outcome = []
 
@@ -65,7 +79,8 @@ def test_new_lifespan_cancels_waiting_rss_before_transport_construction(
         except HDEncodeRequestCancelled:
             outcome.append("cancelled")
 
-    thread = threading.Thread(target=worker, daemon=True)
+    thread = threading.Thread(target=worker, daemon=True,
+                              name="rss-cancellation-worker")
     thread.start()
     time.sleep(0.03)
 
@@ -76,7 +91,8 @@ def test_new_lifespan_cancels_waiting_rss_before_transport_construction(
     thread.join(timeout=2)
 
     assert outcome == ["cancelled"]
-    assert constructors == []
+    assert thread.name not in constructors, (
+        f"the cancelled worker constructed a transport: {constructors}")
 
 
 class _Scanner:
