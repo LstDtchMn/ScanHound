@@ -16,6 +16,7 @@ from backend.release_policy import (  # noqa: F401  (re-exported for callers)
     REASON_LISTING_FULL_DISC,
     is_full_disc_title,
 )
+from backend.sweep.structure import select_with_tier
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -933,26 +934,44 @@ class ScannerService:
 
         return all_posts
 
-    @staticmethod
-    def _select_posts(soup, source_id: str):
-        """Select post link elements from a listing page based on source.
+    #: Ordered per source: index 0 is the primary selector, the rest are
+    #: fallbacks. Kept as data rather than an ``a or b or c`` chain so the
+    #: matching TIER is observable — see _select_posts_with_tier.
+    POST_SELECTORS = {
+        "ddlbase": [
+            'div.movie_title_list > a[href*="/post/"]',
+            'a[href*="/post/"]',
+        ],
+        "adithd": [
+            '.structItem-title a[href*="threads/"]',
+            '.contentRow-title a',
+            'a[href*="threads/"]',
+        ],
+        "hdencode": [
+            'div.data h5 a',
+            'div.data a',
+            'h2.entry-title a',
+            '.post-title a',
+            'article a[rel="bookmark"]',
+        ],
+    }
 
-        Each source uses different HTML structures; this method provides
-        multiple CSS selector fallbacks per source for resilience.
+    @classmethod
+    def _select_posts_with_tier(cls, soup, source_id: str):
+        """Select post links AND report which fallback tier matched.
+
+        The tier is the early-warning signal. An ``a or b or c`` chain silently
+        falls through when site markup drifts, so a breakage that has already
+        consumed two of three fallbacks looks identical to a healthy page — and
+        the eventual total failure arrives with no warning history at all.
         """
-        if source_id == "ddlbase":
-            return (soup.select('div.movie_title_list > a[href*="/post/"]') or
-                    soup.select('a[href*="/post/"]'))
-        elif source_id == "adithd":
-            return (soup.select('.structItem-title a[href*="threads/"]') or
-                    soup.select('.contentRow-title a') or
-                    soup.select('a[href*="threads/"]'))
-        else:
-            return (soup.select('div.data h5 a') or
-                    soup.select('div.data a') or
-                    soup.select('h2.entry-title a') or
-                    soup.select('.post-title a') or
-                    soup.select('article a[rel="bookmark"]'))
+        selectors = cls.POST_SELECTORS.get(source_id, cls.POST_SELECTORS["hdencode"])
+        return select_with_tier(soup, selectors)
+
+    @classmethod
+    def _select_posts(cls, soup, source_id: str):
+        """Select post link elements from a listing page based on source."""
+        return cls._select_posts_with_tier(soup, source_id)[0]
 
     # ── Post processing ───────────────────────────────────────────────
 
