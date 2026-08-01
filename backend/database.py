@@ -1245,6 +1245,39 @@ class DatabaseManager:
                     WHERE terminal_status IS NULL
                 """)
                 cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_qualification_window (
+                        -- The qualification window boundary as DURABLE SAFETY
+                        -- STATE, not operator configuration.
+                        --
+                        -- A runbook rule is not sufficient. Moving the boundary
+                        -- backward imports evidence produced by an earlier
+                        -- build; moving it forward can erase a relevant miss or
+                        -- restart the duration clock without declaring a new
+                        -- window; repeated edits destroy any proof of which
+                        -- evidence was actually reviewed. The zero-miss
+                        -- requirement can be defeated simply by sliding the
+                        -- boundary past an observed miss, which makes the
+                        -- boundary part of what the gate protects.
+                        --
+                        -- Correcting the value BEFORE any cycle has accumulated
+                        -- inside it is legitimate setup. Once one cycle exists
+                        -- at or after it, it LOCKS. Starting another window is
+                        -- an explicit action that SUPERSEDES this row rather
+                        -- than overwriting it, so the sequence stays auditable.
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        window_start_at TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        build_ref TEXT,
+                        operator_note TEXT,
+                        previous_window_start_at TEXT,
+                        superseded_at TEXT
+                    )
+                """)
+                cursor.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_qual_window_active "
+                    "ON hdencode_qualification_window(superseded_at) "
+                    "WHERE superseded_at IS NULL")
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS hdencode_source_coverage (
                         source_key TEXT PRIMARY KEY,
                         coverage_through TEXT,
@@ -2217,6 +2250,87 @@ class DatabaseManager:
             "window_start_at":str(window_start_at) if window_start_at else None,
         }
 
+    # ── qualification window (durable safety state) ─────────────────────
+    def get_active_qualification_window(self):
+        """The persisted boundary, or None if no window has been started.
+
+        This — not configuration — is the authority. Configuration is compared
+        against it and a mismatch blocks, so editing a file cannot silently move
+        the line that decides which evidence counts.
+        """
+        row = self._query(
+            "SELECT * FROM hdencode_qualification_window "
+            "WHERE superseded_at IS NULL ORDER BY id DESC LIMIT 1",
+            one=True, default=None)
+        return dict(row) if row is not None else None
+
+    def count_cycles_in_window(self, window_start_at):
+        """Cycles recorded at or after a boundary — what makes it immutable."""
+        row = self._query(
+            "SELECT COUNT(*) AS n FROM hdencode_shadow_cycles WHERE completed_at >= ?",
+            (str(window_start_at),), one=True, default=None)
+        return int(row["n"]) if row else 0
+
+    def start_qualification_window(self, window_start_at, *, build_ref=None,
+                                   operator_note=None, supersede=False):
+        """Persist a qualification boundary. Returns the stored row.
+
+        Raises ValueError when the boundary is unusable, or when changing it
+        would rewrite history:
+
+        * an existing window with NO cycles inside it may be corrected freely —
+          that is setup, not revision;
+        * once ONE cycle exists at or after it, the boundary is locked and only
+          an explicit ``supersede=True`` may start a new window, which records
+          the previous boundary rather than overwriting it.
+        """
+        normalized = self.normalize_window_start(window_start_at)
+        if not normalized:
+            raise ValueError(
+                f"unusable qualification window boundary: {window_start_at!r} "
+                "(must be a parseable, non-future ISO timestamp)")
+
+        active = self.get_active_qualification_window()
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        if active:
+            if active["window_start_at"] == normalized:
+                return active
+            accumulated = self.count_cycles_in_window(active["window_start_at"])
+            if accumulated and not supersede:
+                raise ValueError(
+                    f"qualification window is LOCKED: {accumulated} cycle(s) have "
+                    f"accumulated since {active['window_start_at']}. Moving the "
+                    "boundary now would rewrite which evidence the gate reviewed. "
+                    "Start a new window explicitly (supersede=True) if that is "
+                    "the intent.")
+            if accumulated:
+                with self.transaction() as conn:
+                    if not conn:
+                        raise RuntimeError("Database unavailable")
+                    conn.execute(
+                        "UPDATE hdencode_qualification_window SET superseded_at=? "
+                        "WHERE id=?", (now, active["id"]))
+            else:
+                # No evidence yet — correct the boundary in place.
+                with self.transaction() as conn:
+                    if not conn:
+                        raise RuntimeError("Database unavailable")
+                    conn.execute(
+                        "DELETE FROM hdencode_qualification_window WHERE id=?",
+                        (active["id"],))
+
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            conn.execute(
+                "INSERT INTO hdencode_qualification_window "
+                "(window_start_at, created_at, build_ref, operator_note, "
+                " previous_window_start_at) VALUES (?,?,?,?,?)",
+                (normalized, now, build_ref, operator_note,
+                 active["window_start_at"] if active else None))
+        return self.get_active_qualification_window()
+
     @staticmethod
     def normalize_window_start(value):
         """Parse and normalise a window boundary, or return None if unusable.
@@ -2249,7 +2363,37 @@ class DatabaseManager:
     def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180,
                                    window_start_at=None):
         required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days))
-        window_start_at = self.normalize_window_start(window_start_at)
+        # The PERSISTED boundary is the authority; `window_start_at` is what
+        # configuration currently claims. They must agree exactly. Without this
+        # the zero-miss requirement could be defeated by editing a file to slide
+        # the boundary past an observed miss.
+        active = self.get_active_qualification_window()
+        configured = self.normalize_window_start(window_start_at)
+        boundary_changed = False
+        if active:
+            if configured and configured != active["window_start_at"]:
+                boundary_changed = True
+            elif not configured:
+                # Configuration cleared while a window is live — treat as a
+                # change, not as "fall back to the persisted value".
+                boundary_changed = True
+        window_start_at = active["window_start_at"] if active else None
+        if window_start_at and boundary_changed:
+            summary = self.get_hdencode_shadow_summary(window_start_at=window_start_at)
+            return {
+                "ready": False, "window_start_at": window_start_at,
+                "required_cycles": required_cycles,
+                "successful_cycles": summary["successful_cycles"],
+                "required_days": required_days, "observed_days": 0.0,
+                "normal_feeds_healthy": False,
+                "relevant_misses": summary["relevant_misses"],
+                "request_reduction_pct": summary["request_reduction_pct"],
+                "recovery_cycles": summary["recovery_cycles"],
+                "first_completed_at": summary["first_completed_at"],
+                "last_completed_at": summary["last_completed_at"],
+                "reasons": ["qualification_window_boundary_changed"],
+                "configured_window_start_at": configured,
+            }
         if not window_start_at:
             # NO WINDOW: return an EMPTY current-window summary.
             #
