@@ -660,6 +660,46 @@ class DatabaseManager:
                 # stored so the fallback unique index doesn't need SQLite
                 # expression-index support across all deployed versions.
                 cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS fileop_events (
+                        -- Append-only ledger of file-operation INTENT and
+                        -- OUTCOME. Safety gate step 2.
+                        --
+                        -- rename_jobs records the CURRENT STATE of a job, so it
+                        -- cannot answer "what was in flight when the process
+                        -- died?" — the row simply sits in whatever status it
+                        -- last held. This table can: an `intent` row with no
+                        -- matching `outcome` row IS an interrupted operation,
+                        -- and that is the only durable trace of the window
+                        -- where a file may have been moved without a record.
+                        --
+                        -- Rows are NEVER updated. An outcome is a second row
+                        -- referencing the intent's event_uuid, so a bug in the
+                        -- outcome path can never destroy the record of intent.
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_uuid TEXT NOT NULL,
+                        kind TEXT NOT NULL,          -- 'intent' | 'outcome'
+                        recorded_at TEXT NOT NULL,
+                        job_id INTEGER,
+                        operation TEXT NOT NULL,     -- place | trash | restore | undo
+                        method TEXT,                 -- move|copy|hardlink|symlink
+                        src_path TEXT,
+                        dst_path TEXT,
+                        -- outcome-only columns; NULL on intent rows
+                        succeeded INTEGER,
+                        cause TEXT,
+                        disk_outcome TEXT,
+                        bytes_written INTEGER,
+                        duration_ms INTEGER,
+                        detail TEXT
+                    )
+                ''')
+                cursor.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_fileop_events_uuid '
+                    'ON fileop_events(event_uuid)')
+                cursor.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_fileop_events_kind_time '
+                    'ON fileop_events(kind, recorded_at)')
+                cursor.execute('''
                     CREATE TABLE IF NOT EXISTS bookmarks (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         imdb_id TEXT,
