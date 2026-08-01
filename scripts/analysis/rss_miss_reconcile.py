@@ -40,6 +40,11 @@ from urllib.parse import urlsplit, urlunsplit
 GREEN_HOURS = 6
 RED_HOURS = 24
 
+# The feeds RSS-primary would actually run on. Catch-up//sub-feeds are useful
+# for recovery but are NOT the production discovery population, so an identity
+# acquired only by them does not prove normal-feed coverage.
+NORMAL_FEEDS = {"movies_all", "tv_all"}
+
 
 def canonical(url: str | None) -> str | None:
     """The single identity function. Both sides of every comparison use this.
@@ -59,10 +64,26 @@ def canonical(url: str | None) -> str | None:
 
 
 def _ts(value: str | None) -> dt.datetime | None:
-    try:
-        return dt.datetime.fromisoformat((value or "")[:19])
-    except (ValueError, TypeError):
+    """Parse a FULL ISO timestamp and normalise to naive UTC.
+
+    An earlier version truncated to 19 characters, silently discarding the
+    timezone offset and fractional seconds. Every timestamp in this dataset
+    happens to be UTC, so the answers were right — but a tool whose entire
+    purpose is reproducibility must not depend on that. One non-UTC row would
+    have shifted a lag by hours with nothing raised.
+    """
+    if not value:
         return None
+    text = str(value).strip()
+    for candidate in (text, text.replace("Z", "+00:00")):
+        try:
+            parsed = dt.datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        return parsed
+    return None
 
 
 def _hours(a: dt.datetime, b: dt.datetime) -> float:
@@ -106,23 +127,61 @@ def main() -> int:
             continue
         prior = acquired.get(key)
         if prior is None or (first_seen or "") < (prior["first_seen"] or ""):
-            acquired[key] = {"first_seen": first_seen, "pub_date": pub_date, "feeds": set()}
+            acquired[key] = {
+                "first_seen": first_seen, "pub_date": pub_date, "feeds": set(),
+                "first_feed_at": None, "first_feeds": set(), "first_normal_at": None,
+            }
 
-    # Feed attribution. hdencode_candidate_feeds keys by canonical_url, NOT by
-    # a candidate id - and it stores the trailing-slash form, so it must go
-    # through canonical() like everything else. An earlier version joined on a
-    # nonexistent candidate_id, caught the OperationalError, and reported every
-    # release as "unattributed": degrading quietly instead of lying, but still
-    # wrong. Absent on older schemas; degrade rather than invent a source.
+    # Feed attribution. Two prior versions of this block were wrong:
+    #   v1 joined on a nonexistent candidate_id, swallowed the OperationalError,
+    #      and reported every release "unattributed" — degrading quietly.
+    #   v2 collected every feed EVER associated with a candidate, ignoring
+    #      first_seen_at. That is an ever-observed SET, not a first acquirer, so
+    #      it could not distinguish "a normal feed acquired it" from "catch-up
+    #      acquired it and a normal feed saw it later". The published conclusion
+    #      happened to be right; the method could not have shown it.
+    # Now: order by membership first_seen_at and record the EARLIEST acquirer,
+    # keeping ties (two feeds carrying it in the same ingest).
+    attribution_available = True
     try:
-        for feed_key, url in conn.execute(
-            "SELECT feed_key, canonical_url FROM hdencode_candidate_feeds"
-        ):
-            key = canonical(url)
-            if key in acquired:
-                acquired[key]["feeds"].add(feed_key)
+        rows = list(conn.execute(
+            "SELECT feed_key, canonical_url, first_seen_at "
+            "FROM hdencode_candidate_feeds"
+        ))
     except sqlite3.OperationalError:
-        pass
+        rows = []
+        attribution_available = False
+
+    for feed_key, url, seen_at in rows:
+        key = canonical(url)
+        entry = acquired.get(key)
+        if entry is None:
+            continue
+        when = _ts(seen_at)
+        best = entry.get("first_feed_at")
+        if when is None:
+            continue
+        if best is None or when < best:
+            entry["first_feed_at"] = when
+            entry["first_feeds"] = {feed_key}
+        elif when == best:
+            entry["first_feeds"].add(feed_key)
+        if feed_key in NORMAL_FEEDS:
+            prior = entry.get("first_normal_at")
+            if prior is None or when < prior:
+                entry["first_normal_at"] = when
+        entry["feeds"].add(feed_key)
+
+    # COLLISION AUDIT. canonical() lowercases the whole path, so two materially
+    # different releases could fold onto one key and be silently treated as the
+    # same identity - which would understate misses. Report it rather than
+    # assume the site is case-insensitive.
+    raw_by_key: dict[str, set] = {}
+    for (url,) in conn.execute(
+        "SELECT canonical_url FROM hdencode_candidates WHERE canonical_url IS NOT NULL"
+    ):
+        raw_by_key.setdefault(canonical(url), set()).add(url.rstrip("/"))
+    collisions = {k: v for k, v in raw_by_key.items() if len(v) > 1}
 
     controls = positive_controls(conn, acquired)
     print("POSITIVE CONTROLS")
@@ -182,7 +241,17 @@ def main() -> int:
         if published:
             pub_offsets.append(_hours(published, miss_at))
 
-        feeds[",".join(sorted(entry["feeds"])) or "unattributed"] += 1
+        # Classify by FIRST acquirer, not by ever-observed membership.
+        if not attribution_available:
+            feeds["attribution unavailable"] += 1
+        elif not entry["first_feeds"]:
+            feeds["no membership row"] += 1
+        elif entry["first_feeds"] & NORMAL_FEEDS:
+            feeds["first acquired by NORMAL feed"] += 1
+        elif entry.get("first_normal_at") is not None:
+            feeds["catch-up first, normal feed later"] += 1
+        else:
+            feeds["CATCH-UP ONLY: " + ",".join(sorted(entry["first_feeds"]))] += 1
 
     def stats(values: list[float]) -> dict:
         if not values:
@@ -192,6 +261,20 @@ def main() -> int:
                 "median": round(s[len(s) // 2], 2), "max": round(s[-1], 2),
                 f"within_{GREEN_HOURS}h": sum(1 for v in s if v <= GREEN_HOURS),
                 f"over_{RED_HOURS}h": sum(1 for v in s if v > RED_HOURS)}
+
+    print("\nCOLLISION AUDIT (one canonical key <- multiple raw URLs)")
+    if collisions:
+        print(f"  {len(collisions)} collision(s) - identities may be merged:")
+        for key, raws in list(collisions.items())[:5]:
+            print(f"    {key[-58:]}")
+            for raw in sorted(raws)[:3]:
+                print(f"       <- {raw[-58:]}")
+    else:
+        print("  none - canonicalisation is injective over this dataset")
+
+    if not attribution_available:
+        print("\n*** FEED ATTRIBUTION UNAVAILABLE - hdencode_candidate_feeds is "
+              "absent. No claim about feed population is supported. ***")
 
     print(f"\nCLASSIFICATION (n={len(misses)})")
     for name in sorted(buckets):
@@ -222,6 +305,8 @@ def main() -> int:
                 "publication_offset_hours": stats(pub_offsets),
                 "first_acquiring_feed": dict(feeds),
                 "unresolved": unresolved,
+                "attribution_available": attribution_available,
+                "canonical_collisions": len(collisions),
                 "thresholds": {"green_hours": GREEN_HOURS, "red_hours": RED_HOURS},
             }, handle, indent=2)
         print(f"\nwrote {args.json}")
