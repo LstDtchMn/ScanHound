@@ -208,6 +208,54 @@ class SweepSessionStore:
             )
         }
 
+    # ── health ──────────────────────────────────────────────────────────
+    def health(self, source_key: str, *, now: Optional[dt.datetime] = None):
+        """Live interval health for one source. Always computed, never read from
+        the cached `interval_state` column — a stale cached label is exactly the
+        failure mode §6 is guarding against."""
+        from backend.sweep.health import evaluate_source_health
+
+        now = now or _now()
+        cov = self.conn.execute(
+            "SELECT source_key, coverage_through, consecutive_failures "
+            "FROM hdencode_source_coverage WHERE source_key=?", (source_key,)
+        ).fetchone()
+        live = self.conn.execute(
+            "SELECT source_key, lease_expires_at FROM hdencode_sweep_sessions "
+            "WHERE source_key=? AND terminal_status IS NULL", (source_key,)
+        ).fetchone()
+        return evaluate_source_health(
+            dict(zip(("source_key", "coverage_through", "consecutive_failures"), cov))
+            if cov else None,
+            now=now,
+            live_session=dict(zip(("source_key", "lease_expires_at"), live)) if live else None,
+        )
+
+    def all_health(self, source_keys, *, now: Optional[dt.datetime] = None) -> dict:
+        """Health for every source we care about, including ones with no row yet
+        — an absent source is `unknown`, not absent from the report."""
+        now = now or _now()
+        return {key: self.health(key, now=now) for key in source_keys}
+
+    def refresh_interval_states(self, source_keys, *,
+                                now: Optional[dt.datetime] = None) -> dict:
+        """Persist the computed labels into `interval_state` for cheap reads.
+
+        The cache is written from the live computation and never the other way
+        round, so it can lag but cannot invent a healthier state than the facts.
+        """
+        states = self.all_health(source_keys, now=now)
+        now_iso = _iso(now or _now())
+        for key, h in states.items():
+            self.conn.execute(
+                "INSERT INTO hdencode_source_coverage (source_key, interval_state, updated_at) "
+                "VALUES (?,?,?) ON CONFLICT(source_key) DO UPDATE SET "
+                "  interval_state=excluded.interval_state, updated_at=excluded.updated_at",
+                (key, h.state.value, now_iso),
+            )
+        self.conn.commit()
+        return states
+
     # ── terminal states ─────────────────────────────────────────────────
     def commit_success(self, session: SweepSession, *, discoveries: int = 0,
                        requests: int = 0, now: Optional[dt.datetime] = None) -> None:
