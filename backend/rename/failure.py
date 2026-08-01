@@ -1,28 +1,30 @@
-"""Bounded failure classification for file placement — safety-gate step 1.
+"""Disk-state classification for file placement — safety-gate step 1 (rev 2).
 
-Today every apply failure collapses into one free-text ``error_message``
-column. That is enough to show a human a string and nothing else: you cannot
-count it, alert on it, or — the part that matters here — answer the only
-question a file-safety gate actually asks.
+Every apply failure used to collapse into one free-text ``error_message``. You
+cannot count that, alert on it, or answer the only question a file-safety gate
+asks: **what is the state of the files on disk now?**
 
-**What is the state of the files on disk after this failure?**
+REV 2 CORRECTS A DESIGN ERROR IN REV 1. That version named disk state as its
+primary axis but *inferred* it from exception type, errno and bytes written.
+That cannot be sound. A ``FileNotFoundError`` does not prove "source intact,
+destination untouched" — it may have come from a later cleanup step, a sidecar,
+a parent directory, or a source that vanished during a race. ``bytes_written ==
+0`` does not prove nothing changed: a rename, hardlink, trash move or metadata
+write may already have happened.
 
-That, not the cause, is the primary axis. "Permission denied" tells you nothing
-about whether a file was lost; "the destination now holds a half-written copy"
-tells you everything, regardless of which errno produced it. So every failure
-gets classified twice: a bounded ``Cause`` for counting and alerting, and a
-``DiskOutcome`` for deciding what is safe to do next.
+So classification now CONSUMES OBSERVED FACTS. The caller looks at the
+filesystem and reports what it saw; this module decides what that means. Cause
+is still derived from the exception, because a cause is a useful thing to count
+— but it no longer determines safety.
 
-FAIL-CLOSED, and this is the whole point of the module: an unrecognised failure
-classifies as ``UNKNOWN``, which is treated as the WORST case — not retry-safe
-and operator-required. A gate that assumes an unclassified error was harmless
-is how a silent loss gets retried into a louder one. Every widening of the
-bounded set must be a deliberate edit here, with a test.
+Two axes, deliberately independent:
 
-Nothing in this module performs I/O or touches the filesystem; it reasons about
-an exception that already happened. That keeps the rules testable without
-staging a real data-loss scenario, which is exactly the property the sweep's
-completion.py had when its tests caught a bug a code read had missed.
+    Cause         why it failed         — for counting and alerting
+    DiskOutcome   what is on disk now   — for deciding what is safe next
+
+FAIL-CLOSED: every observed fact defaults to ``None`` meaning "not established",
+and an incomplete observation yields ``UNKNOWN``, the worst case. "We did not
+look" must never read as "nothing happened".
 """
 from __future__ import annotations
 
@@ -33,10 +35,10 @@ from typing import Optional
 
 
 class Phase(str, Enum):
-    """Where in the apply the failure happened. Changes what is at risk."""
-    PREFLIGHT = "preflight"                    # before anything was touched
-    PLACEMENT = "placement"                    # inside place_file()
-    POST_PLACEMENT_RECORD = "post_placement_record"  # file placed, DB write failed
+    """Where in the apply the failure happened."""
+    PREFLIGHT = "preflight"
+    PLACEMENT = "placement"
+    POST_PLACEMENT_RECORD = "post_placement_record"
 
 
 class Cause(str, Enum):
@@ -56,23 +58,115 @@ class Cause(str, Enum):
 
 
 class DiskOutcome(str, Enum):
-    """What the filesystem looks like now. The safety-relevant axis."""
-    #: Source intact, destination untouched. The only genuinely clean failure.
-    NO_OP = "no_op"
-    #: A partial or unverified destination may exist and needs cleaning up.
-    DEST_PARTIAL = "dest_partial"
-    #: The file WAS placed but the record says otherwise — disk and DB disagree.
-    MOVED_UNRECORDED = "moved_unrecorded"
-    #: An overwrite trashed the previous occupant and the incoming file then
-    #: failed to land (the SH-H09 window). Something must be restored.
-    PRIOR_OCCUPANT_TRASHED = "prior_occupant_trashed"
+    """What the filesystem looks like now, from observation.
+
+    Source presence and destination completeness are represented independently.
+    Conflating them is what hid two very different states in rev 1: a DUPLICATE
+    (both exist, verified) and a LOSS (neither is usable).
+    """
+    #: Source present, destination absent. The only genuinely clean failure.
+    UNCHANGED = "unchanged"
+    #: A partial or unverified destination beside an intact source. Cleanable
+    #: mechanically: remove the partial, retry.
+    DEST_PARTIAL_SOURCE_PRESENT = "dest_partial_source_present"
+    #: Both exist, destination verified complete. A copy finished but the source
+    #: was not consumed — a cross-device move that never cleaned up, or a failed
+    #: source deletion. Not partial and not lost: DUPLICATED and unfinalised.
+    DEST_COMPLETE_SOURCE_PRESENT = "dest_complete_source_present"
+    #: The placement genuinely completed on disk. Dangerous only if the record
+    #: disagrees.
+    DEST_COMPLETE_SOURCE_ABSENT = "dest_complete_source_absent"
+    #: THE CATASTROPHIC STATE. The original is gone and no verified complete
+    #: replacement exists. Named separately so it can never disappear into
+    #: UNKNOWN — it demands a distinct emergency recovery path.
+    SOURCE_ABSENT_DEST_UNUSABLE = "source_absent_dest_unusable"
+    #: An overwrite displaced whatever held the destination and the incoming
+    #: file did not land. Something must be restored.
+    PRIOR_OCCUPANT_DISPLACED = "prior_occupant_displaced"
     #: We cannot tell. Treated as the worst case, never as harmless.
     UNKNOWN = "unknown"
 
 
-#: Only a proven no-op may be retried without human involvement. Everything
-#: else either needs cleanup first or has left disk and records disagreeing.
-RETRY_SAFE_OUTCOMES = frozenset({DiskOutcome.NO_OP})
+#: Only a proven no-op may be retried without human involvement.
+RETRY_SAFE_OUTCOMES = frozenset({DiskOutcome.UNCHANGED})
+
+#: A partial destination beside an intact source can be cleaned up mechanically.
+AUTO_CLEANABLE_OUTCOMES = frozenset({DiskOutcome.DEST_PARTIAL_SOURCE_PRESENT})
+
+#: States where a human must look before anything else touches these paths.
+OPERATOR_REQUIRED_OUTCOMES = frozenset({
+    DiskOutcome.SOURCE_ABSENT_DEST_UNUSABLE,
+    DiskOutcome.PRIOR_OCCUPANT_DISPLACED,
+    DiskOutcome.DEST_COMPLETE_SOURCE_PRESENT,
+    DiskOutcome.UNKNOWN,
+})
+
+
+@dataclass(frozen=True)
+class DiskObservation:
+    """Facts the caller established by LOOKING at the filesystem.
+
+    Every field defaults to None meaning "not established". None is not False:
+    an unchecked destination is not an absent one, and that difference decides
+    whether a state is clean or catastrophic.
+    """
+    source_present: Optional[bool] = None
+    destination_present: Optional[bool] = None
+    #: Verified complete — size and/or hash checked, not merely existing.
+    destination_complete: Optional[bool] = None
+    #: The destination path still holds the file that was there BEFORE this
+    #: operation.
+    destination_is_prior_occupant: Optional[bool] = None
+    prior_occupant_trashed: bool = False
+    prior_occupant_restored: bool = False
+    temp_path_present: Optional[bool] = None
+    method: Optional[str] = None
+    last_confirmed_phase: Optional[Phase] = None
+
+    @property
+    def is_complete(self) -> bool:
+        """True when the facts needed for a confident verdict were established.
+
+        A destination that is absent needs no completeness check; one that is
+        present does.
+        """
+        if self.source_present is None or self.destination_present is None:
+            return False
+        if self.destination_present and self.destination_complete is None:
+            return False
+        return True
+
+
+@dataclass(frozen=True)
+class FailureVerdict:
+    cause: Cause
+    disk_outcome: DiskOutcome
+    phase: Phase
+    detail: str
+    errno_value: Optional[int] = None
+    observation: Optional[DiskObservation] = None
+
+    @property
+    def retry_safe(self) -> bool:
+        return self.disk_outcome in RETRY_SAFE_OUTCOMES
+
+    @property
+    def auto_cleanable(self) -> bool:
+        return self.disk_outcome in AUTO_CLEANABLE_OUTCOMES
+
+    @property
+    def requires_operator(self) -> bool:
+        return self.disk_outcome in OPERATOR_REQUIRED_OUTCOMES
+
+    @property
+    def is_catastrophic(self) -> bool:
+        """The original is gone with no verified replacement."""
+        return self.disk_outcome is DiskOutcome.SOURCE_ABSENT_DEST_UNUSABLE
+
+    @property
+    def is_classified(self) -> bool:
+        return self.cause is not Cause.UNCLASSIFIED
+
 
 _ERRNO_CAUSE = {
     errno.ENOENT: Cause.SOURCE_MISSING,
@@ -91,127 +185,14 @@ _ERRNO_CAUSE = {
     getattr(errno, "EOPNOTSUPP", errno.ENOTSUP): Cause.UNSUPPORTED_FILESYSTEM,
 }
 
-#: Causes that prove nothing was written to the destination. place_file()
-#: refuses to overwrite and raises BEFORE publishing, and a missing source or a
-#: rejected filesystem is detected before any bytes move.
-_NO_OP_CAUSES = frozenset({
-    Cause.SOURCE_MISSING,
-    Cause.DESTINATION_EXISTS,
-    Cause.UNSUPPORTED_FILESYSTEM,
-})
 
-
-@dataclass(frozen=True)
-class FailureVerdict:
-    cause: Cause
-    disk_outcome: DiskOutcome
-    phase: Phase
-    detail: str
-    errno_value: Optional[int] = None
-
-    @property
-    def retry_safe(self) -> bool:
-        """True only when the filesystem is provably unchanged."""
-        return self.disk_outcome in RETRY_SAFE_OUTCOMES
-
-    @property
-    def requires_operator(self) -> bool:
-        """True when a human must look before anything else touches these paths."""
-        return self.disk_outcome in (
-            DiskOutcome.MOVED_UNRECORDED,
-            DiskOutcome.PRIOR_OCCUPANT_TRASHED,
-            DiskOutcome.UNKNOWN,
-        )
-
-    @property
-    def is_classified(self) -> bool:
-        return self.cause is not Cause.UNCLASSIFIED
-
-
-def classify_failure(
-    exc: BaseException,
-    *,
-    phase: Phase = Phase.PLACEMENT,
-    prior_occupant_trashed: bool = False,
-    bytes_written: Optional[int] = None,
-) -> FailureVerdict:
-    """Classify one apply failure.
-
-    `prior_occupant_trashed` says an overwrite already trashed whatever held the
-    destination. That fact OUTRANKS the cause: however the placement failed,
-    the destination the library expects is now empty, so the outcome is
-    PRIOR_OCCUPANT_TRASHED and a human decides.
-
-    `bytes_written` distinguishes a copy that never started from one that died
-    partway. None means unknown, which is not treated as zero.
-    """
-    cause, errno_value = _cause_of(exc)
-
-    if phase is Phase.POST_PLACEMENT_RECORD:
-        # The file is where it should be and the database disagrees. Retrying
-        # would place it a second time; doing nothing leaves a job stuck. Both
-        # are wrong without a human, and neither is safe to guess.
-        return FailureVerdict(
-            cause=Cause.DB_WRITE_FAILED if cause is Cause.UNCLASSIFIED else cause,
-            disk_outcome=DiskOutcome.MOVED_UNRECORDED, phase=phase,
-            detail=("the file was placed but the record was not written — "
-                    "disk and database disagree"),
-            errno_value=errno_value,
-        )
-
-    if prior_occupant_trashed:
-        return FailureVerdict(
-            cause=cause, disk_outcome=DiskOutcome.PRIOR_OCCUPANT_TRASHED,
-            phase=phase,
-            detail=("an overwrite trashed the previous occupant and the incoming "
-                    f"file then failed to land ({_describe(exc)})"),
-            errno_value=errno_value,
-        )
-
-    if cause is Cause.UNCLASSIFIED:
-        # THE FAIL-CLOSED RULE. We do not know what this error did, so we do not
-        # get to assume it did nothing.
-        return FailureVerdict(
-            cause=cause, disk_outcome=DiskOutcome.UNKNOWN, phase=phase,
-            detail=(f"unrecognised failure ({_describe(exc)}) — treated as the "
-                    "worst case until classified"),
-            errno_value=errno_value,
-        )
-
-    if phase is Phase.PREFLIGHT or cause in _NO_OP_CAUSES:
-        return FailureVerdict(
-            cause=cause, disk_outcome=DiskOutcome.NO_OP, phase=phase,
-            detail=f"nothing was written ({_describe(exc)})",
-            errno_value=errno_value,
-        )
-
-    if bytes_written == 0:
-        return FailureVerdict(
-            cause=cause, disk_outcome=DiskOutcome.NO_OP, phase=phase,
-            detail=f"the copy never began ({_describe(exc)})",
-            errno_value=errno_value,
-        )
-
-    # A recognised failure during placement with bytes written, or an unknown
-    # amount written. Either way a partial destination may exist.
-    return FailureVerdict(
-        cause=cause, disk_outcome=DiskOutcome.DEST_PARTIAL, phase=phase,
-        detail=(f"placement failed after writing "
-                f"{'an unknown number of' if bytes_written is None else bytes_written} "
-                f"bytes ({_describe(exc)}) — the destination may hold a partial file"),
-        errno_value=errno_value,
-    )
-
-
-def _cause_of(exc: BaseException):
-    """Map an exception to a bounded cause, preferring errno over type."""
-    # UnsupportedFilesystemSafetyError subclasses OSError and carries ENOTSUP,
-    # so the errno table below already covers it without importing fileops.
+def classify_cause(exc: Optional[BaseException]):
+    """Map an exception to a bounded cause. METRICS ONLY — never safety."""
+    if exc is None:
+        return Cause.UNCLASSIFIED, None
     raw = getattr(exc, "errno", None)
     if isinstance(raw, int) and raw in _ERRNO_CAUSE:
         return _ERRNO_CAUSE[raw], raw
-
-    # Type fallbacks for exceptions raised without an errno.
     if isinstance(exc, FileExistsError):
         return Cause.DESTINATION_EXISTS, raw
     if isinstance(exc, FileNotFoundError):
@@ -223,6 +204,83 @@ def _cause_of(exc: BaseException):
     return Cause.UNCLASSIFIED, raw if isinstance(raw, int) else None
 
 
-def _describe(exc: BaseException) -> str:
+def classify_failure(
+    exc: Optional[BaseException],
+    observation: Optional[DiskObservation] = None,
+    *,
+    phase: Phase = Phase.PLACEMENT,
+) -> FailureVerdict:
+    """Classify one apply failure from OBSERVED disk state.
+
+    `observation` is what the caller saw when it looked. Without it, or with it
+    incomplete, the verdict is UNKNOWN — because rev 1's mistake was deciding
+    that certain exceptions imply an untouched filesystem, and they do not.
+    """
+    cause, errno_value = classify_cause(exc)
+    obs = observation or DiskObservation()
+
+    if phase is Phase.POST_PLACEMENT_RECORD:
+        # The file is where it should be and the database disagrees. Retrying
+        # would place it twice; doing nothing strands the job. Neither is
+        # guessable, and it is only a known state if we actually looked.
+        outcome = (DiskOutcome.DEST_COMPLETE_SOURCE_ABSENT
+                   if obs.destination_complete and obs.source_present is False
+                   else DiskOutcome.UNKNOWN)
+        return FailureVerdict(
+            cause=Cause.DB_WRITE_FAILED if cause is Cause.UNCLASSIFIED else cause,
+            disk_outcome=outcome, phase=phase,
+            detail=("the file was placed but the record was not written — "
+                    "disk and database disagree"),
+            errno_value=errno_value, observation=obs)
+
+    # An overwrite that displaced the previous occupant outranks everything:
+    # however the placement failed, the file the library expects is no longer
+    # where it expects it.
+    if obs.prior_occupant_trashed and not obs.prior_occupant_restored:
+        return _verdict(cause, DiskOutcome.PRIOR_OCCUPANT_DISPLACED, phase, obs,
+                        errno_value,
+                        "an overwrite displaced the previous occupant and the "
+                        f"incoming file did not land ({_describe(exc)})")
+
+    if not obs.is_complete:
+        return _verdict(cause, DiskOutcome.UNKNOWN, phase, obs, errno_value,
+                        "disk state was not established, so no safe conclusion "
+                        f"is available ({_describe(exc)})")
+
+    src, dst, complete = obs.source_present, obs.destination_present, bool(obs.destination_complete)
+
+    if src and not dst:
+        return _verdict(cause, DiskOutcome.UNCHANGED, phase, obs, errno_value,
+                        f"source intact, destination absent ({_describe(exc)})")
+    if src and dst and complete:
+        return _verdict(cause, DiskOutcome.DEST_COMPLETE_SOURCE_PRESENT, phase,
+                        obs, errno_value,
+                        "a verified complete destination exists alongside the "
+                        "source — duplicated, not lost, and not finalised "
+                        f"({_describe(exc)})")
+    if src and dst and not complete:
+        return _verdict(cause, DiskOutcome.DEST_PARTIAL_SOURCE_PRESENT, phase,
+                        obs, errno_value,
+                        "an unverified destination exists beside an intact "
+                        f"source ({_describe(exc)})")
+    if not src and dst and complete:
+        return _verdict(cause, DiskOutcome.DEST_COMPLETE_SOURCE_ABSENT, phase,
+                        obs, errno_value,
+                        f"the placement completed on disk ({_describe(exc)})")
+    # Source gone, destination absent or unverified.
+    return _verdict(cause, DiskOutcome.SOURCE_ABSENT_DEST_UNUSABLE, phase, obs,
+                    errno_value,
+                    "THE SOURCE IS GONE AND NO VERIFIED COMPLETE REPLACEMENT "
+                    f"EXISTS ({_describe(exc)})")
+
+
+def _verdict(cause, outcome, phase, obs, errno_value, detail):
+    return FailureVerdict(cause=cause, disk_outcome=outcome, phase=phase,
+                          detail=detail, errno_value=errno_value, observation=obs)
+
+
+def _describe(exc: Optional[BaseException]) -> str:
+    if exc is None:
+        return "no exception recorded"
     text = str(exc).strip()
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__

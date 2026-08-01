@@ -1,63 +1,131 @@
-"""Append-only file-operation ledger — safety-gate step 2.
+"""Append-only file-operation ledger — safety-gate step 2 (rev 2).
 
-`rename_jobs` records the CURRENT STATE of a job. That is a different thing from
-a history, and the difference is exactly the gap this closes: when a process
-dies mid-move, the job row simply sits in whatever status it last held. Nothing
-anywhere says "a file was being moved from A to B at that moment", so the one
-window where disk and database can silently disagree leaves no trace at all.
+`rename_jobs` records the CURRENT STATE of a job, which is not a history. When
+a process dies mid-move the row sits in whatever status it last held; nothing
+says a file was being moved from A to B at that moment. That is the one window
+where disk and database can silently disagree, and it left no trace.
 
-Two rules make this ledger able to answer that:
+REV 2 CORRECTS THREE FAULTS IN REV 1, all found in review:
 
-1. **INTENT IS RECORDED BEFORE THE FILESYSTEM IS TOUCHED, AND THE WRITE MUST
-   SUCCEED.** If the intent cannot be persisted, the operation does not run.
-   This is deliberately not best-effort — SH-R03 already taught this codebase
-   what "best-effort" bookkeeping costs: the trash manifest's write was wrapped
-   in `except OSError: logger.warning(...)`, but `restore_trash_entry` HARD
-   REFUSES any entry without a manifest record, so a "degraded" write was in
-   fact permanent, unrecoverable loss.
+1. **A silent-failure path.** `_record_outcome` used ``INSERT ... SELECT ...
+   FROM intent``. Given an operation uuid with no intent row, SQLite inserted
+   ZERO rows, committed, and returned normally. Reproduced: the module whose
+   entire purpose is durable bookkeeping recorded nothing and reported success.
+   Outcomes now verify exactly one row was written and raise otherwise.
 
-2. **ROWS ARE NEVER UPDATED.** An outcome is a SECOND row referencing the
-   intent's uuid. A bug in the outcome path therefore cannot destroy the record
-   of intent — which is the record that matters when something has gone wrong.
+2. **The model was a convention, not a constraint.** Nothing stopped two
+   intents sharing an operation, two terminal outcomes for one intent, an
+   outcome with no intent, or an arbitrary ``kind``. Those are now partial
+   unique indexes and a CHECK. A ledger whose shape depends on its writer being
+   correct is not evidence.
 
-The recovery signal falls straight out: an `intent` row with no matching
-`outcome` row IS an interrupted operation. `interrupted_operations()` returns
-them, and they are precisely the paths a human needs to look at before anything
-else touches them.
+3. **A bare "started" marker cannot reconcile anything.** Crash before the
+   operation, during it, and after it but before the outcome all look identical:
+   "intent with no outcome". The intent now carries a PRE-OPERATION EVIDENCE
+   SNAPSHOT — source identity, destination pre-state, prior-occupant reference,
+   method, expected postcondition — so an interrupted operation can be compared
+   against the filesystem and RESOLVED, not merely reported to a human.
+
+Unchanged from rev 1, because it was right: intent is committed BEFORE the
+filesystem is touched and the write must succeed. If it cannot be persisted the
+operation does not run. Deliberately not best-effort — SH-R03 is the precedent,
+where a "degraded" manifest write was in fact permanent, unrecoverable loss.
 """
 from __future__ import annotations
 
 import datetime as dt
+import os
 import sqlite3
 import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-from backend.rename.failure import Cause, DiskOutcome, FailureVerdict
+from backend.rename.failure import DiskObservation, FailureVerdict
 
 KIND_INTENT = "intent"
 KIND_OUTCOME = "outcome"
 
 
 class LedgerWriteError(RuntimeError):
-    """The intent could not be persisted, so the operation must not proceed."""
+    """A ledger write did not durably record what it claimed to."""
 
 
 @dataclass(frozen=True)
 class InterruptedOperation:
-    event_uuid: str
+    operation_uuid: str
     recorded_at: str
     job_id: Optional[int]
     operation: str
     method: Optional[str]
     src_path: Optional[str]
     dst_path: Optional[str]
+    src_size: Optional[int]
+    src_mtime: Optional[float]
+    src_inode: Optional[str]
+    dst_existed: Optional[int]
+    prior_occupant_ref: Optional[str]
+    temp_path: Optional[str]
+    expected_postcondition: Optional[str]
 
     @property
     def summary(self) -> str:
         return (f"{self.operation}({self.method or '?'}) "
                 f"{self.src_path} -> {self.dst_path} "
                 f"began {self.recorded_at} and never reported an outcome")
+
+    def observe_now(self) -> DiskObservation:
+        """Compare the recorded pre-state against the filesystem NOW.
+
+        This is what the evidence snapshot buys: an interrupted operation
+        becomes a classifiable disk state instead of an open question. The
+        source counts as PRESENT only if it still looks like the file the intent
+        described — a different size or mtime at the same path is not the same
+        file, and treating it as one is how a reconciliation lies.
+        """
+        src_present = None
+        if self.src_path:
+            try:
+                st = os.stat(self.src_path)
+                src_present = (
+                    (self.src_size is None or st.st_size == self.src_size)
+                    and (self.src_mtime is None
+                         or abs(st.st_mtime - self.src_mtime) <= 2.0))
+            except FileNotFoundError:
+                src_present = False
+            except OSError:
+                src_present = None       # could not tell -> stays unknown
+
+        dst_present = None
+        dst_complete = None
+        if self.dst_path:
+            try:
+                dst_stat = os.stat(self.dst_path)
+                dst_present = True
+                # Complete only if it matches the size the source had. Anything
+                # else is UNVERIFIED, which is not the same as complete.
+                dst_complete = (self.src_size is not None
+                                and dst_stat.st_size == self.src_size)
+            except FileNotFoundError:
+                dst_present = False
+                dst_complete = None
+            except OSError:
+                dst_present = None
+
+        temp_present = None
+        if self.temp_path:
+            try:
+                temp_present = os.path.exists(self.temp_path)
+            except OSError:
+                temp_present = None
+
+        return DiskObservation(
+            source_present=src_present,
+            destination_present=dst_present,
+            destination_complete=dst_complete,
+            prior_occupant_trashed=bool(self.prior_occupant_ref),
+            temp_path_present=temp_present,
+            method=self.method,
+        )
 
 
 class FileOpLedger:
@@ -70,21 +138,45 @@ class FileOpLedger:
     def record_intent(self, *, operation: str, src: Optional[str] = None,
                       dst: Optional[str] = None, method: Optional[str] = None,
                       job_id: Optional[int] = None,
+                      prior_occupant_ref: Optional[str] = None,
+                      temp_path: Optional[str] = None,
+                      expected_postcondition: Optional[str] = None,
+                      idempotency_token: Optional[str] = None,
                       now: Optional[dt.datetime] = None) -> str:
-        """Persist the intent and return its uuid. Raises if it cannot.
+        """Capture the pre-operation state and return the operation uuid.
 
         The caller MUST treat an exception here as "do not perform the file
-        operation". An unrecorded operation is one that cannot be recovered
-        from, and refusing to start is always cheaper than that.
+        operation". An unrecorded operation cannot be recovered from, and
+        refusing to start is always cheaper than that.
         """
-        event_uuid = str(uuid.uuid4())
+        operation_uuid = str(uuid.uuid4())
+        src_size = src_mtime = src_inode = None
+        if src:
+            try:
+                st = os.stat(src)
+                src_size, src_mtime = st.st_size, st.st_mtime
+                src_inode = f"{st.st_dev}:{st.st_ino}"
+            except OSError:
+                pass          # recorded as unknown, never as absent
+        dst_existed = None
+        if dst:
+            try:
+                dst_existed = 1 if os.path.exists(dst) else 0
+            except OSError:
+                dst_existed = None
+
         try:
             self.conn.execute(
                 "INSERT INTO fileop_events "
-                "(event_uuid, kind, recorded_at, job_id, operation, method, "
-                " src_path, dst_path) VALUES (?,?,?,?,?,?,?,?)",
-                (event_uuid, KIND_INTENT, _iso(now), job_id, operation, method,
-                 src, dst),
+                "(event_uuid, operation_uuid, kind, recorded_at, job_id, "
+                " operation, method, src_path, dst_path, src_size, src_mtime, "
+                " src_inode, dst_existed, prior_occupant_ref, temp_path, "
+                " expected_postcondition, idempotency_token) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), operation_uuid, KIND_INTENT, _iso(now),
+                 job_id, operation, method, src, dst, src_size, src_mtime,
+                 src_inode, dst_existed, prior_occupant_ref, temp_path,
+                 expected_postcondition, idempotency_token),
             )
             # Committed BEFORE the filesystem is touched. An uncommitted intent
             # would vanish on the very crash it exists to record.
@@ -93,71 +185,90 @@ class FileOpLedger:
             raise LedgerWriteError(
                 f"could not record intent for {operation} {src} -> {dst}: {exc}"
             ) from exc
-        return event_uuid
+        return operation_uuid
 
     # ── outcome ─────────────────────────────────────────────────────────
-    def record_success(self, event_uuid: str, *, method_used: Optional[str] = None,
-                       bytes_written: Optional[int] = None,
-                       duration_ms: Optional[int] = None,
-                       now: Optional[dt.datetime] = None) -> None:
-        self._record_outcome(event_uuid, succeeded=1, cause=None,
+    def record_success(self, operation_uuid: str, *, method_used=None,
+                       bytes_written=None, duration_ms=None, now=None) -> None:
+        self._record_outcome(operation_uuid, succeeded=1, cause=None,
                              disk_outcome=None, method=method_used,
-                             bytes_written=bytes_written, duration_ms=duration_ms,
-                             detail=None, now=now)
+                             bytes_written=bytes_written,
+                             duration_ms=duration_ms, detail=None, now=now)
 
-    def record_failure(self, event_uuid: str, verdict: FailureVerdict, *,
-                       bytes_written: Optional[int] = None,
-                       duration_ms: Optional[int] = None,
-                       now: Optional[dt.datetime] = None) -> None:
-        """Record a classified failure. Takes the step-1 verdict directly so the
-        bucket stored is the one the safety rules were evaluated against, not a
-        re-derivation that could drift from it."""
+    def record_failure(self, operation_uuid: str, verdict: FailureVerdict, *,
+                       bytes_written=None, duration_ms=None, now=None) -> None:
+        """Record a classified failure, storing the step-1 verdict verbatim so
+        the bucket written is the one the safety rules were evaluated against."""
         self._record_outcome(
-            event_uuid, succeeded=0, cause=verdict.cause.value,
+            operation_uuid, succeeded=0, cause=verdict.cause.value,
             disk_outcome=verdict.disk_outcome.value, method=None,
             bytes_written=bytes_written, duration_ms=duration_ms,
             detail=verdict.detail, now=now)
 
-    def _record_outcome(self, event_uuid, *, succeeded, cause, disk_outcome,
+    def _record_outcome(self, operation_uuid, *, succeeded, cause, disk_outcome,
                         method, bytes_written, duration_ms, detail, now) -> None:
-        # Unlike the intent, an outcome write that fails is not fatal: the
-        # intent row survives, so the operation simply reads as interrupted —
-        # which is the safe reading, not a lost one.
-        self.conn.execute(
-            "INSERT INTO fileop_events "
-            "(event_uuid, kind, recorded_at, job_id, operation, method, "
-            " src_path, dst_path, succeeded, cause, disk_outcome, "
-            " bytes_written, duration_ms, detail) "
-            "SELECT ?, ?, ?, job_id, operation, COALESCE(?, method), "
-            "       src_path, dst_path, ?, ?, ?, ?, ?, ? "
-            "FROM fileop_events WHERE event_uuid=? AND kind=? LIMIT 1",
-            (event_uuid, KIND_OUTCOME, _iso(now), method, succeeded, cause,
-             disk_outcome, bytes_written, duration_ms, detail,
-             event_uuid, KIND_INTENT),
-        )
+        try:
+            cur = self.conn.execute(
+                "INSERT INTO fileop_events "
+                "(event_uuid, operation_uuid, kind, recorded_at, job_id, "
+                " operation, method, src_path, dst_path, succeeded, cause, "
+                " disk_outcome, bytes_written, duration_ms, detail) "
+                "SELECT ?, ?, ?, ?, job_id, operation, COALESCE(?, method), "
+                "       src_path, dst_path, ?, ?, ?, ?, ?, ? "
+                "FROM fileop_events WHERE operation_uuid=? AND kind=? LIMIT 1",
+                (str(uuid.uuid4()), operation_uuid, KIND_OUTCOME, _iso(now),
+                 method, succeeded, cause, disk_outcome, bytes_written,
+                 duration_ms, detail, operation_uuid, KIND_INTENT),
+            )
+        except sqlite3.IntegrityError as exc:
+            # The one-outcome-per-operation index fired: a second terminal
+            # outcome is a contradiction, not an update.
+            self.conn.rollback()
+            raise LedgerWriteError(
+                f"an outcome already exists for operation {operation_uuid}"
+            ) from exc
+        # THE SILENT-FAILURE FIX. INSERT...SELECT over a non-existent intent
+        # inserts zero rows and commits happily. Rev 1 returned normally from
+        # that, so the module built to guarantee bookkeeping could record
+        # nothing at all and report success.
+        if cur.rowcount != 1:
+            self.conn.rollback()
+            raise LedgerWriteError(
+                f"no outcome recorded for operation {operation_uuid}: "
+                f"{cur.rowcount} row(s) written — the intent does not exist")
         self.conn.commit()
 
     # ── recovery ────────────────────────────────────────────────────────
     def interrupted_operations(self) -> list:
         """Intents with no outcome — operations that were in flight and never
-        reported back. These are the only places disk and records can silently
-        disagree, so they are what a human is shown first."""
+        reported back. The only places disk and records can silently disagree."""
         rows = self.conn.execute(
-            "SELECT i.event_uuid, i.recorded_at, i.job_id, i.operation, "
-            "       i.method, i.src_path, i.dst_path "
+            "SELECT i.operation_uuid, i.recorded_at, i.job_id, i.operation, "
+            "       i.method, i.src_path, i.dst_path, i.src_size, i.src_mtime, "
+            "       i.src_inode, i.dst_existed, i.prior_occupant_ref, "
+            "       i.temp_path, i.expected_postcondition "
             "FROM fileop_events i "
             "WHERE i.kind=? AND NOT EXISTS ("
             "  SELECT 1 FROM fileop_events o "
-            "  WHERE o.event_uuid = i.event_uuid AND o.kind=?) "
+            "  WHERE o.operation_uuid = i.operation_uuid AND o.kind=?) "
             "ORDER BY i.recorded_at",
             (KIND_INTENT, KIND_OUTCOME),
         ).fetchall()
         return [InterruptedOperation(*row) for row in rows]
 
+    def reconcile_interrupted(self):
+        """Classify every interrupted operation against the filesystem NOW.
+
+        Returns ``(InterruptedOperation, DiskObservation)`` pairs. This is the
+        point of the evidence snapshot: each observation can be handed to
+        ``classify_failure`` and yields a real disk state — duplicate, partial,
+        catastrophic — instead of an undifferentiated "something was in flight".
+        """
+        return [(op, op.observe_now()) for op in self.interrupted_operations()]
+
     def outcome_counts(self) -> dict:
-        """Failure counts per bucket — what the free-text column could never
-        give us. Interrupted operations are counted as their own bucket rather
-        than omitted, so the total always reconciles against intents."""
+        """Failure counts per bucket. Interrupted operations are their own
+        bucket rather than omitted, so totals reconcile against intents."""
         counts = {}
         for disk_outcome, n in self.conn.execute(
             "SELECT COALESCE(disk_outcome,'succeeded'), COUNT(*) "

@@ -673,17 +673,38 @@ class DatabaseManager:
                         -- where a file may have been moved without a record.
                         --
                         -- Rows are NEVER updated. An outcome is a second row
-                        -- referencing the intent's event_uuid, so a bug in the
-                        -- outcome path can never destroy the record of intent.
+                        -- referencing the intent's operation_uuid, so a bug in
+                        -- the outcome path cannot destroy the record of intent.
+                        --
+                        -- event_uuid identifies THIS ROW; operation_uuid
+                        -- correlates the intent and outcome of ONE operation.
+                        -- Rev 1 overloaded a single column for both, which made
+                        -- "one intent per operation" unexpressible as a
+                        -- constraint.
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         event_uuid TEXT NOT NULL,
-                        kind TEXT NOT NULL,          -- 'intent' | 'outcome'
+                        operation_uuid TEXT NOT NULL,
+                        kind TEXT NOT NULL CHECK (kind IN ('intent','outcome')),
                         recorded_at TEXT NOT NULL,
                         job_id INTEGER,
                         operation TEXT NOT NULL,     -- place | trash | restore | undo
                         method TEXT,                 -- move|copy|hardlink|symlink
                         src_path TEXT,
                         dst_path TEXT,
+                        -- Pre-operation evidence, captured BEFORE the filesystem
+                        -- is touched. A bare "started" marker cannot distinguish
+                        -- a crash before the operation from one during or after
+                        -- it; all three look identical. Recording what the disk
+                        -- looked like beforehand is what makes an interrupted
+                        -- intent RECONCILABLE rather than merely reportable.
+                        src_size INTEGER,
+                        src_mtime REAL,
+                        src_inode TEXT,
+                        dst_existed INTEGER,
+                        prior_occupant_ref TEXT,
+                        temp_path TEXT,
+                        expected_postcondition TEXT,
+                        idempotency_token TEXT,
                         -- outcome-only columns; NULL on intent rows
                         succeeded INTEGER,
                         cause TEXT,
@@ -694,11 +715,25 @@ class DatabaseManager:
                     )
                 ''')
                 cursor.execute(
-                    'CREATE INDEX IF NOT EXISTS idx_fileop_events_uuid '
-                    'ON fileop_events(event_uuid)')
-                cursor.execute(
                     'CREATE INDEX IF NOT EXISTS idx_fileop_events_kind_time '
                     'ON fileop_events(kind, recorded_at)')
+                # DATABASE-ENFORCED CARDINALITY. The append-only model was
+                # previously a convention the writer was trusted to honour;
+                # nothing stopped two intents sharing an operation uuid, two
+                # terminal outcomes for one intent, an outcome with no intent,
+                # or an arbitrary `kind`. A ledger whose shape depends on its
+                # writer being correct is not evidence.
+                cursor.execute(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS idx_fileop_one_intent '
+                    'ON fileop_events(operation_uuid) '
+                    "WHERE kind = 'intent'")
+                cursor.execute(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS idx_fileop_one_outcome '
+                    'ON fileop_events(operation_uuid) '
+                    "WHERE kind = 'outcome'")
+                cursor.execute(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS idx_fileop_event_uuid '
+                    'ON fileop_events(event_uuid)')
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS bookmarks (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
