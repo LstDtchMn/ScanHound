@@ -100,6 +100,27 @@ def _fetch_status_readiness(base_url, token):
         return json.loads(r.read().decode() or "{}")
 
 
+def _normalize_window_start(value, now):
+    """Parse a window boundary into the stored ISO form, or None.
+
+    FAIL-CLOSED: unparseable or future values return None, and None is
+    handled by the caller as "no window has started" — a blocking
+    condition, never a licence to aggregate everything.
+    """
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    parsed = parsed.astimezone(dt.timezone.utc)
+    if parsed > now:
+        return None
+    return parsed.isoformat()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True)
@@ -109,11 +130,25 @@ def main():
     ap.add_argument("--min-cycles", type=int, default=20)
     ap.add_argument("--min-days", type=int, default=7)
     ap.add_argument("--max-stale-minutes", type=int, default=180)
+    # The qualification window boundary. REQUIRED for a verdict: without
+    # it this script aggregated every cycle ever recorded, and the
+    # collector turns a nonzero relevant_misses into a MANDATORY STOP
+    # with a priority-8 alert. The previous window's misses would have
+    # fired that before the new window started.
+    ap.add_argument("--window-start-at", default="")
     a = ap.parse_args()
     db = Path(a.db).resolve()
     ev = Path(a.evidence_dir).resolve()
     ev.mkdir(parents=True, exist_ok=True)
     now = dt.datetime.now(dt.timezone.utc)
+
+    # Normalise the boundary to the stored ISO form before it reaches
+    # SQL. completed_at is TEXT with a +00:00 offset, so a "...Z" or
+    # bare-date value would compare lexicographically against a
+    # different shape and silently select the wrong rows.
+    window_start = _normalize_window_start(a.window_start_at, now)
+    window_scope = " AND completed_at >= ?" if window_start else ""
+    window_params = (window_start,) if window_start else ()
 
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
@@ -137,12 +172,13 @@ def main():
                     WHERE outcome IN ({placeholders})
                       AND normal_feeds_complete=1
                       AND rss_requests>0
-                      AND listing_requests>0""",
-                CYCLE_OUTCOMES,
+                      AND listing_requests>0{window_scope}""",
+                (*CYCLE_OUTCOMES, *window_params),
             ).fetchone()
             all_misses = con.execute(
                 "SELECT COALESCE(SUM(relevant_miss_count),0) "
-                "FROM hdencode_shadow_cycles"
+                "FROM hdencode_shadow_cycles WHERE 1=1" + window_scope,
+                window_params,
             ).fetchone()[0]
             cycle_rows = [
                 dict(r)
@@ -214,7 +250,31 @@ def main():
 
     required_cycles = max(1, int(a.min_cycles))
     required_days = max(1, int(a.min_days))
+
+    # NO WINDOW: report an EMPTY current window rather than the unscoped
+    # historical totals. The collector converts a nonzero relevant_misses
+    # into a MANDATORY STOP with a priority-8 push and a "stop and roll
+    # back" instruction, so surfacing the previous window's misses here
+    # would fire that alert before the new window had started. Historical
+    # figures move to an explicitly named key that nothing gates on.
+    historical_not_counted = None
+    if not window_start:
+        historical_not_counted = {
+            "successful_cycles": complete_cycles,
+            "relevant_misses": relevant_misses,
+            "first_completed_at": first_at,
+            "last_completed_at": last_at,
+        }
+        complete_cycles = 0
+        relevant_misses = 0
+        recovery_cycles = 0
+        observed_days = 0.0
+        reduction = 0.0
+        first_at = last_at = None
+
     reasons = []
+    if not window_start:
+        reasons.append("qualification_window_not_started")
     if complete_cycles < required_cycles:
         reasons.append("insufficient_comparison_cycles")
     if observed_days < required_days:
@@ -245,6 +305,8 @@ def main():
     readiness = {
         "ready": not reasons,
         "required_cycles": required_cycles,
+        "window_start_at": window_start,
+        "historical_evidence_not_counted": historical_not_counted,
         "successful_cycles": complete_cycles,
         "required_days": required_days,
         "observed_days": observed_days,

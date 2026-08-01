@@ -2217,9 +2217,70 @@ class DatabaseManager:
             "window_start_at":str(window_start_at) if window_start_at else None,
         }
 
+    @staticmethod
+    def normalize_window_start(value):
+        """Parse and normalise a window boundary, or return None if unusable.
+
+        The boundary is compared as TEXT against `completed_at`, which is stored
+        as ISO-8601 with a ``+00:00`` offset. A caller-supplied string in any
+        other shape ('...Z', a bare date, a local offset) would compare
+        lexicographically against a different format and silently select the
+        wrong rows — so it is parsed and re-emitted in the stored form here.
+
+        FAIL-CLOSED: anything unparseable, or in the future, returns None. None
+        means "no window", which blocks — never "count everything".
+        """
+        if not value:
+            return None
+        try:
+            parsed = datetime.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        parsed = parsed.astimezone(datetime.timezone.utc)
+        # A future boundary would exclude every cycle forever, so the window
+        # could never accumulate evidence — indistinguishable from a stalled
+        # collector until someone checked the timestamp.
+        if parsed > datetime.datetime.now(datetime.timezone.utc):
+            return None
+        return parsed.isoformat()
+
     def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180,
                                    window_start_at=None):
         required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days))
+        window_start_at = self.normalize_window_start(window_start_at)
+        if not window_start_at:
+            # NO WINDOW: return an EMPTY current-window summary.
+            #
+            # Returning the unscoped historical totals here — even alongside a
+            # blocking reason — is not merely untidy, it is actively dangerous.
+            # The qualification collector reads `relevant_misses` on its own and
+            # converts any nonzero value into a MANDATORY STOP with a priority-8
+            # push alert and a "stop and roll back" instruction. With 102 void
+            # misses in the table, that alert would fire from the previous
+            # window's evidence before the new one had even started.
+            #
+            # Historical totals are still available, but under an explicitly
+            # named diagnostic key that no gate consumes. Caught in review.
+            historical = self.get_hdencode_shadow_summary()
+            return {
+                "ready": False,
+                "window_start_at": None,
+                "required_cycles": required_cycles, "successful_cycles": 0,
+                "required_days": required_days, "observed_days": 0.0,
+                "normal_feeds_healthy": False,
+                "relevant_misses": 0, "request_reduction_pct": 0.0,
+                "recovery_cycles": 0,
+                "first_completed_at": None, "last_completed_at": None,
+                "reasons": ["qualification_window_not_started"],
+                "historical_evidence_not_counted": {
+                    "successful_cycles": historical["successful_cycles"],
+                    "relevant_misses": historical["relevant_misses"],
+                    "first_completed_at": historical["first_completed_at"],
+                    "last_completed_at": historical["last_completed_at"],
+                },
+            }
         summary=self.get_hdencode_shadow_summary(window_start_at=window_start_at)
         first=summary.get("first_completed_at"); last=summary.get("last_completed_at"); observed_days=0.0
         try:
@@ -2246,11 +2307,6 @@ class DatabaseManager:
         if summary["request_reduction_pct"]<=0: reasons.append("request_reduction_not_proven")
         if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
         if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")
-        # FAIL-CLOSED. With no window boundary this aggregates every cycle ever
-        # recorded, so a freshly deployed build would inherit the previous
-        # window's duration and cycle count as if it had earned them. Absent
-        # scoping is not a reason to accept unscoped evidence.
-        if not window_start_at: reasons.append("qualification_window_not_started")
         return {"ready":not reasons,"window_start_at":summary.get("window_start_at"),"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
 
     # ── HDEncode candidate actions ─────────────────────────────────────
