@@ -166,7 +166,14 @@ def classify_item(
     if item.get("processing_failed"):
         coverage = IdentityCoverage.PROCESSING_FAILED
         cov_detail = "acquired but the pipeline failed to process it"
-    elif rss_state in (RssAcquisition.GREEN, RssAcquisition.YELLOW):
+    elif first_normal is not None:
+        # COVERED_BY_RSS requires an ACTUAL normal-feed observation, not merely
+        # a latency colour. GREEN/YELLOW are assigned two different ways: from a
+        # measured first_normal_at, and — for an item that has aged past the
+        # band without being acquired at all — from its age alone. Keying
+        # coverage off the colour therefore reported never-acquired items as
+        # "acquired through the normal feed", which is the precise shape of a
+        # hidden miss and could pass a false promotion. Caught in review.
         coverage = IdentityCoverage.COVERED_BY_RSS
         cov_detail = "acquired through the normal feed"
     elif rss_state is RssAcquisition.RED and acquired_by_sweep:

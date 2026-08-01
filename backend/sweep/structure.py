@@ -31,9 +31,21 @@ from typing import Optional
 #: Below this, a "page" is a truncated response or an error body, not a listing.
 MIN_PLAUSIBLE_BODY_BYTES = 512
 
-#: A page yielding less than this fraction of the source's established volume is
-#: treated as structurally suspect rather than as a quiet day.
+#: A page yielding less than this fraction of the source's established volume
+#: would be structurally suspect rather than a quiet day.
+#:
+#: THE VALUE IS UNCALIBRATED. It was chosen, not measured — there is no observed
+#: per-source volume distribution behind it. Design rev 2.1 §7 requires
+#: listing-volume evidence before promotion, and until that exists an invented
+#: constant must not be able to create a mandatory stop OR clear one.
 VOLUME_ANOMALY_FRACTION = 0.5
+
+#: Volume-anomaly detection is therefore OFF by default and must be switched on
+#: explicitly, per review ruling. Two things gate it: this flag, and a producer
+#: for `expected_typical`, which does not exist yet — so today the detector
+#: never fires either way. Turning it on before calibration would make the
+#: number above into qualification policy by accident.
+VOLUME_ANOMALY_ENABLED = False
 
 
 class PageStructure(str, Enum):
@@ -78,6 +90,7 @@ def classify_page_structure(
     body_bytes: int,
     expected_typical: Optional[float] = None,
     volume_fraction: float = VOLUME_ANOMALY_FRACTION,
+    volume_anomaly_enabled: bool = VOLUME_ANOMALY_ENABLED,
 ) -> StructureVerdict:
     """Judge one fetched listing page.
 
@@ -124,7 +137,8 @@ def classify_page_structure(
             selector_tier,
         )
 
-    if expected_typical and posts_found < expected_typical * volume_fraction:
+    if (volume_anomaly_enabled and expected_typical
+            and posts_found < expected_typical * volume_fraction):
         return StructureVerdict(
             PageStructure.VOLUME_ANOMALY,
             f"page {page_index} yielded {posts_found} posts against a typical "
