@@ -113,6 +113,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--db", required=True, help="path to a FROZEN snapshot, not the live database")
     ap.add_argument("--json", help="write machine-readable results here")
+    ap.add_argument("--allow-missing-attribution", action="store_true",
+                    help="proceed without hdencode_candidate_feeds; output is "
+                         "marked NON-AUTHORITATIVE")
     args = ap.parse_args()
 
     conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
@@ -151,6 +154,16 @@ def main() -> int:
     except sqlite3.OperationalError:
         rows = []
         attribution_available = False
+        # I told the reviewer this "fails loudly". It did not: it printed a
+        # warning and returned 0, so a caller could act on a non-authoritative
+        # result. A warning is not a failure.
+        if not args.allow_missing_attribution:
+            print("
+ABORT: hdencode_candidate_feeds is absent, so no claim about "
+                  "feed population is supported. Re-run with "
+                  "--allow-missing-attribution to produce a NON-AUTHORITATIVE "
+                  "result.", file=sys.stderr)
+            return 3
 
     for feed_key, url, seen_at in rows:
         key = canonical(url)

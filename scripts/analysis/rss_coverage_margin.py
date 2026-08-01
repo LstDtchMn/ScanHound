@@ -119,19 +119,35 @@ def main() -> int:
 
     # ── per-cycle depth, gap and margin ────────────────────────────────────
     for feed in NORMAL_FEEDS:
-        cycles = [(_ts(t), n) for t, n in conn.execute(
-            "SELECT completed_at, candidate_count FROM hdencode_ingest_cycles "
+        cycles = [(_ts(t), n, o, ch) for t, n, o, ch in conn.execute(
+            "SELECT completed_at, candidate_count, outcome, changed "
+            "FROM hdencode_ingest_cycles "
             "WHERE feed_key=? AND completed_at IS NOT NULL ORDER BY completed_at",
             (feed,))]
-        cycles = [(t, n) for t, n in cycles if t]
+        cycles = [c for c in cycles if c[0]]
         rows = members[feed]
 
-        depths, margins, gaps, per_cycle = [], [], [], []
-        prev = None
-        for when, count in cycles:
+        depths, margins, gaps, per_cycle, recon_delta = [], [], [], [], []
+        prev = None            # last SUCCESSFUL observation, not last attempt
+        failures = 0
+        for when, count, outcome, changed in cycles:
+            # A failed poll must NOT reset the observation clock. The previous
+            # version advanced `prev` on every row including failures, which
+            # shortened the measured gap and therefore OVERSTATED the margin -
+            # in the optimistic direction, on the analysis whose whole purpose
+            # was to find pessimistic cases. A 304 does reset it: the server
+            # confirmed the representation we already hold.
+            succeeded = (outcome or "").lower() != "failed"
+            if not succeeded:
+                failures += 1
+                continue
             gap = (when - prev).total_seconds() / 3600.0 if prev else None
             prev = when
             live = [p for a, b, p in rows if a <= when <= b]
+            # Validate the reconstruction rather than trust it: a changed body
+            # recorded N entries, so the reconstruction must produce N members.
+            if changed and count:
+                recon_delta.append(len(live) - count)
             depth = ((max(live) - min(live)).total_seconds() / 3600.0
                      if len(live) >= 2 else None)
             margin = (depth - gap) if (depth is not None and gap is not None) else None
@@ -162,7 +178,11 @@ def main() -> int:
                          "p50": _pct(margins, .5), "p95": _pct(margins, .95)},
             "nonpositive_margin_cycles": len(nonpositive),
             "margin_at_longest_gap_h": at_worst,
-            "outage_headroom_h": _pct(depths, 0),
+            "minimum_observed_feed_horizon_h": _pct(depths, 0),
+            "failed_polls": failures,
+            "reconstruction_exact_pct": (
+                round(100.0 * sum(1 for d in recon_delta if d == 0) / len(recon_delta), 1)
+                if recon_delta else None),
         }
         report["feeds"][feed] = feed_report
 
@@ -176,8 +196,10 @@ def main() -> int:
         print(f"  MARGIN min/p5/p50      : {m['min']} / {m['p5']} / {m['p50']} h")
         print(f"  cycles with margin <= 0: {len(nonpositive)}")
         print(f"  margin at longest gap  : {at_worst} h")
-        print(f"  OUTAGE HEADROOM        : {feed_report['outage_headroom_h']} h "
-              f"(the MINIMUM observed depth, not the current one)")
+        print(f"  min observed horizon   : {feed_report['minimum_observed_feed_horizon_h']} h "
+              f"(an OBSERVED feed horizon - NOT a guaranteed outage tolerance)")
+        print(f"  failed polls excluded  : {failures}")
+        print(f"  reconstruction exact   : {feed_report['reconstruction_exact_pct']}%")
 
     # ── busiest publication burst, which sizes the sweep ───────────────────
     print("\nPUBLICATION BURST (sizes the hybrid sweep)")
