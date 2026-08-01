@@ -121,6 +121,45 @@ survive a passing result.
 
 ---
 
+## Addendum — the field-level harness was built, and it found five defects
+
+Jesse chose the third option. `tests/test_discovery_parity.py` now drives a
+corpus of release titles through both readers. **38 passed, 5 xfailed.** The
+five are real divergences measured on 2026-08-01, each recorded as
+`xfail(strict=True)` so that fixing one turns the file red and forces the
+marker off rather than letting the record decay.
+
+| # | Divergence | Which reader is wrong | Consequence |
+|---|---|---|---|
+| 1 | RSS emits `2160p`, listing emits `4K` | neither — same meaning, different token | Latent. Exactly the shape that hid 61% of 4K movies behind the frontend chip on 2026-07-30 |
+| 2 | `1920x1080` parses as **year 1920** on the RSS path; listing correctly reads 2019 | **RSS** — `_YEAR_RE` guards with `(?!\d)`, listing's `\b…\b` rejects it | **Reaches a decision.** A wrong `title_year` sets `year_conflict` in `classify_candidate`, resolving the candidate to `ambiguous`, which blocks in the gate |
+| 3 | `DTS5.1` yields **season 5** on the listing path; RSS returns None | **listing** — `SEASON_PATTERN` lacks the `(?<![A-Z0-9])` guard | A movie is read as TV |
+| 4 | `S104` → season 104 (RSS, `\d{1,3}`) vs season 10 (listing, `\d{1,2}`) | undetermined — depends whether `S104` means a season or `S10E4` | The disagreement is the finding |
+| 5 | `1.2 TB` → `size_gb=None` on RSS; listing reads 1228.8 GB | **RSS** — `_SIZE_RE` accepts only `GiB\|GB\|MiB\|MB` | Size feeds the quality/upgrade comparison, so such a release is judged with no size. `#191` reduces but does not remove exposure: TB releases are *usually* full-disc, not always |
+
+**#2 and #5 are the ones that matter for the window.** Both change what the
+decision engine sees, on the RSS path specifically, which is the path being
+promoted.
+
+### The harness was mutation-checked
+
+A parity test that cannot fail is worse than none, so four mutations were run,
+each restored by explicit single-file copy:
+
+| Mutation | Caught by |
+|---|---|
+| `canonical_resolution` always returns None (vacuous folding) | `test_canonical_resolution_still_separates_distinct_resolutions` |
+| listing reader stops extracting resolution | `test_both_readers_agree` **and** `test_the_corpus_actually_exercises_every_field` |
+| listing reports 1080p as 720p (genuine semantic divergence) | `test_both_readers_agree[resolution]` |
+| listing size switches to bytes (unit divergence) | `test_both_readers_agree[size_gb]` |
+
+An earlier attempt at this check was **invalid** and nearly went unnoticed:
+`docker cp tests <ctr>:/work/tests` against an existing directory creates
+`/work/tests/tests/`, so every "restore" silently failed and the mutations
+stacked on each other. The confirmed nested directory is what exposed it. Same
+lesson as the B2 re-run earlier today — an unvalidated instrument produces
+green results indistinguishable from a working system.
+
 ## What must not happen
 
 Whichever option is taken, the qualification report must not claim A4 is
