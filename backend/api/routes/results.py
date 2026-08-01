@@ -35,15 +35,49 @@ def _effective_category(item: Dict[str, Any]) -> str:
     return "tv" if item.get("season") is not None else "4k"
 
 
+# UHD is spelled BOTH ways in the live catalogue and the two spellings never
+# compared equal, so the '4K' facet silently hid most of the 4K library.
+# Measured on the production DB 2026-07-30: 153 movies stored '4K' vs 242
+# stored '2160p' — the '2160p' 61% could not match the '4K' chip. The write
+# path is why the split exists and why it was growing: filename_utils.py
+# normalises 4k/uhd to '2160p' on parse, so every NEWLY parsed release became
+# unfilterable while the matching legacy rows kept working. 1080p was immune
+# because parser and chip happen to agree on that spelling, which is exactly
+# why this survived unnoticed.
+#
+# Canonicalise at the FILTER boundary rather than rewriting stored values: the
+# raw string is still what gets displayed, and a migration would have to be
+# re-run for every future writer that reintroduces a spelling.
+_RES_CANONICAL = {
+    "2160p": "4K", "4k": "4K", "uhd": "4K",
+    "1080p": "1080p", "1080i": "1080p",
+    "720p": "720p",
+    "480p": "480p",
+}
+
+
+def canonical_resolution(res: Any) -> str | None:
+    """Fold a stored resolution string onto the key its filter chip uses.
+
+    Unknown spellings pass through unchanged rather than being dropped: a
+    resolution this table has not seen should stay filterable by its own exact
+    value, not silently vanish the way '2160p' did.
+    """
+    if not res:
+        return None
+    return _RES_CANONICAL.get(str(res).strip().lower(), str(res))
+
+
 def _resolution_keys(item: Dict[str, Any]) -> set:
     """Filter keys an item satisfies for the resolution/type facet. A TV show
     keys ONLY as 'TV' (never by resolution) so the 4K/1080p filters are
-    movies-only; a movie keys by its resolution ('4K'/'1080p'/'720p'). The
-    frontend twin is resolutionKeysFor() in stores/results.ts — keep in sync.
+    movies-only; a movie keys by its CANONICAL resolution ('4K'/'1080p'/'720p')
+    so that '2160p' and '4K' are one facet. The frontend twin is
+    resolutionKeysFor() in stores/results.ts — keep in sync.
     """
     if _effective_category(item) == "tv":
         return {"TV"}
-    res = item.get("resolution")
+    res = canonical_resolution(item.get("resolution"))
     return {res} if res else set()
 
 
@@ -290,7 +324,13 @@ def _filter_and_sort(items, *, filter=None, search=None, category=None,
     if quick:
         q = set(quick)
         if "4k" in q:
-            result = [i for i in result if i.get("resolution") == "4K"]
+            # Second site with the same bug: an exact match on "4K" against a
+            # column that also stores "2160p". Deliberately NOT routed through
+            # _resolution_keys() — that one folds every TV item to {"TV"}, so
+            # reusing it here would silently drop TV from the quick 4K filter,
+            # which today does include TV. Same canonicalisation, different facet.
+            result = [i for i in result
+                      if canonical_resolution(i.get("resolution")) == "4K"]
         if "hdrdv" in q:
             result = [i for i in result
                       if i.get("dovi") or (i.get("hdr") and i.get("hdr") != "SDR")]
