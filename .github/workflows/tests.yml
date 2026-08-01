@@ -2,7 +2,14 @@ name: Tests
 
 on:
   push:
-    branches: [main, master, develop]
+    # agent/** and fix/** are included deliberately. Long-lived work happens on
+    # those branches, often without an open PR, so they previously produced NO
+    # status checks at all — a reviewer inspecting a pushed head found nothing
+    # machine-attested, and every figure was locally produced. On 2026-08-01 a
+    # locally misconfigured harness reported three successive wrong failure
+    # counts before anyone noticed; CI reproduces the real environment and
+    # would have caught it on the first run.
+    branches: [main, master, develop, 'agent/**', 'fix/**']
   pull_request:
     branches: [main, master, develop]
   schedule:
@@ -54,6 +61,39 @@ jobs:
       - name: Run tests
         run: |
           python -m pytest tests/ --tb=short -q
+
+      - name: Verify safety tests still discriminate (mutation check)
+        # Runs only where the harness exists, so the workflow stays valid on
+        # branches that predate it.
+        #
+        # A passing suite proves the tests pass. It does NOT prove they would
+        # FAIL on the defect they were written for — and a test that cannot
+        # distinguish correct from incorrect behaviour is worse than no test,
+        # because it looks like validation. This restores each known defect and
+        # requires the guarding test to fail.
+        if: matrix.python-version == '3.12'
+        run: |
+          if [ -f tests/tools/mutation_check.py ]; then
+            python tests/tools/mutation_check.py
+          else
+            echo "no mutation harness on this branch — skipping"
+          fi
+
+      - name: Report leaked threads (informational)
+        # Does not fail the build. A leaked background thread caused a real
+        # flaky test on 2026-08-01 by constructing an HTTP client inside
+        # another test's monkeypatch window; surfacing leaks makes the next one
+        # visible before it becomes a mystery.
+        if: matrix.python-version == '3.12'
+        continue-on-error: true
+        run: |
+          if [ -f tests/tools/threadleak.py ]; then
+            cp tests/tools/threadleak.py threadleak.py
+            python -m pytest tests/ -q -p threadleak -p no:cacheprovider \
+              2>&1 | sed -n '/THREADLEAK/,$p' | head -60
+          else
+            echo "no thread-leak probe on this branch — skipping"
+          fi
 
       - name: Run tests with coverage
         if: matrix.python-version == '3.11'

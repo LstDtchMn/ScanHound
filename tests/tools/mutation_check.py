@@ -12,7 +12,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-APP = Path("/app")
+#: Repository root, derived from this file so the harness runs anywhere — a
+#: throwaway container, a developer checkout, or a CI runner. It was hardcoded
+#: to /app, which silently limited it to the one environment it was written in.
+APP = Path(__file__).resolve().parents[2]
 
 # (label, file, corrected_snippet, defective_snippet, tests_that_must_fail)
 MUTATIONS = [
