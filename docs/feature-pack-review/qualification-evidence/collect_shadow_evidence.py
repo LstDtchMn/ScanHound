@@ -54,6 +54,12 @@ LOG = EVIDENCE / "shadow-window.log"
 # DB read above). The app token is read at runtime from the WUD compose file
 # (an existing token under the admin account, which is the phone's account) --
 # no additional copy of the secret is written anywhere.
+# The qualification window boundary, read from the same file the app uses
+# so the collector and the app scope identically. Empty until a fresh
+# window is deliberately started; empty means BLOCKED, never "count
+# everything ever recorded".
+WINDOW_FILE = EVIDENCE / "window-start-at.txt"
+
 WUD_COMPOSE = Path(r"X:/Docker Apps/Whats up docker/docker-compose.yml")
 GOTIFY_URL = "http://gotify:80"
 
@@ -155,6 +161,10 @@ def main():
         "--db", "/dbvol/crawler.db",
         "--evidence-dir", "/out",
     ]
+    if WINDOW_FILE.is_file():
+        window = WINDOW_FILE.read_text(encoding="utf-8").strip()
+        if window:
+            cmd += ["--window-start-at", window]
     # Reconcile against the app's own readiness report. This is a PREREQUISITE
     # of qualification, not an enhancement: the whole value of the cross-check
     # is that it is independent of the DB-derived computation, so "no
