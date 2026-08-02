@@ -176,11 +176,12 @@ class SourceBase(ABC):
                 pass
     """
 
-    # Common regex patterns for parsing
-    YEAR_PATTERN: Pattern = re.compile(r'\b(19|20)\d{2}\b')
-    RESOLUTION_PATTERN: Pattern = re.compile(r'\b(720p|1080p|2160p|4K|UHD)\b', re.IGNORECASE)
-    SIZE_PATTERN: Pattern = re.compile(r'(\d+(?:\.\d+)?)\s*(GB|MB|TB)', re.IGNORECASE)
-    SEASON_PATTERN: Pattern = re.compile(r'S(\d{1,2})(?:E(\d{1,2}))?', re.IGNORECASE)
+    # YEAR_PATTERN, RESOLUTION_PATTERN, SIZE_PATTERN and SEASON_PATTERN USED to
+    # live here. They became dead when extract_* began delegating to
+    # backend.release_grammar, and are deleted rather than left as "reference
+    # copies" — a second definition that nothing calls is precisely how the
+    # discovery paths drifted apart, and leaving them would have made this class
+    # look authoritative about rules it no longer owns.
     IMDB_PATTERN: Pattern = re.compile(r'tt\d{7,}')
     HDR_PATTERN: Pattern = re.compile(r'\b(HDR10\+?|Dolby[\s.]*Vision|DV|HDR)\b', re.IGNORECASE)
     CODEC_PATTERN: Pattern = re.compile(r'\b(x264|x265|HEVC|H\.?264|H\.?265|AV1|VP9)\b', re.IGNORECASE)
