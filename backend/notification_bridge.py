@@ -87,10 +87,50 @@ class NotificationBridge:
             return
 
         def _run():
-            self._loop = asyncio.new_event_loop()
+            loop = asyncio.new_event_loop()
+            self._loop = loop
             # Signal ready only after the loop is actually running
-            self._loop.call_soon(self._ready.set)
-            self._loop.run_forever()
+            loop.call_soon(self._ready.set)
+            try:
+                loop.run_forever()
+            finally:
+                # The loop thread owns the loop's whole lifecycle, including
+                # its end. Nothing else ever called close() on this loop, so
+                # its default executor — populated by the desktop-toast path's
+                # run_in_executor(None, ...) — was never retired, and its
+                # asyncio_N workers piled up one lifespan after another.
+                #
+                # Mirrors what asyncio.run() does on the way out. Draining the
+                # async generators and the executor here, on the loop's own
+                # thread after run_forever() returns, means no coroutine has to
+                # be submitted from outside to a loop that may already have
+                # stopped — the race the previous version had between
+                # is_running() and run_coroutine_threadsafe().
+                #
+                # No timeout argument: it is 3.12-only, and this runs on the
+                # loop thread, which shutdown() already bounds with a join.
+                # A wedged toast backend therefore strands this thread rather
+                # than shutdown.
+                #
+                # close() alone would ALSO retire the executor — it calls
+                # shutdown(wait=False) — so the explicit drain is not what
+                # fixes the leak; closing the loop at all is. What the drain
+                # buys is determinism: the workers are gone when this thread
+                # exits, rather than shortly after, which is what a leak check
+                # sampling right at teardown needs. The cost is the wedged case
+                # above, where the drain blocks and this thread is stranded
+                # instead of exiting promptly. Deterministic on the common path
+                # was judged worth one extra daemon thread on the pathological
+                # one; test_a_wedged_drain_strands_the_thread_rather_than_shutdown
+                # pins that behaviour so the trade is visible, not accidental.
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    loop.run_until_complete(loop.shutdown_default_executor())
+                except Exception:
+                    logger.debug("notification loop drain failed; closing anyway",
+                                 exc_info=True)
+                finally:
+                    loop.close()
 
         self._thread = threading.Thread(target=_run, name="notif-loop", daemon=True)
         self._thread.start()
@@ -142,34 +182,24 @@ class NotificationBridge:
         self.send("error", "ScanHound Error", message)
 
     def shutdown(self):
-        """Stop the async loop and cleanup."""
+        """Ask the loop thread to stop, then wait for it, bounded.
+
+        Only signals and waits — the loop thread drains and closes the loop
+        itself (see ``_start_loop``). That keeps the whole teardown on one
+        thread and removes the previous version's window between checking
+        ``is_running()`` and submitting a coroutine, where the loop could stop
+        in between and strand the coroutine for the full wait.
+        """
         if self._loop:
-            # Drain the loop's DEFAULT executor before stopping it. Desktop
-            # toasts are dispatched with ``run_in_executor(None, ...)``, which
-            # lazily creates a pool of ``asyncio_N`` worker threads; stopping
-            # the loop leaves them alive for the whole process, so under
-            # TestClient they piled up one lifespan after another.
-            #
-            # Both waits are bounded: this runs on the shutdown path, and a
-            # notification backend wedged in a native OS call must not be able
-            # to hold it open. On expiry we stop the loop regardless — the
-            # executor threads are daemons.
-            # Only if the loop is actually running: a coroutine submitted to a
-            # stopped loop is never executed, so the wait below would burn its
-            # full timeout on every shutdown that follows a crashed loop.
-            if self._loop.is_running():
-                try:
-                    pending = asyncio.run_coroutine_threadsafe(
-                        self._loop.shutdown_default_executor(timeout=2.0),
-                        self._loop,
-                    )
-                    pending.result(timeout=3.0)
-                except Exception:
-                    logger.debug("notification executor shutdown timed out or "
-                                 "failed; stopping the loop anyway",
-                                 exc_info=True)
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            # Safe even if the loop already stopped: call_soon_threadsafe on a
+            # stopped-but-open loop just queues a callback nobody runs.
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except RuntimeError:
+                logger.debug("notification loop already closed", exc_info=True)
         if self._thread:
+            # Bounds the drain above: a wedged notification backend strands
+            # this thread instead of holding shutdown open.
             self._thread.join(timeout=2.0)
         if self._manager:
             try:

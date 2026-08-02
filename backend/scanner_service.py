@@ -371,23 +371,24 @@ class ScannerService:
                                         track_urls, skip_urls, early_stop)
                 )
             finally:
-                # Shut the loop's DEFAULT executor down before closing it.
-                # Every source adapter fetches pages via
-                # ``loop.run_in_executor(None, ...)``, which lazily creates a
-                # ThreadPoolExecutor of ``asyncio_N`` threads that loop.close()
-                # does NOT touch — so each scan used to strand a pool of idle
-                # worker threads for the life of the process.
+                # close() is sufficient here, deliberately. Every source
+                # adapter fetches via ``loop.run_in_executor(None, ...)``, which
+                # lazily creates a pool of ``asyncio_N`` threads — and
+                # BaseEventLoop.close() calls ``_default_executor.shutdown(
+                # wait=False)``, so those workers are retired without an
+                # explicit drain.
                 #
-                # Bounded: a fetch still blocked on a socket must not hold the
-                # scan thread (and therefore lifespan shutdown) open forever.
-                # On expiry Python logs the still-running threads and we close
-                # regardless; they are daemons.
-                try:
-                    loop.run_until_complete(
-                        loop.shutdown_default_executor(timeout=5))
-                except Exception:
-                    logger.debug("default executor shutdown failed",
-                                 exc_info=True)
+                # An earlier version of this fix awaited
+                # shutdown_default_executor() here on the belief that close()
+                # did not touch the executor. Measured 2026-08-02 on 3.11.15
+                # and 3.12.9: that belief was wrong, and removing the call left
+                # test_api_routes.py at THREADLEAK: none. All it bought was a
+                # per-scan tail spent waiting for threads close() was already
+                # retiring — plus a 3.12-only ``timeout`` argument that raised
+                # TypeError on the 3.11 leg of CI.
+                #
+                # What actually stopped the asyncio_N leak was joining the scan
+                # thread at teardown, which is what lets this close() run at all.
                 loop.close()
         except Exception as e:
             self._log(f"Scan error: {e}", "error")
