@@ -153,7 +153,26 @@ class DesktopNotificationChannel(NotificationChannel):
             return False
 
         try:
-            # Run in executor to avoid blocking
+            # Run in executor to avoid blocking.
+            #
+            # KNOWN, ACCEPTED EXPOSURE: this call is UNBOUNDED. Dispatch goes
+            # through plyer, whose platform backends shell out internally
+            # (gdbus / notify-send on Linux, a native toast thread on Windows)
+            # with no timeout we can pass through. Unlike a stranded daemon
+            # thread, a permanently blocked EXECUTOR callable is joined by
+            # concurrent.futures' _python_exit at interpreter shutdown whatever
+            # its daemon flag, so a wedged backend here can hold the process
+            # open. EmailChannel got a real socket timeout for exactly this
+            # reason; there is no equivalent knob for plyer.
+            #
+            # Accepted on 2026-08-02 rather than fixed, because reaching it
+            # needs a backend that is PRESENT and HANGING: desktop_notifications
+            # defaults to off, the deployment target is headless Docker, and
+            # _get_notifier already disables the channel outright when neither
+            # gdbus nor notify-send exists. Bounding it properly means
+            # reimplementing plyer's dispatch behind subprocess.run(timeout=...)
+            # or isolating notification work in a killable subprocess — both
+            # larger changes than the residual risk justifies.
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
