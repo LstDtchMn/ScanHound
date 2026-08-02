@@ -148,8 +148,40 @@ per-category; "usually" was doing the work.
 Fixed by `title_indicates_tv()` in the shared grammar, deliberately title-only,
 with each path's out-of-band signal additive on top.
 
-**Phase 0 now has no open engineering work.** What remains is Jesse's: 0.7
-through 0.11.
+> ### CORRECTION 2026-08-02 — Phase 0 is NOT complete, and the claim above was wrong
+>
+> An earlier version of this section said "Phase 0 now has no open engineering
+> work." External review found that **the parity work targets the wrong listing
+> reader**, and I verified every element of that finding against the tree:
+>
+> * Nothing in the scan chain constructs `HDEncodeSource` or calls
+>   `SourceBase.parse_release()`. The deployed path is
+>   `ScannerService.run_scan()` → `DetailScraper` → `_process_posts()`.
+> * `_crawl_pages` reads the listing title into `post_title`, uses it **only**
+>   for the full-disc check, and appends
+>   `{'url', 'type', 'source', 'category'}` — **the title is discarded.**
+> * `_process_posts` derives media type as
+>   `details.get('is_tv', False) or post_info['type'] == 'tv'` — `DetailScraper`'s
+>   own filename regexes OR the source descriptor hint.
+> * `backend/detail_scraper.py` does not import `release_grammar`; its season
+>   patterns are independent and one-or-two-digit, with no ambiguity concept.
+>
+> **So divergences (a)–(f) are fixed between the RSS reader and `SourceBase`,
+> and are NOT fixed on the deployed HDEncode listing path.** "Both paths reject
+> `S104` as ambiguous" is false for production. The sixth divergence is not
+> proven fixed where it matters.
+>
+> This is the same defect I criticised and then repeated: the original harness
+> compared RSS against a test-only transcription; I replaced that with
+> `SourceBase` — a real module, but still not the deployed reader. A second
+> non-production implementation in a new costume.
+>
+> Standing evidence: `tests/test_active_listing_path_gap.py` (3 strict xfails
+> that turn red when the gap closes). Two further blockers were raised and are
+> **not yet verified by me**: derived classification is not invalidated when the
+> parser changes, and the Phase A/Phase B split is not enforced in code.
+
+**Phase 0 has open engineering work.** Items 0.7–0.11 must not be approved yet.
 
 ### Phase 1 — bootstrap (~30 h, unattended)
 
