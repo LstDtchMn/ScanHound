@@ -59,8 +59,17 @@ full-disc `[BD]` defect was exactly it: full-disc releases have no `Filename`
 field, the listing side learned to exclude them, and the RSS side did not — an
 asymmetry that lived in the difference between the two extraction
 implementations. `#191` fixed that one instance by giving both sides a shared
-`is_full_disc_title()`. It did not make the rest of the extraction shared, and
-nothing detects the next instance.
+`is_full_disc_title()`.
+
+**Correction (2026-08-02, ChatGPT second pass).** The sentence that stood here
+— "nothing detects the next instance" — was wrong, and understated existing
+coverage. `tests/test_rss_full_disc_symmetry.py` exists and asserts exactly the
+`#191` property on both paths. The accurate statement is narrower: **full-disc
+symmetry is tested; the rest of the extraction is not.** Resolution, size, year,
+season and media type remain derived by two unshared implementations with no
+comparison between them, which is what the harness below addresses. Full-disc
+parity should be described as a separate, already-tested property rather than
+folded into this gap.
 
 **T2 does not cover this.** T2 requires zero actionable candidates left
 unresolved at window closure — it checks that the RSS side *resolves*, never
@@ -140,6 +149,28 @@ marker off rather than letting the record decay.
 **#2 and #5 are the ones that matter for the window.** Both change what the
 decision engine sees, on the RSS path specifically, which is the path being
 promoted.
+
+### Two limits of this harness, found in second-pass review
+
+Both are real and neither was stated when the harness landed:
+
+1. **`listing_fields()` is a test-only transcription of `SourceBase.extract_*`,
+   not a call into the production listing path.** It was written that way so the
+   comparison needs no network, HTML or browser — but that makes it a **third
+   implementation that can itself drift**, which is the very failure mode the
+   harness exists to detect. It must be replaced by, or supplemented with, calls
+   into the production parsing functions.
+2. **Media type is not compared, and a title-only fixture cannot compare it.**
+   Production listing media type is `mode == 'tv' or self.is_tv_release(title)`
+   (`backend/sources/hdencode.py:201`) — it depends on **which category URL was
+   crawled**, not on the title alone. RSS media type depends on the parsed
+   season plus feed categories. The asymmetry is therefore invisible to a
+   fixture that carries only a title; exercising it needs the listing mode and
+   the RSS categories as inputs.
+
+So the harness covers four fields by transcription, not six fields in
+production. That is still worth having — it found five real defects — but the
+claim must be scoped to what it actually does.
 
 ### The harness was mutation-checked
 
