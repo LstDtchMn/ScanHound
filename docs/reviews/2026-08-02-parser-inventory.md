@@ -106,12 +106,43 @@ The reviews found (a)–(f) by comparing implementations 2 and 3. Implementation
    generated constant, a contract test that reads both sources, or an accepted
    documented divergence — not silence.
 
-## What this does not claim
+## MEASURED — `release_grammar` vs `filename_utils`, 12 titles
 
-No behavioural comparison has been run between `filename_utils`,
-`detail_scraper` and `release_grammar`. The defects listed for `detail_scraper`
-are read from its regexes; the spelling disagreement with `filename_utils` is
-read from its code. **Reading a regex is weaker evidence than running it**, and
-the corpus comparison that produced (a)–(f) has not been repeated across these
-implementations. That measurement is the obvious next step and has not been
-done.
+Run rather than read. Resolution is compared **after** canonicalisation, so a
+pure spelling difference is not counted; every row below is a semantic
+disagreement.
+
+| Field | grammar | `filename_utils` | Title |
+|---|---|---|---|
+| season | `3` | `None` | `Another.Series.S03.1080p.WEB-DL...` |
+| is_tv | `True` | `False` | `Another.Series.S03.1080p.WEB-DL...` |
+| is_tv | `True` | `False` | `Long.Run.S104.2160p.WEB-DL...` |
+| is_tv | `True` | `False` | `Docu.Mini.Series.1080p.WEB-DL...` |
+
+**4 divergent observations on 12 titles. Three of the four are `is_tv`.**
+
+### The one that matters: season packs are movies to the rename pipeline
+
+`filename_utils` sets `is_tv` only from `SxxEyy` or `NxMM` — an episode code.
+A **season pack**, `Show.S03.1080p.WEB-DL.mkv`, carries a season with no
+episode, so it parses as `is_tv=False, season=None`.
+
+This is the parser the **rename pipeline** uses, and rename is what moves real
+files. A season pack would be treated as a film. Discovery's grammar reads the
+same string as season 3, TV.
+
+`Mini Series` and the ambiguous `S104` diverge the same way and in the same
+direction: the rename pipeline systematically under-detects TV.
+
+**This is a live defect on a file-moving path, found by measurement, and it is
+unrelated to the qualification work.** Auto-rename is off, so nothing is acting
+on it today — which is the only reason it is not urgent.
+
+### What is still unmeasured
+
+`detail_scraper` has **not** been measured this way — its four defects are
+still read from its regexes rather than observed, because `is_tv` is computed
+inline inside `scrape_details` with no seam to call. Extracting that seam is
+the remaining measurement. Reading a regex is weaker evidence than running it,
+and this section is the reason to prefer the latter: the `S03` finding was not
+visible from the code reading that produced the table above.
