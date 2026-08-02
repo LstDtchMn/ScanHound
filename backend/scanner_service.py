@@ -367,6 +367,10 @@ class ScannerService:
         self._operation_context = operation_context
         operation_context.record(
             scan_context.RUN_SCAN_ENTERED, source_kind=source_type)
+        # Bind for this thread so an out-of-band observer (the netwatch gate)
+        # can name the owning operation without parsing a thread name.
+        _bind = scan_context.bind_current_operation(operation_context)
+        _bind.__enter__()
 
         self.stop_scan_flag = False
         self.is_scanning = True
@@ -413,6 +417,7 @@ class ScannerService:
         finally:
             self.is_scanning = False
             operation_context.record(scan_context.RESULTS_READY)
+            _bind.__exit__(None, None, None)
 
         return list(self.items)
 
@@ -790,7 +795,14 @@ class ScannerService:
                         url = f"{source_base}page/{page_num}/{source_suffix}"
 
                 try:
-                    def _fetch_page(u=url):
+                    # Captured lexically. Reading self._operation_context from
+                    # INSIDE the worker was wrong: an orphaned worker
+                    # overlapping a later scan on the same ScannerService would
+                    # attribute its transport construction to that later
+                    # operation. Round 4 P2.
+                    _own_ctx = getattr(self, "_operation_context", None)
+
+                    def _fetch_page(u=url, _own_ctx=_own_ctx):
                         self._last_crawl_request_count += 1
                         if source_id == "hdencode":
                             with get_hdencode_coordinator().request(
@@ -798,7 +810,7 @@ class ScannerService:
                                 stop_requested=lambda: self.stop_scan_flag,
                                 priority=20,
                             ):
-                                _c = getattr(self, "_operation_context", None)
+                                _c = _own_ctx
                                 if _c is not None and not scraper:
                                     _c.record(
                                         scan_context.LISTING_TRANSPORT_CONSTRUCTED,
@@ -806,7 +818,7 @@ class ScannerService:
                                         source_kind=source_id)
                                 client = scraper or create_source_http_client(hdencode=True)
                                 return client.get(u, timeout=15)
-                        _c = getattr(self, "_operation_context", None)
+                        _c = _own_ctx
                         if _c is not None and not scraper:
                             _c.record(
                                 scan_context.LISTING_TRANSPORT_CONSTRUCTED,
@@ -815,7 +827,7 @@ class ScannerService:
                         client = scraper or create_source_http_client(hdencode=False)
                         return client.get(u, timeout=15)
 
-                    _ctx = getattr(self, "_operation_context", None)
+                    _ctx = _own_ctx
                     if _ctx is not None:
                         _ctx.record(
                             scan_context.LISTING_SUBMITTED,

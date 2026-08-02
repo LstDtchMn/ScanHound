@@ -262,3 +262,94 @@ def test_describe_reports_crossing(tracing_on):
     rendered = sc.describe([context])
     assert "crossed=True" in rendered
     assert sc.ORIGIN_API_MANUAL in rendered
+
+
+# ── round 4 follow-up: post-entry crossing and completion markers ──────
+
+def test_entry_crossing_property_is_narrowly_scoped(tracing_on):
+    """The acceptance-to-entry comparison must not be read as a lifespan claim.
+
+    Round 4 P1: reporting `crossed_ownership` as "no scan crossed a lifespan"
+    overstates it. An operation can enter under its own owner and only later
+    outlive a rollover.
+    """
+    context = sc.new_operation(
+        sc.ORIGIN_API_MANUAL, lifespan_generation=1, scanner=None)
+    context.snapshot_entry(lifespan_generation=1, scanner=None)
+
+    assert context.crossed_ownership_at_entry is False
+    assert context.observed_post_entry_crossing is False
+    assert context.crossed_lifespan is False
+
+    # ... the lifespan rolls over while this operation is still running ...
+    context.record(sc.PUBLISH_LAST_SCAN_ITEMS, active_lifespan_generation=2)
+
+    assert context.crossed_ownership_at_entry is False, "entry check unchanged"
+    assert context.observed_post_entry_crossing is True
+    assert context.crossed_lifespan is True, "the wider question is now answered"
+
+
+def test_live_generation_is_not_copied_from_the_entry_snapshot(tracing_on):
+    context = sc.new_operation(
+        sc.ORIGIN_API_MANUAL, lifespan_generation=4, scanner=None)
+    context.snapshot_entry(lifespan_generation=4, scanner=None)
+    context.record(sc.PUBLISH_CONFIG, active_lifespan_generation=9,
+                   still_owns_lifespan=False)
+
+    event = [e for e in context.trace.events() if e.stage == sc.PUBLISH_CONFIG][0]
+    assert event.active_lifespan_generation == 9
+    assert event.still_owns_lifespan is False
+    assert event.lifespan_generation == 4, "entry snapshot preserved separately"
+
+
+def test_worker_completion_is_recorded_unconditionally(tracing_on):
+    context = sc.new_operation(sc.ORIGIN_DIRECT)
+
+    sc.run_with_scan_context(
+        context, sc.EXECUTOR_LISTING, sc.LISTING_STARTED, lambda: None)
+    with pytest.raises(ValueError):
+        sc.run_with_scan_context(
+            context, sc.EXECUTOR_LISTING, sc.LISTING_STARTED,
+            lambda: (_ for _ in ()).throw(ValueError("boom")))
+
+    finished = [e for e in context.trace.events() if e.stage == sc.WORKER_FINISHED]
+    assert len(finished) == 2, "recorded on the failing path too"
+
+
+def test_worker_completion_is_timestamped_after_start(tracing_on):
+    """Ordering must be decidable on the monotonic clock, not inferred."""
+    context = sc.new_operation(sc.ORIGIN_DIRECT)
+    sc.run_with_scan_context(
+        context, sc.EXECUTOR_LISTING, sc.LISTING_STARTED, lambda: None)
+
+    events = {e.stage: e for e in context.trace.events()}
+    assert events[sc.WORKER_FINISHED].monotonic_ns >= events[sc.LISTING_STARTED].monotonic_ns
+
+
+def test_current_operation_is_bound_inside_worker_and_cleared_after(tracing_on):
+    context = sc.new_operation(sc.ORIGIN_DIRECT)
+    assert sc.current_operation_uuid() is None
+
+    seen = sc.run_with_scan_context(
+        context, sc.EXECUTOR_DETAIL, sc.DETAIL_STARTED,
+        sc.current_operation_uuid)
+
+    assert seen == context.scan_uuid, "netwatch can attribute without thread names"
+    assert sc.current_operation_uuid() is None, "binding must not leak"
+
+
+def test_binding_is_per_thread(tracing_on):
+    outer = sc.new_operation(sc.ORIGIN_DIRECT)
+    seen = {}
+
+    def worker():
+        seen["inside"] = sc.current_operation_uuid()
+
+    with sc.bind_current_operation(outer):
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(timeout=5)
+        seen["outer"] = sc.current_operation_uuid()
+
+    assert seen["outer"] == outer.scan_uuid
+    assert seen["inside"] is None, "a different thread must not inherit the binding"

@@ -135,6 +135,21 @@ def _log_callback(message: str, level: str = "info") -> None:
     })
 
 
+def _still_owns(reg, context) -> "bool | None":
+    """Does the accepted generation still own the lifespan, right now?
+
+    Sampled live rather than reconstructed from the stored entry snapshot —
+    the round-4 review's P1. Returns None when the registry cannot answer.
+    """
+    owns = getattr(reg, "owns_lifespan", None)
+    generation = context.accepted_lifespan_generation
+    if owns is None or generation is None:
+        return None
+    try:
+        return bool(owns(generation))
+    except Exception:
+        return None
+
 def _run_scan(reg: ServiceRegistry, req: ScanRequest,
               context: "scan_context.ScanOperationContext | None" = None) -> None:
     """Execute scan in background thread."""
@@ -217,12 +232,18 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest,
         duration = time.time() - start_time
 
         # Store results
-        context.record(scan_context.PUBLISH_LAST_SCAN_ITEMS)
+        context.record(scan_context.PUBLISH_LAST_SCAN_ITEMS,
+                       active_lifespan_generation=getattr(
+                           reg, "lifespan_generation", None),
+                       still_owns_lifespan=_still_owns(reg, context))
         with _items_lock:
             _last_scan_items = list(items) if items else []
 
         # Broadcast each result
-        context.record(scan_context.PUBLISH_WEBSOCKET)
+        context.record(scan_context.PUBLISH_WEBSOCKET,
+                       active_lifespan_generation=getattr(
+                           reg, "lifespan_generation", None),
+                       still_owns_lifespan=_still_owns(reg, context))
         for item in (items or []):
             item_dict = _media_item_to_dict(item)
             ws_manager.broadcast_sync({"type": "scan:result", "data": item_dict})
@@ -243,7 +264,10 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest,
         # so the UI showed "Just now" the moment a scan began. Manual scans
         # never updated it at all. Stamp it here so it reflects the real last
         # completed scan.
-        context.record(scan_context.PUBLISH_CONFIG)
+        context.record(scan_context.PUBLISH_CONFIG,
+                       active_lifespan_generation=getattr(
+                           reg, "lifespan_generation", None),
+                       still_owns_lifespan=_still_owns(reg, context))
         try:
             reg.config["last_scan_time"] = time.time()
             if reg.backend:
@@ -252,7 +276,10 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest,
             logger.warning("Failed to update last_scan_time")
 
         # Notify
-        context.record(scan_context.PUBLISH_NOTIFICATION)
+        context.record(scan_context.PUBLISH_NOTIFICATION,
+                       active_lifespan_generation=getattr(
+                           reg, "lifespan_generation", None),
+                       still_owns_lifespan=_still_owns(reg, context))
         if reg.notifications:
             reg.notifications.notify_scan_complete(
                 total=stats["total"],
@@ -261,7 +288,10 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest,
             )
 
         # Auto-grab
-        context.record(scan_context.PUBLISH_AUTOGRAB)
+        context.record(scan_context.PUBLISH_AUTOGRAB,
+                       active_lifespan_generation=getattr(
+                           reg, "lifespan_generation", None),
+                       still_owns_lifespan=_still_owns(reg, context))
         if reg.auto_grab and reg.auto_grab.enabled and items:
             try:
                 ws_manager.broadcast_sync({
@@ -288,11 +318,22 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest,
         })
     finally:
         scanner.release_scan()
+        context.record(scan_context.SLOT_RELEASED)
         with _scan_lock:
             _scan_state["state"] = "idle"
             _scan_state["progress"] = 0.0
             _scan_state["phase"] = ""
             _scan_state["holds_slot"] = False
+        # Unconditional. Previously this was recorded ONLY on the `not scanner`
+        # early return, so a normally-completing scan left no completion marker
+        # and worker-outlives-outer-thread could not be decided — round 4's P1.
+        # Sampling the live generation here also catches an operation that
+        # entered under its own owner and then outlived a later rollover.
+        context.record(
+            scan_context.THREAD_FINISHED,
+            active_lifespan_generation=getattr(reg, "lifespan_generation", None),
+            still_owns_lifespan=_still_owns(reg, context),
+        )
 
 
 def _media_item_to_dict(item: Any) -> Dict[str, Any]:

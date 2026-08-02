@@ -78,6 +78,8 @@ METADATA_SUBMITTED = "metadata_submitted"
 METADATA_STARTED = "metadata_started"
 METADATA_FINISHED = "metadata_finished"
 
+WORKER_FINISHED = "worker_finished"
+
 STOP_REQUESTED = "stop_requested"
 RESULTS_READY = "results_ready"
 
@@ -120,6 +122,10 @@ class ScanTraceEvent:
     scanner_id: Optional[int]
     executor_kind: Optional[str]
     source_kind: Optional[str]
+    # Sampled at the moment the event is recorded, NOT copied from the entry
+    # snapshot. None when the caller had no registry to ask.
+    active_lifespan_generation: Optional[int] = None
+    still_owns_lifespan: Optional[bool] = None
 
     def as_dict(self) -> dict:
         return {
@@ -135,6 +141,8 @@ class ScanTraceEvent:
             "scanner_id": self.scanner_id,
             "executor_kind": self.executor_kind,
             "source_kind": self.source_kind,
+            "active_lifespan_generation": self.active_lifespan_generation,
+            "still_owns_lifespan": self.still_owns_lifespan,
         }
 
 
@@ -187,6 +195,11 @@ class ScanOperationContext:
     source_kind: Optional[str] = None
     trace: ScanTrace = field(default_factory=ScanTrace)
 
+    # Set when any recorded event sampled a live generation different from the
+    # accepted one. This is the POST-ENTRY question, which the acceptance-to-
+    # entry comparison below cannot answer.
+    observed_post_entry_crossing: bool = False
+
     # ── owner tuples ──────────────────────────────────────────────────
 
     @property
@@ -198,8 +211,15 @@ class ScanOperationContext:
         return (self.entered_lifespan_generation, self.entered_scanner_id)
 
     @property
-    def crossed_ownership(self) -> bool:
-        """True when the worker began under a different owner than accepted it.
+    def crossed_ownership_at_entry(self) -> bool:
+        """True when the worker BEGAN under a different owner than accepted it.
+
+        Bounded deliberately: this compares acceptance to entry and nothing
+        else. It cannot see an operation that entered under its own owner and
+        then outlived a later lifespan rollover — for that, read
+        :attr:`observed_post_entry_crossing`. Reporting this property as
+        "did any scan cross a lifespan" overstates it, which is exactly the
+        error the round-4 review caught.
 
         Only meaningful once :meth:`snapshot_entry` has run; before that the
         entry tuple is ``(None, None)`` and no claim should be made.
@@ -207,6 +227,16 @@ class ScanOperationContext:
         if self.entered_at_ns is None:
             return False
         return self.accepted_owner != self.entered_owner
+
+    # Back-compat alias. Same narrow meaning as the name above.
+    @property
+    def crossed_ownership(self) -> bool:
+        return self.crossed_ownership_at_entry
+
+    @property
+    def crossed_lifespan(self) -> bool:
+        """True if this operation crossed a lifespan at ANY sampled point."""
+        return self.crossed_ownership_at_entry or self.observed_post_entry_crossing
 
     # ── recording ─────────────────────────────────────────────────────
 
@@ -218,6 +248,8 @@ class ScanOperationContext:
         lifespan_generation: Optional[int] = None,
         scanner_id: Optional[int] = None,
         source_kind: Optional[str] = None,
+        active_lifespan_generation: Optional[int] = None,
+        still_owns_lifespan: Optional[bool] = None,
     ) -> None:
         if not tracing_enabled():
             return
@@ -242,7 +274,13 @@ class ScanOperationContext:
             ),
             executor_kind=executor_kind,
             source_kind=source_kind or self.source_kind,
+            active_lifespan_generation=active_lifespan_generation,
+            still_owns_lifespan=still_owns_lifespan,
         ))
+        if (active_lifespan_generation is not None
+                and active_lifespan_generation
+                != self.accepted_lifespan_generation):
+            self.observed_post_entry_crossing = True
 
     def snapshot_entry(
         self,
@@ -269,6 +307,39 @@ class ScanOperationContext:
 
 _recent: Deque[ScanOperationContext] = deque(maxlen=_MAX_RETAINED_OPERATIONS)
 _recent_lock = threading.Lock()
+
+# Which operation the CURRENT thread is executing. Set by run_scan for the outer
+# thread and by run_with_scan_context for executor workers, so an out-of-band
+# observer (the netwatch gate) can attribute a socket attempt without parsing a
+# thread name. Thread-local, never a process-global "current scan".
+_local = threading.local()
+
+
+def current_operation() -> Optional[ScanOperationContext]:
+    return getattr(_local, "operation", None)
+
+
+def current_operation_uuid() -> Optional[str]:
+    op = current_operation()
+    return op.scan_uuid if op is not None else None
+
+
+class bind_current_operation:
+    """Bind *context* to this thread for the duration of the block."""
+
+    def __init__(self, context: Optional[ScanOperationContext]):
+        self._context = context
+        self._previous = None
+
+    def __enter__(self):
+        self._previous = getattr(_local, "operation", None)
+        if self._context is not None:
+            _local.operation = self._context
+        return self._context
+
+    def __exit__(self, *exc):
+        _local.operation = self._previous
+        return False
 
 
 def new_operation(
@@ -322,9 +393,16 @@ def run_with_scan_context(
     contextvars in every supported path, so the operation is passed rather
     than inferred.
     """
-    if context is not None and started_stage:
-        context.record(started_stage, executor_kind=executor_kind)
-    return fn(*args, **kwargs)
+    with bind_current_operation(context):
+        if context is not None and started_stage:
+            context.record(started_stage, executor_kind=executor_kind)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            # Unconditional, so worker completion can be compared against outer
+            # thread completion on the monotonic clock rather than inferred.
+            if context is not None:
+                context.record(WORKER_FINISHED, executor_kind=executor_kind)
 
 
 def describe(contexts: Optional[Iterable[ScanOperationContext]] = None) -> str:

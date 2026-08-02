@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 
 from backend.api.dependencies import ServiceRegistry, get_registry
+from backend import scan_context
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/background", tags=["background"])
@@ -48,6 +49,10 @@ def background_scan_now(reg: ServiceRegistry = Depends(get_registry)):
         raise HTTPException(status_code=503, detail="Background scanner not initialized")
     if scanner.is_scanning:
         raise HTTPException(status_code=409, detail="A background scan is already running")
+    # Manual trigger, not the periodic loop — the two were indistinguishable in
+    # traces because both called the parameterless scan_once(). Round 4 P2.
     threading.Thread(
-        target=scanner.scan_once, name="background-scan-now", daemon=True).start()
+        target=scanner.scan_once,
+        kwargs={"origin": scan_context.ORIGIN_BACKGROUND_MANUAL},
+        name="background-scan-now", daemon=True).start()
     return {"status": "triggered"}

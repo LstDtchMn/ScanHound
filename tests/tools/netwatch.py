@@ -16,8 +16,9 @@ a usable signal; the ledger has to be checked out-of-band at session end.
 Attribution caveat: ``observed_during_test`` is the pytest node that happened
 to be running when a *leaked* worker made the attempt. It is NOT necessarily
 the test that created that worker. The ``originating_operation`` field is
-reserved for the scan-operation context planned in Phase 2 and stays None
-until that lands. Do not read the observed node as the culprit.
+populated from the scan context bound to the calling thread, so it names the
+owning scan directly rather than by parsing the thread name. It is None when no
+scan owns that thread. Do not read the observed node as the culprit.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ import ipaddress
 import os
 import socket
 import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 
@@ -50,7 +52,11 @@ class _Attempt:
     thread_name: str
     thread_ident: object
     observed_during_test: str
-    originating_operation: object = None  # Phase 2 fills this in.
+    monotonic_ns: int = 0
+    # Read from the scan context bound to THIS thread, not parsed out of the
+    # thread name. None when no scan owns the calling thread.
+    originating_operation: object = None
+    originating_origin: object = None
     stack: list = field(default_factory=list)
 
 
@@ -83,7 +89,20 @@ def _is_ip_literal(host) -> bool:
     return True
 
 
+def _current_operation():
+    """Ask scan_context which operation owns this thread, if any."""
+    try:
+        from backend import scan_context
+    except Exception:
+        return None, None
+    op = scan_context.current_operation()
+    if op is None:
+        return None, None
+    return op.scan_uuid, op.origin
+
+
 def _record(kind: str, host, port) -> _Attempt:
+    uuid_, origin = _current_operation()
     attempt = _Attempt(
         kind=kind,
         host=str(host),
@@ -91,6 +110,9 @@ def _record(kind: str, host, port) -> _Attempt:
         thread_name=threading.current_thread().name,
         thread_ident=threading.current_thread().ident,
         observed_during_test=_CURRENT["nodeid"],
+        monotonic_ns=time.monotonic_ns(),
+        originating_operation=uuid_,
+        originating_origin=origin,
         stack=traceback.format_stack(limit=_STACK_FRAMES),
     )
     with _LOCK:
@@ -213,4 +235,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         terminalreporter.write_line(
             f"      observed during: {a.observed_during_test}")
         terminalreporter.write_line(
-            f"      originating op:  {a.originating_operation} (Phase 2)")
+            f"      monotonic_ns:    {a.monotonic_ns}")
+        terminalreporter.write_line(
+            f"      originating op:  {a.originating_operation} "
+            f"origin={a.originating_origin}")

@@ -225,7 +225,7 @@ class BackgroundScanner:
 
     # ── the scan itself ───────────────────────────────────────────────
 
-    def scan_once(self) -> Dict[str, Any]:
+    def scan_once(self, origin: Optional[str] = None) -> Dict[str, Any]:
         """Run one pre-cache pass: scan each configured source, upsert, purge.
 
         Safe to call directly (used by POST /background/scan-now). Returns a
@@ -418,7 +418,7 @@ class BackgroundScanner:
                 items: List[Any] = []
                 try:
                     items = self._scan_source(
-                        source, source_pages, cached_urls
+                        source, source_pages, cached_urls, origin=origin
                     )
                 except Exception as e:
                     err = str(e)
@@ -571,7 +571,8 @@ class BackgroundScanner:
         return flags if any(flags.values()) else dict(_ALL_CATEGORY_FLAGS)
 
     def _scan_source(self, source: str, pages: int,
-                     skip_urls: Optional[set] = None) -> List[Any]:
+                     skip_urls: Optional[set] = None,
+                     origin: Optional[str] = None) -> List[Any]:
         """Run a single source's scan and return its MediaItems.
 
         Raises on hard failure so the caller can record a per-source error.
@@ -582,7 +583,7 @@ class BackgroundScanner:
         from backend.api.routes.scanner import _SOURCE_NAME_MAP, _SCAN_TYPE_MAP
         source_type = _SOURCE_NAME_MAP.get(str(source).lower(), source)
         _bg_context = scan_context.new_operation(
-            scan_context.ORIGIN_BACKGROUND_PERIODIC,
+            origin or scan_context.ORIGIN_BACKGROUND_PERIODIC,
             parent_operation=f"background-cycle-{self._lifespan_generation}",
             lifespan_generation=getattr(self._reg, "lifespan_generation", None),
             scanner=getattr(self._reg, "scanner", None),
