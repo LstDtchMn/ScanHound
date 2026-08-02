@@ -375,6 +375,17 @@ class GenericWebhookChannel(NotificationChannel):
         return replace_vars(result)
 
 
+# Socket timeout for SMTP dispatch. smtplib defaults to
+# socket._GLOBAL_DEFAULT_TIMEOUT, i.e. BLOCK FOREVER — and this runs in the
+# notification loop's default executor, where a permanently blocked callable
+# does not merely strand a daemon thread: concurrent.futures registers every
+# worker and joins it at interpreter shutdown regardless of the daemon flag,
+# so an unreachable mail server can hold the whole process open. Matches the
+# 10s the webhook/Discord/Slack channels already use, with headroom for a TLS
+# handshake plus AUTH plus the send on one socket.
+SMTP_TIMEOUT_SECONDS = 30.0
+
+
 class EmailChannel(NotificationChannel):
     """Email notifications via SMTP."""
 
@@ -386,7 +397,8 @@ class EmailChannel(NotificationChannel):
         password: str,
         from_addr: str,
         to_addrs: List[str],
-        use_tls: bool = True
+        use_tls: bool = True,
+        timeout: float = SMTP_TIMEOUT_SECONDS,
     ):
         super().__init__("email")
         self.smtp_host = smtp_host
@@ -396,6 +408,7 @@ class EmailChannel(NotificationChannel):
         self.from_addr = from_addr
         self.to_addrs = to_addrs
         self.use_tls = use_tls
+        self.timeout = timeout
 
     def _build_email(self, notification: Notification) -> MIMEMultipart:
         """Build email message."""
@@ -470,13 +483,17 @@ class EmailChannel(NotificationChannel):
         """Synchronous email sending."""
         msg = self._build_email(notification)
 
+        # timeout= bounds every socket operation on the connection, so
+        # connect, STARTTLS, AUTH and the send are all covered by it.
         if self.use_tls:
-            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+            with smtplib.SMTP(self.smtp_host, self.smtp_port,
+                              timeout=self.timeout) as server:
                 server.starttls()
                 server.login(self.username, self.password)
                 server.sendmail(self.from_addr, self.to_addrs, msg.as_string())
         else:
-            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port) as server:
+            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port,
+                                  timeout=self.timeout) as server:
                 server.login(self.username, self.password)
                 server.sendmail(self.from_addr, self.to_addrs, msg.as_string())
 
@@ -572,7 +589,8 @@ class NotificationManager:
                 password=config.get('smtp_password', ''),
                 from_addr=config.get('email_from', ''),
                 to_addrs=config.get('email_to', []),
-                use_tls=config.get('smtp_tls', True)
+                use_tls=config.get('smtp_tls', True),
+                timeout=config.get('smtp_timeout', SMTP_TIMEOUT_SECONDS),
             )
             if config.get('email_types'):
                 channel.set_filters([
