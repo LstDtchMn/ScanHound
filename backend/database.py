@@ -1728,8 +1728,26 @@ class DatabaseManager:
         if media_type == "tv":
             base_clauses.append("content_type = 'TV Shows'")
             if season is not None: base_clauses.append("season = ?"); base_params.append(season)
-        else:
+        elif media_type == "movie":
             base_clauses.append("content_type = 'Movies'")
+        else:
+            # AMBIGUOUS, or anything unrecognised: match NOTHING.
+            #
+            # This branch used to be a bare `else` that searched the MOVIES
+            # library, so an unresolved media type silently became a movie
+            # query — the fail-open direction, and it would have quietly
+            # undone the tri-state the resolver produces upstream.
+            #
+            # Returning no matches leaves the candidate identity-unresolved,
+            # which routes it to hydration and blocks it in the gate. That is
+            # the intended outcome: we do not know which library this belongs
+            # to, so we must not answer as though we do.
+            return {
+                "exact_url_downloaded": exact_url_downloaded,
+                "plex_matches": [],
+                "identity_basis": None,
+                "media_type_unresolved": True,
+            }
         ordered_years=[]
         for year in years or ():
             try: value=int(year)
