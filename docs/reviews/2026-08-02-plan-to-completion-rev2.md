@@ -121,7 +121,7 @@ construction invalidates Phase A and requires a fresh window.
 | 0.1 | Fix divergences (a)(b)(c)(d)(e) in one shared grammar | Claude | **done** — `backend/release_grammar.py` |
 | 0.2 | Route both production readers through it; delete the duplicate patterns | Claude | **done** |
 | 0.3 | Replace the harness's test-only transcription with production calls | Claude | **done** |
-| 0.4 | Add media-type parity using listing `mode` + RSS categories | Claude | **open** |
+| 0.4 | Add media-type parity using listing `mode` + RSS categories | Claude | **done — and it found a sixth divergence** |
 | 0.5 | Re-run B2 reproductions | Claude | **done** — pre-fix loses data, current does not |
 | 0.6 | Correct this plan's contradictions | Claude | **done** — this document |
 | 0.7 | Approve T1, T2a, T2b and the Phase A/B contract | 🔒 Jesse | open |
@@ -130,11 +130,26 @@ construction invalidates Phase A and requires a fresh window.
 | 0.10 | Diagnostic-only rollback DB copy | Claude | open |
 | 0.11 | Deploy exactly that artifact | 🔒 Jesse | open |
 
-**0.4 is the one substantive gap left.** Listing media type is
-`mode == 'tv' or is_tv_release(title)` — it depends on which category URL was
-crawled — while RSS media type depends on the parsed season plus feed
-categories. A title-only fixture cannot exercise that asymmetry, so the parity
-fixtures must carry the listing mode and the RSS categories as inputs.
+**0.4 found a sixth divergence, and it was the most consequential of the six.**
+Listing media type is `mode == 'tv' or is_tv_release(title)`; RSS media type
+keyed purely off a parsed season. So four ordinary TV title forms —
+`Complete Series`, `Mini Series`, `TV Series`, `Season 4` — were classified as
+**movies** on the RSS path and TV on the listing path. `media_type` selects the
+Plex library in `get_hdencode_candidate_context()`, so the same release reached
+different actionable decisions depending on how it was found. That is the A4
+failure itself, live, on the path being promoted.
+
+It stayed invisible because the earlier harness compared four fields derived
+from a title, and media type is not derived from a title alone — `mode` is
+which category URL was crawled. A title-only fixture cannot express that, so the
+comparison was never made. Feed categories usually masked it, since feeds are
+per-category; "usually" was doing the work.
+
+Fixed by `title_indicates_tv()` in the shared grammar, deliberately title-only,
+with each path's out-of-band signal additive on top.
+
+**Phase 0 now has no open engineering work.** What remains is Jesse's: 0.7
+through 0.11.
 
 ### Phase 1 — bootstrap (~30 h, unattended)
 
