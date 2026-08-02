@@ -589,7 +589,17 @@ _DEFAULT_CONFIG: AppConfig = {
     "auto_grab_exclude_genres": "",
     "auto_grab_languages": "",
     "auto_grab_statuses": "missing,upgrade,dv_upgrade",
-    "desktop_notifications": True,
+    # OFF by default (changed 2026-08-02). Desktop dispatch goes through plyer,
+    # which shells out to a native backend with no timeout we can pass through.
+    # That call runs in an executor, and a permanently blocked executor callable
+    # is joined by concurrent.futures' _python_exit at interpreter shutdown
+    # whatever its daemon flag — so a hung notifier can hold the whole process
+    # open. Every other channel is bounded (HTTP 10s, SMTP see
+    # SMTP_TIMEOUT_SECONDS); this one cannot be, without a killable subprocess
+    # boundary that is not built. Shipping it off keeps desktop notifications
+    # out of the process-termination contract rather than leaving an unbounded
+    # path enabled on a fresh install. Existing configs keep their saved value.
+    "desktop_notifications": False,
     "discord_webhook": "",
     "discord_username": "ScanHound",
     "slack_webhook": "",

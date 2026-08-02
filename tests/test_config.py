@@ -197,7 +197,11 @@ class TestDefaultConfig:
         assert _DEFAULT_CONFIG["year_tolerance"] == 1
 
     def test_default_config_notification_defaults(self):
-        assert _DEFAULT_CONFIG["desktop_notifications"] is True
+        # OFF deliberately: plyer's dispatch is unbounded and runs in an
+        # executor, where a wedged callable blocks interpreter exit. Flipping
+        # this back to True re-enables that path on every fresh install — see
+        # the rationale in backend/config.py.
+        assert _DEFAULT_CONFIG["desktop_notifications"] is False
         assert _DEFAULT_CONFIG["discord_username"] == "ScanHound"
         assert _DEFAULT_CONFIG["webhook_method"] == "POST"
         assert _DEFAULT_CONFIG["smtp_port"] == 587

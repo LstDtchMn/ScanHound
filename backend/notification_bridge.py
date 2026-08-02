@@ -37,13 +37,11 @@ class NotificationBridge:
         # Map config keys to notification channels
         notif_config = {}
 
-        # Desktop. NOTE: the `False` fallback here is NOT the effective
-        # default — _DEFAULT_CONFIG (backend/config.py) ships
-        # desktop_notifications=True and tests/test_config.py pins it, so
-        # the key is always present and this branch is normally taken. The
-        # fallback only covers a config dict built without the defaults.
-        # What actually spares the headless container is the gdbus/
-        # notify-send probe in DesktopNotificationChannel._get_notifier.
+        # Desktop — off unless explicitly enabled. _DEFAULT_CONFIG now ships
+        # desktop_notifications=False (see backend/config.py for why: plyer's
+        # dispatch is unbounded and can hold interpreter exit open), so this
+        # fallback and the configured value agree instead of the fallback being
+        # dead as it was before 2026-08-02.
         if config.get("desktop_notifications", False):
             notif_config["desktop_enabled"] = True
 

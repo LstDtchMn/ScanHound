@@ -166,16 +166,22 @@ class DesktopNotificationChannel(NotificationChannel):
             # open. EmailChannel got a real socket timeout for exactly this
             # reason; there is no equivalent knob for plyer.
             #
-            # NOT ACCEPTED — open work. An earlier note here claimed the risk
-            # was narrow because desktop_notifications defaults to off. That
-            # was WRONG: backend/config.py ships it True and
-            # tests/test_config.py pins that, so this channel is enabled on a
-            # fresh config. Only the gdbus/notify-send probe in
-            # _get_notifier spares the headless container — on a desktop
-            # install with a backend present, this unbounded call is live.
-            # A second unbounded dispatch exists at
-            # backend/api/routes/settings.py (/settings/test/desktop); both
-            # need the same killable, wall-clock-bounded dispatcher.
+            # HANDLED BY POLICY, NOT BY A BOUND: desktop notifications are now
+            # OFF by default (backend/config.py), which removes this path from
+            # the process-termination contract instead of leaving an unbounded
+            # call enabled on every fresh install. Turning the channel on is an
+            # explicit opt-in to that risk.
+            #
+            # An earlier note here argued the risk was already narrow "because
+            # desktop_notifications defaults to off". That was false when
+            # written — the default was True — and flipping it is what made the
+            # statement true. Recorded because the note read plausibly for a
+            # whole review round before anyone checked config.py.
+            #
+            # If this is ever defaulted back on, it needs a real bound first:
+            # a killable subprocess boundary that also kills the descendant
+            # process group, covering BOTH this call and the second unbounded
+            # dispatch at backend/api/routes/settings.py (/settings/test/desktop).
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
