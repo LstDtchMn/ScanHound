@@ -353,3 +353,141 @@ def test_binding_is_per_thread(tracing_on):
 
     assert seen["outer"] == outer.scan_uuid
     assert seen["inside"] is None, "a different thread must not inherit the binding"
+
+
+# ── round 5 P2: completion and binding edge gaps ──────────────────────
+
+def test_binding_is_released_when_the_body_raises(tracing_on):
+    """A setup failure must not strand the binding on a reused thread.
+
+    Round 5 P2: run_scan drove the binder with a bare __enter__() and released
+    it from a later finally, so anything raising in between left the thread
+    permanently attributed to a dead operation.
+    """
+    context = sc.new_operation(sc.ORIGIN_DIRECT)
+    with pytest.raises(RuntimeError):
+        with sc.bind_current_operation(context):
+            assert sc.current_operation_uuid() == context.scan_uuid
+            raise RuntimeError("setup blew up")
+    assert sc.current_operation_uuid() is None
+
+
+def test_nested_binding_restores_the_outer_operation(tracing_on):
+    outer = sc.new_operation(sc.ORIGIN_API_MANUAL)
+    inner = sc.new_operation(sc.ORIGIN_BACKGROUND_PERIODIC)
+    with sc.bind_current_operation(outer):
+        with sc.bind_current_operation(inner):
+            assert sc.current_operation_uuid() == inner.scan_uuid
+        assert sc.current_operation_uuid() == outer.scan_uuid
+    assert sc.current_operation_uuid() is None
+
+
+# ── Phase 3 red baseline: publication authority ───────────────────────
+#
+# These encode the two authority failures measured in Phase 2. They are
+# xfail(strict=True) rather than plain failures so the suite stays green while
+# describing the defect: when Phase 3 lands the fence, they XPASS, strict mode
+# turns that into a failure, and whoever fixes it must delete the marker. That
+# is the red baseline round 5 asked to preserve, without a permanently red
+# branch.
+
+
+class _FakeRegistry:
+    """Minimal stand-in for ServiceRegistry's ownership contract."""
+
+    def __init__(self, generation=1):
+        self._generation = generation
+        self._shutdown = False
+
+    @property
+    def lifespan_generation(self):
+        return self._generation
+
+    def owns_lifespan(self, generation):
+        return generation == self._generation and not self._shutdown
+
+    def begin_lifespan(self):
+        self._generation += 1
+        self._shutdown = False
+        return self._generation
+
+    def request_shutdown(self):
+        self._shutdown = True
+
+
+def _publish_under(reg, context):
+    """What _run_scan does today: publish without consulting authority."""
+    published = []
+    context.record(
+        sc.PUBLISH_LAST_SCAN_ITEMS,
+        active_lifespan_generation=reg.lifespan_generation,
+        still_owns_lifespan=reg.owns_lifespan(context.accepted_lifespan_generation),
+    )
+    published.append("last_scan_items")
+    return published
+
+
+@pytest.mark.xfail(strict=True, reason="Phase 3: no publication fence yet")
+def test_no_publication_after_same_generation_shutdown(tracing_on):
+    """Cause 1 of 2, measured: shutdown requested, generation unchanged.
+
+    A fence built on generation equality alone passes this case, which is
+    exactly why it must not be built that way.
+    """
+    reg = _FakeRegistry(generation=9)
+    context = sc.new_operation(
+        sc.ORIGIN_API_MANUAL, lifespan_generation=reg.lifespan_generation)
+    context.snapshot_entry(lifespan_generation=reg.lifespan_generation)
+
+    reg.request_shutdown()
+    assert reg.lifespan_generation == context.accepted_lifespan_generation
+
+    assert _publish_under(reg, context) == [], "must not publish during teardown"
+
+
+@pytest.mark.xfail(strict=True, reason="Phase 3: no publication fence yet")
+def test_no_publication_after_generation_rollover(tracing_on):
+    """Cause 2 of 2, measured: scan c0b9ab57 published under 16, accepted 10."""
+    reg = _FakeRegistry(generation=10)
+    context = sc.new_operation(
+        sc.ORIGIN_API_MANUAL, lifespan_generation=reg.lifespan_generation)
+    context.snapshot_entry(lifespan_generation=reg.lifespan_generation)
+
+    for _ in range(6):
+        reg.begin_lifespan()
+    assert reg.lifespan_generation == 16
+
+    assert _publish_under(reg, context) == [], "must not publish across a rollover"
+
+
+def test_both_authority_failures_are_visible_to_the_instrument(tracing_on):
+    """Not xfail: the INSTRUMENT must already see both causes today.
+
+    This is what makes the two xfail tests above trustworthy — if the recorder
+    could not distinguish these, the red baseline would be meaningless.
+    """
+    same_gen = _FakeRegistry(generation=9)
+    ctx_a = sc.new_operation(
+        sc.ORIGIN_API_MANUAL, lifespan_generation=9)
+    same_gen.request_shutdown()
+    _publish_under(same_gen, ctx_a)
+
+    rolled = _FakeRegistry(generation=10)
+    ctx_b = sc.new_operation(
+        sc.ORIGIN_API_MANUAL, lifespan_generation=10)
+    rolled.begin_lifespan()
+    _publish_under(rolled, ctx_b)
+
+    def authority(ctx):
+        return [e.still_owns_lifespan for e in ctx.trace.events()
+                if e.stage.startswith("publish_")]
+
+    assert authority(ctx_a) == [False], "same-generation teardown must be seen"
+    assert authority(ctx_b) == [False], "rollover must be seen"
+    # And the two are distinguishable by generation comparison alone.
+    gens_a = [e.active_lifespan_generation for e in ctx_a.trace.events()
+              if e.stage.startswith("publish_")]
+    gens_b = [e.active_lifespan_generation for e in ctx_b.trace.events()
+              if e.stage.startswith("publish_")]
+    assert gens_a == [9], "teardown case keeps its generation"
+    assert gens_b == [11], "rollover case does not"

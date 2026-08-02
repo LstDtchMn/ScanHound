@@ -369,9 +369,6 @@ class ScannerService:
             scan_context.RUN_SCAN_ENTERED, source_kind=source_type)
         # Bind for this thread so an out-of-band observer (the netwatch gate)
         # can name the owning operation without parsing a thread name.
-        _bind = scan_context.bind_current_operation(operation_context)
-        _bind.__enter__()
-
         self.stop_scan_flag = False
         self.is_scanning = True
         with self._items_lock:
@@ -385,6 +382,12 @@ class ScannerService:
         # Sync to matching engine's app bridge so check_download_history() works
         self.matching.app.download_history = self.download_history
 
+        # Bound immediately before the try whose finally releases it, so no
+        # statement can raise in between and strand the binding on a reused
+        # caller thread (round 5 P2). The setup above performs no network I/O,
+        # so it does not need attribution.
+        _bind = scan_context.bind_current_operation(operation_context)
+        _bind.__enter__()
         try:
             loop = asyncio.new_event_loop()
             operation_context.record(scan_context.EVENT_LOOP_CREATED)

@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from backend.api.main import create_app
 from backend.api.dependencies import registry
+from backend import scan_context
 from backend.database import DatabaseManager
 
 
@@ -99,6 +100,22 @@ class TestBackgroundStatus:
         # Scanner exists (created at startup). Stub scan_once so the trigger
         # doesn't kick off a real (network) scrape; just confirm it's invoked.
         called = threading.Event()
-        registry._background_scanner.scan_once = lambda: called.set()
+        seen = {}
+
+        def _fake_scan_once(*args, **kwargs):
+            # Records rather than ignores: the route now marks the manual origin
+            # as state before starting the thread, and that is behaviour worth
+            # asserting rather than merely tolerating.
+            seen["args"] = args
+            seen["kwargs"] = kwargs
+            seen["origin"] = getattr(
+                registry._background_scanner, "next_scan_origin", None)
+            called.set()
+
+        registry._background_scanner.scan_once = _fake_scan_once
         assert client.post("/background/scan-now").status_code == 200
         assert called.wait(timeout=2.0)
+        # The call surface must stay parameterless — widening it broke this very
+        # test once already.
+        assert seen["args"] == () and seen["kwargs"] == {}
+        assert seen["origin"] == scan_context.ORIGIN_BACKGROUND_MANUAL

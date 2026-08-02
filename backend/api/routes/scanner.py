@@ -152,13 +152,32 @@ def _still_owns(reg, context) -> "bool | None":
 
 def _run_scan(reg: ServiceRegistry, req: ScanRequest,
               context: "scan_context.ScanOperationContext | None" = None) -> None:
-    """Execute scan in background thread."""
-    global _last_scan_items
+    """Execute a scan on a background thread, marking completion unconditionally.
 
+    A thin wrapper so THREAD_FINISHED is recorded on EVERY exit path — normal
+    return, slot rejection, missing scanner, and any exception raised before the
+    inner try is even entered. Round 5 P2: the marker was previously attached to
+    individual paths and several returns had none, which made
+    "did the worker outlive its outer thread" undecidable on those paths.
+    """
     if context is None:
         # Scheduler and direct callers that predate the context still work.
         context = scan_context.new_operation(
             scan_context.ORIGIN_UNKNOWN, source_kind=req.source)
+    try:
+        _run_scan_inner(reg, req, context)
+    finally:
+        context.record(
+            scan_context.THREAD_FINISHED,
+            active_lifespan_generation=getattr(reg, "lifespan_generation", None),
+            still_owns_lifespan=_still_owns(reg, context),
+        )
+
+
+def _run_scan_inner(reg: ServiceRegistry, req: ScanRequest,
+                    context: "scan_context.ScanOperationContext") -> None:
+    """Execute scan in background thread."""
+    global _last_scan_items
 
     scanner = reg.scanner
     # Identity only — deliberately not a strong reference. Holding the accepted
@@ -169,7 +188,6 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest,
         scanner=scanner,
     )
     if not scanner:
-        context.record(scan_context.THREAD_FINISHED)
         return
 
     # Claim the global scan slot so we never run concurrently with a background
@@ -324,16 +342,8 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest,
             _scan_state["progress"] = 0.0
             _scan_state["phase"] = ""
             _scan_state["holds_slot"] = False
-        # Unconditional. Previously this was recorded ONLY on the `not scanner`
-        # early return, so a normally-completing scan left no completion marker
-        # and worker-outlives-outer-thread could not be decided — round 4's P1.
-        # Sampling the live generation here also catches an operation that
-        # entered under its own owner and then outlived a later rollover.
-        context.record(
-            scan_context.THREAD_FINISHED,
-            active_lifespan_generation=getattr(reg, "lifespan_generation", None),
-            still_owns_lifespan=_still_owns(reg, context),
-        )
+        # THREAD_FINISHED is recorded by the _run_scan wrapper so it covers
+        # every exit path, including the ones that return before reaching here.
 
 
 def _media_item_to_dict(item: Any) -> Dict[str, Any]:
