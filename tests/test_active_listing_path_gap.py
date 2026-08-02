@@ -102,26 +102,37 @@ def test_detail_scraper_season_width_matches_the_shared_grammar():
         "DetailScraper still uses its own two-digit season cap")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "ScannerService._process_posts derives media type as "
-    "`details.get('is_tv') or post_info['type'] == 'tv'` — DetailScraper's "
-    "filename verdict OR the source descriptor hint. The listing TITLE is not "
-    "consulted, so title_indicates_tv() cannot participate."))
+# ───────────────────────── CLOSED 2026-08-02 ───────────────────────────────
+# These two were xfail(strict=True) and began XPASSing when the active scanner
+# path was wired up, which is exactly what strict xfail is for. They are now
+# ordinary assertions guarding against regression.
+
 def test_scanner_service_uses_the_shared_grammar():
-    assert "release_grammar" in _source_of("backend.scanner_service")
+    """_process_posts resolves media type through release_grammar's authority
+    lattice instead of `details['is_tv'] or post_info['type'] == 'tv'`."""
+    source = _source_of("backend.scanner_service")
+    assert "release_grammar" in source
+    assert "resolve_media_type" in source
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "_crawl_pages reads the listing title into post_title, uses it only for the "
-    "full-disc check, and appends "
-    "{'url', 'type', 'source', 'category'} — no title. A title-derived rule "
-    "cannot run downstream because the title is gone by then."))
 def test_the_ordinary_post_record_carries_the_listing_title():
+    """The listing title survives _crawl_pages. It used to be read, used for
+    the full-disc check, and dropped — so no title-derived rule could run
+    downstream."""
     source = _source_of("backend.scanner_service")
     marker = "all_posts.append({'url': post_url"
     start = source.index(marker)
     record = source[start:source.index("}", start)]
-    assert "post_title" in record or "'title'" in record
+    assert "'title': post_title" in record
+
+
+def test_the_listing_route_is_not_allowed_to_outrank_the_title():
+    """The route enters at ROUTE authority, the weakest level. If it were ever
+    raised, a movies-category page could overrule a 'Complete Series' title —
+    which is divergence (f) restored."""
+    source = _source_of("backend.scanner_service")
+    assert "Authority.ROUTE, 'listing-route'" in source, (
+        "the listing crawl route must enter the resolver at ROUTE authority")
 
 
 # ─────────────── the fact that makes the parity harness misaimed ────────────
