@@ -40,8 +40,9 @@ parser question, so resolution comparisons go through
 """
 from __future__ import annotations
 
+import enum
 import re
-from typing import NamedTuple, Optional
+from typing import Iterable, NamedTuple, Optional
 
 # ─────────────────────────────── year ───────────────────────────────────────
 
@@ -153,6 +154,100 @@ _TV_FORM_RES = (
     re.compile(r"(?<!\w)Mini[\s.-]*Series(?!\w)", re.I),
     re.compile(r"(?<!\w)TV\s*Series(?!\w)", re.I),
 )
+
+
+class MediaType(str, enum.Enum):
+    """Three outcomes, because two cannot express disagreement.
+
+    ``AMBIGUOUS`` is the point of this enum. A boolean forces every conflict to
+    resolve silently to one side, and the whole class of defects this module
+    exists to fix is exactly that: a confident wrong answer produced where the
+    honest answer was "the evidence disagrees".
+    """
+
+    TV = "tv"
+    MOVIE = "movie"
+    AMBIGUOUS = "ambiguous"
+
+
+class Authority(enum.IntEnum):
+    """How much a signal is entitled to decide. Higher wins outright.
+
+    The key judgement is that ROUTE sits at the bottom: which feed a release
+    arrived on, or which category page it was crawled from, is **routing
+    metadata, not identity**. Divergence (f) proved it — a TV-shaped release
+    genuinely appears in a movies feed — and the converse happens too, so a
+    route may resolve a silent title but must never contradict a spoken one.
+    """
+
+    ROUTE = 1      # feed category, listing crawl mode
+    TITLE = 2      # release-title grammar
+    DETAIL = 3     # hydrated detail filename
+    IDENTITY = 4   # confirmed external id, or a unique library match
+
+
+class TypeEvidence(NamedTuple):
+    media_type: MediaType   # TV or MOVIE; AMBIGUOUS is an output, not an input
+    authority: Authority
+    source: str = "unknown"  # provenance label, so a verdict can be explained
+
+
+class MediaTypeVerdict(NamedTuple):
+    media_type: MediaType
+    #: True when nothing above ROUTE spoke. The verdict is usable for routing
+    #: and display, but must not by itself authorise an autonomous action.
+    provisional: bool
+    #: Provenance of the deciding evidence, and of anything it overruled. Kept
+    #: because a bare "ambiguous" is unactionable.
+    because: tuple
+
+
+def resolve_media_type(evidence: Iterable[TypeEvidence]) -> MediaTypeVerdict:
+    """Merge typed evidence into one verdict.
+
+    Rules, in order:
+
+    * no evidence at all -> AMBIGUOUS, provisional;
+    * only the highest authority level present decides — lower levels never
+      override it, and never contribute to a conflict;
+    * unanimity at that level -> that type;
+    * disagreement at that level -> AMBIGUOUS (a strong conflict is a real
+      finding, not something to average away);
+    * a verdict decided solely by ROUTE is marked provisional.
+
+    Deliberately NOT a boolean OR of "anything says TV". That rule cannot
+    represent a contradiction, so it resolves every one of them to TV — which
+    is how a film sitting on a TV page becomes a series.
+    """
+    items = [e for e in evidence if e is not None]
+    if not items:
+        return MediaTypeVerdict(MediaType.AMBIGUOUS, True, ("no evidence",))
+
+    top = max(e.authority for e in items)
+    deciding = [e for e in items if e.authority == top]
+    types = {e.media_type for e in deciding}
+    why = tuple(sorted(f"{e.source}={e.media_type.value}" for e in deciding))
+
+    if len(types) > 1:
+        return MediaTypeVerdict(MediaType.AMBIGUOUS, False, why)
+
+    decided = types.pop()
+    overruled = tuple(sorted(
+        f"{e.source}={e.media_type.value} (overruled)"
+        for e in items if e.authority < top and e.media_type is not decided))
+    return MediaTypeVerdict(decided, top is Authority.ROUTE, why + overruled)
+
+
+def title_type_evidence(text: str, *, source: str = "title") -> Optional[TypeEvidence]:
+    """TV evidence from a title, or None when the title says nothing.
+
+    Returns None rather than MOVIE for a silent title. ``title_indicates_tv``
+    being False means "no TV signal here", never "this is a film" — asserting
+    the latter would let a neutral title outrank a trustworthy feed category,
+    which is the opposite of the intended precedence.
+    """
+    return (TypeEvidence(MediaType.TV, Authority.TITLE, source)
+            if title_indicates_tv(text) else None)
 
 
 def title_indicates_tv(text: str) -> bool:
