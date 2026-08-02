@@ -51,8 +51,12 @@ def background_scan_now(reg: ServiceRegistry = Depends(get_registry)):
         raise HTTPException(status_code=409, detail="A background scan is already running")
     # Manual trigger, not the periodic loop — the two were indistinguishable in
     # traces because both called the parameterless scan_once(). Round 4 P2.
+    # Set as state rather than passed as a kwarg: tests stub scan_once with a
+    # zero-argument lambda, so calling it with arguments breaks them.
+    try:
+        scanner.next_scan_origin = scan_context.ORIGIN_BACKGROUND_MANUAL
+    except Exception:
+        pass
     threading.Thread(
-        target=scanner.scan_once,
-        kwargs={"origin": scan_context.ORIGIN_BACKGROUND_MANUAL},
-        name="background-scan-now", daemon=True).start()
+        target=scanner.scan_once, name="background-scan-now", daemon=True).start()
     return {"status": "triggered"}

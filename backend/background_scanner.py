@@ -53,6 +53,12 @@ class BackgroundScanner:
         # short-lived (one instance per scan), so recovery evidence must live
         # here rather than on the service instance.
         self._rss_first_cycle_after_startup = True
+        # Origin for the NEXT scan_once(), set by the manual-trigger route.
+        # Carried as state rather than a call argument because scan_once and
+        # _scan_source are both monkeypatched by tests with fakes bound to the
+        # historical signatures; widening those broke two of them.
+        self.next_scan_origin: Optional[str] = None
+        self._current_scan_origin: Optional[str] = None
 
     @staticmethod
     def _rss_normal_feeds_complete(feeds, *, listing_error=None) -> bool:
@@ -231,6 +237,12 @@ class BackgroundScanner:
         Safe to call directly (used by POST /background/scan-now). Returns a
         small summary dict.
         """
+        self._current_scan_origin = (
+            origin
+            or self.next_scan_origin
+            or scan_context.ORIGIN_BACKGROUND_PERIODIC
+        )
+        self.next_scan_origin = None
         reg = self._reg
         cfg = reg.config or {}
         scanner = reg.scanner
@@ -418,7 +430,7 @@ class BackgroundScanner:
                 items: List[Any] = []
                 try:
                     items = self._scan_source(
-                        source, source_pages, cached_urls, origin=origin
+                        source, source_pages, cached_urls
                     )
                 except Exception as e:
                     err = str(e)
@@ -571,8 +583,7 @@ class BackgroundScanner:
         return flags if any(flags.values()) else dict(_ALL_CATEGORY_FLAGS)
 
     def _scan_source(self, source: str, pages: int,
-                     skip_urls: Optional[set] = None,
-                     origin: Optional[str] = None) -> List[Any]:
+                     skip_urls: Optional[set] = None) -> List[Any]:
         """Run a single source's scan and return its MediaItems.
 
         Raises on hard failure so the caller can record a per-source error.
@@ -583,7 +594,7 @@ class BackgroundScanner:
         from backend.api.routes.scanner import _SOURCE_NAME_MAP, _SCAN_TYPE_MAP
         source_type = _SOURCE_NAME_MAP.get(str(source).lower(), source)
         _bg_context = scan_context.new_operation(
-            origin or scan_context.ORIGIN_BACKGROUND_PERIODIC,
+            self._current_scan_origin or scan_context.ORIGIN_BACKGROUND_PERIODIC,
             parent_operation=f"background-cycle-{self._lifespan_generation}",
             lifespan_generation=getattr(self._reg, "lifespan_generation", None),
             scanner=getattr(self._reg, "scanner", None),
