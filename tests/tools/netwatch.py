@@ -1,85 +1,195 @@
-"""Pytest plugin: record every outbound socket connect, block non-loopback.
+"""Enforcement gate: unauthorized outbound network access fails the test run.
 
-Answers "does the suite attempt real egress, from which thread, during which
-test" without actually sending traffic to third parties. Doubles as a
-prototype of the conftest network guard.
+Run with ``-p netwatch``.
+
+This is the *enforcement* half of the pair. ``tests/tools/probe.py`` is the
+*diagnostic* half: it blocks and records but lets the run stay green. This
+module blocks, records, and forces a non-zero pytest exit status.
+
+Why the exit status is forced rather than surfaced as a test failure: the
+application catches broad ``Exception`` around its network calls, so an
+``OSError`` raised at the socket boundary is swallowed and the run still
+reports "296 passed". Measured 2026-08-02 — two blocked egress attempts to
+hdencode.org produced zero test failures. An exception alone is therefore not
+a usable signal; the ledger has to be checked out-of-band at session end.
+
+Attribution caveat: ``observed_during_test`` is the pytest node that happened
+to be running when a *leaked* worker made the attempt. It is NOT necessarily
+the test that created that worker. The ``originating_operation`` field is
+reserved for the scan-operation context planned in Phase 2 and stays None
+until that lands. Do not read the observed node as the culprit.
 """
+from __future__ import annotations
+
+import os
 import socket
 import threading
+import traceback
+from dataclasses import dataclass, field
 
 import pytest
 
-_CURRENT = {"nodeid": "<session>"}
-_SEEN = []
+# Loopback and non-inet targets are always permitted: in-process ASGI clients,
+# unix sockets, and local fixture servers are legitimate.
+_ALWAYS_ALLOWED = {"127.0.0.1", "::1", "localhost", "0.0.0.0", "", "::"}
+
+# Additional hosts a local fixture server may declare, comma-separated.
+# Deliberately NOT a place to put hdencode.org — allowlisting the real target
+# to make the suite green would encode the defect being hunted.
+_ENV_ALLOW = "SCANHOUND_NETWATCH_ALLOW"
+
+_STACK_FRAMES = 12
+
+
+@dataclass
+class _Attempt:
+    kind: str
+    host: str
+    port: object
+    thread_name: str
+    thread_ident: object
+    observed_during_test: str
+    originating_operation: object = None  # Phase 2 fills this in.
+    stack: list = field(default_factory=list)
+
+
+class UnauthorizedEgress(OSError):
+    """Raised at the socket boundary to stop the call.
+
+    Subclasses OSError so application code that catches OSError/Exception
+    behaves as it would against a real network failure. The run is failed via
+    the ledger, not via this exception.
+    """
+
+
+_LEDGER: list = []
 _LOCK = threading.Lock()
-
-_LOOPBACK = {"127.0.0.1", "::1", "localhost", "0.0.0.0", ""}
-
-
-class BlockedEgress(OSError):
-    pass
+_CURRENT = {"nodeid": "<session start, before any test>"}
+_INSTALLED = {"done": False}
 
 
-def _record(host, port):
-    entry = (
-        str(host),
-        port,
-        threading.current_thread().name,
-        _CURRENT["nodeid"],
+def _allowed_hosts() -> set:
+    extra = os.environ.get(_ENV_ALLOW, "")
+    return _ALWAYS_ALLOWED | {h.strip() for h in extra.split(",") if h.strip()}
+
+
+def _record(kind: str, host, port) -> _Attempt:
+    attempt = _Attempt(
+        kind=kind,
+        host=str(host),
+        port=port,
+        thread_name=threading.current_thread().name,
+        thread_ident=threading.current_thread().ident,
+        observed_during_test=_CURRENT["nodeid"],
+        stack=traceback.format_stack(limit=_STACK_FRAMES),
     )
     with _LOCK:
-        _SEEN.append(entry)
-    return entry
+        _LEDGER.append(attempt)
+    return attempt
 
 
-def pytest_sessionstart(session):
+def pytest_configure(config):
+    """Install the socket guard as early as possible."""
+    if _INSTALLED["done"]:
+        return
+    _INSTALLED["done"] = True
+
     real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_create_connection = socket.create_connection
     real_getaddrinfo = socket.getaddrinfo
 
+    def _split(address):
+        if isinstance(address, tuple) and address:
+            return address[0], (address[1] if len(address) > 1 else None)
+        # AF_UNIX and anything else non-inet.
+        return address, None
+
     def guarded_connect(self, address, *a, **kw):
-        host = address[0] if isinstance(address, tuple) else address
-        port = address[1] if isinstance(address, tuple) and len(address) > 1 else None
-        if str(host) in _LOOPBACK:
+        host, port = _split(address)
+        if not isinstance(address, tuple) or str(host) in _allowed_hosts():
             return real_connect(self, address, *a, **kw)
-        entry = _record(host, port)
-        print(f"\nEGRESS connect {entry[0]}:{entry[1]} "
-              f"thread={entry[2]} test={entry[3]}", flush=True)
-        raise BlockedEgress(f"blocked outbound connect to {host}:{port}")
+        _record("connect", host, port)
+        raise UnauthorizedEgress(f"blocked outbound connect to {host}:{port}")
+
+    def guarded_connect_ex(self, address, *a, **kw):
+        host, port = _split(address)
+        if not isinstance(address, tuple) or str(host) in _allowed_hosts():
+            return real_connect_ex(self, address, *a, **kw)
+        _record("connect_ex", host, port)
+        raise UnauthorizedEgress(f"blocked outbound connect_ex to {host}:{port}")
+
+    def guarded_create_connection(address, *a, **kw):
+        host, port = _split(address)
+        if str(host) in _allowed_hosts():
+            return real_create_connection(address, *a, **kw)
+        _record("create_connection", host, port)
+        raise UnauthorizedEgress(f"blocked create_connection to {host}:{port}")
 
     def guarded_getaddrinfo(host, port, *a, **kw):
-        if str(host) in _LOOPBACK:
+        if str(host) in _allowed_hosts():
             return real_getaddrinfo(host, port, *a, **kw)
-        entry = _record(host, port)
-        print(f"\nEGRESS dns {entry[0]}:{entry[1]} "
-              f"thread={entry[2]} test={entry[3]}", flush=True)
-        raise BlockedEgress(f"blocked DNS lookup for {host}")
+        _record("dns", host, port)
+        raise UnauthorizedEgress(f"blocked DNS lookup for {host}")
 
     socket.socket.connect = guarded_connect
+    socket.socket.connect_ex = guarded_connect_ex
+    socket.create_connection = guarded_create_connection
     socket.getaddrinfo = guarded_getaddrinfo
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
+    """Track which node is running, including the gaps between tests."""
     _CURRENT["nodeid"] = item.nodeid
     yield
-    _CURRENT["nodeid"] = f"<after {item.nodeid}>"
+    # Attempts landing here came from a worker that outlived the test body.
+    _CURRENT["nodeid"] = f"<between tests, after {item.nodeid}>"
 
 
 def pytest_sessionfinish(session, exitstatus):
+    """Force a non-zero exit when the ledger is non-empty.
+
+    The application swallows the OSError, so per-test failures cannot be
+    relied on. This is the signal.
+    """
     with _LOCK:
-        seen = list(_SEEN)
-    print("\n\n===== EGRESS SUMMARY =====", flush=True)
-    print(f"total blocked attempts: {len(seen)}", flush=True)
-    by_host = {}
-    by_thread = {}
-    for host, port, thread, nodeid in seen:
-        by_host[host] = by_host.get(host, 0) + 1
-        # collapse Thread-N (_run_scan) -> _run_scan
-        key = thread.split("(")[-1].rstrip(")") if "(" in thread else thread
-        by_thread[key] = by_thread.get(key, 0) + 1
-    print("by host:", flush=True)
-    for h, n in sorted(by_host.items(), key=lambda kv: -kv[1]):
-        print(f"  {n:6d}  {h}", flush=True)
-    print("by thread:", flush=True)
-    for t, n in sorted(by_thread.items(), key=lambda kv: -kv[1]):
-        print(f"  {n:6d}  {t}", flush=True)
+        empty = not _LEDGER
+    if empty:
+        return
+    if session.exitstatus == 0:
+        session.exitstatus = 1
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    with _LOCK:
+        ledger = list(_LEDGER)
+    if not ledger:
+        terminalreporter.write_sep(
+            "=", "netwatch: no unauthorized egress", green=True)
+        return
+
+    terminalreporter.write_sep(
+        "=", f"netwatch: {len(ledger)} UNAUTHORIZED EGRESS ATTEMPT(S)", red=True
+    )
+    terminalreporter.write_line(
+        "Run failed by netwatch, not by an assertion: the application catches "
+        "the socket error, so no test reports it."
+    )
+    terminalreporter.write_line(
+        "'observed during' is where the attempt LANDED, not necessarily the "
+        "test that leaked the worker."
+    )
+    by_host: dict = {}
+    for a in ledger:
+        by_host[a.host] = by_host.get(a.host, 0) + 1
+    for host, count in sorted(by_host.items(), key=lambda kv: -kv[1]):
+        terminalreporter.write_line(f"  {count:5d}  {host}")
+    terminalreporter.write_line("")
+    for a in ledger:
+        terminalreporter.write_line(f"  {a.kind:18s} {a.host}:{a.port}")
+        terminalreporter.write_line(f"      thread:          {a.thread_name}")
+        terminalreporter.write_line(
+            f"      observed during: {a.observed_during_test}")
+        terminalreporter.write_line(
+            f"      originating op:  {a.originating_operation} (Phase 2)")
