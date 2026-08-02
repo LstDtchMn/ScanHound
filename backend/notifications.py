@@ -13,6 +13,7 @@ import html as html_lib
 import json
 import logging
 import shutil
+import math
 import smtplib
 import string
 import sys
@@ -165,14 +166,16 @@ class DesktopNotificationChannel(NotificationChannel):
             # open. EmailChannel got a real socket timeout for exactly this
             # reason; there is no equivalent knob for plyer.
             #
-            # Accepted on 2026-08-02 rather than fixed, because reaching it
-            # needs a backend that is PRESENT and HANGING: desktop_notifications
-            # defaults to off, the deployment target is headless Docker, and
-            # _get_notifier already disables the channel outright when neither
-            # gdbus nor notify-send exists. Bounding it properly means
-            # reimplementing plyer's dispatch behind subprocess.run(timeout=...)
-            # or isolating notification work in a killable subprocess — both
-            # larger changes than the residual risk justifies.
+            # NOT ACCEPTED — open work. An earlier note here claimed the risk
+            # was narrow because desktop_notifications defaults to off. That
+            # was WRONG: backend/config.py ships it True and
+            # tests/test_config.py pins that, so this channel is enabled on a
+            # fresh config. Only the gdbus/notify-send probe in
+            # _get_notifier spares the headless container — on a desktop
+            # install with a backend present, this unbounded call is live.
+            # A second unbounded dispatch exists at
+            # backend/api/routes/settings.py (/settings/test/desktop); both
+            # need the same killable, wall-clock-bounded dispatcher.
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
@@ -404,6 +407,35 @@ class GenericWebhookChannel(NotificationChannel):
 # handshake plus AUTH plus the send on one socket.
 SMTP_TIMEOUT_SECONDS = 30.0
 
+# Upper bound on a configured override. The point of the timeout is that the
+# process can exit; an hour-long one restores the defect while looking set.
+SMTP_TIMEOUT_MAX_SECONDS = 300.0
+
+
+def _coerce_smtp_timeout(value: Any) -> float:
+    """Return a finite, positive, bounded socket timeout.
+
+    None, 0, negatives, NaN, inf, non-numerics and absurd values all mean
+    the same thing operationally — no effective bound — so each falls back
+    to the default rather than silently disabling the guarantee. Config
+    reaches here from user-editable JSON, so it cannot be trusted to be a
+    sensible number."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return SMTP_TIMEOUT_SECONDS
+    if not math.isfinite(seconds) or seconds <= 0:
+        logger.warning(
+            "Ignoring unusable smtp_timeout %r; using %.0fs",
+            value, SMTP_TIMEOUT_SECONDS)
+        return SMTP_TIMEOUT_SECONDS
+    if seconds > SMTP_TIMEOUT_MAX_SECONDS:
+        logger.warning(
+            "Clamping smtp_timeout %.0fs to %.0fs so SMTP cannot hold "
+            "process exit open", seconds, SMTP_TIMEOUT_MAX_SECONDS)
+        return SMTP_TIMEOUT_MAX_SECONDS
+    return seconds
+
 
 class EmailChannel(NotificationChannel):
     """Email notifications via SMTP."""
@@ -427,7 +459,7 @@ class EmailChannel(NotificationChannel):
         self.from_addr = from_addr
         self.to_addrs = to_addrs
         self.use_tls = use_tls
-        self.timeout = timeout
+        self.timeout = _coerce_smtp_timeout(timeout)
 
     def _build_email(self, notification: Notification) -> MIMEMultipart:
         """Build email message."""
@@ -502,8 +534,12 @@ class EmailChannel(NotificationChannel):
         """Synchronous email sending."""
         msg = self._build_email(notification)
 
-        # timeout= bounds every socket operation on the connection, so
-        # connect, STARTTLS, AUTH and the send are all covered by it.
+        # timeout= is a SOCKET-INACTIVITY timeout, not a total transaction
+        # deadline: each exchange can consume it afresh, a slow-but-
+        # progressing peer keeps resetting it, and DNS resolution happens
+        # before any socket carries it. It fixes the case that was measured
+        # — a server that accepts and then never speaks — and is NOT the
+        # application-wide deadline (that is separate, later work).
         if self.use_tls:
             with smtplib.SMTP(self.smtp_host, self.smtp_port,
                               timeout=self.timeout) as server:

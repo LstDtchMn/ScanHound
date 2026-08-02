@@ -11,6 +11,7 @@ Measured 2026-08-02 on 3.12.9:
     plain daemon thread wedged  -> process exits, code 0
     executor worker wedged      -> process does NOT exit
 """
+import pathlib
 import socket
 import threading
 import time
@@ -133,3 +134,80 @@ def test_default_timeout_is_set_and_finite():
         smtp_host="h", smtp_port=1, username="u", password="p",
         from_addr="f@example.com", to_addrs=["t@example.com"])
     assert channel.timeout == SMTP_TIMEOUT_SECONDS
+
+
+# ── Process-level contract ────────────────────────────────────────────────
+# The bounded-socket tests above prove smtplib returns. They do NOT prove the
+# interpreter can exit, which is the property that actually matters: a blocked
+# executor callable is joined by concurrent.futures' _python_exit regardless of
+# any daemon flag. Only a child process can demonstrate that, so this asserts a
+# POSITIVE contract — SMTP cannot hold exit open — rather than pinning a defect.
+
+_CHILD = r'''
+import sys, time
+from backend.notification_bridge import NotificationBridge
+
+host, port = sys.argv[1], int(sys.argv[2])
+bridge = NotificationBridge()
+bridge.configure({
+    "desktop_notifications": False,     # keep the unbounded plyer path out of it
+    "email_enabled": True,
+    "smtp_host": host, "smtp_port": port,
+    "smtp_username": "u", "smtp_password": "p",
+    "email_from": "f@example.com", "email_to": ["t@example.com"],
+    "smtp_tls": True,
+    "smtp_timeout": 1.0,
+})
+bridge.send("info", "t", "m")
+time.sleep(1.0)                          # let the executor callable reach SMTP
+print("DISPATCHED", flush=True)
+bridge.shutdown()
+print("SHUTDOWN-RETURNED", flush=True)
+'''
+
+
+def test_a_blocked_smtp_send_cannot_hold_interpreter_exit(black_hole, tmp_path):
+    """A live SMTP executor operation must not stop the process terminating.
+
+    The child connects to a server that accepts and never replies, so the
+    executor worker is genuinely blocked in SMTP when shutdown runs — not
+    cancelled before it started. If smtp_timeout stops reaching the deployed
+    channel (it is forwarded through NotificationBridge.configure), the worker
+    blocks forever and _python_exit refuses to let the child exit.
+    """
+    import subprocess
+    import sys as _sys
+
+    script = tmp_path / "child.py"
+    script.write_text(_CHILD, encoding="utf-8")
+
+    import os
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    # Running a script BY PATH puts the script's dir on sys.path, not cwd,
+    # so the repo root has to be passed explicitly for `backend` to import.
+    env = dict(os.environ, PYTHONPATH=str(repo_root))
+    proc = subprocess.Popen(
+        [_sys.executable, str(script), "127.0.0.1", str(black_hole.port)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=str(repo_root), env=env,
+    )
+    began = time.monotonic()
+    try:
+        # Deliberately tight. The child's smtp_timeout is 1s, so a wired build
+        # finishes in a few seconds. If smtp_timeout stops reaching the deployed
+        # channel, the socket falls back to the 30s default and blows this
+        # budget — which is how this test enforces the BRIDGE PROPAGATION, not
+        # merely the existence of a timeout somewhere. Verified by mutation: at
+        # a 45s budget the unwired build still passed, in 31s.
+        out, err = proc.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()                      # never let this hang the suite
+        proc.communicate()
+        raise AssertionError(
+            "child did not exit: a blocked SMTP send held interpreter exit open")
+
+    assert "DISPATCHED" in out, f"child never dispatched.\nout={out}\nerr={err}"
+    assert "SHUTDOWN-RETURNED" in out, f"shutdown() did not return.\nerr={err}"
+    assert proc.returncode == 0, f"child exited {proc.returncode}\nerr={err}"
+    elapsed = time.monotonic() - began
+    assert elapsed < 15.0, f"child took {elapsed:.1f}s"

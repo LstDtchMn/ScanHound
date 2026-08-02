@@ -37,9 +37,13 @@ class NotificationBridge:
         # Map config keys to notification channels
         notif_config = {}
 
-        # Desktop — default OFF: ScanHound runs headless (Docker), where there
-        # is no desktop notification backend. Aligns with the channel registry
-        # default and prevents fresh installs from spamming gdbus errors.
+        # Desktop. NOTE: the `False` fallback here is NOT the effective
+        # default — _DEFAULT_CONFIG (backend/config.py) ships
+        # desktop_notifications=True and tests/test_config.py pins it, so
+        # the key is always present and this branch is normally taken. The
+        # fallback only covers a config dict built without the defaults.
+        # What actually spares the headless container is the gdbus/
+        # notify-send probe in DesktopNotificationChannel._get_notifier.
         if config.get("desktop_notifications", False):
             notif_config["desktop_enabled"] = True
 
@@ -57,8 +61,11 @@ class NotificationBridge:
         # Email
         if config.get("email_enabled", False):
             notif_config["email_enabled"] = True
+            # smtp_timeout included deliberately: EmailChannel accepted it
+            # while this list omitted it, so a configured value silently
+            # never reached the deployed channel.
             for k in ("smtp_host", "smtp_port", "smtp_username", "smtp_password",
-                       "email_from", "email_to", "smtp_tls"):
+                       "email_from", "email_to", "smtp_tls", "smtp_timeout"):
                 if k in config:
                     notif_config[k] = config[k]
 

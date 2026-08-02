@@ -594,9 +594,10 @@ def _join_lifespan_threads(reg: ServiceRegistry) -> None:
         if stragglers:
             logger.warning(
                 "Shutdown timed out after %.1fs waiting for background "
-                "thread(s): %s — abandoning them. They are plain daemon "
-                "threads, which do not hold up interpreter exit; a wedged "
-                "executor worker would, so investigate if shutdown then hangs.",
+                "thread(s): %s — abandoning them. Teardown is bounded; "
+                "PROCESS EXIT IS NOT, because a straggler's own workers "
+                "(executor threads, subprocesses) are not tracked here and "
+                "can still hold the interpreter open.",
                 LIFESPAN_JOIN_BUDGET_SECONDS, ", ".join(stragglers),
             )
     except Exception:
