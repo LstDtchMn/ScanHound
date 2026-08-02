@@ -136,15 +136,14 @@ def _parse_item(item):
     signals = parse_release_title(title)
     year_match = _DESC_YEAR_RE.search(plain_description)
     description_year = int(year_match.group(1)) if year_match else None
-    # An AMBIGUOUS season still counts as TV evidence. The grammar reports
-    # `season is None, ambiguous=True` for a token it cannot interpret (e.g.
-    # 'S104'); reading that as "no season" would file a TV release as a movie,
-    # which is the same class of mistake as the 'DTS5.1' defect in reverse.
-    # "Cannot tell" must never collapse into "definitely not".
+    # Title evidence comes from the SHARED rule, so this path and the listing
+    # path cannot disagree about the same string. Keying purely off a parsed
+    # season used to make 'Complete Series', 'Mini Series', 'TV Series' and
+    # 'Season 4' read as MOVIES here while the listing path read them as TV.
+    # Feed categories are additive on top: they may only ever add TV-ness.
     media_type = (
         "tv"
-        if signals["season"] is not None
-        or signals.get("season_ambiguous")
+        if grammar.title_indicates_tv(title)
         or any("tv" in category.lower() for category in categories)
         else "movie"
     )

@@ -17,6 +17,7 @@ from backend.release_grammar import (
     parse_size_gb,
     parse_year,
     strip_trailing_size,
+    title_indicates_tv,
 )
 
 
@@ -102,6 +103,51 @@ class TestSeasonEpisode:
     def test_leading_zeros_do_not_count_toward_the_width_limit(self):
         # 'S001' is season 1 written wide, not an over-wide season.
         assert parse_season_episode("Show S001E02 1080p").season == 1
+
+
+class TestTvEvidence:
+    """Divergence (f), found 2026-08-02 while closing the media-type gap.
+
+    The listing path recognised four TV title forms that the RSS path did not,
+    because RSS keyed purely off a parsed season. On the RSS side those releases
+    were classified as MOVIES, which selects the wrong Plex library downstream.
+    """
+
+    @pytest.mark.parametrize("title", [
+        "Great Show Complete Series 1080p WEB-DL",
+        "Docu Mini Series 1080p WEB-DL",
+        "Docu Mini-Series 1080p WEB-DL",
+        "Old Programme TV Series 1080p WEB-DL",
+        "Thing Season 4 1080p WEB-DL",
+        "Thing Season 12 1080p WEB-DL",
+    ])
+    def test_tv_forms_without_an_sxxexx_token_are_still_tv(self, title):
+        assert title_indicates_tv(title) is True
+
+    @pytest.mark.parametrize("title", [
+        "Some Show S01E02 1080p WEB-DL",
+        "Another Series S03 1080p WEB-DL",
+    ])
+    def test_season_tokens_are_tv(self, title):
+        assert title_indicates_tv(title) is True
+
+    def test_an_uninterpretable_season_is_still_tv(self):
+        # 'Cannot tell' must not collapse into 'not TV'.
+        assert title_indicates_tv("Long Run S104 2160p WEB-DL") is True
+
+    @pytest.mark.parametrize("title", [
+        "The Batman 2022 1080p BluRay x264-SPARKS",
+        "Movie With DTS5.1 Audio 2021 2160p WEB-DL",
+        "Old Film 1975 720p BluRay",
+    ])
+    def test_films_are_not_tv(self, title):
+        assert title_indicates_tv(title) is False
+
+    def test_the_rule_is_title_only(self):
+        """Out-of-band signals (listing crawl mode, RSS feed categories) are
+        each path's own business and are additive. If this rule ever consulted
+        them it could not be shared, which is the whole point."""
+        assert title_indicates_tv("The Batman 2022 1080p") is False
 
 
 class TestSize:
