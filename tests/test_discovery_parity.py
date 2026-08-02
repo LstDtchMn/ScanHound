@@ -1,10 +1,26 @@
-"""The two discovery paths must read a release title the same way.
-
-ScanHound reads the same source two ways:
+"""Title parity between the RSS reader and the ``SourceBase`` listing reader.
 
     RSS path      backend/sources/hdencode_feed_parser.py :: parse_release_title
     listing path  backend/sources/base.py :: SourceBase.extract_*
                   (inherited by hdencode.py, ddlbase.py and adithd.py)
+
+**SCOPE WARNING — read before citing this file as evidence.**
+``SourceBase`` is **not the listing reader the deployed HDEncode scan uses.**
+The live chain is ``ScannerService.run_scan()`` → ``DetailScraper`` →
+``ScannerService._process_posts()``, and nothing in it constructs
+``HDEncodeSource`` or calls ``SourceBase.parse_release()``. Media type there
+comes from ``DetailScraper``'s own filename regexes OR'd with the source
+descriptor hint; the listing title is discarded in ``_crawl_pages`` after the
+full-disc check.
+
+So this file proves ``RSS reader == SourceBase reader``. It does **not** prove
+``RSS path == deployed listing path``, and the six divergences below are fixed
+only for the former. ``tests/test_active_listing_path_gap.py`` holds the
+standing evidence for the latter and will turn red when it is closed.
+
+The file is still worth having: the RSS reader is the path being promoted, and
+these are its regressions. It is the *listing* half that is aimed at a
+non-deployed reader.
 
 They used to carry independent copies of the same four patterns. On 2026-08-01 a
 harness compared them and found **five divergences on twelve titles** —
