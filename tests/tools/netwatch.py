@@ -21,6 +21,7 @@ until that lands. Do not read the observed node as the culprit.
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import socket
 import threading
@@ -71,6 +72,15 @@ _INSTALLED = {"done": False}
 def _allowed_hosts() -> set:
     extra = os.environ.get(_ENV_ALLOW, "")
     return _ALWAYS_ALLOWED | {h.strip() for h in extra.split(",") if h.strip()}
+
+
+def _is_ip_literal(host) -> bool:
+    """True when *host* is a numeric address rather than a name to resolve."""
+    try:
+        ipaddress.ip_address(str(host).strip("[]"))
+    except ValueError:
+        return False
+    return True
 
 
 def _record(kind: str, host, port) -> _Attempt:
@@ -128,6 +138,17 @@ def pytest_configure(config):
 
     def guarded_getaddrinfo(host, port, *a, **kw):
         if str(host) in _allowed_hosts():
+            return real_getaddrinfo(host, port, *a, **kw)
+        if _is_ip_literal(host):
+            # A numeric literal resolves locally — getaddrinfo parses it and
+            # issues no DNS query, so nothing leaves the host and there is
+            # nothing to block. Connecting to it is still blocked below.
+            #
+            # This is not a nicety: the app's own SSRF protection resolves a
+            # configured webhook to decide whether it points at a private
+            # range. Blocking that lookup breaks the security check the test
+            # suite asserts on (test_ssrf_rejects_private_discord_webhook),
+            # which is how this was found.
             return real_getaddrinfo(host, port, *a, **kw)
         _record("dns", host, port)
         raise UnauthorizedEgress(f"blocked DNS lookup for {host}")

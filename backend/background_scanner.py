@@ -17,6 +17,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from backend.config import source_enabled
+from backend import scan_context
 
 logger = logging.getLogger(__name__)
 
@@ -580,6 +581,17 @@ class BackgroundScanner:
         """
         from backend.api.routes.scanner import _SOURCE_NAME_MAP, _SCAN_TYPE_MAP
         source_type = _SOURCE_NAME_MAP.get(str(source).lower(), source)
+        _bg_context = scan_context.new_operation(
+            scan_context.ORIGIN_BACKGROUND_PERIODIC,
+            parent_operation=f"background-cycle-{self._lifespan_generation}",
+            lifespan_generation=getattr(self._reg, "lifespan_generation", None),
+            scanner=getattr(self._reg, "scanner", None),
+            source_kind=source,
+        )
+        _bg_context.snapshot_entry(
+            lifespan_generation=getattr(self._reg, "lifespan_generation", None),
+            scanner=getattr(self._reg, "scanner", None),
+        )
         items = self._reg.scanner.run_scan(
             scan_type=_SCAN_TYPE_MAP.get("deep", "Deep Scan"),
             source_type=source_type,
@@ -589,6 +601,7 @@ class BackgroundScanner:
             track_urls=False,
             skip_urls=skip_urls,
             early_stop=True,
+            operation_context=_bg_context,
         )
         return list(items) if items else []
 

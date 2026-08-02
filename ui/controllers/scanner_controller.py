@@ -14,6 +14,7 @@ from backend.app_service import (
     COLOR_MISSING, COLOR_DOWNLOADED, COLOR_IN_LIBRARY, COLOR_UPGRADE, COLOR_DV_UPGRADE,
     RESOLUTION_ORDER,
 )
+from backend import scan_context
 from backend.scanner_service import ScannerService, MediaItem, ScanStatus
 from backend.plex_service import PlexService
 from backend.matching import MatchingEngine
@@ -124,6 +125,12 @@ class ScanWorker(QThread):
             self._scanner.set_log_callback(
                 lambda m, l: self.logMessage.emit(m, l)
             )
+            _qt_context = scan_context.new_operation(
+                scan_context.ORIGIN_QT_SCAN_WORKER,
+                scanner=self._scanner,
+                source_kind=self._source,
+            )
+            _qt_context.snapshot_entry(scanner=self._scanner)
             results = self._scanner.run_scan(
                 scan_type=self._scan_type,
                 source_type=self._source,
@@ -132,6 +139,7 @@ class ScanWorker(QThread):
                 search_query=self._search_query,
                 use_expired_cache=self._use_expired_cache,
                 plex_refresh_mode=self._plex_refresh_mode,
+                operation_context=_qt_context,
             )
             self.finished.emit(results)
         except Exception as e:

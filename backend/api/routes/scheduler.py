@@ -7,6 +7,7 @@ from typing import Optional
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.routes.scanner import ScanRequest, _run_scan, _scan_state, _scan_lock
+from backend import scan_context
 
 router = APIRouter(prefix="/scheduler", tags=["scheduler"])
 
@@ -99,8 +100,16 @@ def scheduler_trigger(reg: ServiceRegistry = Depends(get_registry)):
         if _scan_state["state"] == "running":
             raise HTTPException(status_code=409, detail="Scan already in progress")
         _scan_state["state"] = "running"
+        _sched_context = scan_context.new_operation(
+            scan_context.ORIGIN_API_SCHEDULER,
+            lifespan_generation=getattr(reg, "lifespan_generation", None),
+            scanner=getattr(reg, "scanner", None),
+            source_kind=getattr(req, "source", None),
+        )
+        _sched_context.record(scan_context.THREAD_STARTED)
         threading.Thread(
-            target=_run_scan, args=(reg, req), name="scheduled-scan", daemon=True
+            target=_run_scan, args=(reg, req, _sched_context),
+            name="scheduled-scan", daemon=True
         ).start()
 
     return {"status": "triggered"}

@@ -17,6 +17,7 @@ import requests
 from thefuzz import fuzz
 
 from backend.app_service import TMDB_GENRE_MAP, TMDB_LANGUAGE_MAP
+from backend import scan_context
 from backend.tmdb_client import TmdbClient
 
 logger = logging.getLogger(__name__)
@@ -111,7 +112,8 @@ class MetadataEnricher:
         self.scrapers = scrapers
         self.omdb_cache = omdb_cache
 
-    async def enrich(self, items, stop_flag_fn=None, progress_fn=None, log_fn=None):
+    async def enrich(self, items, stop_flag_fn=None, progress_fn=None,
+                     log_fn=None, operation_context=None):
         """Enrich a list of MediaItems in-place with external metadata.
 
         Skips items that already have a description.  Runs workers in a
@@ -287,8 +289,33 @@ class MetadataEnricher:
             except Exception as e:
                 logger.warning("Metadata enrichment failed for %s: %s", item.title, e)
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(fetch_metadata, item) for item in items_to_enrich]
+        _ctx = operation_context
+        _prefix = (
+            _ctx.executor_prefix(scan_context.EXECUTOR_METADATA)
+            if _ctx is not None else ""
+        )
+        with ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix=_prefix
+        ) as executor:
+            if _ctx is not None:
+                _ctx.record(
+                    scan_context.METADATA_EXECUTOR_CREATED,
+                    executor_kind=scan_context.EXECUTOR_METADATA)
+            futures = [
+                executor.submit(
+                    scan_context.run_with_scan_context,
+                    _ctx,
+                    scan_context.EXECUTOR_METADATA,
+                    scan_context.METADATA_STARTED,
+                    fetch_metadata,
+                    item,
+                )
+                for item in items_to_enrich
+            ]
+            if _ctx is not None:
+                _ctx.record(
+                    scan_context.METADATA_SUBMITTED,
+                    executor_kind=scan_context.EXECUTOR_METADATA)
             for future in as_completed(futures):
                 if stop_flag_fn and stop_flag_fn():
                     break

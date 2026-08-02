@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import re
+import functools
 import time
 import threading
 import requests
@@ -33,6 +34,7 @@ from backend.hdencode_coordinator import (
 from backend.hdencode_transport import create_source_http_client
 from backend.matching import MatchingEngine, clear_fuzzy_cache
 from backend.metadata_enricher import MetadataEnricher
+from backend import scan_context
 from backend.scrapers import WebScrapers
 
 logger = logging.getLogger(__name__)
@@ -323,6 +325,7 @@ class ScannerService:
         track_urls: bool = True,
         skip_urls: Optional[Set[str]] = None,
         early_stop: bool = False,
+        operation_context: "Optional[scan_context.ScanOperationContext]" = None,
     ) -> List[MediaItem]:
         """Run a full scan synchronously (call from background thread).
 
@@ -342,12 +345,28 @@ class ScannerService:
                 scan type loads.
             early_stop: If True, stop crawling a source once a populated listing
                 page yields no new (non-skipped) posts — the "previous endpoint".
+            operation_context: Identity of the scan operation, created by the
+                caller that accepted the request. Optional so the Qt worker,
+                direct tests and scripts keep working untouched; a ``direct``
+                context is created when omitted so every scan stays observable.
 
         Returns:
             List of MediaItem results.
         """
         pages = min(max(1, pages), 99)
         flags = resolution_flags or {"4k": True, "1080p": False, "remux": False, "tv": False}
+
+        # Carried on the instance rather than threaded through every internal
+        # signature. Not a process-global: each ScannerService has its own, and
+        # a service's scans are serialised by its own _scan_slot. Work submitted
+        # to executors still receives the context explicitly — a thread never
+        # reads this attribute to decide who it belongs to.
+        if operation_context is None:
+            operation_context = scan_context.new_operation(
+                scan_context.ORIGIN_DIRECT, source_kind=source_type)
+        self._operation_context = operation_context
+        operation_context.record(
+            scan_context.RUN_SCAN_ENTERED, source_kind=source_type)
 
         self.stop_scan_flag = False
         self.is_scanning = True
@@ -364,6 +383,23 @@ class ScannerService:
 
         try:
             loop = asyncio.new_event_loop()
+            operation_context.record(scan_context.EVENT_LOOP_CREATED)
+            # Own the loop's default executor instead of letting asyncio create
+            # an anonymous one lazily. Behaviour-neutral: the loop is fresh, so
+            # either way exactly one pool is created with ThreadPoolExecutor's
+            # default worker count, and neither is shut down here — Phase 3
+            # owns that. What changes is that listing workers are now named
+            # scan-<uuid>-listing instead of the ambiguous asyncio_0, which is
+            # what made event ownership unprovable.
+            listing_executor = ThreadPoolExecutor(
+                thread_name_prefix=operation_context.executor_prefix(
+                    scan_context.EXECUTOR_LISTING)
+            )
+            self._listing_executor = listing_executor
+            loop.set_default_executor(listing_executor)
+            operation_context.record(
+                scan_context.LISTING_EXECUTOR_CREATED,
+                executor_kind=scan_context.EXECUTOR_LISTING)
             try:
                 loop.run_until_complete(
                     self._run_scan_async(scan_type, source_type, pages, flags,
@@ -376,6 +412,7 @@ class ScannerService:
             self._log(f"Scan error: {e}", "error")
         finally:
             self.is_scanning = False
+            operation_context.record(scan_context.RESULTS_READY)
 
         return list(self.items)
 
@@ -761,13 +798,40 @@ class ScannerService:
                                 stop_requested=lambda: self.stop_scan_flag,
                                 priority=20,
                             ):
+                                _c = getattr(self, "_operation_context", None)
+                                if _c is not None and not scraper:
+                                    _c.record(
+                                        scan_context.LISTING_TRANSPORT_CONSTRUCTED,
+                                        executor_kind=scan_context.EXECUTOR_LISTING,
+                                        source_kind=source_id)
                                 client = scraper or create_source_http_client(hdencode=True)
                                 return client.get(u, timeout=15)
+                        _c = getattr(self, "_operation_context", None)
+                        if _c is not None and not scraper:
+                            _c.record(
+                                scan_context.LISTING_TRANSPORT_CONSTRUCTED,
+                                executor_kind=scan_context.EXECUTOR_LISTING,
+                                source_kind=source_id)
                         client = scraper or create_source_http_client(hdencode=False)
                         return client.get(u, timeout=15)
 
+                    _ctx = getattr(self, "_operation_context", None)
+                    if _ctx is not None:
+                        _ctx.record(
+                            scan_context.LISTING_SUBMITTED,
+                            executor_kind=scan_context.EXECUTOR_LISTING,
+                            source_kind=source_id)
                     try:
-                        resp = await loop.run_in_executor(None, _fetch_page)
+                        resp = await loop.run_in_executor(
+                            None,
+                            functools.partial(
+                                scan_context.run_with_scan_context,
+                                _ctx,
+                                scan_context.EXECUTOR_LISTING,
+                                scan_context.LISTING_STARTED,
+                                _fetch_page,
+                            ),
+                        )
                     except (HDEncodeTrafficDenied, HDEncodeRequestCancelled):
                         early_stopped = True
                         self.stop_scan_flag = True
@@ -990,8 +1054,33 @@ class ScannerService:
                 logger.debug("Error processing post %s: %s", url, e)
                 return None
 
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = [executor.submit(process_post, post) for post in all_posts]
+        _ctx = getattr(self, "_operation_context", None)
+        _prefix = (
+            _ctx.executor_prefix(scan_context.EXECUTOR_DETAIL)
+            if _ctx is not None else None
+        )
+        with ThreadPoolExecutor(
+            max_workers=num_threads, thread_name_prefix=_prefix or ""
+        ) as executor:
+            if _ctx is not None:
+                _ctx.record(
+                    scan_context.DETAIL_EXECUTOR_CREATED,
+                    executor_kind=scan_context.EXECUTOR_DETAIL)
+            futures = [
+                executor.submit(
+                    scan_context.run_with_scan_context,
+                    _ctx,
+                    scan_context.EXECUTOR_DETAIL,
+                    scan_context.DETAIL_STARTED,
+                    process_post,
+                    post,
+                )
+                for post in all_posts
+            ]
+            if _ctx is not None:
+                _ctx.record(
+                    scan_context.DETAIL_SUBMITTED,
+                    executor_kind=scan_context.EXECUTOR_DETAIL)
             for future in as_completed(futures):
                 if self.stop_scan_flag:
                     # Cancel queued (not-yet-started) futures so the executor
@@ -1015,6 +1104,10 @@ class ScannerService:
                             self._item_counter += 1
                             self.items.append(item)
 
+        if _ctx is not None:
+            _ctx.record(
+                scan_context.DETAIL_FINISHED,
+                executor_kind=scan_context.EXECUTOR_DETAIL)
         self._log(f"Processing complete: {len(self.items)} items created from {total_posts} posts")
 
     # ── Item creation ─────────────────────────────────────────────────
@@ -1533,6 +1626,7 @@ class ScannerService:
             stop_flag_fn=lambda: self.stop_scan_flag,
             progress_fn=self._progress,
             log_fn=self._log,
+            operation_context=getattr(self, "_operation_context", None),
         )
 
     # ── Grouping ──────────────────────────────────────────────────────

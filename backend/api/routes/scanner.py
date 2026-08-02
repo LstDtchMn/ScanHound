@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend.api.dependencies import ServiceRegistry, get_registry
+from backend import scan_context
 from backend.api.ws import ws_manager
 from backend.config import source_enabled
 from backend.scanner_service import ScanStatus, STATUS_COLORS, STATUS_TEXTS
@@ -134,19 +135,35 @@ def _log_callback(message: str, level: str = "info") -> None:
     })
 
 
-def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
+def _run_scan(reg: ServiceRegistry, req: ScanRequest,
+              context: "scan_context.ScanOperationContext | None" = None) -> None:
     """Execute scan in background thread."""
     global _last_scan_items
 
+    if context is None:
+        # Scheduler and direct callers that predate the context still work.
+        context = scan_context.new_operation(
+            scan_context.ORIGIN_UNKNOWN, source_kind=req.source)
+
     scanner = reg.scanner
+    # Identity only — deliberately not a strong reference. Holding the accepted
+    # scanner alive here would change the old/new/inert distribution this is
+    # meant to measure, and would be the start of the Phase 3 fix.
+    context.snapshot_entry(
+        lifespan_generation=getattr(reg, "lifespan_generation", None),
+        scanner=scanner,
+    )
     if not scanner:
+        context.record(scan_context.THREAD_FINISHED)
         return
 
     # Claim the global scan slot so we never run concurrently with a background
     # pre-cache scan (they share one ScannerService and would corrupt each
     # other's in-memory state). Foreground-vs-foreground is already serialized
     # by _scan_state; this guards foreground-vs-background.
+    context.record(scan_context.SLOT_ATTEMPTED)
     if not scanner.try_acquire_scan():
+        context.record(scan_context.SLOT_REJECTED)
         logger.info("Scan aborted: a background pre-cache scan is currently running")
         ws_manager.broadcast_sync({
             "type": "scan:error",
@@ -158,6 +175,8 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
             _scan_state["phase"] = ""
             _scan_state["holds_slot"] = False
         return
+
+    context.record(scan_context.SLOT_ACQUIRED)
 
     with _scan_lock:
         _scan_state["state"] = "running"
@@ -192,15 +211,18 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
             pages=req.pages,
             resolution_flags=req.flags,
             search_query=req.search_query,
+            operation_context=context,
         )
 
         duration = time.time() - start_time
 
         # Store results
+        context.record(scan_context.PUBLISH_LAST_SCAN_ITEMS)
         with _items_lock:
             _last_scan_items = list(items) if items else []
 
         # Broadcast each result
+        context.record(scan_context.PUBLISH_WEBSOCKET)
         for item in (items or []):
             item_dict = _media_item_to_dict(item)
             ws_manager.broadcast_sync({"type": "scan:result", "data": item_dict})
@@ -221,6 +243,7 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
         # so the UI showed "Just now" the moment a scan began. Manual scans
         # never updated it at all. Stamp it here so it reflects the real last
         # completed scan.
+        context.record(scan_context.PUBLISH_CONFIG)
         try:
             reg.config["last_scan_time"] = time.time()
             if reg.backend:
@@ -229,6 +252,7 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
             logger.warning("Failed to update last_scan_time")
 
         # Notify
+        context.record(scan_context.PUBLISH_NOTIFICATION)
         if reg.notifications:
             reg.notifications.notify_scan_complete(
                 total=stats["total"],
@@ -237,6 +261,7 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
             )
 
         # Auto-grab
+        context.record(scan_context.PUBLISH_AUTOGRAB)
         if reg.auto_grab and reg.auto_grab.enabled and items:
             try:
                 ws_manager.broadcast_sync({
@@ -364,7 +389,18 @@ def scan_start(
         if _scan_state["state"] == "running":
             raise HTTPException(status_code=409, detail="Scan already running")
         _scan_state["state"] = "running"
-        _scan_thread = threading.Thread(target=_run_scan, args=(reg, req), daemon=True)
+        # Snapshot the owner HERE, at acceptance. _run_scan dereferences
+        # reg.scanner again once its thread is scheduled, which may be after a
+        # lifespan rollover has replaced it; comparing the two is the point.
+        context = scan_context.new_operation(
+            scan_context.ORIGIN_API_MANUAL,
+            lifespan_generation=getattr(reg, "lifespan_generation", None),
+            scanner=scanner,
+            source_kind=req.source,
+        )
+        _scan_thread = threading.Thread(
+            target=_run_scan, args=(reg, req, context), daemon=True)
+        context.record(scan_context.THREAD_STARTED)
         _scan_thread.start()
     return {"status": "started", "type": req.type}
 

@@ -53,7 +53,8 @@ class _FakeScanner:
         self._last_crawl_seen_urls = set()
 
     def run_scan(self, scan_type, source_type, pages, resolution_flags=None,
-                 search_query="", track_urls=True, skip_urls=None, early_stop=False):
+                 search_query="", track_urls=True, skip_urls=None,
+                 early_stop=False, operation_context=None):
         self.calls.append({
             "source": source_type, "pages": pages, "scan_type": scan_type,
             "track_urls": track_urls, "skip_urls": skip_urls, "early_stop": early_stop,
