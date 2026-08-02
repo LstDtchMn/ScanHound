@@ -308,6 +308,50 @@ shutdown behaviour and deserve separate review.
 
 ---
 
+## Exact commands, results, and tree state
+
+Everything below was run in a throwaway container, code `docker cp`-ed in (never
+over the Windows 9p bind mount). Probe source is on this branch at
+`tests/tools/probe.py` and `tests/tools/netwatch.py`.
+
+**Command** (identical for all four runs; `-p probe` is the combined
+blocked-egress + construction-attribution plugin):
+
+```bash
+python -m pytest tests/ -k 'full_disc or policy or scanner or rss or feed' -q --no-header -p no:cacheprovider -p probe -s
+```
+
+**Results:**
+
+| run | wall | pytest result | egress attempts | create_scraper (off-main) |
+|---|---|---|---|---|
+| exploratory | — | 296 passed, 4 skipped, 3902 deselected | 2 | not instrumented |
+| 1 | 82s | 296 passed, 4 skipped, 3902 deselected | 2 | 2 |
+| 2 | 76s | 296 passed, 4 skipped, 3902 deselected | 2 | 2 |
+| 3 | 76s | 296 passed, 4 skipped, 3902 deselected | 2 | 2 |
+
+**Exit code:** 0 on all runs (wrapped in `timeout 900`, which did not fire).
+
+**Baseline without the probe:** 296 passed, 4 skipped, 3902 deselected in 127s.
+That 127s figure is the cold first run in a fresh container and must **not** be
+compared against the warm probe runs — see the withdrawn-claims section above.
+
+**Mutation results:** none of my own. The mutation evidence for the closed flake
+fix is the other agent's, recorded in the commit message of `6d067e2` /
+`9b059c5` (baseline PASS, injected foreign construction PASS, real regression
+FAIL). I did not re-run it.
+
+**CI:** none. There is no CI on the agent branches, so nothing here is
+machine-attested; every result above is a local container run.
+
+**Working tree:** clean at the reviewed SHA. All referenced probe code is
+committed, not local-only.
+
+**Not run:** the full suite. This subset is the reproduction scope; a full-suite
+figure from a prior session (4392 passed / 4 skipped) is recorded in project
+notes but was **not** re-measured here and should not be cited from this
+document.
+
 ## Container recipe
 
 This cost both chats time today.
