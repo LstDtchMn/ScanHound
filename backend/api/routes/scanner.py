@@ -135,6 +135,68 @@ def _log_callback(message: str, level: str = "info") -> None:
     })
 
 
+def _fenced(reg, context, stage, publish):
+    """Run *publish* only if this operation still holds publication authority.
+
+    Every externally visible write from a foreground scan goes through here.
+    The lease is atomic: admission cannot be revoked between the decision and
+    the write, which a bare `if owns_lifespan(): publish()` could not promise.
+
+    Returns True when the write happened. Records the attempt either way, so a
+    refused publication is visible in the trace rather than silently dropped.
+    """
+    generation = context.accepted_lifespan_generation
+    acquire = getattr(reg, "acquire_publication", None)
+    if acquire is None or generation is None:
+        # Registry predates the lease (test doubles): behave as before.
+        context.record(stage, active_lifespan_generation=None,
+                       still_owns_lifespan=None)
+        publish()
+        return True
+    with acquire(generation) as admitted:
+        context.record(
+            stage,
+            active_lifespan_generation=getattr(reg, "lifespan_generation", None),
+            still_owns_lifespan=admitted,
+        )
+        if not admitted:
+            return False
+        publish()
+        return True
+
+
+def _make_progress_callback(reg, context):
+    """Progress broadcasts fire throughout the scan, so they need the fence too.
+
+    The module-level _progress_callback could not be fenced: it has no
+    operation to check. Round 5 P1 called this out as a hole in the
+    publication denominator.
+    """
+    def _cb(progress: float, phase: str) -> None:
+        def _publish():
+            with _scan_lock:
+                _scan_state["progress"] = progress
+                _scan_state["phase"] = phase
+            ws_manager.broadcast_sync({
+                "type": "scan:progress",
+                "data": {"progress": progress, "phase": phase},
+            })
+        _fenced(reg, context, scan_context.PUBLISH_PROGRESS, _publish)
+    return _cb
+
+
+def _make_log_callback(reg, context):
+    def _cb(message: str, level: str = "info") -> None:
+        def _publish():
+            ws_manager.broadcast_sync({
+                "type": "log",
+                "data": {"level": level, "message": message,
+                         "timestamp": time.strftime("%H:%M:%S")},
+            })
+        _fenced(reg, context, scan_context.PUBLISH_LOG, _publish)
+    return _cb
+
+
 def _still_owns(reg, context) -> "bool | None":
     """Does the accepted generation still own the lifespan, right now?
 
@@ -198,10 +260,10 @@ def _run_scan_inner(reg: ServiceRegistry, req: ScanRequest,
     if not scanner.try_acquire_scan():
         context.record(scan_context.SLOT_REJECTED)
         logger.info("Scan aborted: a background pre-cache scan is currently running")
-        ws_manager.broadcast_sync({
+        _fenced(reg, context, scan_context.PUBLISH_ERROR, lambda: ws_manager.broadcast_sync({
             "type": "scan:error",
             "data": {"message": "A background pre-cache scan is running; please retry in a moment."},
-        })
+        }))
         with _scan_lock:
             _scan_state["state"] = "idle"
             _scan_state["progress"] = 0.0
@@ -226,8 +288,8 @@ def _run_scan_inner(reg: ServiceRegistry, req: ScanRequest,
     with _selected_lock:
         _selected.clear()
 
-    scanner.set_progress_callback(_progress_callback)
-    scanner.set_log_callback(_log_callback)
+    scanner.set_progress_callback(_make_progress_callback(reg, context))
+    scanner.set_log_callback(_make_log_callback(reg, context))
     start_time = time.time()
 
     try:
@@ -250,90 +312,98 @@ def _run_scan_inner(reg: ServiceRegistry, req: ScanRequest,
         duration = time.time() - start_time
 
         # Store results
-        context.record(scan_context.PUBLISH_LAST_SCAN_ITEMS,
-                       active_lifespan_generation=getattr(
-                           reg, "lifespan_generation", None),
-                       still_owns_lifespan=_still_owns(reg, context))
-        with _items_lock:
-            _last_scan_items = list(items) if items else []
+        def _store_items():
+            global _last_scan_items
+            with _items_lock:
+                _last_scan_items = list(items) if items else []
+        _fenced(reg, context, scan_context.PUBLISH_LAST_SCAN_ITEMS, _store_items)
 
         # Broadcast each result
-        context.record(scan_context.PUBLISH_WEBSOCKET,
-                       active_lifespan_generation=getattr(
-                           reg, "lifespan_generation", None),
-                       still_owns_lifespan=_still_owns(reg, context))
         for item in (items or []):
             item_dict = _media_item_to_dict(item)
-            ws_manager.broadcast_sync({"type": "scan:result", "data": item_dict})
+            if not _fenced(
+                reg, context, scan_context.PUBLISH_ITEM,
+                lambda d=item_dict: ws_manager.broadcast_sync(
+                    {"type": "scan:result", "data": d}),
+            ):
+                # Authority lost mid-loop; stop rather than emit a partial
+                # result set into a lifespan that no longer owns this scan.
+                break
 
         # Stats
         stats = _compute_stats(items)
-        ws_manager.broadcast_sync({
-            "type": "scan:complete",
-            "data": {
-                "stats": stats,
-                "total": stats["total"],
-                "duration": round(duration, 1),
-            },
-        })
+        _fenced(reg, context, scan_context.PUBLISH_SCAN_COMPLETE,
+                lambda: ws_manager.broadcast_sync({
+                    "type": "scan:complete",
+                    "data": {
+                        "stats": stats,
+                        "total": stats["total"],
+                        "duration": round(duration, 1),
+                    },
+                }))
 
         # Stamp "Last scan" at COMPLETION. Previously only the scheduler set
         # last_scan_time, and it did so when the scan was *triggered* (start),
         # so the UI showed "Just now" the moment a scan began. Manual scans
         # never updated it at all. Stamp it here so it reflects the real last
         # completed scan.
-        context.record(scan_context.PUBLISH_CONFIG,
-                       active_lifespan_generation=getattr(
-                           reg, "lifespan_generation", None),
-                       still_owns_lifespan=_still_owns(reg, context))
-        try:
-            reg.config["last_scan_time"] = time.time()
-            if reg.backend:
-                reg.backend.save_config()
-        except Exception:
-            logger.warning("Failed to update last_scan_time")
+        def _persist_config():
+            try:
+                reg.config["last_scan_time"] = time.time()
+                if reg.backend:
+                    reg.backend.save_config()
+            except Exception:
+                logger.warning("Failed to update last_scan_time")
+        _fenced(reg, context, scan_context.PUBLISH_CONFIG, _persist_config)
 
         # Notify
-        context.record(scan_context.PUBLISH_NOTIFICATION,
-                       active_lifespan_generation=getattr(
-                           reg, "lifespan_generation", None),
-                       still_owns_lifespan=_still_owns(reg, context))
         if reg.notifications:
-            reg.notifications.notify_scan_complete(
-                total=stats["total"],
-                missing=stats["missing"],
-                upgrades=stats["upgrade"],
-            )
+            _fenced(reg, context, scan_context.PUBLISH_NOTIFICATION,
+                    lambda: reg.notifications.notify_scan_complete(
+                        total=stats["total"],
+                        missing=stats["missing"],
+                        upgrades=stats["upgrade"],
+                    ))
 
         # Auto-grab
-        context.record(scan_context.PUBLISH_AUTOGRAB,
-                       active_lifespan_generation=getattr(
-                           reg, "lifespan_generation", None),
-                       still_owns_lifespan=_still_owns(reg, context))
         if reg.auto_grab and reg.auto_grab.enabled and items:
-            try:
-                ws_manager.broadcast_sync({
+            # Auto-grab is the highest-consequence publication here: it takes a
+            # real external action between its two broadcasts. Entry is fenced,
+            # and each completion broadcast is fenced separately, because
+            # authority can be lost during process_items().
+            started = _fenced(
+                reg, context, scan_context.PUBLISH_AUTOGRAB,
+                lambda: ws_manager.broadcast_sync({
                     "type": "autograb:started",
                     "data": {"count": len(items)},
-                })
-                grabbed = reg.auto_grab.process_items(items)
-                ws_manager.broadcast_sync({
-                    "type": "autograb:complete",
-                    "data": {"grabbed": grabbed if isinstance(grabbed, int) else 0, "total": len(items)},
-                })
-            except Exception as e:
-                logger.warning("Auto-grab failed: %s", e)
-                ws_manager.broadcast_sync({
-                    "type": "autograb:complete",
-                    "data": {"grabbed": 0, "total": len(items), "error": str(e)},
-                })
+                }))
+            if started:
+                try:
+                    grabbed = reg.auto_grab.process_items(items)
+                    _fenced(
+                        reg, context, scan_context.PUBLISH_AUTOGRAB_COMPLETE,
+                        lambda: ws_manager.broadcast_sync({
+                            "type": "autograb:complete",
+                            "data": {"grabbed": grabbed if isinstance(grabbed, int) else 0,
+                                     "total": len(items)},
+                        }))
+                except Exception as e:
+                    logger.warning("Auto-grab failed: %s", e)
+                    _fenced(
+                        reg, context, scan_context.PUBLISH_AUTOGRAB_COMPLETE,
+                        lambda: ws_manager.broadcast_sync({
+                            "type": "autograb:complete",
+                            "data": {"grabbed": 0, "total": len(items),
+                                     "error": str(e)},
+                        }))
 
     except Exception as e:
         logger.exception("Scan failed")
-        ws_manager.broadcast_sync({
-            "type": "scan:error",
-            "data": {"message": str(e)},
-        })
+        _fenced(reg, context, scan_context.PUBLISH_ERROR,
+                lambda: ws_manager.broadcast_sync({
+                    "type": "scan:error",
+                    "data": {"message": str(e)},
+                }))
     finally:
         scanner.release_scan()
         context.record(scan_context.SLOT_RELEASED)

@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -111,6 +112,9 @@ class ServiceRegistry:
     _plex_metadata_scan_job: Any = None
     _plex_metadata_scan_job_lock: threading.Lock = field(default_factory=threading.Lock)
     _shutdown_event: threading.Event = field(default_factory=threading.Event)
+    # Publications admitted and not yet released. Lets a bounded shutdown
+    # distinguish 'nothing is publishing' from 'something still is'.
+    _active_publications: int = 0
     _lifespan_generation: int = 0
     _lifespan_generation_lock: threading.Lock = field(default_factory=threading.Lock)
     # Auth nonce — generated on startup, validated by middleware.
@@ -190,7 +194,9 @@ class ServiceRegistry:
         with self._lifespan_generation_lock:
             self._lifespan_generation += 1
             generation = self._lifespan_generation
-        self._shutdown_event.clear()
+            # Cleared under the SAME lock that admits publications, so a lease
+            # is never decided against a half-updated view of ownership.
+            self._shutdown_event.clear()
         return generation
 
     @property
@@ -199,13 +205,65 @@ class ServiceRegistry:
             return self._lifespan_generation
 
     def owns_lifespan(self, generation: int) -> bool:
-        """Whether work created by ``generation`` may still publish state."""
+        """Whether work created by ``generation`` may still publish state.
+
+        Correct as a *predicate*, but do not use it as a fence:
+        ``if owns_lifespan(g): publish()`` leaves a time-of-check/time-of-use
+        window in which shutdown can begin between the check and the write.
+        Use :meth:`acquire_publication`, which decides admission and holds the
+        lease atomically.
+
+        Both reads now happen under one lock acquisition; previously the
+        generation and the shutdown flag were read separately, so the result
+        could reflect two different instants.
+        """
         with self._lifespan_generation_lock:
-            current = self._lifespan_generation
-        return generation == current and not self._shutdown_event.is_set()
+            return (generation == self._lifespan_generation
+                    and not self._shutdown_event.is_set())
 
     def request_shutdown(self):
-        self._shutdown_event.set()
+        """Close publication admission, then signal cancellation.
+
+        Taken under the generation lock, so once this returns no further lease
+        can be admitted. Leases already held are unaffected — they are counted
+        by :attr:`active_publications` so a bounded shutdown can wait on them.
+        """
+        with self._lifespan_generation_lock:
+            self._shutdown_event.set()
+
+    @contextmanager
+    def acquire_publication(self, generation: int):
+        """Atomically admit (or refuse) one publication by ``generation``.
+
+        Yields True when this operation may publish, False when it may not:
+
+            with reg.acquire_publication(accepted_generation) as admitted:
+                if admitted:
+                    publish()
+
+        Admission shares one lock with ``request_shutdown`` and
+        ``begin_lifespan``, closing the window a bare ownership check leaves
+        open. The lock is NOT held across the caller's body — the lease is the
+        synchronisation token, so a slow WebSocket, notification or auto-grab
+        call cannot block lifespan rollover.
+        """
+        with self._lifespan_generation_lock:
+            admitted = (generation == self._lifespan_generation
+                        and not self._shutdown_event.is_set())
+            if admitted:
+                self._active_publications += 1
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self._lifespan_generation_lock:
+                    self._active_publications -= 1
+
+    @property
+    def active_publications(self) -> int:
+        """Leases currently held. A bounded shutdown can wait on this."""
+        with self._lifespan_generation_lock:
+            return self._active_publications
 
     @property
     def shutdown_requested(self) -> bool:
