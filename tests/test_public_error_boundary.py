@@ -77,12 +77,6 @@ def test_http_exception_detail_does_not_expose_raw_exception():
 def test_process_folder_background_route_closes_exception(monkeypatch, tmp_path):
     notifications = []
 
-    class ImmediateThread:
-        def __init__(self, *, target, **_kwargs):
-            self.target = target
-        def start(self):
-            self.target()
-
     class FailingService:
         def _translate_path(self, folder):
             return folder
@@ -90,16 +84,27 @@ def test_process_folder_background_route_closes_exception(monkeypatch, tmp_path)
             raise RuntimeError(_SENTINEL)
 
     monkeypatch.setattr(rename, "_service", lambda _reg: FailingService())
-    monkeypatch.setattr(rename.threading, "Thread", ImmediateThread)
     monkeypatch.setattr(rename.ws_manager, "broadcast_sync", notifications.append)
 
     root = tmp_path / "library"
     root.mkdir()
-    reg = SimpleNamespace(config={
-        "auto_rename_movie_library": str(root),
-        "auto_rename_movie_library_4k": "",
-        "auto_rename_tv_library": "",
-    })
+    def _run_inline(target, *, name, args=(), kwargs=None):
+        """Stand in for ServiceRegistry.spawn_lifespan_thread.
+
+        The route hands its background work to the registry now, so the
+        stub needs that method; running it inline is what lets this test
+        inspect the notification the worker broadcasts.
+        """
+        target(*args, **(kwargs or {}))
+
+    reg = SimpleNamespace(
+        config={
+            "auto_rename_movie_library": str(root),
+            "auto_rename_movie_library_4k": "",
+            "auto_rename_tv_library": "",
+        },
+        spawn_lifespan_thread=_run_inline,
+    )
     result = rename.process_folder(
         rename.ProcessFolderRequest(folder=str(root), dry_run=False),
         reg,

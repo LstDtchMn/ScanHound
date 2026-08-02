@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -22,69 +21,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/rss", tags=["rss"])
 
 
-def _join_rss_hydration_threads(reg):
-    threads = list(getattr(reg, "_rss_hydration_threads", set()))
-    for thread in threads:
-        if thread.is_alive():
-            thread.join(timeout=2.0)
-
-
-
-
-def _join_rss_action_threads(reg):
-    threads = list(getattr(reg, "_rss_action_threads", set()))
-    for thread in threads:
-        if thread.is_alive():
-            thread.join(timeout=2.0)
-
-
+# These two used to keep their own thread sets on the registry (attached by
+# hasattr, joined from an AppService shutdown hook). ServiceRegistry now owns
+# that job for every lifespan thread, which fixes what the bespoke version got
+# wrong: the hook was only registered when reg.backend happened to be non-None
+# at the first call — and never retried, because the attribute then existed —
+# the 2s join was PER THREAD rather than a shared budget, the sets were never
+# cleared between lifespans, and an expired join was silent.
 def _start_tracked_action_thread(reg, target):
-    if not hasattr(reg, "_rss_action_threads"):
-        reg._rss_action_threads = set()
-        if reg.backend is not None:
-            reg.backend.add_shutdown_hook(
-                lambda: _join_rss_action_threads(reg)
-            )
-    holder = {}
+    return reg.spawn_lifespan_thread(target, name="rss-candidate-action")
 
-    def wrapped():
-        try:
-            target()
-        finally:
-            reg._rss_action_threads.discard(holder["thread"])
-
-    thread = threading.Thread(
-        target=wrapped,
-        name="rss-candidate-action",
-        daemon=True,
-    )
-    holder["thread"] = thread
-    reg._rss_action_threads.add(thread)
-    thread.start()
-    return thread
 
 def _start_tracked_hydration_thread(reg, target):
-    if not hasattr(reg, "_rss_hydration_threads"):
-        reg._rss_hydration_threads = set()
-        if reg.backend is not None:
-            reg.backend.add_shutdown_hook(
-                lambda: _join_rss_hydration_threads(reg)
-            )
-    holder = {}
-    def wrapped():
-        try:
-            target()
-        finally:
-            reg._rss_hydration_threads.discard(holder["thread"])
-    thread = threading.Thread(
-        target=wrapped,
-        name="rss-explicit-hydration",
-        daemon=True,
-    )
-    holder["thread"] = thread
-    reg._rss_hydration_threads.add(thread)
-    thread.start()
-    return thread
+    return reg.spawn_lifespan_thread(target, name="rss-explicit-hydration")
 
 
 class ModeRequest(BaseModel):

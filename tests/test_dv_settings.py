@@ -31,6 +31,30 @@ def client():
         yield c
 
 
+@pytest.fixture
+def stub_backend(client):
+    """Swap in a save_config no-op backend, then put the real one back.
+
+    Restoring is the point: lifespan teardown stops the AppService — and
+    joins its maintenance thread — THROUGH registry.backend, so a test that
+    leaves a stub in that slot strands the real thread for the rest of the
+    session. Depends on ``client`` so this finalizer runs BEFORE the
+    TestClient exits and shutdown reads the field.
+    """
+    class _Backend:
+        _cleared_keys = set()
+
+        def save_config(self):  # no-op; config isolated by conftest
+            pass
+
+    real = registry.backend
+    registry.backend = _Backend()
+    try:
+        yield
+    finally:
+        registry.backend = real
+
+
 def test_settings_model_accepts_dv_keys_and_4k():
     m = SettingsUpdate(
         dv_library_roots="Y:\\Movies;E:\\4K",
@@ -109,15 +133,8 @@ def test_settings_model_accepts_plex_library_path_mappings():
     assert dumped["plex_library_path_mappings"] == "A: => /library/plex-source/a"
 
 
-def test_put_settings_accepts_plex_library_path_mappings(client):
-    from backend.api.dependencies import registry
+def test_put_settings_accepts_plex_library_path_mappings(client, stub_backend):
     registry.config = {}
-
-    class _Backend:
-        _cleared_keys = set()
-        def save_config(self):  # no-op; config isolated by conftest
-            pass
-    registry.backend = _Backend()
 
     payload = {"plex_library_path_mappings": "A: => /library/plex-source/a"}
     r = client.put("/settings", json=payload)
@@ -126,15 +143,8 @@ def test_put_settings_accepts_plex_library_path_mappings(client):
     assert registry.config["plex_library_path_mappings"] == "A: => /library/plex-source/a"
 
 
-def test_put_settings_round_trips_dv_and_4k(client):
-    from backend.api.dependencies import registry
+def test_put_settings_round_trips_dv_and_4k(client, stub_backend):
     registry.config = {}
-
-    class _Backend:
-        _cleared_keys = set()
-        def save_config(self):  # no-op; config isolated by conftest
-            pass
-    registry.backend = _Backend()
 
     payload = {
         "dv_library_roots": "Y:\\M",
@@ -156,15 +166,8 @@ def test_settings_model_accepts_pipeline_keys():
     assert upd.pipeline_verify_grace_margin_minutes == 45
 
 
-def test_put_settings_round_trips_pipeline_keys(client):
-    from backend.api.dependencies import registry
+def test_put_settings_round_trips_pipeline_keys(client, stub_backend):
     registry.config = {}
-
-    class _Backend:
-        _cleared_keys = set()
-        def save_config(self):  # no-op; config isolated by conftest
-            pass
-    registry.backend = _Backend()
 
     resp = client.put("/settings", json={"pipeline_reconcile_enabled": False,
                                          "pipeline_verify_grace_margin_minutes": 45})
@@ -179,15 +182,8 @@ def test_settings_model_accepts_rename_detect_moved_files_enabled():
     assert upd.rename_detect_moved_files_enabled is False
 
 
-def test_put_settings_round_trips_rename_detect_moved_files_enabled(client):
-    from backend.api.dependencies import registry
+def test_put_settings_round_trips_rename_detect_moved_files_enabled(client, stub_backend):
     registry.config = {}
-
-    class _Backend:
-        _cleared_keys = set()
-        def save_config(self):  # no-op; config isolated by conftest
-            pass
-    registry.backend = _Backend()
 
     resp = client.put("/settings", json={"rename_detect_moved_files_enabled": False})
     assert resp.status_code == 200

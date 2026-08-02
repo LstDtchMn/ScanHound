@@ -364,8 +364,11 @@ def scan_start(
         if _scan_state["state"] == "running":
             raise HTTPException(status_code=409, detail="Scan already running")
         _scan_state["state"] = "running"
-        _scan_thread = threading.Thread(target=_run_scan, args=(reg, req), daemon=True)
-        _scan_thread.start()
+        # Registry-owned so lifespan teardown joins it: a scan started by a
+        # request is still the app's background work, and outliving the
+        # lifespan lets it publish results into the *next* one's globals.
+        _scan_thread = reg.spawn_lifespan_thread(
+            _run_scan, args=(reg, req), name="scan-run")
     return {"status": "started", "type": req.type}
 
 

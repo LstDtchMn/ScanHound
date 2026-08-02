@@ -144,12 +144,17 @@ def _vocab_from_config(config):
 
 
 def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=None,
-                additive_only=False):
+                additive_only=False, stop_requested=None):
     """Reconcile every movie against dv_scan (source='scan'). Returns a summary.
 
     ``additive_only`` never removes labels from an unmatched movie — see
     reconcile_movie. The scheduled auto-sync passes it; the manual button does
     not.
+
+    ``stop_requested`` is polled once per movie so app shutdown can end a
+    long library walk at an item boundary. Every movie already reconciled
+    has been written, so a short run is a partial sync, not a corrupt one,
+    and the next pass simply picks up the rest.
     """
     vocab = _vocab_from_config(config)
     rows = db.get_dv_scans(source="scan", limit=1000000)
@@ -184,6 +189,9 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     added_n = removed_n = matched_n = 0
     details = []
     for i, mv in enumerate(movies):
+        if stop_requested is not None and stop_requested():
+            logger.info("dv sync: stopping at %d/%d on request", i, total)
+            break
         try:
             res = reconcile_movie(mv, index, vocab, pm,
                                   dry_run=dry_run, mappings=mappings,

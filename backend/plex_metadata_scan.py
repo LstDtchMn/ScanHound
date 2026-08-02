@@ -32,9 +32,14 @@ class PlexMetadataScanJob:
     endpoints always observe the current run; a new start() call is rejected
     while a previous run is still "running"."""
 
-    def __init__(self, db, progress_cb: Optional[Callable[[dict], None]] = None):
+    def __init__(self, db, progress_cb: Optional[Callable[[dict], None]] = None,
+                 registry=None):
         self._db = db
         self._progress_cb = progress_cb
+        # Optional so ad-hoc/test construction still works. When present, worker
+        # threads are owned by the app lifespan and joined at shutdown instead
+        # of running on into the next one.
+        self._registry = registry
         self._lock = threading.Lock()
         self._stop_flag = False
         self._stop_mode: Optional[str] = None
@@ -70,9 +75,7 @@ class PlexMetadataScanJob:
             self.started_at = time.time()
             self.error = None
         self._emit()
-        threading.Thread(
-            target=self._run, args=(targets,),
-            name="plex-metadata-scan", daemon=True).start()
+        self._spawn(self._run, (targets,), "plex-metadata-scan")
         return True
 
     def start_run(self, scope: str, targets: list[dict]) -> dict:
@@ -104,10 +107,8 @@ class PlexMetadataScanJob:
             self.started_at = time.time()
             self.error = None
         self._emit()
-        threading.Thread(
-            target=self._run_durable, args=(run["run_uuid"],),
-            name="plex-metadata-inventory", daemon=True,
-        ).start()
+        self._spawn(self._run_durable, (run["run_uuid"],),
+                    "plex-metadata-inventory")
         return self._db.get_metadata_scan_run(run["run_uuid"])
 
     def pause(self, run_uuid: Optional[str] = None) -> dict:
@@ -151,10 +152,8 @@ class PlexMetadataScanJob:
             self.started_at = time.time()
             self.error = None
         self._emit()
-        threading.Thread(
-            target=self._run_durable, args=(run_uuid,),
-            name="plex-metadata-inventory", daemon=True,
-        ).start()
+        self._spawn(self._run_durable, (run_uuid,),
+                    "plex-metadata-inventory")
         return self._db.get_metadata_scan_run(run_uuid)
 
     def retry_failures(self, run_uuid: str) -> dict:
@@ -186,6 +185,20 @@ class PlexMetadataScanJob:
             self._progress_cb(self.status_dict())
         except Exception:
             logger.exception("plex-metadata-scan progress callback failed")
+
+    def _spawn(self, target, args: tuple, name: str) -> None:
+        """Start a worker, lifespan-owned when a registry is available.
+
+        Shutdown pauses an active run (see backend.api.main.
+        _teardown_services), so the worker reaches its _stop_flag check and
+        the join costs a moment rather than the whole budget. The run is left
+        persisted as "paused", which resume() picks back up.
+        """
+        if self._registry is not None:
+            self._registry.spawn_lifespan_thread(target, args=args, name=name)
+            return
+        threading.Thread(target=target, args=args, name=name,
+                         daemon=True).start()
 
     def _cancel_requested(self) -> bool:
         with self._lock:

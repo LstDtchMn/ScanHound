@@ -197,15 +197,15 @@ class TestRenameApi:
         # must release the just-reserved ids itself in that except branch, or
         # those job ids stay pinned "in flight" forever (never re-analyzed).
         import backend.api.routes.rename as rename_routes
+        from backend.api.dependencies import registry
 
-        class _BoomThread:
-            def __init__(self, *a, **k):
-                pass
+        def _boom(*_a, **_k):
+            raise RuntimeError("can't start new thread")
 
-            def start(self):
-                raise RuntimeError("can't start new thread")
-
-        monkeypatch.setattr(rename_routes.threading, "Thread", _BoomThread)
+        # The route spawns through the registry now (so teardown joins the
+        # thread); that is the call that has to raise for this to exercise
+        # the except-RuntimeError branch.
+        monkeypatch.setattr(registry, "spawn_lifespan_thread", _boom)
         dest, name = "/lib/movies", "Dup (2020) [2160p].mkv"
         _seed_job(status="matched", title="Dup", destination_path=dest, new_filename=name)
         _seed_job(status="matched", title="Dup", destination_path=dest, new_filename=name)
@@ -256,14 +256,12 @@ class TestRenameApi:
             events.append,
         )
 
-        class _ImmediateThread:
-            def __init__(self, target, *args, **kwargs):
-                self._target = target
+        from backend.api.dependencies import registry
 
-            def start(self):
-                self._target()
+        def _run_inline(target, *, name, args=(), kwargs=None):
+            target(*args, **(kwargs or {}))
 
-        monkeypatch.setattr(rename_routes.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(registry, "spawn_lifespan_thread", _run_inline)
 
         response = client.post(
             "/rename/dv-scan-folder",
@@ -774,16 +772,14 @@ class TestPathConfinement:
         root.mkdir()
         events = []
 
-        class _ImmediateThread:
-            def __init__(self, target, *args, **kwargs):
-                self._target = target
+        from backend.api.dependencies import registry
 
-            def start(self):
-                self._target()
+        def _run_inline(target, *, name, args=(), kwargs=None):
+            target(*args, **(kwargs or {}))
 
-        # TestClient must create its AnyIO portal with the real stdlib Thread.
-        # Scope the synchronous route-thread replacement inside the live client
-        # context, and restore it before TestClient begins shutdown.
+        # Patching the registry's spawn (rather than threading.Thread) keeps
+        # this scoped to the route: TestClient's own AnyIO portal thread is
+        # unaffected. Still restored before shutdown, which joins real threads.
         with _client_with_library(str(root)) as client:
             with monkeypatch.context() as scoped_patch:
                 scoped_patch.setattr(
@@ -801,9 +797,9 @@ class TestPathConfinement:
                     events.append,
                 )
                 scoped_patch.setattr(
-                    rename_routes.threading,
-                    "Thread",
-                    _ImmediateThread,
+                    registry,
+                    "spawn_lifespan_thread",
+                    _run_inline,
                 )
 
                 response = client.post(

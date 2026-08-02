@@ -680,26 +680,32 @@ class TestDownloads:
             "interval_seconds": 600,
             "items": items,
         }
+        # Keep the real service: lifespan teardown stops the queue through this
+        # very field, so leaving the mock in place would orphan the live worker
+        # + watchdog threads past the end of the test.
+        real_queue = registry._download_queue_service
         registry._download_queue_service = mock_queue
+        try:
+            resp = client.post("/download/batch", json={"items": items})
 
-        resp = client.post("/download/batch", json={"items": items})
-
-        assert resp.status_code == 200
-        body = resp.json()
-        # Response fields are mapped from the scheduled batch.
-        assert body["status"] == "scheduled"
-        assert body["count"] == 2
-        assert body["batch_uuid"] == "batch-test-uuid"
-        assert body["mode"] == "staggered"
-        assert body["interval_minutes"] == 10          # 600s / 60
-        assert body["items"] == items
-        # The route delegated to the durable queue once, with the default
-        # interval (download_batch_interval_minutes=10) and staggered mode.
-        mock_queue.schedule_batch.assert_called_once()
-        args, kwargs = mock_queue.schedule_batch.call_args
-        assert [i["url"] for i in args[0]] == [i["url"] for i in items]
-        assert kwargs["interval_minutes"] == 10
-        assert kwargs["mode"] == "staggered"
+            assert resp.status_code == 200
+            body = resp.json()
+            # Response fields are mapped from the scheduled batch.
+            assert body["status"] == "scheduled"
+            assert body["count"] == 2
+            assert body["batch_uuid"] == "batch-test-uuid"
+            assert body["mode"] == "staggered"
+            assert body["interval_minutes"] == 10          # 600s / 60
+            assert body["items"] == items
+            # The route delegated to the durable queue once, with the default
+            # interval (download_batch_interval_minutes=10) and staggered mode.
+            mock_queue.schedule_batch.assert_called_once()
+            args, kwargs = mock_queue.schedule_batch.call_args
+            assert [i["url"] for i in args[0]] == [i["url"] for i in items]
+            assert kwargs["interval_minutes"] == 10
+            assert kwargs["mode"] == "staggered"
+        finally:
+            registry._download_queue_service = real_queue
 
     def test_download_batch_empty_items(self, client):
         resp = client.post("/download/batch", json={"items": []})
@@ -1643,10 +1649,17 @@ class TestScheduler:
 
     def test_config_no_backend_still_updates_dict(self, client):
         """Config dict is updated even if backend is None (save_config skipped)."""
+        # Restored before the fixture exits: lifespan teardown reaches the
+        # AppService through registry.backend, so leaving it None would strand
+        # the maintenance thread that startup began.
+        real_backend = registry.backend
         registry.backend = None
-        resp = client.put("/scheduler/config", json={"enabled": True})
-        assert resp.status_code == 200
-        assert registry.config["scheduler_enabled"] is True
+        try:
+            resp = client.put("/scheduler/config", json={"enabled": True})
+            assert resp.status_code == 200
+            assert registry.config["scheduler_enabled"] is True
+        finally:
+            registry.backend = real_backend
 
     def test_trigger_no_scanner(self, client):
         """POST /scheduler/trigger returns 503 when scanner not initialized."""
@@ -1672,17 +1685,19 @@ class TestScheduler:
         mock_scanner.is_scanning = False
         mock_scanner.scan_in_progress = False
         registry._scanner_service = mock_scanner
-        with patch("backend.api.routes.scheduler.threading.Thread") as mock_thread:
-            mock_thread.return_value.start = MagicMock()
+        # The scan thread is registry-owned now — that is what lets lifespan
+        # teardown join it — so intercept the spawn there rather than at
+        # threading.Thread.
+        with patch.object(registry, "spawn_lifespan_thread") as mock_spawn:
             resp = client.post("/scheduler/trigger")
         assert resp.status_code == 200
         assert resp.json()["status"] == "triggered"
         # Verify the thread target is the scanner route's _run_scan
-        mock_thread.assert_called_once()
-        call_kwargs = mock_thread.call_args
-        assert call_kwargs.kwargs["target"] is _run_scan
+        mock_spawn.assert_called_once()
+        call = mock_spawn.call_args
+        assert call.args[0] is _run_scan
         # Verify the request is an incremental scan
-        req_arg = call_kwargs.kwargs["args"][1]
+        req_arg = call.kwargs["args"][1]
         assert isinstance(req_arg, ScanRequest)
         assert req_arg.type == "incremental"
 

@@ -113,6 +113,16 @@ class Registry:
     def owns_lifespan(self, generation):
         return self._owns and generation == self.lifespan_generation
 
+    def spawn_lifespan_thread(self, target, *, name, args=(), kwargs=None):
+        """Run the worker inline so its behaviour is observable here.
+
+        The real ServiceRegistry starts a tracked daemon thread that
+        lifespan teardown joins; running it synchronously is what lets this
+        test watch stop_requested() flip as ownership is lost.
+        """
+        target(*args, **(kwargs or {}))
+        return SimpleNamespace(name=name, is_alive=lambda: False)
+
 
 def test_status_reports_readiness_unknowns_and_safe_defaults():
     result = rss.rss_status(Registry())
@@ -192,15 +202,9 @@ def test_explicit_hydration_uses_captured_lifespan_generation(monkeypatch):
                 "cancelled": 0,
             }
 
-    class ImmediateThread:
-        def __init__(self, *, target, **_kwargs):
-            self.target = target
-
-        def start(self):
-            self.target()
-
+    # The spawn itself is intercepted by Registry.spawn_lifespan_thread above,
+    # which runs the worker inline.
     monkeypatch.setattr(rss, "HDEncodeCandidateService", CandidateService)
-    monkeypatch.setattr(rss.threading, "Thread", ImmediateThread)
 
     result = rss.hydrate_candidate(
         rss.CandidateRequest(

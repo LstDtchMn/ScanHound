@@ -1,5 +1,4 @@
 """Scheduler endpoints: status, config, trigger."""
-import threading
 import time
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -99,8 +98,10 @@ def scheduler_trigger(reg: ServiceRegistry = Depends(get_registry)):
         if _scan_state["state"] == "running":
             raise HTTPException(status_code=409, detail="Scan already in progress")
         _scan_state["state"] = "running"
-        threading.Thread(
-            target=_run_scan, args=(reg, req), name="scheduled-scan", daemon=True
-        ).start()
+        # Registry-owned, exactly as /scan/start does it — this is the same
+        # _run_scan under the same lock and state, so it needs the same
+        # lifespan-bounded lifetime.
+        reg.spawn_lifespan_thread(
+            _run_scan, args=(reg, req), name="scheduled-scan")
 
     return {"status": "triggered"}

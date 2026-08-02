@@ -371,6 +371,23 @@ class ScannerService:
                                         track_urls, skip_urls, early_stop)
                 )
             finally:
+                # Shut the loop's DEFAULT executor down before closing it.
+                # Every source adapter fetches pages via
+                # ``loop.run_in_executor(None, ...)``, which lazily creates a
+                # ThreadPoolExecutor of ``asyncio_N`` threads that loop.close()
+                # does NOT touch — so each scan used to strand a pool of idle
+                # worker threads for the life of the process.
+                #
+                # Bounded: a fetch still blocked on a socket must not hold the
+                # scan thread (and therefore lifespan shutdown) open forever.
+                # On expiry Python logs the still-running threads and we close
+                # regardless; they are daemons.
+                try:
+                    loop.run_until_complete(
+                        loop.shutdown_default_executor(timeout=5))
+                except Exception:
+                    logger.debug("default executor shutdown failed",
+                                 exc_info=True)
                 loop.close()
         except Exception as e:
             self._log(f"Scan error: {e}", "error")

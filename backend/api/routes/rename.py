@@ -204,6 +204,11 @@ def list_jobs(status: Optional[str] = None, limit: int = 200, archived: bool = F
             def _run(job_ids):
                 try:
                     for jid in job_ids:
+                        # Stop at an item boundary on shutdown; the ids are
+                        # released by the finally below either way, so a
+                        # short run just leaves them to the next poll.
+                        if reg.shutdown_requested:
+                            break
                         try:
                             job = reg.db.get_rename_job(jid)
                             if job:
@@ -216,7 +221,8 @@ def list_jobs(status: Optional[str] = None, limit: int = 200, archived: bool = F
                     with _analyzing_lock:
                         _analyzing_job_ids.difference_update(job_ids)
             try:
-                threading.Thread(target=_run, args=(fresh,), name="conflict-analyze", daemon=True).start()
+                reg.spawn_lifespan_thread(
+                    _run, args=(fresh,), name="conflict-analyze")
             except RuntimeError:
                 # Thread creation itself failed (e.g. OS thread exhaustion). The
                 # _run() finally that releases these ids never runs, so release
@@ -403,7 +409,7 @@ def scan_dv_conflict(job_id: int, reg: ServiceRegistry = Depends(get_registry)):
         except Exception:
             logger.exception("scan-dv-conflict failed")
 
-    threading.Thread(target=_run, name="scan-dv-conflict", daemon=True).start()
+    reg.spawn_lifespan_thread(_run, name="scan-dv-conflict")
     return {"status": "scanning", "job_id": job_id}
 
 
@@ -461,7 +467,7 @@ def reidentify_all(reg: ServiceRegistry = Depends(get_registry)):
                                        "data": public.notification_data(
                                            title="Re-identify failed")})
 
-    threading.Thread(target=_run, name="rename-reidentify-all", daemon=True).start()
+    reg.spawn_lifespan_thread(_run, name="rename-reidentify-all")
     return {"status": "started"}
 
 
@@ -628,7 +634,7 @@ def process_folder(req: ProcessFolderRequest, reg: ServiceRegistry = Depends(get
                                        "data": public.notification_data(
                                            title="Process folder failed")})
 
-    threading.Thread(target=_run, name="rename-process-folder", daemon=True).start()
+    reg.spawn_lifespan_thread(_run, name="rename-process-folder")
     return {"status": "started", "folder": folder, "dry_run": dry_run}
 
 
@@ -677,7 +683,7 @@ def dv_scan_folder(req: DvScanRequest, reg: ServiceRegistry = Depends(get_regist
                                        "data": public.notification_data(
                                            title="Dolby Vision scan failed")})
 
-    threading.Thread(target=_run, name="dv-scan-folder", daemon=True).start()
+    reg.spawn_lifespan_thread(_run, name="dv-scan-folder")
     return {"status": "started", "folder": folder, "force": force}
 
 
@@ -719,7 +725,8 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
                     "done": done, "total": total}})
             result = dv_labeler.sync_labels(
                 reg.db, plex_manager, reg.config,
-                dry_run=dry_run, progress_cb=_progress)
+                dry_run=dry_run, progress_cb=_progress,
+                stop_requested=lambda: reg.shutdown_requested)
             ws_manager.broadcast_sync({"type": "notification", "data": {
                 "title": "Dolby Vision label sync",
                 "body": (f"{result['matched']} matched, "
@@ -739,7 +746,7 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
         finally:
             ws_manager.broadcast_sync({"type": "dv:sync_done", "data": result})
 
-    threading.Thread(target=_run, name="dv-sync-labels", daemon=True).start()
+    reg.spawn_lifespan_thread(_run, name="dv-sync-labels")
     return {"status": "started", "dry_run": dry_run}
 
 

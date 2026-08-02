@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -24,6 +25,13 @@ EMOJI_4K = "[4K]"
 EMOJI_DV = "[DV]"
 EMOJI_INFO = "\u2139\ufe0f"
 EMOJI_WARNING = "\u26a0\ufe0f"
+
+# Total wall-clock a lifespan teardown may spend waiting for registry-owned
+# threads. It is a BUDGET SHARED BY ALL of them, not a per-thread timeout: a
+# handful of workers wedged in a long network call must not multiply into a
+# minutes-long shutdown. Whatever is still alive when it expires is logged by
+# name and abandoned (every such thread is a daemon, so the process still exits).
+LIFESPAN_JOIN_BUDGET_SECONDS = 5.0
 
 
 class ScannerAppBridge:
@@ -113,6 +121,12 @@ class ServiceRegistry:
     _shutdown_event: threading.Event = field(default_factory=threading.Event)
     _lifespan_generation: int = 0
     _lifespan_generation_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Background threads this lifespan started and must join before it ends.
+    # Services that own a thread AND their own stop() (download queue,
+    # background scanner, notification bridge, AppService) keep joining it
+    # themselves; this list is for the loose threads nobody else owns.
+    _lifespan_threads: List[threading.Thread] = field(default_factory=list)
+    _lifespan_threads_lock: threading.Lock = field(default_factory=threading.Lock)
     # Auth nonce — generated on startup, validated by middleware.
     # If SCANHOUND_AUTH_NONCE env var is set, use that (Tauri passes it).
     # If empty string, auth is disabled (dev mode).
@@ -182,7 +196,8 @@ class ServiceRegistry:
                             "data": status_dict,
                         })
 
-                    self._plex_metadata_scan_job = PlexMetadataScanJob(self.db, progress_cb=_broadcast)
+                    self._plex_metadata_scan_job = PlexMetadataScanJob(
+                        self.db, progress_cb=_broadcast, registry=self)
         return self._plex_metadata_scan_job
 
     def begin_lifespan(self) -> int:
@@ -190,8 +205,111 @@ class ServiceRegistry:
         with self._lifespan_generation_lock:
             self._lifespan_generation += 1
             generation = self._lifespan_generation
+        # A fresh lifespan owns no threads yet. Normally join_lifespan_threads()
+        # has already emptied this during teardown; clearing again matters for
+        # the ABANDONED-lifespan path (startup raised, so teardown never ran) —
+        # otherwise the next shutdown would try to join a previous generation's
+        # workers, which are no longer this lifespan's problem.
+        with self._lifespan_threads_lock:
+            self._lifespan_threads = []
         self._shutdown_event.clear()
         return generation
+
+    def spawn_lifespan_thread(
+        self,
+        target: Callable,
+        *,
+        name: str,
+        args: tuple = (),
+        kwargs: Optional[Dict[str, Any]] = None,
+    ) -> threading.Thread:
+        """Start a daemon thread whose lifetime is bounded by this lifespan.
+
+        Use this instead of a bare ``threading.Thread(...).start()`` for any
+        background work started from the lifespan (or from a route, on the
+        lifespan's behalf). The thread is joined by ``join_lifespan_threads``
+        during teardown, so it cannot survive into the next lifespan and reach
+        a service whose DB was already closed.
+
+        The target is still responsible for NOTICING cancellation — poll
+        ``shutdown_requested`` or block on ``wait_for_shutdown`` rather than
+        ``time.sleep`` — the join only bounds how long teardown waits for it.
+        """
+        thread = threading.Thread(
+            target=target, name=name, args=args, kwargs=kwargs or {}, daemon=True)
+        # Tracking and start() happen under ONE lock hold, which is what makes
+        # this safe against a concurrent spawn or teardown. A thread that has
+        # been constructed but not started reports is_alive() == False exactly
+        # like a finished one, so a racing register() would reap it as dead and
+        # a racing join() would call join() on an unstarted thread (RuntimeError,
+        # aborting the rest of the shutdown). Holding the lock across start()
+        # closes both windows; the new thread never needs this lock, so it
+        # cannot deadlock against us. (A target that itself spawns simply
+        # blocks until start() returns, which does not wait on the child.)
+        with self._lifespan_threads_lock:
+            self._track_locked(thread)
+            thread.start()
+        return thread
+
+    def register_lifespan_thread(self, thread: threading.Thread) -> None:
+        """Track an ALREADY-STARTED thread as owned by this lifespan.
+
+        Prefer ``spawn_lifespan_thread``; this exists for threads constructed
+        elsewhere. Pass a started thread — an unstarted one is indistinguishable
+        from a finished one here, and ``join_lifespan_threads`` would raise on
+        it rather than wait for it.
+        """
+        with self._lifespan_threads_lock:
+            self._track_locked(thread)
+
+    def _track_locked(self, thread: threading.Thread) -> None:
+        """Append ``thread`` to the tracked list. Caller holds the lock."""
+        # Drop finished entries as we go: the real app runs one lifespan for
+        # weeks, and per-scan/per-package threads would otherwise pile up
+        # dead Thread objects for its whole life.
+        self._lifespan_threads = [
+            t for t in self._lifespan_threads if t.is_alive()]
+        self._lifespan_threads.append(thread)
+
+    def wait_for_shutdown(self, seconds: float) -> bool:
+        """Sleep up to ``seconds``, waking immediately if shutdown is requested.
+
+        The interruptible replacement for ``time.sleep`` in background workers:
+        a plain sleep makes the thread unjoinable for its full duration, which
+        is what turns a 30-second settle delay into a 30-second shutdown stall.
+
+        Returns True if shutdown was requested (i.e. the caller should return).
+        """
+        return self._shutdown_event.wait(seconds)
+
+    def join_lifespan_threads(
+        self, timeout: float = LIFESPAN_JOIN_BUDGET_SECONDS
+    ) -> List[str]:
+        """Join every registry-owned thread within one shared time budget.
+
+        ``timeout`` is the TOTAL wall clock spent here, not per thread, so N
+        wedged workers cost the same as one. Returns the names of the threads
+        still alive when the budget ran out (empty on a clean shutdown) for the
+        caller to log — they are daemons, so abandoning them still lets the
+        process exit.
+        """
+        with self._lifespan_threads_lock:
+            threads = list(self._lifespan_threads)
+            self._lifespan_threads = []
+        current = threading.current_thread()
+        deadline = time.monotonic() + max(0.0, timeout)
+        for thread in threads:
+            # A worker that triggered shutdown itself (e.g. the /shutdown route
+            # handler's thread) would deadlock for the whole budget joining
+            # itself.
+            if thread is current:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        return sorted({
+            t.name for t in threads if t is not current and t.is_alive()})
 
     @property
     def lifespan_generation(self) -> int:

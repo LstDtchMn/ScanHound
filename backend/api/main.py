@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
-import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
@@ -14,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 from backend.api.dependencies import (
     ServiceRegistry, ScannerAppBridge, registry,
+    LIFESPAN_JOIN_BUDGET_SECONDS,
     auth_enabled as _auth_enabled,
     token_authorized as _token_authorized,
     has_any_credential as _has_any_credential,
@@ -205,8 +204,6 @@ def _init_services(
 
     # Auto-connect to Plex on startup if configured (direct or account mode).
     if _should_auto_connect_plex(reg.config):
-        # (threading is imported at module level — a local import here would
-        # shadow it for the whole function and break earlier uses.)
         def _auto_connect_plex():
             from backend.api.ws import ws_manager
             try:
@@ -247,7 +244,10 @@ def _init_services(
                     "type": "plex:status",
                     "data": {"connected": False, "server": "", "movie_count": 0, "tv_count": 0},
                 })
-        threading.Thread(target=_auto_connect_plex, daemon=True, name="plex-auto-connect").start()
+        # Registry-owned: plex_svc.connect() talks to the network and cannot be
+        # interrupted, so this is the archetypal "wedged worker" the join budget
+        # exists to survive — teardown waits briefly, warns, and moves on.
+        reg.spawn_lifespan_thread(_auto_connect_plex, name="plex-auto-connect")
 
     # Backfill resolution/size/HDR/DV onto older download-history rows that
     # were grabbed before the metadata was captured (e.g. via batch grabs that
@@ -288,7 +288,7 @@ def _init_services(
         })
 
     reg._plex_metadata_scan_job = PlexMetadataScanJob(
-        reg.db, progress_cb=_broadcast_metadata_scan_progress)
+        reg.db, progress_cb=_broadcast_metadata_scan_progress, registry=reg)
 
     # Crash recovery: any job left in the transient 'applying' state (process
     # died mid-move) is reset to 'matched' so it can be retried. The move is
@@ -306,13 +306,17 @@ def _init_services(
     # (they render as "No poster" otherwise). Delayed + threaded so startup
     # never blocks on TMDB; idempotent (only touches empty poster_path rows).
     def _poster_backfill():
-        time.sleep(30)  # let the app settle first
+        # Interruptible settle delay: a plain time.sleep(30) here made the
+        # thread unjoinable for its whole duration, so every shutdown in the
+        # first 30 seconds of a lifespan either stalled or leaked it. Returns
+        # True the moment shutdown is requested.
+        if reg.wait_for_shutdown(30):
+            return
         try:
             reg._rename_service.backfill_posters()
         except Exception:
             logger.debug("poster backfill failed (non-fatal)", exc_info=True)
-    threading.Thread(target=_poster_backfill, name="poster-backfill",
-                     daemon=True).start()
+    reg.spawn_lifespan_thread(_poster_backfill, name="poster-backfill")
 
     # Surface a DB corruption quarantine (if init_db() hit one) now that the
     # notification bridge actually exists — DatabaseManager._notify_corruption
@@ -345,8 +349,6 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
     state to the DB, and broadcasts changes over the WebSocket so the Downloads
     page updates live. Stops when the registry signals shutdown.
     """
-    import threading
-    import time as _time
     from backend.api.ws import ws_manager
 
     def _loop():
@@ -387,11 +389,11 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                             if (r.get("state") == "extracted" and r.get("save_to")
                                     and key not in handed_to_rename):
                                 handed_to_rename.add(key)
-                                threading.Thread(
-                                    target=reg._rename_service.process_package,
+                                reg.spawn_lifespan_thread(
+                                    reg._rename_service.process_package,
                                     args=(r.get("name"), r.get("save_to")),
-                                    name="auto-rename", daemon=True,
-                                ).start()
+                                    name="auto-rename",
+                                )
                     # Prune stale keys so the set doesn't grow unbounded. Only
                     # when this poll actually returned rows — poll_results()
                     # returns [] on a transient JD failure, and clearing the
@@ -402,13 +404,12 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                         handed_to_rename &= live_keys
             except Exception as e:
                 logger.debug("results poller error: %s", e)
-            # Sleep in short slices so shutdown stays responsive.
-            waited = 0.0
-            while waited < interval and not reg.shutdown_requested:
-                _time.sleep(0.5)
-                waited += 0.5
+            # Wait out the interval on the shutdown event rather than sleeping:
+            # the poller now wakes the instant teardown signals, so the join
+            # below costs microseconds instead of up to half a second.
+            reg.wait_for_shutdown(interval)
 
-    threading.Thread(target=_loop, daemon=True, name="jd-results-poller").start()
+    reg.spawn_lifespan_thread(_loop, name="jd-results-poller")
     logger.info("Download results poller started")
 
 
@@ -535,9 +536,81 @@ def _within(path: str, base: str) -> bool:
     return real_path == real_base or real_path.startswith(real_base + _os.sep)
 
 
+def _signal_workers_to_stop(reg: ServiceRegistry) -> None:
+    """Tell every long-running worker to wind down, before anything is joined.
+
+    A worker that is merely joinable is not enough: without a signal it can
+    reach, the join just spends the whole budget and logs a straggler. Each
+    flag here is one a loop is already polling, and each is individually
+    guarded so a stub or half-built service cannot stop the others being told.
+    """
+    # Wakes every wait_for_shutdown()/shutdown_requested loop (results poller,
+    # poster backfill, RSS hydration/action, rename bulk loops).
+    reg.request_shutdown()
+    # In-flight scan from /scan/start or the scheduler: BackgroundScanner.stop()
+    # covers the scans IT started; nothing was cancelling the route-initiated
+    # ones, so they ran the crawl to completion.
+    try:
+        scanner = reg.scanner
+        if scanner is not None:
+            scanner.stop_scan_flag = True
+    except Exception:
+        logger.debug("scan cancellation on shutdown failed", exc_info=True)
+    # PAUSE, not cancel, an in-flight Plex metadata inventory: the manifest is
+    # persisted, so pausing leaves the run resumable on the next startup.
+    try:
+        job = reg._plex_metadata_scan_job
+        if job is not None and job.is_running():
+            job.pause()
+    except Exception:
+        logger.debug("metadata scan pause on shutdown failed", exc_info=True)
+    # Stops a running apply queue after the file currently in flight (never
+    # mid-move); documented as harmless when nothing is running.
+    try:
+        rename_svc = reg._rename_service
+        if rename_svc is not None:
+            rename_svc.cancel_apply()
+    except Exception:
+        logger.debug("apply-queue cancel on shutdown failed", exc_info=True)
+
+
+def _join_lifespan_threads(reg: ServiceRegistry) -> None:
+    """Wait out the lifespan's own background threads, bounded, and report.
+
+    Covers the workers nobody else owns: the JD results poller, the poster
+    backfill, Plex auto-connect, auto-rename hand-offs and in-flight scans.
+    (The services with their own ``stop()`` — download queue, background
+    scanner, notification bridge, AppService — still join their own threads.)
+
+    Idempotent: the join drains the registry's list, so a second call is a
+    no-op. That is what lets the caller invoke it on both the normal path and
+    the failure path without risking two full budgets.
+    """
+    try:
+        # Passed explicitly (rather than relying on the method's default) so
+        # this module-level constant is the one knob that governs both the
+        # wait and the message — including when a test shrinks it.
+        stragglers = reg.join_lifespan_threads(LIFESPAN_JOIN_BUDGET_SECONDS)
+        if stragglers:
+            logger.warning(
+                "Shutdown timed out after %.1fs waiting for background "
+                "thread(s): %s — abandoning them (daemon threads; the "
+                "process can still exit)",
+                LIFESPAN_JOIN_BUDGET_SECONDS, ", ".join(stragglers),
+            )
+    except Exception:
+        logger.warning("background thread join failed", exc_info=True)
+
+
 def _teardown_services(reg: ServiceRegistry) -> None:
-    """Gracefully shut down one lifespan, then erase its complete object graph."""
-    reg.request_shutdown()  # stop the background results poller
+    """Gracefully shut down one lifespan, then erase its complete object graph.
+
+    Signal first, then join. Every worker is a daemon, so before this the only
+    thing that ended them was interpreter exit — under TestClient, which starts
+    and stops many lifespans in one process, they simply accumulated and kept
+    touching process globals during later tests.
+    """
+    _signal_workers_to_stop(reg)
     try:
         if reg._download_queue_service:
             try:
@@ -559,12 +632,21 @@ def _teardown_services(reg: ServiceRegistry) -> None:
                 reg._watchlist_manager.close()
             except Exception:
                 pass
+        # BEFORE the DB closes, not after: a scan or auto-rename worker still
+        # unwinding writes its results through reg.db, and joining it only
+        # after backend.shutdown() would hand it a closed database for exactly
+        # the window it needs. Waiting here costs nothing on a clean shutdown
+        # (the workers have already seen the flag set at the top).
+        _join_lifespan_threads(reg)
         if reg.backend:
             try:
                 reg.backend.shutdown()
             except Exception:
                 pass
     finally:
+        # Safety net: if anything above raised past its own guard, the join
+        # never ran. Idempotent, so on the normal path this is a no-op.
+        _join_lifespan_threads(reg)
         # Even a failing shutdown hook must not leak a closed DB/service into the
         # next lifespan.  Leave the shutdown event set until the next startup so
         # late old threads still observe cancellation.

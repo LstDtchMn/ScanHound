@@ -690,6 +690,18 @@ class RenameService:
         with self._inflight_lock:
             self._inflight.discard(path)
 
+    def _shutdown_requested(self) -> bool:
+        """Whether the app lifespan is tearing down — bulk loops poll this.
+
+        These bulk background runs are joined by lifespan teardown within a
+        shared budget. Without a check like this the join would simply burn
+        that budget and log a straggler every time one is in flight, so each
+        loop stops at its next item boundary instead. Partial results are
+        already the contract here (every method reports counts, and each item
+        it did finish is persisted before the next begins).
+        """
+        return bool(getattr(self._reg, "shutdown_requested", False))
+
     def process_folder(self, folder: str, dry_run: bool = False) -> dict:
         """Manually scan a folder for video files and create rename jobs for any
         not already tracked — for processing an existing download backlog (no JD
@@ -718,6 +730,8 @@ class RenameService:
             files = self._video_files(resolved)
             created, skipped, failed_db = [], 0, 0
             for path in files:
+                if self._shutdown_requested():
+                    break
                 if not self._claim_path(path):
                     skipped += 1
                     continue
@@ -756,6 +770,8 @@ class RenameService:
         files = self._video_files(resolved)
         previews = []
         for path in files:
+            if self._shutdown_requested():
+                break
             filename = os.path.basename(path)
             tracked = bool(db and db.path_has_rename_job(path))
             try:
@@ -819,6 +835,8 @@ class RenameService:
             scanned, skipped = 0, 0
             by_layer: dict = {}
             for i, path in enumerate(files):
+                if self._shutdown_requested():
+                    break
                 # Skip-check is itself fail-safe: a stat error just means "scan it".
                 try:
                     st = os.stat(path)
@@ -965,6 +983,8 @@ class RenameService:
                     if j.get("status") in ("needs_review", "failed")]
             count = 0
             for job in jobs:
+                if self._shutdown_requested():
+                    break
                 try:
                     self.reidentify(job["id"])
                     count += 1
@@ -2252,9 +2272,18 @@ class RenameService:
                     # apply run behind a permanently-held lock.
                     self._bulk_lock.release()
 
-            t = threading.Thread(target=_worker, args=(eligible,), daemon=True,
-                                 name="rename-apply")
-            t.start()
+            # Lifespan-owned when the registry supports it, so shutdown joins
+            # this worker instead of letting it apply files into the next
+            # lifespan. _teardown_services calls cancel_apply() first, which is
+            # the flag the loop already checks each iteration, so it stops after
+            # the file currently in flight rather than mid-move. getattr because
+            # tests construct RenameService with a minimal registry stub.
+            spawn = getattr(self._reg, "spawn_lifespan_thread", None)
+            if spawn is not None:
+                spawn(_worker, args=(eligible,), name="rename-apply")
+            else:
+                threading.Thread(target=_worker, args=(eligible,), daemon=True,
+                                 name="rename-apply").start()
             # The worker now owns the lock; don't release it in our finally.
             release_lock = False
             return {"ok": True, "queued": len(eligible), "skipped": skipped}

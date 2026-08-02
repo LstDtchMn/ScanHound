@@ -144,6 +144,30 @@ class NotificationBridge:
     def shutdown(self):
         """Stop the async loop and cleanup."""
         if self._loop:
+            # Drain the loop's DEFAULT executor before stopping it. Desktop
+            # toasts are dispatched with ``run_in_executor(None, ...)``, which
+            # lazily creates a pool of ``asyncio_N`` worker threads; stopping
+            # the loop leaves them alive for the whole process, so under
+            # TestClient they piled up one lifespan after another.
+            #
+            # Both waits are bounded: this runs on the shutdown path, and a
+            # notification backend wedged in a native OS call must not be able
+            # to hold it open. On expiry we stop the loop regardless — the
+            # executor threads are daemons.
+            # Only if the loop is actually running: a coroutine submitted to a
+            # stopped loop is never executed, so the wait below would burn its
+            # full timeout on every shutdown that follows a crashed loop.
+            if self._loop.is_running():
+                try:
+                    pending = asyncio.run_coroutine_threadsafe(
+                        self._loop.shutdown_default_executor(timeout=2.0),
+                        self._loop,
+                    )
+                    pending.result(timeout=3.0)
+                except Exception:
+                    logger.debug("notification executor shutdown timed out or "
+                                 "failed; stopping the loop anyway",
+                                 exc_info=True)
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
             self._thread.join(timeout=2.0)

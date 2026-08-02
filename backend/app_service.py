@@ -702,7 +702,8 @@ class AppService:
                                     "initialized — skipping this pass")
                     else:
                         result = dv_labeler.sync_labels(
-                            self.db, pm, self.config, additive_only=True)
+                            self.db, pm, self.config, additive_only=True,
+                            stop_requested=self._maintenance_stop.is_set)
                         logger.info(
                             "DV auto-sync: %d matched, %d label(s) added "
                             "(additive-only)",

@@ -1,6 +1,5 @@
 """Background pre-cache scanner endpoints: status + manual trigger."""
 import logging
-import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -48,6 +47,8 @@ def background_scan_now(reg: ServiceRegistry = Depends(get_registry)):
         raise HTTPException(status_code=503, detail="Background scanner not initialized")
     if scanner.is_scanning:
         raise HTTPException(status_code=409, detail="A background scan is already running")
-    threading.Thread(
-        target=scanner.scan_once, name="background-scan-now", daemon=True).start()
+    # Registry-owned: BackgroundScanner.stop() joins its own scheduler thread,
+    # but this ad-hoc one is not that thread, so nothing was waiting for it.
+    # stop() does set the scanner's stop flag, so it unwinds on the signal.
+    reg.spawn_lifespan_thread(scanner.scan_once, name="background-scan-now")
     return {"status": "triggered"}
