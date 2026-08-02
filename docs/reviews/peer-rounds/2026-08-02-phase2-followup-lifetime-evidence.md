@@ -126,6 +126,59 @@ a live sample, that the live generation is not copied from the entry snapshot,
 that worker completion is recorded on the failing path, and that the
 thread-local binding does not leak across threads.
 
+## Fresh full-suite baseline (pre-Phase-3)
+
+Run at `57016f7`, post-guard-fix and post-Phase-2, which is the causally clean
+baseline round 4 asked for.
+
+```
+4224 passed, 4 skipped, 0 failed, 546.83s     EXIT=1
+netwatch: 18 UNAUTHORIZED EGRESS ATTEMPT(S)
+      8  adit-hd.com
+      4  ollama
+      4  x
+      2  hdencode.org
+```
+
+Exit 1 is the gate alone; no test fails. Arithmetic reconciles exactly against
+the pre-Phase-2 run (4197 passed + 1 failed + 4 skipped = 4202; now 4224 + 4 =
+4228; difference 26 = the 26 new `test_scan_context.py` tests). No test was
+lost or silently skipped.
+
+**Two changes from the pre-Phase-2 inventory**, both explained:
+
+- `192.168.1.1` is gone and `test_ssrf_rejects_private_discord_webhook` passes —
+  the numeric-literal guard fix works.
+- 19 attempts across 5 hosts became **18 across 4**.
+
+### The neutrality claim in this document was initially wrong
+
+The first version of this package asserted behaviour-neutrality on the strength
+of the 296-test subset. The full suite found **two regressions the subset does
+not cover**, both mine:
+
+```
+test_api_background.py::TestBackgroundStatus::test_scan_now_triggers
+    stubs scan_once with `lambda: called.set()` — zero arguments; the route
+    passed kwargs={"origin": ...} and the stub raised TypeError
+test_api_lifecycle.py::test_late_background_worker_cannot_publish_into_next_lifespan
+    patches _scan_source with blocked_scan_source(_source, _pages,
+    _skip_urls=None); adding origin= raised TypeError
+```
+
+Root cause was widening the signature of a **private method that tests
+monkeypatch**, and passing a new kwarg to a method tests stub. Fixed in
+`57016f7` by carrying the origin as state (`next_scan_origin` /
+`_current_scan_origin`) so both call surfaces are byte-for-byte what they were.
+
+`ScannerService.run_scan(operation_context=...)` was deliberately not reverted —
+that is a real public interface, and a double simulating it should accept the
+optional parameter. Private-and-monkeypatched is the distinction that matters.
+
+**The lesson generalises:** a subset-verified neutrality claim is not a
+neutrality claim. Round 4's insistence on a fresh full run before merge was
+correct.
+
 ## Limits
 
 - Local container runs only; no CI on this branch.
