@@ -51,6 +51,57 @@ def test_detail_scraper_uses_the_shared_grammar():
     assert "release_grammar" in _source_of("backend.detail_scraper")
 
 
+# ───────── DetailScraper is a THIRD grammar, carrying its own defects ────────
+#
+# The gap is wider than "the TV-title rule is missing". DetailScraper
+# independently parses season/episode (:236-237), year (:270), size (:292,295),
+# resolution (:325), Dolby Vision (:346) and the show title (:251,261,270).
+# Two of its rules carry defects already fixed in release_grammar, and one is
+# its own. These assert the DESIRED state and fail today.
+
+@pytest.mark.xfail(strict=True, reason=(
+    "DIVERGENCE (e), still live on the deployed listing path. DetailScraper's "
+    "size patterns accept GiB|GB|MiB|MB|KB and NOT TB, so a terabyte release "
+    "is read with no size at all — the same defect fixed in release_grammar, "
+    "in a third copy nobody had looked at."))
+def test_detail_scraper_understands_terabytes():
+    source = _source_of("backend.detail_scraper")
+    size_patterns = [ln for ln in source.splitlines()
+                     if "GiB|GB|MiB|MB" in ln]
+    assert size_patterns, "size patterns moved; re-locate before trusting this"
+    assert all("TB" in ln for ln in size_patterns), (
+        "DetailScraper size patterns still omit TB: %r" % size_patterns)
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "DetailScraper's resolution pattern is (\\d+x\\d+|2160p|1080p): it omits "
+    "720p and 4K/UHD entirely, so a release titled '4K UHD' yields NO "
+    "resolution — and it accepts a pixel dimension AS the resolution, which is "
+    "the inverse of divergence (b). Neither behaviour exists in "
+    "release_grammar."))
+def test_detail_scraper_resolution_vocabulary_matches_the_shared_grammar():
+    source = _source_of("backend.detail_scraper")
+    res_lines = [ln for ln in source.splitlines()
+                 if "2160p|1080p" in ln or "Resolution" in ln and "re.search" in ln]
+    assert res_lines, "resolution pattern moved; re-locate before trusting this"
+    joined = " ".join(res_lines)
+    assert "720p" in joined, "DetailScraper resolution vocabulary omits 720p"
+    assert "UHD" in joined or "4K" in joined, (
+        "DetailScraper resolution vocabulary omits 4K/UHD")
+    assert r"\d+x\d+" not in joined, (
+        "DetailScraper still accepts a pixel dimension as a resolution")
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "DetailScraper caps seasons at two digits (S(\\d{1,2})) with no ambiguity "
+    "concept, so 'S104' silently truncates to season 10 — the behaviour "
+    "release_grammar deliberately rejected as a confident wrong answer."))
+def test_detail_scraper_season_width_matches_the_shared_grammar():
+    source = _source_of("backend.detail_scraper")
+    assert r"S(\d{1,2})" not in source, (
+        "DetailScraper still uses its own two-digit season cap")
+
+
 @pytest.mark.xfail(strict=True, reason=(
     "ScannerService._process_posts derives media type as "
     "`details.get('is_tv') or post_info['type'] == 'tv'` — DetailScraper's "
