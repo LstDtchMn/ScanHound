@@ -11,6 +11,7 @@ import time
 import threading
 import requests
 from bs4 import BeautifulSoup
+from backend import release_grammar as grammar
 from backend.url_identity import canonicalize_listing_url
 from backend.release_policy import (  # noqa: F401  (re-exported for callers)
     REASON_LISTING_FULL_DISC,
@@ -868,7 +869,16 @@ class ScannerService:
                                 policy_excluded_new.append(row)
                             continue
                         page_new += 1
-                        all_posts.append({'url': post_url, 'type': source_type_hint, 'source': source_id, 'category': source_category})
+                        # `title` is retained deliberately. It used to be read,
+                        # used for the full-disc check, and then dropped — so
+                        # the shared title grammar could not participate in the
+                        # media-type decision downstream, and the RSS path and
+                        # this one disagreed about releases named
+                        # "Complete Series", "Mini Series", "TV Series" and
+                        # "Season 4". Carrying it costs one string per post.
+                        all_posts.append({'url': post_url, 'title': post_title,
+                                          'type': source_type_hint,
+                                          'source': source_id, 'category': source_category})
 
                     # Early-stop: a populated page that yields no new posts means
                     # we've reached content already cached/seen — deeper pages are
@@ -994,9 +1004,40 @@ class ScannerService:
                 )
                 if not details:
                     return None
-                is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'
+
+                # Media type is resolved by AUTHORITY, not by boolean OR. The
+                # old rule was `details['is_tv'] or post_info['type'] == 'tv'`,
+                # which could not represent a contradiction and so resolved
+                # every one of them to TV — and it never consulted the listing
+                # title at all, which is how this path and the RSS path came to
+                # disagree about "Complete Series" and friends.
+                verdict = grammar.resolve_media_type([
+                    # The crawl route is the WEAKEST signal: which category page
+                    # a release was found on is routing, not identity.
+                    grammar.TypeEvidence(
+                        grammar.MediaType.TV if post_info['type'] == 'tv'
+                        else grammar.MediaType.MOVIE,
+                        grammar.Authority.ROUTE, 'listing-route')
+                    if post_info.get('type') in ('tv', 'movie') else None,
+                    grammar.title_type_evidence(post_info.get('title') or '',
+                                                source='listing-title'),
+                    # The detail filename outranks the title. Only a positive
+                    # is_tv is evidence: False means "no season token in the
+                    # filename", which is not a claim that this is a film.
+                    grammar.TypeEvidence(grammar.MediaType.TV,
+                                         grammar.Authority.DETAIL, 'detail-filename')
+                    if details.get('is_tv') else None,
+                ])
+                # AMBIGUOUS is preserved as a distinct downstream signal rather
+                # than collapsed here; `is_tv` stays boolean for the existing
+                # consumers, and a genuine clash resolves to NOT-tv so nothing
+                # is filed into a library on contested evidence.
+                is_tv = verdict.media_type is grammar.MediaType.TV
                 details['source'] = post_source
                 details['category'] = post_info.get('category', '')
+                details['media_type_verdict'] = verdict.media_type.value
+                details['media_type_provisional'] = verdict.provisional
+                details['media_type_because'] = list(verdict.because)
                 return {'details': details, 'is_tv': is_tv, 'url': url}
             except Exception as e:
                 logger.debug("Error processing post %s: %s", url, e)

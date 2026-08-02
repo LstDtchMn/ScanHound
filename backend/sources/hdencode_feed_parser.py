@@ -117,6 +117,46 @@ def parse_feed(xml_bytes, feed_key):
     )
 
 
+#: Feed categories recognised as a TV route, normalised and matched WHOLE.
+#: The previous rule was `"tv" in category.lower()`, which also fires on
+#: "TVrip", "HDTV", "HDTV-Rip" and anything else that merely contains those two
+#: letters — a guess presented as a signal. An unknown category is now retained
+#: as provenance and contributes NOTHING, rather than being guessed at.
+_TV_CATEGORIES = frozenset({
+    "tv", "tv shows", "tv-shows", "tvshows", "television",
+    "tv packs", "tv-packs", "tv series", "tv-series",
+})
+_MOVIE_CATEGORIES = frozenset({
+    "movies", "movie", "films", "film",
+})
+
+
+def _normalise_category(value):
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _category_type_evidence(categories):
+    """ROUTE-level evidence from feed categories, or None when they say nothing.
+
+    Returns None on an unknown or empty category set — that is the fail-open
+    direction for *evidence* and the fail-closed direction for *decisions*: it
+    lets the title decide instead of asserting a type nobody established. A
+    category set naming both kinds is also None, since the feed is then telling
+    us nothing useful about this entry.
+    """
+    normalised = {_normalise_category(c) for c in (categories or ())}
+    normalised.discard("")
+    is_tv = bool(normalised & _TV_CATEGORIES)
+    is_movie = bool(normalised & _MOVIE_CATEGORIES)
+    if is_tv == is_movie:          # neither, or contradictory
+        return None
+    return grammar.TypeEvidence(
+        grammar.MediaType.TV if is_tv else grammar.MediaType.MOVIE,
+        grammar.Authority.ROUTE,
+        "feed-category",
+    )
+
+
 def _parse_item(item):
     title = _required_text(item, "title")
     link = canonicalize_post_url(_required_text(item, "link"))
@@ -136,16 +176,20 @@ def _parse_item(item):
     signals = parse_release_title(title)
     year_match = _DESC_YEAR_RE.search(plain_description)
     description_year = int(year_match.group(1)) if year_match else None
-    # Title evidence comes from the SHARED rule, so this path and the listing
-    # path cannot disagree about the same string. Keying purely off a parsed
-    # season used to make 'Complete Series', 'Mini Series', 'TV Series' and
-    # 'Season 4' read as MOVIES here while the listing path read them as TV.
-    # Feed categories are additive on top: they may only ever add TV-ness.
+    # Resolved by AUTHORITY, through the same resolver the listing path uses,
+    # so neither can reach a different verdict from the same evidence.
+    #
+    # The feed category is ROUTE-level: weakest, and unable to overrule a title.
+    # It is also matched against a normalised allowlist rather than by
+    # substring — `"tv" in category` also fires on "TVrip", "HDTV" and any
+    # future category that merely contains those two letters, which is a guess
+    # dressed as a signal.
+    verdict = grammar.resolve_media_type([
+        _category_type_evidence(categories),
+        grammar.title_type_evidence(title, source="feed-title"),
+    ])
     media_type = (
-        "tv"
-        if grammar.title_indicates_tv(title)
-        or any("tv" in category.lower() for category in categories)
-        else "movie"
+        "tv" if verdict.media_type is grammar.MediaType.TV else "movie"
     )
     raw_hash = hashlib.sha256(
         (title + "\0" + link + "\0" + raw_description).encode("utf-8")
