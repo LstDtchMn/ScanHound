@@ -517,26 +517,12 @@ class SourceBase(ABC):
         return title.strip()
 
     def is_tv_release(self, text: str) -> bool:
-        """Check if release is TV content."""
-        # A season/episode token, INCLUDING one too wide to interpret. The
-        # grammar reports 'S104' as ambiguous rather than guessing at 104 or
-        # silently truncating to 10; either way the token is TV evidence, and
-        # reading "cannot tell" as "not TV" would file a series as a film.
-        found = grammar.parse_season_episode(text)
-        if found.season is not None or found.ambiguous:
-            return True
+        """Check if the release title is TV content.
 
-        # Check for common TV indicators
-        tv_indicators = [
-            r'\bS\d{1,2}\b',
-            r'\bSeason\s*\d+\b',
-            r'\bComplete\s*Series\b',
-            r'\bMini\s*Series\b',
-            r'\bTV\s*Series\b'
-        ]
-
-        for pattern in tv_indicators:
-            if re.search(pattern, text, re.IGNORECASE):
-                return True
-
-        return False
+        The season/episode token and the 'Season NN' / 'Complete Series' /
+        'Mini Series' / 'TV Series' forms all live in release_grammar now. They
+        used to be listed here only, so the RSS path — which keyed purely off a
+        parsed season — called all four of those forms MOVIES. That picked the
+        wrong Plex library downstream.
+        """
+        return grammar.title_indicates_tv(text)

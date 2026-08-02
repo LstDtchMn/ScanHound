@@ -188,6 +188,36 @@ class TestTheFiveDivergencesStayFixed:
         # Neither path may quietly downgrade an unreadable season to "a movie".
         assert listing.is_tv_release(title) is True
 
+    @pytest.mark.parametrize("title", [
+        "Great Show Complete Series 1080p WEB-DL 40.0 GB",
+        "Docu Mini Series 1080p WEB-DL 8.0 GB",
+        "Old Programme TV Series 1080p WEB-DL 12.0 GB",
+        "Thing Season 4 1080p WEB-DL 20.0 GB",
+    ])
+    def test_f_tv_forms_without_sxxexx_agree_on_both_paths(self, title):
+        """Divergence (f), found 2026-08-02 closing the media-type gap.
+
+        The listing path recognised these four forms; RSS, keying purely off a
+        parsed season, called them MOVIES. That selects the wrong Plex library
+        in get_hdencode_candidate_context() and so reaches a different
+        actionable decision — the A4 failure, on the path being promoted.
+
+        Feed categories usually rescue it, because feeds are per-category. The
+        point is that "usually" was doing the work, and it does none at all for
+        a TV-shaped release appearing in a movies feed.
+        """
+        assert grammar.title_indicates_tv(title) is True
+        assert listing.is_tv_release(title) is True
+
+    @pytest.mark.parametrize("title", [
+        "The Batman 2022 1080p BluRay x264-SPARKS 14.7 GB",
+        "Movie With DTS5.1 Audio 2021 2160p WEB-DL 44.0 GB",
+    ])
+    def test_f_films_are_films_on_both_paths(self, title):
+        """The other direction: over-correcting would file every movie as TV."""
+        assert grammar.title_indicates_tv(title) is False
+        assert listing.is_tv_release(title) is False
+
     def test_e_terabyte_sizes_parse_on_both_paths(self):
         title = "Big Set 2018 2160p Complete BluRay 1.2 TB"
         assert parse_release_title(title)["size_gb"] == pytest.approx(1228.8)

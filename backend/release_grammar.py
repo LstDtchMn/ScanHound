@@ -138,6 +138,42 @@ def parse_season_episode(text: str) -> SeasonEpisode:
     return SeasonEpisode(int(season_digits), episode, end, False, match.start())
 
 
+#: Title forms that mean "this is TV" without carrying an SxxExx token.
+#: Divergence (f), measured 2026-08-02: the listing path recognised all four,
+#: the RSS path recognised none of them. On the RSS side such a release is
+#: classified as a MOVIE, which selects the wrong Plex library in
+#: get_hdencode_candidate_context() and so reaches a different actionable
+#: decision — precisely the A4 failure, on the path being promoted. Feeds are
+#: per-category so a TV release usually arrives with a "tv" category to fall
+#: back on, but "usually" is not "always", and the fallback does no work at all
+#: for a TV-shaped release appearing in a movies feed.
+_TV_FORM_RES = (
+    re.compile(r"(?<!\w)Season\s*\d+(?!\w)", re.I),
+    re.compile(r"(?<!\w)Complete\s*Series(?!\w)", re.I),
+    re.compile(r"(?<!\w)Mini[\s.-]*Series(?!\w)", re.I),
+    re.compile(r"(?<!\w)TV\s*Series(?!\w)", re.I),
+)
+
+
+def title_indicates_tv(text: str) -> bool:
+    """Whether the TITLE ALONE is evidence of TV content.
+
+    Deliberately title-only. Each path adds its own out-of-band signal on top —
+    the listing path knows which category URL it crawled, the RSS path has feed
+    categories — and those may only ever ADD TV-ness, never remove it. Keeping
+    the title rule here is what stops the two from disagreeing about the same
+    string.
+
+    An AMBIGUOUS season counts. A token too wide to interpret is still a season
+    token, and reading "cannot tell" as "not TV" would file a series as a film.
+    """
+    text = text or ""
+    found = parse_season_episode(text)
+    if found.season is not None or found.ambiguous:
+        return True
+    return any(pattern.search(text) for pattern in _TV_FORM_RES)
+
+
 # ──────────────────────────────── size ──────────────────────────────────────
 
 #: Defect (e): the RSS unit set stopped at GB, so ``1.2 TB`` parsed to nothing.
