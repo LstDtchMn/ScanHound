@@ -43,7 +43,16 @@ class ParsedFeedEntry:
     categories: tuple[str, ...]
     raw_description: str
     raw_hash: str
+    #: "tv", "movie" or "ambiguous". AMBIGUOUS is a real, storable outcome —
+    #: collapsing it to "movie" is what made an unknown category plus a silent
+    #: title into a confident film.
     media_type: str
+    #: True when only the feed category spoke. Weak evidence must stay
+    #: distinguishable from a confirmed identity, or nothing downstream can
+    #: decline to act on it.
+    media_type_provisional: bool
+    #: Provenance of the deciding evidence, and of anything it overruled.
+    media_type_because: tuple[str, ...]
     clean_title: str
     title_year: Optional[int]
     description_year: Optional[int]
@@ -188,9 +197,25 @@ def _parse_item(item):
         _category_type_evidence(categories),
         grammar.title_type_evidence(title, source="feed-title"),
     ])
-    media_type = (
-        "tv" if verdict.media_type is grammar.MediaType.TV else "movie"
-    )
+    # THE VERDICT IS STORED AS-IS, including "ambiguous".
+    #
+    # This previously read `"tv" if verdict is TV else "movie"`, which turned
+    # every non-TV outcome into a confident "movie" — so an unknown feed
+    # category plus a silent title, which the resolver correctly calls
+    # AMBIGUOUS, was persisted as a film. That is the exact fail-open the
+    # resolver exists to prevent, reintroduced one line after it.
+    #
+    # `provisional` and the provenance are carried too: a verdict resting only
+    # on a feed category must stay distinguishable from one backed by a
+    # confirmed identity, or nothing downstream can decline to act on weak
+    # evidence.
+    media_type = verdict.media_type.value
+    media_type_provisional = verdict.provisional
+    media_type_because = tuple(verdict.because)
+    # NOTE: categories are NOT in raw_hash, and media_type now depends on them.
+    # A category-only change can therefore alter the media type without moving
+    # this hash — which also feeds the action idempotency key. Recorded as a
+    # known gap; it belongs to the derived-state versioning work, not here.
     raw_hash = hashlib.sha256(
         (title + "\0" + link + "\0" + raw_description).encode("utf-8")
     ).hexdigest()
@@ -203,6 +228,8 @@ def _parse_item(item):
         raw_description=raw_description,
         raw_hash=raw_hash,
         media_type=media_type,
+        media_type_provisional=media_type_provisional,
+        media_type_because=media_type_because,
         clean_title=signals["clean_title"],
         title_year=signals["year"],
         description_year=description_year,

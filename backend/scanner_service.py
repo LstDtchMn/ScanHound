@@ -66,6 +66,18 @@ class MediaItem:
     year: int
     season: Optional[int] = None
     episodes: Optional[int] = None
+    #: Resolved media type — "tv", "movie" or "ambiguous". Carried explicitly
+    #: because downstream USED to rebuild it as `season is not None`, and
+    #: season-presence is not TV-ness: a season pack, a complete series and a
+    #: mini-series are all TV and none carries an SxxExx token. That
+    #: reconstruction silently matched "Great Show Complete Series" against the
+    #: movie library after the resolver had already decided it was TV.
+    #: Defaults to "ambiguous" so an item built without one is never mistaken
+    #: for a film.
+    media_type: str = "ambiguous"
+    #: True when nothing above the crawl route contributed to `media_type`.
+    #: Weak evidence must remain distinguishable from confirmed identity.
+    media_type_provisional: bool = True
     rating: float = 0.0
     votes: int = 0
     votes_source: str = ""
@@ -97,6 +109,42 @@ class MediaItem:
     # Crawl category this item came from: '4k' | 'remux' | 'tv' | '' (unknown).
     # Drives the instant 4K/Remux/TV display filter in the UI.
     category: str = ""
+
+
+def web_item_facts(item: "MediaItem") -> Dict[str, Any]:
+    """The identity facts Plex matching decides from, as a plain dict.
+
+    Extracted as a seam so the media-type decision is reachable by a test. It
+    previously lived inline inside ``_match_against_plex``, an async method
+    reading instance state, so the only way to "test" it was to restate its
+    logic in the test — which is not a test of anything. A mutation reverting
+    the rule below passed a suite that asserted the restatement.
+
+    THE RULE: ``is_tv`` comes from the CARRIED verdict, never from
+    ``season is not None``. Season-presence and TV-ness are different facts —
+    a season pack, a complete series and a mini-series are all TV and none
+    carries a numeric season, so the old reconstruction sent every one of them
+    to the movie library after the resolver had already decided otherwise.
+
+    AMBIGUOUS yields ``is_tv=False`` because it must not select the TV library,
+    but it is preserved distinctly in ``media_type`` so the library query can
+    refuse to guess rather than defaulting to Movies.
+    """
+    return {
+        'display_title': item.title,
+        'year': item.year,
+        'res': item.resolution,
+        'size': item.size,
+        'dovi': item.dovi,
+        'hdr': item.hdr,
+        'url': item.url,
+        'imdb_id': item.imdb_id,
+        'is_tv': item.media_type == 'tv',
+        'media_type': item.media_type,
+        'media_type_provisional': item.media_type_provisional,
+        'season': item.season,
+        'episodes': item.episodes,
+    }
 
 
 @dataclass
@@ -1173,6 +1221,13 @@ class ScannerService:
                 year=details.get('year', 0),
                 season=season,
                 episodes=episodes,
+                # The resolver's verdict, carried rather than recomputed. It
+                # was previously dropped here and rebuilt downstream from
+                # `season is not None`, which silently sent every TV release
+                # without an SxxExx token to the movie library.
+                media_type=details.get('media_type_verdict', 'ambiguous'),
+                media_type_provisional=bool(
+                    details.get('media_type_provisional', True)),
                 rating=self._parse_rating(details.get('rating')),
                 status=status,
                 status_text=STATUS_TEXTS[status],
@@ -1368,16 +1423,9 @@ class ScannerService:
                 continue
 
             web_item = {
-                'display_title': item.title,
-                'year': item.year,
-                'res': item.resolution,
+                **web_item_facts(item),
                 'size': item.web_data.get('size', item.size),
-                'dovi': item.dovi,
-                'hdr': item.hdr,
-                'url': item.url,
                 'imdb_id': item.web_data.get('imdb_id'),
-                'is_tv': item.season is not None,
-                'season': item.season,
                 'episodes': item.episodes,
                 'search_key': normalize_title(item.title),
                 'episode_number': item.web_data.get('episode_number'),

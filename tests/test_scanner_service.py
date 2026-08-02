@@ -147,6 +147,12 @@ class TestMediaItem:
             "host_pref", "poster_path", "imdb_id",
             "tile_state", "description", "posted_date", "web_data", "group_key",
             "is_duplicate_group", "prior_grab", "category",
+            # Added 2026-08-02. The resolved media type is now CARRIED rather
+            # than rebuilt downstream from `season is not None` — a
+            # reconstruction that sent every TV release without an SxxExx token
+            # (season packs, complete series, mini-series) to the movie library
+            # after the resolver had already decided otherwise.
+            "media_type", "media_type_provisional",
         }
         actual = {f.name for f in fields(MediaItem)}
         assert actual == expected
