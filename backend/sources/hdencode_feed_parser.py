@@ -9,6 +9,7 @@ from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
 import xml.etree.ElementTree as ET
 
+from backend import release_grammar as grammar
 from backend.candidate_evidence import EvidenceState
 
 
@@ -16,19 +17,12 @@ MAX_FEED_BYTES = 2 * 1024 * 1024
 MAX_ENTRIES = 100
 _ALLOWED_HOSTS = {"hdencode.org", "www.hdencode.org"}
 _DANGEROUS_XML = re.compile(br"<!\s*(?:DOCTYPE|ENTITY)\b", re.I)
-_EPISODE_RE = re.compile(
-    r"(?<![A-Z0-9])S(?P<season>\d{1,3})E(?P<episode>\d{1,4})"
-    r"(?P<extra>(?:E\d{1,4})*)(?!\d)",
-    re.I,
-)
-_SEASON_RE = re.compile(r"(?<![A-Z0-9])S(?P<season>\d{1,3})(?!E\d)", re.I)
-_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
-_RESOLUTION_RE = re.compile(r"(?<!\w)(2160p|1080p|720p|4K|UHD)(?!\w)", re.I)
-_SIZE_RE = re.compile(
-    r"(?:\s+[–-]\s+|\s+)(?P<size>\d+(?:\.\d+)?)\s*"
-    r"(?P<unit>GiB|GB|MiB|MB)\s*$",
-    re.I,
-)
+# Season, episode, year, resolution and size patterns USED to live here, in
+# parallel with near-identical ones on the listing path. They were measured
+# disagreeing on five of them (2026-08-01) and now live in
+# backend.release_grammar. They are not kept here as "reference copies":
+# a second definition that nothing calls is exactly how the two paths drifted
+# apart in the first place.
 _DV_RE = re.compile(r"(?<![A-Z0-9])(?:DV|DoVi)(?![A-Z0-9])|Dolby[ ._-]?Vision", re.I)
 _HDR10P_RE = re.compile(r"(?<![A-Z0-9])(?:HDR10\+|HDR10P)(?![A-Z0-9])", re.I)
 _HDR_RE = re.compile(r"(?<![A-Z0-9])(?:HDR10\+?|HDR10P|HDR|HLG)(?![A-Z0-9])", re.I)
@@ -142,9 +136,15 @@ def _parse_item(item):
     signals = parse_release_title(title)
     year_match = _DESC_YEAR_RE.search(plain_description)
     description_year = int(year_match.group(1)) if year_match else None
+    # An AMBIGUOUS season still counts as TV evidence. The grammar reports
+    # `season is None, ambiguous=True` for a token it cannot interpret (e.g.
+    # 'S104'); reading that as "no season" would file a TV release as a movie,
+    # which is the same class of mistake as the 'DTS5.1' defect in reverse.
+    # "Cannot tell" must never collapse into "definitely not".
     media_type = (
         "tv"
         if signals["season"] is not None
+        or signals.get("season_ambiguous")
         or any("tv" in category.lower() for category in categories)
         else "movie"
     )
@@ -178,41 +178,43 @@ def _parse_item(item):
 
 
 def parse_release_title(title):
+    """Parse a feed title. Field extraction lives in :mod:`backend.release_grammar`.
+
+    This reader and the listing reader used to carry independent copies of these
+    patterns, and on 2026-08-01 they were measured disagreeing on five of them.
+    Two of the defects were on this side: a year guard that read ``1920x1080``
+    as year 1920, and a unit set that could not parse ``TB`` at all. Both
+    reached the decision engine. The grammar is shared now so the next edit
+    cannot reopen the gap.
+
+    The RETURN SHAPE is unchanged, including ``resolution`` still being stored
+    as ``2160p`` rather than the canonical comparison token — persisted values
+    are a migration question, not a parser one.
+    """
     raw = html.unescape(str(title or "")).strip()
-    size_match = _SIZE_RE.search(raw)
-    size_text = None
-    size_gb = None
-    title_without_size = raw
-    if size_match:
-        amount = float(size_match.group("size"))
-        unit = size_match.group("unit").upper()
-        size_text = f"{size_match.group('size')} {size_match.group('unit')}"
-        size_gb = amount / 1024.0 if unit in {"MB", "MIB"} else amount
-        title_without_size = raw[:size_match.start()].strip()
+    size = grammar.find_size(raw, anchored=True)
+    size_text = size.text if size else None
+    size_gb = size.gigabytes if size else None
+    title_without_size = raw[:size.start].strip() if size else raw
 
-    episode_match = _EPISODE_RE.search(title_without_size)
-    season_match = None if episode_match else _SEASON_RE.search(title_without_size)
-    season = (
-        int(episode_match.group("season"))
-        if episode_match
-        else int(season_match.group("season"))
-        if season_match
-        else None
-    )
-    episode = int(episode_match.group("episode")) if episode_match else None
-    episode_end = None
-    if episode_match and episode_match.group("extra"):
-        extras = re.findall(r"E(\d{1,4})", episode_match.group("extra"), re.I)
-        if extras:
-            episode_end = int(extras[-1])
+    season_episode = grammar.parse_season_episode(title_without_size)
+    season = season_episode.season
+    episode = season_episode.episode
+    episode_end = season_episode.episode_end
 
-    year_match = _YEAR_RE.search(title_without_size)
-    year = int(year_match.group(1)) if year_match else None
-    resolution_match = _RESOLUTION_RE.search(title_without_size)
+    year = grammar.parse_year(title_without_size)
+
+    # Stored spelling, not the comparison token: every existing row in
+    # hdencode_candidates holds '2160p', so emitting the canonical 'UHD' here
+    # would split the column into two vocabularies. Comparisons go through
+    # grammar.canonical_resolution() instead.
+    found_resolution = grammar.find_resolution(title_without_size)
     resolution = None
-    if resolution_match:
-        value = resolution_match.group(1).upper()
-        resolution = "2160p" if value in {"4K", "UHD"} else value.lower()
+    if found_resolution:
+        resolution = (
+            "2160p" if found_resolution.canonical == "UHD"
+            else found_resolution.raw.lower()
+        )
 
     dv = (
         EvidenceState.ASSERTED.value
@@ -246,23 +248,14 @@ def parse_release_title(title):
         else EvidenceState.UNKNOWN.value
     )
 
-    marker = (
-        episode_match.start()
-        if episode_match
-        else season_match.start()
-        if season_match
-        else year_match.start()
-        if year_match
-        else resolution_match.start()
-        if resolution_match
-        else len(title_without_size)
-    )
+    marker = grammar.metadata_start(title_without_size)
     clean_title = re.sub(r"[._]+", " ", title_without_size[:marker])
     clean_title = re.sub(r"\s+", " ", clean_title).strip(" -.")
     return {
         "clean_title": clean_title,
         "year": year,
         "season": season,
+        "season_ambiguous": season_episode.ambiguous,
         "episode": episode,
         "episode_end": episode_end,
         "resolution": resolution,

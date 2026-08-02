@@ -54,6 +54,17 @@ from typing import NamedTuple, Optional
 _YEAR_RE = re.compile(r"(?<!\w)((?:19|20)\d{2})(?!\w)")
 
 
+class YearMatch(NamedTuple):
+    year: int
+    start: int
+
+
+def find_year(text: str) -> Optional[YearMatch]:
+    """Year with its position, for callers that split a title at its metadata."""
+    match = _YEAR_RE.search(text or "")
+    return YearMatch(int(match.group(1)), match.start()) if match else None
+
+
 def parse_year(text: str) -> Optional[int]:
     """First plausible release year in ``text``, or None.
 
@@ -62,8 +73,8 @@ def parse_year(text: str) -> Optional[int]:
     arithmetic and sorts before every real year; callers that need the old
     sentinel convert at their own boundary.
     """
-    match = _YEAR_RE.search(text or "")
-    return int(match.group(1)) if match else None
+    found = find_year(text)
+    return found.year if found else None
 
 
 # ────────────────────────── season / episode ────────────────────────────────
@@ -95,6 +106,11 @@ class SeasonEpisode(NamedTuple):
     #: Distinct from ``season is None``, which means none was found at all —
     #: callers must not treat "cannot tell" as "definitely a movie".
     ambiguous: bool
+    #: Position of the season/episode token, or None when nothing matched.
+    #: Present even when the season is ambiguous: the token is still where the
+    #: title's metadata begins, so a clean title can be cut there regardless of
+    #: whether the season itself could be interpreted.
+    start: Optional[int] = None
 
 
 def parse_season_episode(text: str) -> SeasonEpisode:
@@ -105,11 +121,11 @@ def parse_season_episode(text: str) -> SeasonEpisode:
     season_match = None if episode_match else _SEASON_RE.search(text)
     match = episode_match or season_match
     if match is None:
-        return SeasonEpisode(None, None, None, False)
+        return SeasonEpisode(None, None, None, False, None)
 
     season_digits = match.group("season")
     if len(season_digits.lstrip("0") or "0") > _MAX_SEASON_DIGITS:
-        return SeasonEpisode(None, None, None, True)
+        return SeasonEpisode(None, None, None, True, match.start())
 
     episode = end = None
     if episode_match:
@@ -119,7 +135,7 @@ def parse_season_episode(text: str) -> SeasonEpisode:
             trailing = re.findall(r"E(\d{1,4})", extra, re.I)
             if trailing:
                 end = int(trailing[-1])
-    return SeasonEpisode(int(season_digits), episode, end, False)
+    return SeasonEpisode(int(season_digits), episode, end, False, match.start())
 
 
 # ──────────────────────────────── size ──────────────────────────────────────
@@ -140,6 +156,28 @@ _SIZE_ANCHORED_RE = re.compile(
 _SIZE_ANYWHERE_RE = re.compile(_SIZE_BODY, re.I)
 
 
+class SizeMatch(NamedTuple):
+    gigabytes: float
+    #: The size exactly as written, e.g. "82.4 GB" — for display and for the
+    #: RSS reader's ``size_text`` field, which is shown to users verbatim.
+    text: str
+    start: int
+
+
+def find_size(text: str, *, anchored: bool = False) -> Optional[SizeMatch]:
+    """Size with its written form and position."""
+    pattern = _SIZE_ANCHORED_RE if anchored else _SIZE_ANYWHERE_RE
+    match = pattern.search(text or "")
+    if not match:
+        return None
+    amount, unit = match.group("size"), match.group("unit")
+    return SizeMatch(
+        float(amount) * _SIZE_UNITS_GB[unit.upper()],
+        f"{amount} {unit}",
+        match.start(),
+    )
+
+
 def parse_size_gb(text: str, *, anchored: bool = False) -> Optional[float]:
     """Release size in gigabytes, or None.
 
@@ -148,11 +186,8 @@ def parse_size_gb(text: str, *, anchored: bool = False) -> Optional[float]:
     where the size appears mid-document, so it passes ``anchored=False``. The
     *grammar* is identical either way; only the position requirement differs.
     """
-    pattern = _SIZE_ANCHORED_RE if anchored else _SIZE_ANYWHERE_RE
-    match = pattern.search(text or "")
-    if not match:
-        return None
-    return float(match.group("size")) * _SIZE_UNITS_GB[match.group("unit").upper()]
+    found = find_size(text, anchored=anchored)
+    return found.gigabytes if found else None
 
 
 def strip_trailing_size(text: str) -> str:
@@ -167,7 +202,13 @@ def strip_trailing_size(text: str) -> str:
 
 # ───────────────────────────── resolution ───────────────────────────────────
 
-_RESOLUTION_RE = re.compile(r"(?<!\w)(2160p|1080p|1080i|720p|480p|4K|UHD)(?!\w)", re.I)
+#: Exactly the union both readers already accepted. Deliberately NOT widened:
+#: adding 1080i or 480p here would make titles newly parseable that previously
+#: yielded no resolution at all — a behaviour change, smuggled into a fix whose
+#: whole purpose is to make the two paths agree without altering what either
+#: one decides. :func:`canonical_resolution` still tolerates those spellings,
+#: because values also arrive from the database rather than from a title.
+_RESOLUTION_RE = re.compile(r"(?<!\w)(2160p|1080p|720p|4K|UHD)(?!\w)", re.I)
 
 #: Defect (a). UHD is spelled at least three ways across this codebase, and the
 #: readers, the database and the frontend chip do not agree on which. This is
@@ -195,7 +236,77 @@ def canonical_resolution(value: Optional[str]) -> Optional[str]:
     return "1080P" if folded == "1080I" else folded
 
 
+class ResolutionMatch(NamedTuple):
+    #: The one token comparisons are made in.
+    canonical: str
+    #: The spelling as written in the title, for callers that persist it.
+    raw: str
+    start: int
+
+
+def find_resolution(text: str) -> Optional[ResolutionMatch]:
+    """Resolution with both spellings and its position."""
+    match = _RESOLUTION_RE.search(text or "")
+    if not match:
+        return None
+    raw = match.group(1)
+    return ResolutionMatch(canonical_resolution(raw), raw, match.start())
+
+
 def parse_resolution(text: str) -> Optional[str]:
     """Canonical resolution for ``text``, or None. See :func:`canonical_resolution`."""
-    match = _RESOLUTION_RE.search(text or "")
-    return canonical_resolution(match.group(1)) if match else None
+    found = find_resolution(text)
+    return found.canonical if found else None
+
+
+# ─────────────────────────── title / metadata split ─────────────────────────
+
+#: A pixel dimension such as ``1920x1080``. It is metadata, never part of a
+#: name, and it must be recognised HERE even though no field is parsed from it.
+#:
+#: This exists because of a second-order effect of the year fix. While the year
+#: guard was broken, ``1920x1080`` matched as year 1920, which put the metadata
+#: boundary at the dimension and produced the right clean title for the wrong
+#: reason. Correcting the year moved the boundary to the real year further
+#: right, and the dimension started leaking into the title — turning
+#: "Concert Film" into "Concert Film 1920x1080", which then fails identity
+#: matching. Naming the token directly fixes both.
+_DIMENSION_RE = re.compile(r"(?<!\w)\d{3,4}\s*[xX]\s*\d{3,4}(?!\w)")
+
+
+def metadata_start(text: str) -> int:
+    """Index where a release title stops being a name and starts being tags.
+
+    Both readers cut the human-readable title at the first metadata token, and
+    both previously computed that boundary from their own regex matches — so a
+    divergence in *any* of the four patterns silently moved the title boundary
+    too, not just the parsed field. Deriving it here keeps the cut in step with
+    the grammar by construction.
+
+    This is a PRIORITY CHAIN, not the earliest match: season/episode wins over
+    year, which wins over resolution. That is the behaviour the RSS reader
+    already had, and it is deliberately preserved — the two differ for a title
+    like ``Show 2019 S01E02``, where the chain keeps the year in the name
+    ("Show 2019") and an earliest-match rule would drop it ("Show"). Changing
+    how titles are cut is a matching change, not a parity fix, so it is out of
+    scope here.
+
+    Returns ``len(text)`` when the title carries no metadata at all.
+    """
+    text = text or ""
+    season = parse_season_episode(text)
+    if season.start is not None:
+        boundary = season.start
+    else:
+        year = find_year(text)
+        if year is not None:
+            boundary = year.start
+        else:
+            resolution = find_resolution(text)
+            boundary = resolution.start if resolution else len(text)
+
+    # A pixel dimension is metadata too, and it can sit to the LEFT of whatever
+    # the chain picked. Take the earlier of the two so it never leaks into the
+    # name; the chain still decides between season, year and resolution.
+    dimension = _DIMENSION_RE.search(text)
+    return min(boundary, dimension.start()) if dimension else boundary
