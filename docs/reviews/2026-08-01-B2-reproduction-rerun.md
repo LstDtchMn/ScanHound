@@ -100,9 +100,45 @@ So the honest statement of the freeze is unchanged from the plan: **no known
 live data-loss defect; the hold is want of real-storage evidence.**
 
 One narrower gap worth naming: `_move_no_replace` falls back to `os.link` when
-`renameat2` is unavailable, and raises `UnsupportedFilesystemSafetyError` when
-even that cannot be done atomically. Which branch the real volumes take has not
-been measured. B5 should record it per volume rather than assume `renameat2`.
+`renameat2` is unavailable. Which branch the real volumes take has not been
+measured. B5 should record it per volume rather than assume `renameat2`.
+
+> **Correction (2026-08-02, ChatGPT second pass).** An earlier version of this
+> paragraph said `_move_no_replace` raises `UnsupportedFilesystemSafetyError`
+> when neither primitive is atomic. **That is wrong.** Verified at `7cc5275`:
+> when `os.link` fails for any reason other than `EXDEV`, `_move_no_replace`
+> raises a **plain `OSError`** carrying the original errno and a fail-closed
+> message, source intact (`fileops.py:304-312`).
+> `UnsupportedFilesystemSafetyError` is raised only by
+> `_require_directory_durability`, the directory-fsync preflight
+> (`fileops.py:141-152`).
+>
+> No data-loss consequence — the source survives either way — but the error
+> mattered for the instruction it produced: **B5 must not detect unsupported
+> no-replace publication by catching that custom class.** It will never be
+> raised on that path. Detect it from the errno instead (`ENOTSUP`,
+> `EOPNOTSUPP`, `ENOSYS`), which the ledger's classifier already handles, and
+> treat observed disk state as authoritative.
+>
+> Related: `filesystem_safety_status()` returns the literal string
+> `"renameat2_or_hardlink"` (`fileops.py:215/221`) — it reports that one of the
+> two is expected, not which one actually works. **B5 needs an operative scratch
+> probe per volume, not that diagnostic.** Capability discovery should be B5's
+> first stop condition, before the rehearsal counts as started, and it can be
+> done entirely with scratch files — no source-consuming operation on real media
+> is needed merely to learn the capability.
+
+### Two scope corrections to the claim above
+
+* This is a **file-level differential reproduction using `fileops.py` from
+  `555e26b`**, not an execution of that historical commit in full. The rest of
+  the tree stayed current. That is still a valid — arguably cleaner — causal
+  isolation, but it is a different and narrower claim than "the old build lost
+  data," and it should be stated as such.
+* The reproduction recipe below ends after current → pre-fix. The actual run was
+  **current → pre-fix → current**, and the third step is what rules out
+  container drift. The recipe should include it, and should pin each installed
+  `fileops.py` by hash rather than by a `grep -c renameat2` sanity check.
 
 ---
 
