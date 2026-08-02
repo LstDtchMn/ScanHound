@@ -30,7 +30,16 @@ EMOJI_WARNING = "\u26a0\ufe0f"
 # threads. It is a BUDGET SHARED BY ALL of them, not a per-thread timeout: a
 # handful of workers wedged in a long network call must not multiply into a
 # minutes-long shutdown. Whatever is still alive when it expires is logged by
-# name and abandoned (every such thread is a daemon, so the process still exits).
+# name and abandoned.
+#
+# Abandonment is only safe because these are PLAIN daemon threads:
+# measured 2026-08-02, a wedged plain daemon thread does not stop the
+# interpreter exiting (exit 0). Do NOT generalise that to a wedged
+# ThreadPoolExecutor worker — concurrent.futures.thread registers every
+# worker and its _python_exit hook JOINS them at interpreter shutdown,
+# daemon flag or not, so one of those blocks process exit outright. Any
+# future worker that owns an executor needs a real bound on the callable,
+# not this budget.
 LIFESPAN_JOIN_BUDGET_SECONDS = 5.0
 
 
@@ -290,8 +299,10 @@ class ServiceRegistry:
         ``timeout`` is the TOTAL wall clock spent here, not per thread, so N
         wedged workers cost the same as one. Returns the names of the threads
         still alive when the budget ran out (empty on a clean shutdown) for the
-        caller to log — they are daemons, so abandoning them still lets the
-        process exit.
+        caller to log. Abandoning them is safe for PLAIN daemon threads,
+        which the interpreter does not wait for; it is NOT safe for a
+        wedged ThreadPoolExecutor worker, which blocks interpreter exit
+        regardless of its daemon flag (see the module constant above).
         """
         with self._lifespan_threads_lock:
             threads = list(self._lifespan_threads)

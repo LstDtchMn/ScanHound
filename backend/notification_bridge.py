@@ -124,6 +124,18 @@ class NotificationBridge:
                 # one; test_a_wedged_drain_strands_the_thread_rather_than_shutdown
                 # pins that behaviour so the trade is visible, not accidental.
                 try:
+                    # Cancel and gather outstanding tasks FIRST, the way
+                    # asyncio.run() does. send() dispatches notify() as
+                    # fire-and-forget and drops the future, so a webhook POST or
+                    # a batch delay can still be in flight here. Closing the loop
+                    # with those pending destroys them mid-await and emits
+                    # "Task was destroyed but it is pending!".
+                    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(
+                            *pending, return_exceptions=True))
                     loop.run_until_complete(loop.shutdown_asyncgens())
                     loop.run_until_complete(loop.shutdown_default_executor())
                 except Exception:

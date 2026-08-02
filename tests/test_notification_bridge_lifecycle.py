@@ -112,3 +112,34 @@ def test_a_wedged_drain_strands_the_thread_rather_than_shutdown():
         # in the suite-wide threadleak report and mask a genuine one.
         release.set()
         stranded.join(timeout=10)
+
+
+def test_pending_non_executor_tasks_are_cancelled_not_destroyed():
+    """send() is fire-and-forget, so a task can still be awaiting at close.
+
+    Closing the loop with tasks pending destroys them mid-await ("Task was
+    destroyed but it is pending!") and silently loses the notification. The
+    owner thread must cancel and gather first, the way asyncio.run() does.
+    """
+    bridge = _bridge_with_running_loop()
+    started = threading.Event()
+    outcome = {}
+
+    async def _slow_notification():
+        started.set()
+        try:
+            await asyncio.sleep(300)      # a webhook POST / batch delay
+        except asyncio.CancelledError:
+            outcome["cancelled"] = True
+            raise
+
+    handle = asyncio.run_coroutine_threadsafe(_slow_notification(), bridge._loop)
+    assert started.wait(timeout=5), "task never started"
+    loop = bridge._loop
+
+    bridge.shutdown()
+
+    assert loop.is_closed(), "loop should be closed"
+    assert outcome.get("cancelled"), (
+        "pending task was destroyed rather than cancelled and gathered")
+    assert handle.cancelled() or handle.done(), "task future left unresolved"
