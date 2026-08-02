@@ -417,6 +417,13 @@ SMTP_TIMEOUT_SECONDS = 30.0
 # process can exit; an hour-long one restores the defect while looking set.
 SMTP_TIMEOUT_MAX_SECONDS = 300.0
 
+# ``smtp_timeout`` is an ADVANCED, FILE-ONLY setting: hand-add it to config.json
+# and AppService.load_config() preserves it, but it is deliberately absent from
+# AppConfig, _DEFAULT_CONFIG, the frontend, and SettingsUpdate — whose
+# extra="forbid" means the API rejects it outright. Kept off the typed surface
+# because the safe 30s default already holds the process-exit bound, and the
+# knob exists for diagnosing a slow relay rather than for routine tuning.
+
 
 def _coerce_smtp_timeout(value: Any) -> float:
     """Return a finite, positive, bounded socket timeout.

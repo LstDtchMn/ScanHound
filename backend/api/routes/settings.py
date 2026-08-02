@@ -320,6 +320,20 @@ def test_notification(
     cfg = reg.config
     try:
         if channel == "desktop":
+            # Gated on the setting, not merely on the channel being constructed.
+            # This route dispatches to plyer DIRECTLY, bypassing
+            # NotificationBridge entirely, so defaulting desktop_notifications
+            # to False did nothing for it: the button stayed live and every
+            # press ran an unbounded native call. It executes in an AnyIO
+            # worker (sync FastAPI handler), and a wedged executor callable is
+            # joined by concurrent.futures' _python_exit at interpreter
+            # shutdown whatever its daemon flag — so this path alone could hold
+            # the process open while the feature was supposedly off.
+            if not cfg.get("desktop_notifications", False):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Desktop notifications are disabled in Settings; "
+                           "no notification was sent")
             from plyer import notification as plyer_notif
             plyer_notif.notify(
                 title="ScanHound Test",

@@ -41,6 +41,11 @@ class _BlackHoleSMTP:
         self._sock.listen(1)
         self.port = self._sock.getsockname()[1]
         self._held = []
+        # Set when a client actually connects. Without this the process test
+        # could only infer that SMTP had been entered, from a sleep — so a
+        # regression that dropped the dispatch entirely would exit fast and
+        # PASS, testing nothing.
+        self.accepted = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
@@ -55,6 +60,7 @@ class _BlackHoleSMTP:
             except OSError:
                 break
             self._held.append(conn)   # accepted, deliberately never answered
+            self.accepted.set()
 
     def close(self):
         self._stop.set()
@@ -159,8 +165,12 @@ bridge.configure({
     "smtp_timeout": 1.0,
 })
 bridge.send("info", "t", "m")
-time.sleep(1.0)                          # let the executor callable reach SMTP
 print("DISPATCHED", flush=True)
+# Block until the PARENT confirms the server actually accepted the connection,
+# so shutdown runs with the executor callable provably inside SMTP. Sleeping a
+# fixed interval here instead would let a build that silently drops the
+# dispatch exit fast and pass, proving nothing.
+assert sys.stdin.readline().strip() == "GO", "parent did not confirm acceptance"
 bridge.shutdown()
 print("SHUTDOWN-RETURNED", flush=True)
 '''
@@ -169,11 +179,15 @@ print("SHUTDOWN-RETURNED", flush=True)
 def test_a_blocked_smtp_send_cannot_hold_interpreter_exit(black_hole, tmp_path):
     """A live SMTP executor operation must not stop the process terminating.
 
-    The child connects to a server that accepts and never replies, so the
-    executor worker is genuinely blocked in SMTP when shutdown runs — not
-    cancelled before it started. If smtp_timeout stops reaching the deployed
-    channel (it is forwarded through NotificationBridge.configure), the worker
-    blocks forever and _python_exit refuses to let the child exit.
+    Blocked-in-SMTP is an OBSERVED PRECONDITION here, not an inference: the
+    parent waits for the black-hole server to actually accept the connection
+    before telling the child to shut down. An earlier version slept a fixed
+    interval instead, which meant a regression that silently dropped the
+    dispatch would exit fast and pass while testing nothing.
+
+    If smtp_timeout stops reaching the deployed channel (it is forwarded
+    through NotificationBridge.configure), the worker blocks on the 30s default
+    and _python_exit refuses to let the child exit inside the budget below.
     """
     import subprocess
     import sys as _sys
@@ -188,11 +202,25 @@ def test_a_blocked_smtp_send_cannot_hold_interpreter_exit(black_hole, tmp_path):
     env = dict(os.environ, PYTHONPATH=str(repo_root))
     proc = subprocess.Popen(
         [_sys.executable, str(script), "127.0.0.1", str(black_hole.port)],
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         cwd=str(repo_root), env=env,
     )
     began = time.monotonic()
+
+    # STEP 1 — require that SMTP was genuinely entered. This is the assertion a
+    # dropped-dispatch regression must fail on.
+    if not black_hole.accepted.wait(timeout=20):
+        proc.kill()
+        out, err = proc.communicate()
+        raise AssertionError(
+            "SMTP connection was never accepted, so the executor callable never "
+            f"reached SMTP and this test proves nothing.\nout={out}\nerr={err}")
+
     try:
+        # STEP 2 — only now release the child into shutdown().
+        proc.stdin.write("GO\n")
+        proc.stdin.flush()
         # Deliberately tight. The child's smtp_timeout is 1s, so a wired build
         # finishes in a few seconds. If smtp_timeout stops reaching the deployed
         # channel, the socket falls back to the 30s default and blows this

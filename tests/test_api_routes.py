@@ -189,6 +189,33 @@ class TestSettings:
         assert resp.status_code == 400
         assert "Unknown channel" in resp.json()["detail"]
 
+    def test_test_desktop_refuses_while_the_feature_is_disabled(self, client):
+        """The test route dispatches to plyer DIRECTLY, bypassing the bridge.
+
+        Defaulting desktop_notifications to False therefore did nothing for it:
+        the route stayed live and every press ran an unbounded native call that
+        can hold interpreter exit open. Gating the channel alone is not enough
+        — this second call site has to refuse too.
+        """
+        from unittest.mock import patch as _patch
+
+        client.put("/settings", json={"desktop_notifications": False})
+        with _patch("plyer.notification.notify") as notify:
+            resp = client.post("/settings/test/desktop")
+        assert resp.status_code == 409, resp.text
+        assert "disabled in Settings" in resp.json()["detail"]
+        assert notify.call_count == 0, "plyer was invoked while disabled"
+
+    def test_test_desktop_dispatches_once_explicitly_enabled(self, client):
+        """Opting in must still work — the guard gates, it does not remove."""
+        from unittest.mock import patch as _patch
+
+        client.put("/settings", json={"desktop_notifications": True})
+        with _patch("plyer.notification.notify") as notify:
+            resp = client.post("/settings/test/desktop")
+        assert resp.status_code == 200, resp.text
+        assert notify.call_count == 1
+
     def test_test_notification_discord_returns_result(self, client):
         # Clear the discord webhook so the test won't make a real HTTP call
         client.put("/settings", json={"discord_webhook": ""})

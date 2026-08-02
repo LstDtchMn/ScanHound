@@ -1710,7 +1710,11 @@
             </label>
             <button
               onclick={() => testChannel('desktop')}
-              disabled={testingChannel === 'desktop'}
+              disabled={testingChannel === 'desktop' ||
+                        !($settings.desktop_notifications as boolean ?? false)}
+              title={!($settings.desktop_notifications as boolean ?? false)
+                     ? 'Enable Desktop Notifications first'
+                     : undefined}
               class={testBtnClassFor('desktop')}
             >
               {testBtnLabel('desktop')}
