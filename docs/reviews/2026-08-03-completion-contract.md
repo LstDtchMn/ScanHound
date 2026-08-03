@@ -181,3 +181,29 @@ compresses it.** Everything else fits inside or around it.
    in-scope git work, not a guardrail action.
 6. R-2 (canonical-URL inventory) proceeds tonight since it blocks Phase A and
    is purely observational.
+
+---
+
+## Round-9 amendments (2026-08-03, applied from the amended verdict)
+
+1. **Anti-proxy rule, contract-wide:** no criterion is satisfied by committing
+   a document that describes the work, by deleting or narrowing a test, by
+   checking only endpoint states, or by an undefined deferral. The evidence
+   artifact must demonstrate the behaviour itself.
+2. **R-2 reworded:** the inventory DOCUMENT does not complete R-2. R-2 closes
+   only when the inventory's §5 criteria PLUS the §6 round-9 additions land:
+   committed executable queries + controls + snapshot provenance,
+   machine-readable outputs with fixed denominators (including the 1 residual
+   miss and the 35 out-of-population exclusions), per-join "100%" definitions,
+   consumer-boundary contract tests for every bridge, and a migration policy
+   for persisted A/B keys.
+3. **Track 5 gains the missing columns:** exit criterion and evidence artifact
+   per item — D-1: filter provably classifies 720p/1080p/4K on a labelled
+   corpus, test + UI screenshot; D-2: UI toggle round-trips to the SAME shared
+   rule both paths call, test proving one predicate object; D-3: HDR10+ label
+   present in Plex + Kometa overlay renders, API query + screenshot; D-4:
+   committed design decision doc; D-5: corrected spec diff + a check that the
+   corrected criterion matches deployed behaviour; D-6: rebased branch, CI
+   green, counters demonstrated against injected failure AND cancellation.
+4. **CI attestation is part of every evidence package:** run URLs, not
+   commit-message claims (7681a87 = actions/runs/30811406913, success).
