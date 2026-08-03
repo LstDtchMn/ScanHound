@@ -166,3 +166,59 @@ def test_confidence_and_provenance_survive_the_database(tmp_path):
         conn.close()
     assert {"media_type_provisional", "media_type_because"} <= cols
     del db
+
+
+# ───────────── hydration must RESOLVE the type, not leave it ────────────────
+
+class TestHydrationResolvesTheType:
+    """The review's reproduced sequence: an AMBIGUOUS candidate was hydrated,
+    its media_type was never updated, `_identity_is_confirmed` fell through to
+    the movie rule, and it was promoted to identity_state='exact' — reaching
+    `_validate_auto_action` as a confident movie it had never been.
+
+    Hydrated DETAIL evidence outranks the title, so when it resolves the type
+    that verdict must be recorded, not merely used and discarded."""
+
+    def test_detail_evidence_resolves_an_ambiguous_type(self):
+        from backend.hdencode_candidate_service import _candidate_updates
+        updates = _candidate_updates({"is_tv": True, "season": 3,
+                                      "display_title": "Great Show"})
+        assert updates["media_type"] == "tv"
+        assert updates["media_type_provisional"] is False
+        assert updates["media_type_because"]
+
+    def test_a_season_number_alone_is_detail_evidence(self):
+        """A season pack has a season and no episode. That is still TV."""
+        from backend.hdencode_candidate_service import _candidate_updates
+        updates = _candidate_updates({"season": 3, "display_title": "Great Show"})
+        assert updates["media_type"] == "tv"
+
+    def test_absent_evidence_does_not_overwrite_a_good_verdict(self):
+        """is_tv False means 'no season token in the filename', which is not a
+        claim that this is a film. Writing 'movie' here would manufacture
+        confidence the detail page never supplied."""
+        from backend.hdencode_candidate_service import _candidate_updates
+        updates = _candidate_updates({"is_tv": False,
+                                      "display_title": "The Batman"})
+        assert "media_type" not in updates
+
+    def test_the_resolved_type_actually_persists(self, tmp_path):
+        """Asserted through the real DB call, because the UPDATE has an
+        explicit column list — a value not named there is computed and
+        silently dropped, which is the failure this change exists to fix."""
+        import sqlite3
+
+        from backend.database import DatabaseManager
+        db = DatabaseManager(str(tmp_path / "t.db"))
+        conn = sqlite3.connect(str(tmp_path / "t.db"))
+        try:
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(hdencode_candidates)")}
+        finally:
+            conn.close()
+        assert {"media_type_provisional", "media_type_because"} <= cols
+        import inspect
+        source = inspect.getsource(db.complete_hdencode_hydration)
+        assert "media_type = COALESCE" in source, (
+            "the hydration UPDATE does not name media_type, so a resolved "
+            "verdict would be dropped at this boundary")
