@@ -633,6 +633,12 @@ class RenameService:
         self.last_package_failed_db = 0
         if not self._cfg.get("auto_rename_enabled"):
             return []
+        from backend.capability_gate import capability_blockers
+        if capability_blockers(self._cfg):
+            # R-6 boundary 2: the AUTONOMOUS entry point self-gates on the
+            # programme evidence pass, mirroring the flag check above --
+            # manual/reviewed rename flows do not pass through here.
+            return []
         db = self._db
         # JDownloader hands us its host (Windows) save path; map it into the
         # container's mounted view before touching the filesystem.
