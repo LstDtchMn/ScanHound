@@ -17,6 +17,7 @@ byte-identical and diffable.
 """
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 
@@ -91,7 +92,7 @@ def measure(db_path: str) -> dict:
         bridged = cur.fetchone()[0]
         cur.execute(f"SELECT COUNT(DISTINCT canonical_url) FROM {b_table}")
         denominator = cur.fetchone()[0]
-        cur.execute(f"SELECT b.canonical_url FROM {b_table} b "
+        cur.execute(f"SELECT DISTINCT b.canonical_url FROM {b_table} b "
                     "WHERE NOT EXISTS (SELECT 1 FROM hdencode_candidates c "
                     "  WHERE b.canonical_url || '/' = c.canonical_url "
                     "     OR b.canonical_url = c.canonical_url) "
@@ -102,8 +103,61 @@ def measure(db_path: str) -> dict:
             "bridged_match": bridged, "unmatched_count": len(unmatched),
             "unmatched": unmatched,
         }
+
+    # ---- actual-function pass (round-10 Q1): run the REAL canonicalizers ----
+    # The SQL bridge above proves string relationships; this section proves
+    # the shared functions themselves behave on the real corpus.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from backend.url_canonical import (
+        canonicalize_hdencode_post_url, canonicalize_listing_url,
+        post_to_listing_identity)
+
+    def _fixed_point_stats(rows_sql, fn):
+        cur.execute(rows_sql)
+        urls = [r[0] for r in cur.fetchall()]
+        accepted = rejected = noncanonical = 0
+        canon_groups = {}
+        for u in urls:
+            try:
+                c = fn(u)
+            except ValueError:
+                rejected += 1
+                continue
+            accepted += 1
+            if c != u:
+                noncanonical += 1
+            canon_groups.setdefault(c, set()).add(u)
+        collisions = {c: sorted(v) for c, v in canon_groups.items() if len(v) > 1}
+        return {"rows": len(urls), "accepted": accepted, "rejected": rejected,
+                "noncanonical_form": noncanonical,
+                "canonical_collision_groups": len(collisions),
+                "collisions": collisions}
+
+    functional = {
+        "form_a_candidates": _fixed_point_stats(
+            "SELECT DISTINCT canonical_url FROM hdencode_candidates",
+            canonicalize_hdencode_post_url),
+        "form_b_shadow_misses": _fixed_point_stats(
+            "SELECT DISTINCT canonical_url FROM hdencode_shadow_misses",
+            canonicalize_listing_url),
+        "form_b_exclusions": _fixed_point_stats(
+            "SELECT DISTINCT canonical_url FROM listing_policy_exclusions",
+            canonicalize_listing_url),
+    }
+    # the NAMED bridge over the real corpus (not the SQL || bridge)
+    cur.execute("SELECT DISTINCT canonical_url FROM hdencode_candidates")
+    cand_bridge = {post_to_listing_identity(r[0]) for r in cur.fetchall()}
+    for b_table in ("hdencode_shadow_misses", "listing_policy_exclusions"):
+        cur.execute(f"SELECT DISTINCT canonical_url FROM {b_table}")
+        b_urls = [r[0] for r in cur.fetchall()]
+        matched = sum(1 for u in b_urls if canonicalize_listing_url(u) in cand_bridge)
+        functional[f"named_bridge_{b_table}"] = {
+            "denominator": len(b_urls), "matched_via_post_to_listing_identity": matched,
+            "unmatched": len(b_urls) - matched}
+
     con.close()
     return {
+        "functional_pass": functional,
         "snapshot_sha256": digest,
         "provenance": "backup-API snapshot of /dbvol/crawler.db (sqlite3 "
                       "Connection.backup into the container's /tmp, docker cp out); "
