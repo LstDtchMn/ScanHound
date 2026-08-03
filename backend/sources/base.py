@@ -425,8 +425,8 @@ class SourceBase(ABC):
 
     def extract_year(self, text: str) -> int:
         """Extract year from text. Returns 0 when absent (legacy sentinel)."""
-        year = grammar.parse_year(text)
-        return year if year is not None else 0
+        match = grammar.select_release_year(text)
+        return match.year if match else 0
 
     def extract_resolution(self, text: str) -> str:
         """Extract resolution from text, in this path's stored spelling.

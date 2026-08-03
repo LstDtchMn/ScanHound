@@ -81,12 +81,21 @@ listing = _Source()
 
 class TestBothPathsUseTheSharedGrammar:
     def test_rss_year_follows_the_shared_grammar(self, monkeypatch):
-        monkeypatch.setattr(grammar, "parse_year", lambda text: 1234)
+        # The year AUTHORITY moved to select_release_year (rightmost rule,
+        # ratified 2026-08-04); both paths must consult it.
+        monkeypatch.setattr(grammar, "select_release_year",
+                            lambda text: grammar.YearMatch(1234, 0))
         assert parse_release_title("The Batman 2022 1080p BluRay")["year"] == 1234
 
     def test_listing_year_follows_the_shared_grammar(self, monkeypatch):
-        monkeypatch.setattr(grammar, "parse_year", lambda text: 1234)
+        monkeypatch.setattr(grammar, "select_release_year",
+                            lambda text: grammar.YearMatch(1234, 0))
         assert listing.extract_year("The Batman 2022 1080p BluRay") == 1234
+
+    def test_both_paths_pick_the_rightmost_year(self):
+        # Executed, not mocked: the shared wrong answer round 10 flagged.
+        assert parse_release_title("Blade Runner 2049 2017 2160p WEB")["year"] == 2017
+        assert listing.extract_year("Blade Runner 2049 2017 2160p WEB") == 2017
 
     def test_rss_size_follows_the_shared_grammar(self, monkeypatch):
         monkeypatch.setattr(grammar, "find_size",

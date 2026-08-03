@@ -268,7 +268,8 @@ def parse_release_title(title):
     episode = season_episode.episode
     episode_end = season_episode.episode_end
 
-    year = grammar.parse_year(title_without_size)
+    _year_match = grammar.select_release_year(title_without_size)
+    year = _year_match.year if _year_match else None
 
     # Stored spelling, not the comparison token: every existing row in
     # hdencode_candidates holds '2160p', so emitting the canonical 'UHD' here

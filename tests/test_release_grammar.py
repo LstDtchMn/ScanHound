@@ -320,3 +320,29 @@ class TestEpisodeGluedSuffixConstraint:
         assert parse_season_episode("Show.S01E01x265.mkv").season == 1
         assert parse_season_episode("Show.S01E01.1080p.mkv").episode == 1
         assert parse_season_episode("Show.S01E01E02.mkv").episode_end == 2
+
+
+class TestRightmostReleaseYear:
+    """Jesse-ratified 2026-08-04 (round-10 prescription): the release year is
+    the RIGHTMOST plausible year token with a non-empty title to its left —
+    earlier year-like tokens are part of the NAME."""
+
+    def test_number_titles_keep_their_number(self):
+        from backend.release_grammar import select_release_year
+        assert select_release_year("Blade Runner 2049 2017 2160p").year == 2017
+        assert select_release_year("2001 A Space Odyssey 1968 1080p").year == 1968
+
+    def test_single_year_and_no_year_forms(self):
+        from backend.release_grammar import select_release_year
+        assert select_release_year("Movie Title 2020 1080p").year == 2020
+        assert select_release_year("2012") is None          # bare year = a title
+        assert select_release_year("No Year Here 1080p") is None
+
+
+class TestInterlacedToken:
+    """Jesse-ratified 2026-08-04: 1080i is 1080-class for every decision that
+    matters; the token joins the shared vocabulary and folds to 1080P."""
+
+    def test_1080i_parses_and_folds(self):
+        from backend.release_grammar import parse_resolution
+        assert parse_resolution("Show.S01E01.1080i.HDTV.mkv") == "1080P"

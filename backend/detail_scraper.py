@@ -271,7 +271,7 @@ class DetailScraper:
                 # instead of giving up, try the next token. First token whose
                 # left side is a non-empty title wins.
                 clean_title = None
-                for year_match in release_grammar.find_years(full_fn):
+                for year_match in reversed(release_grammar.find_years(full_fn)):
                     cut = _clean_cut(full_fn[:year_match.start])
                     if cut:
                         clean_title = cut
