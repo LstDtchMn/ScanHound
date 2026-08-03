@@ -885,3 +885,46 @@ class TestRTSlugIntegration:
         import re
         slug = scraper._title_to_rt_slug("Fast & Furious: Hobbs! and? Shaw#")
         assert re.match(r'^[\w]+$', slug), f"Slug contains invalid URL chars: {slug}"
+
+
+class TestRound10ReworkRegressions:
+    """Behavioural pins for the internal round-10 review's executed findings —
+    deliberately NOT source-grep assertions; that proxy shape is how the
+    leftover override block survived the first R-3 patch."""
+
+    def test_page_resolution_wins_when_filename_has_no_token(self, scraper):
+        # The leftover substring block used to let '1080i' in the filename
+        # override an explicit 2160p page line.
+        html = _build_detail_html("Show.S01E01.1080i.mkv",
+                                  resolution="Resolution: 2160p")
+        assert _scrape(scraper, html)["res"] == "4K"
+
+    def test_title_year_form_keeps_a_clean_title(self, scraper):
+        html = _build_detail_html("Movie Title (2020) 1080p.mkv")
+        result = _scrape(scraper, html)
+        assert result["display_title"].rstrip() == "Movie Title"
+        assert result["year"] == 2020
+
+    def test_opening_year_title_retries_the_next_year_token(self, scraper):
+        html = _build_detail_html("2001.A.Space.Odyssey.1968.1080p.mkv")
+        result = _scrape(scraper, html)
+        assert result["display_title"] == "2001 A Space Odyssey"
+        assert result["year"] == 1968
+
+    def test_group_name_starting_with_s_digit_is_not_tv(self, scraper):
+        html = _build_detail_html("Movie.2020.1080p.x264-S0MEGRP.mkv")
+        result = _scrape(scraper, html)
+        assert result["is_tv"] is False
+        assert result["year"] == 2020
+
+    def test_oversized_prose_is_not_a_labelled_size(self, scraper):
+        html = _build_detail_html(
+            "Movie.2020.1080p.mkv", size_label="Size: 2.0 GB",
+            extra_text="the oversized bonus disc adds 9 GB")
+        assert _scrape(scraper, html)["size"] == "2.0 GB"
+
+    def test_dimension_only_filename_gets_a_clean_title(self, scraper):
+        html = _build_detail_html("Concert.Film.1920x1080.mkv")
+        result = _scrape(scraper, html)
+        assert result["display_title"] == "Concert Film"
+        assert result["year"] == 0
