@@ -112,3 +112,19 @@ share one form — correct by construction once the writer actually runs.
    same-producer consistency make this sound).
 5. Corpus re-measured after 1–3 land; the cross-form join counts above are the
    baseline to beat (0 exact matches must become 100% under the bridge).
+
+## 6. Round-9 additions to the closure criteria (2026-08-03)
+
+§5 alone does not close item 2. Additionally required: (1) committed
+executable measurement + control queries with snapshot provenance/checksum
+(no sensitive production data); (2) machine-readable outputs with fixed
+denominators, explicitly carrying the 1 residual miss and the 35
+out-of-RSS-population exclusions; (3) "100% under the bridge" defined per
+join and per population; (4) consumer-boundary contract tests for every
+identity bridge Phase A relies on, including the sweep frontier once bound;
+(5) a migration/backfill or compatibility policy for already-persisted A/B
+keys when the shared canonicaliser version changes. Frontier identity:
+**Form A**, as a source-specific versioned HDEncode post identity with raw
+URL retained; feed identity stays a DISTINCT function because feed query
+parameters are identity-bearing. §5 criterion 3 (the #191 fix) is DONE
+(7681a87, CI actions/runs/30811406913; assertions sharpened 1c1fab3).
