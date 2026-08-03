@@ -428,15 +428,17 @@ def resolution_from_dimensions(text: str) -> Optional[str]:
     A dimension is NOT a resolution token and never enters the resolution
     vocabulary (that inversion is how divergence (b)'s cousin lived in
     DetailScraper). Detail pages legitimately state "Resolution: 3840x2160",
-    so THIS function is the one sanctioned conversion — explicit, named, and
-    faithful to the scraper's historical mapping: exact standard values only,
-    anything else stays None rather than being guessed into a class.
+    so THIS function is the one sanctioned conversion — explicit and named.
+    POLICY (Jesse-ratified 2026-08-04): 4K-class means width 3840 (standard
+    AND scope crops — deliberately broader than exact 3840x2160) or height
+    2160; 1080/720 map on exact standard edges; anything else, including a
+    2160-WIDE oddity, stays None rather than being guessed into a class.
     """
     match = _DIMENSION_VALUE_RE.search(text or "")
     if not match:
         return None
     width, height = int(match.group(1)), int(match.group(2))
-    if width in (3840, 2160) or height == 2160:
+    if width == 3840 or height == 2160:
         return "UHD"
     if width == 1080 or height == 1080:
         return "1080P"
