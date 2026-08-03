@@ -181,7 +181,11 @@ class SweepSessionStore:
         and cannot inflate the new-identity count, which is what makes replay
         safe.
         """
-        identity = getattr(self, "frontier_identity", None) or DEFAULT_FRONTIER_IDENTITY
+        # Round-10 Q1 defect: an instance-attribute override could swap the
+        # FUNCTION while every row still received the global hdencode-post-v1
+        # version stamp -- a stamped lie. The override is REMOVED until a
+        # future source binds (function, version, namespace) as one object.
+        identity = DEFAULT_FRONTIER_IDENTITY
         now_iso = _iso(_now())
         new = 0
         for post in posts:
