@@ -4229,6 +4229,10 @@ class DatabaseManager:
                             excluded.source_category),
                         data = excluded.data,
                         parse_version = excluded.parse_version,
+                        -- Round-11 Finding 2: the cache write IS the
+                        -- successful re-derivation boundary -- a re-scraped
+                        -- stale row heals here or re-scrapes forever.
+                        derived_state = 'current',
                         last_seen_at = CURRENT_TIMESTAMP
                 ''', [{
                     "url": it.get("url"),

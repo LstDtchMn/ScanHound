@@ -413,3 +413,52 @@ class TestConfigurableCategories:
         bs = BackgroundScanner(_FakeRegistry(
             {"background_scan_categories": ["nonsense"]}, _FakeScanner(), db))
         assert all(bs._category_flags().values())  # never scan nothing
+
+
+class TestR6DemotionRestoresTheSafetyNet:
+    """Round-11 Finding 1 (P0): an invalid-gate primary cycle DEMOTES inside
+    the RSS service -- the scanner must follow the EFFECTIVE mode, so the
+    listing crawl runs, the shadow comparison records, and the demotion is
+    durably visible. Before the fix, config-mode capture left the safety net
+    down: RSS-only discovery under an invalid gate."""
+
+    def test_demoted_primary_runs_listing_and_shadow(self, db, monkeypatch):
+        demoted_cycle = {
+            "mode": "rss_shadow",
+            "demoted_from": "rss_primary",
+            "promotion_gate_blockers": ["phase_b_verdict_absent"],
+            "skipped": False, "feeds": [], "changed": 0, "candidates": 0,
+            "candidate_urls": [], "requests": 0,
+            "coverage_uncertain": False, "fallback_qualified": False,
+            "listing_fallback_started": False, "downloads_started": 0,
+        }
+
+        class _FakeRss:
+            def __init__(self, cfg, db_):
+                pass
+            def poll_cycle(self, **kw):
+                return demoted_cycle
+
+        import backend.hdencode_rss_service as rss_mod
+        monkeypatch.setattr(rss_mod, "HDEncodeRSSService", _FakeRss)
+
+        scanner = _FakeScanner()
+        cfg = {"background_scan_enabled": True,
+               "background_scan_sources": ["HDEncode"],
+               "background_scan_pages": 1,
+               "hdencode_enabled": True,
+               "hdencode_discovery_mode": "rss_primary"}
+        result = BackgroundScanner(_FakeRegistry(cfg, scanner, db)).scan_once()
+
+        # 3+4: RSS polled (fake) AND the LISTING crawl executed
+        assert scanner.calls, "listing crawl must run under demotion"
+        # 5: the shadow comparison recorded a cycle in the real DB
+        import sqlite3 as _sq
+        conn = _sq.connect(db.db_path)
+        shadow_rows = conn.execute(
+            "SELECT COUNT(*) FROM hdencode_shadow_cycles").fetchone()[0]
+        conn.close()
+        assert shadow_rows == 1, "shadow comparison must record under demotion"
+        # 7: durable operator visibility
+        assert demoted_cycle["promotion_gate_blockers"] == ["phase_b_verdict_absent"]
+
