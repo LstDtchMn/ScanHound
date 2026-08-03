@@ -131,9 +131,13 @@ class TestLease:
 
 
 class TestLedger:
-    def _posts(self, *urls, page=1):
-        return [{"canonical_url": u, "raw_url": u + "/", "title": "T",
-                 "page_index": page} for u in urls]
+    def _posts(self, *slugs, page=1):
+        # Real HDEncode URL shapes: the frontier is BOUND to the Form-A post
+        # identity (round 9), which rejects non-URL strings, so fixtures mint
+        # genuine URLs. raw_url deliberately varies (no slash) from canonical.
+        return [{"canonical_url": f"https://hdencode.org/{u}/",
+                 "raw_url": f"https://hdencode.org/{u}", "title": "T",
+                 "page_index": page} for u in slugs]
 
     def test_new_identities_counted_once(self, store):
         s = store.begin(SOURCE, now=T0)
@@ -154,5 +158,32 @@ class TestLedger:
         st.record_observations(s1, self._posts("shared"))
         s2 = st.begin("tv_packs", now=T0)
         assert st.record_observations(s2, self._posts("shared")) == 1
-        assert "shared" in st.known_urls("4k_movies")
-        assert "shared" in st.known_urls("tv_packs")
+        assert "https://hdencode.org/shared/" in st.known_urls("4k_movies")
+        assert "https://hdencode.org/shared/" in st.known_urls("tv_packs")
+
+    def test_variant_spellings_are_ONE_identity(self, store):
+        """The binding itself: www/case/slash variants of one post must not
+        count as new identities — unbound, each spelling minted its own key."""
+        s = store.begin(SOURCE, now=T0)
+        assert store.record_observations(s, [
+            {"canonical_url": "https://WWW.HDEncode.org/x", "raw_url": "", "title": "T",
+             "page_index": 1}]) == 1
+        assert store.record_observations(s, [
+            {"canonical_url": "https://hdencode.org/x/", "raw_url": "", "title": "T",
+             "page_index": 2}]) == 0
+
+    def test_ledger_rows_carry_the_real_version_name(self, store, conn):
+        from backend.url_canonical import POST_IDENTITY_VERSION
+        s = store.begin(SOURCE, now=T0)
+        store.record_observations(s, self._posts("v"))
+        row = conn.execute(
+            "SELECT canonicalizer_version FROM listing_source_ledger").fetchone()
+        assert row[0] == POST_IDENTITY_VERSION == "hdencode-post-v1"
+
+    def test_foreign_host_fails_loudly_not_silently(self, store):
+        import pytest
+        s = store.begin(SOURCE, now=T0)
+        with pytest.raises(ValueError):
+            store.record_observations(s, [
+                {"canonical_url": "https://evil.example/x/", "raw_url": "",
+                 "title": "T", "page_index": 1}])
