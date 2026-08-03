@@ -1269,12 +1269,38 @@ class ScannerService:
                 status = ScanStatus(d.get('status', 'missing'))
             except ValueError:
                 status = ScanStatus.MISSING
+            # A cached dict written before media_type existed carries none, and
+            # MediaItem defaults to 'ambiguous' — which the matcher now
+            # (correctly) refuses to route. Left unhandled that would have made
+            # every pre-existing cached item unmatchable, so resolve it from the
+            # evidence the cache does carry.
+            #
+            # Marked PROVISIONAL: the cache has the title and season but not the
+            # detail-scraper evidence the live path had, so this is a weaker
+            # verdict than a fresh scan produces and must not authorise anything
+            # autonomous on its own.
+            cached_type = str(d.get('media_type') or '').strip().lower()
+            cached_provisional = d.get('media_type_provisional')
+            if cached_type not in ('tv', 'movie', 'ambiguous'):
+                verdict = grammar.resolve_media_type([
+                    grammar.title_type_evidence(d.get('title') or '',
+                                                source='cached-title'),
+                    grammar.TypeEvidence(grammar.MediaType.TV,
+                                         grammar.Authority.TITLE, 'cached-season')
+                    if d.get('season') is not None else None,
+                ])
+                cached_type = verdict.media_type.value
+                cached_provisional = True
+
             return MediaItem(
                 id=str(d.get('id', '') or ''),
                 title=d.get('title', '') or '',
                 year=d.get('year', 0) or 0,
                 season=d.get('season'),
                 episodes=d.get('episodes'),
+                media_type=cached_type,
+                media_type_provisional=(
+                    True if cached_provisional is None else bool(cached_provisional)),
                 rating=d.get('rating', 0.0) or 0.0,
                 rt_score=d.get('rt_score'),
                 status=status,

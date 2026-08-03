@@ -36,7 +36,10 @@ class TestScanStatus:
         assert ScanStatus.DV_UPGRADE.value == "dv_upgrade"
 
     def test_enum_has_expected_members(self):
-        assert len(ScanStatus) == 7
+        # 8 since 2026-08-02: MEDIA_TYPE_UNRESOLVED. An item whose media type
+        # cannot be resolved must be VISIBLE, not silently routed to the movie
+        # matcher, which is what a boolean is_tv branch did.
+        assert len(ScanStatus) == 8
         assert ScanStatus.DOWNLOADED_SIMILAR.value == "downloaded_similar"
 
     def test_enum_round_trips_from_value(self):
@@ -433,6 +436,21 @@ class TestAssignGroupKeys:
 # ── ScannerService.detect_duplicate_groups ───────────────────────────
 
 class TestMatchAgainstPlex:
+    def test_an_unresolved_media_type_is_not_matched_at_all(self):
+        """Companion to the fixture change below.
+
+        Without this, setting media_type='movie' in the movie test would be the
+        only thing keeping the tri-state invariant alive, and nothing would
+        notice if the guard were removed."""
+        svc = _make_service()
+        svc.plex.plex_index = {"all_items": [{"rating_key": "k"}],
+                               "by_imdb": {}, "by_title": {}}
+        svc.items = [MediaItem(id="item_0", title="Anaconda", year=2025)]
+        asyncio.run(svc._match_against_plex("Deep Scan"))
+        svc.matching.find_movie_matches.assert_not_called()
+        svc.matching.find_tv_season_matches.assert_not_called()
+        assert svc.items[0].status is ScanStatus.MEDIA_TYPE_UNRESOLVED
+
     def test_movie_match_stores_selected_plex_rating_key(self):
         svc = _make_service()
         svc.plex.plex_index = {"all_items": [{"rating_key": "new-plex-key"}], "by_imdb": {}, "by_title": {}}
@@ -445,6 +463,10 @@ class TestMatchAgainstPlex:
                 size="20 GB",
                 imdb_id="tt1234567",
                 web_data={"imdb_id": "tt1234567", "size": "20 GB"},
+                # Required since 2026-08-02: the matcher selects on media_type
+                # and refuses to route an unresolved one. This test is about a
+                # MOVIE match, so it must say so.
+                media_type="movie",
             )
         ]
         svc.matching.find_movie_matches.return_value = (
