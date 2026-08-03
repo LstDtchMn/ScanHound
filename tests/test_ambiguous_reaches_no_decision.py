@@ -222,3 +222,78 @@ class TestHydrationResolvesTheType:
         assert "media_type = COALESCE" in source, (
             "the hydration UPDATE does not name media_type, so a resolved "
             "verdict would be dropped at this boundary")
+
+
+class TestUnresolvedAfterHydrationIsTerminal:
+    """A completed hydration is the strongest evidence available without a
+    person. If the type is STILL unresolved after it, re-queueing asks the same
+    question of the same page forever, and promoting the identity around it is
+    how an ambiguous candidate previously became an actionable movie."""
+
+    def _service(self, row):
+        import types
+
+        from backend.hdencode_candidate_service import HDEncodeCandidateService
+        svc = HDEncodeCandidateService.__new__(HDEncodeCandidateService)
+        svc.config = {}
+        from backend.candidate_evidence import CandidateDecisionEngine
+        svc.engine = CandidateDecisionEngine()
+        calls = {"enqueued": 0, "resolved": 0, "state": None}
+
+        def _ctx(**kw):
+            return {"exact_url_downloaded": False, "plex_matches": []}
+
+        def _update(url, *, identity_state, relevance_state, detail_reason):
+            calls["state"] = (identity_state, relevance_state)
+
+        svc.db = types.SimpleNamespace(
+            get_hdencode_candidate_context=_ctx,
+            update_hdencode_candidate_state=_update,
+            enqueue_hdencode_hydration=lambda *a, **k: calls.__setitem__(
+                "enqueued", calls["enqueued"] + 1),
+            resolve_hdencode_hydration=lambda *a, **k: calls.__setitem__(
+                "resolved", calls["resolved"] + 1),
+        )
+        return svc, calls
+
+    def _row(self, **over):
+        row = {
+            "canonical_url": "https://hdencode.org/x/",
+            "clean_title": "Great Show",
+            "media_type": "ambiguous",
+            "title_year": 2024,
+            "description_year": 2024,
+            "identity_state": "hydrated",
+            "hydration_state": "completed",
+            "season": None,
+            "episode": None,
+            "description_complete": 1,
+        }
+        row.update(over)
+        return row
+
+    def test_it_stops_instead_of_requeueing(self):
+        svc, calls = self._service(self._row())
+        state = svc.classify_candidate(self._row())
+        assert state == "media_type_unresolved"
+        assert calls["enqueued"] == 0, "re-queued the same completed hydration"
+        assert calls["resolved"] == 1
+
+    def test_the_identity_is_not_promoted_to_exact(self):
+        """THE REGRESSION. It used to reach identity_state='exact'."""
+        svc, calls = self._service(self._row())
+        svc.classify_candidate(self._row())
+        assert calls["state"][0] == "ambiguous"
+
+    def test_an_unresolved_type_BEFORE_hydration_still_hydrates(self):
+        """Guard against over-correcting: hydration is exactly what should
+        happen while there is still evidence left to gather."""
+        svc, calls = self._service(self._row(hydration_state="not_requested"))
+        state = svc.classify_candidate(self._row(hydration_state="not_requested"))
+        assert state != "media_type_unresolved"
+        assert calls["enqueued"] == 1
+
+    def test_a_resolved_type_is_unaffected(self):
+        svc, calls = self._service(self._row(media_type="movie"))
+        state = svc.classify_candidate(self._row(media_type="movie"))
+        assert state != "media_type_unresolved"
