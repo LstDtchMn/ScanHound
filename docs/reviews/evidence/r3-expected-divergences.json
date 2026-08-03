@@ -6,22 +6,26 @@
     "4K"
    ]
   },
-  "1080i fn beats 2160p line": {
-   "res": [
-    "1080p",
-    "4K"
-   ]
-  },
-  "1080i in filename": {
-   "res": [
-    "1080p",
-    "?"
+  "2012 opening year only": {
+   "display_title": [
+    "2012.1080p.BluRay.mkv",
+    "2012"
    ]
   },
   "3840x1600 scope fn only": {
    "res": [
     "?",
     "4K"
+   ]
+  },
+  "Blade Runner 2049 2017": {
+   "display_title": [
+    "Blade Runner",
+    "Blade Runner 2049"
+   ],
+   "year": [
+    2049,
+    2017
    ]
   },
   "GLUED tags res line": {
@@ -218,6 +222,12 @@
     1
    ]
   },
+  "res line 1080i": {
+   "res": [
+    "?",
+    "1080p"
+   ]
+  },
   "res line 4K token": {
    "res": [
     "?",
@@ -259,6 +269,6 @@
    ]
   }
  },
- "new_at_baseline": "2981d526adf4290f1c961253db327a0ef84040a5",
+ "new_at_baseline": "5251804f70fcea7fe5df720c30c86b6b819ff865",
  "old": "c1715297621128baa1253f857d929d88b854d0b7"
 }
