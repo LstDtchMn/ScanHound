@@ -25,7 +25,20 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-CANONICALIZER_VERSION = "1"
+from backend.url_canonical import (
+    POST_IDENTITY_VERSION,
+    canonicalize_hdencode_post_url,
+)
+
+#: The frontier's canonical form is BOUND to a named, versioned function --
+#: round-9 decision: Form A, the HDEncode post identity. Every sweep source
+#: today is an HDEncode listing category, so this is the store default; a
+#: future non-HDEncode source must set ``self.frontier_identity`` explicitly
+#: (source-specific by design). Namespace safety comes from the identity
+#: function itself: Form A RAISES on non-https or foreign hosts, so a wrong
+#: URL fails the sweep loudly instead of minting a key in the wrong space.
+DEFAULT_FRONTIER_IDENTITY = canonicalize_hdencode_post_url
+CANONICALIZER_VERSION = POST_IDENTITY_VERSION
 DEFAULT_LEASE_SECONDS = 1800
 
 
@@ -168,12 +181,14 @@ class SweepSessionStore:
         and cannot inflate the new-identity count, which is what makes replay
         safe.
         """
+        identity = getattr(self, "frontier_identity", None) or DEFAULT_FRONTIER_IDENTITY
         now_iso = _iso(_now())
         new = 0
         for post in posts:
+            canonical = identity(post["canonical_url"])
             existing = self.conn.execute(
                 "SELECT 1 FROM listing_source_ledger WHERE source_key=? AND canonical_url=?",
-                (session.source_key, post["canonical_url"]),
+                (session.source_key, canonical),
             ).fetchone()
             if existing:
                 self.conn.execute(
@@ -181,7 +196,7 @@ class SweepSessionStore:
                     "       last_page_index=?, status_snapshot=? "
                     "WHERE source_key=? AND canonical_url=?",
                     (now_iso, post.get("page_index"), post.get("status"),
-                     session.source_key, post["canonical_url"]),
+                     session.source_key, canonical),
                 )
                 continue
             new += 1
@@ -192,7 +207,8 @@ class SweepSessionStore:
                 " first_page_index, last_page_index, title_snapshot, "
                 " status_snapshot, sweep_session_uuid, persisted) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)",
-                (session.source_key, post["canonical_url"], post.get("raw_url", ""),
+                (session.source_key, canonical,
+                 post.get("raw_url", "") or post["canonical_url"],
                  CANONICALIZER_VERSION, now_iso, now_iso,
                  post.get("displayed_published_at"), post.get("page_index"),
                  post.get("page_index"), post.get("title"), post.get("status"),
