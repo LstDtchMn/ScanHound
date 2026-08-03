@@ -184,6 +184,14 @@ def test_stale_rss_return_releases_global_scan_slot(monkeypatch):
 
 
 class _NotReadyDb(_HealthDb):
+    def get_hdencode_feed_state(self, key):
+        # freshly checked: a DEMOTED shadow cycle must be runnable with no
+        # network in these tests (R-6)
+        return {"last_checked_at": "2999-01-01T00:00:00+00:00"}
+
+    def list_hdencode_current_feed_urls(self):
+        return []
+
     def get_hdencode_rss_readiness(self, **_kwargs):
         return {
             "ready": False,
@@ -209,8 +217,18 @@ def test_primary_readiness_gate_issues_no_request():
         ),
     )
 
+    # R-6: without a recorded promotion-gate pass, primary DEMOTES to a
+    # shadow cycle (evidence must keep flowing) -- nothing acts as primary,
+    # and with every feed fresh, still no request is issued.
     result = service.poll_cycle(include_catchup=False)
+    assert result["mode"] == "rss_shadow"
+    assert calls == []
 
+    # WITH a recorded pass, the readiness gate holds the ORIGINAL property:
+    # not-ready primary skips outright and issues no request.
+    from tests.tools.gate_pass import full_pass_config
+    service.config.update(full_pass_config())
+    result = service.poll_cycle(include_catchup=False)
     assert result["skipped"] is True
     assert result["reason"] == "primary_not_ready"
     assert result["requests"] == 0
