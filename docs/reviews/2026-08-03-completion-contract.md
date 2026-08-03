@@ -1,3 +1,8 @@
+> ## SUPERSEDED 2026-08-04 by `2026-08-04-completion-contract-rev2.md`
+> Round 10 (Q7) ruled that appended amendments are not an amended
+> contract; rev 2 integrates every correction into the tables. This file
+> is retained as the record of rev 1 + its amendment history.
+
 # ScanHound — Completion Contract, rev 1
 
 **Date:** 2026-08-03 (overnight) · **Author:** Claude · **Reviewer:** ChatGPT (round pending) · **Arbiter:** Jesse
