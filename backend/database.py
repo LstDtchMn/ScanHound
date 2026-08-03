@@ -2019,11 +2019,68 @@ class DatabaseManager:
                 # any blob-adjacent mutation that skips this bump makes
                 # /results/cached serve stale parses indefinitely)
                 self._bg_cache_rev += 1
+        healed = self._reparse_stale_candidates()
         for url in refetch_urls:
             self.requeue_hdencode_hydration(
                 url, reason="stale_derived_refetch", priority=80)
         return {"candidates_refetch_required": refetch,
-                "candidates_stale": stale, "cache_stale": cache_stale}
+                "candidates_stale": stale, "cache_stale": cache_stale,
+                "candidates_reparsed": healed}
+
+    def _reparse_stale_candidates(self):
+        """Offline re-derivation (round-10 ratified: candidate rows retain
+        title/categories/raw_description, so the feed grammar can reparse
+        them without any network). Uses THE shared composition -- the same
+        function live ingest uses -- then re-stamps and returns the row to
+        'current'. relevance_state stays 'unclassified': classification is a
+        downstream verdict and re-runs on the corrected facts."""
+        from backend.sources.hdencode_feed_parser import reparse_feed_facts
+        from backend.release_grammar import GRAMMAR_VERSION
+        healed = 0
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT canonical_url, title, categories, raw_description
+                   FROM hdencode_candidates
+                   WHERE derived_state = 'stale'
+                     AND hydration_state != 'completed'""")
+            rows = cur.fetchall()
+            for url, title, categories_json, raw_description in rows:
+                try:
+                    categories = json.loads(categories_json or "[]")
+                except (TypeError, ValueError):
+                    categories = []
+                facts = reparse_feed_facts(title or "", categories,
+                                           raw_description or "")
+                cur.execute(
+                    """UPDATE hdencode_candidates SET
+                           media_type = ?, media_type_provisional = ?,
+                           media_type_because = ?, clean_title = ?,
+                           title_year = ?, description_year = ?,
+                           season = ?, episode = ?, episode_end = ?,
+                           resolution = ?, size_text = ?, size_gb = ?,
+                           dv_evidence = ?, hdr_evidence = ?,
+                           hevc_evidence = ?, hdr_formats = ?,
+                           description_complete = ?,
+                           feed_parse_version = ?, derived_state = 'current'
+                       WHERE canonical_url = ?""",
+                    (facts["media_type"],
+                     0 if facts["media_type_provisional"] is False else 1,
+                     json.dumps(list(facts["media_type_because"])),
+                     facts["clean_title"], facts["title_year"],
+                     facts["description_year"], facts["season"],
+                     facts["episode"], facts["episode_end"],
+                     facts["resolution"], facts["size_text"],
+                     facts["size_gb"], facts["dv"], facts["hdr"],
+                     facts["hevc"], json.dumps(list(facts["hdr_formats"])),
+                     1 if facts["description_complete"] else 0,
+                     GRAMMAR_VERSION, url))
+                healed += 1
+            conn.commit()
+        return healed
 
     def complete_hdencode_hydration(
         self,
