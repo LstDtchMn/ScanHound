@@ -93,7 +93,7 @@ def parse_year(text: str) -> Optional[int]:
 #: season 5, and a movie silently becomes TV.
 _EPISODE_RE = re.compile(
     r"(?<![A-Z0-9])S(?P<season>\d{1,4})E(?P<episode>\d{1,4})"
-    r"(?P<extra>(?:E\d{1,4})*)(?!\d)",
+    r"(?P<extra>(?:E\d{1,4})*)(?=$|[^A-Za-z0-9]|[xh]26[45])",
     re.I,
 )
 _SEASON_RE = re.compile(r"(?<![A-Z0-9])S(?P<season>\d{1,4})(?![A-Za-z0-9])", re.I)

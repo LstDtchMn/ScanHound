@@ -305,3 +305,18 @@ class TestSizeUnitTrailingBoundary:
         got = find_all_sizes("Disc 1: 45.2 GB and 1.2 TB total (sample 300 MB).")
         assert [s.text for s in got] == ["45.2 GB", "1.2 TB", "300 MB"]
         assert parse_size_gb("Show.Title.2026.2160p - 82.4 GB", anchored=True) == 82.4
+
+
+class TestEpisodeGluedSuffixConstraint:
+    """Round-10: any-letter continuation after an episode token is a name
+    fragment, not TV evidence — only known glued codec suffixes may follow."""
+
+    def test_arbitrary_letters_after_episode_are_rejected(self):
+        from backend.release_grammar import parse_season_episode
+        assert parse_season_episode("Show.S01E01FOOBAR.mkv").season is None
+
+    def test_glued_codecs_and_ordinary_forms_still_parse(self):
+        from backend.release_grammar import parse_season_episode
+        assert parse_season_episode("Show.S01E01x265.mkv").season == 1
+        assert parse_season_episode("Show.S01E01.1080p.mkv").episode == 1
+        assert parse_season_episode("Show.S01E01E02.mkv").episode_end == 2

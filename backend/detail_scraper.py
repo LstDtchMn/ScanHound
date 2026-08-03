@@ -203,18 +203,18 @@ class DetailScraper:
                           soup
             text = content_div.get_text()
 
-            fn_match = re.search(r'Filename\.+:\s*(.+)', text) or re.search(r'Filename\.*:\s*(.+)', text)
+            fn_match = re.search(r'Filename\.+:[ \t]*(\S.*)', text) or re.search(r'Filename\.*:[ \t]*(\S.*)', text)
             if not fn_match:
                 if content_div != soup:
                     text = soup.get_text()
-                    fn_match = re.search(r'Filename\.+:\s*(.+)', text) or re.search(r'Filename\.*:\s*(.+)', text)
+                    fn_match = re.search(r'Filename\.+:[ \t]*(\S.*)', text) or re.search(r'Filename\.*:[ \t]*(\S.*)', text)
 
             if not fn_match:
                 return None
             full_fn = fn_match.group(1).strip()
 
             # Count all episodes (number of Filename entries) for TV packs
-            all_filenames = re.findall(r'Filename\.*:\s*.+', text)
+            all_filenames = re.findall(r'Filename\.*:[ \t]*\S.*', text)
             episodes_count = len(all_filenames)
 
             # Smart Check: Scan ALL filenames for unique episode numbers
@@ -223,7 +223,8 @@ class DetailScraper:
             for fn_line in all_filenames:
                 se_line = release_grammar.parse_season_episode(fn_line)
                 if se_line.episode is not None:
-                    unique_ep_nums.add(se_line.episode)
+                    last = se_line.episode_end or se_line.episode
+                    unique_ep_nums.update(range(se_line.episode, last + 1))
 
             # Use unique episode count instead of total filenames (handles mirrors/duplicates)
             if unique_ep_nums:
@@ -300,7 +301,7 @@ class DetailScraper:
             # labelled-size preference, pick the largest.
             all_sizes = release_grammar.find_all_sizes(text)
             labelled = [m for m in all_sizes
-                        if re.search(r'(?<![a-z])size', text[max(0, m.start - 24):m.start], re.IGNORECASE)]
+                        if re.search(r'(?<![a-z])size(?![a-z])', text[max(0, m.start - 24):m.start], re.IGNORECASE)]
             size_matches = labelled or all_sizes
             if not labelled and size_matches and self.app.config.get("debug_mode", False):
                 self.app.safe_log(f"[DEBUG] Using loose size matches for '{clean_title}': {[m.text for m in size_matches]}")

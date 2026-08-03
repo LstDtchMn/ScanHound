@@ -928,3 +928,24 @@ class TestRound10ReworkRegressions:
         result = _scrape(scraper, html)
         assert result["display_title"] == "Concert Film"
         assert result["year"] == 0
+
+
+class TestRound10SequenceItem3:
+    """Round-10 required-sequence item 3: size-label right boundary, full
+    episode counting, blank-Filename rejection — behavioural, via the facade."""
+
+    def test_sized_prose_is_not_a_labelled_size(self, scraper):
+        html = _build_detail_html(
+            "Movie.2020.1080p.mkv", size_label="Size: 2.0 GB",
+            extra_text="the sized bonus disc adds 9 GB")
+        assert _scrape(scraper, html)["size"] == "2.0 GB"
+
+    def test_glued_episode_lists_count_every_episode(self, scraper):
+        html = _build_detail_html(
+            "Show.S01E01E02.720p.mkv",
+            extra_filenames=["Show.S01E03E04.720p.mkv"])
+        assert _scrape(scraper, html)["episodes"] == 4
+
+    def test_blank_filename_value_yields_no_result(self, scraper):
+        html = _build_detail_html("")
+        assert _scrape(scraper, html) is None
