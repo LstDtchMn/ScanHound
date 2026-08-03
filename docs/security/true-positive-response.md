@@ -31,10 +31,13 @@ take minutes, not hours — when in doubt, treat it as real.
    every clone and proves little — the secret must be treated as burned
    regardless). Jesse may overrule for high-sensitivity cases; record either
    way.
-5. **Add the fingerprint to `.gitleaks.toml` ONLY IF** the text remains in
-   history after rotation, with a comment saying "rotated + burned on
-   <date>", so the scanner stays quiet about the corpse but loud about
-   anything new.
+5. **Suppress the burned corpse via `.gitleaksignore`** (one full
+   fingerprint per line, `commit:path:rule:line` — this is gitleaks' real
+   fingerprint mechanism; a `fingerprints` key in `.gitleaks.toml` is a
+   SILENT NO-OP, measured) ONLY IF the text remains in history after
+   rotation, with an adjacent comment in this file's incident record saying
+   "rotated + burned on <date>". Never widen the `.gitleaks.toml` paths
+   allowlist for an incident.
 6. **Record the incident** in `C:\DockerData\infra-ops\INCIDENTS\` — what
    leaked, when, exposure window, rotation evidence (the failed negative
    test), consumers updated, history decision.
@@ -46,3 +49,12 @@ take minutes, not hours — when in doubt, treat it as real.
 Jesse immediately (Gotify priority 8 if unattended, plus the session
 report). ChatGPT gets the incident write-up as a review round — a second
 reader on "what could this reach" has caught scope errors before.
+
+## Preventive controls (deferred, tracked)
+
+Detection-only is a recorded limitation: every future true positive is
+burned before this procedure starts. Deferred candidates, in value order:
+GitHub push protection (server-side, free for public repos); a local
+pre-commit/pre-push hook running `gitleaks protect --staged`; an
+Uptime-Kuma/Gotify hook so a failed or disabled scan workflow alerts
+someone (nothing watches the watcher today).

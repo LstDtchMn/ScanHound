@@ -1,23 +1,38 @@
 # Secret-scanning config (Track C, contract C-1).
 #
 # OWNERSHIP: Jesse (arbiter) owns every allowlist entry; Claude proposes,
-# ChatGPT reviews. Adding an entry requires: the finding's fingerprint, why it
-# is a false positive, and this header updated. An entry without a reason is
-# a defect, not a suppression.
+# ChatGPT reviews. Adding an entry requires: the finding's FULL fingerprint,
+# why it is a false positive, and this header updated. An entry without a
+# reason is a defect, not a suppression.
+#
+# HARDENED 2026-08-03 after an internal crafted-repo probe proved the first
+# version's unanchored path regexes silently suppressed a planted secret in
+# evil/docs/.../old-image-inspect.json and in a .json.bak sibling. Paths are
+# now ANCHORED and the allowlist is confined to the ONE rule that fired.
 
 [extend]
 useDefault = true
 
+# MEASURED LIMITATION (2026-08-03, gitleaks 8.24.3/8.26.0/8.28.0): rule-
+# scoped suppression does NOT work under [extend] on any tested version --
+# `targetRules` in the singular [allowlist] is silently ignored, and the
+# plural [[allowlists]] table is not merged at all when extending the
+# default config (planted-secret probes, both directions). So this
+# allowlist is PATH-scoped: ANY rule is suppressed inside the two anchored
+# files below. Residual risk, accepted and recorded: a new secret committed
+# INTO one of these two frozen evidence files would be suppressed; they are
+# historical captures nobody edits, and the anchors prevent everything the
+# crafted-repo probe demonstrated (evil/ prefixes, .bak siblings).
 [allowlist]
 description = "Reviewed false positives - 2026-07-31 history-wide review (703 commits, 2 findings, both manually classified FP)"
-# The only two findings ever recorded: the PUBLIC GPG signing-key fingerprint
-# of the official Python Docker image maintainer, matched by generic-api-key
-# inside two committed `docker inspect` evidence captures. A public key
-# fingerprint is not a secret; the files are frozen review evidence.
-# Fingerprints (report 11-gitleaks-report.json, infra-ops security dir):
-#   079f7ec6...:docs/feature-pack-review/qualification-evidence/old-image-inspect.json:generic-api-key:20
-#   079f7ec6...:docs/feature-pack-review/qualification-evidence/new-image-inspect.json:generic-api-key:19
+# Both findings are the SAME string in the SAME evidence commit (079f7ec6):
+# the official Python Docker image maintainer's PUBLIC GPG signing-key
+# fingerprint (7169605F62C751356D054A26A821E680E5FA6305), captured inside two
+# frozen `docker inspect` outputs. A public key fingerprint is not a secret.
+# Full fingerprints (gitleaks fingerprint format, from 11-gitleaks-report.json):
+#   079f7ec6d7060ceaab9f770b8f7422af5ec89f2b:docs/feature-pack-review/qualification-evidence/old-image-inspect.json:generic-api-key:20
+#   079f7ec6d7060ceaab9f770b8f7422af5ec89f2b:docs/feature-pack-review/qualification-evidence/new-image-inspect.json:generic-api-key:19
 paths = [
-    '''docs/feature-pack-review/qualification-evidence/old-image-inspect\.json''',
-    '''docs/feature-pack-review/qualification-evidence/new-image-inspect\.json''',
+    '''^docs/feature-pack-review/qualification-evidence/old-image-inspect\.json$''',
+    '''^docs/feature-pack-review/qualification-evidence/new-image-inspect\.json$''',
 ]
