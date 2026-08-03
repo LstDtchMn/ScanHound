@@ -956,3 +956,17 @@ class TestRound10SequenceItem3:
     def test_blank_filename_value_yields_no_result(self, scraper):
         html = _build_detail_html("")
         assert _scrape(scraper, html) is None
+
+
+class TestYearAuthorityDelegation:
+    """Round-11 Finding 4: DetailScraper must FOLLOW select_release_year,
+    not re-implement it -- perturbation-proven like the RSS/SourceBase tests."""
+
+    def test_detail_scraper_follows_the_selector(self, scraper, monkeypatch):
+        from backend import release_grammar
+        monkeypatch.setattr(
+            release_grammar, "select_release_year",
+            lambda text: release_grammar.YearMatch(1234, len("Movie Title ")))
+        html = _build_detail_html("Movie Title 2020 1080p.mkv")
+        result = _scrape(scraper, html)
+        assert result["year"] == 1234

@@ -270,13 +270,16 @@ class DetailScraper:
                 # filename is part of the NAME ("2001 A Space Odyssey 1968");
                 # instead of giving up, try the next token. First token whose
                 # left side is a non-empty title wins.
-                clean_title = None
-                for year_match in reversed(release_grammar.find_years(full_fn)):
-                    cut = _clean_cut(full_fn[:year_match.start])
-                    if cut:
-                        clean_title = cut
+                # Round-11 Finding 4: consult THE single year authority --
+                # duplicating its rule here is how the deployed listing path
+                # drifts behind the next selector change.
+                year_match = release_grammar.select_release_year(full_fn)
+                if year_match:
+                    clean_title = _clean_cut(full_fn[:year_match.start]) or None
+                    if clean_title:
                         year = year_match.year
-                        break
+                else:
+                    clean_title = None
                 if clean_title is None:
                     # No usable year: cut at the grammar's metadata boundary
                     # so a dimension or resolution token stays out of the
