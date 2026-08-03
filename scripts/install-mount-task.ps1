@@ -852,6 +852,23 @@ LIMITATION: LogonType=Interactive means every trigger requires an existing
 interactive session for this account. There is no unattended pre-logon recovery.
 "@
 
+# ---------------------------------------------------------------------------
+# 4b. PREFLIGHT: assert the PRE-EXISTING tree BEFORE touching the task (O-2)
+# ---------------------------------------------------------------------------
+# The final recursive assertion (after registration) is deliberate -- it is
+# the first point that can cover the freshly written artifacts. But it was
+# also the FIRST recursive pass over pre-existing content, so a stale or
+# tampered artifact deposited before this run (e.g. the 777ff0f-era script
+# copies from 7/26 in the root) aborted the install AFTER the new task was
+# already registered: fail-late, half-live. This pass covers everything that
+# exists NOW, so pre-existing junk aborts while the OLD task definition is
+# still the registered one. Assert-don't-repair is unchanged -- nothing is
+# normalised, the run stops and names the offending path.
+Assert-AdminOnlyPath $RootDir   -Recurse
+Assert-AdminOnlyPath $DeployDir -Recurse
+Assert-AdminOnlyPath $BackupDir -Recurse
+Assert-AdminOnlyPath $RunDir    -Recurse
+
 if (-not $PSCmdlet.ShouldProcess($TaskName, 'Register scheduled task')) {
     Write-Output "`n-WhatIf: bundle deployed; task NOT registered."
     return
