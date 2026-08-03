@@ -1,3 +1,7 @@
+> ## SUPERSEDED 2026-08-04 (same day) by `2026-08-04-completion-contract-rev3.md`
+> Round 11 accepted rev 2's rules but required full rows for Tracks 2/5/6
+> and live statuses; rev 3 delivers both. Retained as the rev-2 record.
+
 # ScanHound — Completion Contract, rev 2
 
 **Date:** 2026-08-04 · **Author:** Claude · **Reviewer:** ChatGPT (round-10 Q7 re-verdict requested) · **Arbiter:** Jesse
