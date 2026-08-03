@@ -15,7 +15,9 @@ from backend.candidate_evidence import EvidenceState
 
 MAX_FEED_BYTES = 2 * 1024 * 1024
 MAX_ENTRIES = 100
-_ALLOWED_HOSTS = {"hdencode.org", "www.hdencode.org"}
+from backend.url_canonical import canonicalize_hdencode_post_url
+
+_ALLOWED_HOSTS = {"hdencode.org", "www.hdencode.org"}  # kept: legacy references
 _DANGEROUS_XML = re.compile(br"<!\s*(?:DOCTYPE|ENTITY)\b", re.I)
 # Season, episode, year, resolution and size patterns USED to live here, in
 # parallel with near-identical ones on the listing path. They were measured
@@ -84,16 +86,10 @@ class ParsedFeed:
 
 
 def canonicalize_post_url(url):
-    parsed = urlsplit((url or "").strip())
-    if parsed.scheme.lower() != "https":
-        raise ValueError("RSS entry URL must be HTTPS")
-    host = (parsed.hostname or "").lower().rstrip(".")
-    if host not in _ALLOWED_HOSTS:
-        raise ValueError(f"RSS entry host is not approved: {host or '<missing>'}")
-    path = re.sub(r"/+", "/", parsed.path or "/")
-    if path != "/":
-        path = path.rstrip("/") + "/"
-    return urlunsplit(("https", "hdencode.org", path, "", ""))
+    """Form-A post identity. The implementation moved to backend.url_canonical
+    (the one home for URL identity); this name stays as the parser's public
+    surface so no importer changes."""
+    return canonicalize_hdencode_post_url(url)
 
 
 def parse_feed(xml_bytes, feed_key):

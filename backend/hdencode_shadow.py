@@ -6,13 +6,19 @@ import random
 from typing import Any, Iterable, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from backend.url_canonical import canonicalize_listing_url
+
 _RELEVANT_STATES={"missing","missing_season","upgrade","dv_upgrade"}
 
 def canonical_url(value: str) -> str:
-    parsed=urlsplit(str(value or '').strip())
-    if not parsed.scheme or not parsed.netloc: return str(value or '').strip().rstrip('/')
-    path=(parsed.path or '/').rstrip('/') or '/'
-    return urlunsplit((parsed.scheme.lower(),parsed.netloc.lower(),path,'',''))
+    """Delegates to the shared Form-B identity (url_canonical). One edge kept
+    from the old local copy: a scheme-less string still gets its trailing
+    slash stripped rather than passing through the urlsplit path, preserving
+    this module's historical behaviour for degenerate inputs."""
+    parsed = urlsplit(str(value or '').strip())
+    if not parsed.scheme or not parsed.netloc:
+        return str(value or '').strip().rstrip('/')
+    return canonicalize_listing_url(value)
 
 def jittered_interval_seconds(minutes: int, *, jitter_minutes: int=10, rng=None) -> int:
     base=max(15,min(int(minutes),360))*60

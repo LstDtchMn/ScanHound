@@ -6,7 +6,10 @@ the exclusion store canonical *by convention* rather than by construction, which
 would break the moment a second writer appeared.
 """
 from typing import Optional
-from urllib.parse import urlsplit, urlunsplit
+
+from backend.url_canonical import (
+    canonicalize_listing_url as _shared_canonicalize_listing_url,
+)
 
 
 def canonicalize_listing_url(url: Optional[str]) -> str:
@@ -24,11 +27,4 @@ def canonicalize_listing_url(url: Optional[str]) -> str:
     everywhere is a larger change that must migrate those stores in the same
     commit.
     """
-    if not url:
-        return ""
-    try:
-        parts = urlsplit(str(url).strip())
-        path = parts.path.rstrip("/") or "/"
-        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, "", ""))
-    except Exception:
-        return str(url).strip()
+    return _shared_canonicalize_listing_url(url)
