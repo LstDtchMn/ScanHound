@@ -2,7 +2,10 @@ name: Tests
 
 on:
   push:
-    branches: [main, master, develop]
+    # claude/** added 2026-08-02: this branch had ZERO CI runs ever -- the stock
+    # trigger only covers main/master/develop, and agent/** branches enabled
+    # themselves on-branch. Local runs were the only test evidence here.
+    branches: [main, master, develop, 'claude/**']
   pull_request:
     branches: [main, master, develop]
   schedule:
