@@ -66,6 +66,14 @@ def find_year(text: str) -> Optional[YearMatch]:
     return YearMatch(int(match.group(1)), match.start()) if match else None
 
 
+def find_years(text: str) -> list:
+    """Every plausible year token, in order. For callers whose FIRST match
+    may be part of the name ("2001 A Space Odyssey 1968"): try the next
+    token instead of giving up -- the round-10 rework's year-retry rule."""
+    return [YearMatch(int(m.group(1)), m.start())
+            for m in _YEAR_RE.finditer(text or "")]
+
+
 def parse_year(text: str) -> Optional[int]:
     """First plausible release year in ``text``, or None.
 

@@ -239,13 +239,18 @@ class DetailScraper:
             episode_number = None
             year = 0
 
+            def _clean_cut(raw):
+                # Shared title cleaner: dots/underscores to spaces, then strip
+                # the separator punctuation the old regexes consumed -- the
+                # review showed 'Movie Title (2020)' yielding 'Movie Title ('.
+                return raw.replace('.', ' ').replace('_', ' ').strip(' -([')
+
             se = release_grammar.parse_season_episode(full_fn)
             if se.ambiguous:
                 # Over-wide season token: "cannot tell", never a truncated
                 # guess. No typed claim is made; the token still marks where
                 # the title's metadata begins.
-                cut = full_fn[:se.start].replace('.', ' ').replace('_', ' ').strip(' -')
-                clean_title = cut or full_fn
+                clean_title = _clean_cut(full_fn[:se.start]) or full_fn
             elif se.season is not None:
                 is_tv = True
                 season = se.season
@@ -258,21 +263,25 @@ class DetailScraper:
                         self.app.safe_log(f"[DEBUG] '{full_fn}' has {len(unique_ep_nums)} unique eps -> Treating as Season Pack")
                     episode_number = None
 
-                cut = full_fn[:se.start].replace('.', ' ').replace('_', ' ').strip(' -')
-                clean_title = cut or full_fn
+                clean_title = _clean_cut(full_fn[:se.start]) or full_fn
             else:
-                year_match = release_grammar.find_year(full_fn)
-                if year_match:
-                    cut = full_fn[:year_match.start].replace('.', ' ').replace('_', ' ').strip()
+                # Year-retry (round-10 rework): a year token that opens the
+                # filename is part of the NAME ("2001 A Space Odyssey 1968");
+                # instead of giving up, try the next token. First token whose
+                # left side is a non-empty title wins.
+                clean_title = None
+                for year_match in release_grammar.find_years(full_fn):
+                    cut = _clean_cut(full_fn[:year_match.start])
                     if cut:
                         clean_title = cut
                         year = year_match.year
-                    else:
-                        # A year-like token OPENING the filename is a title
-                        # ("2001 A Space Odyssey"), not release-year evidence.
-                        clean_title = full_fn
-                else:
-                    clean_title = full_fn
+                        break
+                if clean_title is None:
+                    # No usable year: cut at the grammar's metadata boundary
+                    # so a dimension or resolution token stays out of the
+                    # title ('Concert.Film.1920x1080' -> 'Concert Film').
+                    ms = release_grammar.metadata_start(full_fn)
+                    clean_title = (_clean_cut(full_fn[:ms]) or full_fn) if ms < len(full_fn) else full_fn
 
             # Repair cp437 mojibake (e.g. ΓÇÖ → ') common on Windows-sourced filenames
             try:
@@ -291,7 +300,7 @@ class DetailScraper:
             # labelled-size preference, pick the largest.
             all_sizes = release_grammar.find_all_sizes(text)
             labelled = [m for m in all_sizes
-                        if 'size' in text[max(0, m.start - 24):m.start].lower()]
+                        if re.search(r'(?<![a-z])size', text[max(0, m.start - 24):m.start], re.IGNORECASE)]
             size_matches = labelled or all_sizes
             if not labelled and size_matches and self.app.config.get("debug_mode", False):
                 self.app.safe_log(f"[DEBUG] Using loose size matches for '{clean_title}': {[m.text for m in size_matches]}")
@@ -337,14 +346,10 @@ class DetailScraper:
             if fn_canon in _res_display:
                 res = _res_display[fn_canon]
 
-            # Prefer filename resolution if explicit
-            fn_lower = full_fn.lower()
-            if "2160" in fn_lower or "4k" in fn_lower or "uhd" in fn_lower:
-                res = "4K"
-            elif "1080" in fn_lower:
-                res = "1080p"
-            elif "720" in fn_lower:
-                res = "720p"
+            # (the pre-unification substring override block that survived the
+            # first R-3 patch was removed here -- round-10 internal review,
+            # executed proof: it reapplied the old behaviour after the new
+            # grammar blocks and made declared delta 2 false.)
 
             hdr = "SDR"
             dovi = False
