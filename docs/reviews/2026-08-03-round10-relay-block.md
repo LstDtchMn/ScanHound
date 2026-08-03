@@ -49,7 +49,8 @@ Scope, in order:
    keys are NOT flagged by gitleaks 8.30.1 defaults) and
    agent/scan-failure-visibility-rebased @ ce3f10b (the eight #184
    scan-metrics commits rebased onto main 7adb17b, zero conflicts,
-   scan-metrics 77/77 + scanner 57/57; full suite result to be appended).
+   scan-metrics 77/77 + scanner 57/57; full local suite 4281 passed /
+   0 failed, exit 0 unmasked).
 
 Questions requiring a verdict:
 Q1 Gate item 2: closed (with §5.5 as an acknowledged post-deploy step)?
