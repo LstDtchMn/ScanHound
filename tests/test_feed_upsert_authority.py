@@ -254,3 +254,47 @@ class TestR4OfflineReparse:
                       "description_complete", "media_type_provisional"):
             assert after[field] == before[field], field
         assert after["derived_state"] == "current"
+
+
+class TestR4CacheHealing:
+    """Round-11 Finding 2 (P1): a stale cache row that gets re-scraped must
+    HEAL -- fresh data + current version + derived_state back to 'current' +
+    re-enters the skip set. Without the heal it re-scrapes forever."""
+
+    CACHE_ROW = {"url": "https://hdencode.org/heal1/", "title": "H",
+                 "year": 2026, "status": "missing",
+                 "source_category": "4k_movies", "data": "{}"}
+
+    def test_rescrape_heals_a_stale_row_end_to_end(self, db):
+        assert db.upsert_background_cache([dict(self.CACHE_ROW)])
+        conn = sqlite3.connect(db.db_path)
+        conn.execute("UPDATE background_scan_cache SET parse_version='old-v0'")
+        conn.commit(); conn.close()
+        out = db.reconcile_derived_versions()
+        assert out["cache_stale"] == 1
+        assert self.CACHE_ROW["url"] not in db.get_background_cache_urls()
+        # the re-scrape lands as a fresh upsert of the same URL
+        assert db.upsert_background_cache([dict(self.CACHE_ROW, data='{"v":2}')])
+        conn = sqlite3.connect(db.db_path)
+        row = conn.execute("SELECT parse_version, derived_state, data "
+                           "FROM background_scan_cache").fetchone()
+        conn.close()
+        from backend.release_grammar import GRAMMAR_VERSION
+        assert row[0] == GRAMMAR_VERSION
+        assert row[1] == "current"                 # THE heal
+        assert row[2] == '{"v":2}'
+        assert self.CACHE_ROW["url"] in db.get_background_cache_urls()
+
+    def test_reconcile_cannot_unheal_a_freshly_stamped_row(self, db):
+        """The contract-required write-race property, deterministically: a
+        reconciliation pass computed against old state must not mark a row
+        that has ALREADY been re-stamped current -- the reconciler's UPDATE
+        predicate keys on the LIVE version column, so the late pass is a
+        no-op on healed rows."""
+        assert db.upsert_background_cache([dict(self.CACHE_ROW)])
+        out = db.reconcile_derived_versions()
+        assert out["cache_stale"] == 0
+        conn = sqlite3.connect(db.db_path)
+        assert conn.execute("SELECT derived_state FROM background_scan_cache"
+                            ).fetchone()[0] == "current"
+        conn.close()

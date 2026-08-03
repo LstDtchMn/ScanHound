@@ -195,6 +195,12 @@ class HDEncodeRSSService:
         candidate_urls = self.db.list_hdencode_current_feed_urls()
         cycle = {
             "mode": mode,
+            # Round-11 Finding 1: demotion must be DURABLE and operator-
+            # visible, not a log line -- callers and status readers get the
+            # prior mode and the exact blockers.
+            **({"demoted_from": "rss_primary",
+                "promotion_gate_blockers": list(gate_blockers)}
+               if gate_blockers else {}),
             "at": time.time(),
             "feeds": results,
             "changed": sum(r.get("changed", 0) for r in results),
