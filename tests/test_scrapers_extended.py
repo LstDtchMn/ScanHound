@@ -893,11 +893,18 @@ class TestRound10ReworkRegressions:
     leftover override block survived the first R-3 patch."""
 
     def test_page_resolution_wins_when_filename_has_no_token(self, scraper):
-        # The leftover substring block used to let '1080i' in the filename
-        # override an explicit 2160p page line.
-        html = _build_detail_html("Show.S01E01.1080i.mkv",
+        # The leftover substring block used to let filename fragments override
+        # an explicit page line. (1080i became a REAL token on 2026-08-04, so
+        # this case now uses a genuinely token-less filename; a 1080i filename
+        # legitimately wins the filename-preference rule.)
+        html = _build_detail_html("Show.S01E01.HDTV.mkv",
                                   resolution="Resolution: 2160p")
         assert _scrape(scraper, html)["res"] == "4K"
+
+    def test_1080i_filename_is_now_a_real_token(self, scraper):
+        html = _build_detail_html("Show.S01E01.1080i.mkv",
+                                  resolution="Resolution: 2160p")
+        assert _scrape(scraper, html)["res"] == "1080p"
 
     def test_title_year_form_keeps_a_clean_title(self, scraper):
         html = _build_detail_html("Movie Title (2020) 1080p.mkv")
