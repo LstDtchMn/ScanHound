@@ -234,3 +234,36 @@ class TestResolution:
     def test_resolution_must_be_a_standalone_token(self):
         assert parse_resolution("Codec x2160puppet") is None
         assert parse_resolution("Film 2024 BluRay") is None
+
+
+class TestResolutionFromDimensions:
+    """The one sanctioned dimension->resolution conversion (R-3). Exact
+    standard values only — a nonstandard crop is None, never a guess."""
+
+    def test_standard_dimensions_map(self):
+        from backend.release_grammar import resolution_from_dimensions as rfd
+        assert rfd("Resolution: 3840x2160") == "UHD"
+        assert rfd("1920x1080") == "1080P"
+        assert rfd("1280 x 720") == "720P"
+
+    def test_nonstandard_dimensions_stay_none(self):
+        from backend.release_grammar import resolution_from_dimensions as rfd
+        assert rfd("1920x817") is None      # cinemascope crop: unknown, not 1080p
+        assert rfd("Resolution: unknown") is None
+        assert rfd("") is None and rfd(None) is None
+
+    def test_a_dimension_is_still_not_a_resolution_token(self):
+        from backend.release_grammar import find_resolution
+        assert find_resolution("Some Film 1920x1080") is None
+
+
+class TestFindAllSizes:
+    def test_returns_every_size_in_order_including_tb(self):
+        from backend.release_grammar import find_all_sizes
+        got = find_all_sizes("Disc 1: 45.2 GB ... Disc 2: 1.2 TB ... sample 300 MB")
+        assert [s.text for s in got] == ["45.2 GB", "1.2 TB", "300 MB"]
+        assert got[1].gigabytes > got[0].gigabytes > got[2].gigabytes
+
+    def test_empty_input_is_an_empty_list(self):
+        from backend.release_grammar import find_all_sizes
+        assert find_all_sizes("") == [] and find_all_sizes(None) == []

@@ -390,6 +390,49 @@ def parse_resolution(text: str) -> Optional[str]:
     return found.canonical if found else None
 
 
+_DIMENSION_VALUE_RE = re.compile(r"(?<!\w)(\d{3,4})\s*[xX]\s*(\d{3,4})(?!\w)")
+
+
+def resolution_from_dimensions(text: str) -> Optional[str]:
+    """Canonical resolution implied by an explicit WxH pixel dimension.
+
+    A dimension is NOT a resolution token and never enters the resolution
+    vocabulary (that inversion is how divergence (b)'s cousin lived in
+    DetailScraper). Detail pages legitimately state "Resolution: 3840x2160",
+    so THIS function is the one sanctioned conversion — explicit, named, and
+    faithful to the scraper's historical mapping: exact standard values only,
+    anything else stays None rather than being guessed into a class.
+    """
+    match = _DIMENSION_VALUE_RE.search(text or "")
+    if not match:
+        return None
+    width, height = int(match.group(1)), int(match.group(2))
+    if width in (3840, 2160) or height == 2160:
+        return "UHD"
+    if width == 1080 or height == 1080:
+        return "1080P"
+    if width == 720 or height == 720:
+        return "720P"
+    return None
+
+
+def find_all_sizes(text: str) -> list:
+    """Every size in ``text``, in document order.
+
+    For callers that must choose among several — a listing detail page lists
+    per-file sizes and the scraper keeps the largest. Selection stays with
+    the caller; the *grammar* (units, spelling, TB included) lives here.
+    """
+    return [
+        SizeMatch(
+            float(m.group("size")) * _SIZE_UNITS_GB[m.group("unit").upper()],
+            f"{m.group('size')} {m.group('unit')}",
+            m.start(),
+        )
+        for m in _SIZE_ANYWHERE_RE.finditer(text or "")
+    ]
+
+
 # ─────────────────────────── title / metadata split ─────────────────────────
 
 #: A pixel dimension such as ``1920x1080``. It is metadata, never part of a
