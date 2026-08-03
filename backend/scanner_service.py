@@ -56,6 +56,11 @@ class ScanStatus(Enum):
     IN_LIBRARY = "in_library"
     UPGRADE = "upgrade"
     DV_UPGRADE = "dv_upgrade"
+    # The media type could not be resolved, so NEITHER typed library may be
+    # queried. A visible terminal state, deliberately not a silent default:
+    # an unresolved item used to take the movie matcher and be reported as
+    # an ordinary result, which is indistinguishable from a confident one.
+    MEDIA_TYPE_UNRESOLVED = "media_type_unresolved"
 
 
 @dataclass
@@ -178,6 +183,7 @@ STATUS_COLORS = {
     ScanStatus.IN_LIBRARY: "#27ae60",
     ScanStatus.UPGRADE: "#f39c12",
     ScanStatus.DV_UPGRADE: "#9b59b6",
+    ScanStatus.MEDIA_TYPE_UNRESOLVED: "#7f8c8d",
 }
 
 STATUS_TEXTS = {
@@ -188,6 +194,7 @@ STATUS_TEXTS = {
     ScanStatus.IN_LIBRARY: "\u2713 In Library",
     ScanStatus.UPGRADE: "UPGRADE",
     ScanStatus.DV_UPGRADE: "UPGRADE (DV)",
+    ScanStatus.MEDIA_TYPE_UNRESOLVED: "Type unresolved — review",
 }
 
 # Resolution ranking for the "is this sibling an upgrade over what I grabbed?"
@@ -1432,7 +1439,22 @@ class ScannerService:
             }
 
             try:
-                if web_item['is_tv']:
+                # TRI-STATE SELECTION, not a boolean branch.
+                #
+                # This was `if web_item['is_tv']: tv else: movie`, so an
+                # AMBIGUOUS item fell into the else and was matched against the
+                # MOVIE library. A boolean cannot express "neither", which is
+                # exactly the case the resolver exists to report, so the
+                # selector reads media_type directly and `is_tv` is left for
+                # legacy display only.
+                if web_item['media_type'] not in ('tv', 'movie'):
+                    item.status = ScanStatus.MEDIA_TYPE_UNRESOLVED
+                    item.status_text = STATUS_TEXTS[ScanStatus.MEDIA_TYPE_UNRESOLVED]
+                    item.color = STATUS_COLORS[ScanStatus.MEDIA_TYPE_UNRESOLVED]
+                    item.plex_info = "Media type unresolved"
+                    continue
+
+                if web_item['media_type'] == 'tv':
                     matches, is_uncertain = self.matching.find_tv_season_matches(web_item, plex_index)
                 else:
                     matches, is_uncertain = self.matching.find_movie_matches(web_item, plex_index)

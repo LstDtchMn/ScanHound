@@ -182,3 +182,55 @@ class TestBlockerReporting:
     def test_an_allowed_decision_carries_no_blockers(self):
         assert evaluate_promotion(READY, passing_phase_b(),
                                   current_bindings=BINDINGS).blockers == ()
+
+
+# ───────────────── malformed evidence, added after it shipped ───────────────
+#
+# The first version of this suite had 41 tests and covered ABSENCE and NONZERO.
+# It never covered MALFORMED, and the gate consequently returned allowed=True
+# for `acquisition_ready="false"` with `material_mismatch_count=0.9` and
+# `inconclusive_count=False`. A gate that fails closed on absence and open on
+# garbage is not a fail-closed gate.
+
+class TestMalformedEvidenceIsRejected:
+    def test_the_exact_verdict_that_shipped_through(self):
+        """THE REGRESSION, verbatim."""
+        decision = evaluate_promotion(
+            {"acquisition_ready": "false"},
+            passing_phase_b(material_mismatch_count=0.9,
+                            inconclusive_count=False),
+            current_bindings=BINDINGS)
+        assert decision.allowed is False
+
+    @pytest.mark.parametrize("ready", ["false", "0", 1, "yes", "True"])
+    def test_acquisition_ready_must_be_the_literal_True(self, ready):
+        """Truthiness is not a decision. "false" is a truthy string."""
+        decision = evaluate_promotion({"acquisition_ready": ready},
+                                      passing_phase_b(), current_bindings=BINDINGS)
+        assert decision.allowed is False
+        assert "acquisition_not_ready" in decision.blockers
+
+    @pytest.mark.parametrize("count", [0.9, 0.4, False, "0", "zero", 0.0])
+    def test_counts_must_be_genuine_integer_zero(self, count):
+        """int(0.9) truncates to 0 and bool subclasses int, so both a
+        fractional and a boolean count previously read as clean."""
+        decision = evaluate_promotion(
+            {"acquisition_ready": True},
+            passing_phase_b(material_mismatch_count=count),
+            current_bindings=BINDINGS)
+        assert decision.allowed is False
+
+    def test_a_real_integer_zero_still_passes(self):
+        """Guard against over-correcting into refusing every verdict."""
+        assert evaluate_promotion({"acquisition_ready": True},
+                                  passing_phase_b(material_mismatch_count=0),
+                                  current_bindings=BINDINGS).allowed is True
+
+    @pytest.mark.parametrize("value", [123, None, "", "   ", b"sha256:acq"])
+    def test_bindings_must_be_non_empty_strings(self, value):
+        """Both sides used to be stringified, so 123 could equal "123"."""
+        decision = evaluate_promotion(
+            {"acquisition_ready": True},
+            passing_phase_b(acquisition_artifact_digest=value),
+            current_bindings=BINDINGS)
+        assert decision.allowed is False
