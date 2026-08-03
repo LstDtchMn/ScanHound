@@ -349,7 +349,14 @@ def main():
         return 0
 
     with open(EXPECTED_PATH, encoding="utf-8") as fh:
-        expected = json.load(fh)["divergences"]
+        expected_doc = json.load(fh)
+    expected = expected_doc["divergences"]
+    # Round-11 tightening: the expected file must have been baselined against
+    # the SAME old side, or the divergence contract is meaningless.
+    if expected_doc.get("old") != old_sha:
+        print(f"EXPECTED-FILE PROVENANCE MISMATCH: baselined against "
+              f"{expected_doc.get('old', '?')[:9]}, running against {old_sha[:9]}")
+        return 2
     unexplained = {k: v for k, v in diffs.items() if expected.get(k) != v}
     vanished = {k: v for k, v in expected.items() if k not in diffs}
     for title, bucket in (("UNEXPLAINED (not in expected file)", unexplained),
