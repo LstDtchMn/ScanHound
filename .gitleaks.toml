@@ -15,7 +15,12 @@ useDefault = true
 
 # MEASURED LIMITATION (2026-08-03, gitleaks 8.24.3/8.26.0/8.28.0): rule-
 # scoped suppression does NOT work under [extend] on any tested version --
-# `targetRules` in the singular # The path allowlist that previously lived here is RETIRED (round-10 Q6a):
+# `targetRules` in the singular [allowlist] is silently ignored, and the
+# plural [[allowlists]] table is not merged at all (planted-secret probes,
+# both directions). That measurement is WHY suppression moved to exact
+# fingerprints instead.
+#
+# The path allowlist that previously lived here is RETIRED (round-10 Q6a):
 # the two reviewed findings are now suppressed by EXACT fingerprint in
 # .gitleaksignore, so any OTHER secret in those two files -- or anywhere --
 # reports. Measured on 8.24.3: history scan clean with the ignore file
