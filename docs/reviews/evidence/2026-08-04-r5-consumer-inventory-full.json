@@ -1,0 +1,397 @@
+{
+  "summary": "Enumerate every consumer of derived release facts for the R-5 boundary suite",
+  "agentCount": 3,
+  "logs": [],
+  "result": {
+    "rss": {
+      "boundaries": [
+        {
+          "name": "_validate_auto_action (autonomous grab admission)",
+          "site": "backend/hdencode_action_service.py:381-463 (scan loop queue_approved_auto_actions at 338-379 reads action_state at 360)",
+          "fields_read": "relevance_state, identity_state, media_type, media_type_provisional, hydration_state, description_complete, title_year, description_year, dv_evidence, hdr_evidence (all from the persisted hdencode_candidates row via get_hdencode_candidate at :91 / list_hdencode_candidates at :355)",
+          "on_stale": "The worst boundary: a stale relevance_state='relevant_missing' or identity_state='exact' left over from before a Plex library change authorises an AUTONOMOUS grab of something already owned (dupe grab), and a stale media_type/media_type_provisional targets the wrong library. Conversely a stale 'unknown' dv_evidence silently vetoes a legitimate auto-grab (silent skip). Every check here trusts the persisted verdict, not fresh evidence.",
+          "rank": 1
+        },
+        {
+          "name": "get_hdencode_candidate_context (Plex library selector)",
+          "site": "backend/database.py:1720-1787; called from hdencode_candidate_service.py:90-98 and hdencode_action_service.py:99-114",
+          "fields_read": "clean_title, media_type, title_year/description_year (as years), season, imdb_id, tmdb_id — all sourced from the candidate row by both callers; plus scraped_link_map/downloads for exact_url_downloaded (:1724-1733)",
+          "on_stale": "Stale media_type selects the wrong plex_cache library (tv vs movie, :1754-1758) or hits the fail-closed match-nothing branch (:1760-1776) — a wrong single match promotes identity to 'exact' against the WRONG library title, feeding rank 1 and rank 4 a bogus 'existing' copy. Stale clean_title/year finds no match, so an owned title classifies relevant_missing → dupe grab. Stale season matches the wrong season's copy → wrong upgrade verdict.",
+          "rank": 2
+        },
+        {
+          "name": "classify_candidate (relevance classification)",
+          "site": "backend/hdencode_candidate_service.py:71-198 (evidence build :77-89, year-conflict :110-114, identity confirm _identity_is_confirmed :344-388, media_type terminal :170-174)",
+          "fields_read": "identity_state, resolution, size_gb, dv_evidence, hdr_evidence, hevc_evidence, hdr_formats, title_year, description_year, description_complete, clean_title, media_type, season, episode, imdb_id, tmdb_id, hydration_state",
+          "on_stale": "Persists a wrong relevance_state/identity_state verdict that rank 1 later trusts verbatim. Stale hydration_state='completed' plus unresolved media_type triggers the terminal media_type_unresolved stop (silent-but-counted dead end); stale imdb_id/season confirms identity on old facts. Nothing re-invalidates this verdict when plex_cache changes — only re-hydration resets relevance_state to 'unclassified' (database.py:2011).",
+          "rank": 3
+        },
+        {
+          "name": "CandidateDecisionEngine.decide (dedupe/upgrade comparator)",
+          "site": "backend/candidate_evidence.py:127-241; invoked hdencode_candidate_service.py:102, :124, :152",
+          "fields_read": "resolution, size_gb, dv (dv_evidence), hdr/hevc evidence, hdr_formats, title_year/description_year (year_conflict), identity_confidence — candidate side; res/size/dovi from plex_cache — existing side",
+          "on_stale": "Stale resolution flips the rank comparison (:154-163) — the exact 4K-overwritten-by-1080p class of bug memory warns about; stale size_gb fakes or hides a same-resolution size upgrade (:190-212); stale dv_evidence='unknown' on a known-DV library copy loops the candidate into detail_required forever, while a stale 'asserted' authorises a DV-gain upgrade that is not real.",
+          "rank": 4
+        },
+        {
+          "name": "queue_action (action admission + package-name computation)",
+          "site": "backend/hdencode_action_service.py:91-143 (candidate read :91, dedupe context :99-119, compute_package_name :136-143)",
+          "fields_read": "clean_title, title, description_year, title_year, resolution, season, media_type, imdb_id, tmdb_id, raw_hash (idempotency key :132-135)",
+          "on_stale": "compute_package_name is the JOIN KEY across downloads/download_results/rename_jobs (download_service.py:49-59): a stale clean_title/year/season/resolution mints a wrong package name that flows through JDownloader into the rename pipeline — mis-filed/wrong-library placement downstream. Stale context args can miss exact_url_downloaded → dupe submission of an already-grabbed post.",
+          "rank": 5
+        },
+        {
+          "name": "RSS UI surfaces — /candidates and /actions (the de facto MANUAL admission gate)",
+          "site": "backend/api/routes/rss.py:139-160 (_candidate_row), :216-233 (/candidates), :369-405 (/actions via list_hdencode_actions join database.py:2528-2543)",
+          "fields_read": "all 28 _CANDIDATE_FIELDS (:108-136) incl. media_type, clean_title, both years, season/episode, resolution, size, dv/hdr/hevc evidence, hdr_formats, states; derives year_conflict and evidence_incomplete (:151-159)",
+          "on_stale": "Explicit actions bypass _validate_auto_action ENTIRELY — queue_action checks only exact_url_downloaded for requested_by='explicit' (:115-125). So the displayed row IS the whole evidence gate for a manual grab: stale resolution/DV/size shown here directly causes Jesse to grab a dupe or the worse copy, or to skip a real upgrade.",
+          "rank": 6
+        },
+        {
+          "name": "run_action completion persistence (poisons future dedupe)",
+          "site": "backend/hdencode_action_service.py:241-248 (record_scraped_links from claim join), :305-336 (save_to_history); claim join database.py:2617-2626",
+          "fields_read": "title, clean_title, resolution, size_text, season, title_year, description_year, dv_evidence, hdr_formats (re-read at :305 and via claim_hdencode_action join)",
+          "on_stale": "Stale facts are written PERMANENTLY into downloads history and scraped_link_map — the very stores get_hdencode_candidate_context's exact_url_downloaded and the listing matcher consult later. A wrong year/resolution/DV flag recorded here misleads every future dedupe comparison against this download and mislabels the library history.",
+          "rank": 7
+        },
+        {
+          "name": "Feed-upsert authority guard (hydration_state freeze)",
+          "site": "backend/database.py:1483-1502 (ingest upsert CASE WHEN hydration_state='completed')",
+          "fields_read": "hydration_state (guard) protecting media_type, clean_title, both years, season/episode/episode_end, resolution, size_text/size_gb, dv/hdr/hevc evidence, hdr_formats, description_complete, media_type_provisional/because",
+          "on_stale": "This is WHY staleness is permanent: once hydration_state='completed', feed refreshes can never correct any derived field — the only invalidation path is explicit re-hydration. A wrongly-'completed' state freezes bad facts forever; a wrongly-reset state lets weaker FEED-authority facts overwrite stronger DETAIL-authority ones. R-4's staleness fields must interact with exactly this CASE.",
+          "rank": 8
+        },
+        {
+          "name": "Hydration decisions — claim join, requeue guards, already_hydrated short-circuit",
+          "site": "backend/database.py:1903-1919 (claim join), :1880-1890 (requeue CASE on hydration_state); backend/api/routes/rss.py:305 (already_hydrated); hdencode_candidate_service.py:187-197 (enqueue priority from decision.reason)",
+          "fields_read": "hydration_state; claim join carries media_type, clean_title, both years, season/episode, resolution, size_gb, dv/hdr/hevc evidence, hdr_formats, description_complete to the worker",
+          "on_stale": "Stale hydration_state='completed' makes /hydrate return already_hydrated and requeue refuse — the candidate can never be re-evidenced (silent skip); stale reason-derived priority starves genuinely ambiguous candidates behind cosmetic ones.",
+          "rank": 9
+        },
+        {
+          "name": "RSS dashboard counters (unknown-evidence monitoring)",
+          "site": "backend/database.py:2230-2248 (get_hdencode_rss_dashboard_counts), served via rss.py:172-213 (/status)",
+          "fields_read": "relevance_state (grouped), dv_evidence, hdr_evidence, identity_state, title_year vs description_year (year_conflict count)",
+          "on_stale": "Operator-facing health numbers mislead: stale 'unknown' evidence inflates the unknown counters (looks like a parser regression), stale resolved states hide a real evidence gap. No gate consumes these directly, but qualification review reads them.",
+          "rank": 10
+        },
+        {
+          "name": "Shadow-compare identity inputs",
+          "site": "backend/database.py:2186-2199 (list_hdencode_current_feed_urls) → hdencode_rss_service.py:180 → background_scanner.py:461-472 → hdencode_shadow.py:85-120 (compare_shadow)",
+          "fields_read": "canonical_url identity (Form A) from hdencode_candidate_feeds/hdencode_candidates membership + feed_state last_changed_at; listing-side status from live crawl items (not candidate rows)",
+          "on_stale": "Stale/mismatched identity forms manufacture disjoint_identity_sets or false listing_only rows → phantom relevant_miss cycles that permanently block the readiness gate (the exact 99-of-100 trailing-slash incident, hdencode_shadow.py:113-119). Derived RELEASE facts are not read here — only identity — so R-4 field invalidation does not touch this path, but identity-form invalidation does.",
+          "rank": 11
+        },
+        {
+          "name": "Readiness / promotion-gate chain (Phase A)",
+          "site": "backend/database.py:2426-2517 (get_hdencode_rss_readiness ← get_hdencode_shadow_summary :2250-2314); consumers: rss.py:163-169 and :283 (mode change), hdencode_rss_service.py:97-124 and :171-179 (primary skip + listing fallback), hdencode_action_service.py:347-353 (auto-action gate); Phase B pure gate backend/promotion_gate.py:97-158",
+          "fields_read": "hdencode_shadow_cycles aggregates (outcome, normal_feeds_complete, rss/listing_requests, relevant_miss_count) + hdencode_feed_state health + persisted qualification window — i.e. cycle evidence KEYED on candidate identity, not per-candidate derived fields",
+          "on_stale": "Stale cycle evidence (pre-fix rows inside the window) either opens the auto-grab gate on invalid proof or blocks it forever on void misses — both directions already happened (the 8/1 window incident documented at :2250-2266). promotion_gate.evaluate_promotion additionally fails closed on stale artifact bindings (:78-94).",
+          "rank": 12
+        },
+        {
+          "name": "miss_resolution.py retrospective grader",
+          "site": "docs/feature-pack-review/qualification/scripts/miss_resolution.py:52-79 (cycle blobs + misses join), classify :91-115",
+          "fields_read": "hdencode_shadow_cycles.details_json feed_only/listing_only URL sets, hdencode_shadow_misses canonical_url/title/status — identity + miss status, no release facts",
+          "on_stale": "A stale identity form on either side makes a resolved miss ungradeable (AMBIGUOUS bucket) which blocks gate closure — fails closed, so consequence is stuck qualification, not a wrong grab.",
+          "rank": 13
+        },
+        {
+          "name": "canonical_url_corpus.py — the ONLY reader of hdencode_candidate_details",
+          "site": "scripts/canonical_url_corpus.py:26-41 (URL_COLUMNS incl. hdencode_candidate_details.canonical_url at :30), joins :86-105, functional pass :137-156",
+          "fields_read": "canonical_url columns only, across hdencode_candidates, hdencode_candidate_details, and Form-B tables; never the payload blob's release facts",
+          "on_stale": "Diagnostics only (run against snapshots, mode=ro, controls-gated) — a stale corpus mis-measures identity-form drift but affects no runtime decision.",
+          "rank": 14
+        },
+        {
+          "name": "_authorization_evidence audit snapshot",
+          "site": "backend/hdencode_action_service.py:465-478, persisted via create_hdencode_action :144-156",
+          "fields_read": "relevance_state, identity_state, hydration_state, dv_evidence, hdr_evidence, description_complete, title_year, description_year, discovery_source",
+          "on_stale": "Freezes possibly-stale facts into hdencode_actions.authorized_evidence — the forensic record of WHY an action was allowed then lies about the evidence that existed, which corrupts post-incident review but changes no runtime behaviour.",
+          "rank": 15
+        }
+      ],
+      "evidence": [
+        "hdencode_candidate_details payload blobs are WRITE-ONLY in production: written by complete_hdencode_hydration (database.py:1963-1971), and the sole reader anywhere is scripts/canonical_url_corpus.py:30 which touches only the canonical_url column — R-4 invalidation of these payloads has zero live consumers; the candidate-row copy is the only consumed projection.",
+        "Explicit/manual actions have NO evidence gate: queue_action runs _validate_auto_action only for requested_by='auto' (hdencode_action_service.py:121-125); a manual grab is admitted on exact_url_downloaded alone, so the /candidates display fields (rss.py:108-160) are the entire manual admission surface.",
+        "Staleness is asymmetric by design: complete_hdencode_hydration resets relevance_state='unclassified' (database.py:2011) so hydration invalidates classification — but NOTHING invalidates a persisted relevance/identity verdict when plex_cache changes underneath it; a library edit after classification leaves rank-1 admitting on dead evidence.",
+        "The upsert freeze (database.py:1483-1502) makes hydrated derived fields permanently immune to feed refresh: once hydration_state='completed' the only correction path is explicit re-hydration (rss.py /retry), and rss.py:305 refuses /hydrate on that same state — a wrongly-completed state is a self-locking staleness trap.",
+        "get_hdencode_candidate_context fails closed on unresolved media_type (database.py:1760-1776, match NOTHING) and _validate_auto_action independently blocks media_type not in {tv,movie} and media_type_provisional=True (hdencode_action_service.py:422-436) — the wrong-library direction is double-gated for AUTO actions only.",
+        "CandidateDecisionEngine.decide consumes BOTH sides: candidate row facts vs plex_cache existing (res/size/dovi, candidate_evidence.py:154-235) — staleness on the plex_cache side flips upgrade verdicts just as hard as candidate-side staleness, so R-4 consumer inventory must treat plex_cache freshness as a co-input at this boundary.",
+        "matching.py:687-712 reads dovi_evidence from background_scan_cache item blobs — the listing-vertical twin of the same derived facts, outside this scope but sharing the parser producers; a fact-version bump must cover it or the two verticals diverge.",
+        "Auto-action fan-in at background_scanner.py:339-371: readiness (database.py:2426) gates queue_approved_auto_actions per cycle, then per-candidate _validate_auto_action gates each grab — programme-level (shadow-cycle evidence) and candidate-level (derived facts) gates are deliberately independent (hdencode_action_service.py:418-421 comment), so stale data defeats them separately, never jointly.",
+        "run_action re-reads the candidate row AFTER submission (hdencode_action_service.py:305) rather than using the claim-time snapshot — history rows can record facts hydration changed mid-action, a small TOCTOU on the persistence at :314-333.",
+        "05_shadow_evidence.py and collect_shadow_evidence.py read only hdencode_shadow_cycles/feed state (grep: zero hits for candidate derived fields) — the qualification instruments consume candidate identity via shadow cycles, never per-candidate release facts."
+      ]
+    },
+    "listing": {
+      "boundaries": [
+        {
+          "name": "Download admission: dedup gates + JD destination routing",
+          "site": "backend/download_service.py:2596 (gates 2596-2632; routing 2702-2718)",
+          "fields_read": "resolution (via _res_rank), dovi, season (`season is not None` -> jd_tv_folder at :2709; res rank >= 2160p -> jd_movies_folder_4k at :2711), year, normalized title, size/hdr (persisted); prior quality rows from get_downloaded_title_quality (database.py:3388)",
+          "on_stale": "Worst of all three failure modes at once. Stale resolution/dovi on either side of _is_quality_upgrade (:525-531) -> a real duplicate is admitted and submitted to JDownloader (dupe grab), or a genuine upgrade returns success=True/method=duplicate_similar (silent skip that looks like success). Stale season/resolution at :2709-2715 -> the actual files land in the wrong library root (TV pack into the movies folder or vice versa; 4K into the non-4K drive), i.e. wrong-library placement of a completed external side effect.",
+          "rank": 1
+        },
+        {
+          "name": "Durable grab-quality ledger writes into downloads (incl. blob backfill)",
+          "site": "backend/database.py:4127 (enrich_downloads_from_cache); backend/download_service.py:447 (save_to_history); backend/hdencode_action_service.py:316 (RSS action history)",
+          "fields_read": "From the background_scan_cache blob by URL join (database.py:4142-4147): resolution, size, hdr, dovi. From request/candidate facts: normalized_title, season, year, resolution, size, hdr, dovi",
+          "on_stale": "Permanent poisoning, no invalidation path. The downloads table is the convergence ledger every future admission/overlay decision reads. A stale blob backfilled at startup (api/main.py:258) writes the wrong quality forever: recorded 4K for an actual 1080p grab -> every real 4K upgrade of that title is silently skipped as duplicate_similar; recorded 1080p for an actual 4K -> the next 4K re-upload passes as an 'upgrade' -> dupe grab. Backfill only fills empty fields, so a wrong value is never corrected.",
+          "rank": 2
+        },
+        {
+          "name": "Results assembly: DOWNLOADED overlay + dismissed/skip-title matching",
+          "site": "backend/api/routes/results.py:100 (_overlay_download_state; group_key reconstruction :154), :545-564 (dismissed), :91-97 (_is_better_grab)",
+          "fields_read": "group_key (normalized title|year|season), url, status, resolution, dovi, size, prior_grab from every cached/live item; downloads rows (normalized_title, year, season, resolution, dovi) via get_downloaded_title_quality; dismissed anchors (group_key, resolution, dovi) via get_dismissed_title_quality (database.py:3893)",
+          "on_stale": "Dupe grabs and silent skips at the point the user decides. A stale year/season in the blob desyncs the blob's group_key from the reconstruction at :154 -> a grabbed title's siblings keep reading 'missing' in the swipe deck (the historical 'downloaded items come up again' regression) -> re-grab = dupe; inverted, a genuinely better sibling is hidden as downloaded_similar (silent skip). Stale resolution/dovi vs a dismissed anchor -> skipped titles resurface or a real upgrade over the skip never appears.",
+          "rank": 3
+        },
+        {
+          "name": "rematch_cache: blob reconstruction + status write-back (the launderer)",
+          "site": "backend/scanner_service.py:1331 (rematch_cache), :1264 (_media_item_from_dict; media_type backfill :1282-1293); write-back :1409-1431 via database.py:4870; callers background_scanner.py:509, api/main.py:169, api/routes/downloads.py:42, api/routes/scanner.py:436",
+          "fields_read": "Everything in the blob verbatim: media_type + media_type_provisional, season, episodes, resolution, size, hdr, dovi, title, year, status, plex_info/plex_versions, prior_grab, url",
+          "on_stale": "Staleness gets laundered into fresh-looking verdicts. Rematch re-runs Plex matching and download-status FROM the stale identity/quality facts, then persists status/plex_info/prior_grab back into the same blob every background cycle and after every grab -- the status timestamp says 'just re-checked' while the facts it compared are original-scrape vintage. A blob missing media_type is re-typed from cached title+season only (weaker than the live verdict, provisional=True); a wrong guess makes the row match the wrong library or go MEDIA_TYPE_UNRESOLVED, where the matcher refuses it forever (silent skip). This is the single loop R-4 staleness fields must break.",
+          "rank": 4
+        },
+        {
+          "name": "matching.py library comparison via web_item_facts",
+          "site": "backend/scanner_service.py:119 (web_item_facts), :1476-1486 (tri-state library selector); backend/matching.py:148/:343 (match selection), :493/:600 (upgrade calculus)",
+          "fields_read": "media_type (drives is_tv and TV-vs-movie library choice), season (exact-equality candidate filter matching.py:172-173,336-337), year (+-tolerance :293,:416,:428), imdb_id, res, size (parsed), dovi/dovi_evidence, hdr, episodes vs plex episode_count",
+          "on_stale": "Wrong-library comparison and wrong verdicts. Stale media_type queries the wrong catalogue; stale season/year makes an owned title fail every candidate filter -> reads MISSING -> user re-grabs what they own (dupe); stale res/size/dovi produces phantom UPGRADE/DV_UPGRADE (dupe grab of a non-upgrade) or suppresses a real one (silent skip). Feeds the statuses that ranks 3, 4 and 6 act on.",
+          "rank": 5
+        },
+        {
+          "name": "Auto-grab admission (autonomous, post-scan)",
+          "site": "backend/auto_grab_service.py:80 (evaluate_item), :172-182 (forwards facts into download_item); trigger backend/api/routes/scanner.py:240-250",
+          "fields_read": "status (from matching), rating, votes, genres, language; then item.season, resolution, size, hdr, dovi, year passed straight into download admission",
+          "on_stale": "An autonomous grab with no human review: a stale UPGRADE/MISSING status (from rank 5's comparison or rank 2's poisoned prior-quality rows) fires a real JDownloader submission for something already owned, or skips a wanted item as already_downloaded. Inputs are live-scan-fresh, so exposure is via the download-history and Plex-index sides rather than cached blobs -- but it is the only fully unattended consumer of the verdicts.",
+          "rank": 6
+        },
+        {
+          "name": "Pipeline regrab / search-sources / library verification",
+          "site": "backend/api/routes/pipeline.py:60 (regrab, replays downloads row :72-85 into a FORCED grab), :100-106 (season -> tv/movies search mode); backend/pipeline_service.py:38-71,184-196 (verify title/year/season/resolution vs plex_cache)",
+          "fields_read": "downloads row: title, year, season, resolution, size, hdr, dovi, service_type (all persisted at admission from derived facts, possibly cache-backfilled)",
+          "on_stale": "Regrab passes force=True, bypassing BOTH dedup gates -- a stale season/resolution re-routes the forced grab into the wrong library folder with zero backstop. search-sources with a stale season searches the wrong catalogue mode. Verification with stale season/resolution never matches plex_cache -> the grab is perpetually 'not in library' -> tracker prompts a regrab of a file that arrived fine (dupe).",
+          "rank": 7
+        },
+        {
+          "name": "Results filters/facets/bookmark identity + dismiss meta backfill",
+          "site": "backend/api/routes/results.py:26 (_effective_category), :71 (_resolution_keys), :332 (quick 4K), :574-579 (_item_bookmark_key), :841-870 (dismiss backfill)",
+          "fields_read": "category with `season is not None` fallback (:35), resolution (canonicalised), dovi/hdr, genres, language, posted_date, size, year, title; bookmark identity derives media_type from `season is not None` (:578), NOT the carried verdict; dismiss backfill reads cached group_key/resolution/dovi and PERSISTS them into dismissed_items",
+          "on_stale": "Mostly display (item hidden from or shown in the wrong facet -- annoying, recoverable), with two teeth: bookmark identity keyed to the wrong media_type means the flag silently never matches again; and the dismiss backfill freezes a stale quality anchor into dismissed_items, permanently governing what may resurface (feeds rank 3's skip matching). Note :578 and :35 reconstruct TV-ness from season presence -- the exact pattern web_item_facts (scanner_service.py:128-136) exists to forbid.",
+          "rank": 8
+        },
+        {
+          "name": "Cached-results parse cache + version gate",
+          "site": "backend/api/routes/results.py:643-684 (_load_cached_items); backend/database.py:4949 (get_background_cache_version = COUNT + MAX(last_seen_at) + in-process _bg_cache_rev)",
+          "fields_read": "No item fact directly -- it decides WHETHER /results/cached, select-all (:812) and the dismiss backfill (:852) re-parse the blobs at all",
+          "on_stale": "A meta-boundary R-4 must not miss: _bg_cache_rev is process-local and only bumped by upsert (:4101), update_background_status (:4895) and clear (:4970). Any NEW writer that mutates blob data without bumping it -- including the future R-4 version/staleness-field migrator, or any out-of-process sqlite write -- leaves every cached-results consumer serving pre-update items indefinitely (COUNT and MAX(last_seen_at) both unchanged). Silent skip of the invalidation itself.",
+          "rank": 9
+        },
+        {
+          "name": "Watchlist matching (dormant -- zero callers)",
+          "site": "backend/watchlist.py:521 (check_against_scan_results; constraints :546-564)",
+          "fields_read": "scan item res, dovi, season, imdb_id, display_title, year against wanted-item season/min_resolution constraints",
+          "on_stale": "None today: repo-wide grep finds only the definition, no caller in backend/, ui/, or routes -- the endpoint set in api/routes/watchlist.py never invokes it. If ever wired up: a stale season/res fails the constraint check so a wanted title is never marked found (silent skip), or a stale res passes it and the wrong release is announced. Include in R-4's consumer registry so wiring it later inherits invalidation for free.",
+          "rank": 10
+        }
+      ],
+      "evidence": [
+        "The blob IS the full derived-fact record: background_scanner.py:595-612 serializes the entire _media_item_to_dict dump (routes/scanner.py:273-293) into background_scan_cache.data, so every field R-4 versions rides in one JSON column keyed by url.",
+        "Exactly three code paths parse the blob back: results assembly (results.py:667-674), rematch reconstruction (scanner_service.py:1361-1364), and the URL-join backfill (database.py:4142-4147). All other consumers read facts second-hand via the downloads table or the parsed item dicts.",
+        "The group_key recipe '{normalized_title}|{year or 0}|S{season or 0}' is independently re-derived at scanner_service.py:1702 (_assign_group_keys), results.py:154 (overlay reconstruction from downloads rows), and frontend grouping.ts -- a stale year/season in any one copy desyncs sibling matching between them.",
+        "The downloads table is the convergence ledger: written at download_service.py:2722-2726 from request-time facts, backfilled from cache blobs at database.py:4127-4183 (run every startup, api/main.py:258), and written by RSS actions from candidate facts at hdencode_action_service.py:316-333; read back by dedup (download_service.py:501), the overlay (results.py:136), the scanner lookup (scanner_service.py:1793), and pipeline regrab (pipeline.py:72-74).",
+        "_media_item_from_dict (scanner_service.py:1282-1293) is the vertical's ONLY reader-side migration today: it backfills a missing media_type from cached title+season, marks it provisional, and every other blob field is trusted verbatim -- the template R-4's staleness handling will either extend or replace.",
+        "Two sites still derive TV-ness from `season is not None` instead of the carried verdict: _item_bookmark_key (results.py:578) and _effective_category's fallback (results.py:35) -- the exact reconstruction web_item_facts (scanner_service.py:128-136) documents as the bug that 'silently sent every TV release without an SxxExx token to the movie library'.",
+        "rematch_cache write-back persists ONLY status/status_text/color/plex_info/plex_versions/prior_grab into the blob (scanner_service.py:1416-1427); identity and quality fields are never refreshed after first scrape except via the manual per-URL /scanner/rescan-item (routes/scanner.py:404-465) -- so blob facts age indefinitely while their statuses look freshly computed.",
+        "Parse-cache invalidation hangs on the in-process _bg_cache_rev counter (database.py:4891-4895, 4949-4963); it is bumped by exactly three writers, so any new blob mutator (including an R-4 field migrator) that skips the bump makes /results/cached serve stale parses with no error.",
+        "watchlist.check_against_scan_results (watchlist.py:521) has zero call sites in the entire repo (backend, ui, routes) -- watchlist matching is currently a dead consumer.",
+        "Destination routing (download_service.py:2709-2715) is the single site where a stale derived fact physically misplaces files on disk: season -> jd_tv_folder, _res_rank(resolution)>=2160p -> jd_movies_folder_4k, else jd_movies_folder; pipeline regrab replays these same persisted fields with force=True, bypassing both dedup gates (pipeline.py:80-86, download_service.py:2596)."
+      ]
+    },
+    "ui": {
+      "boundaries": [
+        {
+          "rank": 1,
+          "name": "RSS auto-grab authorization gate (_validate_auto_action + queue_approved_auto_actions)",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\hdencode_action_service.py:381",
+          "fields_read": "media_type (422-428), media_type_provisional (432-436), hydration_state (437), description_complete (442), title_year+description_year conflict (447-455), dv_evidence/hdr_evidence (456-463); the queue loop (338-379) additionally reads relevance_state, identity_state, action_state -- relevance_state is itself computed from resolution/dv/media_type by classify_candidate (hdencode_candidate_service.py:71-183), so staleness propagates into it invisibly",
+          "on_stale": "An autonomous grab is authorized on facts no longer true: wrong-library targeting (tv vs movie), dupe grab of a release whose evidence changed, or the inverse silent skip (stale 'unknown' evidence permanently blocks a now-complete candidate). This is THE consumer that needs a stale_derived signal to EXCLUDE rows -- it is the only autonomous-action authorizer, and its queue-time evidence is frozen into authorized_evidence_json (database.py:2586) as if current."
+        },
+        {
+          "rank": 2,
+          "name": "Grab-time write-through to downloads table (save_to_history)",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\hdencode_action_service.py:305",
+          "fields_read": "clean_title|title, season, resolution, size_text, hdr_formats (flattened), dv_evidence=='asserted' as dovi, description_year|title_year, package_name (314-333); listing-path twin at download_service.py:2722-2726 with client-relayed blob facts (api/routes/downloads.py:102-109, 157)",
+          "on_stale": "Wrong quality is frozen into a downloads row that outlives every cache: _download_status_for (scanner_service.py:1140-1174) and _overlay_download_state (api/routes/results.py:100-191 via get_downloaded_title_quality, database.py:3388) then rank all future releases against it -- a stale '2160p' recorded for a 1080p grab hides genuine 4K upgrades as 'downloaded_similar' forever (silent skip), or a stale low resolution re-offers dupes. Longest-lived consequence in the system."
+        },
+        {
+          "rank": 3,
+          "name": "Package naming + JD destination routing at submit",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\download_service.py:49",
+          "fields_read": "compute_package_name(clean_title|title, description_year|title_year, resolution, season) -- called at hdencode_action_service.py:136-143 (RSS, queue time) and download_service.py:2702 (listing); per-type JD folder at download_service.py:2709-2715 reads season (tv folder) and resolution rank (4K movie folder). RSS actions pass destination through unrouted (hdencode_action_service.py:273-277)",
+          "on_stale": "Stale season/resolution routes the listing grab to the wrong JD folder -- TV lands in the movie root, a 4K file lands on the 1080p drive turning the rename into a slow cross-drive copy; the package name (the pipeline join key per the docstring at download_service.py:51-59) is baked wrong at queue time and misleads every downstream display and the frontend dupe ranker that parses '[4K]' from it (frontend/src/lib/downloads/dupes.ts:24)."
+        },
+        {
+          "rank": 4,
+          "name": "Rename/pipeline join -- VERIFIED: links by package_name, never URL",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\pipeline_service.py:268",
+          "fields_read": "package_name (rename_jobs WHERE package_name = ? at 273; jd_confirmed_name fallback at 246/304; list_pipeline_verdicts joins r.package_name = COALESCE(d.jd_confirmed_name, d.package_name) at database.py:3207-3237 and serves d.title/year/season/resolution to the Pipeline UI at 3202); rename trigger hands JD's reported name to process_package (api/main.py:391-392; job stores it at rename/service.py:1205)",
+          "on_stale": "Self-consistent staleness is survivable (the same wrong name flows to JD and back), but any R-4 invalidation that RECOMPUTES a package name for an in-flight grab breaks the join -- rename rows orphan, the verdict sticks at not_in_plex/unknown, and the Pipeline UI shows the pre-correction facts. Matches the standing 'never recompute old package names' rule; invalidation must version facts, not rewrite join keys."
+        },
+        {
+          "rank": 5,
+          "name": "rematch_cache -- background_scan_cache blob re-scorer",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\scanner_service.py:1331",
+          "fields_read": "per-blob title, season, resolution, hdr, dovi (1359-1370) fed to _download_status_for and the Plex matcher; result status written BACK into the blob (1409+)",
+          "on_stale": "Status (missing/upgrade/downloaded_similar) is recomputed from stale blob facts on every background cycle without re-derivation -- the wrong verdict is re-persisted indefinitely; a stale resolution makes a real upgrade unfindable or manufactures a phantom one. Needs stale_derived to trigger re-scrape/re-derive instead of re-scoring stale data."
+        },
+        {
+          "rank": 6,
+          "name": "Web results serializer + facet chips (cache source)",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\api\\routes\\results.py:647",
+          "fields_read": "_load_cached_items parses every blob field; chips/filters read resolution (_resolution_keys 71-81, quick '4k' 326-333, canonical fold 51-68), dovi/hdr (334-336), size sort (205-220, 260), category-from-season (26-35), group_key/year/season for grouping and dismiss-meta backfill (848-869); client twins: frontend/src/lib/stores/results.ts:95-103+805-813, grouping.ts:120-140, findOtherResolution.ts:28-58",
+          "on_stale": "The human review surface -- the exact fallback the auto gate defers to -- shows wrong facts: items vanish from the 4K/HDR-DV facets, sort by size lies, upgrade/sibling badges mislabel, and a dismissal records the stale resolution/dovi into dismissed_items where it then wrongly suppresses or resurfaces future releases (549-564)."
+        },
+        {
+          "rank": 7,
+          "name": "RSS candidate/hydration/actions serializers (_candidate_row + joins)",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\api\\routes\\rss.py:139",
+          "fields_read": "all 30 derived fields (108-136) plus computed year_conflict (151-155) and evidence_incomplete (156-159); /rss/hydration reads media_type/resolution/dv_evidence (250-265); /rss/actions joins c.clean_title/resolution/dv_evidence/hdr_evidence (database.py:2536-2543); the action worker re-joins at claim time (database.py:2617-2626) and re-fetches at submit (hdencode_action_service.py:305) -- three reads at three different times per action",
+          "on_stale": "Operator grabs/skips on wrong evidence chips (rss/+page.svelte:415-434); and because one action reads candidate facts at queue, claim, and submit time, a staleness transition mid-action produces internally inconsistent records (package_name asserts one resolution, the history row another, authorized_evidence_json a third)."
+        },
+        {
+          "rank": 8,
+          "name": "Candidate context dupe/library guard (get_hdencode_candidate_context)",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\database.py:1721",
+          "fields_read": "clean_title, media_type, description_year+title_year, season, imdb_id/tmdb_id; consumed at hdencode_action_service.py:99-119 before any action; ambiguous media_type deliberately matches nothing (1759-1776)",
+          "on_stale": "Stale clean_title/media_type misses the Plex match, so a title already in the library reads as missing and a dupe grab is authorized (the already_downloaded check at 115 is URL-exact only); the reverse -- stale 'ambiguous' -- keeps a resolvable candidate permanently unresolved (silent skip)."
+        },
+        {
+          "rank": 9,
+          "name": "RSS dashboard metrics (unknown/year_conflict counts)",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\database.py:2230",
+          "fields_read": "dv_evidence/hdr_evidence 'unknown' sums, identity_state, title_year != description_year (2242), relevance_state counts; served by /rss/status (rss.py:172-213) to rss/+page.svelte:325",
+          "on_stale": "The monitoring instrument that says 'evidence is complete' silently includes stale rows -- a qualification-adjacent reader that needs stale rows excluded or counted in their own bucket; note year_conflict is computed independently in SQL here and in Python at rss.py:151-155, so an R-4 staleness field must be honored in BOTH or UI and counts diverge."
+        },
+        {
+          "rank": 10,
+          "name": "Phase B decision bridge / equivalence corpus (planned qualification instrument)",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\promotion_gate.py:38",
+          "fields_read": "not yet implemented -- the contract (ArtifactBindings 38-54, verdict checks 91-156) will compare RSS vs listing DECISIONS, which are functions of media_type/resolution/dv/years on candidate rows",
+          "on_stale": "A Phase B verdict computed over rows whose derived facts have gone stale is 'measured against a system that no longer exists' -- exactly the binding-drift failure the module exists to block. It MUST exclude stale_derived rows from the corpus or add a derivation-version digest to ArtifactBindings. Contrast: Phase A instruments need nothing -- hdencode_shadow.py and sweep/gate.py contain zero derived-field reads (grep confirmed), they are identity-only."
+        },
+        {
+          "rank": 11,
+          "name": "Exports, reports, WS broadcast, notifications",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\download_service.py:2467",
+          "fields_read": "CSV export writes Status/Title/Year/Season/Resolution/Size/HDR per item (2476-2483, invoked from results.py:921-934); live scan WS broadcast of full item dicts (api/routes/scanner.py:204-206) and notify_scan_complete counts (232-237); analytics upgrade report reads status/size/res/display_title (analytics.py:372-404); grab notifications carry title/resolution (api/routes/downloads.py:118-148, auto_grab_service.py:188)",
+          "on_stale": "Misreported deliverables: exported CSVs and the analytics upgrade-candidates report state wrong resolutions and size deltas; notification text is cosmetic-wrong. No feedback into decisions -- lowest write-consequence of the active consumers."
+        },
+        {
+          "rank": 12,
+          "name": "Listing auto-grab (scan-item path)",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\auto_grab_service.py:87",
+          "fields_read": "item.status (derived from resolution/dv comparison), title, season, resolution, size, year, hdr, dovi (87-181) -- passed straight into download_item, hence into package naming, folder routing, and history",
+          "on_stale": "Same blast radius as ranks 2-3 but triggered from the listing scan: a stale status grabs a dupe or skips a real upgrade autonomously; also needs the stale_derived exclusion if blob facts gain a staleness marker."
+        },
+        {
+          "rank": 13,
+          "name": "Watchlist matcher (dormant)",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\watchlist.py:521",
+          "fields_read": "scan item res, dovi, season, display_title, year, imdb_id against min_resolution/prefer_dovi constraints (546-593)",
+          "on_stale": "Wanted-item match silently never fires (or false-fires) -- but NO live backend caller of check_against_scan_results exists today (grep: only the definition), so this is a dormant surface; flag it so R-4 doesn't design for a consumer that isn't wired."
+        },
+        {
+          "rank": 14,
+          "name": "NON-consumers (verified negatives -- no stale_derived need)",
+          "site": "X:\\Docker Apps\\ScanHound\\backend\\rename\\dv_labeler.py:155",
+          "fields_read": "Kometa/DV-label sync reads dv_scan file-mediainfo rows only (sync_labels, triggered app_service.py:674-706) -- never candidate/blob release facts. Rename identification reads filename parse + TMDB + file subtitles/OCR/frames (rename/service.py:994-1075); its media_type/resolution/season in rename_jobs are re-derived per file. hdencode_candidate_details.payload is WRITE-ONLY (INSERT database.py:1963-1971, no SELECT anywhere). Shadow grader + sweep gate + canonical_url_corpus.py are identity-only.",
+          "on_stale": "Nothing -- these re-derive from ground truth (the file itself) or consume identity only. Listing them prevents R-4 from over-scoping invalidation: the only path by which a stale release fact reaches Plex labels or final filenames is the package_name display string, never the label/rename decision itself."
+        }
+      ],
+      "evidence": [
+        "VERIFIED: rename links by package_name, not URL. compute_package_name's docstring names it 'the join key used by the pipeline tracker across downloads/download_results/rename_jobs' (backend/download_service.py:51-53); rename_jobs are matched by 'WHERE package_name = ?' (backend/pipeline_service.py:273) and by r.package_name = COALESCE(d.jd_confirmed_name, d.package_name) (backend/database.py:3207); the rename trigger passes JD's reported package name, not any URL (backend/api/main.py:391-392).",
+        "The package name bakes four derived facts at QUEUE time: compute_package_name(clean_title|title, description_year|title_year, resolution, season) at backend/hdencode_action_service.py:136-143 -- a stale fact becomes a permanent join-key string; jd_confirmed_name capture (database.py:3346-3385) immunizes against JD's sanitization but not against our own stale inputs.",
+        "One RSS action reads candidate derived facts at THREE different times: queue (hdencode_action_service.py:99-143), claim-time SQL join pulling title/clean_title/resolution/size_text/season/years/dv/hdr_formats (database.py:2617-2626), and a fresh get_hdencode_candidate at submit for save_to_history (hdencode_action_service.py:305-333). A staleness transition mid-action yields mutually inconsistent persisted records; only the queue-time snapshot is frozen (authorized_evidence_json, database.py:2586).",
+        "The auto-grab gate _validate_auto_action (hdencode_action_service.py:381-463) is the single autonomous authorizer and reads seven derived fields including media_type_provisional; it has no notion of row age -- the prime candidate for a stale_derived EXCLUDE predicate.",
+        "Grab-time facts are frozen into the downloads table and consumed forever: save_to_history rows feed _download_status_for (scanner_service.py:1155-1173) and _overlay_download_state (api/routes/results.py:136-167 via get_downloaded_title_quality database.py:3388-...); a stale resolution/dovi recorded once mis-ranks every future sibling release (upgrade shown as downloaded_similar = permanent silent skip).",
+        "rematch_cache (scanner_service.py:1331-1410) recomputes and RE-PERSISTS item status from the stale blob's title/season/resolution/hdr/dovi (1359-1386) without ever re-deriving them -- background_scan_cache blobs are only refreshed by a new scrape of the same URL.",
+        "hdencode_candidate_details.payload is write-only: single INSERT at database.py:1963-1971, zero readers repo-wide; its facts reach consumers only via the candidate-row UPDATE in the same transaction (database.py:1983-2046). R-4 staleness fields therefore only need to version hdencode_candidates and background_scan_cache, not the payload archive.",
+        "Verified negatives: Kometa/DV label output reads dv_scan file scans only (backend/rename/dv_labeler.py:155, trigger app_service.py:674-706); rename identification is filename/file-content based (parse_filename + TMDB + subtitles/OCR/frames, backend/rename/service.py:997-1075); hdencode_shadow.py and backend/sweep/* contain no derived-field reads (grep for media_type|resolution|clean_title|dv_evidence|title_year|season: zero matches) -- shadow/sweep qualification needs no stale_derived signal.",
+        "year_conflict and evidence_incomplete are derived per-read in two independent places -- Python (api/routes/rss.py:151-159) and SQL (database.py:2242) -- so any R-4 staleness/version field must be applied in both or the RSS page chips and the dashboard counts will disagree about the same row.",
+        "Resolution canonicalisation is deliberately boundary-side and duplicated client/server (api/routes/results.py:51-81 mirrored by frontend/src/lib/stores/results.ts:95-103, per in-code 'keep in sync' contract); the listing grab's JD folder routing reads season and resolution rank at download_service.py:2709-2715 -- the wrong-library consequence for the LISTING path lives there, while RSS actions pass destination through unrouted (hdencode_action_service.py:273-277)."
+      ]
+    }
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Inventory"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "r5:rss-vertical",
+      "phaseIndex": 1,
+      "phaseTitle": "Inventory",
+      "agentId": "afdc31a2c76077dc5",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1785791459319,
+      "queuedAt": 1785791459304,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Repo \"/x/Docker Apps/ScanHound\", working tree = agent/hybrid-sweep-implementation (READ-ONLY: no writes/checkouts; a pytest run may be active). Cite file:line for every boundary. Round-10 context: derived release facts (media_type + provisional/because, clean_title, title_year/description_year, season/episode, resolution, size, dv/hdr/hevc evidence) are persisted on hdencode_candidates, candidate_…",
+      "lastProgressAt": 1785791788080,
+      "tokens": 138074,
+      "toolCalls": 42,
+      "durationMs": 328761,
+      "resultPreview": "{\"boundaries\":[{\"name\":\"_validate_auto_action (autonomous grab admission)\",\"site\":\"backend/hdencode_action_service.py:381-463 (scan loop queue_approved_auto_actions at 338-379 reads action_state at 360)\",\"fields_read\":\"relevance_state, identity_state, media_type, media_type_provisional, hydration_state, description_complete, title_year, description_year, dv_evidence, hdr_evidence (all from the per…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "r5:listing-vertical",
+      "phaseIndex": 1,
+      "phaseTitle": "Inventory",
+      "agentId": "ae4d024774d4faba8",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1785791459320,
+      "queuedAt": 1785791459304,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Repo \"/x/Docker Apps/ScanHound\", working tree = agent/hybrid-sweep-implementation (READ-ONLY: no writes/checkouts; a pytest run may be active). Cite file:line for every boundary. Round-10 context: derived release facts (media_type + provisional/because, clean_title, title_year/description_year, season/episode, resolution, size, dv/hdr/hevc evidence) are persisted on hdencode_candidates, candidate_…",
+      "lastProgressAt": 1785791842741,
+      "tokens": 171745,
+      "toolCalls": 47,
+      "durationMs": 383421,
+      "resultPreview": "{\"boundaries\":[{\"name\":\"Download admission: dedup gates + JD destination routing\",\"site\":\"backend/download_service.py:2596 (gates 2596-2632; routing 2702-2718)\",\"fields_read\":\"resolution (via _res_rank), dovi, season (`season is not None` -> jd_tv_folder at :2709; res rank >= 2160p -> jd_movies_folder_4k at :2711), year, normalized title, size/hdr (persisted); prior quality rows from get_downloade…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "r5:cross-ui",
+      "phaseIndex": 1,
+      "phaseTitle": "Inventory",
+      "agentId": "abee0201dc57b8841",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1785791459321,
+      "queuedAt": 1785791459304,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Repo \"/x/Docker Apps/ScanHound\", working tree = agent/hybrid-sweep-implementation (READ-ONLY: no writes/checkouts; a pytest run may be active). Cite file:line for every boundary. Round-10 context: derived release facts (media_type + provisional/because, clean_title, title_year/description_year, season/episode, resolution, size, dv/hdr/hevc evidence) are persisted on hdencode_candidates, candidate_…",
+      "lastProgressAt": 1785792049008,
+      "tokens": 165575,
+      "toolCalls": 76,
+      "durationMs": 589687,
+      "resultPreview": "{\"boundaries\":[{\"rank\":1,\"name\":\"RSS auto-grab authorization gate (_validate_auto_action + queue_approved_auto_actions)\",\"site\":\"X:\\\\Docker Apps\\\\ScanHound\\\\backend\\\\hdencode_action_service.py:381\",\"fields_read\":\"media_type (422-428), media_type_provisional (432-436), hydration_state (437), description_complete (442), title_year+description_year conflict (447-455), dv_evidence/hdr_evidence (456-46…"
+    }
+  ],
+  "totalTokens": 475394,
+  "totalToolCalls": 165
+}
