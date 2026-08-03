@@ -1,0 +1,238 @@
+{
+ "divergences": {
+  "1080 in group name": {
+   "res": [
+    "1080p",
+    "4K"
+   ]
+  },
+  "1080i fn beats 2160p line": {
+   "res": [
+    "1080p",
+    "4K"
+   ]
+  },
+  "1080i in filename": {
+   "res": [
+    "1080p",
+    "?"
+   ]
+  },
+  "3840x1600 scope fn only": {
+   "res": [
+    "?",
+    "4K"
+   ]
+  },
+  "GLUED tags res line": {
+   "res": [
+    "4K",
+    "?"
+   ]
+  },
+  "KB labelled size": {
+   "size": [
+    "500 KB",
+    "?"
+   ]
+  },
+  "KB plus loose GB": {
+   "size": [
+    "500 KB",
+    "2.0 GB"
+   ]
+  },
+  "S01E01 after open paren": {
+   "display_title": [
+    "Show Name (S01E01).mkv",
+    "Show Name"
+   ],
+   "episode_number": [
+    null,
+    1
+   ],
+   "episodes": [
+    null,
+    1
+   ],
+   "is_tv": [
+    false,
+    true
+   ],
+   "season": [
+    null,
+    1
+   ]
+  },
+  "S01E01 at string start": {
+   "episode_number": [
+    null,
+    1
+   ],
+   "episodes": [
+    null,
+    1
+   ],
+   "is_tv": [
+    false,
+    true
+   ],
+   "season": [
+    null,
+    1
+   ]
+  },
+  "S01E01 glued to codec": {
+   "display_title": [
+    "Show.S01E01x265.mkv",
+    "Show"
+   ],
+   "episode_number": [
+    null,
+    1
+   ],
+   "episodes": [
+    null,
+    1
+   ],
+   "is_tv": [
+    false,
+    true
+   ],
+   "season": [
+    null,
+    1
+   ]
+  },
+  "S104 ambiguous": {
+   "display_title": [
+    "Show.Name.S104.2160p.mkv",
+    "Show Name"
+   ]
+  },
+  "S104E01": {
+   "display_title": [
+    "Show.Name.S104E01.1080p.mkv",
+    "Show Name"
+   ]
+  },
+  "S2015 four digits": {
+   "display_title": [
+    "Show.Name.S2015.1080p.mkv",
+    "Show Name"
+   ]
+  },
+  "S3XY letter after digit": {
+   "display_title": [
+    "Tesla.S3XY.Story.2160p.mkv",
+    "Tesla S3XY Story"
+   ]
+  },
+  "TB labelled": {
+   "size": [
+    "?",
+    "1.2 TB"
+   ]
+  },
+  "TB loose only": {
+   "size": [
+    "?",
+    "1.2 TB"
+   ]
+  },
+  "UNDERSCORE before S01E01": {
+   "display_title": [
+    "Show_Name_S01E01.1080p.mkv",
+    "Show Name"
+   ],
+   "episode_number": [
+    null,
+    1
+   ],
+   "episodes": [
+    null,
+    1
+   ],
+   "is_tv": [
+    false,
+    true
+   ],
+   "season": [
+    null,
+    1
+   ]
+  },
+  "bare 2160 substring beats line": {
+   "res": [
+    "4K",
+    "1080p"
+   ]
+  },
+  "dimension as year 1920x1080": {
+   "year": [
+    1920,
+    0
+   ]
+  },
+  "pack E01E02 line": {
+   "episode_number": [
+    1,
+    null
+   ]
+  },
+  "pack glued eps x265": {
+   "display_title": [
+    "Show.S01E01x265.mkv",
+    "Show"
+   ],
+   "episodes": [
+    null,
+    2
+   ],
+   "is_tv": [
+    false,
+    true
+   ],
+   "season": [
+    null,
+    1
+   ]
+  },
+  "res line 4K token": {
+   "res": [
+    "?",
+    "4K"
+   ]
+  },
+  "res line 720p token": {
+   "res": [
+    "?",
+    "720p"
+   ]
+  },
+  "res line UHD token": {
+   "res": [
+    "?",
+    "4K"
+   ]
+  },
+  "res line spaced dims": {
+   "res": [
+    "?",
+    "4K"
+   ]
+  },
+  "year glued 5 digits": {
+   "display_title": [
+    "Movie",
+    "Movie.20201.Extended.mkv"
+   ],
+   "year": [
+    2020,
+    0
+   ]
+  }
+ },
+ "new_at_baseline": "2638b241c023242bafded60832a05451cabe5c88",
+ "old": "c1715297621128baa1253f857d929d88b854d0b7"
+}
