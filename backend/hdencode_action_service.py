@@ -342,6 +342,12 @@ class HDEncodeActionService:
         lifespan_generation: Optional[int] = None,
         stop_requested: Optional[Callable[[], bool]] = None,
     ) -> list[dict]:
+        from backend.capability_gate import capability_blockers
+        if capability_blockers(self.config):
+            # R-6 boundary 2: no autonomous side effect without a recorded
+            # evidence pass. Checked once per scan at the queue entry (the
+            # per-candidate validator keeps candidate-level semantics).
+            return []
         if self.config.get("hdencode_rss_auto_grab_enabled") is not True:
             return []
         readiness = self.db.get_hdencode_rss_readiness(

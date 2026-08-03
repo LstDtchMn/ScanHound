@@ -80,6 +80,10 @@ def _service(db, tmdb_search, *, movie_lib="", tv_lib="", **cfg):
         "auto_rename_movie_library": movie_lib,
         "auto_rename_tv_library": tv_lib,
     }
+    # R-6: these are AUTONOMOUS-flow tests; they assume the programme gate
+    # is open (test_capability_gate asserts the closed default).
+    from tests.tools.gate_pass import full_pass_config
+    base.update(full_pass_config())
     base.update(cfg)
     return RenameService(_Reg(base, db), tmdb_search=tmdb_search)
 

@@ -285,6 +285,19 @@ def set_rss_mode(
             status_code=409,
             detail="RSS primary requires completed shadow validation",
         )
+    if request.mode == "rss_primary":
+        # R-6 boundary 1: relying on RSS as primary DEMOTES the listing
+        # safety net, so it additionally requires a full recorded
+        # promotion-gate pass -- readiness alone is Phase A posture, not
+        # programme permission.
+        from backend.capability_gate import capability_blockers
+        blockers = capability_blockers(reg.config)
+        if blockers:
+            raise HTTPException(
+                status_code=409,
+                detail={"reason": "promotion_gate_blocked",
+                        "blockers": list(blockers)},
+            )
     reg.config["hdencode_discovery_mode"] = request.mode
     reg.backend.save_config()
     return {"mode": request.mode}

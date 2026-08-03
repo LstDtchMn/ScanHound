@@ -142,8 +142,20 @@ def test_primary_mode_is_blocked_until_readiness():
     assert reg.config["hdencode_discovery_mode"] == "rss_shadow"
 
 
-def test_primary_mode_and_one_setting_rollback_when_ready():
+def test_primary_mode_requires_a_recorded_gate_pass():
+    # R-6: readiness alone no longer admits rss_primary -- the promotion
+    # gate must hold a complete recorded pass.
     reg = Registry(ready=True)
+    with pytest.raises(HTTPException) as caught:
+        rss.set_rss_mode(rss.ModeRequest(mode="rss_primary"), reg)
+    assert caught.value.status_code == 409
+    assert caught.value.detail["reason"] == "promotion_gate_blocked"
+
+
+def test_primary_mode_and_one_setting_rollback_when_ready():
+    from tests.tools.gate_pass import full_pass_config
+    reg = Registry(ready=True)
+    reg.config.update(full_pass_config())
     assert rss.set_rss_mode(
         rss.ModeRequest(mode="rss_primary"),
         reg,

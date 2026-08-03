@@ -105,6 +105,21 @@ class HDEncodeRSSService:
                 "hdencode_rss_window_start_at"
             ) or None,
         )
+        gate_blockers = ()
+        if mode == "rss_primary":
+            # R-6: a gate that WAS valid at promotion can go invalid (binding
+            # drift, version bump). The safe direction is DEMOTION: keep
+            # polling (evidence must flow), restore shadow behaviour, record
+            # why. Silent skipping here would be a discovery outage.
+            from backend.capability_gate import capability_blockers
+            gate_blockers = capability_blockers(self.config)
+            if gate_blockers:
+                if gate_blockers != getattr(self, "_last_gate_blockers", ()):
+                    logger.warning(
+                        "rss_primary demoted to shadow behaviour: %s",
+                        list(gate_blockers))
+                    self._last_gate_blockers = gate_blockers
+                mode = "rss_shadow"
         if mode == "rss_primary" and not readiness["ready"]:
             cycle = {
                 "mode": mode,
