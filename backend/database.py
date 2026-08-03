@@ -1961,6 +1961,70 @@ class DatabaseManager:
                 conn.rollback()
                 raise
 
+    def reconcile_derived_versions(self):
+        """R-4: turn version mismatches into visible staleness (round-10 model).
+
+        Runs at startup. NULL stamps on pre-existing rows read as
+        stamped-by-nothing = mismatched. Hydrated rows whose detail parse is
+        outdated need a REFETCH (the payload never kept the source filename);
+        non-hydrated rows are merely STALE (their feed facts are offline-
+        reparseable -- commit 3 re-derives them in place). Dependent
+        classification is invalidated in the same statement so nothing keeps
+        trusting a verdict computed under the old grammar. Cache rows carry
+        their own dedicated column, and the parse-cache generation counter is
+        bumped so /results/cached cannot serve pre-reconciliation parses.
+        Returns the three affected-row counts for the startup log."""
+        from backend.release_grammar import GRAMMAR_VERSION
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE hdencode_candidates
+                SET derived_state = 'refetch_required',
+                    relevance_state = 'unclassified'
+                WHERE hydration_state = 'completed'
+                  AND COALESCE(detail_parse_version, '') != ?
+                  AND derived_state != 'refetch_required'
+                """, (GRAMMAR_VERSION,))
+            refetch = cur.rowcount
+            cur.execute(
+                """
+                UPDATE hdencode_candidates
+                SET derived_state = 'stale',
+                    relevance_state = 'unclassified'
+                WHERE hydration_state != 'completed'
+                  AND COALESCE(feed_parse_version, '') != ?
+                  AND derived_state != 'stale'
+                """, (GRAMMAR_VERSION,))
+            stale = cur.rowcount
+            cur.execute(
+                """
+                UPDATE background_scan_cache
+                SET derived_state = 'stale'
+                WHERE COALESCE(parse_version, '') != ?
+                  AND derived_state != 'stale'
+                """, (GRAMMAR_VERSION,))
+            cache_stale = cur.rowcount
+            cur.execute(
+                """SELECT canonical_url FROM hdencode_candidates
+                   WHERE derived_state = 'refetch_required'
+                     AND hydration_state = 'completed'""")
+            refetch_urls = [r[0] for r in cur.fetchall()]
+            conn.commit()
+            if cache_stale:
+                # the in-process parse-cache generation gate (R-5 finding:
+                # any blob-adjacent mutation that skips this bump makes
+                # /results/cached serve stale parses indefinitely)
+                self._bg_cache_rev += 1
+        for url in refetch_urls:
+            self.requeue_hdencode_hydration(
+                url, reason="stale_derived_refetch", priority=80)
+        return {"candidates_refetch_required": refetch,
+                "candidates_stale": stale, "cache_stale": cache_stale}
+
     def complete_hdencode_hydration(
         self,
         canonical_url,
@@ -2022,6 +2086,7 @@ class DatabaseManager:
                         WHEN ? THEN 1 ELSE description_complete
                     END,
                     detail_parse_version = ?,
+                    derived_state = 'current',
                     hydration_state = 'completed',
                     identity_state = COALESCE(?, identity_state),
                     relevance_state = 'unclassified',
@@ -2256,7 +2321,8 @@ class DatabaseManager:
                 SUM(CASE WHEN dv_evidence='unknown' THEN 1 ELSE 0 END) AS dv,
                 SUM(CASE WHEN hdr_evidence='unknown' THEN 1 ELSE 0 END) AS hdr,
                 SUM(CASE WHEN identity_state IN ('unknown','ambiguous','hydrated') OR identity_state IS NULL THEN 1 ELSE 0 END) AS identity,
-                SUM(CASE WHEN title_year IS NOT NULL AND description_year IS NOT NULL AND title_year != description_year THEN 1 ELSE 0 END) AS year_conflict
+                SUM(CASE WHEN COALESCE(derived_state,'current') != 'current' THEN 1 ELSE 0 END) AS stale_derived,
+                        SUM(CASE WHEN title_year IS NOT NULL AND description_year IS NOT NULL AND title_year != description_year THEN 1 ELSE 0 END) AS year_conflict
                FROM hdencode_candidates""",one=True,default=None)
         return {
             "candidate_counts":{row["name"]:int(row["count"]) for row in candidate_rows},
@@ -4924,7 +4990,7 @@ class DatabaseManager:
 
     def get_background_cache_urls(self):
         """Return the set of URLs currently in the background cache."""
-        rows = self._query('SELECT url FROM background_scan_cache', default=[])
+        rows = self._query("SELECT url FROM background_scan_cache WHERE COALESCE(derived_state,'current') != 'stale'", default=[])
         return {row[0] for row in rows} if rows else set()
 
     def touch_background_cache(self, urls):

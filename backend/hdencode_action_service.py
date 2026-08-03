@@ -389,6 +389,18 @@ class HDEncodeActionService:
                 "auto_action_invalid",
                 "Automatic actions may only submit approved grabs.",
             )
+        if (candidate.get("derived_state") or "current") != "current":
+            # R-4: facts derived under an older grammar version never
+            # authorise an AUTONOMOUS action -- queue-time evidence is frozen
+            # into authorized_evidence_json as if current, so stale rows are
+            # excluded outright rather than re-scored. Raise, never return:
+            # this validator's contract is exception-based, and an early
+            # return would silently PASS the stale row (caught red by the
+            # commit-2 test before this fix).
+            raise HDEncodeActionError(
+                "stale_derived",
+                "Derived facts predate the current grammar version.",
+            )
         if candidate.get("relevance_state") not in {
             "relevant_missing",
             "relevant_upgrade",
