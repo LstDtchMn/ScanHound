@@ -15,24 +15,9 @@ useDefault = true
 
 # MEASURED LIMITATION (2026-08-03, gitleaks 8.24.3/8.26.0/8.28.0): rule-
 # scoped suppression does NOT work under [extend] on any tested version --
-# `targetRules` in the singular [allowlist] is silently ignored, and the
-# plural [[allowlists]] table is not merged at all when extending the
-# default config (planted-secret probes, both directions). So this
-# allowlist is PATH-scoped: ANY rule is suppressed inside the two anchored
-# files below. Residual risk, accepted and recorded: a new secret committed
-# INTO one of these two frozen evidence files would be suppressed; they are
-# historical captures nobody edits, and the anchors prevent everything the
-# crafted-repo probe demonstrated (evil/ prefixes, .bak siblings).
-[allowlist]
-description = "Reviewed false positives - 2026-07-31 history-wide review (703 commits, 2 findings, both manually classified FP)"
-# Both findings are the SAME string in the SAME evidence commit (079f7ec6):
-# the official Python Docker image maintainer's PUBLIC GPG signing-key
-# fingerprint (7169605F62C751356D054A26A821E680E5FA6305), captured inside two
-# frozen `docker inspect` outputs. A public key fingerprint is not a secret.
-# Full fingerprints (gitleaks fingerprint format, from 11-gitleaks-report.json):
-#   079f7ec6d7060ceaab9f770b8f7422af5ec89f2b:docs/feature-pack-review/qualification-evidence/old-image-inspect.json:generic-api-key:20
-#   079f7ec6d7060ceaab9f770b8f7422af5ec89f2b:docs/feature-pack-review/qualification-evidence/new-image-inspect.json:generic-api-key:19
-paths = [
-    '''^docs/feature-pack-review/qualification-evidence/old-image-inspect\.json$''',
-    '''^docs/feature-pack-review/qualification-evidence/new-image-inspect\.json$''',
-]
+# `targetRules` in the singular # The path allowlist that previously lived here is RETIRED (round-10 Q6a):
+# the two reviewed findings are now suppressed by EXACT fingerprint in
+# .gitleaksignore, so any OTHER secret in those two files -- or anywhere --
+# reports. Measured on 8.24.3: history scan clean with the ignore file
+# alone; a planted PAT inside a reviewed file now REPORTS (it was the
+# accepted residual of the path form, now closed).

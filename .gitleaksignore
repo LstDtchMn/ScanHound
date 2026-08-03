@@ -1,0 +1,11 @@
+# Exact-finding suppression (round-10 Q6a: prefer this over path allowlists —
+# a path allowlist hides FUTURE secrets in the allowed files; a fingerprint
+# hides exactly one reviewed finding and nothing else).
+#
+# Both lines are the SAME string in the SAME evidence commit: the official
+# Python Docker image maintainer's PUBLIC GPG signing-key fingerprint
+# captured in two frozen `docker inspect` outputs. Reviewed 2026-07-31,
+# classified false positive. Owner: Jesse; adding a line here requires the
+# reviewed reason recorded in .gitleaks.toml's header or an incident record.
+079f7ec6d7060ceaab9f770b8f7422af5ec89f2b:docs/feature-pack-review/qualification-evidence/old-image-inspect.json:generic-api-key:20
+079f7ec6d7060ceaab9f770b8f7422af5ec89f2b:docs/feature-pack-review/qualification-evidence/new-image-inspect.json:generic-api-key:19
