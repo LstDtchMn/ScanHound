@@ -104,6 +104,16 @@
     1
    ]
   },
+  "S01E01E02 double episode": {
+   "episode_number": [
+    1,
+    null
+   ],
+   "episodes": [
+    1,
+    2
+   ]
+  },
   "S104 ambiguous": {
    "display_title": [
     "Show.Name.S104.2160p.mkv",
@@ -174,10 +184,20 @@
     0
    ]
   },
+  "empty filename value": {
+   "_none": [
+    false,
+    true
+   ]
+  },
   "pack E01E02 line": {
    "episode_number": [
     1,
     null
+   ],
+   "episodes": [
+    2,
+    4
    ]
   },
   "pack glued eps x265": {
@@ -222,6 +242,12 @@
     "4K"
    ]
   },
+  "whitespace filename": {
+   "_none": [
+    false,
+    true
+   ]
+  },
   "year glued 5 digits": {
    "display_title": [
     "Movie",
@@ -233,6 +259,6 @@
    ]
   }
  },
- "new_at_baseline": "2638b241c023242bafded60832a05451cabe5c88",
+ "new_at_baseline": "2981d526adf4290f1c961253db327a0ef84040a5",
  "old": "c1715297621128baa1253f857d929d88b854d0b7"
 }
