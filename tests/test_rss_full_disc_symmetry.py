@@ -147,3 +147,66 @@ class TestExclusionStoreIdentity:
             "SELECT policy_reason FROM listing_policy_exclusions").fetchone()[0]
         conn.close()
         assert reason == REASON_RSS_FULL_DISC
+
+
+# ──────────────── the recording wiring, on the REAL entry type ───────────────
+
+RSS_BODY_WITH_DISC = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>HDEncode</title>
+<item><title>Normal Film 2026 2160p WEB-DL</title>
+  <link>https://hdencode.org/normal-film-2026/</link>
+  <guid>https://hdencode.org/normal-film-2026/</guid>
+  <pubDate>Fri, 01 Aug 2026 12:00:00 +0000</pubDate>
+  <category>Movies</category><description>x</description></item>
+<item><title>[BD]Disc Rip 2026 Blu-ray AVC DTS-HD</title>
+  <link>https://hdencode.org/disc-rip-2026/</link>
+  <guid>https://hdencode.org/disc-rip-2026/</guid>
+  <pubDate>Fri, 01 Aug 2026 11:00:00 +0000</pubDate>
+  <category>Movies</category><description>x</description></item>
+</channel></rss>"""
+
+
+class TestExclusionRecordingUsesTheRealEntryType:
+    def test_poll_feed_durably_records_the_rss_exclusion(self, db):
+        """THE P0. The recorder read ``entry.link`` on ParsedFeedEntry, which
+        has no such field; the AttributeError was swallowed by the
+        observability except, so no durable row was ever written in
+        production. FakeEntry hid it by defining the attribute the real class
+        lacks — so THIS test refuses fakes: the entries come from parse_feed
+        itself, exactly as in a live poll."""
+        from contextlib import contextmanager
+        from backend.hdencode_rss_service import HDEncodeRSSService
+
+        svc = object.__new__(HDEncodeRSSService)
+        svc.config = {"hdencode_skip_full_disc": True}
+        svc.db = db
+
+        class Coordinator:
+            @contextmanager
+            def request(self, kind, *, stop_requested=None, priority=None):
+                yield
+            def observe_http_status(self, status):
+                return types.SimpleNamespace(blocked=False)
+            def observe_network_failure(self, code):
+                raise AssertionError("no network failure in this test")
+        svc.coordinator = Coordinator()
+
+        class Client:
+            def fetch(self, url, *, last_modified=None):
+                return types.SimpleNamespace(
+                    status=200, body=RSS_BODY_WITH_DISC.encode(), last_modified=None)
+        svc.client = Client()
+
+        feed = types.SimpleNamespace(
+            key="movies_all", url="https://hdencode.org/feed/")
+        result = svc.poll_feed(feed)
+
+        assert result["outcome"] not in ("failed", "parse_failed", "denied"), result
+        assert db.count_policy_exclusions("hdencode") == 1
+        conn = sqlite3.connect(db.db_path)
+        row = conn.execute(
+            "SELECT canonical_url, policy_reason "
+            "FROM listing_policy_exclusions").fetchone()
+        conn.close()
+        assert row[1] == REASON_RSS_FULL_DISC
+        assert "disc-rip-2026" in row[0]

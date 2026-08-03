@@ -331,7 +331,7 @@ class HDEncodeRSSService:
         if excluded:
             try:
                 self.db.record_policy_exclusions([
-                    {"url": entry.link, "source": "hdencode",
+                    {"url": entry.canonical_url, "source": "hdencode",
                      "category": feed.key, "title": entry.title,
                      "reason": REASON_RSS_FULL_DISC}
                     for entry in excluded
