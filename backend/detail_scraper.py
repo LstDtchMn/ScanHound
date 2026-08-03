@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
+from backend import release_grammar
 from backend.models import ScrapeResult
 from backend.hdencode_coordinator import (
     HDEncodeRequestCancelled,
@@ -220,61 +221,58 @@ class DetailScraper:
             # This distinguishes "Season Pack" (E01, E02...) from "Single Ep with Mirrors" (E01, E01...)
             unique_ep_nums = set()
             for fn_line in all_filenames:
-                m = re.search(r'[.\s]S(\d{1,2})E(\d{1,2})(?:[.\s]|$)', fn_line, re.IGNORECASE)
-                if m:
-                    unique_ep_nums.add(int(m.group(2)))
+                se_line = release_grammar.parse_season_episode(fn_line)
+                if se_line.episode is not None:
+                    unique_ep_nums.add(se_line.episode)
 
             # Use unique episode count instead of total filenames (handles mirrors/duplicates)
             if unique_ep_nums:
                 episodes_count = len(unique_ep_nums)
 
-            # Check for TV Season pattern first (Show.Name.S01E01 or Show.Name.S01.Complete)
+            # Season, episode and year now come from the ONE shared grammar
+            # (R-3). DetailScraper was a third grammar with its own defects:
+            # a two-digit season cap that read S104 as season 10, and a year
+            # rule without the shared guards. The title still cuts where the
+            # grammar says the metadata starts.
             is_tv = False
             season = None
             episode_number = None
+            year = 0
 
-            tv_ep_match = re.search(r'[\s.\-]+S(\d{1,2})E(\d{1,2})(?:[\-E]?\d{1,2})?(?:[\s.\-]|$)', full_fn, re.IGNORECASE)
-            tv_season_match = re.search(r'[\s.\-]+S(\d{1,2})(?:[\s.\-]|$)', full_fn, re.IGNORECASE)
-
-            if tv_ep_match:
+            se = release_grammar.parse_season_episode(full_fn)
+            if se.ambiguous:
+                # Over-wide season token: "cannot tell", never a truncated
+                # guess. No typed claim is made; the token still marks where
+                # the title's metadata begins.
+                cut = full_fn[:se.start].replace('.', ' ').replace('_', ' ').strip(' -')
+                clean_title = cut or full_fn
+            elif se.season is not None:
                 is_tv = True
-                season = int(tv_ep_match.group(1))
-                episode_number = int(tv_ep_match.group(2))
+                season = se.season
+                episode_number = se.episode
 
-                # OVERRIDE: If we found multiple UNIQUE episodes in the file list,
-                # this is a Season Pack, not a single episode
-                if len(unique_ep_nums) > 1:
+                # OVERRIDE: multiple UNIQUE episodes in the file list mean a
+                # Season Pack, not a single episode
+                if episode_number is not None and len(unique_ep_nums) > 1:
                     if self.app.config.get("debug_mode"):
                         self.app.safe_log(f"[DEBUG] '{full_fn}' has {len(unique_ep_nums)} unique eps -> Treating as Season Pack")
                     episode_number = None
 
-                show_name_match = re.match(r'^(.+?)[\s.\-_]+S\d{1,2}E\d{1,2}', full_fn, re.IGNORECASE)
-                if show_name_match:
-                    raw_title = show_name_match.group(1)
-                    clean_title = raw_title.replace('.', ' ').replace('_', ' ').strip(' -')
-                else:
-                    clean_title = full_fn
-                year = 0
-            elif tv_season_match:
-                is_tv = True
-                season = int(tv_season_match.group(1))
-                show_name_match = re.match(r'^(.+?)[\s.\-_]+S\d{1,2}', full_fn, re.IGNORECASE)
-                if show_name_match:
-                    raw_title = show_name_match.group(1)
-                    clean_title = raw_title.replace('.', ' ').replace('_', ' ').strip(' -')
-                else:
-                    clean_title = full_fn
-                year = 0
+                cut = full_fn[:se.start].replace('.', ' ').replace('_', ' ').strip(' -')
+                clean_title = cut or full_fn
             else:
-                # Movie pattern: Title.Year or Title (Year)
-                ty_match = re.search(r'^(.+?)[.\s\(\-]+(19\d{2}|20\d{2})', full_fn)
-                if ty_match:
-                    raw_title = ty_match.group(1)
-                    year = int(ty_match.group(2))
-                    clean_title = raw_title.replace('.', ' ').replace('_', ' ').strip()
+                year_match = release_grammar.find_year(full_fn)
+                if year_match:
+                    cut = full_fn[:year_match.start].replace('.', ' ').replace('_', ' ').strip()
+                    if cut:
+                        clean_title = cut
+                        year = year_match.year
+                    else:
+                        # A year-like token OPENING the filename is a title
+                        # ("2001 A Space Odyssey"), not release-year evidence.
+                        clean_title = full_fn
                 else:
                     clean_title = full_fn
-                    year = 0
 
             # Repair cp437 mojibake (e.g. ΓÇÖ → ') common on Windows-sourced filenames
             try:
@@ -288,15 +286,15 @@ class DetailScraper:
             rating_match = re.search(r'Rating\s*:\s*(\d+(\.\d+)?)', text, re.IGNORECASE)
             rating = rating_match.group(1) if rating_match else "-"
 
-            # ROBUST SIZE FINDING: Find ALL sizes and pick the largest
-            size_matches = re.findall(r'\b(?:Total\s+)?(?:File\s*)?Size\s*(?:\.|:)?\s*(\d+(?:\.\d+)?\s*(?:GiB|GB|MiB|MB|KB))', text, re.IGNORECASE)
-
-            if not size_matches:
-                loose_matches = re.findall(r'\b(\d+(?:\.\d+)?\s*(?:GiB|GB|MiB|MB))\b', text, re.IGNORECASE)
-                if loose_matches:
-                    size_matches = loose_matches
-                    if self.app.config.get("debug_mode", False):
-                        self.app.safe_log(f"[DEBUG] Using loose size matches for '{clean_title}': {size_matches}")
+            # ROBUST SIZE FINDING: every size via the shared grammar (TB/TiB
+            # included -- divergence (e) lived here in a third copy), keep the
+            # labelled-size preference, pick the largest.
+            all_sizes = release_grammar.find_all_sizes(text)
+            labelled = [m for m in all_sizes
+                        if 'size' in text[max(0, m.start - 24):m.start].lower()]
+            size_matches = labelled or all_sizes
+            if not labelled and size_matches and self.app.config.get("debug_mode", False):
+                self.app.safe_log(f"[DEBUG] Using loose size matches for '{clean_title}': {[m.text for m in size_matches]}")
 
             size = "?"
             if size_matches:
@@ -304,12 +302,12 @@ class DetailScraper:
                 best_size = "?"
                 found_sizes = []
 
-                for s_str in size_matches:
-                    gb_val = self.app.parse_size(s_str)
-                    found_sizes.append(f"{s_str}({gb_val:.2f}GB)")
+                for s_match in size_matches:
+                    gb_val = s_match.gigabytes
+                    found_sizes.append(f"{s_match.text}({gb_val:.2f}GB)")
                     if gb_val > max_gb:
                         max_gb = gb_val
-                        best_size = s_str.upper()
+                        best_size = s_match.text.upper()
 
                 size = best_size
                 if self.app.config.get("debug_mode", False):
@@ -322,15 +320,22 @@ class DetailScraper:
                         snippet = text[max(0, idx-20):min(len(text), idx+50)].replace('\n', ' ')
                         self.app.safe_log(f"[DEBUG] 'Size' keyword found at {idx}: '...{snippet}...'")
 
-            res_match = re.search(r'Resolution\.*:\s*(\d+x\d+|2160p|1080p)', text, re.IGNORECASE)
+            # Resolution tokens come from the shared grammar vocabulary; an
+            # explicit WxH converts ONLY through the grammar's named dimension
+            # bridge -- a dimension is never itself a resolution.
+            _res_display = {"UHD": "4K", "1080P": "1080p", "720P": "720p"}
             res = "?"
-            if res_match:
-                if "3840" in res_match.group(1) or "2160" in res_match.group(1):
-                    res = "4K"
-                elif "1080" in res_match.group(1):
-                    res = "1080p"
-                elif "720" in res_match.group(1):
-                    res = "720p"
+            res_line = re.search(r'Resolution\.*:\s*([^\r\n]+)', text, re.IGNORECASE)
+            if res_line:
+                token = release_grammar.find_resolution(res_line.group(1))
+                canon = token.canonical if token else release_grammar.resolution_from_dimensions(res_line.group(1))
+                res = _res_display.get(canon, "?")
+
+            # Prefer filename resolution if explicit
+            fn_token = release_grammar.find_resolution(full_fn)
+            fn_canon = fn_token.canonical if fn_token else release_grammar.resolution_from_dimensions(full_fn)
+            if fn_canon in _res_display:
+                res = _res_display[fn_canon]
 
             # Prefer filename resolution if explicit
             fn_lower = full_fn.lower()

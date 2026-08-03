@@ -360,15 +360,16 @@ class TestScrapeDetailsSize:
         assert "500" in result["size"]
         assert "MB" in result["size"]
 
-    def test_size_tb_not_matched_by_regex(self, scraper):
-        """The size regex only handles GiB/GB/MiB/MB/KB, not TB.
-        A size like '1.2 TB' will not be captured."""
+    def test_size_tb_is_matched_via_the_shared_grammar(self, scraper):
+        """Divergence (e), CLOSED 2026-08-03. This test previously pinned the
+        DEFECT ('TB is not in the regex alternation, so size defaults to ?').
+        Sizes now go through release_grammar.find_all_sizes, whose unit
+        grammar includes TB/TiB, so a terabyte release keeps its size."""
         html = _build_detail_html(
             "Movie.2020.2160p.mkv", size_label="Total Size: 1.2 TB"
         )
         result = _scrape(scraper, html)
-        # TB is not in the regex alternation, so size defaults to "?"
-        assert result["size"] == "?"
+        assert result["size"] == "1.2 TB"
 
     def test_size_large_gb_equivalent_of_tb(self, scraper):
         """When the page lists a TB-equivalent in GB, it should parse correctly."""
