@@ -406,6 +406,34 @@ class HDEncodeActionService:
                 "auto_identity_unknown",
                 "The candidate identity is not confirmed.",
             )
+        # The media TYPE must be resolved, independently of identity.
+        #
+        # A confirmed external id resolves WHICH title this is; it does not
+        # resolve whether the title is a film or a series, and those are the
+        # two different libraries an action would target. A candidate could
+        # previously reach here typed 'ambiguous' with identity_state='exact',
+        # because _identity_is_confirmed fell through to the movie rule for any
+        # unrecognised type.
+        #
+        # This is a CANDIDATE-level gate and is deliberately not satisfied by
+        # the programme-level promotion gate: qualification says the pipeline
+        # may act at all, this says *this release* is understood well enough to
+        # act on. Both are required.
+        media_type = str(candidate.get("media_type") or "").strip().lower()
+        if media_type not in {"tv", "movie"}:
+            raise HDEncodeActionError(
+                "auto_media_type_unresolved",
+                "The candidate's media type is unresolved; it cannot be "
+                "targeted at a library automatically.",
+            )
+        # A type resting only on the feed category is routing metadata, not
+        # identity. It may inform display and manual review; it must not by
+        # itself authorise an autonomous action.
+        if candidate.get("media_type_provisional") is True:
+            raise HDEncodeActionError(
+                "auto_media_type_provisional",
+                "The candidate's media type rests only on route evidence.",
+            )
         if candidate.get("hydration_state") != "completed":
             raise HDEncodeActionError(
                 "auto_hydration_required",

@@ -62,15 +62,34 @@ class PromotionDecision(NamedTuple):
     blockers: tuple
 
 
+def _is_exact_zero(value: Any) -> bool:
+    """Whether ``value`` is a genuine integer zero.
+
+    Deliberately strict, because the permissive version shipped and failed
+    open. ``int(0.9)`` truncates to 0, and ``bool`` subclasses ``int`` so
+    ``int(False)`` is 0 — a verdict reporting ``material_mismatch_count=0.9``
+    or ``inconclusive_count=False`` was read as a clean sheet.
+    """
+    if isinstance(value, bool):        # bool before int: True/False are ints
+        return False
+    return isinstance(value, int) and value == 0
+
+
 def _binding_mismatches(verdict: Mapping[str, Any],
                         current: ArtifactBindings) -> tuple:
+    """Compare bindings without cross-type coercion.
+
+    The first version stringified both sides, so values of different types
+    could compare equal. A binding is an exact identifier; anything that is not
+    a non-empty string of the expected value is a mismatch, not a near-miss.
+    """
     out = []
     for field in ArtifactBindings._fields:
         expected = getattr(current, field)
         recorded = verdict.get(field)
-        if not recorded:
+        if not isinstance(recorded, str) or not recorded.strip():
             out.append(f"phase_b_missing_{field}")
-        elif str(recorded) != str(expected):
+        elif not isinstance(expected, str) or recorded != expected:
             out.append(f"phase_b_{field}_mismatch")
     return tuple(out)
 
@@ -83,17 +102,25 @@ def evaluate_promotion(
 ) -> PromotionDecision:
     """Decide whether RSS may act as primary.
 
-    FAILS CLOSED on every kind of absence: no acquisition result, no Phase B
-    verdict, no bindings to check against. "We have no evidence" and "the
-    evidence says no" must be treated identically — an earlier version of the
-    readiness code returned a clean success on an empty window, and that is the
-    same mistake one layer up.
+    FAILS CLOSED on absence AND on malformation. "We have no evidence", "the
+    evidence says no", and "the evidence is unreadable" are treated
+    identically.
+
+    The malformation half was missing from the first version and it failed
+    open: ``acquisition_ready="false"`` is truthy, ``int(0.9)`` truncates to
+    zero, and ``False`` is an ``int``, so a verdict built from those returned
+    ``allowed=True``. Forty-one tests covered absence and non-zero counts and
+    never covered garbage. A gate that fails closed on absence and open on
+    malformed input is not a fail-closed gate.
     """
     blockers = []
 
     if not acquisition:
         blockers.append("acquisition_evidence_unavailable")
-    elif not acquisition.get("acquisition_ready"):
+    elif acquisition.get("acquisition_ready") is not True:
+        # `is not True`, not falsiness: the string "false" is truthy, and so is
+        # "0", 1, and any non-empty object. Readiness is a decision, and only
+        # the literal boolean records one.
         blockers.append("acquisition_not_ready")
 
     if not phase_b:
@@ -107,18 +134,21 @@ def evaluate_promotion(
         blockers.append(
             "phase_b_failed" if status == PHASE_B_FAIL else "phase_b_not_passed")
 
-    # Counts are read strictly. A missing count is NOT zero: it means the
-    # Phase B run did not report one, which is an incomplete verdict.
+    # Counts are read strictly, in three separate ways:
+    #   absent      -> the run did not report one; an incomplete verdict
+    #   malformed   -> not a genuine integer (0.9, False, "0", None-like)
+    #   non-zero    -> a real finding
+    # Only an exact integer zero passes. See _is_exact_zero for why int() and
+    # truthiness are both unsafe here.
     for key in ("material_mismatch_count", "inconclusive_count"):
-        value = phase_b.get(key)
-        if value is None:
+        if key not in phase_b or phase_b.get(key) is None:
             blockers.append(f"phase_b_missing_{key}")
-        else:
-            try:
-                if int(value) != 0:
-                    blockers.append(f"phase_b_{key}_nonzero")
-            except (TypeError, ValueError):
-                blockers.append(f"phase_b_invalid_{key}")
+            continue
+        value = phase_b[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            blockers.append(f"phase_b_invalid_{key}")
+        elif not _is_exact_zero(value):
+            blockers.append(f"phase_b_{key}_nonzero")
 
     if current_bindings is None:
         blockers.append("artifact_bindings_unavailable")

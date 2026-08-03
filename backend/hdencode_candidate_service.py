@@ -327,12 +327,28 @@ def _identity_is_confirmed(row) -> bool:
     # Conflicting year evidence is never auto-confirmed.
     if title_year and description_year and title_year != description_year:
         return False
-    if str(row.get("media_type") or "").lower() == "tv":
+    media_type = str(row.get("media_type") or "").strip().lower()
+    if media_type == "tv":
         # A single episode needs season AND episode; a season pack (season with
         # no episode) requires explicit pack identity, not auto-confirmed here.
         return row.get("season") is not None and row.get("episode") is not None
-    # Movie: a complete, non-conflicting title + year.
-    return bool(title_year or description_year)
+    if media_type == "movie":
+        # A complete, non-conflicting title + year.
+        return bool(title_year or description_year)
+    # AMBIGUOUS, empty, or anything unrecognised: NOT confirmed.
+    #
+    # This used to be a bare fallthrough returning the movie rule, so a
+    # candidate the resolver had explicitly called AMBIGUOUS was confirmed as a
+    # movie on nothing more than a clean title and a year — promoted to
+    # identity_state='exact', relevance 'relevant_missing', and passed by
+    # _validate_auto_action. An unresolved type is the one case where we most
+    # need to decline, and it was the one case that fell through.
+    #
+    # Note the external-id fast paths above still return True before reaching
+    # here: a confirmed IMDb/TMDB id IS a real identity. What it does not do is
+    # resolve the media TYPE, which is why hydration must write the resolved
+    # type back rather than leaving the row ambiguous with an exact identity.
+    return False
 
 
 def _candidate_updates(payload):

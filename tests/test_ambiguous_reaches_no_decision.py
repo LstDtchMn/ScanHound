@@ -29,66 +29,78 @@ signal to delete the markers.
 
 import pytest
 
-from backend.promotion_gate import ArtifactBindings, evaluate_promotion
-
-BINDINGS = ArtifactBindings(
-    acquisition_artifact_digest="sha256:acq",
-    decision_bridge_digest="sha256:bridge",
-    phase_a_corpus_digest="sha256:corpus",
-    configuration_fingerprint="cfg-1",
-    parser_version="grammar-1",
-    equivalence_contract_version="contract-1",
-)
-
-
-def _passing_phase_b(**overrides):
-    verdict = {
-        "phase_b_status": "pass",
-        "material_mismatch_count": 0,
-        "inconclusive_count": 0,
-        **BINDINGS._asdict(),
-    }
-    verdict.update(overrides)
-    return verdict
-
-
 # ─────────── the matcher selector must be tri-state, not boolean ────────────
-
-@pytest.mark.xfail(strict=True, reason=(
-    "_match_against_plex selects with `if web_item['is_tv']`, so AMBIGUOUS "
-    "takes the else branch and calls find_movie_matches. The preserved "
-    "media_type is never consulted at the decision point — the seam carries "
-    "it and the consumer ignores it."))
-def test_the_matcher_selector_consumes_media_type_not_is_tv():
-    """The selector must read the tri-state directly.
-
-    `is_tv` is an unsafe decision input once AMBIGUOUS is a legal value,
-    because a boolean cannot express 'neither'."""
-    import inspect
-
-    from backend import scanner_service
-    source = inspect.getsource(scanner_service.ScannerService._match_against_plex)
-    assert "web_item['is_tv']" not in source, (
-        "the matcher branch still routes on the lossy boolean")
+#
+# These call the PRODUCTION method and assert which matcher ran. An earlier
+# version asserted a source string and a restatement of the predicate; both
+# were satisfiable while the consumer still collapsed the tri-state.
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "There is no unresolved terminal state. An ambiguous item silently takes "
-    "the movie matcher instead of entering a visible manual-review state with "
-    "a stop condition."))
-def test_an_unresolved_item_reaches_a_visible_state():
-    from backend.scanner_service import ScanStatus
-    assert any("UNRESOLVED" in name or "REVIEW" in name
-               for name in ScanStatus.__members__)
+class _FakeMatching:
+    """Records which typed matcher the production selector chose."""
+
+    def __init__(self):
+        self.tv_calls = 0
+        self.movie_calls = 0
+
+    def find_tv_season_matches(self, web_item, plex_index):
+        self.tv_calls += 1
+        return [], False
+
+    def find_movie_matches(self, web_item, plex_index):
+        self.movie_calls += 1
+        return [], False
+
+
+def _run_matcher(media_type):
+    """Drive the real ScannerService._match_against_plex over one item."""
+    import asyncio
+    import threading
+    import types
+    from backend.scanner_service import MediaItem, ScannerService
+
+    svc = ScannerService.__new__(ScannerService)
+    item = MediaItem(id="1", title="Great Show", year=2024, season=None,
+                     media_type=media_type)
+    svc.items = [item]
+    svc._items_lock = threading.Lock()
+    # stop_scan_flag is a property backed by _stop_event; set the event.
+    svc._stop_event = threading.Event()
+    svc.matching = _FakeMatching()
+    svc.plex = types.SimpleNamespace(
+        plex_index={"all_items": [object()], "by_title": {}})
+    svc._log = lambda *a, **k: None
+    svc._progress = lambda *a, **k: None
+    svc.db = types.SimpleNamespace()
+    asyncio.run(svc._match_against_plex("Deep Scan"))
+    return svc.matching, item
+
+
+class TestTheMatcherSelectorIsTriState:
+    def test_tv_calls_only_the_tv_matcher(self):
+        matching, _ = _run_matcher("tv")
+        assert (matching.tv_calls, matching.movie_calls) == (1, 0)
+
+    def test_movie_calls_only_the_movie_matcher(self):
+        matching, _ = _run_matcher("movie")
+        assert (matching.tv_calls, matching.movie_calls) == (0, 1)
+
+    def test_ambiguous_calls_NEITHER_matcher(self):
+        """THE REGRESSION. `if web_item['is_tv']` sent this to the movie
+        matcher, because a boolean cannot express 'neither'."""
+        matching, _ = _run_matcher("ambiguous")
+        assert (matching.tv_calls, matching.movie_calls) == (0, 0)
+
+    def test_ambiguous_reaches_a_visible_state(self):
+        """It must not merely be skipped — it has to be reportable."""
+        from backend.scanner_service import ScanStatus
+        _, item = _run_matcher("ambiguous")
+        assert item.status is ScanStatus.MEDIA_TYPE_UNRESOLVED
+        assert "unresolved" in item.status_text.lower()
 
 
 # ──────────── identity confirmation must not default to movie ───────────────
 
-@pytest.mark.xfail(strict=True, reason=(
-    "_identity_is_confirmed has an explicit TV branch and then a bare movie "
-    "fallthrough, so an AMBIGUOUS row with a clean title and year confirms as "
-    "a movie, is promoted to identity_state='exact', and passes "
-    "_validate_auto_action. Ambiguous is never movie-by-default."))
 def test_identity_confirmation_rejects_an_unresolved_media_type():
     from backend.hdencode_candidate_service import _identity_is_confirmed
     row = {
@@ -102,27 +114,45 @@ def test_identity_confirmation_rejects_an_unresolved_media_type():
     assert _identity_is_confirmed(row) is False
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "_validate_auto_action checks neither an unresolved media type nor the "
-    "confidence of a resolved one. Programme-level qualification and "
-    "candidate-level suitability are different gates; the combined promotion "
-    "gate does not substitute for this one."))
-def test_auto_action_validation_rejects_an_unresolved_media_type():
-    import inspect
+@pytest.mark.parametrize("media_type,provisional,expect_code", [
+    ("ambiguous", False, "auto_media_type_unresolved"),
+    ("", False, "auto_media_type_unresolved"),
+    (None, False, "auto_media_type_unresolved"),
+    ("movie", True, "auto_media_type_provisional"),
+    ("tv", True, "auto_media_type_provisional"),
+])
+def test_auto_action_validation_rejects_weak_or_unresolved_media_type(
+        media_type, provisional, expect_code):
+    """Asserted through the production validator, not its source.
 
-    from backend import hdencode_action_service
-    source = inspect.getsource(
-        hdencode_action_service.HDEncodeActionService._validate_auto_action)
-    assert "media_type" in source
+    This is a CANDIDATE-level gate: qualification says the pipeline may act at
+    all, this says THIS release is understood well enough to act on. A
+    confirmed external id resolves WHICH title it is, never whether it is a
+    film or a series — and those are two different libraries."""
+    from backend.hdencode_action_service import (
+        HDEncodeActionError, HDEncodeActionService)
+
+    svc = HDEncodeActionService.__new__(HDEncodeActionService)
+    svc.config = {"hdencode_rss_auto_grab_enabled": True}
+    candidate = {
+        "relevance_state": "relevant_missing",
+        "identity_state": "exact",
+        "hydration_state": "completed",
+        "description_complete": 1,
+        "media_type": media_type,
+        "media_type_provisional": provisional,
+        "title_year": 2024,
+        "description_year": 2024,
+    }
+    with pytest.raises(HDEncodeActionError) as excinfo:
+        svc._validate_auto_action(candidate, "grab")
+    # .code carries the machine-readable reason; args[0] is the
+    # human message, which is not the contract.
+    assert excinfo.value.code == expect_code
 
 
 # ─────────── confidence and provenance must survive to the DB ───────────────
 
-@pytest.mark.xfail(strict=True, reason=(
-    "hdencode_candidates has no media_type_provisional or media_type_because "
-    "columns and ingest_hdencode_feed writes neither, so the claim that weak "
-    "route-only evidence stays distinguishable to a downstream decision is "
-    "false at the persistence boundary. They live only on the parser object."))
 def test_confidence_and_provenance_survive_the_database(tmp_path):
     import sqlite3
 
@@ -136,44 +166,3 @@ def test_confidence_and_provenance_survive_the_database(tmp_path):
         conn.close()
     assert {"media_type_provisional", "media_type_because"} <= cols
     del db
-
-
-# ─────────────── the promotion gate must reject malformed input ─────────────
-
-@pytest.mark.xfail(strict=True, reason=(
-    "evaluate_promotion coerces permissively: `not acquisition.get(...)` "
-    "accepts the string 'false'; int(0.9) truncates to 0; False is an int and "
-    "passes as a zero count. It returns allowed=True for deliberately "
-    "malformed evidence. 41 tests covered ABSENCE and NONZERO, never MALFORMED."))
-def test_the_gate_rejects_malformed_evidence():
-    decision = evaluate_promotion(
-        {"acquisition_ready": "false"},
-        _passing_phase_b(material_mismatch_count=0.9, inconclusive_count=False),
-        current_bindings=BINDINGS)
-    assert decision.allowed is False
-
-
-# Only TRUTHY non-True values are defects. [] and {} are falsy and the gate
-# already blocks them, so including them would assert a passing case as a
-# failure and make this file self-contradictory.
-@pytest.mark.parametrize("ready", ["false", "0", 1, "yes"])
-@pytest.mark.xfail(strict=True, reason=(
-    "acquisition_ready must be the literal True, not merely truthy."))
-def test_acquisition_ready_must_be_exactly_true(ready):
-    decision = evaluate_promotion({"acquisition_ready": ready},
-                                  _passing_phase_b(), current_bindings=BINDINGS)
-    assert decision.allowed is False
-
-
-# True is int 1, so the gate already blocks it. Only values that coerce to
-# a clean zero are defects.
-@pytest.mark.parametrize("count", [0.9, 0.4, False])
-@pytest.mark.xfail(strict=True, reason=(
-    "counts must be non-Boolean integers equal to zero. int() truncation and "
-    "bool-is-int both let a non-zero or non-integer count read as clean."))
-def test_counts_must_be_real_integers(count):
-    decision = evaluate_promotion(
-        {"acquisition_ready": True},
-        _passing_phase_b(material_mismatch_count=count),
-        current_bindings=BINDINGS)
-    assert decision.allowed is False

@@ -1028,6 +1028,20 @@ class DatabaseManager:
                     ("imdb_id", "TEXT"),
                     ("tmdb_id", "TEXT"),
                     ("discovery_source", "TEXT NOT NULL DEFAULT 'rss'"),
+                    # Media-type CONFIDENCE and PROVENANCE, additive.
+                    #
+                    # The resolver produced both and the parser object carried
+                    # both, but there was nowhere to put them, so they died at
+                    # this boundary — the claim that weak route-only evidence
+                    # stayed distinguishable to a downstream decision was false
+                    # for every actionable path.
+                    #
+                    # Defaults are the CAUTIOUS values: an existing row that
+                    # predates this column has an unknown provenance, so it is
+                    # treated as provisional (1) until re-parsed, which blocks
+                    # it from autonomous action rather than grandfathering it in.
+                    ("media_type_provisional", "INTEGER NOT NULL DEFAULT 1"),
+                    ("media_type_because", "TEXT NOT NULL DEFAULT '[]'"),
                 ):
                     try:
                         cursor.execute(
@@ -1452,10 +1466,11 @@ class DatabaseManager:
                             size_text, size_gb, dv_evidence, hdr_evidence,
                             hevc_evidence, hdr_formats, categories,
                             raw_description, raw_hash, description_complete,
+                            media_type_provisional, media_type_because,
                             first_seen_at, last_seen_at, updated_at
                         ) VALUES (
                             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?, ?, ?
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         )
                         ON CONFLICT(canonical_url) DO UPDATE SET
                             guid = excluded.guid,
@@ -1479,6 +1494,8 @@ class DatabaseManager:
                             raw_description = excluded.raw_description,
                             raw_hash = excluded.raw_hash,
                             description_complete = excluded.description_complete,
+                            media_type_provisional = excluded.media_type_provisional,
+                            media_type_because = excluded.media_type_because,
                             last_seen_at = excluded.last_seen_at,
                             updated_at = excluded.updated_at
                         """,
@@ -1497,6 +1514,11 @@ class DatabaseManager:
                             row.get("raw_description") or "",
                             row["raw_hash"],
                             1 if row.get("description_complete") else 0,
+                            # Absent provenance defaults to PROVISIONAL, not
+                            # confirmed: a row whose confidence we cannot read
+                            # must not be treated as strongly evidenced.
+                            0 if row.get("media_type_provisional") is False else 1,
+                            json.dumps(list(row.get("media_type_because") or [])),
                             now, now, now,
                         ),
                     )
