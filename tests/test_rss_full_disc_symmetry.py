@@ -201,12 +201,17 @@ class TestExclusionRecordingUsesTheRealEntryType:
             key="movies_all", url="https://hdencode.org/feed/")
         result = svc.poll_feed(feed)
 
-        assert result["outcome"] not in ("failed", "parse_failed", "denied"), result
+        assert result["outcome"] == "changed", result
+        assert result["candidate_count"] == 1   # the normal entry, not the disc
         assert db.count_policy_exclusions("hdencode") == 1
         conn = sqlite3.connect(db.db_path)
         row = conn.execute(
-            "SELECT canonical_url, policy_reason "
+            "SELECT canonical_url, source, category, title, policy_reason "
             "FROM listing_policy_exclusions").fetchone()
         conn.close()
-        assert row[1] == REASON_RSS_FULL_DISC
-        assert "disc-rip-2026" in row[0]
+        # Exact row, not substrings: the store canonicalises to Form B
+        # (no trailing slash), source/category/title come from the writer.
+        assert row == ("https://hdencode.org/disc-rip-2026",
+                       "hdencode", "movies_all",
+                       "[BD]Disc Rip 2026 Blu-ray AVC DTS-HD",
+                       REASON_RSS_FULL_DISC)
