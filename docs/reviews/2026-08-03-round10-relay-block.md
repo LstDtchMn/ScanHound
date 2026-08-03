@@ -42,6 +42,14 @@ Scope, in order:
    sequencing. NOT implemented — approve, amend, or redirect before code.
 5. Q2 re-verdict on the amended completion contract
    (2026-08-03-completion-contract.md, round-9 amendments section).
+6. Two NEW staged branches awaiting Jesse's merge decision — review both:
+   agent/security-track-c @ 85ad01f (secret-scan workflow all-branches,
+   reviewed allowlist, true-positive response procedure; evidence in the
+   commit message includes a measured default-ruleset gap: bare AWS AKIA
+   keys are NOT flagged by gitleaks 8.30.1 defaults) and
+   agent/scan-failure-visibility-rebased @ ce3f10b (the eight #184
+   scan-metrics commits rebased onto main 7adb17b, zero conflicts,
+   scan-metrics 77/77 + scanner 57/57; full suite result to be appended).
 
 Questions requiring a verdict:
 Q1 Gate item 2: closed (with §5.5 as an acknowledged post-deploy step)?
@@ -49,6 +57,8 @@ Q2 Gate item 3: closed, and are the three declared deltas acceptable?
 Q3 S-2 order + its three embedded questions.
 Q4 R-4/R-6 proposals: approved to build as specified?
 Q5 Contract: acceptable now as the definition of done?
+Q6 The two staged branches (item 6): mergeable as-is once CI attests, or
+   changes required?
 ```
 
 CI attestation: every commit above must carry its green run URL in the final

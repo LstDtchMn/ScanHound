@@ -207,3 +207,24 @@ compresses it.** Everything else fits inside or around it.
    green, counters demonstrated against injected failure AND cancellation.
 4. **CI attestation is part of every evidence package:** run URLs, not
    commit-message claims (7681a87 = actions/runs/30811406913, success).
+
+---
+
+## Status snapshot — 2026-08-03 end of autonomous session
+
+Legend: ✅ done+evidence · 🔨 engineering done, verdict pending · 📋 proposal
+in round 10 · ⬜ open · 🔒 waiting on Jesse.
+
+**Track 1:** R-1 ✅ (round 9) · R-2 🔨 (f0ed051/ee9567f/3c54d9a + refuter pass;
+§5.5 re-measure is post-deploy by nature) · R-3 🔨 (a57c7ef/f172d1f, three
+declared deltas) · R-4/R-5/R-6 📋 · R-7 🔒 approved-in-principle · R-8..R-16 ⬜.
+**Track 2:** all ⬜ (scheduled inside the window). **Track 3:** S-1 ✅ (both
+claude heads CI-green) · S-2 🔨 (order approved pending round 10) · S-3/S-4/
+S-5 ⬜. **Track 4:** C-1+C-2 🔨 staged on agent/security-track-c @ 85ad01f 🔒
+merge · C-3/C-4 🔒. **Track 5:** D-6 🔨 rebased clean as
+agent/scan-failure-visibility-rebased @ ce3f10b 🔒 merge · D-3 half · rest ⬜.
+**Track 6:** O-1 🔨 supervised wrapper delivered 🔒 Jesse runs · O-2 ⬜ (wait
+for O-1's evidence) · O-3 🔒 · O-4/O-5 ✅.
+
+**Cross-cutting blocker:** GitHub Actions billing failure — four heads
+(f172d1f, 3409543, 85ad01f, ce3f10b) await machine attestation.
