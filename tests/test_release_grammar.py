@@ -346,3 +346,20 @@ class TestInterlacedToken:
     def test_1080i_parses_and_folds(self):
         from backend.release_grammar import parse_resolution
         assert parse_resolution("Show.S01E01.1080i.HDTV.mkv") == "1080P"
+
+
+class TestDimensionPolicyNarrowed:
+    """Jesse-ratified 2026-08-04 (round-11 Q5): 4K-class = width 3840 (incl.
+    scope crops) or height 2160. A 2160-WIDE oddity is unknown, not 4K --
+    the width-2160 match was an accident of the old substring translation."""
+
+    def test_2160_wide_is_unknown(self):
+        from backend.release_grammar import resolution_from_dimensions as rfd
+        assert rfd("2160x900") is None
+        assert rfd("2160x3840") is None   # portrait stays unknown too
+
+    def test_ratified_forms_still_map(self):
+        from backend.release_grammar import resolution_from_dimensions as rfd
+        assert rfd("3840x2160") == "UHD"
+        assert rfd("3840x1600") == "UHD"  # the ratified scope crop
+        assert rfd("1920x1080") == "1080P"
