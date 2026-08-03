@@ -1,11 +1,42 @@
 # RSS qualification: replace the absolute miss gate with a recovery criterion
 
 **Date:** 2026-07-27
-**Revision:** 4 — parked. (Rev 2 fixed four review findings; rev 3 recorded Jesse's
+**Revision:** 5 — SUPERSEDED (see block below). Previously: 4 — parked. (Rev 2 fixed four review findings; rev 3 recorded Jesse's
 decisions; rev 4 parks the whole track. The rev-2 header value was stale and is
 corrected here — a defect the peer review caught.)
 **Branch:** `agent/rss-miss-recovery-criterion` (off the parked Stage 0 branch)
 **Decision owner:** Jesse.
+
+> ## REV 5 (2026-08-03) — SUPERSEDED, not merely paused (#192 correction)
+>
+> The park condition below ("until the discard defect is fixed and a fresh
+> observation window exists") has been OVERTAKEN, not satisfied. Since rev 4:
+> the whole prior evidence window was ruled **void** (readiness blind for
+> 8.9 days); qualification was split into **Phase A (acquisition) and
+> Phase B (decision suitability)** with promotion requiring both; and the
+> pass/fail thresholds were predeclared as **T1/T2a/T2b**. This document's
+> recovery criterion is therefore superseded as a whole — do not revive any
+> gate from it, including under a "the discard defect is fixed now" reading.
+>
+> **Current authority chain** (branch `agent/hybrid-sweep-implementation`):
+> `docs/reviews/2026-08-03-completion-contract.md` (completion status) →
+> `docs/reviews/2026-08-02-plan-to-completion-rev2.md` (route, Phase A/B) →
+> `docs/reviews/2026-08-01-A5-predeclared-thresholds.md` (T1/T2a/T2b +
+> population identity) → `backend/promotion_gate.py` (the combined gate,
+> wiring pending).
+>
+> **What this document still contributes:** the recovery-latency IDEA
+> survived into T1 (p50/p95/max latency bands, measured from
+> `first_normal_at`) — arrived at through the polling-lag analysis that
+> showed 99 of 100 "misses" were acquired with median 1.0 h. The 23 positive
+> `feed_only` recoveries, feed uptime, restart/catch-up evidence and the
+> six ineligible-cycle diagnoses remain true historical observations; they
+> are NOT admissible qualification evidence for any new window.
+>
+> Verified against the tree on 2026-08-03: `compare_shadow`'s listing side
+> is still `run_scan` items, which is one reason Phase A alone cannot prove
+> decision suitability — that asymmetry is now handled by the Phase A/B
+> split rather than by this criterion.
 
 > ## STATUS: PAUSED / SUPERSEDED BY THE LISTING DETAIL-DISCARD INVESTIGATION
 >
