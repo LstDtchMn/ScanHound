@@ -6,7 +6,23 @@
 `claude/nostalgic-brattain-946f4f` (now `2f8c898`), both CI-green as of
 2026-08-03 morning — the first machine-attested runs in their history.
 
-## Recommended order
+## Order — REVISED per round-10 Q4 (binding)
+
+Round 10 approved the conflict analysis but REJECTED the standalone brattain
+merge: its own round-1 verdict requires changes before merge, and assigning
+the three lifecycle P0s to meitner does not make an intermediate main state
+safe. Revised order: (1) hybrid-sweep merges after its gates close;
+(2) brattain rebases as the INTEGRATION BASE — not a merge candidate;
+(3) meitner integrates/rebases onto it; (4) the application-wide deadline,
+generation fencing, admission closure and startup-safety P0s close there,
+plus `--threadleak-fail` (required, not deferrable past the merge) and the
+ratified desktop_notifications opt-in migration; (5) ONE combined shutdown
+branch runs the combined gate and merges (🔒). Safe isolated brattain
+commits may cherry-pick separately. The three embedded questions below were
+answered by round 10 (no deferral; opt-in migration required; fail-mode
+required pre-merge) and are retained for the record.
+
+## Original recommended order (superseded on step 2-3)
 
 1. **`agent/hybrid-sweep-implementation` merges first** (already required: it
    is the RSS-promotion prerequisite, contract R-8, 🔒 Jesse). Relevantly for
