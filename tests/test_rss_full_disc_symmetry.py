@@ -206,7 +206,7 @@ class TestExclusionRecordingUsesTheRealEntryType:
         assert db.count_policy_exclusions("hdencode") == 1
         conn = sqlite3.connect(db.db_path)
         row = conn.execute(
-            "SELECT canonical_url, source, category, title, policy_reason "
+            "SELECT canonical_url, source, category, listing_title, policy_reason "
             "FROM listing_policy_exclusions").fetchone()
         conn.close()
         # Exact row, not substrings: the store canonicalises to Form B
