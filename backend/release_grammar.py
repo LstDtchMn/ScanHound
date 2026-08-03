@@ -52,6 +52,14 @@ from typing import Iterable, NamedTuple, Optional
 #: release year. Requiring a non-word neighbour rejects it, because ``x`` is a
 #: word character — which is exactly what the listing path's ``\b...\b`` was
 #: already doing correctly.
+#: Version of THIS grammar's parsing behaviour. Bump on ANY change that can
+#: alter a parsed field (year selection, tokens, boundaries, season rules...)
+#: -- persisted derived facts carry it, and R-4's reconciler treats a
+#: mismatch as stale. v1 baselines the 2026-08-04 state (rightmost year,
+#: 1080i token, boundary guards). Independent of POST_IDENTITY_VERSION:
+#: URL identity and title grammar change for different reasons.
+GRAMMAR_VERSION = "release-grammar-v1"
+
 _YEAR_RE = re.compile(r"(?<!\w)((?:19|20)\d{2})(?!\w)")
 
 

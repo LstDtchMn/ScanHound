@@ -97,3 +97,36 @@ class TestHydratedFactsSurviveChangedPolls:
         after = _row(db)
         assert after["resolution"] != before["resolution"]
         assert after["size_gb"] != before["size_gb"]
+
+
+class TestR4VersionStamps:
+    """R-4 commit 1: every write boundary stamps the grammar version it
+    parsed with -- dedicated columns, behaviour-neutral (nothing reads them
+    yet). The reconciler (commit 2) turns mismatches into staleness."""
+
+    def test_ingest_stamps_feed_parse_version(self, db):
+        from backend.release_grammar import GRAMMAR_VERSION
+        _ingest(db, _body("Movie 2026 2160p WEB-DL - 12.0 GB"), "sha-v1")
+        row = _row(db)
+        assert row["feed_parse_version"] == GRAMMAR_VERSION
+        assert row["derived_state"] == "current"
+        assert row["detail_parse_version"] is None
+
+    def test_hydration_stamps_detail_parse_version(self, db):
+        from backend.release_grammar import GRAMMAR_VERSION
+        _ingest(db, _body("Movie 2026 2160p WEB-DL - 12.0 GB"), "sha-v1")
+        db.complete_hdencode_hydration(
+            URL, payload={"url": URL}, candidate_updates={"media_type": "movie"})
+        assert _row(db)["detail_parse_version"] == GRAMMAR_VERSION
+
+    def test_cache_upsert_stamps_parse_version(self, db):
+        from backend.release_grammar import GRAMMAR_VERSION
+        assert db.upsert_background_cache([{
+            "url": "https://hdencode.org/c1/", "title": "C", "year": 2026,
+            "status": "missing", "source_category": "4k_movies",
+            "data": "{}"}])
+        conn = sqlite3.connect(db.db_path)
+        row = conn.execute("SELECT parse_version, derived_state "
+                           "FROM background_scan_cache").fetchone()
+        conn.close()
+        assert row[0] == GRAMMAR_VERSION and row[1] == "current"

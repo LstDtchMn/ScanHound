@@ -12,6 +12,7 @@ import datetime
 import logging
 
 from backend.url_identity import canonicalize_listing_url
+from backend import release_grammar
 import time
 import threading
 import uuid
@@ -708,6 +709,11 @@ class DatabaseManager:
 
                 # ── Column migrations (guarded by "duplicate column name") ─
                 _column_migrations = [
+                    # R-4 derived-state versioning (round-10 model): version
+                    # stamps + staleness live in DEDICATED columns, never only
+                    # inside a JSON blob.
+                    'ALTER TABLE background_scan_cache ADD COLUMN parse_version TEXT',
+                    "ALTER TABLE background_scan_cache ADD COLUMN derived_state TEXT NOT NULL DEFAULT 'current'",
                     'ALTER TABLE downloads ADD COLUMN normalized_title TEXT',
                     'ALTER TABLE downloads ADD COLUMN season INTEGER',
                     'ALTER TABLE downloads ADD COLUMN resolution TEXT',
@@ -1042,6 +1048,12 @@ class DatabaseManager:
                     # it from autonomous action rather than grandfathering it in.
                     ("media_type_provisional", "INTEGER NOT NULL DEFAULT 1"),
                     ("media_type_because", "TEXT NOT NULL DEFAULT '[]'"),
+                    # R-4 versioning: NULL version on a pre-existing row means
+                    # "stamped by nothing" -- the reconciler treats it exactly
+                    # like a version mismatch (stale), never as current.
+                    ("feed_parse_version", "TEXT"),
+                    ("detail_parse_version", "TEXT"),
+                    ("derived_state", "TEXT NOT NULL DEFAULT 'current'"),
                 ):
                     try:
                         cursor.execute(
@@ -1467,10 +1479,11 @@ class DatabaseManager:
                             hevc_evidence, hdr_formats, categories,
                             raw_description, raw_hash, description_complete,
                             media_type_provisional, media_type_because,
+                            feed_parse_version,
                             first_seen_at, last_seen_at, updated_at
                         ) VALUES (
                             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         )
                         ON CONFLICT(canonical_url) DO UPDATE SET
                             -- Round-10 Q3 P0: a changed poll must NOT revert
@@ -1500,6 +1513,7 @@ class DatabaseManager:
                             description_complete = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.description_complete ELSE excluded.description_complete END,
                             media_type_provisional = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.media_type_provisional ELSE excluded.media_type_provisional END,
                             media_type_because = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.media_type_because ELSE excluded.media_type_because END,
+                            feed_parse_version = excluded.feed_parse_version,
                             last_seen_at = excluded.last_seen_at,
                             updated_at = excluded.updated_at
                         """,
@@ -1523,6 +1537,7 @@ class DatabaseManager:
                             # must not be treated as strongly evidenced.
                             0 if row.get("media_type_provisional") is False else 1,
                             json.dumps(list(row.get("media_type_because") or [])),
+                            release_grammar.GRAMMAR_VERSION,
                             now, now, now,
                         ),
                     )
@@ -2006,6 +2021,7 @@ class DatabaseManager:
                     description_complete = CASE
                         WHEN ? THEN 1 ELSE description_complete
                     END,
+                    detail_parse_version = ?,
                     hydration_state = 'completed',
                     identity_state = COALESCE(?, identity_state),
                     relevance_state = 'unclassified',
@@ -2042,6 +2058,7 @@ class DatabaseManager:
                         else None
                     ),
                     1 if updates.get("description_complete") else 0,
+                    release_grammar.GRAMMAR_VERSION,
                     updates.get("identity_state"),
                     now,
                     canonical_url,
@@ -4076,10 +4093,10 @@ class DatabaseManager:
                 conn.cursor().executemany('''
                     INSERT INTO background_scan_cache
                         (url, title, year, status, source_category, data,
-                         scraped_at, last_seen_at)
+                         parse_version, scraped_at, last_seen_at)
                     VALUES
                         (:url, :title, :year, :status, :source_category, :data,
-                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                         :parse_version, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     ON CONFLICT(url) DO UPDATE SET
                         title = excluded.title,
                         year = excluded.year,
@@ -4088,6 +4105,7 @@ class DatabaseManager:
                             NULLIF(background_scan_cache.source_category, ''),
                             excluded.source_category),
                         data = excluded.data,
+                        parse_version = excluded.parse_version,
                         last_seen_at = CURRENT_TIMESTAMP
                 ''', [{
                     "url": it.get("url"),
@@ -4096,6 +4114,7 @@ class DatabaseManager:
                     "status": it.get("status"),
                     "source_category": it.get("source_category"),
                     "data": it.get("data"),
+                    "parse_version": release_grammar.GRAMMAR_VERSION,
                 } for it in rows])
                 conn.commit()
                 self._bg_cache_rev += 1
