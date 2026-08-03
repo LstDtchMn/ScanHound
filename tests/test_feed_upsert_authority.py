@@ -130,3 +130,67 @@ class TestR4VersionStamps:
                            "FROM background_scan_cache").fetchone()
         conn.close()
         assert row[0] == GRAMMAR_VERSION and row[1] == "current"
+
+
+class TestR4Reconciler:
+    """R-4 commit 2: version mismatches become visible staleness with the
+    ratified consequences -- refetch transition, auto-action exclusion,
+    skip-set bypass, cache generation bump."""
+
+    def _age_stamps(self, db):
+        conn = sqlite3.connect(db.db_path)
+        conn.execute("UPDATE hdencode_candidates SET feed_parse_version='old-v0',"
+                     " detail_parse_version=CASE WHEN hydration_state='completed'"
+                     " THEN 'old-v0' ELSE detail_parse_version END")
+        conn.execute("UPDATE background_scan_cache SET parse_version='old-v0'")
+        conn.commit(); conn.close()
+
+    def test_hydrated_mismatch_becomes_refetch_and_requeues(self, db):
+        _ingest(db, _body("Movie 2026 2160p WEB-DL - 12.0 GB"), "sha-v1")
+        db.complete_hdencode_hydration(
+            URL, payload={"url": URL}, candidate_updates={"media_type": "movie"})
+        self._age_stamps(db)
+        out = db.reconcile_derived_versions()
+        assert out["candidates_refetch_required"] == 1
+        row = _row(db)
+        assert row["derived_state"] == "refetch_required"
+        assert row["relevance_state"] == "unclassified"
+        assert row["hydration_state"] == "queued"      # the completed->queued transition
+        # re-hydration under the current grammar returns the row to current
+        db.complete_hdencode_hydration(
+            URL, payload={"url": URL}, candidate_updates={"media_type": "movie"})
+        assert _row(db)["derived_state"] == "current"
+
+    def test_nonhydrated_mismatch_is_stale_and_blocks_auto_action(self, db):
+        _ingest(db, _body("Movie 2026 2160p WEB-DL - 12.0 GB"), "sha-v1")
+        self._age_stamps(db)
+        out = db.reconcile_derived_versions()
+        assert out["candidates_stale"] == 1
+        assert _row(db)["derived_state"] == "stale"
+        import pytest as _pytest
+        from backend.hdencode_action_service import (
+            HDEncodeActionError, HDEncodeActionService)
+        svc = object.__new__(HDEncodeActionService)
+        svc.config = {"hdencode_rss_auto_grab_enabled": True}
+        with _pytest.raises(HDEncodeActionError) as exc:
+            svc._validate_auto_action(_row(db), "grab")
+        assert exc.value.code == "stale_derived"
+
+    def test_stale_cache_rows_leave_the_skip_set_and_bump_the_rev(self, db):
+        assert db.upsert_background_cache([{
+            "url": "https://hdencode.org/c1/", "title": "C", "year": 2026,
+            "status": "missing", "source_category": "4k_movies", "data": "{}"}])
+        assert "https://hdencode.org/c1/" in db.get_background_cache_urls()
+        self._age_stamps(db)
+        rev_before = db.get_background_cache_version()
+        out = db.reconcile_derived_versions()
+        assert out["cache_stale"] == 1
+        assert "https://hdencode.org/c1/" not in db.get_background_cache_urls()
+        assert db.get_background_cache_version() != rev_before
+
+    def test_reconcile_is_idempotent_and_current_rows_untouched(self, db):
+        _ingest(db, _body("Movie 2026 2160p WEB-DL - 12.0 GB"), "sha-v1")
+        out1 = db.reconcile_derived_versions()
+        assert out1 == {"candidates_refetch_required": 0,
+                        "candidates_stale": 0, "cache_stale": 0}
+        assert _row(db)["derived_state"] == "current"

@@ -141,6 +141,10 @@ def _init_services(
     reg._plex_service = plex_svc
 
     # Scanner
+    reconciled = backend.db.reconcile_derived_versions()
+    if any(reconciled.values()):
+        logging.getLogger(__name__).info(
+            "derived-state reconciliation: %s", reconciled)
     scrapers = WebScrapers(bridge)
     matching = MatchingEngine(bridge)
     scanner_svc = ScannerService(
