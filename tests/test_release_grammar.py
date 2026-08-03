@@ -267,3 +267,41 @@ class TestFindAllSizes:
     def test_empty_input_is_an_empty_list(self):
         from backend.release_grammar import find_all_sizes
         assert find_all_sizes("") == [] and find_all_sizes(None) == []
+
+
+class TestSeasonTokenTrailingBoundary:
+    """Round-10 internal review, executed-proof defect: _SEASON_RE had no
+    trailing boundary, so a release-group name beginning S+digit parsed as a
+    season — 'x264-S0MEGRP' became TV season 0, 'Tesla.S3XY.Story' season 3.
+    PRE-EXISTED on the RSS path; imported to the detail path by R-3. A
+    season-only token followed by a letter is a name, not a season."""
+
+    def test_group_names_are_not_seasons(self):
+        from backend.release_grammar import parse_season_episode
+        assert parse_season_episode("Movie.2020.1080p.x264-S0MEGRP.mkv").season is None
+        assert parse_season_episode("Tesla.S3XY.Story.2160p.mkv").season is None
+        assert not parse_season_episode("Movie.2020.1080p.x264-S0MEGRP.mkv").ambiguous
+
+    def test_real_season_forms_still_parse(self):
+        from backend.release_grammar import parse_season_episode
+        assert parse_season_episode("Show.Name.S01.Complete.1080p").season == 1
+        assert parse_season_episode("Show.Name.S01E02.1080p").season == 1
+        assert parse_season_episode("Show.Name.S104.2160p").ambiguous
+        assert parse_season_episode("Show S2 2020").season == 2
+
+
+class TestSizeUnitTrailingBoundary:
+    """Same review: the size unit had no trailing boundary, so '15 GBps' in
+    page prose parsed as a 15 GB release size — and being large it tends to
+    win pick-the-largest."""
+
+    def test_units_glued_to_letters_are_not_sizes(self):
+        from backend.release_grammar import find_size, find_all_sizes
+        assert find_size("server pushes 15 GBps easily") is None
+        assert find_all_sizes("rated 200 TBW endurance") == []
+
+    def test_real_sizes_still_parse(self):
+        from backend.release_grammar import find_all_sizes, parse_size_gb
+        got = find_all_sizes("Disc 1: 45.2 GB and 1.2 TB total (sample 300 MB).")
+        assert [s.text for s in got] == ["45.2 GB", "1.2 TB", "300 MB"]
+        assert parse_size_gb("Show.Title.2026.2160p - 82.4 GB", anchored=True) == 82.4

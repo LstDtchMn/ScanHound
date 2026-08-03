@@ -88,7 +88,7 @@ _EPISODE_RE = re.compile(
     r"(?P<extra>(?:E\d{1,4})*)(?!\d)",
     re.I,
 )
-_SEASON_RE = re.compile(r"(?<![A-Z0-9])S(?P<season>\d{1,4})(?!E\d)", re.I)
+_SEASON_RE = re.compile(r"(?<![A-Z0-9])S(?P<season>\d{1,4})(?![A-Za-z0-9])", re.I)
 
 #: Seasons wider than this are treated as AMBIGUOUS rather than guessed at.
 #: ``S104`` is defect (d): it could be season 104, ``S1E04`` or ``S10E4``, and
@@ -281,7 +281,7 @@ _SIZE_UNITS_GB = {
     "GB": 1.0, "GIB": 1.0,
     "TB": 1024.0, "TIB": 1024.0,
 }
-_SIZE_BODY = r"(?P<size>\d+(?:\.\d+)?)\s*(?P<unit>TiB|TB|GiB|GB|MiB|MB)"
+_SIZE_BODY = r"(?P<size>\d+(?:\.\d+)?)\s*(?P<unit>TiB|TB|GiB|GB|MiB|MB)(?![A-Za-z])"
 _SIZE_ANCHORED_RE = re.compile(
     r"(?:\s+[–-]\s+|\s+)" + _SIZE_BODY + r"\s*$", re.I)
 _SIZE_ANYWHERE_RE = re.compile(_SIZE_BODY, re.I)
