@@ -112,3 +112,15 @@ The two decisions that are genuinely yours:
    hand?
 
 Everything else restates bars already agreed in the design or by ChatGPT.
+
+
+## Population identity (added 2026-08-03, inventory §5.4)
+
+The Phase A acquisition population is the set of **Form-A post identities**
+(`canonicalize_hdencode_post_url`, version `hdencode-post-v1`) in
+`hdencode_candidates`. The miss ledger and policy-exclusion store key on
+**Form B** (`canonicalize_listing_url`, `listing-v1`). Every instrument that
+joins the two MUST use the named bridge `post_to_listing_identity` (or the
+producer-consistent membership already inside `compare_shadow` /
+`miss_resolution.py`) and state its denominators. No threshold may be graded
+from a join that has not declared its bridge.

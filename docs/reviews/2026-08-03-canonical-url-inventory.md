@@ -128,3 +128,32 @@ keys when the shared canonicaliser version changes. Frontier identity:
 URL retained; feed identity stays a DISTINCT function because feed query
 parameters are identity-bearing. §5 criterion 3 (the #191 fix) is DONE
 (7681a87, CI actions/runs/30811406913; assertions sharpened 1c1fab3).
+
+## 7. Migration / compatibility policy for persisted keys (§6.5)
+
+Persisted identities are NEVER rewritten in place. Policy, effective with
+`hdencode-post-v1` / `listing-v1`:
+
+1. **A version bump is a schema event.** Changing any identity function
+   requires: a new version string, a dual-read bridge (old-form and new-form
+   lookups both consulted) shipped in the SAME commit, and a one-shot,
+   counted re-key migration whose before/after row counts are recorded as
+   evidence. Rows that cannot be re-keyed are listed, not dropped.
+2. **Never during a window.** Any identity version change invalidates a
+   running qualification window by definition (it changes the acquisition
+   population); the migration must land before a window opens or after it is
+   graded, never inside one.
+3. **Existing corpus is already version-stamped or accounted:** sweep-ledger
+   rows carry `canonicalizer_version` per row; `hdencode_candidates` keys are
+   uniformly Form A (measured: 2969/2969 trailing-slash, 0 exceptions);
+   the two Form-B ledgers are uniformly slash-stripped (112/112, 149/149).
+   Reproduce with `scripts/canonical_url_corpus.py` — committed output at
+   `docs/reviews/evidence/2026-08-03-canonical-url-corpus.json`
+   (snapshot sha256 `69fb7c2cbbcfd904…`, controls embedded).
+4. **"100% under the bridge", defined per join (§6.3):**
+   shadow_misses→candidates: denominator 112, bridged 111, the 1 unmatched
+   row is listed in the JSON and separately proven a genuine
+   never-in-candidates absence, not a form mismatch. exclusions→candidates:
+   denominator 149, bridged 114, the 35 unmatched are the out-of-RSS-
+   population set, listed in full. A future "pass" must cite these same
+   denominators or explain the population change.
