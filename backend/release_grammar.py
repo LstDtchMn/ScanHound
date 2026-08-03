@@ -74,6 +74,17 @@ def find_years(text: str) -> list:
             for m in _YEAR_RE.finditer(text or "")]
 
 
+def select_release_year(text: str):
+    """The RELEASE year: rightmost plausible year token with a non-empty
+    title to its left. Ratified 2026-08-04 (round-10 prescription): earlier
+    year-like tokens belong to the NAME -- "Blade Runner 2049 2017" is the
+    2017 film, and a bare leading year is a title, not evidence."""
+    for match in reversed(find_years(text)):
+        if (text or "")[:match.start].strip():
+            return match
+    return None
+
+
 def parse_year(text: str) -> Optional[int]:
     """First plausible release year in ``text``, or None.
 
@@ -341,13 +352,15 @@ def strip_trailing_size(text: str) -> str:
 
 # ───────────────────────────── resolution ───────────────────────────────────
 
-#: Exactly the union both readers already accepted. Deliberately NOT widened:
+#: Exactly the union both readers already accepted, PLUS 1080i (ratified
+#: 2026-08-04: interlaced 1080 is 1080-class for every decision that
+#: matters; canonical_resolution folds it to 1080P). Otherwise NOT widened:
 #: adding 1080i or 480p here would make titles newly parseable that previously
 #: yielded no resolution at all — a behaviour change, smuggled into a fix whose
 #: whole purpose is to make the two paths agree without altering what either
 #: one decides. :func:`canonical_resolution` still tolerates those spellings,
 #: because values also arrive from the database rather than from a title.
-_RESOLUTION_RE = re.compile(r"(?<!\w)(2160p|1080p|720p|4K|UHD)(?!\w)", re.I)
+_RESOLUTION_RE = re.compile(r"(?<!\w)(2160p|1080p|1080i|720p|4K|UHD)(?!\w)", re.I)
 
 #: Defect (a). UHD is spelled at least three ways across this codebase, and the
 #: readers, the database and the frontend chip do not agree on which. This is
@@ -480,7 +493,7 @@ def metadata_start(text: str) -> int:
     if season.start is not None:
         boundary = season.start
     else:
-        year = find_year(text)
+        year = select_release_year(text)
         if year is not None:
             boundary = year.start
         else:
