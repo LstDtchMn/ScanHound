@@ -6,7 +6,7 @@ If you find yourself reviewing a summary, STOP and say so.
 
 Repository: LstDtchMn/ScanHound (public, GitHub connector)
 Branch: agent/hybrid-sweep-implementation
-Head: c2cb3d4
+Head: 7681a87
 Base: main @ 7cc5275
 
 Scope of this round, in order:
@@ -32,5 +32,10 @@ Questions requiring a verdict:
 Q1 Round-8 P0s: closed or not?
 Q2 Contract: acceptable as the definition of done (subject to Jesse's batch)?
 Q3 Inventory: does item 2 close once §5's five criteria land, or is more needed?
-Q4 The #191 P0 fix plan (real-dataclass failing test first): correct?
+Q4 The #191 P0 fix is now IMPLEMENTED at 7681a87 (Jesse authorised
+   fix-now-test-first this morning): the new test drives poll_feed with a
+   real RSS body so parse_feed builds real ParsedFeedEntry objects; it
+   failed on line 334's AttributeError pre-fix, passes post-fix (94/94
+   across RSS/feed files). Verify the FIX and the test's realism, not the
+   plan.
 ```
