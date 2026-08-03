@@ -156,6 +156,23 @@ class HDEncodeCandidateService:
             else:
                 decision = _detail_decision("identity_unresolved")
 
+        # An unresolved media type after a COMPLETED hydration is terminal.
+        #
+        # Hydration is the strongest evidence this pipeline can gather without
+        # a human. If it has run to completion and the type is still not one of
+        # tv/movie, re-queueing the same hydration would ask the same question
+        # of the same page forever, and promoting the identity around it is how
+        # an ambiguous candidate previously became an actionable "movie".
+        #
+        # Stop visibly instead: no typed library can be chosen, so the candidate
+        # needs a person. This is counted, not silent — the state is queryable
+        # and Phase B's inconclusive count is what blocks promotion on it.
+        media_type = str(row.get("media_type") or "").strip().lower()
+        if (media_type not in {"tv", "movie"}
+                and str(row.get("hydration_state") or "") == "completed"):
+            resolved_identity = "ambiguous"
+            decision = _terminal_decision("media_type_unresolved")
+
         if _cancelled(stop_requested):
             return "cancelled"
 
@@ -272,6 +289,25 @@ def _detail_decision(reason):
         state="detail_required",
         reason=reason,
         requires_detail=True,
+        safe_to_auto_act=False,
+    )
+
+
+def _terminal_decision(reason):
+    """A stop, not a request for more evidence.
+
+    ``requires_detail=False`` is the point: it resolves the hydration queue
+    rather than re-enqueueing, so a candidate whose type cannot be determined
+    does not ask the same question of the same page forever. ``safe_to_auto_act``
+    stays False — this state exists precisely because no typed library can be
+    chosen, so nothing autonomous may follow from it.
+    """
+    from backend.candidate_evidence import CandidateDecision
+
+    return CandidateDecision(
+        state=reason,
+        reason=reason,
+        requires_detail=False,
         safe_to_auto_act=False,
     )
 
