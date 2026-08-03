@@ -1991,6 +1991,14 @@ class DatabaseManager:
                     hdr_evidence = COALESCE(?, hdr_evidence),
                     hdr_formats = COALESCE(?, hdr_formats),
                     imdb_id = COALESCE(?, imdb_id),
+                    -- Hydrated detail outranks the title, so if it resolves the
+                    -- media type that verdict must land. Without these three
+                    -- columns the values _candidate_updates now produces would
+                    -- be computed and silently dropped at this boundary, which
+                    -- is the same failure this whole change exists to fix.
+                    media_type = COALESCE(?, media_type),
+                    media_type_provisional = COALESCE(?, media_type_provisional),
+                    media_type_because = COALESCE(?, media_type_because),
                     description_complete = CASE
                         WHEN ? THEN 1 ELSE description_complete
                     END,
@@ -2018,6 +2026,17 @@ class DatabaseManager:
                         else None
                     ),
                     updates.get("imdb_id"),
+                    updates.get("media_type"),
+                    (
+                        (1 if updates["media_type_provisional"] else 0)
+                        if "media_type_provisional" in updates
+                        else None
+                    ),
+                    (
+                        json.dumps(updates["media_type_because"])
+                        if "media_type_because" in updates
+                        else None
+                    ),
                     1 if updates.get("description_complete") else 0,
                     updates.get("identity_state"),
                     now,

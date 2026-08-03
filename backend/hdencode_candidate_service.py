@@ -7,6 +7,7 @@ import logging
 import re
 from typing import Callable, Optional
 
+from backend import release_grammar as grammar
 from backend.candidate_evidence import (
     CandidateDecisionEngine,
     CandidateEvidence,
@@ -351,11 +352,39 @@ def _identity_is_confirmed(row) -> bool:
     return False
 
 
+def _hydrated_type_evidence(payload):
+    """DETAIL-authority media-type evidence from a hydrated detail payload.
+
+    Hydration used to update every other parsed field and leave ``media_type``
+    untouched, so a candidate the resolver had called AMBIGUOUS stayed
+    ambiguous no matter what the detail page proved — while its identity was
+    promoted to 'exact' around it. Detail evidence outranks the title, so if it
+    resolves the type it must be recorded.
+
+    Only a POSITIVE TV signal is evidence. ``is_tv`` false means "no season
+    token in the filename", which is not a claim that this is a film.
+    """
+    if payload.get("is_tv") is True or _int_or_none(payload.get("season")) is not None:
+        return grammar.TypeEvidence(
+            grammar.MediaType.TV, grammar.Authority.DETAIL, "detail-filename")
+    return None
+
+
 def _candidate_updates(payload):
     """Return only authoritative hydrated fields; absence never means false."""
     updates = {}
     def put(name, value):
         if value is not None and value != "": updates[name] = value
+
+    # Resolve the media type from hydrated evidence, at DETAIL authority.
+    # Absent evidence leaves the stored value alone rather than overwriting a
+    # good verdict with an empty one.
+    hydrated_type = _hydrated_type_evidence(payload)
+    if hydrated_type is not None:
+        verdict = grammar.resolve_media_type([hydrated_type])
+        updates["media_type"] = verdict.media_type.value
+        updates["media_type_provisional"] = verdict.provisional
+        updates["media_type_because"] = list(verdict.because)
 
     put("clean_title", str(payload.get("display_title") or "").strip() or None)
     put("description_year", _int_or_none(payload.get("year")))
