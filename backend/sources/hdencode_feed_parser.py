@@ -162,6 +162,43 @@ def _category_type_evidence(categories):
     )
 
 
+def reparse_feed_facts(title, categories, raw_description):
+    """Feed-derived facts from the three retained inputs -- THE composition.
+
+    Shared by _parse_item (live ingest) and the R-4 reconciler (offline
+    re-derivation of stale candidate rows): a stale row is reparsed with
+    exactly the code a fresh feed sighting would use, so the two can never
+    drift. Returns only the DERIVED subset -- identity, guid, pub_date and
+    raw_hash stay with the ingest path."""
+    plain_description = _description_text(raw_description)
+    signals = parse_release_title(title)
+    year_match = _DESC_YEAR_RE.search(plain_description)
+    description_year = int(year_match.group(1)) if year_match else None
+    verdict = grammar.resolve_media_type([
+        _category_type_evidence(tuple(categories)),
+        grammar.title_type_evidence(title, source="feed-title"),
+    ])
+    return {
+        "media_type": verdict.media_type.value,
+        "media_type_provisional": verdict.provisional,
+        "media_type_because": tuple(verdict.because),
+        "clean_title": signals["clean_title"],
+        "title_year": signals["year"],
+        "description_year": description_year,
+        "season": signals["season"],
+        "episode": signals["episode"],
+        "episode_end": signals["episode_end"],
+        "resolution": signals["resolution"],
+        "size_text": signals["size_text"],
+        "size_gb": signals["size_gb"],
+        "dv": signals["dv"],
+        "hdr": signals["hdr"],
+        "hevc": signals["hevc"],
+        "hdr_formats": signals["hdr_formats"],
+        "description_complete": _description_complete(raw_description),
+    }
+
+
 def _parse_item(item):
     title = _required_text(item, "title")
     link = canonicalize_post_url(_required_text(item, "link"))
@@ -177,41 +214,7 @@ def _parse_item(item):
         if text
     )
     raw_description = _child_text(item, "description")
-    plain_description = _description_text(raw_description)
-    signals = parse_release_title(title)
-    year_match = _DESC_YEAR_RE.search(plain_description)
-    description_year = int(year_match.group(1)) if year_match else None
-    # Resolved by AUTHORITY, through the same resolver the listing path uses,
-    # so neither can reach a different verdict from the same evidence.
-    #
-    # The feed category is ROUTE-level: weakest, and unable to overrule a title.
-    # It is also matched against a normalised allowlist rather than by
-    # substring — `"tv" in category` also fires on "TVrip", "HDTV" and any
-    # future category that merely contains those two letters, which is a guess
-    # dressed as a signal.
-    verdict = grammar.resolve_media_type([
-        _category_type_evidence(categories),
-        grammar.title_type_evidence(title, source="feed-title"),
-    ])
-    # THE VERDICT IS STORED AS-IS, including "ambiguous".
-    #
-    # This previously read `"tv" if verdict is TV else "movie"`, which turned
-    # every non-TV outcome into a confident "movie" — so an unknown feed
-    # category plus a silent title, which the resolver correctly calls
-    # AMBIGUOUS, was persisted as a film. That is the exact fail-open the
-    # resolver exists to prevent, reintroduced one line after it.
-    #
-    # `provisional` and the provenance are carried too: a verdict resting only
-    # on a feed category must stay distinguishable from one backed by a
-    # confirmed identity, or nothing downstream can decline to act on weak
-    # evidence.
-    media_type = verdict.media_type.value
-    media_type_provisional = verdict.provisional
-    media_type_because = tuple(verdict.because)
-    # NOTE: categories are NOT in raw_hash, and media_type now depends on them.
-    # A category-only change can therefore alter the media type without moving
-    # this hash — which also feeds the action idempotency key. Recorded as a
-    # known gap; it belongs to the derived-state versioning work, not here.
+    facts = reparse_feed_facts(title, categories, raw_description)
     raw_hash = hashlib.sha256(
         (title + "\0" + link + "\0" + raw_description).encode("utf-8")
     ).hexdigest()
@@ -223,23 +226,23 @@ def _parse_item(item):
         categories=categories,
         raw_description=raw_description,
         raw_hash=raw_hash,
-        media_type=media_type,
-        media_type_provisional=media_type_provisional,
-        media_type_because=media_type_because,
-        clean_title=signals["clean_title"],
-        title_year=signals["year"],
-        description_year=description_year,
-        season=signals["season"],
-        episode=signals["episode"],
-        episode_end=signals["episode_end"],
-        resolution=signals["resolution"],
-        size_text=signals["size_text"],
-        size_gb=signals["size_gb"],
-        dv=signals["dv"],
-        hdr=signals["hdr"],
-        hevc=signals["hevc"],
-        hdr_formats=signals["hdr_formats"],
-        description_complete=_description_complete(raw_description),
+        media_type=facts["media_type"],
+        media_type_provisional=facts["media_type_provisional"],
+        media_type_because=facts["media_type_because"],
+        clean_title=facts["clean_title"],
+        title_year=facts["title_year"],
+        description_year=facts["description_year"],
+        season=facts["season"],
+        episode=facts["episode"],
+        episode_end=facts["episode_end"],
+        resolution=facts["resolution"],
+        size_text=facts["size_text"],
+        size_gb=facts["size_gb"],
+        dv=facts["dv"],
+        hdr=facts["hdr"],
+        hevc=facts["hevc"],
+        hdr_formats=facts["hdr_formats"],
+        description_complete=facts["description_complete"],
     )
 
 

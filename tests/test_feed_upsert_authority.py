@@ -44,6 +44,14 @@ def _ingest(db, body, sha):
         completed_at="2026-08-01T12:00:05+00:00")
 
 
+def _row2(db):
+    conn = sqlite3.connect(db.db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM hdencode_candidates LIMIT 1").fetchone()
+    conn.close()
+    return dict(row)
+
+
 def _row(db):
     conn = sqlite3.connect(db.db_path)
     conn.row_factory = sqlite3.Row
@@ -161,19 +169,29 @@ class TestR4Reconciler:
             URL, payload={"url": URL}, candidate_updates={"media_type": "movie"})
         assert _row(db)["derived_state"] == "current"
 
-    def test_nonhydrated_mismatch_is_stale_and_blocks_auto_action(self, db):
+    def test_nonhydrated_mismatch_is_marked_then_healed_offline(self, db):
+        # Commit 3 made non-hydrated staleness TRANSIENT: the same
+        # reconciliation pass reparses the retained inputs and returns the
+        # row to current -- so the durable observable is the reparse count
+        # plus the fresh stamp, not a lingering 'stale' state.
         _ingest(db, _body("Movie 2026 2160p WEB-DL - 12.0 GB"), "sha-v1")
         self._age_stamps(db)
         out = db.reconcile_derived_versions()
         assert out["candidates_stale"] == 1
-        assert _row(db)["derived_state"] == "stale"
+        assert out["candidates_reparsed"] == 1
+        assert _row(db)["derived_state"] == "current"
+
+    def test_auto_action_rejects_a_stale_row_outright(self):
+        # Unit-level: whatever leaves a row non-current (refetch_required
+        # rows, or a future marker), the autonomous authorizer refuses it
+        # before any other consideration.
         import pytest as _pytest
         from backend.hdencode_action_service import (
             HDEncodeActionError, HDEncodeActionService)
         svc = object.__new__(HDEncodeActionService)
         svc.config = {"hdencode_rss_auto_grab_enabled": True}
         with _pytest.raises(HDEncodeActionError) as exc:
-            svc._validate_auto_action(_row(db), "grab")
+            svc._validate_auto_action({"derived_state": "refetch_required"}, "grab")
         assert exc.value.code == "stale_derived"
 
     def test_stale_cache_rows_leave_the_skip_set_and_bump_the_rev(self, db):
@@ -192,5 +210,47 @@ class TestR4Reconciler:
         _ingest(db, _body("Movie 2026 2160p WEB-DL - 12.0 GB"), "sha-v1")
         out1 = db.reconcile_derived_versions()
         assert out1 == {"candidates_refetch_required": 0,
-                        "candidates_stale": 0, "cache_stale": 0}
+                        "candidates_stale": 0, "cache_stale": 0,
+                        "candidates_reparsed": 0}
         assert _row(db)["derived_state"] == "current"
+
+
+class TestR4OfflineReparse:
+    """R-4 commit 3: stale non-hydrated rows are re-derived IN PLACE through
+    the same composition live ingest uses -- including healing a real
+    old-grammar artifact without any network."""
+
+    def test_stale_row_heals_offline_with_corrected_facts(self, db):
+        # A genuine pre-boundary-fix artifact: the group name S0MEGRP once
+        # parsed as TV season 0. Plant that wrong verdict with an old stamp;
+        # the reconciler must reparse it into a movie under the current
+        # grammar and return the row to 'current'.
+        _ingest(db, _body("Movie 2020 1080p x264-S0MEGRP - 4.0 GB"), "sha-v1")
+        conn = sqlite3.connect(db.db_path)
+        conn.execute("UPDATE hdencode_candidates SET media_type='tv', season=0,"
+                     " feed_parse_version='old-v0'")
+        conn.commit(); conn.close()
+        out = db.reconcile_derived_versions()
+        assert out["candidates_stale"] == 1
+        assert out["candidates_reparsed"] == 1
+        row = _row2(db)
+        assert row["derived_state"] == "current"
+        assert row["media_type"] != "tv"
+        assert row["season"] is None
+        from backend.release_grammar import GRAMMAR_VERSION
+        assert row["feed_parse_version"] == GRAMMAR_VERSION
+
+    def test_ingest_and_reparse_agree_exactly(self, db):
+        # THE anti-drift property: reparsing a fresh row changes nothing.
+        _ingest(db, _body("Show Complete Series 2160p WEB - 40.0 GB"), "sha-v1")
+        before = _row2(db)
+        conn = sqlite3.connect(db.db_path)
+        conn.execute("UPDATE hdencode_candidates SET feed_parse_version='old-v0'")
+        conn.commit(); conn.close()
+        db.reconcile_derived_versions()
+        after = _row2(db)
+        for field in ("media_type", "clean_title", "title_year", "season",
+                      "resolution", "size_gb", "dv_evidence", "hdr_formats",
+                      "description_complete", "media_type_provisional"):
+            assert after[field] == before[field], field
+        assert after["derived_state"] == "current"
