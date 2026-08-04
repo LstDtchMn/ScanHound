@@ -3,9 +3,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ScanResult } from '$lib/api/types';
 
 const reconnectHandlers: Array<() => void> = [];
+/** WS handlers recorded by event name so tests can simulate backend-pushed
+ *  events (scheduled scans!) exactly as connection.ts would deliver them.
+ *  Both results.ts and scanner.ts register on this same mock at import. */
+const wsHandlers: Record<string, Array<(data: Record<string, unknown>) => void>> = {};
 vi.mock('$lib/stores/connection', () => ({
   connection: {
-    on: vi.fn(() => () => {}),
+    on: vi.fn((event: string, cb: (data: Record<string, unknown>) => void) => {
+      (wsHandlers[event] ??= []).push(cb);
+      return () => {};
+    }),
     onReconnect: (fn: () => void) => { reconnectHandlers.push(fn); return () => {}; }
   }
 }));
@@ -18,10 +25,16 @@ vi.mock('$lib/api/client', () => ({
     deselectAll: vi.fn().mockResolvedValue({}),
     getCachedResults: vi.fn(),
     getResults: vi.fn(),
+    scanStatus: vi.fn().mockResolvedValue({ state: 'idle' }),
     setBookmark: vi.fn().mockResolvedValue({ status: 'ok', bookmarked: true }),
     getBookmarks: vi.fn().mockResolvedValue({ items: [], count: 0 })
   }
 }));
+
+/** Deliver a backend-pushed WS event to every registered handler. */
+function fireWs(event: string, data: Record<string, unknown>) {
+  (wsHandlers[event] ?? []).forEach((fn) => fn(data));
+}
 
 const { api } = await import('$lib/api/client');
 
@@ -1836,5 +1849,107 @@ describe('category toggle exits live mode to the server cache', () => {
     await vi.waitFor(() => expect(api.getCachedResults).toHaveBeenCalledTimes(1));
     await new Promise((r) => setTimeout(r, 300));
     expect(api.getCachedResults).toHaveBeenCalledTimes(1); // and never a second
+  });
+});
+
+describe('category-switch review round 2: empty selection, remote scans, failure path', () => {
+  // Peer-review blockers on the first cut of the live-mode-exit fix:
+  // (1) an empty categoryFilter means "every known category OFF", but
+  //     buildResultParams used to OMIT the parameter when the array was empty
+  //     — and an omitted parameter means "no category filter" server-side, so
+  //     the exit path showed everything the instant the user deselected all.
+  //     The store now sends the '__none__' sentinel instead (backend contract
+  //     test: tests/test_results_category_sentinel.py).
+  // (2) scanActive mirrored only the LOCAL Start button's scanState, so a
+  //     scheduled/remote scan streaming into an open session (scanState still
+  //     'idle') wasn't protected — a toggle would fetch and churn against the
+  //     stream. Activity now also follows the stream itself (scan:result /
+  //     scan:complete), backend progress events, and an api.scanStatus
+  //     reconcile on (re)connect.
+  beforeEach(() => {
+    // paged OFF before resetStores' filter writes — see the round-1 suite's
+    // beforeEach for why this ordering keeps stray debounce timers impossible
+    pagedMode.set(false);
+    resetStores();
+    vi.clearAllMocks();
+    (api.scanStatus as any).mockResolvedValue({ state: 'idle' });
+    setScanActive(false);
+  });
+
+  it('live mode, only TV enabled, TV toggled off: the fetch says __none__, never "no filter"', async () => {
+    categoryFilter.set(['tv']);
+    results.set([item({ url: 't1', title: 'TV Thing', category: 'tv', season: 1 })]);
+    pagedMode.set(false);
+    (api.getCachedResults as any).mockResolvedValueOnce({ items: [], total: 0, title_counts: {} });
+    toggleCategoryFilter('tv'); // selection is now EMPTY
+    expect(get(pagedMode)).toBe(true);
+    await vi.waitFor(() => expect(api.getCachedResults).toHaveBeenCalledTimes(1));
+    expect(api.getCachedResults).toHaveBeenCalledWith(
+      expect.objectContaining({ category: '__none__' })
+    );
+  });
+
+  it('paged mode, final enabled category toggled off: the debounced fetch says __none__', async () => {
+    categoryFilter.set(['4k']); // narrowed while still live — no timer scheduled
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValue({ items: [], total: 0, title_counts: {} });
+    toggleCategoryFilter('4k'); // selection is now EMPTY
+    await vi.waitFor(() => expect(api.getCachedResults).toHaveBeenCalledTimes(1));
+    expect(api.getCachedResults).toHaveBeenCalledWith(
+      expect.objectContaining({ category: '__none__' })
+    );
+  });
+
+  it('a scheduled/remote scan (scanState idle) streaming in keeps toggles live; completion re-arms the exit', async () => {
+    const { handleScanResult, handleScanComplete } = await import('./results');
+    pagedMode.set(true); // browsing the cache when the scheduled scan starts
+    handleScanResult({ url: 'r1', title: 'Remote', category: 'tv', season: 1 });
+    expect(get(pagedMode)).toBe(false); // the stream took the deck
+    toggleCategoryFilter('tv');
+    expect(get(pagedMode)).toBe(false); // stream owns the deck — no exit
+    expect(api.getCachedResults).not.toHaveBeenCalled();
+    (api.getCachedResults as any).mockResolvedValueOnce({ items: [], total: 0, title_counts: {} });
+    handleScanComplete({ stats: { total: 1, missing: 1, upgrade: 0, library: 0 } });
+    toggleCategoryFilter('tv'); // toggle it back on, scan over
+    expect(get(pagedMode)).toBe(true); // exit re-armed
+    await vi.waitFor(() => expect(api.getCachedResults).toHaveBeenCalledTimes(1));
+  });
+
+  it('backend scan:progress alone (scheduled scan, nothing streamed yet) marks activity', async () => {
+    const { scanState } = await import('./scanner'); // registers its WS handlers
+    fireWs('scan:progress', { progress: 0.4, phase: 'scanning' });
+    expect(get(scanState)).toBe('running');
+    results.set([item({ url: 'x', title: 'X', category: 'tv', season: 1 })]);
+    pagedMode.set(false);
+    toggleCategoryFilter('tv');
+    expect(get(pagedMode)).toBe(false); // protected before the first result lands
+    expect(api.getCachedResults).not.toHaveBeenCalled();
+    fireWs('scan:complete', { stats: { total: 0, missing: 0, upgrade: 0, library: 0 } });
+    expect(get(scanState)).toBe('idle');
+  });
+
+  it('reconnecting into an already-running scan reconciles activity from api.scanStatus', async () => {
+    const { reconcileScanActivity, scanState } = await import('./scanner');
+    (api.scanStatus as any).mockResolvedValueOnce({ state: 'running' });
+    await reconcileScanActivity();
+    expect(get(scanState)).toBe('running'); // joined mid-scan, no local Start
+    results.set([item({ url: 'x', title: 'X', category: 'tv', season: 1 })]);
+    pagedMode.set(false);
+    toggleCategoryFilter('tv');
+    expect(get(pagedMode)).toBe(false);
+    expect(api.getCachedResults).not.toHaveBeenCalled();
+    scanState.set('idle'); // cleanup through the mirror
+  });
+
+  it('cache-request failure after the live→paged exit never shows rows outside the selected categories', async () => {
+    const { loadError } = await import('./results');
+    results.set([item({ url: 't1', title: 'TV Thing', category: 'tv', season: 1 })]);
+    pagedMode.set(false);
+    (api.getCachedResults as any).mockRejectedValueOnce(new Error('network'));
+    toggleCategoryFilter('tv');
+    expect(get(pagedMode)).toBe(true);
+    expect(get(results)).toEqual([]); // stale live rows cleared at the exit itself
+    await vi.waitFor(() => expect(get(loadError)).toBe(true));
+    expect(get(results)).toEqual([]); // error state, not contradictory rows
   });
 });

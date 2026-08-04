@@ -257,6 +257,12 @@ export function toggleCategoryFilter(key: CategoryKey) {
     // already fired and bailed (it saw live mode), so this single direct
     // loadResults is the one fetch — no double-load.
     pagedMode.set(true);
+    // Drop the live rows at the exit itself: paged mode passes `results`
+    // through unfiltered, so if the cache request below fails, retaining
+    // them would display rows contradicting the just-selected chips. The
+    // cost is a brief empty+loading state instead of stale rows during the
+    // fetch; on failure the loadError state shows, never wrong rows.
+    results.set([]);
     loadResults(true);
   }
 }
@@ -506,6 +512,13 @@ function inPostedRange(postedDate: string | null | undefined, after: string, bef
  *  append. */
 export function handleScanResult(data: Record<string, unknown>) {
   const item = data as unknown as ScanResult;
+  // A streamed row proves a scan is producing, whoever started it. The
+  // scanner.ts scanState mirror only sees LOCALLY-started scans, so this is
+  // the backstop that keeps toggleCategoryFilter's live-mode exit disarmed
+  // while a scheduled/remote scan streams into this session (scanState may
+  // still be 'idle' here). Cleared in handleScanComplete and by scanner.ts'
+  // scan:complete/scan:error handlers.
+  scanActive = true;
   if (get(pagedMode)) {
     results.set([]);
     pagedMode.set(false);
@@ -528,6 +541,9 @@ export function handleScanResult(data: Record<string, unknown>) {
  *  see handleScanResult. */
 export function handleScanComplete(data: Record<string, unknown>) {
   const s = data.stats as ScanStats;
+  // The stream is over — re-arm the category-toggle live-mode exit (see
+  // handleScanResult). Local scans also clear via the scanState mirror.
+  scanActive = false;
   if (s) stats.set(s);
   // A completed live scan always supersedes the cache banner.
   fromCache.set(false);
@@ -665,7 +681,15 @@ function buildResultParams(page: number): Record<string, string> {
   const p: Record<string, string> = { page: String(page), per_page: String(PAGED_PER_PAGE) };
   const s = get(statusFilter); if (s !== 'all') p.filter = s;
   const q = get(searchFilter); if (q) p.search = q;
-  const cats = get(categoryFilter); if (cats.length) p.category = cats.join(',');
+  // An EMPTY selection means every known category is deselected (the store's
+  // established meaning — see flagsFor and the live-mode filter). An omitted
+  // parameter would mean the opposite server-side ("no category filter" →
+  // show everything), so the empty set crosses the API boundary as an
+  // explicit sentinel instead: CATEGORY_NONE_SENTINEL in
+  // backend/api/routes/results.py (contract test
+  // tests/test_results_category_sentinel.py).
+  const cats = get(categoryFilter);
+  p.category = cats.length ? cats.join(',') : '__none__';
   const g = get(genreFilter);
   if (g.include.length) p.genre = g.include.join(',');
   if (g.exclude.length) p.genre_exclude = g.exclude.join(',');
