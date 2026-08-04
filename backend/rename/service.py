@@ -1559,8 +1559,26 @@ class RenameService:
                 # deduped sibling name; the existing file is never touched.
                 # Persist the rewritten filename so the job record (and any
                 # subsequent undo) reflects where the file actually landed.
+                #
+                # The write MUST be checked, like restore_key_ok above and
+                # applied_ok below: update_rename_job returns False on a
+                # failed write rather than raising. An unchecked failure left
+                # the row naming the ORIGINAL destination while the file was
+                # placed at the deduped sibling -- so a later undo would
+                # remove the pre-existing library file the user chose to
+                # KEEP, and undo removes rather than trashes. Nothing has
+                # been moved at this point, so bailing out is a clean
+                # on-disk no-op.
                 new_dst = _fileops.dedupe_dest(dst)
-                db.update_rename_job(job_id, new_filename=os.path.basename(new_dst))
+                if not db.update_rename_job(
+                        job_id, new_filename=os.path.basename(new_dst)):
+                    msg = ("The keep-both filename could not be saved, so "
+                           "nothing was changed. Retry once the database is "
+                           "healthy.")
+                    db.update_rename_job(
+                        job_id, status="needs_review", warning_message=msg)
+                    self._broadcast(job_id)
+                    return {"ok": False, "error": msg}
                 dst = new_dst
             else:
                 # None → hold for review (existing behavior); 'skip' → same,

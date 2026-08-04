@@ -6,6 +6,17 @@ these run fully offline.
 import os
 import pytest
 
+
+def _all_files(root):
+    """Every file under root as (relpath, size) — the on-disk state a
+    destructive-operation test must assert, not just a return value."""
+    out = []
+    for dirpath, _dirs, names in os.walk(root):
+        for n in names:
+            full = os.path.join(dirpath, n)
+            out.append((os.path.relpath(full, root), os.path.getsize(full)))
+    return out
+
 from backend.database import DatabaseManager
 from backend.rename import fileops as _fileops
 from backend.rename import llm_identify
@@ -694,6 +705,49 @@ class TestConflictSignal:
         assert job["status"] == "applied"
         assert job["conflict_kind"] is None
         assert job["conflict_same_size"] is None
+
+    def test_keep_both_bails_out_when_the_filename_cannot_be_persisted(
+            self, db, tmp_path):
+        """A failed keep-both bookkeeping write must place NOTHING.
+
+        update_rename_job returns False on a failed write instead of
+        raising. Unchecked, the row kept naming the ORIGINAL destination
+        while the file was placed at the deduped sibling -- and undo()
+        REMOVES (not trashes) whatever the row names, so the pre-existing
+        library file the user chose to KEEP was the thing deleted.
+        Assert the on-disk outcome, not just the return value.
+        """
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="x")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv", content="yy")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+        svc.apply(jid2)  # -> needs_review + conflict signal
+
+        before = sorted(_all_files(lib))
+
+        real_update = db.update_rename_job
+
+        def _fail_new_filename(job_id, **kw):
+            if "new_filename" in kw:
+                return False          # the exact write the bug ignored
+            return real_update(job_id, **kw)
+
+        db.update_rename_job = _fail_new_filename
+        try:
+            out = svc.apply(jid2, conflict_strategy="keep_both")
+        finally:
+            db.update_rename_job = real_update
+
+        assert out["ok"] is False
+        # the library is byte-for-byte unchanged: nothing placed, nothing lost
+        assert sorted(_all_files(lib)) == before
+        assert db.get_rename_job(jid2)["status"] == "needs_review"
 
     def test_samefile_reapply_clears_conflict_signal(self, db, tmp_path):
         """Re-applying a job whose source is already hardlinked at dst is a
