@@ -18,7 +18,7 @@ missing data. That is why they survived this long.
 | Severity | Count | Fixed so far |
 |---|---|---|
 | critical | 1 | 1 |
-| high | 12 | 1 |
+| high | 12 | 2 |
 | medium | 13 | 0 |
 | low | 6 | 0 |
 
@@ -377,7 +377,7 @@ Final directory state after the app closes: only e2e.db, e2e.db.corrupt.17858866
 
 ---
 
-### 11. `backend/download_service.py:2773`
+### 11. `backend/download_service.py:2773`  ✅ FIXED in `ed1e1ec` (guarded in `database.add_to_history`)
 
 *download-path*
 
