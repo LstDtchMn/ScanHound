@@ -87,6 +87,13 @@ MUTATIONS = [
         ["tests/test_detail_hydration_composition.py::TestEpisodeRangeSemantics::test_glued_multi_episode_file_carries_its_parsed_range"],
     ),
     (
+        "audit — hydration writes the absent-year sentinel 0 over a real year",
+        "backend/hdencode_candidate_service.py",
+        '    put("description_year", _int_or_none(payload.get("year")) or None)',
+        '    put("description_year", _int_or_none(payload.get("year")))',
+        ["tests/test_detail_hydration_composition.py::TestProductionEmissionContract::test_tv_side_fields_come_from_the_detail_parse"],
+    ),
+    (
         "round-13 Q2 — hydration adapter drops hevc evidence",
         "backend/hdencode_candidate_service.py",
         '    if payload.get("hevc") is True:\n'

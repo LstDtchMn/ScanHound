@@ -423,7 +423,14 @@ def _candidate_updates(payload):
         updates["media_type_because"] = list(verdict.because)
 
     put("clean_title", str(payload.get("display_title") or "").strip() or None)
-    put("description_year", _int_or_none(payload.get("year")))
+    # `or None`: the detail scraper's ABSENT-year sentinel is 0, not None
+    # (detail_scraper initialises year = 0 and assigns only in the movie /
+    # no-season branch, so EVERY tv hydration and every yearless movie
+    # returns 0). put()'s guard rejects None and "" but 0 passes it, and the
+    # sink COALESCEs -- so a real feed-derived year was being overwritten
+    # with 0, which the year-conflict gate then reads as falsy "no year"
+    # instead of a conflict. An absent year must leave the stored value alone.
+    put("description_year", _int_or_none(payload.get("year")) or None)
     put("season", _int_or_none(payload.get("season")))
     put("episode", _int_or_none(payload.get("episode_number")))
     put("episode_end", _int_or_none(payload.get("episode_end")))

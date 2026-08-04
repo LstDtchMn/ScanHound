@@ -242,6 +242,13 @@ class TestProductionEmissionContract:
         assert row["hevc_evidence"] == "asserted"     # feed had no token
         assert "detail-filename" in (row["media_type_because"] or "")
         assert row["description_complete"] == 1
+        # A TV detail page yields NO year (the scraper's absent-year sentinel
+        # is 0, not None) -- it must not overwrite the feed's parse with 0.
+        # Audit finding: put()'s guard rejects None/"" but 0 passes it, and
+        # the sink COALESCEs, so every tv hydration was zeroing this column
+        # and the year-conflict gate then read 0 as "no year" rather than as
+        # a conflict.
+        assert row["description_year"] != 0
 
     def test_movie_side_fields_come_from_the_detail_parse(self, db):
         url = _ingest(db, _entry(
