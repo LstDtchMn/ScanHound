@@ -528,7 +528,7 @@ class ScannerService:
 
         # ── Process posts (parallel) ──────────────────────────────────
         num_threads = self.config.get("scan_threads", 10)
-        await self._process_posts(all_posts, scraper, num_threads)
+        completed_urls = await self._process_posts(all_posts, scraper, num_threads)
 
         if self.stop_scan_flag:
             return
@@ -536,8 +536,17 @@ class ScannerService:
         # Save scanned URLs only after all posts are processed — avoids
         # permanently marking unvisited URLs as "seen" if the scan is stopped.
         if track_urls and all_posts and scan_type != "Site Search":
-            urls_to_save = [{'url': p['url'], 'title': None, 'source': p.get('source')} for p in all_posts]
-            self.db.add_scanned_urls_batch(urls_to_save)
+            # Record ONLY the posts that actually completed. Recording every
+            # crawled URL meant a post whose detail scrape failed (three
+            # transient timeouts, or a worker exception) was marked scanned
+            # and then skipped by every future incremental scan -- so a
+            # transient network blip removed a release from the catalogue
+            # permanently. A URL left out here is simply retried next time.
+            urls_to_save = [{'url': p['url'], 'title': None,
+                             'source': p.get('source')}
+                            for p in all_posts if p['url'] in completed_urls]
+            if urls_to_save:
+                self.db.add_scanned_urls_batch(urls_to_save)
 
         # ── Sort by posted date (newest first) ────────────────────────
         self.items.sort(key=self._posted_date_sort_key, reverse=True)
@@ -963,9 +972,18 @@ class ScannerService:
 
     # ── Post processing ───────────────────────────────────────────────
 
-    async def _process_posts(self, all_posts: List[Dict], scraper, num_threads: int):
+    async def _process_posts(self, all_posts: List[Dict], scraper,
+                             num_threads: int) -> Set[str]:
+        """Scrape each post's detail page and turn it into a MediaItem.
+
+        Returns the set of post URLs that completed END TO END -- the detail
+        scrape succeeded AND a MediaItem was created. Callers record only
+        these in ``scanned_urls``; a URL left out is retried on the next scan
+        instead of being skipped forever.
+        """
         processed = 0
         total_posts = len(all_posts)
+        completed_urls: Set[str] = set()
 
         def process_post(post_info):
             if self.stop_scan_flag:
@@ -1014,8 +1032,12 @@ class ScannerService:
                             item.id = f"item_{self._item_counter}"
                             self._item_counter += 1
                             self.items.append(item)
+                        # Only a post that produced an item counts as scanned.
+                        if result.get('url'):
+                            completed_urls.add(result['url'])
 
         self._log(f"Processing complete: {len(self.items)} items created from {total_posts} posts")
+        return completed_urls
 
     # ── Item creation ─────────────────────────────────────────────────
 

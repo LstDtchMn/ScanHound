@@ -112,6 +112,18 @@ def _init_services(
     reg.config = backend.config
     reg.db = backend.db
 
+    # Restart recovery for interrupted HDEncode actions: ONCE per lifespan,
+    # here, rather than in HDEncodeActionService.__init__ where it used to
+    # live. That service is constructed per API request and per scan cycle,
+    # and the recovery is a blanket state-keyed UPDATE with no owner column,
+    # so a second construction clobbered the first's in-flight work. At this
+    # point no worker thread exists yet, which is what makes the sweep safe.
+    if backend.db is not None:
+        try:
+            backend.db.recover_hdencode_actions()
+        except Exception:
+            logger.exception("Failed to recover interrupted HDEncode actions")
+
     # Notification bridge
     notif = NotificationBridge()
     notif.configure(backend.config)

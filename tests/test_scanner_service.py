@@ -703,3 +703,59 @@ class TestRematchCacheDoesNotTouchSharedItems:
         except Exception:
             pass
         assert any("/1" in (m or "") for m in msgs), msgs
+
+
+class TestOnlyCompletedPostsAreMarkedScanned:
+    """Every crawled URL used to be written to scanned_urls regardless of
+    outcome. A post whose detail scrape failed -- three transient timeouts,
+    or a worker exception -- was therefore recorded as scanned and skipped by
+    every future incremental scan. A momentary network blip removed a release
+    from the catalogue permanently, and nothing ever retried it.
+    """
+
+    def _svc(self, db):
+        from backend.scanner_service import ScannerService
+        svc = object.__new__(ScannerService)
+        svc.db = db
+        svc._items_lock = threading.Lock()
+        svc._stop_event = threading.Event()
+        svc._item_counter = 0
+        svc.items = []
+        svc._log = lambda *a, **k: None
+        svc._progress = lambda *a, **k: None
+        svc.scrapers = MagicMock()
+        return svc
+
+    def _posts(self):
+        return [{"url": "https://x/ok", "type": "movie", "title": "OK",
+                 "source": "hdencode"},
+                {"url": "https://x/fails", "type": "movie", "title": "Fails",
+                 "source": "hdencode"}]
+
+    def test_a_failed_post_is_not_recorded_as_scanned(self):
+        db = MagicMock()
+        svc = self._svc(db)
+        # the scrape succeeds for one post and returns nothing for the other
+        svc.scrapers.scrape_details = lambda url, headers, scraper=None, **k: (
+            {"display_title": "OK", "is_tv": False} if url.endswith("/ok") else None)
+        svc._create_media_item = lambda r: (
+            MediaItem(id="i", title="OK", year=2020, url=r["url"])
+            if r.get("url", "").endswith("/ok") else None)
+
+        completed = asyncio.run(
+            svc._process_posts(self._posts(), MagicMock(), num_threads=1))
+
+        assert completed == {"https://x/ok"}, (
+            "a post whose detail scrape failed must not count as scanned")
+
+    def test_an_item_that_fails_to_build_is_not_recorded_either(self):
+        db = MagicMock()
+        svc = self._svc(db)
+        svc.scrapers.scrape_details = lambda url, headers, scraper=None, **k: {
+            "display_title": "x", "is_tv": False}
+        svc._create_media_item = lambda r: None      # scrape OK, item fails
+
+        completed = asyncio.run(
+            svc._process_posts(self._posts(), MagicMock(), num_threads=1))
+
+        assert completed == set()
