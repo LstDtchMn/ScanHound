@@ -394,6 +394,11 @@ class AppService:
         self._scheduler_thread: Optional[threading.Thread] = None
         self._scheduler_stop = threading.Event()
         self._scan_trigger: Optional[Callable] = None
+        #: When the scheduler last FIRED, in memory only. The interval gate
+        #: below reads the later of this and config['last_scan_time'] so a
+        #: past-due interval cannot re-fire every 60s on a build where
+        #: nothing stamps last_scan_time at completion.
+        self._last_scheduler_fire: float = 0.0
         self._config_lock = threading.RLock()
 
         # Maintenance loop — trash retention sweep + periodic WAL checkpoint.
@@ -749,7 +754,8 @@ class AppService:
                 interval_seconds = interval_hours * 3600
                 only_when_idle = self.config.get("scheduler_only_when_idle", False)
 
-                last = self.config.get("last_scan_time", 0)
+                last = max(self.config.get("last_scan_time", 0) or 0,
+                           self._last_scheduler_fire)
                 now = time.time()
                 if now - last < interval_seconds:
                     continue
@@ -760,11 +766,26 @@ class AppService:
                     if idle_secs < idle_threshold:
                         continue
 
-                with self._config_lock:
-                    self.config["last_scan_time"] = now
-                    self.save_config()
+                # Stamp the IN-MEMORY fire time unconditionally -- that is
+                # what stops a past-due interval re-firing every 60s -- but
+                # only write last_scan_time when a scan was really handed
+                # off. Stamping it here regardless was a lie: nothing under
+                # backend/ registers a scan trigger (set_scan_trigger's only
+                # caller is the legacy desktop controller), so on the server
+                # the scheduler recorded "a scan ran" for a scan that never
+                # started. routes/scanner.py already stamps it at scan
+                # COMPLETION, which is the honest place.
+                #
+                # NOT simply deleting the stamp: on the desktop build, where
+                # a trigger IS registered, nothing stamps at completion, so
+                # deleting it outright makes the gate re-fire every loop --
+                # a scan storm. The in-memory clock covers both builds.
+                self._last_scheduler_fire = now
                 logger.info("Scheduled scan triggered")
                 if self._scan_trigger:
+                    with self._config_lock:
+                        self.config["last_scan_time"] = now
+                        self.save_config()
                     try:
                         self._scan_trigger()
                     except Exception as e:
