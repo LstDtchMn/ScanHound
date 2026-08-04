@@ -285,3 +285,115 @@ class TestProductionEmissionContract:
         payload = ws.scrape_details("https://example.com/d", headers={}, scraper=fake)
         updates = _candidate_updates(payload)
         assert "title_year" not in updates
+
+
+# ── round-14: the grammar/detail dependency must be MECHANICAL ───────────────
+
+class TestGrammarChangesInvalidateCompletedDetailRows:
+    """Round 13 split the detail and feed authorities; round 14 caught that
+    the split was only remembered, not enforced. DetailScraper delegates year,
+    season/episode/range, size, resolution/dimension and the HEVC vocabulary
+    to release_grammar -- so a grammar change alters what detail extraction
+    produces. With a FIXED detail stamp, every completed row still compared
+    equal and was never refetched, and a code comment asserted the opposite.
+
+    DETAIL_PARSE_VERSION is now composite, so either authority moving
+    invalidates completed rows automatically.
+    """
+
+    def test_the_stamp_composes_both_authorities(self):
+        from backend.detail_scraper import DETAIL_CAPABILITY_VERSION
+        assert DETAIL_CAPABILITY_VERSION in DETAIL_PARSE_VERSION
+        assert GRAMMAR_VERSION in DETAIL_PARSE_VERSION
+        # and it is still not simply the grammar's own version
+        assert DETAIL_PARSE_VERSION != GRAMMAR_VERSION
+
+    def _hydrated(self, db):
+        url = _ingest(db, _entry("Grammar Dep 2026 1080p WEB - 8.0 GB",
+                                 "Movies", "grammar-dep"))
+        _hydrate(db, url, _build_detail_html(
+            "Grammar.Dep.2026.1080p.WEB-DL.x265-GRP.mkv"))
+        return url
+
+    def test_a_grammar_only_change_invalidates_and_requeues(self, db, monkeypatch):
+        """The reviewer's required test: move ONLY the grammar version, leave
+        the detail capability alone, and a completed row must still be
+        invalidated and queued for refetch."""
+        url = self._hydrated(db)
+        assert _row(db, url)["derived_state"] == "current"
+
+        # simulate a future grammar bump -- capability string untouched
+        import backend.detail_scraper as ds
+        monkeypatch.setattr(
+            ds, "DETAIL_PARSE_VERSION",
+            ds.DETAIL_CAPABILITY_VERSION + "+release-grammar-vNEXT")
+
+        counts = db.reconcile_derived_versions()
+
+        assert counts["candidates_refetch_required"] == 1
+        assert _row(db, url)["derived_state"] == "refetch_required"
+        conn = sqlite3.connect(db.db_path)
+        state = conn.execute(
+            "SELECT state FROM hdencode_hydration_queue WHERE canonical_url = ?",
+            (url,)).fetchone()
+        conn.close()
+        assert state is not None and state[0] == "queued"
+
+    def test_completed_rows_feed_facts_are_rederived_not_skipped(self, db):
+        """Second half of the same finding: a completed row is excluded from
+        the wholesale stale sweep (that pass would destroy its detail facts),
+        which left the fields detail never supplies frozen at the OLD
+        grammar's parse forever. They must be re-derived from retained feed
+        inputs instead of skipped."""
+        url = self._hydrated(db)
+        conn = sqlite3.connect(db.db_path)
+        conn.execute(
+            "UPDATE hdencode_candidates SET feed_parse_version='old-v0',"
+            " title_year=NULL WHERE canonical_url=?", (url,))
+        conn.commit(); conn.close()
+
+        counts = db.reconcile_derived_versions()
+
+        assert counts["completed_feed_facts_reparsed"] == 1
+        row = _row(db, url)
+        assert row["feed_parse_version"] == GRAMMAR_VERSION
+        assert row["title_year"] == 2026          # re-derived from the title
+
+    def test_the_narrow_pass_never_touches_detail_authority_fields(self, db):
+        """It must not become the wholesale sweep by accident: a refetch may
+        already be in flight, and these are the facts the authority model
+        exists to protect."""
+        url = self._hydrated(db)
+        before = _row(db, url)
+        conn = sqlite3.connect(db.db_path)
+        conn.execute(
+            "UPDATE hdencode_candidates SET feed_parse_version='old-v0'"
+            " WHERE canonical_url=?", (url,))
+        conn.commit(); conn.close()
+
+        db.reconcile_derived_versions()
+
+        after = _row(db, url)
+        for field in ("season", "episode", "episode_end", "resolution",
+                      "size_text", "size_gb", "hevc_evidence", "clean_title",
+                      "description_year", "media_type"):
+            assert after[field] == before[field], field
+
+    def test_autonomous_action_is_denied_until_both_legs_are_current(self, db, monkeypatch):
+        """The consequence that matters: while either leg is stale, nothing
+        autonomous may act on the row."""
+        from backend.hdencode_action_service import (
+            HDEncodeActionError, HDEncodeActionService)
+        url = self._hydrated(db)
+        import backend.detail_scraper as ds
+        monkeypatch.setattr(
+            ds, "DETAIL_PARSE_VERSION",
+            ds.DETAIL_CAPABILITY_VERSION + "+release-grammar-vNEXT")
+        db.reconcile_derived_versions()
+
+        row = dict(_row(db, url))
+        svc = object.__new__(HDEncodeActionService)
+        svc.config = {"hdencode_rss_auto_grab_enabled": True}
+        with pytest.raises(HDEncodeActionError) as exc:
+            svc._validate_auto_action(row, "grab")
+        assert exc.value.code == "stale_derived"

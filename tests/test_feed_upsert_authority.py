@@ -242,9 +242,14 @@ class TestR4Reconciler:
     def test_reconcile_is_idempotent_and_current_rows_untouched(self, db):
         _ingest(db, _body("Movie 2026 2160p WEB-DL - 12.0 GB"), "sha-v1")
         out1 = db.reconcile_derived_versions()
+        # Exact equality on purpose: a new counter must be a deliberate change
+        # here, not something that quietly appears. completed_feed_facts_
+        # reparsed is round-14's narrow pass for COMPLETED rows whose
+        # feed-authority fields went stale with the grammar.
         assert out1 == {"candidates_refetch_required": 0,
                         "candidates_stale": 0, "cache_stale": 0,
-                        "candidates_reparsed": 0}
+                        "candidates_reparsed": 0,
+                        "completed_feed_facts_reparsed": 0}
         assert _row(db)["derived_state"] == "current"
 
 

@@ -28,17 +28,34 @@ from backend.rename import llm_identify as _llm
 
 logger = logging.getLogger(__name__)
 
-#: Version stamp for what DETAIL hydration extracts — persisted to
-#: hdencode_candidates.detail_parse_version at completion, compared by
-#: reconcile_derived_versions: completed rows stamped with anything else are
-#: marked refetch_required and requeued, so a capability change here heals
-#: gradually (hydration-limit per cycle) instead of instantly.
-#: Deliberately DECOUPLED from release_grammar.GRAMMAR_VERSION (round-13): a
-#: detail-only extraction change must not force an offline reparse of every
-#: feed fact, and a grammar change already reaches detail rows through the
-#: refetch leg because the stamps then differ too.
-#: v2: episode_end (glued-range) and hevc codec evidence join the payload.
-DETAIL_PARSE_VERSION = "hdencode-detail-v2"
+#: This scraper's own extraction capability. Bump when what DetailScraper
+#: EXTRACTS changes. v2: episode_end (glued-range) and hevc codec evidence
+#: joined the payload.
+DETAIL_CAPABILITY_VERSION = "hdencode-detail-v2"
+
+#: Version stamp persisted to hdencode_candidates.detail_parse_version at
+#: completion and compared by reconcile_derived_versions: completed rows
+#: stamped with anything else are marked refetch_required and requeued, so a
+#: change heals gradually (hydration-limit per cycle) instead of instantly.
+#:
+#: COMPOSITE, and that is the point (round-14). The detail result is a
+#: function of BOTH this scraper and the shared grammar — DetailScraper
+#: delegates year selection, season/episode/range, size, resolution/dimension
+#: and the HEVC vocabulary to release_grammar. Round 13 split the two
+#: authorities so a detail-only change would not force an offline reparse of
+#: every feed fact; the first cut then stamped a FIXED string, and a comment
+#: claimed a grammar change "reaches detail rows because the stamps differ
+#: too" — which nothing in code made true. A grammar bump would have altered
+#: what detail extraction produces while every completed row still compared
+#: equal and was never refetched.
+#:
+#: Composing the two makes the dependency mechanical rather than remembered:
+#: either authority moving changes the effective stamp, so completed rows are
+#: invalidated automatically, while a detail-only bump still leaves
+#: feed_parse_version alone (the decoupling that was wanted).
+DETAIL_PARSE_VERSION = (
+    f"{DETAIL_CAPABILITY_VERSION}+{release_grammar.GRAMMAR_VERSION}"
+)
 
 # HDEncode pacing and authorization now live in HDEncodeTrafficCoordinator.
 

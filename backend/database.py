@@ -1961,6 +1961,16 @@ class DatabaseManager:
                 conn.rollback()
                 raise
 
+    #: Fields the DETAIL adapter can never supply, so on a COMPLETED row they
+    #: remain the feed's parse and go stale with the grammar like any other
+    #: feed fact. The feed upsert's CASE guards freeze all 17 protected fields
+    #: once hydration completes — correct against a later poll, but it also
+    #: means nothing re-derives these after a grammar change. Verified against
+    #: _candidate_updates' emitted key list (round-14): title_year is the one
+    #: protected field it never writes; description_year is where the detail
+    #: page's year goes. Keep in sync if that adapter starts emitting more.
+    _FEED_ONLY_ON_COMPLETED = ("title_year",)
+
     @staticmethod
     def _detail_parse_version():
         """Lazy import: detail_scraper pulls bs4/HTTP-transport modules at
@@ -2028,12 +2038,64 @@ class DatabaseManager:
                 # /results/cached serve stale parses indefinitely)
                 self._bg_cache_rev += 1
         healed = self._reparse_stale_candidates()
+        feed_healed = self._reparse_completed_feed_only()
         for url in refetch_urls:
             self.requeue_hdencode_hydration(
                 url, reason="stale_derived_refetch", priority=80)
         return {"candidates_refetch_required": refetch,
                 "candidates_stale": stale, "cache_stale": cache_stale,
-                "candidates_reparsed": healed}
+                "candidates_reparsed": healed,
+                "completed_feed_facts_reparsed": feed_healed}
+
+    def _reparse_completed_feed_only(self):
+        """Re-derive the FEED-authority facts of COMPLETED rows (round-14).
+
+        A completed row is excluded from the ordinary stale sweep — that pass
+        overwrites every parsed field, which would destroy the detail facts
+        the whole authority model exists to protect. But excluding it entirely
+        left a gap: on a grammar change its detail leg is refetched (the
+        composite DETAIL_PARSE_VERSION now guarantees that), while the fields
+        detail never supplies stayed frozen at the OLD grammar's parse
+        forever, because the feed upsert's CASE guards also stop a later poll
+        from touching them.
+
+        So this pass re-derives exactly ``_FEED_ONLY_ON_COMPLETED`` from the
+        retained feed inputs — offline, through the same shared composition —
+        and re-stamps feed_parse_version. Detail-authority fields are not in
+        the statement at all, so a refetch in flight cannot be clobbered.
+        """
+        from backend.sources.hdencode_feed_parser import reparse_feed_facts
+        from backend.release_grammar import GRAMMAR_VERSION
+        healed = 0
+        assignments = ", ".join(
+            f"{f} = ?" for f in self._FEED_ONLY_ON_COMPLETED)
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT canonical_url, title, categories, raw_description
+                   FROM hdencode_candidates
+                   WHERE hydration_state = 'completed'
+                     AND COALESCE(feed_parse_version, '') != ?""",
+                (GRAMMAR_VERSION,))
+            for url, title, categories_json, raw_description in cur.fetchall():
+                try:
+                    categories = json.loads(categories_json or "[]")
+                except (TypeError, ValueError):
+                    categories = []
+                facts = reparse_feed_facts(title or "", categories,
+                                           raw_description or "")
+                params = [facts[f] for f in self._FEED_ONLY_ON_COMPLETED]
+                params += [GRAMMAR_VERSION, url]
+                cur.execute(
+                    f"""UPDATE hdencode_candidates
+                        SET {assignments}, feed_parse_version = ?
+                        WHERE canonical_url = ?""", params)
+                healed += 1
+            conn.commit()
+        return healed
 
     def _reparse_stale_candidates(self):
         """Offline re-derivation (round-10 ratified: candidate rows retain
@@ -2056,6 +2118,10 @@ class DatabaseManager:
                    WHERE derived_state = 'stale'
                      AND hydration_state != 'completed'""")
             rows = cur.fetchall()
+            # NOTE the exclusion above is load-bearing: this pass overwrites
+            # every parsed field wholesale, which is right for a row with no
+            # detail facts and destructive for one that has them. Completed
+            # rows get the narrow pass in _reparse_completed_feed_only().
             for url, title, categories_json, raw_description in rows:
                 try:
                     categories = json.loads(categories_json or "[]")
