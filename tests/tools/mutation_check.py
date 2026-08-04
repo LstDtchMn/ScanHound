@@ -20,6 +20,14 @@ APP = Path(__file__).resolve().parents[2]
 # (label, file, corrected_snippet, defective_snippet, tests_that_must_fail)
 MUTATIONS = [
     (
+        "round-11 F1 -- demotion must propagate the effective mode",
+        "backend/background_scanner.py",
+        '                if rss_cycle and rss_cycle.get("mode"):\n'
+        '                    discovery_mode = rss_cycle["mode"]',
+        "                pass  # MUTATION: propagation disabled",
+        ["tests/test_background_scanner.py::TestR6DemotionRestoresTheSafetyNet::test_demoted_primary_runs_listing_and_shadow"],
+    ),
+    (
         "blocker 1 — coverage keyed off colour instead of first_normal_at",
         "backend/sweep/gate.py",
         "    elif first_normal is not None:",
