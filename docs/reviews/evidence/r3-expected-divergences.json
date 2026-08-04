@@ -115,10 +115,6 @@
    ]
   },
   "S01E01E02 double episode": {
-   "episode_number": [
-    1,
-    null
-   ],
    "episodes": [
     1,
     2
@@ -275,6 +271,6 @@
    ]
   }
  },
- "new_at_baseline": "c48246c4253bbf82a991216ca050f9f0ca557da2",
+ "new_at_baseline": "0148f22fe8584c52708fcc79cd0c6eefe1f7f455",
  "old": "c1715297621128baa1253f857d929d88b854d0b7"
 }
