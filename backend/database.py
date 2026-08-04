@@ -2788,14 +2788,44 @@ class DatabaseManager:
             INSERT INTO downloads (url, title, normalized_title, season, resolution, size, status, hdr, dovi, year, package_name, service_type, last_grabbed_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(url) DO UPDATE SET
-                title = excluded.title,
-                normalized_title = excluded.normalized_title,
-                season = excluded.season,
-                resolution = excluded.resolution,
-                size = excluded.size,
-                status = excluded.status,
-                hdr = excluded.hdr,
-                dovi = excluded.dovi,
+                -- A FAILED attempt must never overwrite what a SUCCESSFUL grab
+                -- recorded. Re-grab (the Regrab button) passes force=True,
+                -- which skips the dedup gate, so a failed retry of an
+                -- already-delivered URL reached this statement and flipped
+                -- status completed -> failed. Every "do we have this?" reader
+                -- excludes failed rows, so the release stopped counting as
+                -- downloaded, lost its duplicate protection, and the next
+                -- auto-grab re-fetched a file already on disk. Silently: the
+                -- retry failure is notified, the demotion is not.
+                --
+                -- The guard is narrow on purpose. It fires ONLY when a failed
+                -- write lands on a non-failed row; a genuinely new failed
+                -- attempt still records as failed and stays retryable, and a
+                -- later success still overwrites normally.
+                title = CASE WHEN excluded.status = 'failed'
+                              AND COALESCE(downloads.status, 'completed') != 'failed'
+                             THEN downloads.title ELSE excluded.title END,
+                normalized_title = CASE WHEN excluded.status = 'failed'
+                              AND COALESCE(downloads.status, 'completed') != 'failed'
+                             THEN downloads.normalized_title ELSE excluded.normalized_title END,
+                season = CASE WHEN excluded.status = 'failed'
+                              AND COALESCE(downloads.status, 'completed') != 'failed'
+                             THEN downloads.season ELSE excluded.season END,
+                resolution = CASE WHEN excluded.status = 'failed'
+                              AND COALESCE(downloads.status, 'completed') != 'failed'
+                             THEN downloads.resolution ELSE excluded.resolution END,
+                size = CASE WHEN excluded.status = 'failed'
+                              AND COALESCE(downloads.status, 'completed') != 'failed'
+                             THEN downloads.size ELSE excluded.size END,
+                status = CASE WHEN excluded.status = 'failed'
+                              AND COALESCE(downloads.status, 'completed') != 'failed'
+                             THEN downloads.status ELSE excluded.status END,
+                hdr = CASE WHEN excluded.status = 'failed'
+                              AND COALESCE(downloads.status, 'completed') != 'failed'
+                             THEN downloads.hdr ELSE excluded.hdr END,
+                dovi = CASE WHEN excluded.status = 'failed'
+                              AND COALESCE(downloads.status, 'completed') != 'failed'
+                             THEN downloads.dovi ELSE excluded.dovi END,
                 year = COALESCE(excluded.year, downloads.year),
                 package_name = COALESCE(excluded.package_name, downloads.package_name),
                 service_type = COALESCE(excluded.service_type, downloads.service_type),
