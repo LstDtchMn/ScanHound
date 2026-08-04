@@ -1,125 +1,101 @@
 # Audit-fixes relay block (Jesse: paste the fenced block to ChatGPT)
 
-**Supersedes the version committed at `f593cec`**, which described only the first
-commit (`440682d`). Three more fixes landed after it; all four are covered below.
+**Round 2.** The five blockers from the 2026-08-06 review are closed at `9438d94`;
+this block replaces the round-1 text.
 
 ```
-Peer review -- STANDALONE AUDIT FIXES, independent of the hybrid-sweep
-and category-switch branches. Read the artifacts, not any summary; if
-you find yourself reviewing a summary, STOP. (An overnight report also
-sits on this branch at docs/reviews/2026-08-06-overnight-report.md --
-that is CONTEXT for what was done and why, written for the repo owner
-in non-technical language. It is explicitly NOT the review target.
-Review the code and tests.)
+Peer review ROUND 2 -- audit fixes. All five blockers closed. Read the
+artifacts, not any summary; if you find yourself reviewing a summary,
+STOP.
 
 Repository: LstDtchMn/ScanHound
 Branch: agent/audit-fixes-2026-08
-Head: 03f0569 (plus this relay commit)
+Head: 9438d94 (plus this relay commit)
 Base: main @ 7adb17b
-Commits under review, oldest first:
-  440682d  dv_detect no-DV-is-positive-only; watchlist add_item -> add
-  93f7060  dv_labeler 'unknown' no longer strips labels; upsert_dv_scan
-           preserves a good layer
-  fa56dfd  keep_both unchecked write no longer arms a destructive undo
-  03f0569  the rename pause now covers the manual apply path
+Prior reviewed head: 5387df2
 
-Context: a decomposed full-program audit (nine subsystem readers over
-database, scanner core, RSS pipeline, API routes, rename/fileops,
-DV/HDR/Kometa, frontend, infra, security) produced 15 critical/high
-candidates, then an adversarial pass whose job was to REFUTE each one.
-Two were refuted and are NOT here: a Windows drive-letter escape in
-trash delete (impossible -- the deployed runtime is the linux
-container, verified in-container os.name=posix), and a feed guid
-collision aborting ingestion (guid and canonical_url cannot vary
-independently against the real feed). This branch carries only
-confirmed findings.
+Every blocker was re-verified against the code before changing
+anything, and you were right on all five -- including about a test of
+mine that pinned the wrong behaviour.
 
-1. dv_detect (440682d) -- DV detection FAILURES were reported as an
-   authoritative "no Dolby Vision". tempfile.mkstemp pre-creates the
-   RPU output at zero bytes and dovi_tool writes it only on success,
-   so every genuine failure (mount read error, truncated file, demux
-   error) leaves rpu_size == 0; the empty-file test ran BEFORE the
-   error discrimination, so those returned {layer:'none', error:None}
-   -- the exact inverse of what the surrounding comment says the code
-   does. Reachability is the point: the media sits on 9p/SMB bind
-   mounts where dovi_tool read failures are an expected event.
-   CONFIRMED LIVE VICTIM: Alien Romulus was recorded dv_layer='none'
-   from a dovi_tool TIMEOUT on 2026-07-22; it kept its label only
-   because a sibling copy scanned clean. "No DV" is now positive-only:
-   a clean exit, or dovi_tool itself saying "no rpu"/"not found".
-   Test-quality note worth your attention: the pre-existing hard-error
-   test passed only because it used rpu_size=5 -- a state dovi_tool
-   never leaves behind on failure -- so the suite had no power on the
-   axis the bug was on.
+1. GENERIC "not found" REMOVED. Confirmed: the bare substring also
+   matched "input file not found" / "video track not found" / "NAL
+   unit not found", and a file can vanish between the isfile() check
+   and the subprocess -- the exact mount failure this module exists to
+   classify honestly. Absence is now asserted only by RPU-SPECIFIC
+   messages (_NO_RPU_MESSAGES: "no rpu", "rpu not found", "no dolby
+   vision rpu"). Your four generic strings are committed as negative
+   controls asserting 'unknown'. A clean exit with an empty RPU still
+   means 'none'.
 
-2. dv_labeler + upsert_dv_scan (93f7060) -- THE PAIRING, and the most
-   important thing to check. Fix 1 converts silent 'none' into honest
-   'unknown', and 'unknown' was exactly the value that triggered label
-   stripping: reconcile_movie treated `layer is not None` as "matched"
-   while desired_label('unknown') is None, so the removal loop
-   subtracted nothing and stripped EVERY managed DV label -- in the
-   unattended hourly additive-only sync. Shipping fix 1 WITHOUT this
-   would have made the system worse, not better. is_authoritative()
-   now enforces the "could not run" vs "confirmed no DV" distinction
-   dv_detect already documents; 'none' stays authoritative and still
-   removes stale labels. `matched` now means matched-to-a-real-finding,
-   which also stops sync_labels re-persisting the 'unknown' row on
-   every pass. Separately, upsert_dv_scan no longer lets an incoming
-   'unknown' destroy a known layer, mirroring the COALESCE
-   preserve-on-null the same statement already applies to
-   title/rating_key/imdb_id; the signature columns still take the
-   incoming NULLs so the intended retry still happens.
+2. 'unknown' IS NOW NON-DESTRUCTIVE IN EVERY MODE. You were right that
+   my "negative control" pinned behaviour contradicting this module's
+   own invariant. reconcile_movie now decides removal per case:
+   'unknown' never removes, in any mode; an authoritative layer
+   (including 'none') removes in any mode; an UNMATCHED title keeps the
+   pre-existing policy (full reconcile removes, additive_only does
+   not). That test is REVERSED, with two controls proving the guard did
+   not break what it must not: authoritative 'none' still removes, and
+   an unmatched title still removes under full reconcile.
 
-3. keep_both (fa56dfd) -- a DATA-LOSS path, not mitigated by the
-   auto-rename pause (keep_both is a manual conflict resolution and is
-   the default selection in the Compare modal). update_rename_job
-   returns False on a failed write rather than raising, and the
-   keep_both branch ignored it -- the one write in apply() that did.
-   The row then named the ORIGINAL destination while the file was
-   placed at the deduped sibling, and undo() REMOVES (not trashes)
-   whatever the row names: the pre-existing library file the user
-   explicitly chose to KEEP was the thing deleted. Now checked,
-   matching restore_key_ok/applied_ok in the same function; nothing
-   has moved at that point so the bail-out is a clean on-disk no-op.
-   The test asserts the on-disk file list before and after, not the
-   return value.
+3. MULTIPART AGGREGATION HAS AN EXPLICIT CONTRACT. Reproduced your
+   finding by execution before fixing: pick_layer(['none','unknown'])
+   returned 'none' or 'unknown' depending purely on part ORDER, and one
+   'none' part plus one unscanned part returned 'none'. Now: a positive
+   finding wins by rank; ANY missing or unknown part makes the
+   aggregate 'unknown'; only all-parts-authoritative-'none' is 'none'.
+   All four of your cases are tested, both orders included, plus an
+   end-to-end assertion that a mixed title keeps its badge.
 
-4. rename pause (03f0569) -- "paused" meant only that the JDownloader
-   post-extract hook was off. Process -> Apply stayed fully live and
-   performed a real, source-consuming move, and fileops' move->hardlink
-   downgrade fires only for UNATTENDED applies, so with "require
-   confirmation" on it never fires at all. All three apply routes
-   funnel through queue_apply, so the gate sits there. NOT gated:
-   undo() (recovery must stay reachable while paused) and
-   resolve_keep_plex() (moves only the DOWNLOAD to recoverable trash).
-   DECLARED TRADE-OFF: the setting is labelled "Enable auto-rename" and
-   also arms the JDownloader hook, so applying one file manually now
-   means switching that on. Decoupling would need its own setting; that
-   is the repo owner's call and is flagged, not decided.
+4. THE PAUSE MOVED TO THE DESTRUCTIVE BOUNDARY. Confirmed the bypass
+   you named: process_package() calls apply(automatic=True) itself when
+   a job matches and confirmation is off, never touching queue_apply --
+   so the pause was false for precisely the UNATTENDED case. The
+   authoritative check is now the first thing apply() does, before any
+   filesystem mutation; queue_apply keeps its copy as the early,
+   friendly response for the HTTP routes. Tests cover direct apply(),
+   the process_package path with confirmation disabled, queued
+   single/bulk/confident, undo still available, keep-Plex still
+   available, and everything working again after re-enabling.
 
-Evidence, all red-first (test fails on the unfixed tree, passes after),
-with negative controls stated in each test file:
-  440682d  3 failed / 44 passed red; 363 passed / exit 0 green
-  93f7060  4 failed / 34 passed red; 228 passed / exit 0 green
-  fa56dfd  1 failed / 1 passed red;  346 passed / exit 0 green
-  03f0569  2 failed / 1 passed red;  349 passed / exit 0 green
-Run in a throwaway container from image scanhound:latest with the
-dependency set .github/workflows/tests.yml installs. CI itself is
-billing-blocked, so this is author-attested local evidence (declared).
+   NOTE, since your Q3 reviewed the older head: the toggle is no longer
+   auto_rename_enabled. It is a dedicated rename_manual_apply_enabled
+   (default True), plumbed through the config model, the SettingsUpdate
+   API model, the frontend type and a labelled Settings toggle -- so
+   pausing automation no longer forces giving up manual renaming, which
+   is the split you described as the longer-term shape. Three
+   pre-existing guard tests caught real gaps in that change (the
+   expected-keys set, the UI-editable-keys check proving it would have
+   422'd, and svelte-check on the frontend type).
+
+5. THE ONE-TIME RESCAN IS A REQUIRED SHIPPING STEP, not a follow-up --
+   the repo owner decided that explicitly. It is STEP 1 of
+   docs/reviews/2026-08-06-dv-full-coverage-setup.md, which also
+   carries the blocking dependency you would want flagged: the host
+   scanner imports dv_detect FROM THE WORKING TREE, so scanning before
+   this branch lands would rewrite the same false verdicts at
+   4,344-file scale. Taking your point about the boundary, the step
+   selects by VALUE ('none'/'unknown' under source='scan') rather than
+   by a remembered count of 15.
+
+Evidence: red-first -- 11 tests fail on the unfixed tree (11 failed /
+218 passed), including both rename tests, which proves the bypass was
+real rather than theoretical. Green at 9438d94: 571 passed / 0 failed /
+exit 0 across dv_detect, dv_labeler, dv_scan_db, dv_import,
+dv_host_scan, all four rename suites, the watchlist route and config.
+CI remains billing-blocked (declared).
+
+Your instruction to keep the DV producer and consumer commits together
+is recorded in the branch and in this block: do not cherry-pick 440682d
+without 93f7060 and 9438d94.
 
 Verdicts requested:
-Q1 dv_detect: is "no DV" positive-only the right semantics, and does
-   the branch ordering miss any failure shape?
-Q2 The dv_labeler/upsert_dv_scan pairing: is 'none' correctly left
-   authoritative while 'unknown' is not? Note the consequence I did
-   NOT fix in code -- ~13 'none' and 2 'unknown' rows already in the
-   live DB may be false negatives from the old dv_detect behaviour.
-   That is data, not code. Should the fix ship with a one-off
-   re-scan of those rows as a required step?
-Q3 The rename pause trade-off in item 4: gate on the existing
-   auto-rename toggle (as built), or add a dedicated
-   "allow manual applies" setting?
-Q4 Any objection to merging this branch ahead of the other two? File
-   overlap: none with agent/hybrid-sweep-rebased or
-   agent/category-switch-cache-fix.
+Q1 Do all five blockers close?
+Q2 The multipart contract: is "any missing or unknown part -> unknown"
+   the right aggregate, or should a missing part be distinguished from
+   a failed one?
+Q3 Merge order given the overlap you identified with hybrid-sweep
+   (backend/database.py, backend/rename/service.py,
+   tests/test_rename_service.py) -- audit-fixes first, then rebase
+   hybrid, or the reverse?
 ```
