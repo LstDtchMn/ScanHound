@@ -24,6 +24,12 @@ from backend.hdencode_coordinator import (
 )
 from backend.hdencode_transport import create_source_http_client
 from backend.rename import llm_identify as _llm
+from backend.scan_metrics import (
+    DiscardCode,
+    PostOutcome,
+    ScanStage,
+    TerminalKind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +110,7 @@ class DetailScraper:
         scraper=None,
         *,
         stop_requested: Optional[Callable[[], bool]] = None,
+        outcome: Optional[PostOutcome] = None,
     ) -> Optional[ScrapeResult]:
         """Scrape movie/TV show details from an HDEncode post page.
 
@@ -122,21 +129,39 @@ class DetailScraper:
             headers: HTTP headers for the request.
             scraper: Optional pre-created cloudscraper instance (avoids
                      creating a new one per call for batch processing).
+            outcome: Optional per-post ticket. Every exit below books the
+                     factual branch it took onto it, so a caller can tell a
+                     source outage from a layout change from an operator Stop.
+                     Purely diagnostic: it changes no return value and no
+                     control flow.
 
         Returns:
             dict with parsed media metadata, or None on failure.
         """
+        # A null ticket keeps the exits below free of `if outcome is not None`
+        # guards. PostOutcome(None) is a no-op recorder by construction, so an
+        # uninstrumented caller costs one object and behaves identically.
+        ticket = outcome if outcome is not None else PostOutcome(None)
+        ticket.note_started()
+        # Bound BEFORE the try so the outer handler can stage a failure on
+        # evidence: with no response in hand the fault cannot have been in
+        # parsing, whatever the exception looks like.
+        resp = None
         try:
             source_kind = _detail_source_kind(url)
             hdencode_request = source_kind == "hdencode"
 
             # Retry logic for robust connection
             max_retries = 3
-            resp = None
             last_error = None
 
             for attempt in range(max_retries):
                 if _is_cancelled(stop_requested):
+                    ticket.discard(
+                        DiscardCode.DETAIL_CANCELLED_BEFORE_REQUEST,
+                        stage=ScanStage.DETAIL_FETCH,
+                        terminal_kind=TerminalKind.CANCELLED_AFTER_START,
+                    )
                     return None
                 try:
                     if hdencode_request:
@@ -145,10 +170,18 @@ class DetailScraper:
                             stop_requested=stop_requested,
                         ):
                             if _is_cancelled(stop_requested):
+                                ticket.discard(
+                                    DiscardCode.DETAIL_CANCELLED_IN_COORDINATOR,
+                                    stage=ScanStage.DETAIL_FETCH,
+                                    terminal_kind=TerminalKind.CANCELLED_AFTER_START,
+                                )
                                 return None
                             active_scraper = scraper or create_source_http_client(
                                 hdencode=True
                             )
+                            # Counted at the call site, before the response is
+                            # known: a request that times out still cost one.
+                            ticket.note_http_request()
                             resp = active_scraper.get(
                                 url, headers=headers, timeout=20
                             )
@@ -159,6 +192,7 @@ class DetailScraper:
                         active_scraper = scraper or create_source_http_client(
                             hdencode=False
                         )
+                        ticket.note_http_request()
                         resp = active_scraper.get(
                             url, headers=headers, timeout=20
                         )
@@ -170,11 +204,26 @@ class DetailScraper:
                     else:
                         _interruptible_sleep(1 * (attempt + 1), stop_requested)
                         continue
-                except (
-                    HDEncodeRequestCancelled,
-                    HDEncodeTrafficDenied,
-                    _DetailRequestCancelled,
-                ):
+                # ORDER IS LOAD-BEARING: HDEncodeRequestCancelled SUBCLASSES
+                # HDEncodeTrafficDenied. Catching the parent first would file
+                # every operator Stop as "the source denied us" - a scan the
+                # user stopped would read as a site problem, which is the
+                # opposite diagnosis. The subclass must come first.
+                except (HDEncodeRequestCancelled, _DetailRequestCancelled) as e:
+                    ticket.discard(
+                        DiscardCode.DETAIL_CANCELLED_IN_COORDINATOR,
+                        stage=ScanStage.DETAIL_FETCH,
+                        exception_type=type(e).__name__,
+                        terminal_kind=TerminalKind.CANCELLED_AFTER_START,
+                    )
+                    return None
+                except HDEncodeTrafficDenied as e:
+                    ticket.discard(
+                        DiscardCode.DETAIL_TRAFFIC_DENIED,
+                        stage=ScanStage.DETAIL_FETCH,
+                        exception_type=type(e).__name__,
+                        terminal_kind=TerminalKind.RAISED_EXCEPTION,
+                    )
                     return None
                 except Exception as e:
                     last_error = e
@@ -185,11 +234,25 @@ class DetailScraper:
                     try:
                         _interruptible_sleep(1 * (attempt + 1), stop_requested)
                     except _DetailRequestCancelled:
+                        ticket.discard(
+                            DiscardCode.DETAIL_RETRY_SLEEP_CANCELLED,
+                            stage=ScanStage.DETAIL_FETCH,
+                            exception_type=type(e).__name__,
+                            terminal_kind=TerminalKind.CANCELLED_AFTER_START,
+                        )
                         return None
 
             if not resp or resp.status_code != 200:
                 if self.app.config.get("debug_mode"):
                     self.app.safe_log(f"[Scrape Error] Failed after {max_retries} attempts: {last_error or 'Status ' + str(resp.status_code if resp else 'None')}")
+                ticket.discard(
+                    DiscardCode.DETAIL_NO_USABLE_RESPONSE,
+                    stage=ScanStage.DETAIL_FETCH,
+                    exception_type=(
+                        type(last_error).__name__ if last_error else None
+                    ),
+                    terminal_kind=TerminalKind.RETURNED_NONE,
+                )
                 return None
 
             soup = BeautifulSoup(resp.content, 'html.parser', from_encoding='utf-8')
@@ -209,6 +272,14 @@ class DetailScraper:
                     fn_match = re.search(r'Filename\.+:\s*(.+)', text) or re.search(r'Filename\.*:\s*(.+)', text)
 
             if not fn_match:
+                # The page loaded fine; we could not find the field we parse.
+                # This is the signature of a site layout change, and it is the
+                # one discard worth waking someone up for.
+                ticket.discard(
+                    DiscardCode.DETAIL_NO_FILENAME,
+                    stage=ScanStage.DETAIL_PARSE,
+                    terminal_kind=TerminalKind.RETURNED_NONE,
+                )
                 return None
             full_fn = fn_match.group(1).strip()
 
@@ -385,6 +456,9 @@ class DetailScraper:
             except Exception:
                 multi_episode_hint = None
 
+            # Data came back. NOT terminal: construction, abandonment on Stop
+            # or a bookkeeping gap can still follow downstream.
+            ticket.data_returned()
             return {
                 'display_title': clean_title,
                 'year': year,
@@ -408,4 +482,19 @@ class DetailScraper:
         except Exception as e:
             if self.app.config.get("debug_mode", False):
                 self.app.safe_log(f"Scrape Details Error ({url}): {e}")
+            ticket.note_exception_type(type(e).__name__)
+            # This handler spans the whole method, so it must not assert
+            # "parse failure" for something that died before a page arrived.
+            # A response in hand is the evidence that parsing was reached.
+            if resp is not None:
+                code, stage = (
+                    DiscardCode.DETAIL_PARSE_EXCEPTION, ScanStage.DETAIL_PARSE)
+            else:
+                code, stage = (DiscardCode.UNKNOWN, ScanStage.UNSPECIFIED)
+            ticket.discard(
+                code,
+                stage=stage,
+                exception_type=type(e).__name__,
+                terminal_kind=TerminalKind.RAISED_EXCEPTION,
+            )
             return None
