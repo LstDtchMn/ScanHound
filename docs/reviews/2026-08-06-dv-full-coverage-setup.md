@@ -53,6 +53,13 @@ DELETE FROM dv_scan WHERE source='scan' AND dv_layer IN ('none','unknown');
 Run against `/dbvol/crawler.db` inside the container. The host detector will re-scan those files on
 its next pass because the row (and its signature) is gone.
 
+Selected **by value, not by a remembered count of 15** — peer review's point, and the right one: the
+count is a snapshot, and a row written under the old detector cannot be told apart from a good one
+by anything except its value. Deleting every `none`/`unknown` scan row is a deliberate superset of
+"rows written before the fix": it re-scans a handful of genuinely-no-DV files, which costs minutes
+and removes the need to trust a timestamp boundary. Nothing else is touched — positive findings
+(fel/mel/p8/p5) stay, so no correct label is disturbed.
+
 ## STEP 2 — widen the scan roots (Settings → Renaming → DV detection)
 
 Replace `dv_library_roots` with the four top-level roots, semicolon-separated:
