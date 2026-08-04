@@ -6,10 +6,13 @@ artifacts, not any summary; if you find yourself reviewing a summary,
 STOP.
 
 Repository: LstDtchMn/ScanHound
-Branch: agent/hybrid-sweep-rebased (resolve its tip; commits after the
-  one below are documentation only)
-Last CODE commit -- this is what to review:
+Branch: agent/hybrid-sweep-combined -- THE CANDIDATE NOW. It is the
+  reviewed branch plus a merge of main after PR #40 landed (see the
+  combined-tree section below). agent/hybrid-sweep-rebased is unchanged
+  and remains the branch your round-14 comments were written against.
+Last CODE commit on the reviewed branch:
   70939859e620e8398ba95b6eb53c33abef1c308d
+Combined-tree merge commit: f77ace7
 Base: main @ 7adb17b -- 106 commits ahead, 0 behind (re-counted)
 Prior reviewed head: 9ff626eac6f593e6635df4506a7823a2ed799330
 
@@ -76,8 +79,49 @@ you were right about both.
    Mutation harness (run separately, afterwards): 10/10 corrected->PASS
    / defective->FAIL, exit 0.
 
-Still open and declared, unchanged: CI attestation (O-5, billing),
-R-7 formal sign-off, R-8..R-11, R-2b post-deploy.
+4. TWO THINGS YOU HAVE FLAGGED EVERY ROUND ARE NOW CLOSED.
+
+   CI ATTESTATION (O-5). Root-caused rather than waited out: this was
+   never an outage. The repo was PRIVATE, so Actions minutes are
+   metered, and 1,801+ of the 2,000 monthly minutes were burned in
+   three days. The tell is mechanical and worth reusing -- every failed
+   run since 2026-08-03 14:20Z had **0 steps executed**, i.e. the job
+   never started, whereas a genuine test failure on 08-01 showed 14-15
+   steps. The repo was made public (unlimited minutes) after a
+   full-history secret scan came back clean: gitleaks over all 1,008
+   commits found only the public Python release-manager GPG fingerprint
+   baked into the base image; .gitignore has always covered
+   .env/config.json/data//*.db and data/ was never committed.
+
+   Green runs, executed steps, machine-attested:
+     main after PR #40 ......... actions/runs/30947333538 (16/12/12)
+     COMBINED candidate ........ actions/runs/30948928368 (16/14/14)
+
+   COMBINED-TREE VALIDATION, which you required once an approved branch
+   advanced main. PR #40 (category-switch) merged as af9c299.
+   agent/hybrid-sweep-combined @ f77ace7 is the reviewed branch plus a
+   merge of that main. Deliberately a MERGE onto a NEW branch, not a
+   rebase: contract rev 3.2 binds evidence to exact SHAs and a rebase
+   would rewrite every one.
+
+   The merge was clean, but that is not the claim. Both branches modify
+   backend/api/routes/results.py, and after the merge the two
+   behaviours compose in a SINGLE expression in _filter_and_sort:
+       enabled = set(category) - {CATEGORY_NONE_SENTINEL}
+       ... _effective_category(i) not in _KNOWN_CATEGORIES
+           or _effective_category(i) in enabled
+   So the suite is the proof, not the merge's silence:
+     4797 passed / 0 failed / 4 skipped / exit 0
+     docs/reviews/evidence/2026-08-06-full-suite-combined-f77ace7.txt
+   That is FOUR MORE than the branch alone -- PR #40's
+   tests/test_results_category_sentinel.py now runs beside this
+   branch's media-type authority tests.
+
+Still open and declared: R-7 formal sign-off, R-8..R-11, R-2b
+post-deploy. NOTE agent/audit-fixes-2026-08 is still in review and also
+overlaps this branch (database.py, rename/service.py,
+tests/test_rename_service.py), so a THIRD combination will be needed
+once it lands.
 
 MERGE-ORDER NOTE, per your own round-14 point: category-switch is
 approved and audit-fixes is in round 2. Both advance main and both
@@ -91,6 +135,8 @@ Q1 Does R-4 close -- is the composite stamp the right mechanical
    binding, and is _FEED_ONLY_ON_COMPLETED the right treatment for a
    completed row's feed facts (versus reparsing them wholesale)?
 Q2 Does contract rev 3.2 now satisfy its own exact-binding rule?
-Q3 With those closed, is this branch gated only by the combined-tree
-   rebase, CI and R-7?
+Q3 With R-4, the contract, CI and the combined tree all now closed, is
+   agent/hybrid-sweep-combined the merge candidate gated ONLY by R-7
+   sign-off -- and should the audit-fixes combination happen before
+   R-7, or after this merges?
 ```
