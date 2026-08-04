@@ -330,3 +330,49 @@ def test_full_reconcile_still_removes_by_default():
     mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
     assert res["removed"] == ["DV FEL"]
+
+
+# ── 'unknown' is a FAILED detection, not a finding ──────────────────────────
+# The suite already pinned the authoritative cases ('fel' converges a stale
+# label, 'none' removes one, no match preserves). It never pinned the failure
+# case -- and that was the one that stripped labels: desired_label('unknown')
+# is None, so the removal loop subtracted nothing and took every managed DV
+# label off the title during the unattended hourly sync. A single unreadable
+# file on a network mount was enough.
+
+def test_additive_only_keeps_label_when_layer_is_unknown():
+    idx = {"y:/a.mkv": "unknown"}  # detection FAILED for this file
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
+
+    assert res["removed"] == []
+    assert res["added"] == []
+    pm.remove_label.assert_not_called()
+
+
+def test_unknown_is_not_reported_as_a_match():
+    """sync_labels gates its rating_key back-write on `matched`; re-persisting
+    an 'unknown' row on every pass is what made one failure sticky instead of
+    letting the next host run retry it."""
+    idx = {"y:/a.mkv": "unknown"}
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
+
+    assert res["matched"] is False
+    assert res["layer"] == "unknown"  # still reported for diagnostics
+
+
+def test_unknown_does_not_block_a_full_non_additive_reconcile():
+    """Negative control: outside additive_only the caller has asked for a
+    full reconcile, and that behavior is unchanged."""
+    idx = {"y:/a.mkv": "unknown"}
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=False)
+
+    assert res["removed"] == ["DV FEL"]

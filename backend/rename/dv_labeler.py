@@ -20,9 +20,27 @@ _LAYER_RANK = ["fel", "mel", "profile8", "profile5"]
 _THROTTLE_S = 0.05  # inter-write pause so a big library can't hammer Plex
 
 
+#: A layer value that records a FAILED detection rather than a finding.
+#: dv_detect resolves any error — no dovi_tool, unreadable file, timeout,
+#: subprocess failure — to this, and dv_host_scan.classify_to_row stores it.
+#: It is NOT evidence, and must never be treated as an authoritative answer
+#: about a file. 'none' IS authoritative: it means the tool ran and found no
+#: Dolby Vision.
+LAYER_DETECTION_FAILED = "unknown"
+
+
+def is_authoritative(layer):
+    """Whether a dv_layer is a real finding we may act on destructively.
+
+    The distinction dv_detect documents — "could not run" vs "confirmed no
+    DV" — is only meaningful if it is enforced where labels are removed.
+    """
+    return layer is not None and layer != LAYER_DETECTION_FAILED
+
+
 def desired_label(layer, vocab):
     """Map a dv_layer to its managed label, or None for none/unknown/NULL."""
-    if not layer or layer in ("none", "unknown"):
+    if not layer or layer in ("none", LAYER_DETECTION_FAILED):
         return None
     label = vocab.get(layer)
     return label if label in MANAGED else None
@@ -91,16 +109,26 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     match may still replace a stale managed label so unattended reconciliation
     converges after an authoritative rescan. A transient matching failure must
     never strip the labels that Kometa's FEL/MEL overlays depend on.
+
+    "Matched" therefore means matched to a REAL finding: a row whose layer is
+    'unknown' records that detection FAILED, and under additive_only it is
+    treated exactly like no row at all. Reading it as a match was a
+    label-stripping bug — desired_label('unknown') is None, so the removal
+    loop subtracted nothing and stripped every managed DV label from the
+    title during the unattended hourly sync. Any detection failure (an
+    unreadable file on a network mount is the common one) could silently
+    undo the FEL/MEL overlays.
     """
     norm_paths = _movie_norm_paths(movie, mappings)
     layer = pick_layer(norm_paths, index)
     desired = desired_label(layer, vocab)
     existing_managed = _existing_labels(movie) & MANAGED
+    authoritative = is_authoritative(layer)
 
     added, removed = [], []
     if desired and desired not in existing_managed:
         added.append(desired)
-    if not additive_only or layer is not None:
+    if not additive_only or authoritative:
         for stale in existing_managed - ({desired} if desired else set()):
             removed.append(stale)
 
@@ -121,7 +149,12 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     return {
         "added": added,
         "removed": removed,
-        "matched": layer is not None,
+        # A failed detection is not a match. Besides the summary count, this
+        # gates sync_labels' rating_key back-write -- re-persisting an
+        # 'unknown' row (as source='scan') on every pass is what made a
+        # single detection failure sticky instead of self-healing on the
+        # next host run.
+        "matched": authoritative,
         "layer": layer,
         "desired_label": desired,
         "existing_labels": sorted(existing_managed),
