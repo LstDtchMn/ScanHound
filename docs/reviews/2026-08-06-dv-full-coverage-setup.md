@@ -35,10 +35,12 @@ So: merge `agent/audit-fixes-2026-08` (or check it out in that working tree) **f
 with:
 
 ```bash
-grep -n "explicit_no_dv" "X:/Docker Apps/ScanHound/backend/rename/dv_detect.py"
+grep -n "_NO_RPU_MESSAGES" "X:/Docker Apps/ScanHound/backend/rename/dv_detect.py"
 ```
 
-That line exists only in the fixed version. No output means do not start the scan.
+That constant exists only in the fixed version. **No output means do not start the scan.**
+(An earlier draft of this file checked for `explicit_no_dv`, an intermediate name that the round-2
+review replaced — checking for it now would give a false negative.)
 
 ## STEP 1 — clear the ~15 stale rows (required part of shipping, per the 2026-08-06 decision)
 
