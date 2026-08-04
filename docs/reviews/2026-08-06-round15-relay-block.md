@@ -7,7 +7,10 @@ STOP.
 
 Repository: LstDtchMn/ScanHound
 Branch: agent/hybrid-sweep-rebased
-Head: 717f759aaa95b7874dc791a820d68ccbb4d62bf2 (plus this relay commit)
+Branch: agent/hybrid-sweep-rebased (resolve its tip; commits after the
+  one below are documentation only)
+Last CODE commit -- this is what to review:
+  70939859e620e8398ba95b6eb53c33abef1c308d
 Base: main @ 7adb17b -- 106 commits ahead, 0 behind (re-counted)
 Prior reviewed head: 9ff626eac6f593e6635df4506a7823a2ed799330
 
