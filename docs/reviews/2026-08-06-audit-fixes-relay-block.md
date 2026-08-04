@@ -82,12 +82,71 @@ mine that pinned the wrong behaviour.
    selects by VALUE ('none'/'unknown' under source='scan') rather than
    by a remembered count of 15.
 
-Evidence: red-first -- 11 tests fail on the unfixed tree (11 failed /
-218 passed), including both rename tests, which proves the bypass was
-real rather than theoretical. Green at 9438d94: 571 passed / 0 failed /
-exit 0 across dv_detect, dv_labeler, dv_scan_db, dv_import,
-dv_host_scan, all four rename suites, the watchlist route and config.
-CI remains billing-blocked (declared).
+Evidence for the five blockers: red-first -- 11 tests fail on the
+unfixed tree (11 failed / 218 passed), including both rename tests,
+which proves the bypass was real rather than theoretical. Green at
+9438d94: 571 passed / 0 failed / exit 0.
+
+SIX FURTHER FIXES LANDED AFTER THAT REVIEW -- the remaining confirmed
+audit findings, each red-first with a negative control. Listed because
+the block you last read covered only the five blockers:
+
+  a3c86d3 mediainfo: a media_probe cache HIT returned the stored blob
+    verbatim, so dv_layer stayed frozen at its first value -- null for
+    every DV file, since plex_metadata_scan probes BEFORE running
+    dovi_tool, and dovi_tool never changes mtime/size so the row is
+    current forever. A later DV scan never reached
+    conflict_preview/rank_conflict. The hit path now re-resolves
+    dv_layer the way the miss path does; the ffprobe skip is untouched.
+  60502d8 rematch_cache published its rows into the SHARED self.items
+    while two of its three callers hold no scan slot. The list is now
+    passed explicitly. NO lock added, deliberately: acquiring the scan
+    slot deadlocks, since background_scanner already holds that
+    non-reentrant lock when it calls in.
+  7993bce scanned_urls recorded every crawled URL regardless of
+    outcome, so a post whose detail scrape failed was marked scanned
+    and skipped by every future incremental scan. Only posts that
+    complete end to end are recorded now. SAME COMMIT: action recovery
+    moved out of HDEncodeActionService.__init__ (constructed per API
+    request, and the recovery is a blanket state-keyed UPDATE with no
+    owner column, so it reset other threads' in-flight work) to a
+    once-per-lifespan startup call.
+  50a4af1 connection.ts: onclose mutated the shared `ws` with no
+    identity check, so disconnect()+connect() left a SECOND live socket
+    and every broadcast was dispatched twice for the life of the tab.
+    Handlers are now bound per socket; superseded sockets are inert.
+  8ec3e36 the scheduler stamped last_scan_time before checking whether
+    a trigger existed -- nothing under backend/ registers one, so the
+    server recorded scans that never ran. NOT fixed by deleting the
+    stamp: on the desktop build a trigger IS registered and nothing
+    stamps at completion, so deleting it causes a scan storm (proven by
+    applying that variant). An in-memory fire clock gates both builds.
+  1401c61 committed full-suite artifact.
+
+A TEST-QUALITY FAILURE OF MINE, disclosed because it bears on how much
+the above is worth: my first version of the rematch tests asserted
+self.items AFTER the call and PASSED against the defective code -- the
+old code restored it in a finally, so the corruption is only observable
+DURING the match. Rewritten to observe at match time; they now fail on
+the unfixed tree.
+
+CI: THE ATTESTATION GAP IS CLOSED, and the cause was not billing alone.
+This branch had SIX commits and ZERO runs: its workflow triggered on
+[main, master, develop] only -- the agent/** trigger existed on the
+hybrid branches and had never reached main or here -- so a branch can
+be silently unattested with nothing to indicate it. Trigger added; the
+repo is also public now (private repos meter Actions minutes and this
+one had burned 1,801+ of 2,000 in three days; every failed run since
+2026-08-03 14:20Z had ZERO steps executed, i.e. the job never started).
+
+  Local, clean-room: 4248 passed / 0 failed / 4 skipped / exit 0
+    docs/reviews/evidence/2026-08-06-full-suite-auditfixes-0d2f224.txt
+    (lower than the hybrid branch's 4793 because this branch is cut
+     from main and lacks the hybrid RSS-authority suites -- structural)
+  CI on this branch: actions/runs/30951792563
+  For context, both green with executed steps:
+    main after PR #40 ......... actions/runs/30947333538
+    hybrid combined tree ...... actions/runs/30948928368
 
 Your instruction to keep the DV producer and consumer commits together
 is recorded in the branch and in this block: do not cherry-pick 440682d
@@ -98,8 +157,13 @@ Q1 Do all five blockers close?
 Q2 The multipart contract: is "any missing or unknown part -> unknown"
    the right aggregate, or should a missing part be distinguished from
    a failed one?
-Q3 Merge order given the overlap you identified with hybrid-sweep
-   (backend/database.py, backend/rename/service.py,
-   tests/test_rename_service.py) -- audit-fixes first, then rebase
-   hybrid, or the reverse?
+Q3 The six later fixes: any objection, particularly (a) rematch_cache
+   passing the list rather than locking -- given the deadlock argument
+   -- and (b) the scheduler's in-memory clock versus persisting a
+   separate field?
+Q4 Merge order given the overlap with hybrid-sweep (database.py,
+   rename/service.py, tests/test_rename_service.py). Note PR #40 has
+   since merged and the hybrid candidate is now
+   agent/hybrid-sweep-combined, validated as the combined tree; a third
+   combination will be needed once this branch lands.
 ```
