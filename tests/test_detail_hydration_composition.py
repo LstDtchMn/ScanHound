@@ -210,3 +210,71 @@ class TestDetailParseVersioning:
         counts = db.reconcile_derived_versions()
         assert counts["candidates_refetch_required"] == 0  # negative control
         assert _row(db, url)["derived_state"] == "current"
+
+
+# ── round-13 separation, contract 2: production EMISSION ─────────────────────
+
+class TestProductionEmissionContract:
+    """Every field claimed detail-authoritative is actually EMITTED by the
+    production adapter and reaches the row. This is contract 2 of the
+    round-13 separation; contract 1 (the sink PRESERVES the fields across a
+    changed poll) lives in test_feed_upsert_authority.py. Feed values are
+    chosen to DIFFER from the detail page's, so every assertion observes the
+    detail emission itself, not a feed value the sink happened to keep.
+
+    One deliberate retraction, pinned here: ``title_year`` is FEED authority.
+    The detail page's year maps to ``description_year`` by design
+    (_candidate_updates), so title_year's post-hydration CASE guard protects
+    it from LATER FEED POLLS — it is not, and never was, a detail-emitted
+    fact. The round-13 review was right that claiming otherwise was wrong.
+    """
+
+    def test_tv_side_fields_come_from_the_detail_parse(self, db):
+        url = _ingest(db, _entry(
+            "Placeholder Show S02 720p WEB - 1.0 GB", "TV", "emit-tv"))
+        row = _hydrate(db, url, _build_detail_html(
+            "Emit.Show.S01E01E02.1080p.WEB-DL.x265-GRP.mkv"))
+        assert row["clean_title"] == "Emit Show"      # feed said Placeholder
+        assert row["season"] == 1                     # feed said 2
+        assert row["episode"] == 1                    # feed had none
+        assert row["episode_end"] == 2                # feed had none
+        assert row["resolution"] == "1080p"           # feed said 720p
+        assert row["hevc_evidence"] == "asserted"     # feed had no token
+        assert "detail-filename" in (row["media_type_because"] or "")
+        assert row["description_complete"] == 1
+
+    def test_movie_side_fields_come_from_the_detail_parse(self, db):
+        url = _ingest(db, _entry(
+            "Placeholder Film 2020 720p WEB - 1.0 GB", "Movies", "emit-mv"))
+        row = _hydrate(db, url, _build_detail_html(
+            "Emit.Movie.2026.2160p.WEB-DL.DV.x265-GRP.mkv",
+            size_label="FileSize: 20.5 GB",
+            resolution="Resolution: 3840x2160",
+            color_primaries="bt.2020"))
+        assert row["description_year"] == 2026        # detail's year home
+        assert row["resolution"] == "4K"              # feed said 720p
+        assert row["size_text"] == "20.5 GB"          # feed said 1.0 GB
+        assert row["size_gb"] == pytest.approx(20.5)
+        assert row["dv_evidence"] == "asserted"       # feed had no DV token
+        assert row["hdr_evidence"] == "asserted"      # bt.2020 primaries
+        assert (row["hdr_formats"] or "") != ""       # formats list persisted
+        # THE RETRACTION: title_year stays the FEED's parse, untouched
+        assert row["title_year"] == 2020
+
+    def test_the_adapter_never_emits_title_year(self, db):
+        """Pinned at the adapter boundary too: a maximally rich REAL payload
+        still contains no title_year key — so the sink's COALESCE always
+        binds None there on the production path, by design."""
+        from unittest.mock import MagicMock
+        from backend.hdencode_candidate_service import _candidate_updates
+
+        ws = WebScrapers(MockApp())
+        fake = MagicMock()
+        fake.get.return_value = _FakeResponse(_build_detail_html(
+            "Rich.Movie.2026.2160p.WEB-DL.DV.x265-GRP.mkv",
+            size_label="FileSize: 20.5 GB",
+            resolution="Resolution: 3840x2160",
+            color_primaries="bt.2020"))
+        payload = ws.scrape_details("https://example.com/d", headers={}, scraper=fake)
+        updates = _candidate_updates(payload)
+        assert "title_year" not in updates

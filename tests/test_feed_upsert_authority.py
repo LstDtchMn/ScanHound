@@ -65,6 +65,15 @@ def _row(db):
 #: ALL SEVENTEEN protected fields, each with a distinct hydrated value --
 #: round-12 hardening: a future CASE omission in the upsert guard must fail
 #: a named field assertion, not hide behind a subset.
+#:
+#: Round-13 separation: this is CONTRACT 1 -- the SINK preserves every
+#: protected field across a changed poll, proven with handcrafted updates
+#: precisely so each field can carry a distinct sentinel value. Whether the
+#: production adapter can actually PRODUCE a field is CONTRACT 2, proven
+#: end-to-end in test_detail_hydration_composition.py
+#: (TestProductionEmissionContract) -- which is also where title_year's
+#: feed-authority retraction is pinned. Passing here says nothing about
+#: emission, by design.
 DETAIL_FACTS = {
     "media_type": "tv",
     "media_type_provisional": 0,
