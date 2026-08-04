@@ -10,7 +10,8 @@ STOP.
 
 Repository: LstDtchMn/ScanHound
 Branch: agent/audit-fixes-2026-08
-Head: 9438d94 (plus this relay commit)
+Head: f80299594512d6012300b277476fbeccf399f157
+Code commits: 440682d, 93f7060, fa56dfd, 03f0569, d0edea8, 9438d94
 Base: main @ 7adb17b
 Prior reviewed head: 5387df2
 
