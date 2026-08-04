@@ -147,12 +147,24 @@ def detect_layer(path: str, *, cancel_requested=None) -> dict:
         if ex.returncode != 0 or not rpu_size:
             err = (ex.stderr or b"").decode("utf-8", "ignore").strip()
             low = err.lower()
-            # An empty RPU, or an explicit "no RPU", means no Dolby Vision (the
-            # file may still be HDR10 — out of scope). A nonzero exit with some
-            # other error is a genuine failure → unknown, not "no DV".
-            if not rpu_size or "no rpu" in low or "not found" in low:
+            # "No Dolby Vision" is a POSITIVE finding and may only be reported
+            # when the tool actually succeeded, or said so itself.
+            #
+            # The empty-RPU test must NOT come first: mkstemp pre-creates the
+            # output file at zero bytes and dovi_tool writes it only on
+            # success, so EVERY failure mode leaves rpu_size == 0 — a read
+            # error on the media mount, a truncated file, a demux error. The
+            # old ordering therefore reported those as an authoritative
+            # LAYER_NONE with error=None, exactly inverting the intent this
+            # comment block has always stated. On 9p/SMB mounts, where
+            # dovi_tool read failures are an expected event rather than a
+            # rare one, that silently marked real Dolby Vision files as
+            # having none.
+            explicit_no_dv = "no rpu" in low or "not found" in low
+            if explicit_no_dv or (ex.returncode == 0 and not rpu_size):
                 return {"layer": LAYER_NONE, "tool": True, "error": None}
-            return {"layer": LAYER_UNKNOWN, "tool": True, "error": err[:200] or "extract failed"}
+            return {"layer": LAYER_UNKNOWN, "tool": True,
+                    "error": err[:200] or "extract produced no RPU"}
         # Stage 2: read the FEL/MEL token from the summary. A failed info call
         # must NOT be parsed as "no Profile line found" (→ false 'none'); the RPU
         # extracted fine, so a failure here is 'unknown'.

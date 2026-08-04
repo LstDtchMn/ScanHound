@@ -293,7 +293,7 @@ def import_trakt(
                 status=WatchlistItemStatus.WANTED,
                 notes=f"Imported from Trakt ({username})",
             )
-            mgr.add_item(item)
+            mgr.add(item)
             count += 1
         except Exception as e:
             logger.warning("Failed to import Trakt item '%s': %s", title, e)
