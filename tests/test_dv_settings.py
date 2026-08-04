@@ -193,3 +193,60 @@ def test_put_settings_round_trips_rename_detect_moved_files_enabled(client):
     assert resp.status_code == 200
     got = client.get("/settings").json()
     assert got["rename_detect_moved_files_enabled"] is False
+
+
+def test_autonomous_behaviour_that_is_ON_can_be_turned_OFF():
+    """A kill switch nobody can reach is not a kill switch.
+
+    dv_auto_sync_enabled gates the hourly Plex label sync, defaults to TRUE,
+    and is documented as its off switch -- yet it had NO UI control and was
+    absent from SettingsUpdate, so the only way to stop it was editing
+    config.json AND restarting the container (the value is read from the
+    in-memory config). Found when the promotion-window tool reported the sync
+    enabled in production and there was no supported way to disable it.
+
+    The invariant is deliberately about DISABLING, not reachability in
+    general. hdencode_rss_auto_grab_enabled is excluded ON PURPOSE: it
+    defaults to FALSE, and keeping it out of the settings API is defence in
+    depth -- autonomous grabbing should be enabled by the promotion
+    programme's recorded decision (contract R-16), not by a checkbox. The
+    risk it carries is being switched ON by accident, which is the opposite
+    of what this test protects.
+
+    The existing UI-editable-keys test cannot catch this class: it checks
+    that everything the UI edits is accepted by the API, and these keys were
+    in NEITHER.
+    """
+    from backend.api.routes.settings import SettingsUpdate
+    from backend.config import get_default_config
+
+    model = set(SettingsUpdate.model_fields.keys())
+    defaults = get_default_config()
+
+    #: Autonomous actors, and whether the app ships them ON.
+    autonomous = (
+        "dv_auto_sync_enabled",          # hourly Plex DV label sync
+        "auto_rename_enabled",           # JDownloader post-extract hook
+        "rename_manual_apply_enabled",   # the Apply button
+        "background_scan_enabled",       # the background crawl
+        "hdencode_rss_auto_grab_enabled",
+    )
+    on_by_default = [k for k in autonomous if defaults.get(k) is True]
+    assert on_by_default, "sanity: at least one autonomous actor ships enabled"
+
+    missing = sorted(k for k in on_by_default if k not in model)
+    assert not missing, (
+        "these run autonomously by default but cannot be switched off through "
+        f"the API, so the app itself cannot stop them: {missing}")
+
+
+def test_auto_grab_stays_out_of_the_settings_api_on_purpose():
+    """Pins the exclusion above so it is a decision, not an oversight.
+
+    If autonomous grabbing is ever meant to be user-togglable, deleting this
+    test is the deliberate act that records the change.
+    """
+    from backend.api.routes.settings import SettingsUpdate
+    from backend.config import get_default_config
+    assert get_default_config().get("hdencode_rss_auto_grab_enabled") is False
+    assert "hdencode_rss_auto_grab_enabled" not in SettingsUpdate.model_fields

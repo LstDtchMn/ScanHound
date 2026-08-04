@@ -479,6 +479,11 @@ export interface Settings {
   /** Whether the Renames page's Apply button may place files. Independent of
    *  auto_rename_enabled, which arms the automatic JDownloader hook. */
   rename_manual_apply_enabled?: boolean;
+  /** The hourly additive-only DV label sync. Documented as a kill switch but
+   *  previously unreachable from the app: no UI, and the settings API did not
+   *  accept it, so the only way to use it was editing config.json AND
+   *  restarting (the value is read from the in-memory config). */
+  dv_auto_sync_enabled?: boolean;
   auto_rename_confidence_threshold?: number;
   auto_rename_require_confirmation?: boolean;
   auto_rename_move_method?: string;
