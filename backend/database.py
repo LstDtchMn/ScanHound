@@ -2124,11 +2124,13 @@ class DatabaseManager:
                     description_year = COALESCE(?, description_year),
                     season = COALESCE(?, season),
                     episode = COALESCE(?, episode),
+                    episode_end = COALESCE(?, episode_end),
                     resolution = COALESCE(?, resolution),
                     size_text = COALESCE(?, size_text),
                     size_gb = COALESCE(?, size_gb),
                     dv_evidence = COALESCE(?, dv_evidence),
                     hdr_evidence = COALESCE(?, hdr_evidence),
+                    hevc_evidence = COALESCE(?, hevc_evidence),
                     hdr_formats = COALESCE(?, hdr_formats),
                     imdb_id = COALESCE(?, imdb_id),
                     -- Hydrated detail outranks the title, so if it resolves the
@@ -2157,11 +2159,13 @@ class DatabaseManager:
                     updates.get("description_year"),
                     updates.get("season"),
                     updates.get("episode"),
+                    updates.get("episode_end"),
                     updates.get("resolution"),
                     updates.get("size_text"),
                     updates.get("size_gb"),
                     updates.get("dv_evidence"),
                     updates.get("hdr_evidence"),
+                    updates.get("hevc_evidence"),
                     (
                         json.dumps(updates["hdr_formats"])
                         if "hdr_formats" in updates

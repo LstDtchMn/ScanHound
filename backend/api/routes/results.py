@@ -58,7 +58,11 @@ def _bookmark_key_for_item(i: Dict[str, Any]):
         return ("imdb", imdb)
     media_type = i.get("media_type")
     if media_type not in ("tv", "movie"):
-        media_type = "tv" if i.get("season") is not None else "movie"
+        # Round-12 F5: bookmark identity is PERSISTENT, so uncertainty is
+        # preserved in the key -- an unresolved type gets its own
+        # discriminator and can never collide with a confident tv or movie
+        # bookmark. Season presence is one grammar field, not an identity.
+        media_type = "ambiguous"
     return ("title", normalize_title(str(i.get("title", ""))), i.get("year"), media_type)
 
 

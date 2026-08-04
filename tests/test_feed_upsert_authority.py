@@ -62,25 +62,39 @@ def _row(db):
     return dict(row)
 
 
+#: ALL SEVENTEEN protected fields, each with a distinct hydrated value --
+#: round-12 hardening: a future CASE omission in the upsert guard must fail
+#: a named field assertion, not hide behind a subset.
 DETAIL_FACTS = {
+    "media_type": "tv",
+    "media_type_provisional": 0,
+    "media_type_because": '["detail"]',
     "clean_title": "Movie Detail Cut",
     "title_year": 2027,
+    "description_year": 2028,
     "season": 1,
+    "episode": 4,
+    "episode_end": 6,
     "resolution": "2160P",
     "size_text": "50.0 GB",
     "size_gb": 50.0,
     "dv_evidence": "present",
-    "media_type": "tv",
-    "media_type_provisional": 0,
-    "media_type_because": '["detail"]',
+    "hdr_evidence": "present",
+    "hevc_evidence": "present",
+    "hdr_formats": '["DV", "HDR10"]',
+    "description_complete": 1,
 }
+
+PROTECTED_FIELDS = tuple(DETAIL_FACTS)
 
 
 class TestHydratedFactsSurviveChangedPolls:
     def test_detail_authority_survives_and_feed_facts_update(self, db):
         _ingest(db, _body("Movie 2026 2160p WEB-DL - 12.0 GB"), "sha-v1")
         updates = dict(DETAIL_FACTS)
-        updates["media_type_because"] = ["detail"]  # hydration JSON-encodes it
+        # hydration JSON-encodes these two itself -- pass the raw shapes
+        updates["media_type_because"] = ["detail"]
+        updates["hdr_formats"] = ["DV", "HDR10"]
         db.complete_hdencode_hydration(
             URL, payload={"url": URL}, candidate_updates=updates)
         assert _row(db)["hydration_state"] == "completed"
@@ -89,9 +103,17 @@ class TestHydratedFactsSurviveChangedPolls:
         _ingest(db, _body("Movie 2026 1080p WEB-DL - 4.0 GB", "?v=2"), "sha-v2")
 
         row = _row(db)
-        # 1. every detail-authority fact SURVIVES
-        for field, expected in DETAIL_FACTS.items():
-            assert row[field] == expected, (field, row[field])
+        # 1. every one of the SEVENTEEN detail-authority facts SURVIVES
+        assert len(PROTECTED_FIELDS) == 17
+        for field in PROTECTED_FIELDS:
+            assert row[field] == DETAIL_FACTS[field], (field, row[field])
+        # meta-guard: the SQL carries exactly one CASE per protected field
+        import inspect
+        from backend import database as _dbmod
+        src = inspect.getsource(_dbmod)
+        for field in PROTECTED_FIELDS:
+            assert (f"{field} = CASE WHEN hdencode_candidates.hydration_state"
+                    in src), f"upsert guard missing for {field}"
         assert row["hydration_state"] == "completed"
         # 2. raw feed-only facts DID update — this is not a frozen row
         assert "1080p" in row["title"]
@@ -285,16 +307,42 @@ class TestR4CacheHealing:
         assert row[2] == '{"v":2}'
         assert self.CACHE_ROW["url"] in db.get_background_cache_urls()
 
-    def test_reconcile_cannot_unheal_a_freshly_stamped_row(self, db):
-        """The contract-required write-race property, deterministically: a
-        reconciliation pass computed against old state must not mark a row
-        that has ALREADY been re-stamped current -- the reconciler's UPDATE
-        predicate keys on the LIVE version column, so the late pass is a
-        no-op on healed rows."""
+    def test_race_both_serialized_orders_end_current(self, db):
+        """Round-12 F2 remainder -- the REAL interleaving property, proven
+        deterministically over TWO independent database handles in both
+        serialized orders. Final state must be current version + current
+        state + the fresh blob either way."""
+        from backend.database import DatabaseManager
+        from backend.release_grammar import GRAMMAR_VERSION
+        db2 = DatabaseManager(db.db_path)   # second, independent handle
+
+        def _cache_row():
+            conn = sqlite3.connect(db.db_path)
+            r = conn.execute("SELECT parse_version, derived_state, data "
+                             "FROM background_scan_cache WHERE url = ?",
+                             (self.CACHE_ROW["url"],)).fetchone()
+            conn.close()
+            return r
+
+        # ORDER 1: fresh upsert commits BEFORE the reconciliation pass.
         assert db.upsert_background_cache([dict(self.CACHE_ROW)])
-        out = db.reconcile_derived_versions()
-        assert out["cache_stale"] == 0
         conn = sqlite3.connect(db.db_path)
-        assert conn.execute("SELECT derived_state FROM background_scan_cache"
-                            ).fetchone()[0] == "current"
-        conn.close()
+        conn.execute("UPDATE background_scan_cache SET parse_version='old-v0'")
+        conn.commit(); conn.close()
+        healed = dict(self.CACHE_ROW)
+        healed["data"] = '{"o1": 1}'
+        assert db2.upsert_background_cache([healed])      # heal lands first
+        out = db.reconcile_derived_versions()             # late pass second
+        assert out["cache_stale"] == 0                    # nothing to mark
+        assert _cache_row() == (GRAMMAR_VERSION, "current", '{"o1": 1}')
+
+        # ORDER 2: reconciliation marks stale BEFORE the upsert lands.
+        conn = sqlite3.connect(db.db_path)
+        conn.execute("UPDATE background_scan_cache SET parse_version='old-v0'")
+        conn.commit(); conn.close()
+        out = db.reconcile_derived_versions()             # marks stale first
+        assert out["cache_stale"] == 1
+        assert _cache_row()[1] == "stale"
+        healed["data"] = '{"o2": 2}'
+        assert db2.upsert_background_cache([healed])      # heal lands second
+        assert _cache_row() == (GRAMMAR_VERSION, "current", '{"o2": 2}')

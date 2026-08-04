@@ -46,3 +46,27 @@ class TestBookmarkIdentity:
     def test_imdb_id_short_circuits_type_entirely(self):
         key = self._key(_item(media_type="tv", imdb_id="tt123"))
         assert key == ("imdb", "tt123")
+
+
+class TestBookmarkAmbiguityPreserved:
+    """Round-12 F5 remainder: bookmark identity is PERSISTENT, so an
+    unresolved/ambiguous media type must keep its uncertainty in the key --
+    never inferred from season, never able to collide with a confident tv or
+    movie bookmark."""
+
+    def _key(self, item):
+        from backend.api.routes import results as mod
+        return mod._bookmark_key_for_item(item)
+
+    def test_ambiguous_type_cannot_collide_with_tv_or_movie(self):
+        base = _item(media_type="ambiguous", season=2)
+        key = self._key(base)
+        assert key != self._key(_item(media_type="tv", season=2))
+        assert key != self._key(_item(media_type="movie", season=2))
+        assert "ambiguous" in str(key)
+
+    def test_absent_type_is_also_not_inferred_from_season(self):
+        key_with = self._key(_item(media_type=None, season=3))
+        key_without = self._key(_item(media_type=None))
+        assert "tv" not in str(key_with)
+        assert "movie" not in str(key_without)
