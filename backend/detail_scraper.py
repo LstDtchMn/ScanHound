@@ -25,7 +25,6 @@ from backend.hdencode_coordinator import (
 )
 from backend.hdencode_transport import create_source_http_client
 from backend.rename import llm_identify as _llm
-from backend.sources.hdencode_feed_parser import HEVC_TOKEN_RE
 
 logger = logging.getLogger(__name__)
 
@@ -386,7 +385,7 @@ class DetailScraper:
             # Codec evidence from THE shared HEVC vocabulary (the same regex
             # the feed-title parse asserts with), positive-only: a release
             # filename without the token is NOT thereby H.264.
-            hevc = True if HEVC_TOKEN_RE.search(full_fn) else None
+            hevc = True if release_grammar.HEVC_TOKEN_RE.search(full_fn) else None
             hdr_match = re.search(r'Color primaries\.*:\s*(.+)', text, re.IGNORECASE)
             if hdr_match:
                 ht = hdr_match.group(1).lower()

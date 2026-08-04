@@ -358,6 +358,18 @@ def strip_trailing_size(text: str) -> str:
     return (text or "")[:match.start()].strip() if match else (text or "").strip()
 
 
+# ───────────────────────────── codec vocabulary ─────────────────────────────
+
+#: THE HEVC token vocabulary, shared by the feed-title parse (hdencode_feed_
+#: parser asserts hevc evidence with it) and the detail-filename codec pass
+#: (detail_scraper, round-13) so the two can never disagree on what counts as
+#: an HEVC assertion. A CONSTANT, not a parse function: nothing in this
+#: module's parse output consumes it, so adding it changes no grammar
+#: behaviour and needs no GRAMMAR_VERSION bump — the differential harness
+#: verifies that empirically (zero divergences across this change).
+HEVC_TOKEN_RE = re.compile(r"(?<![A-Z0-9])(?:HEVC|H\.?265|X265)(?![A-Z0-9])", re.I)
+
+
 # ───────────────────────────── resolution ───────────────────────────────────
 
 #: Exactly the union both readers already accepted, PLUS 1080i (ratified

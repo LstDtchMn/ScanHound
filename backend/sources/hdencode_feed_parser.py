@@ -28,10 +28,10 @@ _DANGEROUS_XML = re.compile(br"<!\s*(?:DOCTYPE|ENTITY)\b", re.I)
 _DV_RE = re.compile(r"(?<![A-Z0-9])(?:DV|DoVi)(?![A-Z0-9])|Dolby[ ._-]?Vision", re.I)
 _HDR10P_RE = re.compile(r"(?<![A-Z0-9])(?:HDR10\+|HDR10P)(?![A-Z0-9])", re.I)
 _HDR_RE = re.compile(r"(?<![A-Z0-9])(?:HDR10\+?|HDR10P|HDR|HLG)(?![A-Z0-9])", re.I)
-# Public: the ONE HEVC token vocabulary. detail_scraper imports this for
-# its codec-evidence pass so feed and detail can never disagree on what
-# counts as an HEVC assertion.
-HEVC_TOKEN_RE = re.compile(r"(?<![A-Z0-9])(?:HEVC|H\.?265|X265)(?![A-Z0-9])", re.I)
+# THE HEVC token vocabulary lives in the shared grammar (round-13) so the
+# feed-title parse and the detail-filename pass can never disagree;
+# re-exported here for compatibility with existing importers.
+HEVC_TOKEN_RE = grammar.HEVC_TOKEN_RE
 _HEVC_RE = HEVC_TOKEN_RE
 _TAG_RE = re.compile(r"<[^>]+>")
 _DESC_YEAR_RE = re.compile(
