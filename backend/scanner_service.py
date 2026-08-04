@@ -1249,21 +1249,31 @@ class ScannerService:
         if not items:
             return 0
 
-        # Run the same Plex matcher over the reconstructed items.
-        with self._items_lock:
-            saved_items = self.items
-            self.items = items
+        # Run the same Plex matcher over the reconstructed items -- passed in
+        # explicitly, NOT published into the shared self.items.
+        #
+        # This method is called from three places and only ONE of them holds
+        # the scan slot (background_scanner, right after its cycle). The other
+        # two -- downloads.py's post-grab annotation and main.py's
+        # queue-delivery hook -- fire from request and download-queue threads
+        # while a scan may be mid-flight. The old code swapped these cache
+        # rows into self.items and restored them in a finally, so a
+        # concurrent scan matched and published the WRONG item list.
+        #
+        # The fix deliberately adds no lock. Taking the scan slot here would
+        # deadlock: it is a non-reentrant threading.Lock that
+        # background_scanner already holds when it calls in, and a
+        # try_acquire would silently make its rematch a permanent no-op.
+        # Removing the shared-state mutation removes the race outright.
         try:
             loop = asyncio.new_event_loop()
             try:
-                loop.run_until_complete(self._match_against_plex("Deep Scan"))
+                loop.run_until_complete(
+                    self._match_against_plex("Deep Scan", items=items))
             finally:
                 loop.close()
         except Exception:
             logger.exception("Cache re-match: Plex matching failed")
-        finally:
-            with self._items_lock:
-                self.items = saved_items
 
         # Persist only rows whose status/info changed (preserve last_seen).
         updates = []
@@ -1292,19 +1302,33 @@ class ScannerService:
 
     # ── Plex matching ─────────────────────────────────────────────────
 
-    async def _match_against_plex(self, scan_type: str = "Deep Scan"):
-        """Compare all scan results against the Plex library index.
+    async def _match_against_plex(self, scan_type: str = "Deep Scan",
+                                  items: Optional[List[MediaItem]] = None):
+        """Compare scan results against the Plex library index.
 
         Updates each MediaItem's status (IN_LIBRARY, UPGRADE, DV_UPGRADE)
         and plex_info field based on matching results.
+
+        ``items`` lets a caller match a list it OWNS instead of the shared
+        ``self.items``. rematch_cache uses it: it previously published its
+        reconstructed cache rows into self.items and restored them in a
+        finally, which corrupted a concurrent scan's results — and two of its
+        callers (downloads.py's grab annotation, main.py's queue-delivery
+        hook) run with no scan slot held. Passing the list is the fix that
+        does NOT introduce a lock: acquiring the scan slot here would
+        deadlock, because background_scanner already holds that
+        non-reentrant lock when it calls in.
         """
         plex_index = self.plex.plex_index
         if not plex_index["all_items"]:
             self._log("No Plex data available, skipping matching", "warning")
             return
 
-        with self._items_lock:
-            items_snapshot = list(self.items)
+        if items is not None:
+            items_snapshot = list(items)
+        else:
+            with self._items_lock:
+                items_snapshot = list(self.items)
         total = len(items_snapshot)
         for idx, item in enumerate(items_snapshot):
             if self.stop_scan_flag:
