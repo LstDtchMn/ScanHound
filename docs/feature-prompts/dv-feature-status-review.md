@@ -61,7 +61,7 @@ ScanHound is a standalone Dockerized media-management app (private repo `LstDtch
 
 ## 4. NOT YET BUILT / TODO
 
-> **SUPERSEDED 2026-08-06.** This section is historical. The "whole back
+> **SUPERSEDED 2026-08-04.** This section is historical. The "whole back
 > half" it describes as missing is built and RUNNING: the Plex label
 > write-path exists (`backend/rename/dv_labeler.py`), a real sync ran on
 > 2026-07-26 writing 457 rating_keys, Plex currently carries 171 DV FEL /
@@ -70,7 +70,7 @@ ScanHound is a standalone Dockerized media-management app (private repo `LstDtch
 > plumbing all landed too. Read the items below as the original plan, not
 > as outstanding work.
 >
-> What IS outstanding, measured 2026-08-06: the host detector has scanned
+> What IS outstanding, measured 2026-08-04: the host detector has scanned
 > only 466 files of the ~2,465 the 4K library flags as Dolby Vision,
 > because `dv_library_roots` lists four "4K DV" SUBfolders rather than the
 > four top-level roots; the nightly scheduled task was never created, so

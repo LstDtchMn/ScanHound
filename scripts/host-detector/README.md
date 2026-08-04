@@ -98,7 +98,7 @@ The nightly run must happen in this exact order:
 
 ## Rollout gate — clear this BEFORE the first real label sync
 
-> **STATUS 2026-08-06 -- this gate is CLEARED.** The mapping table below was
+> **STATUS 2026-08-04 -- this gate is CLEARED.** The mapping table below was
 > populated on 2026-07-11 (`Y:` -> the 4K HDR Geronimo share) after a dry run
 > matched only 92 of 463 files without it, and the first real label sync ran on
 > 2026-07-26. The section is kept because it explains WHY the table matters and

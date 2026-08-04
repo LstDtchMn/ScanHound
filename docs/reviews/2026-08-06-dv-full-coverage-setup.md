@@ -1,13 +1,18 @@
 # Dolby Vision full-coverage scan — setup steps
 
-**Decided 2026-08-06:** scan **every directory in the Plex `Movies (4K HDR)` library**, not just the
+> **Filename note.** This file is named `2026-08-06-...` but was written on
+> **2026-08-04**. The name is kept because it was already relayed to the peer
+> reviewer and renaming would break that path. Dates in the body below have
+> been corrected to the real ones.
+
+**Decided 2026-08-04:** scan **every directory in the Plex `Movies (4K HDR)` library**, not just the
 folders named "4K DV", and let the **nightly job** work through the backlog rather than running a
 marathon. This document is the ordered checklist, with the one blocking dependency first.
 
 ## Why this is needed
 
 The detector's configured roots are four folders literally named `4K DV` / `DV`, so it has only ever
-seen 463 files. Measured against Plex's own file paths on 2026-08-06:
+seen 463 files. Measured against Plex's own file paths on 2026-08-04:
 
 | Root | Files in the 4K library | Of which Plex flags Dolby Vision |
 |---|---:|---:|
@@ -42,7 +47,7 @@ That constant exists only in the fixed version. **No output means do not start t
 (An earlier draft of this file checked for `explicit_no_dv`, an intermediate name that the round-2
 review replaced — checking for it now would give a false negative.)
 
-## STEP 1 — clear the ~15 stale rows (required part of shipping, per the 2026-08-06 decision)
+## STEP 1 — clear the ~15 stale rows (required part of shipping, per the 2026-08-04 decision)
 
 13 rows read `none` and 2 read `unknown` in `dv_scan` (source='scan'). Some are false negatives
 produced by the old behaviour. They must be cleared so the corrected detector re-decides them rather

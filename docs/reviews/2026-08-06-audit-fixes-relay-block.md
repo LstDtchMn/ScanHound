@@ -1,6 +1,11 @@
 # Audit-fixes relay block (Jesse: paste the fenced block to ChatGPT)
 
-**Round 2.** The five blockers from the 2026-08-06 review are closed at `9438d94`;
+> **Filename note.** This file is named `2026-08-06-...` but was written on
+> **2026-08-04**. The name is kept because it was already relayed to the peer
+> reviewer and renaming would break that path. Dates in the body below have
+> been corrected to the real ones.
+
+**Round 2.** The five blockers from the 2026-08-04 review are closed at `9438d94`;
 this block replaces the round-1 text.
 
 ```

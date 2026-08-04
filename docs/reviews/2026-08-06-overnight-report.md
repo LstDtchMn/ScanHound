@@ -1,4 +1,10 @@
 > **Reviewer note:** this document is CONTEXT — a plain-language account of an
+
+> **Filename note.** This file is named `2026-08-06-...` but was written on
+> **2026-08-04**. The name is kept because it was already relayed to the peer
+> reviewer and renaming would break that path. Dates in the body below have
+> been corrected to the real ones.
+
 > overnight session, written for the repository owner. It is **not** a review
 > artifact. The things to review are the code and tests on the three branches
 > named in section 5, each of which carries its own relay block under
@@ -6,7 +12,7 @@
 
 # Overnight run — what happened while you slept
 
-**2026-08-05 evening → 2026-08-06 morning.** No prompting, as instructed. Nothing merged, nothing
+**2026-08-03 evening → 2026-08-04 morning.** No prompting, as instructed. Nothing merged, nothing
 deployed, nothing pushed to `main`. Three branches are ready for your review, each with a
 paste-ready block for ChatGPT.
 
