@@ -88,3 +88,38 @@ outside a running scan:
 | ID | Exit criterion | Evidence (executed, exact) | B/V/A | Status |
 |---|---|---|---|---|
 | D-7 | Category switch always consults the server cache; live mode is a scan-time overlay, not a lock; scan streams unaffected | red-first suite (3-fail discrimination run) + 396/0 green + check/build clean at the branch head; post-deploy UI check per the declared limitation | C / CG + vitest / 🔒 | 🔨 built, verdict pending |
+
+
+---
+
+## Round 2 (2026-08-05, after ChatGPT's CHANGES-REQUIRED verdict) -- commit `b5dd04b`
+
+Both blockers fixed, both behaviorally tested, plus the nonblocking note closed:
+
+1. **Empty selection sentinel:** empty `categoryFilter` now crosses the API as
+   `category=__none__` (named `CATEGORY_NONE_SENTINEL` in results.py, subtracted from the
+   enabled set). Contract test `tests/test_results_category_sentinel.py`; mutation run
+   injecting the empty-means-all regression fails the named test (1 failed / 3 passed) --
+   the raw behavior was accidental before, now it is a stated, discriminating contract.
+2. **Backend-observed scan activity:** stream backstop (`handleScanResult` sets /
+   `handleScanComplete` clears the flag), explicit clears in scanner.ts'
+   `scan:complete`/`scan:error` (a streamed-only scan never flips `scanState`, so the
+   mirror alone cannot clear), `scan:progress` adopts 'running' when idle (never
+   overriding 'stopping'), and `reconcileScanActivity()` (exported, tested) reconciles
+   with `api.scanStatus` at startup and every reconnect.
+3. **Failure path (was a declared limitation):** the live exit now drops live rows at the
+   flip; a failed cache request shows the `loadError` state, never rows contradicting the
+   chips. Tested.
+
+Evidence: six new tests red at the prior head (6 failed / 120 skipped, exit 1) -> green at
+`b5dd04b`: vitest **402/0 exit 0**, svelte-check 0 errors, vite build exit 0, backend
+subset 62 passed / exit 0 (throwaway container).
+
+**Overlap change:** this round adds `backend/api/routes/results.py` + a new backend test
+file to the branch. `agent/hybrid-sweep-rebased` also edits results.py -- the round-1
+zero-overlap measurement no longer holds; combined-tree validation after this merge is
+now mandatory (different regions of the file: `_filter_and_sort` sentinel vs
+`_effective_category`/bookmark work).
+
+The remaining declared limitation is unchanged: clicked-in-UI verification is post-deploy
+(prod behind CF Access).
