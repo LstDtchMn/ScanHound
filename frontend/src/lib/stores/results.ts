@@ -227,12 +227,44 @@ export const CATEGORY_LABELS: Record<CategoryKey, string> = { '4k': '4K', remux:
  *  (see `flagsFor` below), so there's exactly one writer. */
 export const categoryFilter = persisted<string[]>('sh-category-filter', [...CATEGORY_KEYS]);
 
+/** True while a locally-started scan is running/stopping. Mirrored in from
+ *  scanner.ts (which subscribes its scanState store to setScanActive below) —
+ *  results.ts cannot import the scanner store itself without an import cycle:
+ *  scanner.ts already imports clearResults from here. */
+let scanActive = false;
+export function setScanActive(active: boolean) {
+  scanActive = active;
+}
+
 /** Toggle a normalized category key in/out of categoryFilter. The ONLY writer
  *  of categoryFilter (see its doc comment above) — called directly by
  *  FilterBar's Category chips, and by ScanControls' category chips (which
- *  map their per-source key to its normalized form via normCat first). */
+ *  map their per-source key to its normalized form via normCat first).
+ *
+ *  A category chip is a browse-scope switch, not a refinement: in live mode
+ *  `results` holds ONLY the last scan's streamed items, so client-filtering
+ *  by category shows an empty deck for every category that scan didn't cover
+ *  — even though the server cache holds fresh rows for it. So a toggle
+ *  outside a running scan exits live mode and refetches from the cache.
+ *  While a scan is active the stream owns the deck (handleScanResult clears
+ *  paged rows and flips back to live on the next streamed item — flipping
+ *  here would just churn against it), so the pre-existing client-side
+ *  filtering behavior is kept for that window. */
 export function toggleCategoryFilter(key: CategoryKey) {
   categoryFilter.update((c) => (c.includes(key) ? c.filter((x) => x !== key) : [...c, key]));
+  if (!get(pagedMode) && !scanActive) {
+    // Flip AFTER the update above: the debounced _filterKey subscription has
+    // already fired and bailed (it saw live mode), so this single direct
+    // loadResults is the one fetch — no double-load.
+    pagedMode.set(true);
+    // Drop the live rows at the exit itself: paged mode passes `results`
+    // through unfiltered, so if the cache request below fails, retaining
+    // them would display rows contradicting the just-selected chips. The
+    // cost is a brief empty+loading state instead of stale rows during the
+    // fetch; on failure the loadError state shows, never wrong rows.
+    results.set([]);
+    loadResults(true);
+  }
 }
 
 /** Per-source scan-category definitions for ScanControls' checkboxes/chips.
@@ -480,6 +512,13 @@ function inPostedRange(postedDate: string | null | undefined, after: string, bef
  *  append. */
 export function handleScanResult(data: Record<string, unknown>) {
   const item = data as unknown as ScanResult;
+  // A streamed row proves a scan is producing, whoever started it. The
+  // scanner.ts scanState mirror only sees LOCALLY-started scans, so this is
+  // the backstop that keeps toggleCategoryFilter's live-mode exit disarmed
+  // while a scheduled/remote scan streams into this session (scanState may
+  // still be 'idle' here). Cleared in handleScanComplete and by scanner.ts'
+  // scan:complete/scan:error handlers.
+  scanActive = true;
   if (get(pagedMode)) {
     results.set([]);
     pagedMode.set(false);
@@ -502,20 +541,33 @@ export function handleScanResult(data: Record<string, unknown>) {
  *  see handleScanResult. */
 export function handleScanComplete(data: Record<string, unknown>) {
   const s = data.stats as ScanStats;
+  // The stream is over — re-arm the category-toggle live-mode exit (see
+  // handleScanResult). Local scans also clear via the scanState mirror.
+  // Unconditional: the activity lifecycle is global, whoever scanned.
+  scanActive = false;
+
+  const streamed = activeScanResultCount;
+  activeScanResultCount = 0; // per-scan counter: reset for every completion
+
+  // Everything below mutates THIS session's view, and scan:complete is
+  // broadcast to every session — so it applies only when this session is
+  // actually showing that scan's output (live mode). A user browsing the
+  // server-backed cache in paged mode must not have their rows, counts or
+  // cache banner rewritten by a scheduled or other-client scan.
+  if (get(pagedMode)) return;
+
   if (s) stats.set(s);
   // A completed live scan always supersedes the cache banner.
   fromCache.set(false);
 
-  // If a completed scan produced no streamed items, ensure stale results
-  // from an earlier run are cleared out of the UI.
-  if (!s || s.total === 0 || activeScanResultCount === 0) {
+  // If a completed live scan produced no streamed items, clear the stale
+  // rows from the earlier run (paged mode already returned above).
+  if (!s || s.total === 0 || streamed === 0) {
     results.set([]);
     selectedKeys.set(new Set());
     selectedDetail.set(null);
     focusedIndex.set(-1);
   }
-
-  activeScanResultCount = 0;
 }
 
 connection.on('scan:result', handleScanResult);
@@ -639,7 +691,15 @@ function buildResultParams(page: number): Record<string, string> {
   const p: Record<string, string> = { page: String(page), per_page: String(PAGED_PER_PAGE) };
   const s = get(statusFilter); if (s !== 'all') p.filter = s;
   const q = get(searchFilter); if (q) p.search = q;
-  const cats = get(categoryFilter); if (cats.length) p.category = cats.join(',');
+  // An EMPTY selection means every known category is deselected (the store's
+  // established meaning — see flagsFor and the live-mode filter). An omitted
+  // parameter would mean the opposite server-side ("no category filter" →
+  // show everything), so the empty set crosses the API boundary as an
+  // explicit sentinel instead: CATEGORY_NONE_SENTINEL in
+  // backend/api/routes/results.py (contract test
+  // tests/test_results_category_sentinel.py).
+  const cats = get(categoryFilter);
+  p.category = cats.length ? cats.join(',') : '__none__';
   const g = get(genreFilter);
   if (g.include.length) p.genre = g.include.join(',');
   if (g.exclude.length) p.genre_exclude = g.exclude.join(',');
@@ -1285,7 +1345,13 @@ let _filterDebounce: ReturnType<typeof setTimeout> | undefined;
 let _filterKeyPrimed = false;
 _filterKey.subscribe(() => {
   if (!_filterKeyPrimed) { _filterKeyPrimed = true; return; } // skip initial fire
-  if (!get(pagedMode)) return;
+  // Clear any pending refetch BEFORE the mode check, not after: a filter
+  // change always invalidates a previously scheduled refetch, even when it
+  // happens in live mode (where no new timer is set). Clearing only on the
+  // paged path let a timer scheduled just before a paged→live flip survive
+  // and fire into a later paged world — a duplicate page-1 fetch racing the
+  // one toggleCategoryFilter now issues directly on its live→paged exit.
   clearTimeout(_filterDebounce);
+  if (!get(pagedMode)) return;
   _filterDebounce = setTimeout(() => loadResults(true), 250);
 });

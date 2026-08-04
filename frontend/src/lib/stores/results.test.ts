@@ -3,9 +3,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ScanResult } from '$lib/api/types';
 
 const reconnectHandlers: Array<() => void> = [];
+/** WS handlers recorded by event name so tests can simulate backend-pushed
+ *  events (scheduled scans!) exactly as connection.ts would deliver them.
+ *  Both results.ts and scanner.ts register on this same mock at import. */
+const wsHandlers: Record<string, Array<(data: Record<string, unknown>) => void>> = {};
 vi.mock('$lib/stores/connection', () => ({
   connection: {
-    on: vi.fn(() => () => {}),
+    on: vi.fn((event: string, cb: (data: Record<string, unknown>) => void) => {
+      (wsHandlers[event] ??= []).push(cb);
+      return () => {};
+    }),
     onReconnect: (fn: () => void) => { reconnectHandlers.push(fn); return () => {}; }
   }
 }));
@@ -18,10 +25,16 @@ vi.mock('$lib/api/client', () => ({
     deselectAll: vi.fn().mockResolvedValue({}),
     getCachedResults: vi.fn(),
     getResults: vi.fn(),
+    scanStatus: vi.fn().mockResolvedValue({ state: 'idle' }),
     setBookmark: vi.fn().mockResolvedValue({ status: 'ok', bookmarked: true }),
     getBookmarks: vi.fn().mockResolvedValue({ items: [], count: 0 })
   }
 }));
+
+/** Deliver a backend-pushed WS event to every registered handler. */
+function fireWs(event: string, data: Record<string, unknown>) {
+  (wsHandlers[event] ?? []).forEach((fn) => fn(data));
+}
 
 const { api } = await import('$lib/api/client');
 
@@ -61,6 +74,7 @@ const {
   resolutionFilter,
   categoryFilter,
   toggleCategoryFilter,
+  setScanActive,
   activeNarrowingFilters,
   CATEGORY_KEYS,
   flagsFor,
@@ -1747,5 +1761,226 @@ describe('activeNarrowingFilters (names the "Hidden by: ..." culprits)', () => {
     clearAllFilters();
 
     expect(get(activeNarrowingFilters)).toEqual([]);
+  });
+});
+
+describe('category toggle exits live mode to the server cache', () => {
+  // Regression coverage for the "open the app, switch to 4K/Remux, list stays
+  // empty" bug: onMount's /results load locks the app into live mode, where a
+  // category chip only client-filtered the last scan's in-memory items — the
+  // fresh cached rows for every other category were never fetched. A toggle
+  // outside a running scan must now exit live mode and load from the cache;
+  // DURING a scan the stream owns the deck and the old client-side behavior
+  // must be preserved (see toggleCategoryFilter's doc comment).
+  beforeEach(() => {
+    // Flip out of paged mode BEFORE resetStores' filter writes: the debounced
+    // _filterKey subscription schedules its refetch only when pagedMode is
+    // true at write time, so this ordering guarantees no leftover debounce
+    // timer from setup can fire a stray loadResults mid-test and break the
+    // exact call-count assertions below.
+    pagedMode.set(false);
+    resetStores();
+    vi.clearAllMocks();
+    setScanActive(false);
+  });
+
+  it('live mode, no scan running: a toggle flips to paged mode and fetches the narrowed categories from the cache', async () => {
+    // The bug's exact shape: the deck holds only the last scan's TV items…
+    results.set([item({ url: 't1', title: 'TV Thing', category: 'tv', season: 1 })]);
+    pagedMode.set(false);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [
+        item({ url: 'k1', title: '4K Movie', category: '4k' }),
+        item({ url: 'r1', title: 'Remux Movie', category: 'remux' })
+      ],
+      total: 2, stats: { total: 2, missing: 2, upgrade: 0, library: 0 }, title_counts: {}
+    });
+    toggleCategoryFilter('tv'); // …and the user switches away from TV
+    expect(get(pagedMode)).toBe(true); // live-mode lock released synchronously
+    await vi.waitFor(() => {
+      expect(get(results).map((r) => r.url)).toEqual(['k1', 'r1']);
+    });
+    // and the fetch asked the server for exactly the remaining categories
+    expect(api.getCachedResults).toHaveBeenCalledWith(
+      expect.objectContaining({ category: '4k,remux' })
+    );
+  });
+
+  it('exactly ONE fetch fires — the direct call; the debounced subscription bailed while still in live mode', async () => {
+    pagedMode.set(false);
+    (api.getCachedResults as any).mockResolvedValue({ items: [], total: 0, title_counts: {} });
+    toggleCategoryFilter('remux');
+    // outlive the 250ms filter debounce: a second call arriving here would
+    // mean the direct path and the subscription both fired (or a stale timer
+    // from an earlier filter change survived — the always-clear fix above it)
+    await new Promise((r) => setTimeout(r, 350));
+    expect(api.getCachedResults).toHaveBeenCalledTimes(1);
+  });
+
+  it('while a scan is active the toggle stays live and client-filters (the stream owns the deck); after the scan it exits again — wired through the real scanner store', async () => {
+    const { scanState } = await import('./scanner');
+    try {
+      scanState.set('running'); // mirrors into setScanActive(true) in results.ts
+      results.set([
+        item({ url: 't1', title: 'TV Thing', category: 'tv', season: 1 }),
+        item({ url: 'k1', title: '4K Movie', category: '4k' })
+      ]);
+      pagedMode.set(false);
+      toggleCategoryFilter('tv'); // turn TV off mid-scan
+      expect(get(pagedMode)).toBe(false); // still live
+      expect(api.getCachedResults).not.toHaveBeenCalled();
+      expect(get(filteredResults).map((r) => r.url)).toEqual(['k1']); // old behavior kept
+
+      (api.getCachedResults as any).mockResolvedValueOnce({ items: [], total: 0, title_counts: {} });
+      scanState.set('idle'); // scan finished
+      toggleCategoryFilter('tv'); // toggle TV back on
+      expect(get(pagedMode)).toBe(true); // …and now the toggle exits live mode
+      await vi.waitFor(() => expect(api.getCachedResults).toHaveBeenCalledTimes(1));
+    } finally {
+      scanState.set('idle'); // never leak scan-active state into other suites
+    }
+  });
+
+  it('in paged mode a toggle still refetches via the debounce — and only once (the direct path must not double-fire)', async () => {
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValue({ items: [], total: 0, title_counts: {} });
+    toggleCategoryFilter('remux');
+    expect(api.getCachedResults).not.toHaveBeenCalled(); // debounced, not immediate
+    await vi.waitFor(() => expect(api.getCachedResults).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(api.getCachedResults).toHaveBeenCalledTimes(1); // and never a second
+  });
+});
+
+describe('category-switch review round 2: empty selection, remote scans, failure path', () => {
+  // Peer-review blockers on the first cut of the live-mode-exit fix:
+  // (1) an empty categoryFilter means "every known category OFF", but
+  //     buildResultParams used to OMIT the parameter when the array was empty
+  //     — and an omitted parameter means "no category filter" server-side, so
+  //     the exit path showed everything the instant the user deselected all.
+  //     The store now sends the '__none__' sentinel instead (backend contract
+  //     test: tests/test_results_category_sentinel.py).
+  // (2) scanActive mirrored only the LOCAL Start button's scanState, so a
+  //     scheduled/remote scan streaming into an open session (scanState still
+  //     'idle') wasn't protected — a toggle would fetch and churn against the
+  //     stream. Activity now also follows the stream itself (scan:result /
+  //     scan:complete), backend progress events, and an api.scanStatus
+  //     reconcile on (re)connect.
+  beforeEach(() => {
+    // paged OFF before resetStores' filter writes — see the round-1 suite's
+    // beforeEach for why this ordering keeps stray debounce timers impossible
+    pagedMode.set(false);
+    resetStores();
+    vi.clearAllMocks();
+    (api.scanStatus as any).mockResolvedValue({ state: 'idle' });
+    setScanActive(false);
+  });
+
+  it('live mode, only TV enabled, TV toggled off: the fetch says __none__, never "no filter"', async () => {
+    categoryFilter.set(['tv']);
+    results.set([item({ url: 't1', title: 'TV Thing', category: 'tv', season: 1 })]);
+    pagedMode.set(false);
+    (api.getCachedResults as any).mockResolvedValueOnce({ items: [], total: 0, title_counts: {} });
+    toggleCategoryFilter('tv'); // selection is now EMPTY
+    expect(get(pagedMode)).toBe(true);
+    await vi.waitFor(() => expect(api.getCachedResults).toHaveBeenCalledTimes(1));
+    expect(api.getCachedResults).toHaveBeenCalledWith(
+      expect.objectContaining({ category: '__none__' })
+    );
+  });
+
+  it('paged mode, final enabled category toggled off: the debounced fetch says __none__', async () => {
+    categoryFilter.set(['4k']); // narrowed while still live — no timer scheduled
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValue({ items: [], total: 0, title_counts: {} });
+    toggleCategoryFilter('4k'); // selection is now EMPTY
+    await vi.waitFor(() => expect(api.getCachedResults).toHaveBeenCalledTimes(1));
+    expect(api.getCachedResults).toHaveBeenCalledWith(
+      expect.objectContaining({ category: '__none__' })
+    );
+  });
+
+  it('a scheduled/remote scan (scanState idle) streaming in keeps toggles live; completion re-arms the exit', async () => {
+    const { handleScanResult, handleScanComplete } = await import('./results');
+    pagedMode.set(true); // browsing the cache when the scheduled scan starts
+    handleScanResult({ url: 'r1', title: 'Remote', category: 'tv', season: 1 });
+    expect(get(pagedMode)).toBe(false); // the stream took the deck
+    toggleCategoryFilter('tv');
+    expect(get(pagedMode)).toBe(false); // stream owns the deck — no exit
+    expect(api.getCachedResults).not.toHaveBeenCalled();
+    (api.getCachedResults as any).mockResolvedValueOnce({ items: [], total: 0, title_counts: {} });
+    handleScanComplete({ stats: { total: 1, missing: 1, upgrade: 0, library: 0 } });
+    toggleCategoryFilter('tv'); // toggle it back on, scan over
+    expect(get(pagedMode)).toBe(true); // exit re-armed
+    await vi.waitFor(() => expect(api.getCachedResults).toHaveBeenCalledTimes(1));
+  });
+
+  it('backend scan:progress alone (scheduled scan, nothing streamed yet) marks activity', async () => {
+    const { scanState } = await import('./scanner'); // registers its WS handlers
+    fireWs('scan:progress', { progress: 0.4, phase: 'scanning' });
+    expect(get(scanState)).toBe('running');
+    results.set([item({ url: 'x', title: 'X', category: 'tv', season: 1 })]);
+    pagedMode.set(false);
+    toggleCategoryFilter('tv');
+    expect(get(pagedMode)).toBe(false); // protected before the first result lands
+    expect(api.getCachedResults).not.toHaveBeenCalled();
+    fireWs('scan:complete', { stats: { total: 0, missing: 0, upgrade: 0, library: 0 } });
+    expect(get(scanState)).toBe('idle');
+  });
+
+  it('reconnecting into an already-running scan reconciles activity from api.scanStatus', async () => {
+    const { reconcileScanActivity, scanState } = await import('./scanner');
+    (api.scanStatus as any).mockResolvedValueOnce({ state: 'running' });
+    await reconcileScanActivity();
+    expect(get(scanState)).toBe('running'); // joined mid-scan, no local Start
+    results.set([item({ url: 'x', title: 'X', category: 'tv', season: 1 })]);
+    pagedMode.set(false);
+    toggleCategoryFilter('tv');
+    expect(get(pagedMode)).toBe(false);
+    expect(api.getCachedResults).not.toHaveBeenCalled();
+    scanState.set('idle'); // cleanup through the mirror
+  });
+
+  it('a scheduled scan completing with nothing found never wipes a paged browse view', async () => {
+    // Audit finding: scan:complete is broadcast to EVERY session, and the
+    // handler's "clear stale rows" branch had no pagedMode guard — so a
+    // scheduled (or other-client) scan that streamed nothing wiped the rows,
+    // selection, open detail panel and tab counts of a user who was just
+    // browsing the cache and never started a scan.
+    const { handleScanComplete, stats, selectedDetail } = await import('./results');
+    const row = item({ url: 'p1', title: 'Paged Row', category: '4k' });
+    pagedMode.set(true);
+    results.set([row]);
+    selectedKeys.set(new Set(['p1']));
+    selectedDetail.set(row);
+    stats.set({ total: 300, missing: 250, upgrade: 30, library: 20 });
+
+    fireWs('scan:complete', { stats: { total: 0, missing: 0, upgrade: 0, library: 0 } });
+
+    expect(get(results).map((r) => r.url)).toEqual(['p1']); // rows survive
+    expect(get(selectedKeys).has('p1')).toBe(true);         // selection survives
+    expect(get(selectedDetail)?.url).toBe('p1');            // detail panel survives
+    expect(get(stats).total).toBe(300);                     // counts not clobbered
+  });
+
+  it('a live scan that finds nothing still clears its own stale rows (the behavior the guard must preserve)', async () => {
+    const { handleScanResult, handleScanComplete } = await import('./results');
+    pagedMode.set(true);
+    handleScanResult({ url: 'a', title: 'A', category: '4k' }); // flips to live
+    expect(get(pagedMode)).toBe(false);
+    handleScanComplete({ stats: { total: 0, missing: 0, upgrade: 0, library: 0 } });
+    expect(get(results)).toEqual([]); // negative control: live mode still clears
+  });
+
+  it('cache-request failure after the live→paged exit never shows rows outside the selected categories', async () => {
+    const { loadError } = await import('./results');
+    results.set([item({ url: 't1', title: 'TV Thing', category: 'tv', season: 1 })]);
+    pagedMode.set(false);
+    (api.getCachedResults as any).mockRejectedValueOnce(new Error('network'));
+    toggleCategoryFilter('tv');
+    expect(get(pagedMode)).toBe(true);
+    expect(get(results)).toEqual([]); // stale live rows cleared at the exit itself
+    await vi.waitFor(() => expect(get(loadError)).toBe(true));
+    expect(get(results)).toEqual([]); // error state, not contradictory rows
   });
 });
