@@ -1941,6 +1941,37 @@ describe('category-switch review round 2: empty selection, remote scans, failure
     scanState.set('idle'); // cleanup through the mirror
   });
 
+  it('a scheduled scan completing with nothing found never wipes a paged browse view', async () => {
+    // Audit finding: scan:complete is broadcast to EVERY session, and the
+    // handler's "clear stale rows" branch had no pagedMode guard — so a
+    // scheduled (or other-client) scan that streamed nothing wiped the rows,
+    // selection, open detail panel and tab counts of a user who was just
+    // browsing the cache and never started a scan.
+    const { handleScanComplete, stats, selectedDetail } = await import('./results');
+    const row = item({ url: 'p1', title: 'Paged Row', category: '4k' });
+    pagedMode.set(true);
+    results.set([row]);
+    selectedKeys.set(new Set(['p1']));
+    selectedDetail.set(row);
+    stats.set({ total: 300, missing: 250, upgrade: 30, library: 20 });
+
+    fireWs('scan:complete', { stats: { total: 0, missing: 0, upgrade: 0, library: 0 } });
+
+    expect(get(results).map((r) => r.url)).toEqual(['p1']); // rows survive
+    expect(get(selectedKeys).has('p1')).toBe(true);         // selection survives
+    expect(get(selectedDetail)?.url).toBe('p1');            // detail panel survives
+    expect(get(stats).total).toBe(300);                     // counts not clobbered
+  });
+
+  it('a live scan that finds nothing still clears its own stale rows (the behavior the guard must preserve)', async () => {
+    const { handleScanResult, handleScanComplete } = await import('./results');
+    pagedMode.set(true);
+    handleScanResult({ url: 'a', title: 'A', category: '4k' }); // flips to live
+    expect(get(pagedMode)).toBe(false);
+    handleScanComplete({ stats: { total: 0, missing: 0, upgrade: 0, library: 0 } });
+    expect(get(results)).toEqual([]); // negative control: live mode still clears
+  });
+
   it('cache-request failure after the live→paged exit never shows rows outside the selected categories', async () => {
     const { loadError } = await import('./results');
     results.set([item({ url: 't1', title: 'TV Thing', category: 'tv', season: 1 })]);

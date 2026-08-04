@@ -543,21 +543,31 @@ export function handleScanComplete(data: Record<string, unknown>) {
   const s = data.stats as ScanStats;
   // The stream is over — re-arm the category-toggle live-mode exit (see
   // handleScanResult). Local scans also clear via the scanState mirror.
+  // Unconditional: the activity lifecycle is global, whoever scanned.
   scanActive = false;
+
+  const streamed = activeScanResultCount;
+  activeScanResultCount = 0; // per-scan counter: reset for every completion
+
+  // Everything below mutates THIS session's view, and scan:complete is
+  // broadcast to every session — so it applies only when this session is
+  // actually showing that scan's output (live mode). A user browsing the
+  // server-backed cache in paged mode must not have their rows, counts or
+  // cache banner rewritten by a scheduled or other-client scan.
+  if (get(pagedMode)) return;
+
   if (s) stats.set(s);
   // A completed live scan always supersedes the cache banner.
   fromCache.set(false);
 
-  // If a completed scan produced no streamed items, ensure stale results
-  // from an earlier run are cleared out of the UI.
-  if (!s || s.total === 0 || activeScanResultCount === 0) {
+  // If a completed live scan produced no streamed items, clear the stale
+  // rows from the earlier run (paged mode already returned above).
+  if (!s || s.total === 0 || streamed === 0) {
     results.set([]);
     selectedKeys.set(new Set());
     selectedDetail.set(null);
     focusedIndex.set(-1);
   }
-
-  activeScanResultCount = 0;
 }
 
 connection.on('scan:result', handleScanResult);
