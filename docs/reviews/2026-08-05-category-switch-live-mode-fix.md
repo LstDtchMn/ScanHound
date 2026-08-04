@@ -123,3 +123,28 @@ now mandatory (different regions of the file: `_filter_and_sort` sentinel vs
 
 The remaining declared limitation is unchanged: clicked-in-UI verification is post-deploy
 (prod behind CF Access).
+
+---
+
+## Round 3 (2026-08-06, full-program audit finding) -- commit `bc9981a`
+
+Not review feedback: found by the decomposed program audit, in this same file, and it is the
+same *class* as the reviewer's blocker 2 (this session's view being rewritten by a scan it did
+not start).
+
+`handleScanComplete` mutated this session's view unconditionally, but `scan:complete` is
+broadcast to EVERY session. A scheduled scan -- or another client's scan -- that streamed
+nothing into this session therefore hit the "clear stale results" branch and wiped the rows,
+selection and open detail panel of a user who was merely browsing the cache, while
+`stats.set(s)` clobbered the tab counts with the scan's zero stats and `fromCache.set(false)`
+dropped the cached-results banner from under still-cached rows.
+
+The view mutations now apply only in live mode, where this session is actually showing that
+scan's output; in paged mode `results` is server-owned cache content that no scan outcome
+speaks for. The activity flag (`scanActive`) and the per-scan streamed counter stay
+unconditional -- both are global facts about the scan, not view state.
+
+Evidence: red-first (mutating the guard back out fails the new paged-view test, 1 failed /
+127 skipped), with a **negative control** proving a LIVE scan that finds nothing still clears
+its own stale rows. Green at `bc9981a`: vitest **404/0 exit 0**, svelte-check 0 errors, vite
+build exit 0.
