@@ -12,6 +12,12 @@
     "2012"
    ]
   },
+  "2160 inside odd WxH fn": {
+   "res": [
+    "4K",
+    "1080p"
+   ]
+  },
   "3840x1600 scope fn only": {
    "res": [
     "?",
@@ -269,6 +275,6 @@
    ]
   }
  },
- "new_at_baseline": "5251804f70fcea7fe5df720c30c86b6b819ff865",
+ "new_at_baseline": "c48246c4253bbf82a991216ca050f9f0ca557da2",
  "old": "c1715297621128baa1253f857d929d88b854d0b7"
 }
