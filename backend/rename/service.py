@@ -2144,6 +2144,20 @@ class RenameService:
         if db is None:
             return {"ok": False, "queued": 0, "skipped": 0,
                     "error": "Database unavailable"}
+        # The freeze covers the MANUAL path too. `auto_rename_enabled` used to
+        # gate only the JDownloader post-extract hook, so with renaming
+        # nominally "paused" a Process-then-Apply click still performed a
+        # real, source-consuming move on real storage -- and the one guard
+        # that would have softened it (the move->hardlink downgrade in
+        # fileops.place_file) fires only for UNATTENDED applies, so with
+        # "require confirmation" on it never fires at all. Applying is the
+        # single irreversible step in this feature; the switch that claims to
+        # pause it now actually does.
+        if not self._cfg.get("auto_rename_enabled"):
+            return {"ok": False, "queued": 0, "skipped": 0, "paused": True,
+                    "error": ("Renaming is paused, so nothing was applied. "
+                              "Turn on Auto-rename in Settings → Renaming "
+                              "to apply renames.")}
         if not self._bulk_lock.acquire(blocking=False):
             return {"ok": False, "queued": 0, "skipped": 0, "busy": True}
         release_lock = True

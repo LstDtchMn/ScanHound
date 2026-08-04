@@ -3007,3 +3007,63 @@ class TestDetectMovedSourceFiles:
         assert result["checked"] >= 1  # job_bad (empty path) still got processed
         job_good_row = db.get_rename_job(job_good)
         assert job_good_row["status"] == "needs_review"  # untouched by the raise, not crashed
+
+
+class TestPauseGatesTheManualApplyPath:
+    """`auto_rename_enabled` used to gate ONLY the JDownloader post-extract
+    hook, so with renaming nominally "paused" a Process-then-Apply click
+    still performed a real, source-consuming move on real storage -- and
+    fileops' move->hardlink downgrade never softened it, because that fires
+    only for UNATTENDED applies and confirmation is required.
+
+    Applying is the single irreversible step in this feature, and all three
+    apply routes (single, bulk, apply-all-confident) funnel through
+    queue_apply, so gating it there covers every one. undo() and
+    resolve_keep_plex() are deliberately NOT gated: undo is a recovery
+    action you may well need while paused, and keep-plex only moves the
+    DOWNLOAD to recoverable trash without touching the library.
+    """
+
+    def test_apply_refuses_and_moves_nothing_while_paused(self, db, tmp_path):
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+
+        svc._reg.config["auto_rename_enabled"] = False   # the pause switch
+        out = svc.queue_apply([jid])
+
+        assert out["ok"] is False
+        assert out.get("paused") is True
+        assert "paused" in out["error"].lower()
+        assert os.path.exists(src)                        # source untouched
+        assert not os.path.isdir(lib) or _all_files(lib) == []  # nothing placed
+        assert db.get_rename_job(jid)["status"] != "applied"
+
+    def test_apply_works_again_once_unpaused(self, db, tmp_path):
+        # Negative control: the gate must not be a one-way door.
+        save_to, _src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+
+        svc._reg.config["auto_rename_enabled"] = False
+        assert svc.queue_apply([jid])["ok"] is False
+        svc._reg.config["auto_rename_enabled"] = True
+        out = svc.queue_apply([jid])
+
+        assert out["ok"] is True
+        assert out["queued"] == 1
+
+    def test_undo_is_not_gated_by_the_pause(self, db, tmp_path):
+        # Recovery must stay reachable while paused.
+        save_to, _src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+        assert svc.apply(jid)["ok"] is True
+
+        svc._reg.config["auto_rename_enabled"] = False
+        out = svc.undo(jid)
+
+        assert out["ok"] is True
