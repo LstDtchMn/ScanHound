@@ -21,14 +21,10 @@ def _reset_jobs():
 
 @pytest.fixture
 def client():
-    # auto_rename_enabled states this fixture's PRECONDITION explicitly:
-    # applying is gated on it (queue_apply refuses while renaming is paused,
-    # so "paused" covers the manual Process->Apply path and not just the
-    # JDownloader hook). Tests that exercise apply must therefore declare
-    # renaming as enabled rather than relying on the config default, which
-    # is False.
-    app = create_app(config_override={
-        "plex_url": "", "plex_token": "", "auto_rename_enabled": True})
+    # Applying is gated on rename_manual_apply_enabled, which defaults True,
+    # so no override is needed here -- stated because the gate exists and a
+    # future default flip would otherwise break these tests silently.
+    app = create_app(config_override={"plex_url": "", "plex_token": ""})
     with TestClient(app) as c:
         yield c
 
@@ -40,7 +36,6 @@ def _client_with_library(movie_library: str):
     root rather than accepting any path a caller supplies."""
     app = create_app(config_override={
         "plex_url": "", "plex_token": "",
-        "auto_rename_enabled": True,
         "auto_rename_movie_library": movie_library,
     })
     return TestClient(app)
@@ -132,13 +127,8 @@ class TestRenameApi:
         finally:
             os.remove(flag_path)
 
-    def test_status_defaults(self):
-        # Deliberately NOT the `client` fixture: this test is about the
-        # CONFIG DEFAULTS, and that fixture now declares auto_rename_enabled
-        # True as the precondition for applying.
-        app = create_app(config_override={"plex_url": "", "plex_token": ""})
-        with TestClient(app) as c:
-            body = c.get("/rename/status").json()
+    def test_status_defaults(self, client):
+        body = client.get("/rename/status").json()
         assert body["enabled"] is False
         assert body["confidence_threshold"] == 70
         assert body["counts"] == {}

@@ -3010,11 +3010,16 @@ class TestDetectMovedSourceFiles:
 
 
 class TestPauseGatesTheManualApplyPath:
-    """`auto_rename_enabled` used to gate ONLY the JDownloader post-extract
-    hook, so with renaming nominally "paused" a Process-then-Apply click
-    still performed a real, source-consuming move on real storage -- and
-    fileops' move->hardlink downgrade never softened it, because that fires
-    only for UNATTENDED applies and confirmation is required.
+    """Nothing used to gate the manual path: `auto_rename_enabled` covers
+    only the JDownloader post-extract hook, so with renaming nominally
+    "paused" a Process-then-Apply click still performed a real,
+    source-consuming move on real storage -- and fileops' move->hardlink
+    downgrade never softened it, because that fires only for UNATTENDED
+    applies and confirmation is required.
+
+    `rename_manual_apply_enabled` is a SEPARATE switch on purpose: gating on
+    auto_rename_enabled would mean renaming one file by hand also re-arms the
+    automatic pipeline, the wrong trade during a safety review.
 
     Applying is the single irreversible step in this feature, and all three
     apply routes (single, bulk, apply-all-confident) funnel through
@@ -3030,12 +3035,13 @@ class TestPauseGatesTheManualApplyPath:
         svc = _service(db, _matrix_search, movie_lib=lib)
         jid = svc.process_package("pkg", save_to)[0]
 
-        svc._reg.config["auto_rename_enabled"] = False   # the pause switch
+        svc._reg.config["rename_manual_apply_enabled"] = False  # the freeze switch
         out = svc.queue_apply([jid])
 
         assert out["ok"] is False
         assert out.get("paused") is True
-        assert "paused" in out["error"].lower()
+        # the message must name the setting to change, not just say "no"
+        assert "allow manual renames" in out["error"].lower()
         assert os.path.exists(src)                        # source untouched
         assert not os.path.isdir(lib) or _all_files(lib) == []  # nothing placed
         assert db.get_rename_job(jid)["status"] != "applied"
@@ -3047,13 +3053,26 @@ class TestPauseGatesTheManualApplyPath:
         svc = _service(db, _matrix_search, movie_lib=lib)
         jid = svc.process_package("pkg", save_to)[0]
 
-        svc._reg.config["auto_rename_enabled"] = False
+        svc._reg.config["rename_manual_apply_enabled"] = False
         assert svc.queue_apply([jid])["ok"] is False
-        svc._reg.config["auto_rename_enabled"] = True
+        svc._reg.config["rename_manual_apply_enabled"] = True
         out = svc.queue_apply([jid])
 
         assert out["ok"] is True
         assert out["queued"] == 1
+
+    def test_the_two_switches_are_independent(self, db, tmp_path):
+        """The whole point of the separate setting: automation off must NOT
+        block a deliberate manual apply, and vice versa."""
+        save_to, _src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+
+        svc._reg.config["auto_rename_enabled"] = False        # automation off
+        svc._reg.config["rename_manual_apply_enabled"] = True  # manual allowed
+
+        assert svc.queue_apply([jid])["ok"] is True
 
     def test_undo_is_not_gated_by_the_pause(self, db, tmp_path):
         # Recovery must stay reachable while paused.
@@ -3063,7 +3082,7 @@ class TestPauseGatesTheManualApplyPath:
         jid = svc.process_package("pkg", save_to)[0]
         assert svc.apply(jid)["ok"] is True
 
-        svc._reg.config["auto_rename_enabled"] = False
+        svc._reg.config["rename_manual_apply_enabled"] = False
         out = svc.undo(jid)
 
         assert out["ok"] is True

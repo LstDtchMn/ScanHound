@@ -476,6 +476,9 @@ export interface Settings {
 
   // Auto-rename + Plex sort + Ollama assist
   auto_rename_enabled?: boolean;
+  /** Whether the Renames page's Apply button may place files. Independent of
+   *  auto_rename_enabled, which arms the automatic JDownloader hook. */
+  rename_manual_apply_enabled?: boolean;
   auto_rename_confidence_threshold?: number;
   auto_rename_require_confirmation?: boolean;
   auto_rename_move_method?: string;

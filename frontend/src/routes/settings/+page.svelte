@@ -1434,6 +1434,18 @@
           </label>
 
           <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.rename_manual_apply_enabled ?? true}
+              onchange={(e) => settings.update((s) => ({ ...s, rename_manual_apply_enabled: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm font-medium">Allow manual renames</span>
+          </label>
+          <p class="text-xs text-[var(--text-secondary)] -mt-2 ml-7">
+            The Apply button on the Renames page. Independent of auto-rename above:
+            turn this off to freeze all file moves while still leaving the rest of the
+            page usable, or leave it on to rename by hand without arming automation.
+          </p>
+
+          <label class="flex items-center gap-3">
             <input type="checkbox" checked={$settings.auto_rename_require_confirmation ?? true}
               onchange={(e) => settings.update((s) => ({ ...s, auto_rename_require_confirmation: e.currentTarget.checked }))}
               class="accent-[var(--accent)]" />
