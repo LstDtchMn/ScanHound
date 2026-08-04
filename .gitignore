@@ -71,3 +71,7 @@ backend/frontend/
 
 # Project-local Git worktrees
 .worktrees/
+
+# promotion_window.py's live log -- written during an actual window run, not
+# a repo artifact. The FINISHED log is committed deliberately as evidence.
+docs/reviews/evidence/promotion-window-log.json
