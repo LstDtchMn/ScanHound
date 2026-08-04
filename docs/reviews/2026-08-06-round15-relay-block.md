@@ -6,7 +6,6 @@ artifacts, not any summary; if you find yourself reviewing a summary,
 STOP.
 
 Repository: LstDtchMn/ScanHound
-Branch: agent/hybrid-sweep-rebased
 Branch: agent/hybrid-sweep-rebased (resolve its tip; commits after the
   one below are documentation only)
 Last CODE commit -- this is what to review:
