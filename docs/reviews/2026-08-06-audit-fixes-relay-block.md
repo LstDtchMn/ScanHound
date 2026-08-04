@@ -10,8 +10,9 @@ STOP.
 
 Repository: LstDtchMn/ScanHound
 Branch: agent/audit-fixes-2026-08
-Head: 931648fa3c765de5e8ffd8302f1f5d594101af88
-Code commits: 440682d, 93f7060, fa56dfd, 03f0569, d0edea8, 9438d94
+Last CODE commit (what to review): 9438d94b51df53475721d0b4832be34dc6a69bba
+Branch: agent/audit-fixes-2026-08 -- resolve its tip for the docs commits
+Code commits, oldest first: 440682d, 93f7060, fa56dfd, 03f0569, d0edea8, 9438d94
 Base: main @ 7adb17b
 Prior reviewed head: 5387df2
 
