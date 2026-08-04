@@ -6,6 +6,7 @@ vi.mock('$lib/api/client', () => ({
 }));
 vi.mock('$lib/stores/results', () => ({
   clearResults: vi.fn(),
+  setScanActive: vi.fn(),
 }));
 
 import { selectedScanSource, searchThisSite } from './scanner';

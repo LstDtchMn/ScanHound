@@ -227,12 +227,38 @@ export const CATEGORY_LABELS: Record<CategoryKey, string> = { '4k': '4K', remux:
  *  (see `flagsFor` below), so there's exactly one writer. */
 export const categoryFilter = persisted<string[]>('sh-category-filter', [...CATEGORY_KEYS]);
 
+/** True while a locally-started scan is running/stopping. Mirrored in from
+ *  scanner.ts (which subscribes its scanState store to setScanActive below) —
+ *  results.ts cannot import the scanner store itself without an import cycle:
+ *  scanner.ts already imports clearResults from here. */
+let scanActive = false;
+export function setScanActive(active: boolean) {
+  scanActive = active;
+}
+
 /** Toggle a normalized category key in/out of categoryFilter. The ONLY writer
  *  of categoryFilter (see its doc comment above) — called directly by
  *  FilterBar's Category chips, and by ScanControls' category chips (which
- *  map their per-source key to its normalized form via normCat first). */
+ *  map their per-source key to its normalized form via normCat first).
+ *
+ *  A category chip is a browse-scope switch, not a refinement: in live mode
+ *  `results` holds ONLY the last scan's streamed items, so client-filtering
+ *  by category shows an empty deck for every category that scan didn't cover
+ *  — even though the server cache holds fresh rows for it. So a toggle
+ *  outside a running scan exits live mode and refetches from the cache.
+ *  While a scan is active the stream owns the deck (handleScanResult clears
+ *  paged rows and flips back to live on the next streamed item — flipping
+ *  here would just churn against it), so the pre-existing client-side
+ *  filtering behavior is kept for that window. */
 export function toggleCategoryFilter(key: CategoryKey) {
   categoryFilter.update((c) => (c.includes(key) ? c.filter((x) => x !== key) : [...c, key]));
+  if (!get(pagedMode) && !scanActive) {
+    // Flip AFTER the update above: the debounced _filterKey subscription has
+    // already fired and bailed (it saw live mode), so this single direct
+    // loadResults is the one fetch — no double-load.
+    pagedMode.set(true);
+    loadResults(true);
+  }
 }
 
 /** Per-source scan-category definitions for ScanControls' checkboxes/chips.
@@ -1285,7 +1311,13 @@ let _filterDebounce: ReturnType<typeof setTimeout> | undefined;
 let _filterKeyPrimed = false;
 _filterKey.subscribe(() => {
   if (!_filterKeyPrimed) { _filterKeyPrimed = true; return; } // skip initial fire
-  if (!get(pagedMode)) return;
+  // Clear any pending refetch BEFORE the mode check, not after: a filter
+  // change always invalidates a previously scheduled refetch, even when it
+  // happens in live mode (where no new timer is set). Clearing only on the
+  // paged path let a timer scheduled just before a paged→live flip survive
+  // and fire into a later paged world — a duplicate page-1 fetch racing the
+  // one toggleCategoryFilter now issues directly on its live→paged exit.
   clearTimeout(_filterDebounce);
+  if (!get(pagedMode)) return;
   _filterDebounce = setTimeout(() => loadResults(true), 250);
 });

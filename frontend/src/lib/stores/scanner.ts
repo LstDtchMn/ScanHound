@@ -2,12 +2,16 @@ import { writable } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { connection } from './connection';
 import { addToast } from './notifications';
-import { clearResults, type ScanSource } from '$lib/stores/results';
+import { clearResults, setScanActive, type ScanSource } from '$lib/stores/results';
 
 export type ScanState = 'idle' | 'running' | 'stopping';
 export type ScanType = 'deep' | 'incremental' | 'loaded' | 'search';
 
 export const scanState = writable<ScanState>('idle');
+// Mirror scan activity into results.ts (see setScanActive's doc comment for
+// why the dependency points this way): every scanState writer — startScan,
+// scan:complete/error, the idle-reconcile poll — flows through here.
+scanState.subscribe((s) => setScanActive(s !== 'idle'));
 export const scanProgress = writable<number>(0);
 export const scanPhase = writable<string>('');
 export const scanItemCount = writable<number>(0);

@@ -61,6 +61,7 @@ const {
   resolutionFilter,
   categoryFilter,
   toggleCategoryFilter,
+  setScanActive,
   activeNarrowingFilters,
   CATEGORY_KEYS,
   flagsFor,
@@ -1747,5 +1748,93 @@ describe('activeNarrowingFilters (names the "Hidden by: ..." culprits)', () => {
     clearAllFilters();
 
     expect(get(activeNarrowingFilters)).toEqual([]);
+  });
+});
+
+describe('category toggle exits live mode to the server cache', () => {
+  // Regression coverage for the "open the app, switch to 4K/Remux, list stays
+  // empty" bug: onMount's /results load locks the app into live mode, where a
+  // category chip only client-filtered the last scan's in-memory items — the
+  // fresh cached rows for every other category were never fetched. A toggle
+  // outside a running scan must now exit live mode and load from the cache;
+  // DURING a scan the stream owns the deck and the old client-side behavior
+  // must be preserved (see toggleCategoryFilter's doc comment).
+  beforeEach(() => {
+    // Flip out of paged mode BEFORE resetStores' filter writes: the debounced
+    // _filterKey subscription schedules its refetch only when pagedMode is
+    // true at write time, so this ordering guarantees no leftover debounce
+    // timer from setup can fire a stray loadResults mid-test and break the
+    // exact call-count assertions below.
+    pagedMode.set(false);
+    resetStores();
+    vi.clearAllMocks();
+    setScanActive(false);
+  });
+
+  it('live mode, no scan running: a toggle flips to paged mode and fetches the narrowed categories from the cache', async () => {
+    // The bug's exact shape: the deck holds only the last scan's TV items…
+    results.set([item({ url: 't1', title: 'TV Thing', category: 'tv', season: 1 })]);
+    pagedMode.set(false);
+    (api.getCachedResults as any).mockResolvedValueOnce({
+      items: [
+        item({ url: 'k1', title: '4K Movie', category: '4k' }),
+        item({ url: 'r1', title: 'Remux Movie', category: 'remux' })
+      ],
+      total: 2, stats: { total: 2, missing: 2, upgrade: 0, library: 0 }, title_counts: {}
+    });
+    toggleCategoryFilter('tv'); // …and the user switches away from TV
+    expect(get(pagedMode)).toBe(true); // live-mode lock released synchronously
+    await vi.waitFor(() => {
+      expect(get(results).map((r) => r.url)).toEqual(['k1', 'r1']);
+    });
+    // and the fetch asked the server for exactly the remaining categories
+    expect(api.getCachedResults).toHaveBeenCalledWith(
+      expect.objectContaining({ category: '4k,remux' })
+    );
+  });
+
+  it('exactly ONE fetch fires — the direct call; the debounced subscription bailed while still in live mode', async () => {
+    pagedMode.set(false);
+    (api.getCachedResults as any).mockResolvedValue({ items: [], total: 0, title_counts: {} });
+    toggleCategoryFilter('remux');
+    // outlive the 250ms filter debounce: a second call arriving here would
+    // mean the direct path and the subscription both fired (or a stale timer
+    // from an earlier filter change survived — the always-clear fix above it)
+    await new Promise((r) => setTimeout(r, 350));
+    expect(api.getCachedResults).toHaveBeenCalledTimes(1);
+  });
+
+  it('while a scan is active the toggle stays live and client-filters (the stream owns the deck); after the scan it exits again — wired through the real scanner store', async () => {
+    const { scanState } = await import('./scanner');
+    try {
+      scanState.set('running'); // mirrors into setScanActive(true) in results.ts
+      results.set([
+        item({ url: 't1', title: 'TV Thing', category: 'tv', season: 1 }),
+        item({ url: 'k1', title: '4K Movie', category: '4k' })
+      ]);
+      pagedMode.set(false);
+      toggleCategoryFilter('tv'); // turn TV off mid-scan
+      expect(get(pagedMode)).toBe(false); // still live
+      expect(api.getCachedResults).not.toHaveBeenCalled();
+      expect(get(filteredResults).map((r) => r.url)).toEqual(['k1']); // old behavior kept
+
+      (api.getCachedResults as any).mockResolvedValueOnce({ items: [], total: 0, title_counts: {} });
+      scanState.set('idle'); // scan finished
+      toggleCategoryFilter('tv'); // toggle TV back on
+      expect(get(pagedMode)).toBe(true); // …and now the toggle exits live mode
+      await vi.waitFor(() => expect(api.getCachedResults).toHaveBeenCalledTimes(1));
+    } finally {
+      scanState.set('idle'); // never leak scan-active state into other suites
+    }
+  });
+
+  it('in paged mode a toggle still refetches via the debounce — and only once (the direct path must not double-fire)', async () => {
+    pagedMode.set(true);
+    (api.getCachedResults as any).mockResolvedValue({ items: [], total: 0, title_counts: {} });
+    toggleCategoryFilter('remux');
+    expect(api.getCachedResults).not.toHaveBeenCalled(); // debounced, not immediate
+    await vi.waitFor(() => expect(api.getCachedResults).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(api.getCachedResults).toHaveBeenCalledTimes(1); // and never a second
   });
 });
