@@ -62,6 +62,38 @@ MUTATIONS = [
         "VOLUME_ANOMALY_ENABLED = True",
         ["tests/test_sweep_structure.py::TestVolumeAnomalyIsDisabledUntilCalibrated::test_a_volume_collapse_does_NOT_fire_by_default"],
     ),
+    (
+        "round-13 R-5 — listing composition drops DETAIL evidence",
+        "backend/scanner_service.py",
+        "        grammar.TypeEvidence(grammar.MediaType.TV,\n"
+        "                             grammar.Authority.DETAIL, 'detail-filename')\n"
+        "        if details.get('is_tv') else None,",
+        "        None,  # MUTATION: detail evidence dropped",
+        ["tests/test_r5_boundary_suite_part2.py::TestCrossPathMediaType::test_detail_filename_overrides_the_weaker_route_and_title"],
+    ),
+    (
+        "round-13 R-5 — listing composition drops TITLE evidence",
+        "backend/scanner_service.py",
+        "        grammar.title_type_evidence(post_info.get('title') or '',\n"
+        "                                    source='listing-title'),",
+        "        None,  # MUTATION: title evidence dropped",
+        ["tests/test_r5_boundary_suite_part2.py::TestCrossPathMediaType::test_media_type_and_provisionality_agree"],
+    ),
+    (
+        "round-13 Q2 — hydration adapter drops episode_end",
+        "backend/hdencode_candidate_service.py",
+        '    put("episode_end", _int_or_none(payload.get("episode_end")))',
+        "    pass  # MUTATION: episode_end dropped by the adapter",
+        ["tests/test_detail_hydration_composition.py::TestEpisodeRangeSemantics::test_glued_multi_episode_file_carries_its_parsed_range"],
+    ),
+    (
+        "round-13 Q2 — hydration adapter drops hevc evidence",
+        "backend/hdencode_candidate_service.py",
+        '    if payload.get("hevc") is True:\n'
+        '        updates["hevc_evidence"] = "asserted"',
+        "    pass  # MUTATION: hevc evidence dropped by the adapter",
+        ["tests/test_detail_hydration_composition.py::TestHevcEvidence::test_detail_codec_token_asserts_hevc"],
+    ),
 ]
 
 

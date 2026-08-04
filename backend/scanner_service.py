@@ -1041,6 +1041,9 @@ class ScannerService:
     # ── Post processing ───────────────────────────────────────────────
 
     async def _process_posts(self, all_posts: List[Dict], scraper, num_threads: int):
+        # Media-type resolution lives in resolve_listing_media_type (module
+        # level, below this class) — THE one listing composition, executed
+        # directly by the R-5 cross-path suite. Do not inline a copy here.
         processed = 0
         total_posts = len(all_posts)
 
@@ -1060,29 +1063,7 @@ class ScannerService:
                 if not details:
                     return None
 
-                # Media type is resolved by AUTHORITY, not by boolean OR. The
-                # old rule was `details['is_tv'] or post_info['type'] == 'tv'`,
-                # which could not represent a contradiction and so resolved
-                # every one of them to TV — and it never consulted the listing
-                # title at all, which is how this path and the RSS path came to
-                # disagree about "Complete Series" and friends.
-                verdict = grammar.resolve_media_type([
-                    # The crawl route is the WEAKEST signal: which category page
-                    # a release was found on is routing, not identity.
-                    grammar.TypeEvidence(
-                        grammar.MediaType.TV if post_info['type'] == 'tv'
-                        else grammar.MediaType.MOVIE,
-                        grammar.Authority.ROUTE, 'listing-route')
-                    if post_info.get('type') in ('tv', 'movie') else None,
-                    grammar.title_type_evidence(post_info.get('title') or '',
-                                                source='listing-title'),
-                    # The detail filename outranks the title. Only a positive
-                    # is_tv is evidence: False means "no season token in the
-                    # filename", which is not a claim that this is a film.
-                    grammar.TypeEvidence(grammar.MediaType.TV,
-                                         grammar.Authority.DETAIL, 'detail-filename')
-                    if details.get('is_tv') else None,
-                ])
+                verdict = resolve_listing_media_type(post_info, details)
                 # AMBIGUOUS is preserved as a distinct downstream signal rather
                 # than collapsed here; `is_tv` stays boolean for the existing
                 # consumers, and a genuine clash resolves to NOT-tv so nothing
@@ -1815,3 +1796,37 @@ class ScannerService:
         except Exception as e:
             logger.error("Failed to load download history: %s", e)
             return set()
+
+
+def resolve_listing_media_type(post_info, details):
+    """THE listing-path media-type composition (round-13 R-5 extraction).
+
+    Media type is resolved by AUTHORITY, not by boolean OR. The old rule was
+    ``details['is_tv'] or post_info['type'] == 'tv'``, which could not
+    represent a contradiction and so resolved every one of them to TV -- and
+    it never consulted the listing title at all, which is how this path and
+    the RSS path came to disagree about "Complete Series" and friends.
+
+    Inputs: ``post_info['type']`` (crawl route, 'tv'/'movie'/other),
+    ``post_info['title']`` (listing title), ``details['is_tv']`` (the detail
+    filename's positive TV signal). Called by ``_process_posts``'s worker and
+    the rescan route; executed DIRECTLY by the R-5 cross-path suite, so any
+    drift here fails tests rather than silently diverging from the RSS path.
+    """
+    return grammar.resolve_media_type([
+        # The crawl route is the WEAKEST signal: which category page
+        # a release was found on is routing, not identity.
+        grammar.TypeEvidence(
+            grammar.MediaType.TV if post_info['type'] == 'tv'
+            else grammar.MediaType.MOVIE,
+            grammar.Authority.ROUTE, 'listing-route')
+        if post_info.get('type') in ('tv', 'movie') else None,
+        grammar.title_type_evidence(post_info.get('title') or '',
+                                    source='listing-title'),
+        # The detail filename outranks the title. Only a positive
+        # is_tv is evidence: False means "no season token in the
+        # filename", which is not a claim that this is a film.
+        grammar.TypeEvidence(grammar.MediaType.TV,
+                             grammar.Authority.DETAIL, 'detail-filename')
+        if details.get('is_tv') else None,
+    ])

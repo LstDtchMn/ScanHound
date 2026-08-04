@@ -20,9 +20,12 @@ from tests.test_r5_boundary_suite import MATRIX, _rss_row
 # ── 1. cross-path media type + provisionality via the REAL compositions ──────
 
 class TestCrossPathMediaType:
-    """RSS verdict (parse_feed's resolver call) vs the deployed listing
-    composition (scanner_service's resolver call, mirrored evidence-for-
-    evidence) -- both are the REAL production compositions."""
+    """RSS verdict (the real parse_feed) vs THE listing composition —
+    resolve_listing_media_type itself, the exact function _process_posts'
+    worker and the rescan route call. Round-13: the previous version of this
+    class restated the evidence list inline, so a drift inside
+    scanner_service would have stayed green; now the production function is
+    executed directly and any drift fails here."""
 
     ROUTE = {"TV": "tv", "Movies": "movie", "Weird-Category": None}
 
@@ -30,20 +33,50 @@ class TestCrossPathMediaType:
                                       "ambiguous_season", "ordinary_movie",
                                       "route_title_conflict", "unresolved_type"])
     def test_media_type_and_provisionality_agree(self, name):
-        from backend import release_grammar as grammar
+        from backend.scanner_service import resolve_listing_media_type
         rss = _rss_row(name)
         title, category = MATRIX[name]
-        route = self.ROUTE[category]
-        verdict = grammar.resolve_media_type([
-            grammar.TypeEvidence(
-                grammar.MediaType.TV if route == "tv"
-                else grammar.MediaType.MOVIE,
-                grammar.Authority.ROUTE, "listing-route")
-            if route in ("tv", "movie") else None,
-            grammar.title_type_evidence(title, source="listing-title"),
-        ])
+        verdict = resolve_listing_media_type(
+            # ingest-time comparison: no detail page has been scraped yet, and
+            # is_tv=False contributes NO evidence by the function's contract
+            {"type": self.ROUTE[category], "title": title},
+            {"is_tv": False},
+        )
         assert verdict.media_type.value == rss["media_type"], name
         assert verdict.provisional == bool(rss["media_type_provisional"]), name
+
+    def test_detail_filename_overrides_the_weaker_route_and_title(self):
+        """The DETAIL evidence slot, executed on BOTH real paths: a
+        movie-routed post whose detail page proves a season token resolves TV
+        via detail-filename on the listing path, and the RSS path's real
+        hydration composition (_candidate_updates) reaches the same
+        non-provisional verdict from the same parsed details."""
+        from unittest.mock import MagicMock
+
+        from backend.hdencode_candidate_service import _candidate_updates
+        from backend.scanner_service import resolve_listing_media_type
+        from backend.scrapers import WebScrapers
+        from tests.test_scrapers_extended import (
+            MockApp, _FakeResponse, _build_detail_html)
+
+        ws = WebScrapers(MockApp())
+        fake = MagicMock()
+        fake.get.return_value = _FakeResponse(
+            _build_detail_html("Show.Name.S01E02.1080p.WEB.mkv"))
+        details = ws.scrape_details(
+            "https://example.com/d", headers={}, scraper=fake)
+        assert details["is_tv"] is True  # the REAL parse produced the signal
+
+        verdict = resolve_listing_media_type(
+            {"type": "movie", "title": "Show Name 1080p WEB"}, details)
+        assert verdict.media_type.value == "tv"
+        assert verdict.provisional is False  # decided by DETAIL, not ROUTE
+        assert any("detail-filename" in b for b in verdict.because)
+        assert any("overruled" in b for b in verdict.because)  # route lost
+
+        updates = _candidate_updates(details)
+        assert updates["media_type"] == "tv"
+        assert bool(updates["media_type_provisional"]) is verdict.provisional
 
 
 # ── 2 + 4. the real /results/cached route ────────────────────────────────────
