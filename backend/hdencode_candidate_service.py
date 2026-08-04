@@ -426,6 +426,7 @@ def _candidate_updates(payload):
     put("description_year", _int_or_none(payload.get("year")))
     put("season", _int_or_none(payload.get("season")))
     put("episode", _int_or_none(payload.get("episode_number")))
+    put("episode_end", _int_or_none(payload.get("episode_end")))
     put("resolution", str(payload.get("res") or "").strip() or None)
     put("size_text", str(payload.get("size") or "").strip() or None)
     put("size_gb", _size_gb(payload.get("size")))
@@ -434,6 +435,13 @@ def _candidate_updates(payload):
 
     if "dovi" in payload and payload.get("dovi") is not None:
         updates["dv_evidence"] = "asserted" if payload.get("dovi") is True else "negated"
+
+    # Codec evidence is positive-only: the scraper emits hevc=True on an exact
+    # shared-vocabulary token and None otherwise — a filename without the
+    # token is not thereby H.264, so absence changes nothing (round-13: this
+    # column was sink-only; the detail producer now exists).
+    if payload.get("hevc") is True:
+        updates["hevc_evidence"] = "asserted"
 
     if "hdr" in payload and payload.get("hdr") is not None:
         hdr_value=str(payload.get("hdr") or "").strip(); hdr_upper=hdr_value.upper()

@@ -25,8 +25,21 @@ from backend.hdencode_coordinator import (
 )
 from backend.hdencode_transport import create_source_http_client
 from backend.rename import llm_identify as _llm
+from backend.sources.hdencode_feed_parser import HEVC_TOKEN_RE
 
 logger = logging.getLogger(__name__)
+
+#: Version stamp for what DETAIL hydration extracts — persisted to
+#: hdencode_candidates.detail_parse_version at completion, compared by
+#: reconcile_derived_versions: completed rows stamped with anything else are
+#: marked refetch_required and requeued, so a capability change here heals
+#: gradually (hydration-limit per cycle) instead of instantly.
+#: Deliberately DECOUPLED from release_grammar.GRAMMAR_VERSION (round-13): a
+#: detail-only extraction change must not force an offline reparse of every
+#: feed fact, and a grammar change already reaches detail rows through the
+#: refetch leg because the stamps then differ too.
+#: v2: episode_end (glued-range) and hevc codec evidence join the payload.
+DETAIL_PARSE_VERSION = "hdencode-detail-v2"
 
 # HDEncode pacing and authorization now live in HDEncodeTrafficCoordinator.
 
@@ -238,6 +251,7 @@ class DetailScraper:
             is_tv = False
             season = None
             episode_number = None
+            episode_end = None
             year = 0
 
             def _clean_cut(raw):
@@ -257,12 +271,22 @@ class DetailScraper:
                 season = se.season
                 episode_number = se.episode
 
-                # OVERRIDE: multiple UNIQUE episodes in the file list mean a
-                # Season Pack, not a single episode
-                if episode_number is not None and len(unique_ep_nums) > 1:
-                    if self.app.config.get("debug_mode"):
-                        self.app.safe_log(f"[DEBUG] '{full_fn}' has {len(unique_ep_nums)} unique eps -> Treating as Season Pack")
-                    episode_number = None
+                # Pack vs glued-range (round-13 semantics): a SEPARATE
+                # filename line carrying an episode outside the primary
+                # file's own parsed range means a Season Pack — no single
+                # episode number describes it, and a contiguous range is
+                # never invented from the file count. But a glued
+                # multi-episode file (S01E01E03) or mirrored copies of the
+                # same file keep their episode and carry the grammar's
+                # parsed range end.
+                if episode_number is not None:
+                    own_range = set(range(se.episode, (se.episode_end or se.episode) + 1))
+                    if unique_ep_nums and not unique_ep_nums.issubset(own_range):
+                        if self.app.config.get("debug_mode"):
+                            self.app.safe_log(f"[DEBUG] '{full_fn}' has {len(unique_ep_nums)} unique eps -> Treating as Season Pack")
+                        episode_number = None
+                    else:
+                        episode_end = se.episode_end
 
                 clean_title = _clean_cut(full_fn[:se.start]) or full_fn
             else:
@@ -359,6 +383,10 @@ class DetailScraper:
             dovi = False
             if re.search(r'\b(DV|DoVi|Dolby\s?Vision)\b', full_fn, re.IGNORECASE):
                 dovi = True
+            # Codec evidence from THE shared HEVC vocabulary (the same regex
+            # the feed-title parse asserts with), positive-only: a release
+            # filename without the token is NOT thereby H.264.
+            hevc = True if HEVC_TOKEN_RE.search(full_fn) else None
             hdr_match = re.search(r'Color primaries\.*:\s*(.+)', text, re.IGNORECASE)
             if hdr_match:
                 ht = hdr_match.group(1).lower()
@@ -415,7 +443,9 @@ class DetailScraper:
                 'is_tv': is_tv,
                 'season': season,
                 'episode_number': episode_number,
+                'episode_end': episode_end,
                 'episodes': episodes_count if is_tv else None,
+                'hevc': hevc,
                 'posted_date': posted_date,
                 'multi_episode_hint': multi_episode_hint,
             }

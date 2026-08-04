@@ -143,11 +143,13 @@ class TestR4VersionStamps:
         assert row["detail_parse_version"] is None
 
     def test_hydration_stamps_detail_parse_version(self, db):
-        from backend.release_grammar import GRAMMAR_VERSION
+        # Round-13: the detail stamp is the SCRAPER's own version, decoupled
+        # from the grammar's (see DETAIL_PARSE_VERSION's doc comment).
+        from backend.detail_scraper import DETAIL_PARSE_VERSION
         _ingest(db, _body("Movie 2026 2160p WEB-DL - 12.0 GB"), "sha-v1")
         db.complete_hdencode_hydration(
             URL, payload={"url": URL}, candidate_updates={"media_type": "movie"})
-        assert _row(db)["detail_parse_version"] == GRAMMAR_VERSION
+        assert _row(db)["detail_parse_version"] == DETAIL_PARSE_VERSION
 
     def test_cache_upsert_stamps_parse_version(self, db):
         from backend.release_grammar import GRAMMAR_VERSION

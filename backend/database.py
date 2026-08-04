@@ -1961,6 +1961,14 @@ class DatabaseManager:
                 conn.rollback()
                 raise
 
+    @staticmethod
+    def _detail_parse_version():
+        """Lazy import: detail_scraper pulls bs4/HTTP-transport modules at
+        import time and database.py must stay importable without them —
+        matches the function-local GRAMMAR_VERSION import idiom below."""
+        from backend.detail_scraper import DETAIL_PARSE_VERSION
+        return DETAIL_PARSE_VERSION
+
     def reconcile_derived_versions(self):
         """R-4: turn version mismatches into visible staleness (round-10 model).
 
@@ -1988,7 +1996,7 @@ class DatabaseManager:
                 WHERE hydration_state = 'completed'
                   AND COALESCE(detail_parse_version, '') != ?
                   AND derived_state != 'refetch_required'
-                """, (GRAMMAR_VERSION,))
+                """, (self._detail_parse_version(),))
             refetch = cur.rowcount
             cur.execute(
                 """
@@ -2184,7 +2192,10 @@ class DatabaseManager:
                         else None
                     ),
                     1 if updates.get("description_complete") else 0,
-                    release_grammar.GRAMMAR_VERSION,
+                    # The DETAIL extraction's own version, not the grammar's:
+                    # what this stamp certifies is "the scraper that produced
+                    # these facts" (see DETAIL_PARSE_VERSION's doc comment).
+                    self._detail_parse_version(),
                     updates.get("identity_state"),
                     now,
                     canonical_url,

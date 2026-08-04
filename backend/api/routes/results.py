@@ -49,8 +49,9 @@ def _effective_category(item: Dict[str, Any]) -> str:
 def _bookmark_key_for_item(i: Dict[str, Any]):
     """Bookmark identity: imdb id when present; otherwise title/year plus the
     CARRIED media-type verdict (round-11 -- season-derived typing gave a
-    tokenless TV result and its saved TV bookmark different keys). Ambiguous
-    verdicts keep the legacy season heuristic so keys stay stable.
+    tokenless TV result and its saved TV bookmark different keys). An
+    unresolved/absent verdict keys as its own 'ambiguous' discriminator
+    (round-12 F5); season is NEVER part of bookmark identity.
     NOTE: bookmarks saved under the old mis-derived keys will no longer
     match; they were keyed wrongly and are re-savable in one click."""
     imdb = i.get("imdb_id")
