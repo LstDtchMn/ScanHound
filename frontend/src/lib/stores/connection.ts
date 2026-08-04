@@ -95,9 +95,22 @@ function createConnection() {
     const base = wsBase();
     const nonce = getAuthNonce();
     const wsUrl = nonce ? `${base}?token=${encodeURIComponent(nonce)}` : base;
-    ws = new WebSocket(wsUrl);
+    // Bind every handler to THIS socket rather than to the shared `ws`.
+    // A disconnect()+connect() cycle — which saveServerConfig does back to
+    // back — races the old socket's close event, because close is delivered
+    // asynchronously. The old handlers then ran against the NEW socket's
+    // world: onclose nulled the shared `ws`, orphaning the socket that had
+    // just been created, and (since connect() had already reset
+    // manualDisconnect) scheduled a reconnect that opened a SECOND live
+    // socket. Every broadcast was dispatched twice for the life of the tab,
+    // and disconnect() could never close the orphan because `ws` no longer
+    // referred to it. Deterministic, not a rare race.
+    const socket = new WebSocket(wsUrl);
+    ws = socket;
+    const isCurrent = () => ws === socket;
 
-    ws.onopen = () => {
+    socket.onopen = () => {
+      if (!isCurrent()) { socket.close(); return; }  // superseded: stay inert
       reconnectDelay = RECONNECT_DELAY;
       retryCount = 0;
       if (hasConnectedOnce) {
@@ -106,7 +119,8 @@ function createConnection() {
       hasConnectedOnce = true;
     };
 
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (!isCurrent()) return;   // an orphan must never dispatch
       try {
         const msg: WsMessage = JSON.parse(event.data);
         if (msg.type === 'connected') {
@@ -119,7 +133,11 @@ function createConnection() {
       }
     };
 
-    ws.onclose = () => {
+    socket.onclose = () => {
+      // Only the CURRENT socket may report disconnection, clear the shared
+      // reference, or schedule a reconnect. A superseded socket closing is
+      // expected and must be silent.
+      if (!isCurrent()) return;
       state.set('disconnected');
       ws = null;
       if (!manualDisconnect) {
@@ -127,8 +145,8 @@ function createConnection() {
       }
     };
 
-    ws.onerror = () => {
-      ws?.close();
+    socket.onerror = () => {
+      socket.close();   // close THIS socket, never whatever `ws` now points at
     };
   }
 
