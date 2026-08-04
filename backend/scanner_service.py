@@ -24,6 +24,16 @@ from backend.app_service import (
 )
 from backend.database import DatabaseManager
 from backend.config import source_enabled
+from backend.scan_metrics import (
+    DiscardCode,
+    FutureTerminalState,
+    PostOutcome,
+    ScanStage,
+    ScanStageCounters,
+    TerminalKind,
+    conservation_errors_of,
+    summary_line_of,
+)
 from backend.hdencode_coordinator import (
     HDEncodeRequestCancelled,
     HDEncodeTrafficDenied,
@@ -178,6 +188,31 @@ def is_full_disc_title(title: Optional[str]) -> bool:
     return bool(_FULL_DISC_TITLE_RE.match(title))
 
 
+def _future_terminal_state(fut) -> Optional[FutureTerminalState]:
+    """Classify a Future's TERMINAL state, or None if it has none yet.
+
+    Returning None rather than guessing is the point: ``reconcile`` refuses to
+    close a ticket without a terminal state and counts the misuse, so a worker
+    still running cannot have its outcome invented for it.
+
+    Order matters. ``.exception()`` raises CancelledError on a cancelled future
+    and blocks on one that is not done, so both are ruled out first.
+    """
+    try:
+        if fut.cancelled():
+            return FutureTerminalState.CANCELLED_BEFORE_START
+        if not fut.done():
+            return None
+        if fut.exception() is not None:
+            return FutureTerminalState.COMPLETED_EXCEPTION
+        return (
+            FutureTerminalState.COMPLETED_WITH_DATA if fut.result()
+            else FutureTerminalState.COMPLETED_FALSEY
+        )
+    except Exception:  # noqa: BLE001 - an unclassifiable future is not terminal
+        return None
+
+
 # ── ScannerService ────────────────────────────────────────────────────
 
 class ScannerService:
@@ -220,6 +255,10 @@ class ScannerService:
         # URLs seen in the most recent listing crawl (new + skipped), exposed so
         # the background scanner can refresh last_seen on still-listed items.
         self._last_crawl_seen_urls: Set[str] = set()
+        # Per-stage counters from the most recent post-processing pass. None
+        # until one has run; a scan that produced no numbers must be readable
+        # as exactly that rather than as a scan of zero posts.
+        self._last_scan_metrics = None
         # True when the last crawl stopped early at cached content — the scanner
         # then never saw deeper pages, so it must NOT purge against this crawl.
         self._last_crawl_early_stopped: bool = False
@@ -963,12 +1002,57 @@ class ScannerService:
 
     # ── Post processing ───────────────────────────────────────────────
 
+    def _record_scan_metrics(self, counters: ScanStageCounters) -> None:
+        """Publish one scan's counters, and say so out loud when they disagree.
+
+        Kept deliberately no-throw. Metrics exist to explain a scan; they must
+        never be the reason one fails.
+        """
+        try:
+            snap = counters.snapshot_counts()
+            self._last_scan_metrics = snap
+            errors = conservation_errors_of(snap)
+            self._log(summary_line_of(snap))
+            if errors:
+                # The equations not balancing means the instrumentation lost
+                # track of posts, so every ratio derived from it is suspect.
+                # Saying that plainly beats publishing a confident wrong number.
+                self._log(
+                    "Scan accounting did not balance, so treat these numbers as "
+                    "incomplete: " + "; ".join(errors)
+                )
+                logger.warning("scan metrics conservation failure: %s", errors)
+            try:
+                self.db.record_scan_metrics(snap)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("could not persist scan metrics: %s", e)
+        except Exception as e:  # noqa: BLE001 - never break a scan over bookkeeping
+            logger.warning("scan metrics recording failed: %s", e)
+
     async def _process_posts(self, all_posts: List[Dict], scraper, num_threads: int):
         processed = 0
         total_posts = len(all_posts)
 
-        def process_post(post_info):
+        counters = ScanStageCounters()
+        counters.note_scheduled(total_posts)
+
+        def process_post(post_info, ticket):
+            # Booked HERE, by the layer that owns execution, not left to the
+            # scraper. Scheduling and execution are the scanner's own facts;
+            # depending on an inner layer to record them means swapping or
+            # stubbing that layer silently zeroes this scan's accounting while
+            # items still ship. Idempotent, so the scraper booking it too is
+            # free.
+            ticket.note_started()
             if self.stop_scan_flag:
+                # The worker was reached but stopped before doing any work. It
+                # DID start -- the executor ran it -- so this is not the same
+                # thing as a future cancelled while still queued.
+                ticket.discard(
+                    DiscardCode.DETAIL_CANCELLED_AFTER_START,
+                    stage=ScanStage.DETAIL_FETCH,
+                    terminal_kind=TerminalKind.CANCELLED_AFTER_START,
+                )
                 return None
             url = post_info['url']
             post_source = post_info.get('source', 'hdencode')
@@ -979,19 +1063,50 @@ class ScannerService:
                     headers,
                     scraper,
                     stop_requested=lambda: self.stop_scan_flag,
+                    outcome=ticket,
                 )
                 if not details:
+                    # The scraper books its own exit. Deliberately no fallback
+                    # here: a generic reason booked on top of a specific one is
+                    # exactly the double-booking PostOutcome exists to prevent,
+                    # and post-drain reconciliation catches a genuinely
+                    # unrecorded post as DETAIL_EMPTY.
                     return None
+                # Likewise the scanner's own fact: a usable payload came back.
+                # Idempotent with the scraper's identical call.
+                ticket.data_returned()
                 is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'
                 details['source'] = post_source
                 details['category'] = post_info.get('category', '')
                 return {'details': details, 'is_tv': is_tv, 'url': url}
             except Exception as e:
                 logger.debug("Error processing post %s: %s", url, e)
+                ticket.note_exception_type(type(e).__name__)
+                # A no-op if the scraper already booked a specific branch.
+                # The LIFECYCLE is known even when the reason is not: it raised.
+                ticket.discard(
+                    DiscardCode.UNKNOWN,
+                    stage=ScanStage.UNSPECIFIED,
+                    exception_type=type(e).__name__,
+                    terminal_kind=TerminalKind.RAISED_EXCEPTION,
+                )
                 return None
 
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = [executor.submit(process_post, post) for post in all_posts]
+            # Keyed by future so post-drain reconciliation can pair each
+            # future's terminal state with the lifecycle its worker recorded.
+            tickets: Dict[Any, PostOutcome] = {}
+            futures = []
+            for post in all_posts:
+                ticket = PostOutcome(
+                    counters,
+                    url=post.get('url', ''),
+                    source=post.get('source', 'hdencode'),
+                    category=post.get('category', ''),
+                )
+                fut = executor.submit(process_post, post, ticket)
+                tickets[fut] = ticket
+                futures.append(fut)
             for future in as_completed(futures):
                 if self.stop_scan_flag:
                     # Cancel queued (not-yet-started) futures so the executor
@@ -1008,12 +1123,38 @@ class ScannerService:
                 processed += 1
                 self._progress(processed / total_posts, f"Processing {processed}/{total_posts}")
                 if result:
+                    ticket = tickets.get(future)
                     item = self._create_media_item(result)
                     if item:
                         with self._items_lock:
                             item.id = f"item_{self._item_counter}"
                             self._item_counter += 1
                             self.items.append(item)
+                        if ticket is not None:
+                            ticket.item_created()
+                    elif ticket is not None:
+                        # The page was read but the release could not be
+                        # assembled. _create_media_item swallows its own
+                        # exception and returns None, so from here the two are
+                        # indistinguishable -- both are construction failures.
+                        ticket.discard(
+                            DiscardCode.MEDIA_ITEM_EXCEPTION,
+                            stage=ScanStage.MEDIA_ITEM_CONSTRUCTION,
+                            terminal_kind=TerminalKind.CONSTRUCTION_FAILED,
+                        )
+
+        # The executor has drained, so every worker has finished or was
+        # cancelled. Close any ticket the loop never reached -- chiefly the
+        # posts stranded by the `break` above, whose detail SUCCEEDED but whose
+        # result was never consumed. Reconciling from the future's own terminal
+        # state keeps that distinct from a failure: the work was done, the scan
+        # just ended first.
+        for fut, ticket in tickets.items():
+            if ticket.booked:
+                continue
+            ticket.reconcile(_future_terminal_state(fut))
+
+        self._record_scan_metrics(counters)
 
         self._log(f"Processing complete: {len(self.items)} items created from {total_posts} posts")
 

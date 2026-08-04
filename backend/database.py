@@ -1038,6 +1038,38 @@ class DatabaseManager:
                         if "duplicate column" not in str(exc).lower():
                             raise
 
+                # Per-scan stage counters (contract D-6).
+                #
+                # One row per post-processing pass. The counters live in a JSON
+                # blob rather than one column per counter on purpose: the
+                # taxonomy is versioned and expected to gain reason codes, and
+                # a schema migration per new code would guarantee that adding
+                # one gets skipped. `taxonomy_version` records which vocabulary
+                # a row was written under, so an old row is never re-read as if
+                # it used today's meanings.
+                #
+                # `conservation_ok` is stored, not derived at read time: it
+                # records whether the equations balanced AT THE MOMENT OF THE
+                # SCAN, under the code then running. Recomputing it later from
+                # the blob would answer a different question.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS scan_metrics (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        recorded_at TEXT NOT NULL,
+                        taxonomy_version INTEGER NOT NULL,
+                        posts_scheduled INTEGER NOT NULL,
+                        items_emitted INTEGER NOT NULL,
+                        conservation_ok INTEGER NOT NULL,
+                        conservation_errors TEXT,
+                        counters_json TEXT NOT NULL,
+                        samples_json TEXT
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_scan_metrics_recorded
+                    ON scan_metrics(recorded_at DESC)
+                """)
+
                 # Persistent RSS candidate actions (v6, additive-only).
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS hdencode_actions (
@@ -3307,6 +3339,98 @@ class DatabaseManager:
         # Canonicalise on read as well as write, so a row written before this
         # invariant existed still matches.
         return {canonicalize_listing_url(row["canonical_url"]) for row in rows}
+
+    def record_scan_metrics(self, snap):
+        """Persist one scan's stage counters (contract D-6). Returns the row id.
+
+        Whether the accounting BALANCED is stored as its own column rather than
+        recomputed on read. The question this table answers is "was that scan
+        trustworthy", which is a fact about the moment it ran and the code then
+        running; re-deriving it later from the blob, under a newer taxonomy,
+        answers a different question and would quietly relabel history.
+
+        Samples are capped upstream (per reason and per cycle) and carry no
+        response bodies, only a URL and a classification.
+        """
+        from backend import scan_metrics as _sm
+
+        payload = _sm.dict_of(snap)
+        errors = _sm.conservation_errors_of(snap)
+        samples = [s.to_dict() for s in (snap.samples or ())]
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                return None
+            cur = conn.execute(
+                """
+                INSERT INTO scan_metrics (
+                    recorded_at, taxonomy_version, posts_scheduled,
+                    items_emitted, conservation_ok, conservation_errors,
+                    counters_json, samples_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.datetime.now().isoformat(timespec="seconds"),
+                    _sm.TAXONOMY_VERSION,
+                    snap.detail_scheduled,
+                    _sm.media_items_emitted_of(snap),
+                    0 if errors else 1,
+                    json.dumps(errors) if errors else None,
+                    json.dumps(payload),
+                    json.dumps(samples) if samples else None,
+                ),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def get_recent_scan_metrics(self, limit=20):
+        """Most recent scan-metric rows, newest first, counters decoded.
+
+        ``taxonomy_version`` is returned alongside so a caller can see when a
+        row predates the current vocabulary instead of comparing counts across
+        two different sets of meanings.
+        """
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                return []
+            rows = conn.execute(
+                """
+                SELECT id, recorded_at, taxonomy_version, posts_scheduled,
+                       items_emitted, conservation_ok, conservation_errors,
+                       counters_json, samples_json
+                FROM scan_metrics
+                ORDER BY recorded_at DESC, id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+
+        out = []
+        for r in rows:
+            def _load(raw, fallback):
+                if not raw:
+                    return fallback
+                try:
+                    return json.loads(raw)
+                except (ValueError, TypeError):
+                    # A row we cannot decode is reported as undecodable rather
+                    # than as an empty scan, which would read as "nothing went
+                    # wrong" -- the precise misreading this table exists to stop.
+                    return None
+
+            out.append({
+                "id": r["id"],
+                "recorded_at": r["recorded_at"],
+                "taxonomy_version": r["taxonomy_version"],
+                "posts_scheduled": r["posts_scheduled"],
+                "items_emitted": r["items_emitted"],
+                "conservation_ok": bool(r["conservation_ok"]),
+                "conservation_errors": _load(r["conservation_errors"], []),
+                "counters": _load(r["counters_json"], None),
+                "samples": _load(r["samples_json"], []),
+            })
+        return out
 
     def record_policy_exclusions(self, rows) -> int:
         """Upsert observed policy exclusions. Returns the number written.
