@@ -60,6 +60,25 @@ LAYER_P8 = "profile8"
 LAYER_NONE = "none"
 LAYER_UNKNOWN = "unknown"
 
+#: dovi_tool messages that positively assert "this stream carries no RPU".
+#: Deliberately RPU-SPECIFIC. A bare "not found" test also matched failures
+#: like "input file not found" / "video track not found" / "NAL unit not
+#: found" -- and a file CAN vanish between the isfile() check and the
+#: subprocess, which is precisely the NAS/mount failure this module exists to
+#: classify honestly. Matching those as absence would rebuild the
+#: false-authoritative path: a mount hiccup becoming "no Dolby Vision", which
+#: then authorises label removal.
+_NO_RPU_MESSAGES = (
+    "no rpu",              # "No RPU found"
+    "rpu not found",
+    "no dolby vision rpu",
+)
+
+
+def _says_no_rpu(stderr_lower: str) -> bool:
+    """True only when dovi_tool itself reported an absent RPU."""
+    return any(m in stderr_lower for m in _NO_RPU_MESSAGES)
+
 
 def available() -> bool:
     """Whether the ``dovi_tool`` binary is on PATH."""
@@ -160,8 +179,7 @@ def detect_layer(path: str, *, cancel_requested=None) -> dict:
             # dovi_tool read failures are an expected event rather than a
             # rare one, that silently marked real Dolby Vision files as
             # having none.
-            explicit_no_dv = "no rpu" in low or "not found" in low
-            if explicit_no_dv or (ex.returncode == 0 and not rpu_size):
+            if _says_no_rpu(low) or (ex.returncode == 0 and not rpu_size):
                 return {"layer": LAYER_NONE, "tool": True, "error": None}
             return {"layer": LAYER_UNKNOWN, "tool": True,
                     "error": err[:200] or "extract produced no RPU"}

@@ -3074,6 +3074,53 @@ class TestPauseGatesTheManualApplyPath:
 
         assert svc.queue_apply([jid])["ok"] is True
 
+    def test_direct_apply_is_gated_too_not_just_the_queue(self, db, tmp_path):
+        """Peer review caught the placement: the gate was in queue_apply(),
+        one layer ABOVE the operation with the side effect. apply() is
+        callable directly, so the authoritative check belongs there."""
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+
+        svc._reg.config["rename_manual_apply_enabled"] = False
+        out = svc.apply(jid)
+
+        assert out["ok"] is False and out.get("paused") is True
+        assert os.path.exists(src)
+        assert not os.path.isdir(lib) or _all_files(lib) == []
+
+    def test_the_unattended_process_package_path_is_gated(self, db, tmp_path):
+        """The real bypass: process_package() calls apply(automatic=True)
+        itself when a job matches and confirmation is off -- never touching
+        queue_apply. That is the UNATTENDED case, so a pause that missed it
+        would be false exactly where it matters most."""
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_require_confirmation=False,
+                       rename_manual_apply_enabled=False)
+
+        ids = svc.process_package("pkg", save_to)
+
+        assert ids                      # the job is still created...
+        assert os.path.exists(src)      # ...but nothing was placed
+        assert not os.path.isdir(lib) or _all_files(lib) == []
+        assert db.get_rename_job(ids[0])["status"] != "applied"
+
+    def test_the_unattended_path_still_applies_when_allowed(self, db, tmp_path):
+        """Negative control for the test above: with the switch on, the
+        confirmation-off auto-apply behaves exactly as before."""
+        save_to, _src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_require_confirmation=False,
+                       rename_manual_apply_enabled=True)
+
+        ids = svc.process_package("pkg", save_to)
+
+        assert db.get_rename_job(ids[0])["status"] == "applied"
+
     def test_undo_is_not_gated_by_the_pause(self, db, tmp_path):
         # Recovery must stay reachable while paused.
         save_to, _src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")

@@ -366,13 +366,80 @@ def test_unknown_is_not_reported_as_a_match():
     assert res["layer"] == "unknown"  # still reported for diagnostics
 
 
-def test_unknown_does_not_block_a_full_non_additive_reconcile():
-    """Negative control: outside additive_only the caller has asked for a
-    full reconcile, and that behavior is unchanged."""
+def test_unknown_never_removes_even_in_a_full_reconcile():
+    """REVERSED after peer review, and the reviewer was right.
+
+    The first cut kept 'unknown' destructive outside additive_only and pinned
+    that as a "negative control" -- which contradicted this module's own
+    stated invariant that a failed detection is not evidence. A manual full
+    reconcile may reconcile KNOWN evidence; it cannot convert a failed
+    classification into proof of absence.
+    """
     idx = {"y:/a.mkv": "unknown"}
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
 
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=False)
 
+    assert res["removed"] == []
+    pm.remove_label.assert_not_called()
+
+
+def test_full_reconcile_still_removes_for_an_authoritative_none():
+    """The behaviour the guard above must NOT break: a real 'no DV' finding
+    still strips a stale label in either mode."""
+    idx = {"y:/a.mkv": "none"}
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=False)
+
     assert res["removed"] == ["DV FEL"]
+
+
+def test_full_reconcile_still_removes_for_an_unmatched_movie():
+    """And the pre-existing full-reconcile policy for a title with no scan row
+    at all is unchanged -- that is a coverage decision, not a failed one."""
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+
+    res = reconcile_movie(mv, {}, VOCAB, pm, dry_run=False, additive_only=False)
+
+    assert res["removed"] == ["DV FEL"]
+
+
+# ── multipart aggregation: incomplete coverage is never proof of absence ────
+
+class TestMultipartAggregate:
+    """A title with several parts must not have its labels deleted because of
+    filesystem ordering or a part nobody scanned."""
+
+    def test_none_plus_unknown_is_unknown_in_both_orders(self):
+        idx = {"y:/a.mkv": "none", "y:/b.mkv": "unknown"}
+        assert pick_layer(["y:/a.mkv", "y:/b.mkv"], idx) == "unknown"
+        assert pick_layer(["y:/b.mkv", "y:/a.mkv"], idx) == "unknown"
+
+    def test_none_plus_an_unscanned_part_is_unknown(self):
+        idx = {"y:/a.mkv": "none"}
+        assert pick_layer(["y:/a.mkv", "y:/missing.mkv"], idx) == "unknown"
+
+    def test_every_part_none_is_authoritative_none(self):
+        idx = {"y:/a.mkv": "none", "y:/b.mkv": "none"}
+        assert pick_layer(["y:/a.mkv", "y:/b.mkv"], idx) == "none"
+
+    def test_a_positive_finding_wins_over_an_unknown_sibling(self):
+        idx = {"y:/a.mkv": "fel", "y:/b.mkv": "unknown"}
+        assert pick_layer(["y:/a.mkv", "y:/b.mkv"], idx) == "fel"
+
+    def test_no_matched_part_at_all_is_still_no_match(self):
+        assert pick_layer(["y:/a.mkv", "y:/b.mkv"], {}) is None
+
+    def test_a_mixed_title_keeps_its_label_end_to_end(self):
+        # the consequence that matters: ordering must not delete a badge
+        idx = {"y:/a.mkv": "none", "y:/b.mkv": "unknown"}
+        pm = MagicMock()
+        mv = _movie(1, ["Y:/a.mkv", "Y:/b.mkv"], ["DV FEL"])
+        res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False,
+                              additive_only=False)
+        assert res["removed"] == []
+        pm.remove_label.assert_not_called()

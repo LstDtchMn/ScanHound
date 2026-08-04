@@ -1413,6 +1413,19 @@ class RenameService:
             deduped sibling name (:func:`fileops.dedupe_dest`); the existing
             file at ``dst`` is left untouched.
         """
+        # THE authoritative pause check, at the operation that performs the
+        # side effect rather than at one of its callers. queue_apply() has an
+        # early, friendlier copy for the HTTP routes, but this is the one that
+        # counts: apply() is reachable directly, and process_package() calls it
+        # (automatic=True) whenever a job matches and confirmation is off --
+        # a path that never goes through queue_apply at all. Gating only the
+        # queue would leave "renaming is paused" false for exactly the
+        # unattended case.
+        if not self._cfg.get("rename_manual_apply_enabled", True):
+            return {"ok": False, "paused": True,
+                    "error": ("Applying renames is turned off, so nothing was "
+                              "changed. Turn on \"Allow manual renames\" in "
+                              "Settings → Renaming to apply.")}
         db = self._db
         job = db.get_rename_job(job_id) if db else None
         if not job:

@@ -47,12 +47,36 @@ def desired_label(layer, vocab):
 
 
 def pick_layer(norm_paths, index):
-    """Best layer among a movie's candidate normalized paths (rank fel>mel>p8>p5)."""
+    """Aggregate one verdict for a title from ALL its parts.
+
+    The contract, in order:
+
+    1. any positive DV finding wins, by the documented rank (fel > mel > p8 > p5)
+       -- one part proving Dolby Vision proves it for the title;
+    2. otherwise, if ANY part is unclassified ('unknown') or has no row at all,
+       the aggregate is 'unknown' -- absence has not been established;
+    3. only when EVERY part is matched and authoritatively 'none' is the
+       aggregate 'none'.
+
+    Rules 2 and 3 are the fix for two unsafe behaviours. The old
+    ``found[0] if found else None`` made a mixed ['none','unknown'] title
+    depend on part ORDER -- filesystem/Plex ordering decided whether labels
+    were deleted -- and it returned 'none' for a title whose other part had no
+    row, treating an unproven part as proof of absence. Removal is destructive
+    and Kometa's overlays key off these labels, so incomplete coverage must
+    read as "don't know", never as "no".
+    """
     found = [index[p] for p in norm_paths if p in index]
     for rank in _LAYER_RANK:
         if rank in found:
             return rank
-    return found[0] if found else None
+    if not found:
+        return None                      # nothing matched: not our title
+    if len(found) != len(norm_paths):
+        return LAYER_DETECTION_FAILED    # a part has no row -> incomplete
+    if any(layer != "none" for layer in found):
+        return LAYER_DETECTION_FAILED    # 'unknown' (or anything unranked)
+    return "none"                        # every part authoritatively no-DV
 
 
 def build_index(rows, mappings=None):
@@ -125,10 +149,24 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     existing_managed = _existing_labels(movie) & MANAGED
     authoritative = is_authoritative(layer)
 
+    # Removal is the destructive half, so it needs its own rule per case:
+    #   'unknown'      -> NEVER remove, in any mode. Classification failed;
+    #                     a manual full reconcile may ask to reconcile known
+    #                     evidence, but it cannot convert failed evidence into
+    #                     proof of absence.
+    #   authoritative  -> remove stale labels, in any mode (that is what makes
+    #                     unattended reconciliation converge after a rescan).
+    #   no match       -> the pre-existing policy: full reconcile removes,
+    #                     additive_only leaves the title alone.
+    if layer == LAYER_DETECTION_FAILED:
+        may_remove = False
+    else:
+        may_remove = authoritative or not additive_only
+
     added, removed = [], []
     if desired and desired not in existing_managed:
         added.append(desired)
-    if not additive_only or authoritative:
+    if may_remove:
         for stale in existing_managed - ({desired} if desired else set()):
             removed.append(stale)
 
