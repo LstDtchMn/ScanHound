@@ -4748,10 +4748,21 @@ class DatabaseManager:
                 label="reset_applying_rename_jobs")
         return count
 
-    def count_rename_jobs_by_status(self):
-        """Return a ``{status: count}`` map over all rename jobs."""
-        rows = self._query(
-            "SELECT status, COUNT(*) FROM rename_jobs GROUP BY status", default=[])
+    def count_rename_jobs_by_status(self, include_archived=False):
+        """Return a ``{status: count}`` map over rename jobs.
+
+        Excludes archived jobs by DEFAULT, because list_rename_jobs excludes
+        them by default too, and these counts label the cards above that very
+        list. Counting archived rows here made every card disagree with what
+        clicking it showed -- "Applied 89" opening a list of 78 -- while the
+        separate Archived card counted those same jobs a second time. A
+        number you cannot reconcile with the screen teaches you to distrust
+        the screen.
+        """
+        sql = "SELECT status, COUNT(*) FROM rename_jobs"
+        if not include_archived:
+            sql += " WHERE archived_at IS NULL"
+        rows = self._query(sql + " GROUP BY status", default=[])
         return {r[0]: r[1] for r in (rows or [])}
 
     def package_has_rename_job(self, package_name):
