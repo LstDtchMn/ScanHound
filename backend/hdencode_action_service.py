@@ -447,7 +447,11 @@ class HDEncodeActionService:
         # A type resting only on the feed category is routing metadata, not
         # identity. It may inform display and manual review; it must not by
         # itself authorise an autonomous action.
-        if candidate.get("media_type_provisional") is True:
+        # Round-12 R-5 suite finding: DB rows carry the INTEGER 1, and
+        # `is True` is False for 1 -- the strict-bool idiom made this gate
+        # inert against every real row (only bool-passing test fixtures ever
+        # fired it). Truthiness is the correct read for an int-typed column.
+        if bool(candidate.get("media_type_provisional")):
             raise HDEncodeActionError(
                 "auto_media_type_provisional",
                 "The candidate's media type rests only on route evidence.",
