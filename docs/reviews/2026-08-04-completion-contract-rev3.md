@@ -1,3 +1,7 @@
+> ## SUPERSEDED 2026-08-05 by `2026-08-05-completion-contract-rev3.1.md`
+> Round-12 Q3: self-containment, exact SHAs, degrouped R-8..R-16, honest
+> statuses. Retained as the rev-3 record.
+
 # ScanHound — Completion Contract, rev 3
 
 **Date:** 2026-08-04 (post-round-11) · **Author:** Claude · **Reviewer:** ChatGPT (narrow re-verdict
