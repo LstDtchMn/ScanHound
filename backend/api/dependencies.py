@@ -259,8 +259,19 @@ def _quarantine_marker_present(db) -> bool:
     try:
         return (os.path.exists(f"{path}.corrupt_flag.json")
                 or os.path.exists(f"{path}.corrupt_flag.notified.json"))
-    except Exception:  # noqa: BLE001 - an unreadable filesystem is not proof
-        return False
+    except Exception:  # noqa: BLE001
+        # FAIL CLOSED. An earlier version returned False here with the comment
+        # "an unreadable filesystem is not proof" -- true, but it is proof of
+        # nothing in EITHER direction, and this is a security decision. False
+        # means "no quarantine ever happened", which un-gates
+        # /auth/set-password. If we cannot read the markers we do not know
+        # whether this install was previously credentialed, and unknown must
+        # behave like locked. Round-3 review flagged the old direction.
+        logger.warning(
+            "Could not determine whether %s was ever quarantined; treating the "
+            "install as recovery-locked because an unreadable marker cannot "
+            "clear it", path)
+        return True
 
 
 def credential_state(db: Any = None) -> str:

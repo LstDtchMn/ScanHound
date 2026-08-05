@@ -1339,7 +1339,29 @@ class DatabaseManager:
                 logger.warning(
                     "Renamed corrupt DB to %s%s. Creating fresh DB.", backup_name,
                     f" (with {', '.join(preserved)} sidecar(s))" if preserved else "")
-                self._write_corruption_flag(backup_name, e)
+                if not self._write_corruption_flag(backup_name, e):
+                    # The marker is the ONLY durable evidence that this
+                    # installation was initialised before the rebuild. Serving
+                    # a fresh empty database without it means the auth layer
+                    # reads "absent", the bootstrap path is exempt, and the
+                    # first unauthenticated caller becomes administrator.
+                    #
+                    # So refuse, exactly as a mandatory-WAL failure refuses.
+                    # The corrupt DB is already renamed to backup_name and its
+                    # sidecars moved with it, so nothing is lost -- the app
+                    # fails to start instead of starting wide open, which is
+                    # the only safe direction for a security marker.
+                    raise QuarantineAbortedError(
+                        "Database corruption was quarantined to "
+                        f"{backup_name}, but the recovery marker "
+                        f"{self.db_path}.corrupt_flag.json could NOT be "
+                        "written. Refusing to create a fresh database: "
+                        "without that marker the empty database is "
+                        "indistinguishable from a first install and the "
+                        "password-setup route would accept an "
+                        "unauthenticated request. Fix the filesystem "
+                        "permissions or free space beside the database, then "
+                        "restart.")
                 self.init_db()
             except OSError as os_err:
                 logger.critical("Failed to recover DB: %s", os_err)
@@ -1419,19 +1441,56 @@ class DatabaseManager:
                     "%s (%s)", quarantined, original, rb_err)
         return fully_restored
 
-    def _write_corruption_flag(self, backup_name: str, error) -> None:
-        """Persist a marker file recording the quarantine, independent of logs."""
+    def _write_corruption_flag(self, backup_name: str, error) -> bool:
+        """Persist the quarantine marker DURABLY. Returns whether it landed.
+
+        This file is SECURITY STATE, not alert metadata. The auth layer reads
+        it to tell a rebuilt-empty database from a genuinely fresh install; with
+        no marker, the empty database reports "absent", /auth/set-password stays
+        bootstrap-exempt, and an unauthenticated caller becomes administrator.
+        Round-3 review: this method previously swallowed OSError and returned
+        None, and the caller proceeded to init_db() regardless -- so a marker
+        write that failed silently reopened the takeover.
+
+        Written to a temp sibling, fsynced, then os.replace()d, and the
+        directory entry is fsynced too. Without that a crash between write and
+        flush can leave a zero-length or absent marker -- which reads exactly
+        like "never quarantined".
+        """
+        flag_path = f"{self.db_path}.corrupt_flag.json"
+        tmp_path = f"{flag_path}.partial"
+        payload = json.dumps({
+            "detected_at": datetime.datetime.now().isoformat(),
+            "db_path": self.db_path,
+            "backup_path": backup_name,
+            "error": str(error),
+        }, indent=2)
         try:
-            flag_path = f"{self.db_path}.corrupt_flag.json"
-            with open(flag_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "detected_at": datetime.datetime.now().isoformat(),
-                    "db_path": self.db_path,
-                    "backup_path": backup_name,
-                    "error": str(error),
-                }, f, indent=2)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, flag_path)
+            # fsync the DIRECTORY so the rename itself survives a power loss.
+            # Not available on every platform; a failure here is not fatal
+            # because the file content is already durable.
+            try:
+                dir_fd = os.open(os.path.dirname(flag_path) or ".", os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except (OSError, AttributeError):
+                pass
+            return True
         except OSError:
             logger.exception("Failed to write DB corruption flag file")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            return False
 
     # ── HDEncode RSS evidence ──────────────────────────────────────────
 

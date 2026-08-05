@@ -928,7 +928,7 @@ class ScannerService:
                             crawl_reasons.add(CRAWL_REASON_TRANSPORT_ERROR)
                             early_stopped = True
                             self._log(
-                                f"{source_name}: page {page} returned "
+                                f"{source_name}: page {page_num} returned "
                                 f"{resp.status_code}; the crawl is incomplete, so "
                                 "this cycle is not usable as promotion evidence "
                                 "and its seen-set must not age rows out",

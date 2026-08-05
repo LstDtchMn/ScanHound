@@ -747,3 +747,117 @@ class TestRestoreScoping:
         assert sorted(r["key"] for r in db.load_plex_cache("Movies")) == [
             "1_10_0", "2_20_0"]
         db.close()
+
+
+class TestPartialCacheCoverageKeepsThePreviousAuthority:
+    """Round-3 review: `restored` being truthy was treated as full coverage.
+
+    The predicate was `if not unreliable or restored or not previous`, so ANY
+    positive restored count blocked the fallback to the previous complete list.
+    That does not prove every unreadable library was covered. The reviewer's
+    case:
+
+        previous authority : library A -> owned A,  library B -> owned B
+        current load       : A and B both unreadable
+        cache              : holds A only
+        restore            : restored == 1  (truthy)
+        fallback           : REJECTED, because restored was truthy
+        new authority      : A present, B GONE and auto-grabbable
+
+    Coverage is now checked per library, and against the previous complete list
+    so that partial coverage WITHIN one library is caught too.
+    """
+
+    def _two_libraries_one_cached(self, tmp_path):
+        """A complete load first, then one where BOTH libraries fail and the
+        cache can only supply one of them."""
+        # Cache holds ALPHA (Movies 1080p) only — BRAVO was never cached.
+        db = DatabaseManager(db_path=str(tmp_path / "plex.db"))
+        db.save_plex_cache([dict(ALPHA, library_name="Movies 1080p")],
+                           "Movies", full_replace=False)
+        cfg = _config()
+
+        # Load 1: both libraries readable -> a COMPLETE authority of two rows.
+        pm_ok = _plex_manager({
+            "Movies 1080p": _movie_section(
+                _mock_movie(ALPHA["original_title"], ALPHA["rating_key"])),
+            "Movies 4K": _movie_section(
+                _mock_movie(BRAVO["original_title"], BRAVO["rating_key"])),
+        })
+        plex = PlexService(config=cfg, db=db, plex_manager=pm_ok)
+        plex.load_libraries()
+        assert plex.last_load_complete is True, "setup: load 1 must be complete"
+        assert len(plex.plex_movies) == 2, plex.plex_movies
+
+        # Load 2: BOTH libraries unreadable. Cache can only cover Movies 1080p.
+        plex._plex_manager = _plex_manager({
+            "Movies 1080p": None,
+            "Movies 4K": None,
+        })
+        plex.load_libraries()
+        return plex, db, cfg
+
+    def test_the_uncovered_librarys_title_is_still_owned(self, tmp_path):
+        plex, db, cfg = self._two_libraries_one_cached(tmp_path)
+        try:
+            items, _ = _match(plex, db, cfg,
+                              [_item(BRAVO["original_title"], "tt0000003")])
+            # Not `== IN_LIBRARY`: these fixtures own a 1080p copy while the
+            # candidate is a 50 GB 4K release, so the correct verdict is
+            # UPGRADE -- "you have it, a better one exists". Either way the
+            # matcher FOUND it. MISSING is the harm, because that is what
+            # reaches auto-grab.
+            assert items[0].status != ScanStatus.MISSING, (
+                "the library the cache could not cover vanished from the "
+                f"matcher; status={items[0].status}")
+            assert items[0].plex_info not in ("", "-", None), (
+                "found but with nothing to show the user")
+        finally:
+            db.close()
+
+    def test_the_uncovered_librarys_title_is_not_auto_grabbed(self, tmp_path):
+        plex, db, cfg = self._two_libraries_one_cached(tmp_path)
+        try:
+            items, _ = _match(plex, db, cfg,
+                              [_item(BRAVO["original_title"], "tt0000003")])
+            _report, dl = _auto_grab(cfg, items)
+            grabbed = _grabbed_urls(dl)
+            assert grabbed == [], (
+                f"a film the user owns was queued for re-download: {grabbed}")
+        finally:
+            db.close()
+
+    def test_the_cached_librarys_title_is_still_owned_too(self, tmp_path):
+        """Keeping the previous list must not lose what the cache DID cover."""
+        plex, db, cfg = self._two_libraries_one_cached(tmp_path)
+        try:
+            items, _ = _match(plex, db, cfg,
+                              [_item(ALPHA["original_title"], "tt0000001")])
+            assert items[0].status != ScanStatus.MISSING, (
+                "keeping the previous list lost what the cache DID cover; "
+                f"status={items[0].status}")
+        finally:
+            db.close()
+
+    def test_full_coverage_still_uses_the_restored_list(self, tmp_path):
+        """POSITIVE CONTROL. A fix that always kept the previous list would
+        pass every test above and stop the restore path ever being used —
+        including on the first load, when there is no previous list at all.
+        """
+        db = _seed_movies(tmp_path, [dict(ALPHA, library_name="Movies 1080p"),
+                                     dict(ZULU, library_name="Movies 4K")])
+        cfg = _config()
+        pm = _plex_manager({
+            "Movies 1080p": _movie_section(
+                _mock_movie(ALPHA["original_title"], ALPHA["rating_key"])),
+            "Movies 4K": None,
+        })
+        plex = PlexService(config=cfg, db=db, plex_manager=pm)
+        try:
+            plex.load_libraries()
+            # Movies 4K failed but the cache covered it -> restore was used.
+            assert plex.last_load_restored_rows >= 1
+            assert any(m.get("clean_title") == "zulu nine"
+                       for m in plex.plex_movies), plex.plex_movies
+        finally:
+            db.close()

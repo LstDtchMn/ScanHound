@@ -511,24 +511,65 @@ class PlexService:
             # one. It is stale by at most one cycle, whereas the partial list is
             # WRONG about titles the user owns right now. Doing nothing is the
             # only option that cannot cause a re-download.
-            def _keep_previous(live, restored, unreliable, previous, label):
-                if not unreliable or restored or not previous:
+            def _rows_per_library(rows):
+                """Row count per library. Untagged legacy rows share one bucket.
+
+                library_name is only on rows written since that column existed,
+                so an older cache has none. Counting them together is enough for
+                the comparison below, which only asks "did this library lose
+                rows", never which row went where.
+                """
+                counts = {}
+                for r in rows or ():
+                    key = r.get('library_name') or '<untagged>'
+                    counts[key] = counts.get(key, 0) + 1
+                return counts
+
+            def _keep_previous(live, restored_libs, unreliable, previous, label):
+                # Round-3 review: the predicate was `restored or not previous`,
+                # so ANY positive restored count blocked the fallback. That does
+                # not prove every unreadable library was covered. Their case:
+                # libraries A and B both unreadable, cache holds A only,
+                # restored == 1, fallback rejected, and every title in B
+                # disappears from the matcher and becomes auto-grabbable.
+                #
+                # Coverage is now checked PER LIBRARY, and against the previous
+                # complete list rather than against a bare count -- which also
+                # catches partial coverage WITHIN one library (the cache holding
+                # some of A's rows but not all), and the mixed tagged/untagged
+                # cache shape where restoring one tagged row would otherwise
+                # mask untagged owned rows vanishing.
+                if not unreliable or not previous:
+                    return live
+
+                uncovered = sorted(set(unreliable) - set(restored_libs or ()))
+                prev_counts = _rows_per_library(previous)
+                live_counts = _rows_per_library(live)
+                shrunk = sorted(
+                    lib for lib, n in prev_counts.items()
+                    if live_counts.get(lib, 0) < n)
+
+                if not uncovered and not shrunk:
                     return live
                 self._log(
-                    f"{label}: {len(unreliable)} library(ies) unreadable AND the "
-                    "cache could not supply their rows, so the previous complete "
-                    f"list of {len(previous)} is being kept rather than replaced "
-                    "with a partial one. Owned titles would otherwise read as "
-                    "Missing and be re-downloaded.",
+                    f"{label}: {len(unreliable)} library(ies) unreadable and the "
+                    "cache did not fully cover them"
+                    + (f" (no rows restored for: {', '.join(uncovered)})"
+                       if uncovered else "")
+                    + (f" (fewer rows than before for: {', '.join(shrunk)})"
+                       if shrunk else "")
+                    + f". Keeping the previous complete list of {len(previous)} "
+                    "rather than replacing it with a partial one — owned titles "
+                    "would otherwise read as Missing and be re-downloaded.",
                     "warning",
                 )
                 return list(previous)
 
             movies_authority = _keep_previous(
-                movies_authority, movies_restored, unreliable_movie_libs,
+                movies_authority, movies_restored_libs, unreliable_movie_libs,
                 self.plex_movies, "Movies")
             tv_authority = _keep_previous(
-                tv_authority, tv_restored, unreliable_tv_libs,
+                tv_authority, tv_restored_libs, unreliable_tv_libs,
                 self.plex_tv, "TV Shows")
 
             # Atomic swap — UI reads see complete state, never partial

@@ -281,3 +281,93 @@ class TestNonceLiftsTheLock:
         finally:
             deps.registry.db, deps.registry.auth_nonce = saved_db, saved_nonce
             rebuilt.close()
+
+
+class TestMarkerDurabilityIsMandatory:
+    """Round-3 review: the marker write was allowed to fail silently.
+
+    _write_corruption_flag caught OSError, logged, and returned None; the
+    quarantine then called init_db() regardless. So a failed marker write left
+    a fresh EMPTY database active with no marker — which reads as "absent",
+    keeps /auth/set-password bootstrap-exempt, and hands admin to the first
+    unauthenticated caller. The marker is security state, so its durable
+    creation has to be mandatory.
+    """
+
+    def test_quarantine_refuses_to_rebuild_when_the_marker_cannot_be_written(
+            self, db_path, monkeypatch):
+        from backend.database import QuarantineAbortedError
+
+        _credentialed_db(db_path)
+        _corrupt_the_file(db_path)
+
+        # Fail exactly the marker write, nothing else.
+        real_open = open
+
+        def _no_marker(path, *a, **kw):
+            if str(path).endswith(".corrupt_flag.json.partial"):
+                raise OSError("simulated read-only filesystem")
+            return real_open(path, *a, **kw)
+        monkeypatch.setattr("builtins.open", _no_marker)
+
+        with pytest.raises(QuarantineAbortedError, match="recovery marker"):
+            DatabaseManager(db_path)
+
+        monkeypatch.undo()
+        # Refusing is only safe because the corrupt DB was already preserved.
+        import glob
+        assert glob.glob(db_path + ".corrupt.*"), (
+            "the quarantine backup must still exist — refusing to rebuild must "
+            "not also mean losing the original")
+
+    def test_a_writable_marker_still_rebuilds_normally(self, db_path):
+        """POSITIVE CONTROL. A fix that aborted on every quarantine would pass
+        the test above and make any corruption a hard startup failure."""
+        _credentialed_db(db_path)
+        rebuilt = _quarantine_for_real(db_path)
+        try:
+            assert os.path.exists(corruption_flag_path(db_path))
+            assert credential_state(rebuilt) == RECOVERY_LOCKED
+        finally:
+            rebuilt.close()
+
+    def test_the_marker_write_is_atomic(self, db_path):
+        """No partial file may be left where a reader looks.
+
+        A zero-length or half-written marker reads the same as no marker at
+        all, so the write goes to a temp sibling and is renamed into place.
+        """
+        _credentialed_db(db_path)
+        rebuilt = _quarantine_for_real(db_path)
+        try:
+            assert not os.path.exists(
+                f"{db_path}.corrupt_flag.json.partial"), "temp file left behind"
+            import json as _json
+            with open(corruption_flag_path(db_path), encoding="utf-8") as f:
+                payload = _json.load(f)      # must parse: proves it is complete
+            assert payload["db_path"] == db_path
+        finally:
+            rebuilt.close()
+
+    def test_an_unreadable_marker_locks_rather_than_unlocks(self, db_path,
+                                                            monkeypatch):
+        """DISAGREEING CASE for the marker READER.
+
+        It previously returned False when os.path.exists raised, with the
+        rationale "an unreadable filesystem is not proof". True — but it is
+        proof of nothing either way, and False means "never quarantined",
+        which un-gates password setup. Unknown must behave like locked.
+        """
+        from backend.api import dependencies as deps
+
+        db = DatabaseManager(db_path)
+        try:
+            def _boom(_path):
+                raise OSError("filesystem unavailable")
+            monkeypatch.setattr(deps.os.path, "exists", _boom)
+
+            assert deps._quarantine_marker_present(db) is True, (
+                "an unreadable marker cleared the recovery lock")
+        finally:
+            monkeypatch.undo()
+            db.close()
