@@ -1,0 +1,21 @@
+ScanHound full backend suite — round-15 R-4 correction
+
+code head    : eabcf9205ee49cbf2c831d43b19ddd5035ad4b98
+branch head  : a47a2c355d1752cffbbdd3ec50472a043299517e
+branch       : agent/hybrid-sweep-rebased
+base         : main@7adb17bd8661633cade99b4ed7ca98bab3a9c8eb
+python       : 3.12.13 (main, Jul 14 2026, 02:09:31) [GCC 12.2.0]
+harness      : throwaway container, COMPLETE tree via 'git archive HEAD'
+               (a backend+tests-only copy omits
+                docs/feature-pack-review/qualification-evidence/
+                collect_shadow_evidence.py and invents 23 failures)
+concurrency  : ONE pytest per container, verified by process count
+
+BASELINE, unchanged tree at 775fbe98969b75578083743b879b71c5e6f6918f:
+=========== 4793 passed, 4 skipped, 12 warnings in 709.76s (0:11:49) ===========
+
+THIS HEAD:
+=========== 4801 passed, 4 skipped, 12 warnings in 715.40s (0:11:55) ===========
+
+delta = +8 passing, 0 failing — exactly the 8 tests added in
+tests/test_completed_row_feed_authority.py. No regressions.
