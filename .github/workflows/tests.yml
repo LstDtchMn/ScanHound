@@ -2,7 +2,10 @@ name: Tests
 
 on:
   push:
-    branches: [main, master, develop]
+    # agent/** and fix/** included deliberately: long-lived work happens on
+    # those branches, often with no open PR, so they otherwise produce NO
+    # status checks and every figure is locally produced.
+    branches: [main, master, develop, 'agent/**', 'fix/**']
   pull_request:
     branches: [main, master, develop]
   schedule:
