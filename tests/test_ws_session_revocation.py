@@ -25,6 +25,21 @@ NEW_PASSWORD = "a-whole-new-secret"
 _SETTLE_S = 0.5
 
 
+def _sock(client, token):
+    """Socket URL for a SESSION credential, via a ws-ticket.
+
+    A raw ?token=<session token> is refused server-side since A-2, because its
+    appearance in a URL is the leak the ticket exists to remove. These tests
+    are about REVALIDATION, not about the handshake credential, so they take
+    the supported path -- the ticket resolves back to the session that minted
+    it, which is exactly what the periodic re-check must keep following.
+    """
+    resp = client.post("/auth/ws-ticket",
+                       headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200, resp.text
+    return f"/ws?ticket={resp.json()['ticket']}"
+
+
 def _clear_auth():
     try:
         dm = DatabaseManager()
@@ -75,7 +90,7 @@ def test_valid_socket_survives_many_revalidations(client):
     # fired — would pass all the revocation tests below. This one requires the
     # socket to live through ~10 re-checks and still round-trip a frame.
     token = _logged_in(client)
-    with client.websocket_connect(f"/ws?token={token}") as ws:
+    with client.websocket_connect(_sock(client, token)) as ws:
         assert ws.receive_json()["type"] == "connected"
         time.sleep(_SETTLE_S)
         ws.send_text("not valid json")
@@ -107,7 +122,7 @@ def test_nonce_socket_survives_revalidation(client):
 def test_socket_closes_after_logout(client):
     token = _logged_in(client)
     with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect(f"/ws?token={token}") as ws:
+        with client.websocket_connect(_sock(client, token)) as ws:
             assert ws.receive_json()["type"] == "connected"
             assert client.post("/auth/logout",
                                headers=_auth(token)).status_code == 200
@@ -117,7 +132,7 @@ def test_socket_closes_after_logout(client):
 def test_socket_closes_after_password_change(client):
     token = _logged_in(client)
     with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect(f"/ws?token={token}") as ws:
+        with client.websocket_connect(_sock(client, token)) as ws:
             assert ws.receive_json()["type"] == "connected"
             resp = client.post("/auth/set-password", headers=_auth(token),
                                json={"new_password": NEW_PASSWORD,
@@ -129,7 +144,7 @@ def test_socket_closes_after_password_change(client):
 def test_socket_closes_once_the_session_expires(client):
     token = _logged_in(client)
     with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect(f"/ws?token={token}") as ws:
+        with client.websocket_connect(_sock(client, token)) as ws:
             assert ws.receive_json()["type"] == "connected"
             # Same row, expiry moved into the past (ON CONFLICT updates it) —
             # expiry is not revocation, and the socket outlived it too.
@@ -144,7 +159,7 @@ def test_revoked_socket_closes_on_a_sent_frame_too(client, monkeypatch):
     monkeypatch.setattr(ws_module, "_REVALIDATE_INTERVAL_S", 60.0)
     token = _logged_in(client)
     with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect(f"/ws?token={token}") as ws:
+        with client.websocket_connect(_sock(client, token)) as ws:
             assert ws.receive_json()["type"] == "connected"
             assert client.post("/auth/logout",
                                headers=_auth(token)).status_code == 200

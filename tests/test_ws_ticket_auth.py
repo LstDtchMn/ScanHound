@@ -72,10 +72,45 @@ def test_ticket_authorizes_the_socket(client):
         assert ws.receive_json()["type"] == "connected"
 
 
-def test_token_query_param_still_works(client):
-    # The frontend still sends ?token=; accepting the ticket must not break it.
+# REVERSED for A-2. This asserted that a raw ?token= session credential still
+# authorizes the socket, i.e. it pinned the leak the ticket exists to remove.
+# The server now refuses it, so the property does not depend on the frontend
+# choosing well -- a client (or a regression, or a downgrade forced by a
+# reverse proxy returning 404) cannot re-open it.
+def test_a_raw_session_token_in_the_query_is_refused(client):
+    token = _logged_in(client)
+    with pytest.raises(Exception):
+        with client.websocket_connect(f"/ws?token={token}") as ws:
+            ws.receive_json()
+
+
+def test_the_desktop_nonce_in_the_query_is_still_accepted(client):
+    """POSITIVE CONTROL, and the reason this is not a blanket ban.
+
+    The desktop build authenticates the socket with its local process nonce
+    over loopback, where there is no intermediary to log it, and that nonce is
+    not a 30-day credential. Refusing it would break the desktop app while
+    doing nothing about the actual leak.
+    """
+    registry.auth_nonce = "secret-nonce"
+    with client.websocket_connect("/ws?token=secret-nonce") as ws:
+        assert ws.receive_json()["type"] == "connected"
+
+
+def test_the_operator_can_opt_back_in(monkeypatch, client):
+    """Legacy support is a SERVER-side operator decision, not an inference
+    from an HTTP status. Off by default; this proves the switch exists and
+    works, so "remove the fallback" did not strand anyone who needs it."""
+    monkeypatch.setenv("SCANHOUND_WS_ALLOW_TOKEN_QUERY", "1")
     token = _logged_in(client)
     with client.websocket_connect(f"/ws?token={token}") as ws:
+        assert ws.receive_json()["type"] == "connected"
+
+
+def test_a_ticket_is_still_the_normal_path_for_a_session(client):
+    """The replacement must work, or "refuse the token" is just an outage."""
+    token = _logged_in(client)
+    with client.websocket_connect(f"/ws?ticket={_ticket(client, token)}") as ws:
         assert ws.receive_json()["type"] == "connected"
 
 

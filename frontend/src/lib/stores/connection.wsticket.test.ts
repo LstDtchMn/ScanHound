@@ -165,20 +165,27 @@ describe('WebSocket handshake credential (SH-P2-17)', () => {
     return e;
   }
 
-  it('falls back to ?token= when the backend has no /auth/ws-ticket route', async () => {
-    // An older backend 404s the route; request() turns that into a throw.
-    wsTicketMock.mockRejectedValue(apiError(404, 'API error: 404 Not Found'));
-    const { connection } = await import('./connection');
+  // REVERSED for A-2. This test previously asserted that a 404 downgrades to
+  // ?token=<30-day session token>, i.e. it pinned the leak as desired
+  // behaviour — so its green result was not evidence that the
+  // no-token-in-URL property held. A 404/405 does not prove the backend is
+  // old: reverse-proxy drift, a partial deploy, an intermediary error page or
+  // a wrong API base all produce one, which made the status code a downgrade
+  // oracle. Legacy support is now an operator decision on the SERVER
+  // (SCANHOUND_WS_ALLOW_TOKEN_QUERY=1), not an inference from a response.
+  it.each([[404, 'Not Found'], [405, 'Method Not Allowed']])(
+    'does NOT downgrade to ?token= on a %i', async (status, text) => {
+      wsTicketMock.mockRejectedValue(apiError(status, text));
+      const { connection } = await import('./connection');
 
-    await connection.connect();
+      await connection.connect();
 
-    expect(FakeWebSocket.instances).toHaveLength(1);
-    expect(lastSocket().url).toBe(`ws://test/ws?token=${SESSION_TOKEN}`);
-    // POSITIVE CONTROL: the legacy path must still connect, not just be built.
-    lastSocket().open();
-    expect(get(connection.state)).toBe('connected');
-    connection.disconnect();
-  });
+      expect(FakeWebSocket.instances).toHaveLength(0);
+      const leaked = FakeWebSocket.instances.filter((s) =>
+        s.url.includes(SESSION_TOKEN));
+      expect(leaked).toHaveLength(0);
+      connection.disconnect();
+    });
 
   it('does not downgrade when the ticket response is malformed', async () => {
     // A 200 with no ticket field means the route EXISTS and misbehaved --

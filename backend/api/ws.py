@@ -131,6 +131,24 @@ ws_manager = ConnectionManager()
 _REVALIDATE_INTERVAL_S = 60.0
 
 
+def _token_query_credential_allowed(token: str) -> bool:
+    """Whether a raw ``?token=`` value may be used as the socket credential.
+
+    True only for the desktop nonce, or when the operator has explicitly
+    opted back in. Deliberately does NOT consult ``token_authorized``: that
+    would accept a valid session token, which is precisely the credential
+    whose appearance in a URL this is preventing.
+    """
+    import os
+    import secrets as _secrets
+    from backend.api.dependencies import registry
+
+    if os.environ.get("SCANHOUND_WS_ALLOW_TOKEN_QUERY", "") == "1":
+        return True
+    nonce = registry.auth_nonce
+    return bool(nonce) and _secrets.compare_digest(token, nonce)
+
+
 def _socket_authorized(credential: str) -> bool:
     """The handshake rule, in one place so the periodic re-check reuses it.
 
@@ -151,7 +169,30 @@ def _socket_authorized(credential: str) -> bool:
 async def websocket_endpoint(ws: WebSocket, token: str = Query(default=""),
                              ticket: str = Query(default="")):
     from backend.api.dependencies import consume_ws_ticket
-    credential = token
+    credential = ""
+    if token:
+        # A RAW ?token= is accepted only when it is the desktop nonce.
+        #
+        # A-2: the ticket exists because a 30-day session token in the URL is
+        # written verbatim into every NPM/nginx, Cloudflare and uvicorn access
+        # log. Accepting one here anyway leaves that leak reachable from the
+        # server side no matter how careful the client is, so the server now
+        # refuses it by default and the client cannot re-open the hole.
+        #
+        # The nonce is different and stays allowed: it is a local-process
+        # secret used by the desktop build over loopback, where there is no
+        # intermediary to log it, and it is not a 30-day credential.
+        # SCANHOUND_WS_ALLOW_TOKEN_QUERY=1 restores the old behaviour for an
+        # operator who needs it — off by default, mirroring
+        # SCANHOUND_ALLOW_OPEN.
+        if _token_query_credential_allowed(token):
+            credential = token
+        else:
+            logger.warning(
+                "WebSocket handshake presented a session token in the query "
+                "string; refused. Mint a ws-ticket instead (or set "
+                "SCANHOUND_WS_ALLOW_TOKEN_QUERY=1 to restore the old "
+                "behaviour).")
     if ticket:
         # A ws-ticket is single-use and expires in seconds, so — unlike the
         # 30-day token — a copy in a proxy access log is worthless. It

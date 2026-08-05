@@ -74,11 +74,30 @@ def test_ws_rejects_bad_token_when_password_set(client):
             ws.receive_json()
 
 
-def test_ws_accepts_valid_session_token(client):
+def test_ws_accepts_a_valid_session_via_a_ticket(client):
+    # REVERSED for A-2. This asserted that a raw ?token=<30-day session token>
+    # authorizes the socket -- the leak the ticket exists to remove, since every
+    # proxy logs the request line verbatim. The server refuses it now, so the
+    # property no longer depends on the client choosing well.
+    #
+    # The underlying thing worth testing -- a valid SESSION authorizes the
+    # socket -- is unchanged and now goes through the supported path.
     client.post("/auth/set-password", json={"new_password": PASSWORD})
     token = client.post("/auth/login", json={"password": PASSWORD}).json()["token"]
-    with client.websocket_connect(f"/ws?token={token}") as ws:
+    ticket = client.post(
+        "/auth/ws-ticket",
+        headers={"Authorization": f"Bearer {token}"}).json()["ticket"]
+    with client.websocket_connect(f"/ws?ticket={ticket}") as ws:
         assert ws.receive_json()["type"] == "connected"
+
+
+def test_ws_refuses_a_raw_session_token_in_the_query(client):
+    # The disagreeing half: the same credential, presented the leaky way.
+    client.post("/auth/set-password", json={"new_password": PASSWORD})
+    token = client.post("/auth/login", json={"password": PASSWORD}).json()["token"]
+    with pytest.raises(Exception):
+        with client.websocket_connect(f"/ws?token={token}") as ws:
+            ws.receive_json()
 
 
 def test_ws_accepts_desktop_nonce(client):

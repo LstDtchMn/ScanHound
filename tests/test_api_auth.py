@@ -76,6 +76,10 @@ def test_status_open_when_nothing_configured(client):
         "has_password": False,
         "nonce_active": False,
         "setup_required": False,
+        # A-1 added this: distinct from setup_required so the UI can say
+        # "locked pending recovery" instead of offering a password form
+        # the gate would refuse. False here -- nothing was quarantined.
+        "recovery_locked": False,
     }
 
 

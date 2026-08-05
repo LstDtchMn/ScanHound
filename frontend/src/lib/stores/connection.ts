@@ -96,26 +96,39 @@ function createConnection() {
    *  already-authorized POST, dies in ~30s and on first redemption, so a
    *  logged one is worthless.
    *
-   *  Returns '' ONLY when the route is genuinely absent (404/405), i.e. an
-   *  older backend that predates ws-tickets; the caller then falls back to the
-   *  legacy ?token= form for that case alone.
+   *  Returns null on EVERY failure, and null means retry — never downgrade.
    *
-   *  Falling back on ANY failure would defeat the point. A transient 5xx or a
-   *  network blip would re-leak the 30-day token into every proxy log — and a
-   *  backend restart is precisely when the ticket POST fails AND when
-   *  reconnect attempts are most frequent, so the worst case is also the
-   *  likeliest one. Verified as a live behaviour, not a theoretical one,
-   *  before this was narrowed. On a transient failure we return null and let
-   *  the socket retry rather than downgrade the credential. */
+   *  This deliberately no longer distinguishes 404/405 ("old backend") from a
+   *  5xx. That inference was unsound: reverse-proxy drift, a partial deploy,
+   *  an intermediary error page, a wrong API base or deliberate route
+   *  interference all produce those statuses too, so anyone able to produce
+   *  one could force the 30-day token back into the URL. The status code was a
+   *  downgrade oracle for the exact leak the ticket removes.
+   *
+   *  Legacy backends are handled on the SERVER instead
+   *  (SCANHOUND_WS_ALLOW_TOKEN_QUERY=1, off by default) — an operator
+   *  decision, not one an HTTP response gets to make. The server also refuses
+   *  a raw session token in the query regardless of what this client sends, so
+   *  the property does not rest on the frontend alone. */
   async function fetchWsTicket(): Promise<string | null> {
     try {
       const res = await api.authWsTicket();
       return typeof res?.ticket === 'string' ? res.ticket : null;
-    } catch (e) {
-      const status = (e as { status?: number } | null)?.status;
-      // Route absent -> this backend cannot mint tickets at all; downgrade.
-      if (status === 404 || status === 405) return '';
-      // Anything else is transient. Do NOT downgrade.
+    } catch {
+      // NO status is treated as permission to downgrade any more (A-2).
+      //
+      // 404/405 was previously read as "this backend is too old for tickets",
+      // and that inference is unsound: those statuses also come from
+      // reverse-proxy drift, a partial deployment, an intermediary error page,
+      // a wrong API base, or deliberate route interference. Anyone able to
+      // produce one could therefore force the 30-day session token back into
+      // the URL — turning the error code into a downgrade oracle for the exact
+      // leak the ticket removes.
+      //
+      // So every failure is now transient: retry, never downgrade. A genuinely
+      // old backend is handled server-side instead, by
+      // SCANHOUND_WS_ALLOW_TOKEN_QUERY=1, which is an operator decision rather
+      // than something an HTTP response can decide for us.
       return null;
     }
   }
@@ -155,6 +168,12 @@ function createConnection() {
         }
         return;
       }
+      // The `?token=` arm is reached only when the ticket endpoint answered
+      // 200 with no ticket field... which now returns null and retries. In
+      // practice this leaves the DESKTOP case, where `nonce` is the local
+      // process nonce and the server accepts it over loopback. The server
+      // refuses a session token here regardless, so a future regression on
+      // this line cannot re-create the leak on its own.
       wsUrl = ticket
         ? `${base}?ticket=${encodeURIComponent(ticket)}`
         : `${base}?token=${encodeURIComponent(nonce)}`;
