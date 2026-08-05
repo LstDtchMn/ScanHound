@@ -198,17 +198,21 @@ class TestRelocationSnapshotConsistency:
         finally:
             w.close()
 
-    def test_writer_committing_after_the_backup_does_not_void_the_migration(
+    def test_a_post_snapshot_commit_refuses_adoption_instead_of_orphaning_it(
             self, tmp_path, monkeypatch):
-        """DISAGREEING CASE for the other half of the fix: the read snapshot has
-        to be HELD across the verification, not just across the copy.
+        """REVERSED after round 3, and the reversal is the point.
 
-        An implementation that copied correctly but then re-read the source
-        through a fresh connection would see this post-copy INSERT, find a row
-        count the copy cannot have, and reject a faithful migration — measured
-        here as 1 row inside the snapshot vs 2 outside it. Rejection is safe
-        but permanent-ish in effect: on any busy machine the relocation would
-        keep failing and the DB would stay on the bind mount forever.
+        This test used to assert that a row committed after the backup snapshot
+        legitimately stays out of the adopted copy -- "a defined, consistent
+        value". For an EXPORT that is true. For an AUTHORITATIVE relocation it
+        is data loss: _resolve_db_path makes the new path authoritative and its
+        exists() guard never retries, so that committed row is orphaned in a
+        file nothing reads again.
+
+        A pinned read snapshot cannot prevent this, because a read transaction
+        deliberately permits writers. So the migration now detects that the
+        source moved and REFUSES to adopt, leaving the legacy database
+        authoritative and retrying on the next start. Nothing is lost.
         """
         legacy, new = self._paths(tmp_path)
         w = self._seed(legacy, rows=((1, "v1"),))
@@ -221,15 +225,45 @@ class TestRelocationSnapshotConsistency:
                 return result
 
             _hook_backup(monkeypatch, _backup_then_commit)
-            assert cfg._checkpoint_and_copy(legacy, new) is True
+            with pytest.raises(RuntimeError, match="changed while it was being copied"):
+                cfg._checkpoint_and_copy(legacy, new)
         finally:
             w.close()
 
-        # A defined, consistent value: the snapshot as of the copy. The row
-        # committed afterwards is simply not part of it (it is still in the
-        # legacy DB, which the relocation does not delete).
-        assert _read(new) == [(1, "v1")]
+        # Refusal, not adoption: nothing at the destination, and the legacy DB
+        # still holds BOTH rows. That is what makes retrying safe.
+        assert not os.path.exists(new), (
+            "a copy missing a committed row was adopted anyway")
         assert _read(legacy) == [(1, "v1"), (2, "landed_after_copy")]
+
+    def test_an_untouched_source_still_migrates(self, tmp_path):
+        """POSITIVE CONTROL for the guard. A cutover check that refused
+        whenever it could not prove quiescence would block relocation forever
+        on any machine, which is the failure mode the previous version of this
+        test was written to prevent. With nothing else writing, adoption must
+        still happen.
+        """
+        legacy, new = self._paths(tmp_path)
+        self._seed(legacy, rows=((1, "v1"), (2, "v2"))).close()
+
+        assert cfg._checkpoint_and_copy(legacy, new) is True
+        assert _read(new) == [(1, "v1"), (2, "v2")]
+
+    def test_an_unreadable_change_token_refuses_rather_than_adopts(
+            self, tmp_path, monkeypatch):
+        """Unknown must not license adoption.
+
+        _source_change_token returns None when it cannot sample the source. A
+        fix that treated None as "unchanged" would pass every test above while
+        adopting a copy whose faithfulness it could not establish.
+        """
+        legacy, new = self._paths(tmp_path)
+        self._seed(legacy, rows=((1, "v1"),)).close()
+        monkeypatch.setattr(cfg, "_source_change_token", lambda _p: None)
+
+        with pytest.raises(RuntimeError, match="changed while it was being copied"):
+            cfg._checkpoint_and_copy(legacy, new)
+        assert not os.path.exists(new)
 
     # ── positive controls: a fix that disabled relocation must fail here ──
 

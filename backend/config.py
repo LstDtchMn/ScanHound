@@ -489,6 +489,11 @@ def _checkpoint_and_copy(legacy_path: str, new_path: str) -> bool:
         if os.path.exists(path):
             os.remove(path)
 
+    # Change token BEFORE the snapshot is pinned. See the adoption guard at the
+    # end of this function for why a pinned read snapshot is not enough on its
+    # own.
+    before_token = _source_change_token(legacy_path)
+
     source = sqlite3.connect(legacy_path, isolation_level=None)
     try:
         source.execute(f"PRAGMA busy_timeout={_MIGRATION_CHECKPOINT_BUSY_MS}")
@@ -514,9 +519,65 @@ def _checkpoint_and_copy(legacy_path: str, new_path: str) -> bool:
             pass
         source.close()
 
+    # THE CUTOVER GUARD (round-3 review: this residual was upgraded to a
+    # blocker, and correctly).
+    #
+    # The pinned read snapshot makes the COPY internally consistent, but a read
+    # transaction deliberately permits writers. So a commit landing after the
+    # snapshot is real, durable, present in the legacy database -- and absent
+    # from the copy. Adopting the copy then orphans it permanently, because
+    # _resolve_db_path's exists() guard never retries a path that is already
+    # there. For an export a defined earlier snapshot is fine; for an
+    # AUTHORITATIVE relocation it is data loss.
+    #
+    # A lock respected by every writer was the reviewer's first option, but
+    # nothing else in this codebase takes such a lock and a single-process one
+    # would not cover an overlapping container. This is their third option:
+    # detect that the source moved and REFUSE to adopt, keeping the legacy
+    # database authoritative. Nothing is lost -- the next start retries, and
+    # until then the legacy file holds everything.
+    after_token = _source_change_token(legacy_path)
+    if before_token is None or after_token is None or before_token != after_token:
+        raise RuntimeError(
+            "the legacy database changed while it was being copied "
+            f"({before_token} -> {after_token}); refusing to adopt the copy, "
+            "because a commit made after the snapshot exists only in the "
+            "legacy file and adopting would orphan it. The legacy database "
+            "stays authoritative and the next start retries.")
+
     _fold_and_drop_copy_sidecars(temp_path)
     os.replace(temp_path, new_path)
     return True
+
+
+def _source_change_token(path: str):
+    """A value that changes if anything writes ``path``. None if unknowable.
+
+    ``PRAGMA data_version`` is the primitive that actually answers this: SQLite
+    bumps it when the database is modified by a DIFFERENT connection, which is
+    exactly the case a pinned read snapshot cannot see. Paired with the -wal
+    size because data_version is per-connection state and a fresh connection is
+    opened for each sample, and because a write folded into the main file
+    between samples moves the WAL too.
+
+    Returns None on any failure, and the caller treats None as "assume it
+    changed" -- an unknown answer must not license adoption.
+    """
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            version = conn.execute("PRAGMA data_version").fetchone()[0]
+        finally:
+            conn.close()
+        try:
+            wal_size = os.path.getsize(path + "-wal")
+        except OSError:
+            wal_size = 0
+        return (version, wal_size, os.path.getsize(path))
+    except Exception:  # noqa: BLE001 - unknown must fail closed at the caller
+        return None
 
 
 def _resolve_db_path(name: str) -> str:
