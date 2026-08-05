@@ -5060,6 +5060,15 @@ class DatabaseManager:
 
 # ── Startup-time corruption surfacing ─────────────────────────────────────
 
+# How many startups may attempt the quarantine alert before the flag is
+# consumed without ever being confirmed. Bounded deliberately: retrying gives
+# a bridge that was not ready — or a process killed a second after dispatch —
+# another chance, while an install with no notification channel configured at
+# all still stops re-announcing the same incident instead of alerting on every
+# boot forever.
+CORRUPTION_NOTIFY_MAX_ATTEMPTS = 3
+
+
 def corruption_flag_path(db_path: str) -> str:
     """Path to the persisted corruption marker for ``db_path`` (see
     DatabaseManager._write_corruption_flag)."""
@@ -5070,37 +5079,122 @@ def db_corruption_flag_present(db_path: str) -> bool:
     """Whether an un-acknowledged corruption flag exists for ``db_path``.
 
     True only for the not-yet-notified flag — once notify_db_corruption_once
-    renames it to .notified.json, this returns False again.
+    renames it to .notified.json, this returns False again. The flag now
+    survives startup until the alert is confirmed delivered (or the retry
+    budget is spent), so this is reachable by an HTTP caller; under the old
+    rename-on-dispatch ordering it was erased before the server accepted its
+    first request and could never be True.
     """
     return os.path.exists(corruption_flag_path(db_path))
 
 
+def _read_corruption_flag_payload(flag_path: str) -> dict:
+    """The flag's JSON body, or {} when it is missing/unreadable/not an object.
+
+    A malformed flag must not become an unbounded retry loop, so a parse
+    failure reads as "no attempts recorded" and the next write replaces it
+    with well-formed JSON.
+    """
+    try:
+        with open(flag_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_corruption_flag_payload(flag_path: str, payload: dict) -> None:
+    """Rewrite the flag in place. The retry budget lives INSIDE the file
+    because the whole failure mode being guarded against is a process that
+    dies moments after dispatch — an in-memory counter would reset with it."""
+    try:
+        with open(flag_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except OSError:
+        logger.exception("Failed to update DB corruption flag %s", flag_path)
+
+
 def notify_db_corruption_once(db_path: str, bridge) -> bool:
-    """If a corruption flag exists for ``db_path``, notify once and rename it.
+    """Alert on a corruption quarantine, and consume the flag only once that
+    alert is CONFIRMED delivered.
 
     Called at the END of startup, which is the earliest the notification
     bridge exists — _quarantine_corrupt_db runs inside init_db(), long before
-    it is wired up, so this is the ONLY delivery path for a quarantine event
-    (the ERROR log line and the flag file are the other two). Renaming the flag to
-    ``.corrupt_flag.notified.json`` after a successful notify means this
-    fires exactly once per corruption event, even across many restarts,
-    while still leaving a permanent on-disk record of the incident.
+    it is wired up, so this is the ONLY push delivery path for a quarantine
+    event (the ERROR log line and the flag file are the other two, and both
+    are passive).
 
-    Returns True if a (previously un-notified) flag was found and processed
-    (regardless of whether the notification itself succeeded — the rename
-    only happens if we got as far as attempting notification, so the
-    "fire once" behavior holds even when the bridge silently fails).
+    Delivery, not dispatch, is what consumes the flag. ``bridge.notify_error``
+    is the contract point: it must return exactly True to confirm that the
+    alert actually went out. Exactly True, not merely truthy — a fire-and-
+    forget bridge that returns its pending Future would otherwise be misread
+    as a confirmation, which is the precise shape of the bug this replaces.
+    The stock NotificationBridge hands the coroutine to a daemon loop and
+    returns None, so it is never confirmed and the flag is retried instead:
+    an alert dispatched microseconds before the container is killed, or into
+    a bridge with zero configured channels, no longer marks the incident
+    "notified". A quarantine means the entire download history was lost, so
+    it is the one event where silently dropping the alert costs the most.
+
+    Retries are bounded by CORRUPTION_NOTIFY_MAX_ATTEMPTS with the counter
+    stored in the flag file, so this stays fire-once-per-event across restarts
+    and a permanently broken bridge cannot alert on every boot. When the
+    budget runs out the flag is consumed anyway and the ``.notified.json``
+    records ``delivery_confirmed: false``, keeping the permanent on-disk
+    record of the incident either way.
+
+    Returns True if a (previously un-notified) flag was found and an alert was
+    attempted, whether or not it was confirmed or the flag consumed.
     """
     flag_path = corruption_flag_path(db_path)
     if not os.path.exists(flag_path):
         return False
+
+    payload = _read_corruption_flag_payload(flag_path)
+    try:
+        attempts = int(payload.get("notify_attempts") or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+
+    delivered = False
+    MESSAGE = "Database corruption was detected and quarantined — check logs"
     try:
         if bridge is not None:
-            bridge.notify_error(
-                "Database corruption was detected and quarantined — check logs")
+            # Prefer the CONFIRMING call. notify_error() is fire-and-forget and
+            # returns None on every path, so asking it whether the alert landed
+            # can only ever answer "no" -- which would burn all three attempts
+            # on a perfectly healthy channel and send three duplicate alerts
+            # for one incident. notify_error_confirmed() waits for the channel
+            # result. The getattr fallback keeps older/stand-in bridges working
+            # (they simply never confirm, which is the safe direction).
+            confirm = getattr(bridge, "notify_error_confirmed", None)
+            if callable(confirm):
+                delivered = confirm(MESSAGE) is True
+            else:
+                delivered = bridge.notify_error(MESSAGE) is True
     except Exception:
         logger.warning("DB corruption notification failed (non-fatal)", exc_info=True)
+
+    attempts += 1
+    payload["notify_attempts"] = attempts
+    payload["last_notify_attempt_at"] = datetime.datetime.now().isoformat()
+    payload["delivery_confirmed"] = delivered
+    _write_corruption_flag_payload(flag_path, payload)
+
+    if not delivered and attempts < CORRUPTION_NOTIFY_MAX_ATTEMPTS:
+        logger.warning(
+            "DB corruption alert was not confirmed delivered (attempt %d of "
+            "%d); keeping %s so the next startup retries",
+            attempts, CORRUPTION_NOTIFY_MAX_ATTEMPTS, flag_path)
+        return True
+
     notified_path = f"{db_path}.corrupt_flag.notified.json"
+    if not delivered:
+        logger.error(
+            "DB corruption alert was never confirmed delivered after %d "
+            "attempt(s); marking it notified anyway. The quarantine record "
+            "stays at %s — check the logs for the backup path",
+            attempts, notified_path)
     try:
         os.replace(flag_path, notified_path)
     except OSError:

@@ -93,7 +93,15 @@ async function request<T>(path: string, options?: RequestInit, timeoutMs = REQUE
     } catch {
       // non-JSON error body — fall through to the generic message
     }
-    throw new Error(detail || `API error: ${resp.status} ${resp.statusText}`);
+    const err = new Error(
+      detail || `API error: ${resp.status} ${resp.statusText}`
+    ) as Error & { status?: number };
+    // The HTTP status, attached so callers can branch on WHY a request failed
+    // without string-sniffing the message. The WebSocket ticket path needs
+    // exactly this: it may fall back to the legacy token only when the route
+    // is genuinely absent (404/405), never on a transient 5xx.
+    err.status = resp.status;
+    throw err;
   }
   const ct = resp.headers.get('content-type') || '';
   if (!ct.includes('application/json')) {
@@ -132,6 +140,12 @@ export const api = {
     }),
   authLogout: () =>
     request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
+  /** Mint a short-lived, single-use ticket for the WebSocket handshake.
+   *  The browser cannot set an Authorization header on a WebSocket, so this
+   *  authorized POST stands in for it — see connection.ts. `expires_in` is
+   *  seconds (~30 server-side), which is why a ticket is never reused. */
+  authWsTicket: () =>
+    request<{ ticket: string; expires_in: number }>('/auth/ws-ticket', { method: 'POST' }),
 
   // Scanner
   scanStart: (type = 'deep', searchQuery = '', pages = 1, source = 'HDEncode', flags?: Record<string, boolean>) =>

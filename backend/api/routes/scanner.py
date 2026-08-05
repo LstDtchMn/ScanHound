@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -167,6 +168,25 @@ def _scan_was_cancelled(scanner: Any) -> bool:
     return False
 
 
+def _scan_failure(scanner: Any) -> Optional[str]:
+    """The error message from a scan that died inside ``run_scan``, or None.
+
+    ``ScannerService.run_scan`` catches every exception from the async scan and
+    returns its partial ``items`` list, so a DNS failure, a Plex load error or
+    a DB error arrives here indistinguishable from a clean run that happened to
+    find nothing — and the completion side effects below (last_scan_time, the
+    Scan Complete notification, auto-grab, the scan_history row) would all fire
+    for a scan that crashed. run_scan records the message instead of raising;
+    reading it is the only way this thread can tell the two apart.
+
+    Same bool/str discipline as ``_scan_was_cancelled``: a Mock scanner
+    auto-creates a truthy attribute for any name, so only a genuine non-empty
+    string counts as a failure.
+    """
+    value = getattr(scanner, "last_scan_error", None)
+    return value if isinstance(value, str) and value else None
+
+
 def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
     """Execute scan in background thread."""
     global _last_scan_items
@@ -274,6 +294,25 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
             })
             return
 
+        failure = _scan_failure(scanner)
+        if failure:
+            # run_scan swallowed this exception, so without the recorded
+            # message the run below would report itself complete. Same
+            # treatment as a cancellation: the partial results already
+            # broadcast stay visible, every completion side effect is skipped.
+            ws_manager.broadcast_sync({
+                "type": "scan:error",
+                "data": {
+                    "message": (
+                        f"Scan failed: {failure}. "
+                        f"{stats['total']} partial result(s) are shown; they "
+                        "were not matched against Plex, so their status is "
+                        "not reliable."
+                    ),
+                },
+            })
+            return
+
         ws_manager.broadcast_sync({
             "type": "scan:complete",
             "data": {
@@ -282,6 +321,33 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
                 "duration": round(duration, 1),
             },
         })
+
+        # Persist the run. save_scan_history has had no production caller, so
+        # scan_history stayed empty and Analytics reported 0 scans / 0 items
+        # forever — indistinguishable from a system that never scanned.
+        # Cancelled and failed runs returned above, so only a genuine
+        # completion is recorded. Two constraints:
+        #   * timestamp must be a naive local ISO string — analytics.py
+        #     compares it to datetime.now().isoformat(), parses it back with
+        #     datetime.fromisoformat() and groups on SQLite date(timestamp);
+        #   * upgrade_count carries DV upgrades too, because _compute_stats
+        #     folds dv_upgrade into its "upgrade" bucket.
+        # Wrapped so a DB failure can never fail an otherwise-good scan.
+        try:
+            db = getattr(reg, "db", None)
+            if db is not None:
+                db.save_scan_history({
+                    "timestamp": datetime.now().isoformat(),
+                    "scan_type": scan_type,
+                    "items_scanned": stats["total"],
+                    "missing_count": stats["missing"],
+                    "upgrade_count": stats["upgrade"],
+                    "in_library_count": stats["library"],
+                    "duration_seconds": round(duration, 2),
+                    "sources_scanned": source_type,
+                })
+        except Exception:
+            logger.warning("Failed to record scan history", exc_info=True)
 
         # Stamp "Last scan" at COMPLETION. Previously only the scheduler set
         # last_scan_time, and it did so when the scan was *triggered* (start),

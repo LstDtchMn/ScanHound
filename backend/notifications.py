@@ -684,6 +684,13 @@ class NotificationManager:
             priority: Priority level
             data: Additional data
             batch: If True, batch with other notifications
+
+        Returns:
+            The number of channels that accepted it, or None when the answer
+            is genuinely unknown -- which is what batching means: the send has
+            not happened yet. A caller that must not discard state without
+            proof of delivery has to treat None as "not delivered", never as
+            zero-so-give-up.
         """
         notification = Notification(
             type=type,
@@ -695,8 +702,8 @@ class NotificationManager:
 
         if batch:
             await self._add_to_batch(notification)
-        else:
-            await self._send_notification(notification)
+            return None
+        return await self._send_notification(notification)
 
     def send_notification(
         self,
@@ -801,10 +808,18 @@ class NotificationManager:
             if channel.should_handle(notification):
                 tasks.append(channel.send(notification))
 
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            successes = sum(1 for r in results if r is True)
-            logger.debug(f"Notification sent to {successes}/{len(tasks)} channels")
+        if not tasks:
+            # No channel wanted it. Reporting 0 rather than None keeps "nobody
+            # is listening" distinct from "we never got far enough to know".
+            return 0
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        successes = sum(1 for r in results if r is True)
+        logger.debug(f"Notification sent to {successes}/{len(tasks)} channels")
+        # Returned, not just logged. A caller holding something it may only
+        # discard ONCE -- the database-corruption flag is the live example --
+        # has no other way to tell a delivered alert from a swallowed one.
+        return successes
 
     def get_history(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Get notification history."""

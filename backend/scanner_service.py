@@ -222,7 +222,13 @@ class ScannerService:
         self._last_crawl_seen_urls: Set[str] = set()
         # True when the last crawl stopped early at cached content — the scanner
         # then never saw deeper pages, so it must NOT purge against this crawl.
-        self._last_crawl_early_stopped: bool = False
+        # ``run_scan`` re-arms this to True for every run; only a crawl that
+        # actually finished may lower it. See run_scan.
+        self._last_crawl_early_stopped: bool = True
+        #: Message from the last run_scan that died inside the async scan, or
+        #: None. run_scan does NOT re-raise, so this is the only way a caller
+        #: can tell a failed run from one that legitimately found nothing.
+        self.last_scan_error: Optional[str] = None
         #: Full-disc releases excluded by policy this crawl: rows the caller
         #: persists, plus the total (new + already-known) for reporting.
         self._last_crawl_policy_excluded_observed: List[Dict] = []
@@ -356,6 +362,16 @@ class ScannerService:
             self._item_counter = 0
         self._last_crawl_seen_urls = set()
         self._last_crawl_request_count = 0
+        self.last_scan_error = None
+        # Re-armed pessimistically, NOT reset to False: only ``_crawl_pages``
+        # may lower this, at the end of a crawl that actually ran. This method
+        # swallows exceptions and _run_scan_async returns early in several
+        # places (no sources, stop requested), so a run that never crawled used
+        # to leave the PREVIOUS run's value behind — and a stale False tells
+        # background_scanner the cache is safe to purge after a scan that
+        # refreshed nothing, aging the whole catalogue out over the retention
+        # window with no error anywhere.
+        self._last_crawl_early_stopped = True
 
         # Load download history
         self.download_history = self._load_download_history()
@@ -374,6 +390,16 @@ class ScannerService:
                 loop.close()
         except Exception as e:
             self._log(f"Scan error: {e}", "error")
+            # Deliberately NOT re-raised. background_scanner._scan_source's
+            # caller skips its own purge guard once a source reports an error,
+            # so raising here would restore the very purge this is preventing.
+            # Record the failure instead: _last_crawl_early_stopped stays True
+            # (the crawl is by definition incomplete), which is the signal the
+            # background scanner already reads to hold the purge, and
+            # last_scan_error lets the API route report the run as failed
+            # instead of broadcasting scan:complete over partial items.
+            self.last_scan_error = str(e) or e.__class__.__name__
+            self._last_crawl_early_stopped = True
         finally:
             self.is_scanning = False
 

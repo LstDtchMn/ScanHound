@@ -173,6 +173,37 @@ class NotificationBridge:
         """Convenience: send error notification."""
         self.send("error", "ScanHound Error", message)
 
+    def notify_error_confirmed(self, message: str, timeout: float = 15.0) -> bool:
+        """Send an error alert and WAIT to find out whether it was delivered.
+
+        Separate from :meth:`notify_error` on purpose. Ordinary notifications
+        stay fire-and-forget so nothing in the hot path waits on an SMTP round
+        trip; this variant exists for the one caller that must not discard
+        state without proof — the database-corruption flag, which marks a
+        total-history-loss event as "notified" exactly once.
+
+        Returns True only when at least one channel accepted it. False covers
+        every other outcome, all of which mean the same thing to the caller:
+        do not throw the evidence away yet. That includes an unconfigured
+        bridge, a dead loop, a timeout, a raised channel, no channel willing to
+        handle the type, and a BATCHED send (whose delivery has not happened
+        yet, and which reports None rather than a count).
+        """
+        if not self._manager or not self._loop:
+            return False
+        try:
+            from backend.notifications import NotificationType
+            future = asyncio.run_coroutine_threadsafe(
+                self._manager.notify(
+                    NotificationType.ERROR, "ScanHound Error", message),
+                self._loop,
+            )
+            delivered = future.result(timeout=timeout)
+        except Exception as e:  # noqa: BLE001 - a failed alert is not fatal
+            logger.warning(f"Confirmed error notification failed: {e}")
+            return False
+        return bool(delivered) and delivered is not None
+
     def shutdown(self):
         """Stop the async loop and cleanup."""
         if self._loop:

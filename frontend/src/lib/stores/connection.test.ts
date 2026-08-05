@@ -28,7 +28,12 @@ class FakeWebSocket {
   }
 }
 
-vi.mock('$lib/api/client', () => ({ getAuthNonce: () => null }));
+// No nonce here, so doConnect() never reaches the ticket call — api is stubbed
+// only so the mocked module still satisfies connection.ts's imports.
+vi.mock('$lib/api/client', () => ({
+  getAuthNonce: () => null,
+  api: { authWsTicket: () => Promise.reject(new Error('not used')) }
+}));
 vi.mock('$lib/api/endpoint', () => ({ wsBase: () => 'ws://test/ws' }));
 
 describe('connection reconnect hook', () => {

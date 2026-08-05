@@ -1143,7 +1143,22 @@ class DownloadQueueService:
         with self.db.transaction() as conn:
             if not conn:
                 raise DownloadQueueError("The database is unavailable.")
-            conn.execute(
+            current = conn.execute(
+                """
+                SELECT state, batch_uuid
+                FROM download_queue_items
+                WHERE item_uuid = ?
+                """,
+                (item_uuid,),
+            ).fetchone()
+            if current is None:
+                raise DownloadQueueError("The retry item was not found.")
+            if current["state"] == "claimed":
+                raise DownloadQueueItemClaimed(
+                    item_uuid=item_uuid,
+                    batch_uuid=current["batch_uuid"],
+                )
+            updated = conn.execute(
                 """
                 UPDATE download_queue_items
                 SET state = 'ready', scheduled_for = ?, cooldown_until = NULL,
@@ -1163,20 +1178,30 @@ class DownloadQueueService:
                   )
                 """,
                 (now, now, item_uuid),
-            )
+            ).rowcount
+            if updated != 1:
+                # Raising rolls the transaction back before the batch UPDATE
+                # below runs. That order is load-bearing: forcing the batch to
+                # 'scheduled' with cooldown_until NULL for an item that was
+                # never retried destroys both preconditions _maybe_auto_resume
+                # selects on, stranding every sibling still in waiting_source.
+                raise DownloadQueueError(
+                    "That item cannot be retried while it is "
+                    f"{current['state']}."
+                )
             conn.execute(
                 """
                 UPDATE download_queue_batches
                 SET state = 'scheduled', cooldown_until = NULL, updated_at = ?
                 WHERE batch_uuid = ?
                 """,
-                (now, item["batch_uuid"]),
+                (now, current["batch_uuid"]),
             )
-            self._refresh_batch_locked(conn, item["batch_uuid"], now)
+            self._refresh_batch_locked(conn, current["batch_uuid"], now)
         self._wake.set()
-        updated = self.get_item(item_uuid) or item
-        self._emit("download:queue_updated", updated)
-        return updated
+        refreshed = self.get_item(item_uuid) or item
+        self._emit("download:queue_updated", refreshed)
+        return refreshed
 
     def retry_ready(self, interval_minutes: int = 10) -> dict:
         self._assert_hdencode_available()

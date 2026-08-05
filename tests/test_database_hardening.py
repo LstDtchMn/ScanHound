@@ -319,53 +319,98 @@ class TestNotifyDbCorruptionOnce:
         assert notify_db_corruption_once(db_path, bridge) is False
         bridge.notify_error.assert_not_called()
 
-    def test_flag_present_notifies_once_and_renames_flag(self, db_path):
+    # CONTRACT CHANGED (audit finding #19). The flag used to be consumed on
+    # DISPATCH, so a total-history-loss event was marked "notified" whether or
+    # not anything was ever delivered. It is now consumed on CONFIRMED
+    # delivery, with a bounded retry budget so a permanently broken bridge
+    # cannot alert on every boot forever. The old
+    # test_bridge_exception_does_not_prevent_flag_rename was DELETED rather
+    # than adapted: it asserted the rejected policy outright ("Even if the
+    # bridge itself raises, the flag must still be renamed").
+
+    @staticmethod
+    def _confirming_bridge(delivered=True):
+        """A bridge that reports delivery explicitly.
+
+        Not a bare MagicMock: that returns a truthy Mock which is not `is
+        True`, i.e. exactly the ambiguity the new code refuses. Using one here
+        would silently test the UNconfirmed path while looking like the happy
+        one.
+        """
+        bridge = MagicMock()
+        bridge.notify_error_confirmed.return_value = delivered
+        return bridge
+
+    def test_confirmed_delivery_consumes_the_flag_exactly_once(self, db_path):
+        """POSITIVE CONTROL: the healthy path still fires once and stops."""
         flag_path = corruption_flag_path(db_path)
         with open(flag_path, "w", encoding="utf-8") as f:
             json.dump({"detected_at": "x", "db_path": db_path,
                       "backup_path": "y", "error": "z"}, f)
 
         assert db_corruption_flag_present(db_path) is True
-        bridge = MagicMock()
+        bridge = self._confirming_bridge()
         result = notify_db_corruption_once(db_path, bridge)
 
         assert result is True
-        bridge.notify_error.assert_called_once()
-        (msg,), _ = bridge.notify_error.call_args
+        bridge.notify_error_confirmed.assert_called_once()
+        (msg,), _ = bridge.notify_error_confirmed.call_args
         assert "corruption" in msg.lower()
 
-        # Flag renamed so a second call is a no-op (fires exactly once).
         assert not os.path.exists(flag_path)
         assert os.path.exists(f"{db_path}.corrupt_flag.notified.json")
         assert db_corruption_flag_present(db_path) is False
 
-        bridge2 = MagicMock()
+        bridge2 = self._confirming_bridge()
         assert notify_db_corruption_once(db_path, bridge2) is False
-        bridge2.notify_error.assert_not_called()
+        bridge2.notify_error_confirmed.assert_not_called()
 
-    def test_bridge_exception_does_not_prevent_flag_rename(self, db_path):
-        """Even if the bridge itself raises, the flag must still be renamed
-        so the corruption isn't re-announced forever."""
+    def test_unconfirmed_delivery_keeps_the_flag_for_the_next_startup(self, db_path):
+        """The whole point of the finding: no confirmation, no consumption."""
+        flag_path = corruption_flag_path(db_path)
+        with open(flag_path, "w", encoding="utf-8") as f:
+            json.dump({"detected_at": "x"}, f)
+
+        bridge = self._confirming_bridge(delivered=False)
+        assert notify_db_corruption_once(db_path, bridge) is True
+        bridge.notify_error_confirmed.assert_called_once()
+
+        assert os.path.exists(flag_path), (
+            "an unconfirmed alert must leave the evidence in place")
+        assert db_corruption_flag_present(db_path) is True
+
+    def test_a_broken_bridge_stops_after_the_retry_budget(self, db_path):
+        """Retrying is not the same as retrying forever.
+
+        A bridge that never confirms would otherwise re-announce the same
+        incident on every boot for the life of the install.
+        """
         flag_path = corruption_flag_path(db_path)
         with open(flag_path, "w", encoding="utf-8") as f:
             json.dump({"detected_at": "x"}, f)
 
         bridge = MagicMock()
-        bridge.notify_error.side_effect = RuntimeError("bridge down")
+        bridge.notify_error_confirmed.side_effect = RuntimeError("bridge down")
 
-        result = notify_db_corruption_once(db_path, bridge)  # must not raise
-        assert result is True
+        for _ in range(10):                       # far past the budget
+            notify_db_corruption_once(db_path, bridge)  # must never raise
+
         assert not os.path.exists(flag_path)
         assert os.path.exists(f"{db_path}.corrupt_flag.notified.json")
+        assert bridge.notify_error_confirmed.call_count < 10, (
+            "the alert must stop retrying once the budget is spent")
 
-    def test_none_bridge_still_renames_flag(self, db_path):
-        """A None bridge (not yet configured) must not crash and must still
-        consume the flag so it doesn't leak into every future call."""
+    def test_none_bridge_does_not_crash_and_still_terminates(self, db_path):
+        """A None bridge (not yet configured) cannot confirm anything, so the
+        flag is kept — but the retry budget must still bound it."""
         flag_path = corruption_flag_path(db_path)
         with open(flag_path, "w", encoding="utf-8") as f:
             json.dump({"detected_at": "x"}, f)
 
-        result = notify_db_corruption_once(db_path, None)
-        assert result is True
+        assert notify_db_corruption_once(db_path, None) is True
+        assert os.path.exists(flag_path), "nothing was delivered, so keep it"
+
+        for _ in range(10):
+            notify_db_corruption_once(db_path, None)
         assert not os.path.exists(flag_path)
         assert os.path.exists(f"{db_path}.corrupt_flag.notified.json")

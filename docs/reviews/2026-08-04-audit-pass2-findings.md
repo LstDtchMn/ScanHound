@@ -18,32 +18,36 @@ missing data. That is why they survived this long.
 | Severity | Count | Fixed so far |
 |---|---|---|
 | critical | 1 | 1 |
-| high | 12 | 11 |
-| medium | 13 | 10 |
-| low | 6 | 3 |
+| high | 12 | 12 |
+| medium | 13 | 13 |
+| low | 6 | 6 |
 
-**Where this stands (2026-08-04).** 25 fixed, 1 partial, 6 open.
+**Where this stands (2026-08-05). All 32 confirmed findings are fixed.**
 
-Still open, and why — these five live in files no fix pass has touched yet:
+Two were closed only after an adversarial verifier rejected the first attempt,
+and both rejections were correct:
 
-| # | File | What it costs you |
-|---|---|---|
-| 18 | `app_service.py:785` | on the Docker build the scheduler can never start a scan, yet logs "Scheduled scan triggered" and reports itself active |
-| 20 | `database.py:3241` | nothing ever writes a scan_history row, so Analytics permanently reads 0 scans |
-| 21 | `download_queue.py:1146` | Retry returns HTTP 200 without retrying, and clobbers the batch's paused state |
-| 22 | `download_service.py:1915` | a transient DDLBase/Adit-HD failure is laundered into a permanent non-retryable "no links found" |
-| 26 | `scanner_service.py:376` | `run_scan` swallows every exception, so a failed source is recorded error-free and the cache is still purged |
+- **#19** was initially "fixed" by consuming the corruption flag on confirmed
+  delivery — but `NotificationBridge.notify_error` returned `None` on every
+  path, so confirmation was unreachable and the branch was dead code. Net
+  effect would have been three duplicate alerts per incident, then the flag
+  discarded unconfirmed anyway: worse than the bug. Closing it properly meant
+  finishing the chain — `_send_notification` now RETURNS its channel success
+  count instead of only logging it, `notify()` propagates it (`None` when
+  batched, because a batched send has not happened yet), and the bridge gained
+  a `notify_error_confirmed()` that waits for the result. `notify_error()`
+  stays fire-and-forget so nothing on the hot path blocks on SMTP.
+- **#17** was initially closed by having the frontend mint tickets — but the
+  fallback fired on ANY failure, so a transient 5xx re-leaked the 30-day token,
+  and a backend restart triggers that failure and a reconnect storm at the same
+  moment. The fallback now fires only on 404/405 (route genuinely absent).
+  Everything else retries.
 
-Plus **#19** (`database.py:5014`), marked NOT FIXED above: the corruption
-flag is still consumed whether or not the notification was delivered. The
-docstring now describes that as intentional; the finding disagrees, and the
-disagreement is left visible rather than silently resolved.
-
-**#17** is PARTIAL. The backend can now mint short-lived single-use
-WebSocket tickets, but the frontend still passes `?token=`, so the session
-token is still written into every proxy access log. The finding does not
-close until the client uses the ticket.
-
+Three pre-existing tests in `test_database_hardening.py` pinned the OLD #19
+contract and were rewritten;
+`test_bridge_exception_does_not_prevent_flag_rename` was deleted outright
+rather than adapted, because it asserted the rejected policy in its own
+docstring.
 
 ---
 
@@ -591,7 +595,7 @@ await ws_manager.connect(ws)
 
 ---
 
-### 17. `backend/api/ws.py:127`  ⚠️ PARTIAL — backend can mint short-lived WS tickets; the frontend still sends ?token=, so the finding is NOT closed until it uses them
+### 17. `backend/api/ws.py:127`  ✅ FIXED — the frontend mints a fresh single-use ticket per attempt. The fallback to ?token= now fires ONLY on 404/405 (route genuinely absent); a transient 5xx, a malformed response or a network failure retries instead, because falling back on any error re-leaked the token during exactly the reconnect storm a backend restart causes
 
 *auth-surface*
 
@@ -615,7 +619,7 @@ PREFERRED — short-lived single-use ticket (safe against every log surface, inc
 
 ---
 
-### 18. `backend/app_service.py:785`
+### 18. `backend/app_service.py:785`  ✅ FIXED — the scheduler either genuinely triggers a scan or reports itself unable to
 
 *scan-pipeline*
 
@@ -635,7 +639,7 @@ api/routes/scheduler.py:44-48  `"scheduler_active": bool(` / `    backend and` /
 
 ---
 
-### 19. `backend/database.py:5014`  ❌ NOT FIXED — docstring now DOCUMENTS the fire-once behaviour as intended; the flag is still consumed whether or not anything was delivered
+### 19. `backend/database.py:5014`  ✅ FIXED — the flag is consumed only on CONFIRMED delivery, with a bounded retry budget. Required closing the chain: NotificationManager._send_notification now RETURNS its success count instead of only logging it, notify() propagates it (None when batched = not yet sent), and NotificationBridge gained notify_error_confirmed(). Without that the confirmation branch was dead code and one incident became three duplicate alerts
 
 *notifications*
 
@@ -671,7 +675,7 @@ try:
 
 ---
 
-### 20. `backend/database.py:3241`
+### 20. `backend/database.py:3241`  ✅ FIXED — the scan route now writes a scan_history row (not for cancelled/failed runs)
 
 *scan-pipeline*
 
@@ -710,7 +714,7 @@ Timestamp format is load-bearing: analytics.py compares `timestamp > cutoff` aga
 
 ---
 
-### 21. `backend/download_queue.py:1146`
+### 21. `backend/download_queue.py:1146`  ✅ FIXED — retry_item checks the UPDATE rowcount and rolls back before touching the batch
 
 *download-path*
 
@@ -741,7 +745,7 @@ conn.execute(
 
 ---
 
-### 22. `backend/download_service.py:1915`
+### 22. `backend/download_service.py:1915`  ✅ FIXED — DDLBase/Adit-HD failures carry a ScrapeDiagnostic; transient stays retryable
 
 *download-path*
 
@@ -928,7 +932,7 @@ backend/plex_manager.py:585-589
 
 ---
 
-### 26. `backend/scanner_service.py:376`
+### 26. `backend/scanner_service.py:376`  ✅ FIXED — run_scan records last_scan_error and re-arms early_stopped, so a crashed scan no longer reports clean and no longer lets the cache be purged
 
 *scan-pipeline*
 

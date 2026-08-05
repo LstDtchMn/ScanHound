@@ -726,8 +726,82 @@ class AppService:
         logger.info("Maintenance loop started (every %.0fs)", interval_seconds)
 
     def set_scan_trigger(self, callback: Optional[Callable]):
-        """Register a callback the scheduler invokes to start a scan."""
+        """Register a callback the scheduler invokes to start a scan.
+
+        Registering a trigger also revives a scheduler thread that stopped
+        itself because nothing could start a scan (see _scheduler_loop), so a
+        trigger registered after startup doesn't leave the scheduler dead.
+        """
         self._scan_trigger = callback
+        if callback is not None and self.config.get("scheduler_enabled", False):
+            self._start_scheduler()
+
+    def _fire_scheduled_scan(self) -> str:
+        """Start one scheduled scan. Returns "started", "skipped" or "unavailable".
+
+        "skipped" means a scan could not start *right now* (one is already
+        running, or the registered trigger raised) — the caller retries on the
+        next tick. "unavailable" means nothing on this build can ever start a
+        scan, which the caller must not report as a successful trigger.
+        """
+        trigger = self._scan_trigger
+        if trigger is not None:
+            try:
+                result = trigger()
+            except Exception as e:
+                logger.error(f"Scheduled scan trigger failed: {e}")
+                return "skipped"
+            # Registered triggers (ui/controllers/scanner_controller.py) return
+            # None, so only an explicit False means "I started nothing".
+            return "skipped" if result is False else "started"
+        return self._start_api_scan()
+
+    def _start_api_scan(self) -> str:
+        """Scheduler fallback for the API-server build. Same returns as above.
+
+        set_scan_trigger is only ever called by the Qt desktop controller, so
+        under docker/entrypoint.sh (``python -m backend.api``) the scheduler
+        had no way to start a scan at all. Start one exactly the way POST
+        /scheduler/trigger does. Imported at call time because backend.api
+        imports this module — a module-level import would be circular (same
+        reason as the rename-service lookup in _run_maintenance_pass).
+        """
+        try:
+            from backend.api.dependencies import registry
+            from backend.api.routes.scanner import (
+                ScanRequest, _run_scan, _scan_lock, _scan_state,
+            )
+        except Exception as e:
+            logger.debug("Scheduler: API scan machinery unavailable (%s)", e)
+            return "unavailable"
+
+        if registry.backend is not self:
+            # Not the AppService this process serves over HTTP (desktop build,
+            # or an instance replaced by a lifespan restart) — its scan routes
+            # would drive somebody else's services, so there is no fallback.
+            return "unavailable"
+        if registry._scanner_service is None:
+            # Server build, still wiring: backend/api/main.py's lifespan
+            # assigns reg.backend *before* AppService.startup() — which is what
+            # starts this scheduler — and reg._scanner_service only afterwards,
+            # so an early tick must retry rather than declare itself dead.
+            return "skipped"
+
+        # Mirrors the route's 409 guard: a background pre-cache scan owns the
+        # single scan slot.
+        scanner = registry.scanner
+        if scanner is not None and getattr(scanner, "scan_in_progress", False):
+            return "skipped"
+
+        with _scan_lock:
+            if _scan_state["state"] == "running":
+                return "skipped"
+            _scan_state["state"] = "running"
+            threading.Thread(
+                target=_run_scan, args=(registry, ScanRequest(type="incremental")),
+                name="scheduled-scan", daemon=True,
+            ).start()
+        return "started"
 
     def _start_scheduler(self):
         """Start the background scan scheduler thread.
@@ -741,6 +815,9 @@ class AppService:
         idle_threshold = 300  # 5 minutes
 
         def _scheduler_loop():
+            # Edge-trigger the "couldn't start" warning: a scan that runs for
+            # an hour would otherwise log one line every 60s.
+            skip_logged = False
             while not self._scheduler_stop.wait(60):
                 if self._scheduler_stop.is_set():
                     break
@@ -760,23 +837,46 @@ class AppService:
                     if idle_secs < idle_threshold:
                         continue
 
-                with self._config_lock:
-                    self.config["last_scan_time"] = now
-                    self.save_config()
-                logger.info("Scheduled scan triggered")
-                if self._scan_trigger:
-                    try:
-                        self._scan_trigger()
-                    except Exception as e:
-                        logger.error(f"Scheduled scan trigger failed: {e}")
-                elif self._log_callback:
-                    try:
-                        self._log_callback(
-                            "Scheduled scan interval reached (no trigger registered)",
-                            "warning"
-                        )
-                    except Exception:
-                        pass
+                # Fire first, then record it. The old order stamped
+                # last_scan_time and logged "Scheduled scan triggered" before
+                # checking whether anything could actually start a scan — on
+                # the server build nothing ever could, so the log claimed the
+                # opposite of what happened, once per interval, forever.
+                outcome = self._fire_scheduled_scan()
+                if outcome == "started":
+                    # Stamped at trigger time (not completion) so the next tick
+                    # can't fire a second scan while this one is still running.
+                    with self._config_lock:
+                        self.config["last_scan_time"] = now
+                        self.save_config()
+                    logger.info("Scheduled scan triggered")
+                    skip_logged = False
+                    continue
+
+                if outcome == "skipped":
+                    # last_scan_time deliberately NOT stamped: no scan ran, so
+                    # the interval isn't consumed and the next tick retries
+                    # instead of waiting another full interval.
+                    if not skip_logged:
+                        self.log(
+                            "Scheduled scan could not start (a scan is already "
+                            "running or the trigger failed) — will retry",
+                            "warning")
+                        skip_logged = True
+                    continue
+
+                # "unavailable": no trigger is registered and this build has no
+                # scan machinery to fall back on, so the scheduler can never do
+                # anything. Stop the thread — /scheduler/status derives
+                # scheduler_active from it being alive, and a green
+                # "Scheduler active" dot over a scheduler that cannot scan is
+                # worse than no scheduler. set_scan_trigger() revives it.
+                self.log(
+                    "Scheduler stopped: no scan trigger is registered, so "
+                    "scheduled scans cannot run on this build",
+                    "error")
+                self._scheduler_stop.set()
+                return
 
         self._scheduler_thread = threading.Thread(
             target=_scheduler_loop, name="scheduler", daemon=True

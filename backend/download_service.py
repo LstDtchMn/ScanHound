@@ -133,6 +133,20 @@ def _source_page_kind(url: str) -> str:
     return "hdencode"
 
 
+def _as_scraped_links(result) -> ScrapedLinks:
+    """Normalize a scraper's return value without discarding its diagnostic.
+
+    A diagnostic lives on the ``ScrapedLinks`` instance, not in the list
+    payload, so re-wrapping (``ScrapedLinks(ScrapedLinks([], diagnostic=d))``)
+    silently loses ``d`` and the failure is reported as a plain "no links
+    found".  Mocks and older callers may still hand back a bare list, which
+    has no diagnostic to preserve.
+    """
+    if isinstance(result, ScrapedLinks):
+        return result
+    return ScrapedLinks(result or ())
+
+
 def _challenge_iframe_signal(src: str) -> str:
     """Return a closed, non-sensitive challenge-frame signal.
 
@@ -1912,14 +1926,14 @@ class DownloadService:
         try:
             with self._driver_lock:
                 if source_kind == "ddlbase":
-                    return ScrapedLinks(
+                    return _as_scraped_links(
                         self._scrape_ddlbase_links(
                             url,
                             progress_callback=progress_callback,
                         )
                     )
                 if source_kind == "adithd":
-                    return ScrapedLinks(
+                    return _as_scraped_links(
                         self._scrape_adithd_links(url, service_type)
                     )
 
@@ -2060,25 +2074,39 @@ class DownloadService:
                 self._active_scrapes -= 1
                 self._scrapes_done.notify_all()
 
-    def _scrape_ddlbase_links(self, url: str, progress_callback: Optional[Callable] = None) -> List[str]:
+    def _scrape_ddlbase_links(self, url: str, progress_callback: Optional[Callable] = None) -> ScrapedLinks:
         """Scrape download links from DDLBase post page.
 
         DDLBase encodes shortlinks in ``ddllk`` attributes on ``a.boolk``
         elements using XOR encryption (key: ``mySecret123``) + base64.
         Mirror 1 links (cuty.io/cuttlinks.com) resolve to 1fichier.com.
+
+        Returns ``ScrapedLinks`` rather than a bare list so a transient
+        failure (driver/network/Turnstile/shortlink timeout) travels with a
+        retryable diagnostic instead of being reported as the permanent,
+        non-retryable "no download links found on the source page".
         """
         _ensure_selenium()
         from bs4 import BeautifulSoup
 
         try:
             self._log(f"[DDLBase] Scraping links from: {url}")
-            driver = self._navigate(url, tag="DDLBase")
+            driver, navigation_diagnostic = self._navigate_with_diagnostic(
+                url, tag="DDLBase"
+            )
             if driver is None:
-                return []
+                return ScrapedLinks(diagnostic=navigation_diagnostic)
             # DDLBase is Cloudflare-protected; wait for any "Just a moment…"
             # challenge to clear before parsing (the HDEncode path does the
             # same), then let the page JS render the boolk shortlink tags.
-            self._wait_past_cloudflare(driver)
+            # A challenge that never clears is an interactive-verification
+            # outcome, not an empty page — surfacing it keeps the item
+            # retryable instead of failing it permanently.
+            wait_diagnostic = self._wait_past_cloudflare(
+                driver, source_kind="ddlbase"
+            )
+            if wait_diagnostic is not None:
+                return ScrapedLinks(diagnostic=wait_diagnostic)
             time.sleep(3)
 
             soup = BeautifulSoup(driver.page_source, 'html.parser')
@@ -2111,10 +2139,14 @@ class DownloadService:
 
             if not shortlinks and not direct_links:
                 self._log("[DDLBase] No shortlinks or download links found", "warning")
-                self._log_page_diagnostics(
+                # This classification was already being computed and thrown
+                # away. A genuinely empty post still classifies as the
+                # non-retryable NO_FILE_HOST_LINKS; only a page carrying
+                # challenge/network evidence classifies as something else.
+                diagnostic = self._log_page_diagnostics(
                     driver, source_kind="ddlbase"
                 )
-                return []
+                return ScrapedLinks(diagnostic=diagnostic)
 
             self._log(f"[DDLBase] Found {len(shortlinks)} shortlinks, {len(direct_links)} direct links")
 
@@ -2126,6 +2158,19 @@ class DownloadService:
                     f"[DDLBase] Decoded {len(shortlinks)} shortlink(s) but none are "
                     "auto-resolvable (only cuty.io / cuttlinks.com are) — no links delivered",
                     "warning",
+                )
+                # A mirror this build cannot automate is a permanent
+                # capability limit, not a transient failure: retrying the
+                # same post produces the same unsupported mirrors.
+                return ScrapedLinks(
+                    diagnostic=ScrapeDiagnostic(
+                        ScrapeCode.NO_FILE_HOST_LINKS,
+                        retryable=False,
+                        affects_source_health=False,
+                        signals=("shortlinks_not_automatable",),
+                        stage="shortlink_resolution",
+                        transport_attempted=True,
+                    )
                 )
 
             for short_url in dict.fromkeys(resolvable):
@@ -2144,11 +2189,42 @@ class DownloadService:
                     "(timeout/captcha) — no links delivered",
                     "warning",
                 )
-            return resolved
+                # The post DID carry automatable shortlinks; the resolver ran
+                # and came back empty. That is a timeout/Turnstile/ad-gate
+                # failure on cuty.io, which the very next attempt often
+                # clears — so it must stay retryable and must not claim the
+                # source page has no links.
+                return ScrapedLinks(
+                    diagnostic=ScrapeDiagnostic(
+                        ScrapeCode.SCRAPE_EXCEPTION,
+                        retryable=True,
+                        affects_source_health=False,
+                        signals=("shortlink_unresolved",),
+                        stage="shortlink_resolution",
+                        transport_attempted=True,
+                        retry_mode="immediate",
+                        detail=(
+                            f"All {len(resolvable)} resolvable shortlink(s) failed "
+                            "to resolve."
+                        ),
+                    )
+                )
+            return ScrapedLinks(resolved)
 
         except Exception as e:
             self._log(f"[DDLBase] Error scraping links: {e}", "error")
-            return []
+            return ScrapedLinks(
+                diagnostic=ScrapeDiagnostic(
+                    ScrapeCode.SCRAPE_EXCEPTION,
+                    retryable=True,
+                    affects_source_health=False,
+                    signals=(type(e).__name__,),
+                    stage="link_retrieval",
+                    transport_attempted=True,
+                    retry_mode="immediate",
+                    detail=f"DDLBase link scrape failed: {e}",
+                )
+            )
 
     @staticmethod
     def _is_ddlbase_shortlink(url: str) -> bool:
@@ -2365,13 +2441,36 @@ class DownloadService:
 
         return None
 
-    def _scrape_adithd_links(self, url: str, service_type: str) -> List[str]:
-        """Scrape download links from Adit-HD forum thread."""
+    def _scrape_adithd_links(self, url: str, service_type: str) -> ScrapedLinks:
+        """Scrape download links from Adit-HD forum thread.
+
+        Returns ``ScrapedLinks`` rather than a bare list so a browser launch
+        failure, a thrown scrape, or a verification wall is reported as what
+        it is instead of the permanent, non-retryable "no download links
+        found on the source page".
+        """
         _ensure_selenium()
 
         try:
             self._log(f"[Adit-HD] Scraping links from: {url}")
-            driver = self.get_driver()
+            try:
+                driver = self.get_driver()
+            except Exception as exc:
+                self._log(
+                    f"[Adit-HD] browser launch failed: {type(exc).__name__}",
+                    "error",
+                )
+                return ScrapedLinks(
+                    diagnostic=ScrapeDiagnostic(
+                        ScrapeCode.BROWSER_LAUNCH_FAILED,
+                        retryable=True,
+                        affects_source_health=False,
+                        signals=(type(exc).__name__,),
+                        transport_attempted=False,
+                        retry_mode="immediate",
+                        detail="The browser could not start.",
+                    )
+                )
 
             # Try to use the adithd source from registry
             try:
@@ -2413,7 +2512,7 @@ class DownloadService:
 
                         if links:
                             self._log(f"[Adit-HD] Found {len(links)} {service_type} links")
-                            return links
+                            return ScrapedLinks(links)
 
                         # Plugin DID return links, just none for the requested host —
                         # say so accurately instead of "returned no links".
@@ -2444,11 +2543,35 @@ class DownloadService:
                     found.append(href)
 
             self._log(f"[Adit-HD] Found {len(found)} links (fallback scrape)")
-            return found
+            if not found:
+                # Classify the page instead of asserting it has no links: a
+                # login/verification wall renders zero anchors too, and that
+                # outcome is recoverable while a genuinely empty thread is
+                # not. A thread with no matching links still classifies as
+                # the non-retryable NO_FILE_HOST_LINKS/REQUESTED_HOST_MISSING.
+                diagnostic = self._log_page_diagnostics(
+                    driver,
+                    keyword=keyword or None,
+                    stage="requested_host",
+                    source_kind="adithd",
+                )
+                return ScrapedLinks(diagnostic=diagnostic)
+            return ScrapedLinks(found)
 
         except Exception as e:
             self._log(f"[Adit-HD] Error scraping links: {e}", "error")
-            return []
+            return ScrapedLinks(
+                diagnostic=ScrapeDiagnostic(
+                    ScrapeCode.SCRAPE_EXCEPTION,
+                    retryable=True,
+                    affects_source_health=False,
+                    signals=(type(e).__name__,),
+                    stage="link_retrieval",
+                    transport_attempted=True,
+                    retry_mode="immediate",
+                    detail=f"Adit-HD link scrape failed: {e}",
+                )
+            )
 
     # ── Export ─────────────────────────────────────────────────────────
 
