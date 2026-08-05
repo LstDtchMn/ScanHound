@@ -1034,6 +1034,23 @@ class DatabaseManager:
                     ("imdb_id", "TEXT"),
                     ("tmdb_id", "TEXT"),
                     ("discovery_source", "TEXT NOT NULL DEFAULT 'rss'"),
+                    # WHICH protected fields detail actually supplied for THIS
+                    # row (JSON array), recorded at hydration completion.
+                    #
+                    # Authority is per row, not per field. _candidate_updates
+                    # omits any field the detail payload did not carry, and the
+                    # sink COALESCEs, so a completed row is a MIXTURE: fields
+                    # detail supplied are detail-authoritative, and the rest are
+                    # still the feed's. Nothing recorded which was which, so the
+                    # feed-repair pass had no way to know what it was allowed to
+                    # re-derive and repaired exactly one hardcoded field.
+                    #
+                    # NULL means "recorded before this column existed". That is
+                    # deliberately NOT the same as '[]' (detail supplied
+                    # nothing): an unknown claim set must not be read as an
+                    # empty one, or the repair would overwrite detail facts it
+                    # cannot see.
+                    ("detail_authority_fields", "TEXT"),
                     # Media-type CONFIDENCE and PROVENANCE, additive.
                     #
                     # The resolver produced both and the parser object carried
@@ -1969,6 +1986,32 @@ class DatabaseManager:
     #: _candidate_updates' emitted key list (round-14): title_year is the one
     #: protected field it never writes; description_year is where the detail
     #: page's year goes. Keep in sync if that adapter starts emitting more.
+    #: Every column the hydration sink COALESCEs, i.e. every field whose
+    #: authority can differ ROW BY ROW. A field is detail-authoritative on a
+    #: row only if that row's detail payload actually supplied it.
+    _PROTECTED_FIELDS = (
+        "clean_title", "title_year", "description_year",
+        "season", "episode", "episode_end",
+        "resolution", "size_text", "size_gb",
+        "dv_evidence", "hdr_evidence", "hevc_evidence", "hdr_formats",
+        "media_type", "media_type_provisional", "media_type_because",
+    )
+
+    #: Fields that must move together or not at all. Re-deriving one member
+    #: from a new grammar while another stays at the old parse produces a row
+    #: that is internally inconsistent -- "HDR10+ formats" beside "no HDR
+    #: evidence", or a size_text that disagrees with size_gb -- which is worse
+    #: than either value alone being stale. If ANY member is detail-claimed the
+    #: whole group is treated as detail-owned.
+    _COUPLED_FIELD_GROUPS = (
+        ("media_type", "media_type_provisional", "media_type_because"),
+        ("size_text", "size_gb"),
+        ("hdr_evidence", "hdr_formats"),
+        ("season", "episode", "episode_end"),
+    )
+
+    #: Superseded by per-row authority (round-15). Kept only as the historical
+    #: name in migration notes; the repair no longer reads it.
     _FEED_ONLY_ON_COMPLETED = ("title_year",)
 
     @staticmethod
@@ -2067,27 +2110,39 @@ class DatabaseManager:
         from backend.sources.hdencode_feed_parser import reparse_feed_facts
         from backend.release_grammar import GRAMMAR_VERSION
         healed = 0
-        assignments = ", ".join(
-            f"{f} = ?" for f in self._FEED_ONLY_ON_COMPLETED)
         with self._lock:
             conn = self.get_connection()
             if not conn:
                 raise RuntimeError("Database unavailable")
             cur = conn.cursor()
             cur.execute(
-                """SELECT canonical_url, title, categories, raw_description
+                """SELECT canonical_url, title, categories, raw_description,
+                          detail_authority_fields
                    FROM hdencode_candidates
                    WHERE hydration_state = 'completed'
                      AND COALESCE(feed_parse_version, '') != ?""",
                 (GRAMMAR_VERSION,))
-            for url, title, categories_json, raw_description in cur.fetchall():
+            for (url, title, categories_json, raw_description,
+                 claimed_json) in cur.fetchall():
                 try:
                     categories = json.loads(categories_json or "[]")
                 except (TypeError, ValueError):
                     categories = []
+
+                feed_owned = self._feed_owned_fields(claimed_json)
+                if not feed_owned:
+                    # Detail owns every protected field on this row, so there
+                    # is nothing the feed may re-derive. Do NOT stamp
+                    # feed_parse_version: the stamp certifies that the feed
+                    # facts were re-derived under the current grammar, and
+                    # here none were. Claiming otherwise is exactly the
+                    # over-certification this pass is being fixed for.
+                    continue
+
                 facts = reparse_feed_facts(title or "", categories,
                                            raw_description or "")
-                params = [facts[f] for f in self._FEED_ONLY_ON_COMPLETED]
+                assignments = ", ".join(f"{f} = ?" for f in feed_owned)
+                params = [self._feed_fact_value(facts, f) for f in feed_owned]
                 params += [GRAMMAR_VERSION, url]
                 cur.execute(
                     f"""UPDATE hdencode_candidates
@@ -2096,6 +2151,58 @@ class DatabaseManager:
                 healed += 1
             conn.commit()
         return healed
+
+    #: reparse_feed_facts names three facts without the ``_evidence`` suffix
+    #: its columns carry. A pure KEY rename: the values are already the stored
+    #: verdict strings ('asserted' / 'negated' / 'unknown'), not tri-state
+    #: booleans, and those columns are NOT NULL DEFAULT 'unknown' -- so passing
+    #: a None through here violates the constraint rather than meaning
+    #: "absent". ('unknown' IS how absence is spelled.)
+    _FEED_FACT_KEY = {
+        "dv_evidence": "dv",
+        "hdr_evidence": "hdr",
+        "hevc_evidence": "hevc",
+    }
+
+    def _feed_owned_fields(self, claimed_json):
+        """Protected fields the FEED still owns on one completed row.
+
+        ``claimed_json`` is that row's recorded detail claim set. A field is
+        feed-owned when detail did not supply it, with two guards:
+
+        - ``None`` (a row written before the column existed) yields NOTHING.
+          An unknown claim set is not an empty one; treating it as empty would
+          let the repair overwrite detail facts it cannot see. Those rows heal
+          on their next hydration, which records a claim set.
+        - Coupled groups move together. If detail claimed any member, the
+          whole group stays detail-owned, so a new-grammar HDR format list can
+          never land beside an old-grammar HDR verdict.
+        """
+        if claimed_json is None:
+            return ()
+        try:
+            claimed = set(json.loads(claimed_json))
+        except (TypeError, ValueError):
+            # Undecodable is unknown, not empty -- same reasoning as None.
+            return ()
+        for group in self._COUPLED_FIELD_GROUPS:
+            if claimed & set(group):
+                claimed |= set(group)
+        return tuple(f for f in self._PROTECTED_FIELDS if f not in claimed)
+
+    @staticmethod
+    def _feed_fact_value(facts, field):
+        """One feed fact, converted to what its column stores."""
+        key = DatabaseManager._FEED_FACT_KEY.get(field, field)
+        value = facts.get(key)
+        if field in DatabaseManager._FEED_FACT_KEY:
+            # NOT NULL DEFAULT 'unknown': absence is spelled, never NULL.
+            return value or "unknown"
+        if field == "media_type_provisional":
+            return 1 if value else 0
+        if field in ("media_type_because", "hdr_formats"):
+            return json.dumps(list(value or []))
+        return value
 
     def _reparse_stale_candidates(self):
         """Offline re-derivation (round-10 ratified: candidate rows retain
@@ -2168,6 +2275,33 @@ class DatabaseManager:
         with self.transaction() as conn:
             if not conn:
                 raise RuntimeError("Database unavailable")
+
+            # The detail claim set is CUMULATIVE, not per-payload.
+            #
+            # Every protected column is written with COALESCE, so a value
+            # stays whatever the last non-NULL write left there. If an earlier
+            # detail payload supplied `resolution` and a later refetch omits
+            # it, the STORED resolution is still detail-derived -- COALESCE
+            # kept it. Recording only this payload's keys would then mark that
+            # column feed-owned and let the feed repair overwrite a detail
+            # fact with a lower-authority one, which is the exact downgrade
+            # the authority model exists to prevent. Verified against the real
+            # sink before this was added: rich hydration then sparse refetch
+            # left resolution='2160P' with 'resolution' absent from a
+            # per-payload claim set.
+            #
+            # Union is therefore the correct accumulation. It only ever grows,
+            # which is conservative in the safe direction: the repair declines
+            # to touch a field rather than risking a downgrade.
+            prior = conn.execute(
+                "SELECT detail_authority_fields FROM hdencode_candidates "
+                "WHERE canonical_url = ?", (canonical_url,)).fetchone()
+            claimed = set(updates) & set(self._PROTECTED_FIELDS)
+            if prior and prior[0]:
+                try:
+                    claimed |= set(json.loads(prior[0]))
+                except (TypeError, ValueError):
+                    pass    # undecodable prior: keep this payload's claims
             conn.execute(
                 """
                 INSERT INTO hdencode_candidate_details (
@@ -2219,6 +2353,11 @@ class DatabaseManager:
                         WHEN ? THEN 1 ELSE description_complete
                     END,
                     detail_parse_version = ?,
+                    -- Exactly which protected fields THIS payload supplied.
+                    -- Without it the feed-repair pass cannot tell a
+                    -- detail-owned field from a feed-owned one on a completed
+                    -- row, because COALESCE erases the distinction.
+                    detail_authority_fields = ?,
                     derived_state = 'current',
                     hydration_state = 'completed',
                     identity_state = COALESCE(?, identity_state),
@@ -2262,6 +2401,7 @@ class DatabaseManager:
                     # what this stamp certifies is "the scraper that produced
                     # these facts" (see DETAIL_PARSE_VERSION's doc comment).
                     self._detail_parse_version(),
+                    json.dumps(sorted(claimed)),
                     updates.get("identity_state"),
                     now,
                     canonical_url,
