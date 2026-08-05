@@ -348,35 +348,44 @@ def _assert_wal_fully_checkpointed(legacy_path: str) -> None:
         "checkpointed database")
 
 
-def _assert_copy_matches_source(source_path: str, copy_path: str) -> None:
-    """Raise unless ``copy_path`` holds the same schema and row counts as
-    ``source_path``.
+def _assert_copy_matches_source(source_conn, copy_path: str) -> None:
+    """Raise unless ``copy_path`` holds the same schema version and row counts
+    as the snapshot ``source_conn`` is reading.
 
-    Reading the source through a fresh connection sees its WAL, while the copy
-    is main-file-only, so comparing the two is the only check that can tell a
-    good copy from a stale one — ``integrity_check`` passes on both.
+    ``source_conn`` is a CONNECTION, not a path, and specifically the same one
+    (inside the same still-open read transaction) that produced the copy. That
+    is load-bearing: re-reading the source through a fresh connection would
+    compare the copy against whatever a concurrent writer has committed SINCE
+    the copy was taken, so an ordinary INSERT landing in that gap would reject
+    a perfectly faithful migration.
+
+    This is a sanity net on top of the backup API, not the primary guarantee —
+    see _checkpoint_and_copy. Row counts alone cannot detect a same-count
+    divergence (an UPDATE, or a paired DELETE+INSERT), and ``integrity_check``
+    passes on a stale-but-coherent file, so consistency has to come from HOW
+    the copy is made rather than from checking it afterwards.
     """
     import sqlite3
 
-    def _snapshot(path):
-        conn = sqlite3.connect(path)
-        try:
-            conn.execute(f"PRAGMA busy_timeout={_MIGRATION_CHECKPOINT_BUSY_MS}")
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            tables = [r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-            counts = {t: conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
-                      for t in tables}
-            return version, counts
-        finally:
-            conn.close()
+    def _snapshot(conn):
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        counts = {t: conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
+                  for t in tables}
+        return version, counts
 
-    src_version, src_counts = _snapshot(source_path)
+    src_version, src_counts = _snapshot(source_conn)
+
+    copy_conn = sqlite3.connect(copy_path)
     try:
-        copy_version, copy_counts = _snapshot(copy_path)
+        copy_conn.execute(f"PRAGMA busy_timeout={_MIGRATION_CHECKPOINT_BUSY_MS}")
+        copy_version, copy_counts = _snapshot(copy_conn)
     except sqlite3.DatabaseError as e:
         raise RuntimeError(f"migrated copy is unreadable: {e}") from e
+    finally:
+        copy_conn.close()
 
     if src_version != copy_version:
         raise RuntimeError(
@@ -386,47 +395,126 @@ def _assert_copy_matches_source(source_path: str, copy_path: str) -> None:
         differing = sorted(t for t in src_counts
                            if t in copy_counts and src_counts[t] != copy_counts[t])
         raise RuntimeError(
-            f"migrated copy does not match {source_path} "
+            f"migrated copy does not match the source snapshot "
             f"(missing tables: {missing}; row-count mismatch: {differing})")
 
 
+def _fold_and_drop_copy_sidecars(copy_path: str) -> None:
+    """Fold any -wal beside ``copy_path`` into its main file, then remove the
+    sidecars.
+
+    The backup API leaves the destination flagged WAL-mode (the file-format
+    byte lives in page 1, which is copied verbatim from the source), so both
+    the backup connection and the verification read create sidecars next to
+    the temp name. SQLite removes them itself on a clean close, so a SURVIVOR
+    implies an unclean close — exactly the case where it may still hold
+    committed frames. Deleting it blind would silently discard them, so
+    checkpoint first: we hold the only connection here, so TRUNCATE always
+    folds everything.
+
+    HONESTY NOTE, added after adversarial verification. This is BELT AND
+    BRACES, not a demonstrated safeguard. Deleting it outright changed nothing
+    in testing, and the specific hazard an earlier version of this docstring
+    asserted -- "an orphaned -wal would be replayed into the fresh copy" --
+    could not be reproduced: a SIGKILLed writer leaving a 2 MB leftover -wal
+    with 498 junk rows and an extra table produced an identical clean result
+    with this function present and absent, because the backup API truncates and
+    overwrites the destination. It is kept because it is cheap and the
+    unclean-close reasoning above is sound in principle, but no test covers it
+    and none should pretend to -- a test that passes with its subject deleted
+    certifies the code instead of checking it.
+    """
+    import sqlite3
+
+    if any(os.path.exists(copy_path + s) for s in ("-wal", "-shm")):
+        conn = sqlite3.connect(copy_path, isolation_level=None)
+        try:
+            conn.execute(f"PRAGMA busy_timeout={_MIGRATION_CHECKPOINT_BUSY_MS}")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        finally:
+            conn.close()
+    for suffix in ("-wal", "-shm"):
+        sidecar = copy_path + suffix
+        if os.path.exists(sidecar):
+            os.remove(sidecar)
+
+
 def _checkpoint_and_copy(legacy_path: str, new_path: str) -> bool:
-    """Fold the legacy DB's WAL into its main file, then atomically copy it
-    to new_path.
+    """Copy the legacy DB to new_path through SQLite's online backup API.
 
     Returns True on success and raises on any failure to produce a faithful
     copy — never returns True for a stale/partial one. _resolve_db_path turns
     that into "keep using the legacy DB", which is always the safe outcome:
     the legacy file still holds the data.
 
-    Never touches -wal/-shm sidecars at the destination — the copied file is a
-    clean, checkpointed snapshot that SQLite will happily open fresh (WAL/SHM
-    get recreated on first write).
+    Why the backup API rather than a file copy: in WAL mode a committed
+    transaction lives in the -wal until something checkpoints it, and until
+    then the main DB file is still the pre-write snapshot. Checkpoint-then-copy
+    therefore has a window — any writer committing after the checkpoint leaves
+    the copied main file stale, and no after-the-fact comparison can reliably
+    catch it (an UPDATE or a paired DELETE+INSERT changes no row counts, and
+    integrity_check passes on a stale-but-coherent file, so a stale copy would
+    be certified as good and then adopted PERMANENTLY — the exists() guard in
+    _resolve_db_path never retries). The backup API instead reads THROUGH the
+    WAL inside a read transaction, so what lands at the destination is by
+    construction the source's state at one instant.
 
-    Atomicity: copy2 goes to a temp sibling (new_path + ".migrating") first,
-    then os.replace() swaps it into place. os.replace is atomic on the same
-    filesystem, and the temp file lives in the same directory as new_path
-    (same volume), so a crash between the copy and the replace never leaves
+    The read transaction is opened before the backup and held until after the
+    verification read, so both observe the same snapshot; a writer committing
+    mid-operation is simply not part of it, rather than corrupting it or
+    spuriously failing it.
+
+    The pre-checkpoint is kept, though the backup API no longer depends on it:
+    it fails fast and loudly on the contended case, and folding the WAL first
+    keeps the backup reading mostly from the main file.
+
+    Atomicity: the backup goes to a temp sibling (new_path + ".migrating")
+    first, then os.replace() swaps it into place. os.replace is atomic on the
+    same filesystem, and the temp file lives in the same directory as new_path
+    (same volume), so a crash between the backup and the replace never leaves
     a partial/truncated file at new_path — either the replace happened (full
     file present) or it didn't (nothing present at new_path, so the
     idempotency guard in _resolve_db_path correctly retries migration on the
     next boot instead of mistaking a truncated file for "already migrated").
     """
-    import shutil
+    import sqlite3
+
     _assert_wal_fully_checkpointed(legacy_path)
 
     temp_path = new_path + ".migrating"
-    if os.path.exists(temp_path):
-        os.remove(temp_path)  # stale leftover from a prior interrupted attempt
-    shutil.copy2(legacy_path, temp_path)
-    _assert_copy_matches_source(legacy_path, temp_path)
-    # The verification read above opens the copy, which recreates -wal/-shm
-    # next to the TEMP name. SQLite deletes them on a clean close; drop any
-    # survivor so os.replace() doesn't strand them beside the migrated DB.
-    for suffix in ("-wal", "-shm"):
-        sidecar = temp_path + suffix
-        if os.path.exists(sidecar):
-            os.remove(sidecar)
+    # Leftovers from a prior interrupted attempt. The sidecars go too: the
+    # backup writes into an existing file rather than replacing it, so an
+    # orphaned -wal would be replayed into the fresh copy.
+    for path in (temp_path, temp_path + "-wal", temp_path + "-shm"):
+        if os.path.exists(path):
+            os.remove(path)
+
+    source = sqlite3.connect(legacy_path, isolation_level=None)
+    try:
+        source.execute(f"PRAGMA busy_timeout={_MIGRATION_CHECKPOINT_BUSY_MS}")
+        # A deferred BEGIN acquires nothing until the first read, so issue one
+        # immediately — that is what pins the WAL snapshot the backup and the
+        # verification below both read from.
+        source.execute("BEGIN")
+        source.execute("SELECT count(*) FROM sqlite_master").fetchall()
+
+        dest = sqlite3.connect(temp_path)
+        try:
+            source.backup(dest)
+        finally:
+            dest.close()
+
+        _assert_copy_matches_source(source, temp_path)
+    finally:
+        # Read-only transaction, so rollback and commit are equivalent; this
+        # just releases the snapshot so the source can be checkpointed again.
+        try:
+            source.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        source.close()
+
+    _fold_and_drop_copy_sidecars(temp_path)
     os.replace(temp_path, new_path)
     return True
 

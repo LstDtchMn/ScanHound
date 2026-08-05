@@ -7,6 +7,7 @@ dealing with asyncio. Runs the async notification loop in a daemon thread.
 import asyncio
 import logging
 import threading
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,13 @@ class NotificationBridge:
         bridge, a dead loop, a timeout, a raised channel, no channel willing to
         handle the type, and a BATCHED send (whose delivery has not happened
         yet, and which reports None rather than a count).
+
+        ONE confirming channel is enough (first_success_wins). Waiting for every
+        selected channel meant the slowest one decided the answer: EmailChannel
+        runs blocking smtplib, so a wedged SMTP server could burn the whole
+        ``timeout`` while a Discord webhook had already delivered in 200ms, and
+        this would report False for an alert the operator had actually received
+        -- consuming a retry and duplicating the alert on the next boot.
         """
         if not self._manager or not self._loop:
             return False
@@ -195,10 +203,26 @@ class NotificationBridge:
             from backend.notifications import NotificationType
             future = asyncio.run_coroutine_threadsafe(
                 self._manager.notify(
-                    NotificationType.ERROR, "ScanHound Error", message),
+                    NotificationType.ERROR, "ScanHound Error", message,
+                    first_success_wins=True),
                 self._loop,
             )
             delivered = future.result(timeout=timeout)
+        except FutureTimeoutError:
+            # Deliberately NOT cancelled. Reaching here means NO channel has
+            # confirmed yet, so cancelling would guarantee the alert is never
+            # delivered; letting the sends finish may still get it out. The
+            # caller retries either way, so the cost of not cancelling is at
+            # worst a duplicate alert -- the cheaper mistake for a
+            # total-history-loss event. The abandoned work is no longer
+            # unbounded: each channel send is capped by
+            # DEFAULT_CHANNEL_SEND_TIMEOUT and smtplib now carries an explicit
+            # socket timeout, so it ends on its own. (Cancelling could not have
+            # stopped an smtplib call already running in the executor anyway.)
+            logger.warning(
+                "Confirmed error notification not observed within %.1fs; "
+                "treating as undelivered", timeout)
+            return False
         except Exception as e:  # noqa: BLE001 - a failed alert is not fatal
             logger.warning(f"Confirmed error notification failed: {e}")
             return False

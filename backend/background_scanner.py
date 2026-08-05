@@ -82,20 +82,46 @@ class BackgroundScanner:
         how blocked cycles were being recorded as shadow ``outcome='success'``
         with zero misses and counted as promotion evidence.
 
-        The durable signal is the crawl's seen-set: ``_crawl_pages`` fills it
-        from every listing page it actually parsed, and ``run_scan`` clears it
-        at the start of each run, so an empty set means no listing page was
-        read this cycle.
+        Two signals, and BOTH are required.
 
-        A crawl that early-stopped at already-cached content is deliberately
-        NOT treated as incomplete here: it reached the discovery frontier and
-        its seen-set is non-empty. ``_last_crawl_early_stopped`` is True for
-        that healthy case too, so using it would mark almost every cycle
-        incomplete and stall the shadow evidence entirely.
+        1. The crawl's seen-set: ``_crawl_pages`` fills it from every listing
+           page it actually parsed, and ``run_scan`` clears it at the start of
+           each run, so an empty set means no listing page was read this cycle.
+           This catches the all-pages-blocked cycle.
+
+        2. The crawl's completion reason. The seen-set alone cannot catch a
+           PARTIAL failure — page 1 parses, page 2 blocks or throws — because
+           page 1 already made the set non-empty. Only ``complete`` and
+           ``cached_frontier`` mean the listing was observed as far as it needed
+           to be; ``blocked``, ``transport_error``, ``coordinator_stopped``,
+           ``cancelled``, ``scan_error`` and ``not_started`` all mean some of the
+           listing was never seen, so the comparison's control arm is not sound
+           and the cycle must not count as promotion evidence.
+
+        ``_last_crawl_early_stopped`` is deliberately NOT used: it is True both
+        for the healthy cached-frontier stop (the crawl reached the discovery
+        frontier — the normal steady state for the background pre-cache, which
+        runs with early_stop=True) and for a block, so keying on it would mark
+        almost every cycle incomplete and stall the shadow evidence entirely.
+        The reason field is what tells those two apart.
         """
         if err:
             return True
-        return not getattr(scanner, "_last_crawl_seen_urls", None)
+        if not getattr(scanner, "_last_crawl_seen_urls", None):
+            return True
+        if not hasattr(scanner, "_last_crawl_completion_reason"):
+            # A stand-in, not a production crawl: the real ScannerService sets
+            # this in __init__ and re-arms it in every run_scan, so the attribute
+            # cannot be missing on a live scanner. Pre-existing test doubles
+            # (built with ScannerService.__new__ or as plain classes) predate the
+            # field; fall back to the seen-set rule for them instead of failing
+            # every such cycle. hasattr, not a None/falsy check, on purpose — a
+            # double that DOES set the field, to None or anything else
+            # unratified, is judged by the allowlist like any real crawl.
+            return False
+        from backend.scanner_service import CRAWL_REASONS_FULLY_OBSERVED
+        reason = getattr(scanner, "_last_crawl_completion_reason")
+        return reason not in CRAWL_REASONS_FULLY_OBSERVED
 
     def _qualify_restart_recovery(
         self,
@@ -511,6 +537,15 @@ class BackgroundScanner:
                             ),
                         ),
                     ).as_dict()
+                    # Provenance for the decision record. record_hdencode_shadow_
+                    # comparison json-dumps everything it does not map to a
+                    # column into details_json, so a later reader can see WHY a
+                    # cycle was or was not counted instead of having to trust
+                    # normal_feeds_complete alone. Not a ShadowComparison field:
+                    # that dataclass is frozen and shared with the RSS package.
+                    metrics["listing_completion_reason"] = getattr(
+                        scanner, "_last_crawl_completion_reason", None
+                    )
                     completed_at = datetime.now(timezone.utc).isoformat()
                     restart_recovery = self._qualify_restart_recovery(
                         preexisting_normal_feed_state=(

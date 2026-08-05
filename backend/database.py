@@ -33,6 +33,22 @@ class RenameJobDBError(Exception):
     DB problem" apart from "legitimately skipped" should catch this."""
 
 
+class QuarantineAbortedError(RuntimeError):
+    """Raised when a corruption quarantine could NOT preserve a file whose
+    preservation was mandatory, so it refused to create a fresh database.
+
+    Only raised for the data-loss case: the pre-quarantine checkpoint did not
+    prove the main DB file complete, and the -wal holding the difference could
+    not be moved next to the backup. Creating a fresh DB at that basename would
+    consume/reset the stranded WAL, destroying the only copy of those
+    transactions while the flag file advertises a backup that lacks them.
+    Deliberately a RuntimeError, not an sqlite3/OSError: it must not be
+    swallowed by the broad `except OSError` / `except sqlite3.Error` handlers
+    this layer uses for recoverable conditions. Startup failing is the intended
+    outcome — the files on disk are still complete and an operator can act.
+    """
+
+
 class DatabaseManager:
     """Thread-safe SQLite database manager with connection pooling and auto-recovery."""
 
@@ -1227,6 +1243,12 @@ class DatabaseManager:
         Shared by the true-corruption branches of init_db() (plain
         DatabaseError, and OperationalError whose message indicates real
         corruption rather than a transient lock/I-O condition).
+
+        Raises:
+            QuarantineAbortedError: when a mandatory file move failed. Nothing
+                fresh is created at self.db_path in that case, and every move
+                that did succeed is rolled back if it can be — see
+                _checkpoint_for_quarantine() for what makes the -wal mandatory.
         """
         logger.error(
             "DATABASE CORRUPTION DETECTED at %s — quarantining and "
@@ -1236,18 +1258,13 @@ class DatabaseManager:
         # reachable from here can deliver. notify_db_corruption_once() (called
         # at the end of startup, from api/main.py) is the delivery path, fed by
         # the flag file written below.
+        wal_folded = False
         if self.conn:
             # Fold the WAL into the main file FIRST so the quarantined backup is
             # a complete database. This path only runs when the DB is already
             # corrupt, i.e. exactly when the implicit close-time checkpoint is
             # most likely to fail — so its outcome has to be known, not assumed.
-            try:
-                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error as ckpt_err:
-                logger.warning(
-                    "Could not checkpoint WAL before quarantine (%s); the "
-                    "-wal sidecar is preserved alongside the backup instead",
-                    ckpt_err)
+            wal_folded = self._checkpoint_for_quarantine()
             try:
                 self.conn.close()
             except sqlite3.Error:
@@ -1257,8 +1274,23 @@ class DatabaseManager:
         # Auto-recovery: back up corrupt file and start fresh
         if os.path.exists(self.db_path):
             backup_name = f"{self.db_path}.corrupt.{int(time.time())}"
+            # Whether moving the -wal is MANDATORY, decided BEFORE anything is
+            # renamed. Mandatory unless the checkpoint above proved the main
+            # file already holds every committed page: an unfolded WAL left
+            # under the original basename is the only copy of the difference,
+            # and the fresh DB created at that basename moments later consumes
+            # and resets it. Conditioned on the file existing too — if there is
+            # no -wal on disk there is nothing to lose, however the checkpoint
+            # went. The -shm is never mandatory: it is a rebuildable
+            # shared-memory index, not data.
+            wal_is_mandatory = (
+                not wal_folded and os.path.exists(f"{self.db_path}-wal"))
+            # (original_path, quarantined_path) for each rename already done, in
+            # order, so an abort can put them back.
+            moved = []
             try:
                 os.rename(self.db_path, backup_name)
+                moved.append((self.db_path, backup_name))
                 # Move the sidecars WITH the backup (same convention as
                 # config._migrate_db). Two reasons, both load-bearing: a -wal
                 # left under the ORIGINAL name holds every transaction the
@@ -1270,14 +1302,40 @@ class DatabaseManager:
                 preserved = []
                 for suffix in ("-wal", "-shm"):
                     sidecar = f"{self.db_path}{suffix}"
-                    if os.path.exists(sidecar):
-                        try:
-                            os.rename(sidecar, f"{backup_name}{suffix}")
-                            preserved.append(suffix)
-                        except OSError as sc_err:
-                            logger.error(
-                                "Could not preserve %s alongside the corrupt-DB "
-                                "backup: %s", sidecar, sc_err)
+                    if not os.path.exists(sidecar):
+                        continue
+                    try:
+                        os.rename(sidecar, f"{backup_name}{suffix}")
+                    except OSError as sc_err:
+                        if suffix == "-wal" and wal_is_mandatory:
+                            # Data-loss guard. Do NOT fall through to the flag
+                            # write and the fresh DB: that is precisely what
+                            # would consume the stranded WAL and advertise a
+                            # backup missing its newest transactions. Undo the
+                            # moves and fail startup loudly instead — every
+                            # byte is still on disk for an operator to rescue.
+                            logger.critical(
+                                "QUARANTINE ABORTED: could not preserve the "
+                                "load-bearing WAL %s alongside %s (%s). It "
+                                "holds transactions the pre-quarantine "
+                                "checkpoint could not fold, so NO fresh "
+                                "database will be created at %s.",
+                                sidecar, backup_name, sc_err, self.db_path)
+                            rolled_back = self._rollback_quarantine_moves(moved)
+                            raise QuarantineAbortedError(
+                                f"corruption quarantine aborted: could not "
+                                f"preserve {sidecar} alongside {backup_name} "
+                                f"({sc_err})" + ("" if rolled_back else
+                                    f"; the rollback also FAILED — files are "
+                                    f"left under {backup_name}* and must be "
+                                    f"restored by hand before restarting")
+                            ) from sc_err
+                        logger.error(
+                            "Could not preserve %s alongside the corrupt-DB "
+                            "backup: %s", sidecar, sc_err)
+                        continue
+                    moved.append((sidecar, f"{backup_name}{suffix}"))
+                    preserved.append(suffix)
                 logger.warning(
                     "Renamed corrupt DB to %s%s. Creating fresh DB.", backup_name,
                     f" (with {', '.join(preserved)} sidecar(s))" if preserved else "")
@@ -1285,6 +1343,81 @@ class DatabaseManager:
                 self.init_db()
             except OSError as os_err:
                 logger.critical("Failed to recover DB: %s", os_err)
+
+    def _checkpoint_for_quarantine(self) -> bool:
+        """Fold the WAL into the main DB file; report whether it FULLY folded.
+
+        PRAGMA wal_checkpoint(TRUNCATE) yields one row of
+        (busy, log, checkpointed): busy is 1 when another connection blocked the
+        reset, log is how many frames the WAL contained and checkpointed how
+        many of them were written back into the main DB file. Only
+        ``busy == 0 and checkpointed == log`` proves the main file is complete
+        and the -wal therefore disposable. The result is the whole point of this
+        call — discarding it (the pre-fix behaviour) makes "the backup is a
+        complete database" an assumption rather than a fact.
+
+        Anything else is reported as NOT folded: an exception, busy == 1, a
+        partial backfill, an absent/unreadable result row, or the -1/-1 SQLite
+        reports for a DB that is not in WAL mode (which proves nothing about a
+        -wal that exists on disk anyway). That is the safe direction — a
+        needlessly preserved sidecar costs one stale file, a skipped
+        load-bearing one costs data.
+
+        Returns:
+            True only when the main DB file is known to hold every committed
+            page.
+        """
+        try:
+            row = self.conn.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.Error as ckpt_err:
+            logger.warning(
+                "Could not checkpoint WAL before quarantine (%s); the "
+                "-wal sidecar is preserved alongside the backup instead",
+                ckpt_err)
+            return False
+        try:
+            busy, log_frames, folded = row[0], row[1], row[2]
+        except (TypeError, IndexError, KeyError):
+            # None (no row) or a shorter row than documented. Unknown == unsafe.
+            logger.warning(
+                "PRAGMA wal_checkpoint(TRUNCATE) returned no usable result "
+                "(%r) before quarantine; treating the -wal as load-bearing",
+                row)
+            return False
+        if (isinstance(busy, int) and isinstance(log_frames, int)
+                and isinstance(folded, int)
+                and busy == 0 and log_frames >= 0 and folded == log_frames):
+            return True
+        logger.warning(
+            "WAL was NOT fully folded before quarantine (busy=%r, log=%r, "
+            "checkpointed=%r); preserving the -wal alongside the backup is "
+            "now mandatory", busy, log_frames, folded)
+        return False
+
+    def _rollback_quarantine_moves(self, moved) -> bool:
+        """Put quarantine renames back, newest first.
+
+        Args:
+            moved: list of (original_path, quarantined_path) pairs, in the order
+                they were renamed.
+
+        Returns:
+            True only if every pair was restored. A False return is itself a
+            data-integrity event, and the caller must still refuse to create a
+            fresh DB: a stranded -wal may remain under the original basename,
+            which is exactly the file a fresh DB would destroy.
+        """
+        fully_restored = True
+        for original, quarantined in reversed(moved):
+            try:
+                os.rename(quarantined, original)
+            except OSError as rb_err:
+                fully_restored = False
+                logger.critical(
+                    "Quarantine rollback FAILED: could not move %s back to "
+                    "%s (%s)", quarantined, original, rb_err)
+        return fully_restored
 
     def _write_corruption_flag(self, backup_name: str, error) -> None:
         """Persist a marker file recording the quarantine, independent of logs."""

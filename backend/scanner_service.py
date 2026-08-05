@@ -38,6 +38,77 @@ from backend.scrapers import WebScrapers
 logger = logging.getLogger(__name__)
 
 
+# ── Crawl completion reasons ──────────────────────────────────────────
+#
+# ``_last_crawl_early_stopped`` answers only "may the caller purge?", and it
+# answers True for four situations the crawl already tells apart internally: a
+# healthy stop at the cached-content frontier, a Cloudflare block, a coordinator
+# refusal, and a cancellation. A consumer that has to know whether the listing
+# was actually OBSERVED (the RSS shadow comparison's control arm) cannot get
+# that from one boolean — page 1 parsing fine and page 2 blocking looks
+# identical to a clean cached-frontier stop. These name the situation.
+
+#: Crawl never ran (no sources, stopped before the first page, run_scan raised
+#: before ``_crawl_pages``). The pessimistic value ``run_scan`` re-arms.
+CRAWL_REASON_NOT_STARTED = "not_started"
+#: Every requested page of every source was fetched and parsed.
+CRAWL_REASON_COMPLETE = "complete"
+#: Stopped at the discovery frontier — a populated page whose every unique URL
+#: was already known. Healthy: the listing WAS observed down to the point where
+#: nothing is new.
+CRAWL_REASON_CACHED_FRONTIER = "cached_frontier"
+#: At least one page came back 403/429/503 (Cloudflare / rate limit).
+CRAWL_REASON_BLOCKED = "blocked"
+#: At least one page raised before it could be read/parsed (connection reset,
+#: timeout, unparseable body).
+CRAWL_REASON_TRANSPORT_ERROR = "transport_error"
+#: The HDEncode traffic coordinator refused the request outright.
+CRAWL_REASON_COORDINATOR_STOPPED = "coordinator_stopped"
+#: Someone set ``stop_scan_flag`` (operator /scan/stop, app shutdown, or the
+#: coordinator's stop_requested hook) and the crawl was cut short.
+CRAWL_REASON_CANCELLED = "cancelled"
+#: ``run_scan`` caught an exception from the async scan. Distinct from
+#: transport_error, which is a single page inside an otherwise running crawl.
+CRAWL_REASON_SCAN_ERROR = "scan_error"
+
+#: Ranked WORST FIRST. One crawl spans several sources and pages, so it can
+#: observe more than one of these (source A blocked, source B stopped at the
+#: frontier). The worst is reported, because every consumer is asking the same
+#: question: was any part of the listing left unobserved?
+CRAWL_REASON_PRECEDENCE = (
+    CRAWL_REASON_COORDINATOR_STOPPED,
+    CRAWL_REASON_BLOCKED,
+    CRAWL_REASON_TRANSPORT_ERROR,
+    CRAWL_REASON_CANCELLED,
+    CRAWL_REASON_CACHED_FRONTIER,
+    CRAWL_REASON_COMPLETE,
+)
+
+#: The only reasons under which the listing crawl may serve as the RSS shadow
+#: comparison's CONTROL ARM. Deliberately an allowlist, not a blocklist of bad
+#: reasons: these cycles are promotion evidence for turning the listing crawl
+#: off, so a reason nobody has ratified must count as unusable rather than
+#: silently pass through.
+CRAWL_REASONS_FULLY_OBSERVED = frozenset({
+    CRAWL_REASON_COMPLETE,
+    CRAWL_REASON_CACHED_FRONTIER,
+})
+
+
+def worst_crawl_reason(reasons) -> str:
+    """Reduce the reasons observed during one crawl to the one to report.
+
+    An empty set means nothing adverse happened, i.e. ``complete``. Callers must
+    therefore only call this after a crawl that actually attempted a page;
+    ``run_scan`` covers the never-crawled case with ``not_started``.
+    """
+    observed = set(reasons or ())
+    for reason in CRAWL_REASON_PRECEDENCE:
+        if reason in observed:
+            return reason
+    return CRAWL_REASON_COMPLETE
+
+
 # ── Data models ───────────────────────────────────────────────────────
 
 class ScanStatus(Enum):
@@ -225,6 +296,11 @@ class ScannerService:
         # ``run_scan`` re-arms this to True for every run; only a crawl that
         # actually finished may lower it. See run_scan.
         self._last_crawl_early_stopped: bool = True
+        # WHY the last crawl ended — one of the CRAWL_REASON_* values above.
+        # ``_last_crawl_early_stopped`` cannot separate a healthy cached-frontier
+        # stop from a partial block, and the RSS shadow control arm needs that
+        # separation. Re-armed to not_started by every run_scan.
+        self._last_crawl_completion_reason: str = CRAWL_REASON_NOT_STARTED
         #: Message from the last run_scan that died inside the async scan, or
         #: None. run_scan does NOT re-raise, so this is the only way a caller
         #: can tell a failed run from one that legitimately found nothing.
@@ -372,6 +448,10 @@ class ScannerService:
         # refreshed nothing, aging the whole catalogue out over the retention
         # window with no error anywhere.
         self._last_crawl_early_stopped = True
+        # Same pessimism, same reason: a run that returns without ever reaching
+        # ``_crawl_pages`` must not leave the PREVIOUS run's reason behind, or a
+        # consumer would read last cycle's "complete" as this cycle's evidence.
+        self._last_crawl_completion_reason = CRAWL_REASON_NOT_STARTED
 
         # Load download history
         self.download_history = self._load_download_history()
@@ -400,6 +480,10 @@ class ScannerService:
             # instead of broadcasting scan:complete over partial items.
             self.last_scan_error = str(e) or e.__class__.__name__
             self._last_crawl_early_stopped = True
+            # Overwrites whatever ``_crawl_pages`` set: the exception may have
+            # been raised AFTER a clean crawl (Plex load, enrichment), and such a
+            # run is still not a cycle anyone should draw conclusions from.
+            self._last_crawl_completion_reason = CRAWL_REASON_SCAN_ERROR
         finally:
             self.is_scanning = False
 
@@ -736,6 +820,10 @@ class ScannerService:
         seen_exclusion_canonical: Set[str] = set()
         policy_excluded_known = 0
         early_stopped = False
+        #: Every adverse/notable outcome seen anywhere in this crawl. Collected
+        #: rather than overwritten so a block on source A is not erased by a
+        #: healthy frontier stop on source B; ``worst_crawl_reason`` picks.
+        crawl_reasons: Set[str] = set()
         total_pages = len(sources) * pages
         current_page = 0
 
@@ -794,7 +882,19 @@ class ScannerService:
 
                     try:
                         resp = await loop.run_in_executor(None, _fetch_page)
-                    except (HDEncodeTrafficDenied, HDEncodeRequestCancelled):
+                    except HDEncodeTrafficDenied as denied:
+                        # HDEncodeRequestCancelled SUBCLASSES
+                        # HDEncodeTrafficDenied, so this one clause catches both
+                        # (as the previous two-name tuple did) and the isinstance
+                        # test is what separates them: cancelled means the scan
+                        # was already being stopped, a plain denial means the
+                        # coordinator refused the traffic. Both leave the listing
+                        # unobserved; they are different facts for the operator.
+                        crawl_reasons.add(
+                            CRAWL_REASON_CANCELLED
+                            if isinstance(denied, HDEncodeRequestCancelled)
+                            else CRAWL_REASON_COORDINATOR_STOPPED
+                        )
                         early_stopped = True
                         self.stop_scan_flag = True
                         self._log(
@@ -811,8 +911,29 @@ class ScannerService:
                         # ONLY a Cloudflare / rate-limit block (403/429/503) is a
                         # "block": it fails every page, so back off and abandon the
                         # source, and (below) mark the crawl incomplete so still-
-                        # listed items aren't purged. A 404/other is ordinary
-                        # end-of-content — skip that page quietly.
+                        # listed items aren't purged.
+                        #
+                        # 404 alone is ordinary end-of-content — skip it quietly.
+                        # EVERYTHING ELSE is a transport failure and must say so.
+                        # This used to fall through the bare `continue` below with
+                        # no reason recorded, so page 1 succeeding and page 2
+                        # returning 500/502/504/520-524/401 published
+                        # listing_completion_reason="complete" and counted as RSS
+                        # promotion evidence -- the review's blocker verbatim,
+                        # surviving the first fix because the reason vocabulary
+                        # was keyed off the block triple rather than off "did we
+                        # actually read this page".
+                        if (resp.status_code != 404
+                                and resp.status_code not in (403, 429, 503)):
+                            crawl_reasons.add(CRAWL_REASON_TRANSPORT_ERROR)
+                            early_stopped = True
+                            self._log(
+                                f"{source_name}: page {page} returned "
+                                f"{resp.status_code}; the crawl is incomplete, so "
+                                "this cycle is not usable as promotion evidence "
+                                "and its seen-set must not age rows out",
+                                "warning",
+                            )
                         if resp.status_code in (403, 429, 503):
                             blocked_total += 1
                             blocked_streak += 1
@@ -916,11 +1037,23 @@ class ScannerService:
                     if early_stop and page_unique > 0 and page_new == 0:
                         self._log(f"{source_name}: reached previously-cached content at page {page_num}, stopping")
                         early_stopped = True
+                        crawl_reasons.add(CRAWL_REASON_CACHED_FRONTIER)
                         break
 
                     await asyncio.sleep(0.3)
                 except Exception as e:
                     self._log(f"Crawl error: {e}", "error")
+                    # This page was NOT read: the fetch raised, or the body could
+                    # not be parsed. Its posts are missing from the seen-set even
+                    # though the loop moves on to the next page, so the crawl is
+                    # incomplete. Before this, a connection failure on page 2 of 3
+                    # left BOTH early_stopped False and (had nothing else fired)
+                    # the reason at "complete" — the caller purged against a
+                    # partial seen-set and the RSS shadow counted the cycle as
+                    # control-arm evidence, with only an "error" log line to say
+                    # otherwise.
+                    early_stopped = True
+                    crawl_reasons.add(CRAWL_REASON_TRANSPORT_ERROR)
 
             if blocked_total:
                 # A blocked source's crawl is INCOMPLETE — treat it like an
@@ -928,6 +1061,10 @@ class ScannerService:
                 # simply couldn't reach (they'd reappear as new when the block
                 # clears).
                 early_stopped = True
+                # ONE blocked page is enough, even when other pages of this
+                # source parsed fine: that is exactly the case R-1 names, where a
+                # successful page 1 hid a broken page 2.
+                crawl_reasons.add(CRAWL_REASON_BLOCKED)
                 self._log(
                     f"{source_name}: {blocked_total} page(s) blocked "
                     f"(HTTP {last_block_status}) — Cloudflare not cleared; this "
@@ -957,12 +1094,28 @@ class ScannerService:
         self._last_crawl_policy_excluded_new = policy_excluded_new
         self._last_crawl_policy_excluded_count = total_excluded
 
+        if self.stop_scan_flag:
+            # Cut short: the remaining pages of this source, and every later
+            # source, were never fetched. Recorded even when a block or a
+            # coordinator refusal is what set the flag — those rank above
+            # cancelled in CRAWL_REASON_PRECEDENCE, so the more specific cause
+            # still wins and this only fills in the plain operator/shutdown stop.
+            crawl_reasons.add(CRAWL_REASON_CANCELLED)
+            # A cancelled crawl is as partial as an early-stopped one; the two
+            # break statements at the top of the source/page loops used to leave
+            # this False, which let the caller purge against a partial seen-set.
+            early_stopped = True
+
         # Expose every listing URL seen this crawl (new + skipped) so callers can
         # refresh "last seen" on still-listed items without re-scraping them.
         self._last_crawl_seen_urls = set(seen_post_urls)
         # A crawl that stopped early never visited deeper pages, so its seen-set
         # is partial — the caller must not age out items it simply didn't revisit.
         self._last_crawl_early_stopped = early_stopped
+        # The reason behind that boolean. Note the two are NOT redundant:
+        # cached_frontier and blocked both set early_stopped, and only this tells
+        # a caller which one it was looking at.
+        self._last_crawl_completion_reason = worst_crawl_reason(crawl_reasons)
 
         return all_posts
 

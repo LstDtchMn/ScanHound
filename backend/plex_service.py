@@ -43,6 +43,20 @@ class PlexService:
         self._plex_loading_lock = threading.Lock()
         self._last_full_load_time: float = 0  # unix timestamp of last full Plex API load
 
+        # ── Completeness of the in-memory authority (public) ──────────
+        # plex_movies/plex_tv/plex_index are what the scanner matches against,
+        # so a caller has to be able to ask whether they cover every configured
+        # library. Re-armed at the top of every load; False until one finishes.
+        #: True when the loaded authority covers every configured library.
+        self.last_load_complete: bool = False
+        #: Content types ("Movies" / "TV Shows") whose live read was incomplete.
+        self.last_load_incomplete_types: List[str] = []
+        #: Libraries whose cached rows were merged back in because their live
+        #: read failed or degraded.
+        self.last_load_restored_libraries: List[str] = []
+        #: How many cached rows that merge contributed.
+        self.last_load_restored_rows: int = 0
+
         # Callbacks
         self._log_fn: Optional[Callable[[str, str], None]] = None
         self._stats_callback: Optional[Callable[[Dict[str, int]], None]] = None
@@ -172,6 +186,13 @@ class PlexService:
         try:
             self._plex_loading = True
 
+            # Re-armed per load so a caller inspecting these afterwards can
+            # never read the PREVIOUS run's verdict as this run's.
+            self.last_load_complete = False
+            self.last_load_incomplete_types = []
+            self.last_load_restored_libraries = []
+            self.last_load_restored_rows = 0
+
             movie_libs, tv_libs = self._configured_libs()
 
             # ── Cache path ────────────────────────────────────────────
@@ -207,6 +228,10 @@ class PlexService:
                         self.stats['tv_seasons'] = len(self.plex_tv)
                         self._build_plex_index()
                         self._emit_stats()
+                        # Reached only when every CONFIGURED content type had
+                        # cached rows (the missing_types gate above), so this
+                        # authority is complete even though no library was read.
+                        self.last_load_complete = True
                         self._last_full_load_time = time.time()
                         self._log(
                             f"Loaded Cache: {len(self.plex_movies)} movies, {self.stats['tv_seasons']} seasons",
@@ -261,6 +286,15 @@ class PlexService:
             # that legitimately had media data but failed to extract must
             # not be treated as "successfully absent" (SH-H07).
             movie_extract_fail = 0
+            # WHICH libraries the flags above are about. The booleans are enough
+            # to block a destructive full_replace, but not to repair the live
+            # authority: _build_plex_index turns _movies/_tv into the matcher's
+            # only view of the library, so a library that was skipped is a
+            # library whose owned titles now read Missing. Recorded per library
+            # so cached rows can be merged back for exactly those, leaving the
+            # libraries that DID load on their fresh data (SH-P1).
+            unreliable_movie_libs: Set[str] = set()
+            unreliable_tv_libs: Set[str] = set()
 
             # ── Movies ────────────────────────────────────────────────
             for lib_name in movie_libs:
@@ -280,6 +314,7 @@ class PlexService:
                         # row this library owns (SH-H12).
                         self._log(f"Movie library '{lib_name}' not found", "warning")
                         movies_load_incomplete = True
+                        unreliable_movie_libs.add(lib_name)
                         continue
 
                     items = lib.all()
@@ -318,9 +353,15 @@ class PlexService:
                             # a real per-item failure, not a legitimately
                             # media-less item.
                             movie_extract_fail += 1
+                            # Attributed HERE, not at the post-loop
+                            # `if movie_extract_fail:` — the counter is shared
+                            # across libraries, so by then lib_name is whichever
+                            # library happened to be iterated last.
+                            unreliable_movie_libs.add(lib_name)
                 except Exception as e:
                     self._log(f"Error loading movie library '{lib_name}': {e}", "error")
                     movies_load_incomplete = True
+                    unreliable_movie_libs.add(lib_name)
 
                 current_lib_idx += 1
 
@@ -342,6 +383,7 @@ class PlexService:
                         # full-replace the cache (SH-H12).
                         self._log(f"TV library '{lib_name}' not found", "warning")
                         tv_load_incomplete = True
+                        unreliable_tv_libs.add(lib_name)
                         continue
 
                     items = lib.all()
@@ -425,10 +467,12 @@ class PlexService:
                     # (SH-H07).
                     if tv_errors or tv_extract_fail:
                         tv_load_incomplete = True
+                        unreliable_tv_libs.add(lib_name)
 
                 except Exception as e:
                     self._log(f"Error loading TV library '{lib_name}': {e}", "error")
                     tv_load_incomplete = True
+                    unreliable_tv_libs.add(lib_name)
 
                 current_lib_idx += 1
 
@@ -443,13 +487,72 @@ class PlexService:
             self.stats['plex_4k'] = len(seen_4k)
             self.stats['tv_seasons'] = tv_seasons
 
+            # Repair the live authority before it becomes the matcher's view of
+            # the library. Protecting the cached rows on disk (the full_replace
+            # gate below) is only half the job: those rows also have to be IN
+            # the index, or the scanner reports owned titles as Missing and
+            # auto-grab re-downloads them (SH-P1).
+            movies_authority, movies_restored, movies_restored_libs = (
+                self._restore_cached_libraries(_movies, "Movies", unreliable_movie_libs))
+            tv_authority, tv_restored, tv_restored_libs = (
+                self._restore_cached_libraries(_tv, "TV Shows", unreliable_tv_libs))
+
+            # LAST RESORT when the cache could not cover a failed library.
+            #
+            # _restore_cached_libraries returns the live rows unchanged when the
+            # cache read raises OR comes back empty — and load_plex_cache
+            # swallows every error and returns [] — so "restored 0 rows for a
+            # library that failed" means the repair above did nothing. Installing
+            # the partial list then replaces a COMPLETE in-memory authority with
+            # an incomplete one, which is the harm the finding names: measured
+            # end to end, an owned 4K title read MISSING and auto-grab took it.
+            #
+            # Keeping the previous list is strictly better than a known-partial
+            # one. It is stale by at most one cycle, whereas the partial list is
+            # WRONG about titles the user owns right now. Doing nothing is the
+            # only option that cannot cause a re-download.
+            def _keep_previous(live, restored, unreliable, previous, label):
+                if not unreliable or restored or not previous:
+                    return live
+                self._log(
+                    f"{label}: {len(unreliable)} library(ies) unreadable AND the "
+                    "cache could not supply their rows, so the previous complete "
+                    f"list of {len(previous)} is being kept rather than replaced "
+                    "with a partial one. Owned titles would otherwise read as "
+                    "Missing and be re-downloaded.",
+                    "warning",
+                )
+                return list(previous)
+
+            movies_authority = _keep_previous(
+                movies_authority, movies_restored, unreliable_movie_libs,
+                self.plex_movies, "Movies")
+            tv_authority = _keep_previous(
+                tv_authority, tv_restored, unreliable_tv_libs,
+                self.plex_tv, "TV Shows")
+
             # Atomic swap — UI reads see complete state, never partial
-            self.plex_movies = _movies
-            self.plex_tv = _tv
+            self.plex_movies = movies_authority
+            self.plex_tv = tv_authority
 
             self._build_plex_index()
 
-            if not self.plex_movies and not self.plex_tv:
+            self.last_load_restored_libraries = movies_restored_libs + tv_restored_libs
+            self.last_load_restored_rows = movies_restored + tv_restored
+            if self.last_load_restored_rows:
+                self._log(
+                    f"Restored {self.last_load_restored_rows} cached row(s) for "
+                    f"{', '.join(self.last_load_restored_libraries)} so their titles "
+                    "keep matching while those libraries are unreadable",
+                    "warning",
+                )
+
+            # The cache-save decisions below deliberately read the LIVE lists
+            # (_movies / _tv), not the merged authority above. Merging cached
+            # rows back in must not make a partial load look complete enough to
+            # full_replace, and must not re-save rows that are already in the
+            # cache they came from.
+            if not _movies and not _tv:
                 self._log(
                     "Plex load returned 0 movies and 0 TV seasons — check library names in "
                     "Settings > Plex. Preserving existing cache.",
@@ -464,9 +567,9 @@ class PlexService:
                 # non-empty but incomplete list; full_replace would otherwise
                 # wipe a good cache with either.
                 self._log("Saving to local cache...")
-                if self.plex_movies and not movies_load_incomplete:
-                    self.db.save_plex_cache(self.plex_movies, "Movies", full_replace=True)
-                elif not self.plex_movies:
+                if _movies and not movies_load_incomplete:
+                    self.db.save_plex_cache(_movies, "Movies", full_replace=True)
+                elif not _movies:
                     self._log("Skipping Movies cache save — load returned 0 (preserving existing cache)", "warning")
                 else:
                     self._log(
@@ -474,9 +577,9 @@ class PlexService:
                         "cache save to avoid clobbering good cache with a partial set",
                         "warning",
                     )
-                if self.plex_tv and not tv_load_incomplete:
-                    self.db.save_plex_cache(self.plex_tv, "TV Shows", full_replace=True)
-                elif not self.plex_tv:
+                if _tv and not tv_load_incomplete:
+                    self.db.save_plex_cache(_tv, "TV Shows", full_replace=True)
+                elif not _tv:
                     self._log("Skipping TV Shows cache save — load returned 0 (preserving existing cache)", "warning")
                 else:
                     self._log(
@@ -485,11 +588,37 @@ class PlexService:
                         "warning",
                     )
 
-            self._last_full_load_time = time.time()
+            self.last_load_incomplete_types = (
+                (["Movies"] if movies_load_incomplete else [])
+                + (["TV Shows"] if tv_load_incomplete else []))
+            self.last_load_complete = not self.last_load_incomplete_types
+
+            # Freshness is only claimed for a load that actually read every
+            # configured library. ScannerService suppresses a Deep Scan reload
+            # when this stamp is under 5 minutes old; stamping it after a
+            # partial read made it suppress the RETRY, so one unreadable library
+            # kept the gap open for a whole extra scan cycle. Leaving the
+            # previous (older) value alone means the stamp is not REFRESHED by a
+            # partial read.
+            #
+            # Corrected: an earlier draft of this comment claimed the retained
+            # stamp "lets the next scan reload and recover". It does the
+            # opposite inside the 300s suppression window — retaining a recent
+            # stamp is precisely what stops the next Deep Scan from reloading.
+            # Outside 300s the stamp is stale anyway, so the claim was only true
+            # where it did not matter. What actually protects the user is the
+            # authority retention above: a retry would hit the same unreadable
+            # library and the same empty cache, so not replacing the good list
+            # is the safeguard, not the reload.
+            if self.last_load_complete:
+                self._last_full_load_time = time.time()
+
             self._emit_stats()
+            restored_note = (f" (+{self.last_load_restored_rows} from cache)"
+                             if self.last_load_restored_rows else "")
             self._log(
-                f"Loaded Plex: {len(self.plex_movies)} movies, {tv_seasons} TV seasons",
-                "success" if (self.plex_movies or self.plex_tv) else "warning",
+                f"Loaded Plex: {len(_movies)} movies, {tv_seasons} TV seasons{restored_note}",
+                "success" if (_movies or _tv) else "warning",
             )
 
         except Exception as e:
@@ -497,6 +626,116 @@ class PlexService:
         finally:
             self._plex_loading = False
             self._plex_loading_lock.release()
+
+    # ── Partial-load repair ───────────────────────────────────────────
+
+    @staticmethod
+    def _cache_identity(row: Dict, is_tv: bool) -> str:
+        """The plex_cache primary key for a row from EITHER source.
+
+        Must mirror ``DatabaseManager._plex_cache_key`` exactly. The merge below
+        uses it to tell "the cached copy of a row I already loaded live" from "a
+        row only the cache has"; if the two sources computed different strings
+        for the same file, every restored library would be duplicated in the
+        index. Live movie dicts carry an explicit per-part ``key``; live TV
+        season dicts do not, and their stored key is the bare rating_key.
+        """
+        key = row.get('key')
+        if key:
+            return str(key)
+        if is_tv:
+            return str(row.get('rating_key'))
+        return f"{row.get('rating_key')}_{row.get('media_id')}"
+
+    @staticmethod
+    def _as_live_shape(row: Dict, is_tv: bool) -> Dict:
+        """A cached row reshaped to look like one the live load produced.
+
+        The two shapes are not interchangeable for MOVIES. save_plex_cache
+        writes ``item.get('season', 0)``, so every cached movie row comes back
+        with ``season == 0``, whereas a live movie dict has no ``season`` key at
+        all. That difference is load-bearing: MatchingEngine decides whether a
+        row is a TV season with ``p.get('season') == web_season``, so a cached
+        movie row is a valid candidate for a season-0/specials release while its
+        live twin is not. Verified against the real engine — the live-shaped row
+        returns no match, the cache-shaped one matches the movie as the owned
+        season.
+
+        Restoring rows must not smuggle that difference into the index, so the
+        movie rows this merge adds are put back into the live shape.
+        """
+        if is_tv:
+            return row
+        normalized = dict(row)
+        normalized['season'] = None
+        return normalized
+
+    def _restore_cached_libraries(self, live_rows: List[Dict], mode: str,
+                                  lib_names) -> tuple[List[Dict], int, List[str]]:
+        """Merge cached rows for `lib_names` back into a live-loaded list.
+
+        A library that could not be read is not evidence that its titles are
+        gone — plex_cache still holds them, and the full_replace gate in
+        load_libraries deliberately keeps them there. But the live list is what
+        _build_plex_index turns into the matcher's authority, so leaving those
+        titles out of it makes owned releases read Missing and hands them
+        straight to auto-grab.
+
+        Only rows the live pass did NOT produce are added, keyed on the
+        plex_cache primary key. That single rule covers both failure shapes: a
+        library that failed outright contributes all of its rows, while one that
+        merely had per-item extraction failures contributes only the items
+        missing from the fresh set — fresh data always wins over cache.
+
+        Returns (merged_rows, restored_row_count, restored_library_names). When
+        there is nothing to restore it returns `live_rows` itself, so the
+        healthy path keeps assigning the exact list the load built.
+        """
+        if not lib_names:
+            return live_rows, 0, []
+
+        try:
+            cached = self.db.load_plex_cache(mode)
+        except Exception as e:
+            logger.warning("Could not read the %s cache to restore %s: %s",
+                           mode, sorted(lib_names), e)
+            return live_rows, 0, []
+        # load_plex_cache returns [] on its own errors; anything that is not a
+        # list means this DatabaseManager stand-in does not implement it, and
+        # there is nothing to merge.
+        if not isinstance(cached, list) or not cached:
+            return live_rows, 0, []
+
+        is_tv = (mode == "TV Shows")
+        live_ids = {self._cache_identity(r, is_tv) for r in live_rows}
+        wanted = set(lib_names)
+
+        # library_name is only recorded on rows written since that column
+        # existed, so a cache from an older build attributes nothing and the
+        # per-library filter cannot run. Restoring every not-live row instead is
+        # still the right trade: the cost is that a title genuinely deleted from
+        # a HEALTHY library survives one extra load (the next complete load
+        # prunes it), against re-downloading titles the user already owns.
+        tagged = any(r.get('library_name') for r in cached)
+        if not tagged:
+            self._log(
+                f"{mode} cache rows carry no library name, so rows cannot be "
+                f"attributed to {', '.join(sorted(wanted))} — restoring every "
+                "cached row the live load did not return",
+                "warning",
+            )
+
+        merged = list(live_rows)
+        restored_libs = set()
+        for row in cached:
+            if tagged and row.get('library_name') not in wanted:
+                continue
+            if self._cache_identity(row, is_tv) in live_ids:
+                continue
+            merged.append(self._as_live_shape(row, is_tv))
+            restored_libs.add(row.get('library_name') or mode)
+
+        return merged, len(merged) - len(live_rows), sorted(restored_libs)
 
     # ── Data extraction ───────────────────────────────────────────────
 

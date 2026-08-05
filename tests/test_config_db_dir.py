@@ -186,10 +186,29 @@ class TestMigrationCopy:
 
         db_dir = tmp_path / "db_volume"
 
-        import shutil
-        def _boom(*a, **kw):
-            raise OSError("simulated copy failure")
-        monkeypatch.setattr(shutil, "copy2", _boom)
+        # The copy goes through sqlite3's ONLINE BACKUP API now, not
+        # shutil.copy2 (D-1: copy2 of the main file certified a coherent but
+        # stale snapshot when a writer committed after the checkpoint). Patching
+        # copy2 injected nothing, so this test passed while asserting nothing.
+        #
+        # Injected at os.replace, the final atomic swap. Two constraints ruled
+        # out the alternatives: sqlite3's Connection type is immutable so
+        # .backup cannot be patched, and this test RELOADS backend.config, which
+        # discards any patch applied to the module object itself. A stdlib seam
+        # survives the reload -- the same technique the neighbouring
+        # test_crash_between_temp_copy_and_replace test already relies on.
+        #
+        # What this test is about is the CALLER's contract: any copy-stage
+        # failure must leave CACHE_FILE on the legacy path rather than crashing
+        # or adopting a half-migrated location. Mechanism-level failures are
+        # covered in tests/test_db_relocation_snapshot_consistency.py.
+        real_replace = os.replace
+
+        def _boom(src, dst, *a, **kw):
+            if str(dst).endswith("crawler.db"):
+                raise OSError("simulated copy failure")
+            return real_replace(src, dst, *a, **kw)
+        monkeypatch.setattr(os, "replace", _boom)
 
         cfg_mod = _reload_config(monkeypatch, db_dir=str(db_dir), data_dir=str(data_dir))
         # Falls back to the legacy path rather than crashing or pointing at a

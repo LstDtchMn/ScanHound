@@ -35,6 +35,26 @@ logger = logging.getLogger(__name__)
 # string instead. See _post_webhook.
 _BODYLESS_METHODS = ("GET", "HEAD", "DELETE")
 
+# Wall-clock ceiling on ONE channel's send. Webhook channels already cap
+# themselves at 10s inside _post_webhook, but EmailChannel runs blocking
+# smtplib in the default executor and nothing above it bounded that. Without a
+# ceiling a single wedged channel holds the asyncio.gather in
+# _send_notification open, so a caller waiting for delivery confirmation cannot
+# observe a DIFFERENT channel that already succeeded.
+# 45s leaves headroom over DEFAULT_SMTP_TIMEOUT: smtplib applies that timeout
+# per socket operation (connect, then login, then DATA), so a slow-but-alive
+# server can legitimately take ~3x it before returning.
+DEFAULT_CHANNEL_SEND_TIMEOUT = 45.0
+
+# Socket timeout handed to smtplib. smtplib otherwise inherits
+# socket.getdefaulttimeout(), which is None here, so connect/login/DATA can
+# each block until the OS TCP timeout (minutes). asyncio.wait_for alone cannot
+# rescue that: cancelling the await does NOT stop the thread already running
+# inside run_in_executor, so an unbounded smtplib call ties up an executor
+# worker for as long as the socket hangs. This is the only bound that actually
+# ends that thread. Same value the /settings/test/email endpoint already uses.
+DEFAULT_SMTP_TIMEOUT = 10.0
+
 
 def _normalize_addrs(value) -> List[str]:
     """Coerce an address value into a list of addresses.
@@ -76,6 +96,21 @@ def _payload_to_params(payload: dict) -> Dict[str, Any]:
         else:
             params[key] = str(value)
     return params
+
+
+def _discard_task_result(task):
+    """Retrieve and drop a detached task's outcome.
+
+    Reading .exception() is what marks it as handled; without this asyncio logs
+    "Task exception was never retrieved" for every channel abandoned by
+    _await_first_success. A cancelled task raises from .exception(), so check
+    that first.
+    """
+    try:
+        if not task.cancelled():
+            task.exception()
+    except Exception:  # noqa: BLE001 - nothing left to report this to
+        pass
 
 
 class NotificationType(Enum):
@@ -440,7 +475,8 @@ class EmailChannel(NotificationChannel):
         password: str,
         from_addr: str,
         to_addrs: Union[str, List[str]],
-        use_tls: bool = True
+        use_tls: bool = True,
+        timeout: float = DEFAULT_SMTP_TIMEOUT
     ):
         super().__init__("email")
         self.smtp_host = smtp_host
@@ -452,6 +488,12 @@ class EmailChannel(NotificationChannel):
         # both here so the To: header and the sendmail envelope agree.
         self.to_addrs = _normalize_addrs(to_addrs)
         self.use_tls = use_tls
+        # Must be > 0: smtplib rejects timeout=0 outright (non-blocking sockets
+        # are unsupported), and None would restore the unbounded default this
+        # exists to remove.
+        self.timeout = (
+            float(timeout) if timeout and float(timeout) > 0
+            else DEFAULT_SMTP_TIMEOUT)
 
     def _build_email(self, notification: Notification) -> MIMEMultipart:
         """Build email message."""
@@ -523,16 +565,24 @@ class EmailChannel(NotificationChannel):
             return False
 
     def _send_sync(self, notification: Notification):
-        """Synchronous email sending."""
+        """Synchronous email sending.
+
+        Runs on an executor thread, which is why the explicit timeout matters:
+        the caller's asyncio.wait_for can stop WAITING for this thread but
+        cannot stop the thread, so an untimed socket here would hold an
+        executor worker until the OS gave up.
+        """
         msg = self._build_email(notification)
 
         if self.use_tls:
-            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+            with smtplib.SMTP(self.smtp_host, self.smtp_port,
+                              timeout=self.timeout) as server:
                 server.starttls()
                 server.login(self.username, self.password)
                 server.sendmail(self.from_addr, self.to_addrs, msg.as_string())
         else:
-            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port) as server:
+            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port,
+                                  timeout=self.timeout) as server:
                 server.login(self.username, self.password)
                 server.sendmail(self.from_addr, self.to_addrs, msg.as_string())
 
@@ -636,7 +686,8 @@ class NotificationManager:
                 password=config.get('smtp_password', ''),
                 from_addr=config.get('email_from', ''),
                 to_addrs=config.get('email_to', []),
-                use_tls=config.get('smtp_tls', True)
+                use_tls=config.get('smtp_tls', True),
+                timeout=config.get('smtp_timeout', DEFAULT_SMTP_TIMEOUT)
             )
             if config.get('email_types'):
                 channel.set_filters([
@@ -673,7 +724,9 @@ class NotificationManager:
         message: str,
         priority: NotificationPriority = NotificationPriority.NORMAL,
         data: Optional[Dict[str, Any]] = None,
-        batch: bool = False
+        batch: bool = False,
+        first_success_wins: bool = False,
+        channel_timeout: Optional[float] = None
     ):
         """Send a notification to all configured channels.
 
@@ -684,6 +737,13 @@ class NotificationManager:
             priority: Priority level
             data: Additional data
             batch: If True, batch with other notifications
+            first_success_wins: Return as soon as ONE channel confirms, leaving
+                the slower channels to finish in the background. For a caller
+                that is waiting on the answer, since an unobserved success is
+                as damaging as a failure -- see NotificationBridge
+                .notify_error_confirmed.
+            channel_timeout: Per-channel ceiling; defaults to
+                DEFAULT_CHANNEL_SEND_TIMEOUT.
 
         Returns:
             The number of channels that accepted it, or None when the answer
@@ -703,7 +763,11 @@ class NotificationManager:
         if batch:
             await self._add_to_batch(notification)
             return None
-        return await self._send_notification(notification)
+        return await self._send_notification(
+            notification,
+            first_success_wins=first_success_wins,
+            channel_timeout=channel_timeout,
+        )
 
     def send_notification(
         self,
@@ -788,8 +852,38 @@ class NotificationManager:
 
         return combined
 
-    async def _send_notification(self, notification: Notification):
-        """Send notification to all applicable channels."""
+    async def _send_channel(self, channel: NotificationChannel,
+                            notification: Notification,
+                            timeout: float) -> bool:
+        """Run ONE channel's send under a hard wall-clock ceiling.
+
+        Always returns a bool, never raises (barring cancellation, which is
+        BaseException and must propagate), so the aggregation below can treat
+        every channel uniformly: only an explicit True counts as delivered.
+        A timeout is deliberately NOT an exception here -- the channel simply
+        did not confirm, which is the same answer as returning False.
+        """
+        try:
+            result = await asyncio.wait_for(channel.send(notification), timeout)
+        except asyncio.TimeoutError:
+            logger.error(
+                f"{channel.name} notification timed out after {timeout:.1f}s")
+            return False
+        except Exception as e:
+            # gather(return_exceptions=True) used to swallow these silently.
+            logger.error(f"{channel.name} notification raised: {e}")
+            return False
+        return result is True
+
+    async def _send_notification(self, notification: Notification,
+                                 first_success_wins: bool = False,
+                                 channel_timeout: Optional[float] = None):
+        """Send notification to all applicable channels.
+
+        Returns the number of channels that confirmed delivery. With
+        first_success_wins the count is only "at least one" -- it returns on the
+        first confirmation and does not wait for the rest.
+        """
         # Add to history
         self._history.append(notification)
         if len(self._history) > self._max_history:
@@ -802,23 +896,65 @@ class NotificationManager:
             except Exception as e:
                 logger.error(f"Notification callback error: {e}")
 
-        # Send to channels
+        timeout = (DEFAULT_CHANNEL_SEND_TIMEOUT if channel_timeout is None
+                   else channel_timeout)
+
+        # Send to channels. Real Tasks, not bare coroutines: with
+        # first_success_wins the losers keep running after we return, and only a
+        # Task survives being handed back to the loop unawaited.
         tasks = []
         for channel in self._channels:
             if channel.should_handle(notification):
-                tasks.append(channel.send(notification))
+                tasks.append(asyncio.ensure_future(
+                    self._send_channel(channel, notification, timeout)))
 
         if not tasks:
             # No channel wanted it. Reporting 0 rather than None keeps "nobody
             # is listening" distinct from "we never got far enough to know".
             return 0
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        successes = sum(1 for r in results if r is True)
+        if first_success_wins:
+            successes = await self._await_first_success(tasks)
+        else:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            successes = sum(1 for r in results if r is True)
         logger.debug(f"Notification sent to {successes}/{len(tasks)} channels")
         # Returned, not just logged. A caller holding something it may only
         # discard ONCE -- the database-corruption flag is the live example --
         # has no other way to tell a delivered alert from a swallowed one.
+        return successes
+
+    async def _await_first_success(self, tasks) -> int:
+        """Wait only until one channel confirms; then stop waiting.
+
+        The remaining sends are NOT cancelled. They were requested and their
+        delivery is still wanted -- a Discord confirmation is no reason to
+        abandon the email. What this drops is the WAIT, which is the actual
+        defect: one channel with no bound of its own (EmailChannel's blocking
+        smtplib) otherwise hides another channel's already-completed success
+        from the caller, and an unobserved success costs a caller with a
+        one-shot flag exactly as much as a failed one.
+
+        Returns the number of confirmations seen -- 0 only if every channel
+        finished without confirming.
+        """
+        pending = set(tasks)
+        successes = 0
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                try:
+                    if task.result() is True:
+                        successes += 1
+                except Exception:  # noqa: BLE001 - _send_channel already logged
+                    pass
+            if successes:
+                # Detach the stragglers so an exception nobody is left to read
+                # is not reported as "Task exception was never retrieved".
+                for task in pending:
+                    task.add_done_callback(_discard_task_result)
+                return successes
         return successes
 
     def get_history(self, limit: int = 50) -> List[Dict[str, Any]]:

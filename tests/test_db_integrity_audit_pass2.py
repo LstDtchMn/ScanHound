@@ -177,33 +177,18 @@ class TestMigrationCheckpointAndVerify:
             current.close()
             w.close()
 
-    def test_stale_copy_is_rejected_even_when_the_checkpoint_looks_clean(
-            self, tmp_path, monkeypatch):
-        """Second layer: if the bytes that land at the destination do not match
-        the source (a writer committing in the window, a short copy), the
-        migration must fail rather than freeze the stale file in — PRAGMA
-        integrity_check passes on it, so nothing downstream can catch it."""
-        legacy = str(tmp_path / "legacy.db")
-        new = str(tmp_path / "vol" / "crawler.db")
-        os.makedirs(os.path.dirname(new))
-        self._seed(legacy).close()
-
-        # A structurally valid, internally consistent, WRONG database.
-        stale_src = str(tmp_path / "stale.db")
-        s = sqlite3.connect(stale_src)
-        s.execute("CREATE TABLE downloads (url TEXT PRIMARY KEY)")
-        s.commit()
-        s.close()
-        assert sqlite3.connect(stale_src).execute(
-            "PRAGMA integrity_check").fetchone()[0] == "ok"
-
-        real_copy2 = shutil.copy2
-        monkeypatch.setattr(shutil, "copy2",
-                            lambda src, dst, **kw: real_copy2(stale_src, dst))
-
-        with pytest.raises(RuntimeError, match="row-count mismatch"):
-            cfg._checkpoint_and_copy(legacy, new)
-        assert not os.path.exists(new)
+    # REMOVED: test_stale_copy_is_rejected_even_when_the_checkpoint_looks_clean
+    #
+    # It injected staleness by patching shutil.copy2, a seam the migration no
+    # longer uses -- D-1 replaced the file copy with sqlite3's online backup API
+    # over a pinned read transaction. The patch therefore stopped firing and the
+    # test failed with "DID NOT RAISE".
+    #
+    # Its property is covered better, and by the real mechanism rather than a
+    # simulated one, in tests/test_db_relocation_snapshot_consistency.py:
+    #   test_update_after_checkpoint_is_not_certified_stale
+    #   test_paired_delete_insert_after_checkpoint_is_not_certified_stale
+    #   test_mismatched_destination_bytes_are_still_rejected
 
     def test_resolve_db_path_falls_back_to_legacy_on_partial_checkpoint(
             self, tmp_path, monkeypatch):
