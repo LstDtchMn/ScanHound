@@ -123,6 +123,13 @@ class TerminalKind(str, Enum):
     CONSTRUCTION_FAILED = "construction_failed"
     ABANDONED_ON_STOP = "abandoned_on_stop"
     TERMINAL_MISSING = "terminal_missing"
+    #: The operator's own policy removed it. Not a failure and not a stop: the
+    #: system did exactly what it was told. Kept as its own kind because the
+    #: alternatives both lie -- filing it under failures makes a correctly
+    #: configured scan look broken in proportion to how much the operator
+    #: excluded, and folding it into the stop bucket claims someone pressed
+    #: Stop when nobody did.
+    EXCLUDED_BY_POLICY = "excluded_by_policy"
     #: No factual kind was supplied and none can be inferred. Never guess a
     #: content-failure bucket for an ambiguous event - that is how a green
     #: equation ends up describing something that did not happen.
@@ -158,6 +165,15 @@ class DiscardCode(str, Enum):
     #: cause - the same error as a green test asserting the wrong invariant.
     TERMINAL_OUTCOME_MISSING = "terminal_outcome_missing"
 
+    # -- listing-stage policy ---------------------------------------------
+    #: A full-disc release the operator's hdencode_skip_full_disc policy
+    #: removes at the LISTING stage, before any detail fetch. It costs no
+    #: request and reaches no parser, so it takes part in none of the detail
+    #: conservation equations -- but it is still a release the scan saw and did
+    #: not ship, and without a slot of its own a cycle that skipped forty of
+    #: them is indistinguishable from one that saw none.
+    LISTING_POLICY_EXCLUDED_FULL_DISC = "listing_policy_excluded_full_disc"
+
     # -- declared, currently unreachable (see module docstring) -----------
     MISSING_REQUIRED_TITLE = "missing_required_title"
     MISSING_REQUIRED_URL = "missing_required_url"
@@ -187,6 +203,7 @@ STAGE_FOR_CODE: Dict[DiscardCode, ScanStage] = {
     DiscardCode.MISSING_REQUIRED_URL: ScanStage.MEDIA_ITEM_CONSTRUCTION,
     DiscardCode.INVALID_METADATA: ScanStage.MEDIA_ITEM_CONSTRUCTION,
     DiscardCode.SOURCE_BLOCKED: ScanStage.DETAIL_FETCH,
+    DiscardCode.LISTING_POLICY_EXCLUDED_FULL_DISC: ScanStage.LISTING,
 }
 
 _MESSAGES: Dict[DiscardCode, str] = {
@@ -207,6 +224,7 @@ _MESSAGES: Dict[DiscardCode, str] = {
     DiscardCode.MISSING_REQUIRED_URL: "The release had no usable URL.",
     DiscardCode.INVALID_METADATA: "The release metadata failed validation.",
     DiscardCode.SOURCE_BLOCKED: "The source blocked the request.",
+    DiscardCode.LISTING_POLICY_EXCLUDED_FULL_DISC: "Skipped as a full-disc release, because your settings exclude them.",
     DiscardCode.UNKNOWN: "The release was discarded for a reason the scan could not classify.",
 }
 
@@ -236,6 +254,7 @@ DEFAULT_KIND_FOR_CODE: Dict[DiscardCode, TerminalKind] = {
     DiscardCode.INVALID_METADATA: TerminalKind.CONSTRUCTION_FAILED,
     DiscardCode.MEDIA_ITEM_ABANDONED_ON_STOP: TerminalKind.ABANDONED_ON_STOP,
     DiscardCode.TERMINAL_OUTCOME_MISSING: TerminalKind.TERMINAL_MISSING,
+    DiscardCode.LISTING_POLICY_EXCLUDED_FULL_DISC: TerminalKind.EXCLUDED_BY_POLICY,
     # UNKNOWN is deliberately ABSENT: it may be an exception, a falsy return or
     # a construction failure, and picking one silently asserts a lifecycle that
     # was never observed.
@@ -249,6 +268,8 @@ _STOP_KINDS = {
 }
 #: A bookkeeping defect is not a content failure either.
 _GAP_KINDS = {TerminalKind.TERMINAL_MISSING, TerminalKind.UNSPECIFIED}
+#: Nor is the operator's own exclusion policy working as configured.
+_POLICY_KINDS = {TerminalKind.EXCLUDED_BY_POLICY}
 
 
 def joint_key(stage: ScanStage, kind: TerminalKind) -> str:
@@ -342,6 +363,11 @@ class ScanStageCounters:
     listing_urls_new: int = 0
     listing_urls_skipped_cached: int = 0
     listing_blocked_pages: int = 0
+    #: Releases the operator's full-disc policy removed at the LISTING
+    #: stage. Outside every detail equation on purpose: these never reach
+    #: detail, so folding them in would inflate the denominator of a ratio
+    #: about detail health with posts detail never saw.
+    listing_policy_excluded: int = 0
     listing_early_stopped: bool = False
 
     # scheduling vs execution vs cost - three different quantities
@@ -397,6 +423,28 @@ class ScanStageCounters:
     )
 
     # -- scheduling / execution ------------------------------------------
+
+    def note_policy_excluded(self, count: int = 1) -> None:
+        """Record releases the operator's own policy removed at the listing.
+
+        Counted, not hidden: the policy working correctly and the listing
+        silently returning nothing look identical without this. No-throw like
+        every other recorder.
+
+        ``_as_count`` is called OUTSIDE the lock, and must be. It takes the
+        same lock itself to record a fault on a bad value, and the lock is a
+        plain threading.Lock rather than an RLock -- so coercing inside the
+        critical section deadlocks the scan on exactly the malformed input the
+        coercion exists to survive.
+        """
+        count = _as_count(self, count)
+        if count <= 0:
+            return
+        try:
+            with self._lock:
+                self.listing_policy_excluded += count
+        except Exception:  # pragma: no cover - a recorder must never escape
+            pass
 
     def note_scheduled(self, count: int = 1) -> None:
         """Posts handed to the executor. Not yet attempted work."""
@@ -592,6 +640,7 @@ class ScanStageCounters:
                 listing_urls_new=self.listing_urls_new,
                 listing_urls_skipped_cached=self.listing_urls_skipped_cached,
                 listing_blocked_pages=self.listing_blocked_pages,
+                listing_policy_excluded=self.listing_policy_excluded,
                 listing_early_stopped=bool(self.listing_early_stopped),
                 detail_scheduled=self.detail_scheduled,
                 detail_started=self.detail_started,
@@ -670,6 +719,7 @@ class CountersSnapshot:
     listing_urls_new: int
     listing_urls_skipped_cached: int
     listing_blocked_pages: int
+    listing_policy_excluded: int
     listing_early_stopped: bool
     detail_scheduled: int
     detail_started: int
@@ -703,7 +753,8 @@ def outcome_groups_of(snap: CountersSnapshot) -> Dict[str, int]:
     A parser-regression threshold that counts an operator pressing Stop, or
     counts our own bookkeeping gaps, measures the wrong thing.
     """
-    groups = {"failures": 0, "operator_stop_outcomes": 0, "instrumentation_gaps": 0}
+    groups = {"failures": 0, "operator_stop_outcomes": 0,
+              "instrumentation_gaps": 0, "policy_excluded": 0}
     for name, count in snap.kinds.items():
         try:
             kind = TerminalKind(name)
@@ -713,6 +764,8 @@ def outcome_groups_of(snap: CountersSnapshot) -> Dict[str, int]:
             continue
         if kind in _STOP_KINDS:
             groups["operator_stop_outcomes"] += count
+        elif kind in _POLICY_KINDS:
+            groups["policy_excluded"] += count
         elif kind in _GAP_KINDS:
             groups["instrumentation_gaps"] += count
         else:
@@ -923,6 +976,7 @@ def dict_of(snap: CountersSnapshot) -> dict:
         "listing_urls_new": snap.listing_urls_new,
         "listing_urls_skipped_cached": snap.listing_urls_skipped_cached,
         "listing_blocked_pages": snap.listing_blocked_pages,
+        "listing_policy_excluded": snap.listing_policy_excluded,
         "listing_early_stopped": snap.listing_early_stopped,
         "detail_scheduled": snap.detail_scheduled,
         "detail_started": snap.detail_started,

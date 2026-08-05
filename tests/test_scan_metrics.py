@@ -778,10 +778,15 @@ class TestPopulationSeparation:
         c.note_started()
         c.note_discard(DiscardCode.TERMINAL_OUTCOME_MISSING, url="c")
 
+        # Exact equality on purpose: a new population must force this test to
+        # be reconsidered rather than silently absorbing events into a bucket
+        # nobody looked at. `policy_excluded` was added for D-6's full-disc
+        # slot and is zero here because nothing in this scan was excluded.
         assert c.outcome_groups() == {
             "failures": 1,
             "operator_stop_outcomes": 1,
             "instrumentation_gaps": 1,
+            "policy_excluded": 0,
         }
         assert c.conservation_errors() == []
 

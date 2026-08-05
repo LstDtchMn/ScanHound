@@ -1035,6 +1035,15 @@ class ScannerService:
 
         counters = ScanStageCounters()
         counters.note_scheduled(total_posts)
+        # Full-disc releases the operator's policy removed during the listing
+        # crawl, which ran before this method. Folded in from the crawl rather
+        # than recorded here because they never reach detail at all -- they are
+        # excluded before any request is made. Without this the metrics cannot
+        # tell "the listing had nothing new" from "the listing had forty
+        # releases and your settings excluded every one of them".
+        excluded = getattr(self, "_last_crawl_policy_excluded_observed", None)
+        if excluded:
+            counters.note_policy_excluded(len(excluded))
 
         def process_post(post_info, ticket):
             # Booked HERE, by the layer that owns execution, not left to the
