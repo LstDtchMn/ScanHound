@@ -199,3 +199,85 @@ def test_recovery_by_removing_the_marker_restores_bootstrap(db_path):
             "become possible again")
     finally:
         rebuilt.close()
+
+
+class TestNonceLiftsTheLock:
+    """Jesse's ratified trade (2026-08-05): keep the lock, but presenting the
+    desktop nonce is enough to lift it — no hand-editing files on the host.
+
+    The nonce is out-of-band proof by construction: it comes from the local
+    process that started the app, not from the network. A session token is not,
+    and could not be anyway — a rebuilt-empty database has no credential that
+    could have issued one.
+    """
+
+    def test_the_nonce_lifts_the_lock_and_keeps_the_incident_record(self, db_path):
+        from backend.api import dependencies as deps
+
+        _credentialed_db(db_path)
+        rebuilt = _quarantine_for_real(db_path)
+        saved_db, saved_nonce = deps.registry.db, deps.registry.auth_nonce
+        try:
+            deps.registry.db = rebuilt
+            deps.registry.auth_nonce = "desktop-nonce-abc123"
+            assert credential_state(rebuilt) == RECOVERY_LOCKED
+
+            assert deps.token_authorized("desktop-nonce-abc123") is True
+
+            assert credential_state(rebuilt) == "absent", (
+                "the lock did not lift after out-of-band proof")
+            # The history must survive the unlock.
+            assert os.path.exists(f"{db_path}.corrupt_flag.recovered.json"), (
+                "the only durable record that corruption happened was deleted")
+            assert not os.path.exists(corruption_flag_path(db_path))
+        finally:
+            deps.registry.db, deps.registry.auth_nonce = saved_db, saved_nonce
+            try:
+                os.unlink(f"{db_path}.corrupt_flag.recovered.json")
+            except OSError:
+                pass
+            rebuilt.close()
+
+    def test_a_wrong_nonce_does_not_lift_the_lock(self, db_path):
+        """DISAGREEING CASE. A fix that cleared the marker on any nonce
+        COMPARISON rather than a successful match would pass the test above
+        and hand the unlock to anyone who guesses at the endpoint."""
+        from backend.api import dependencies as deps
+
+        _credentialed_db(db_path)
+        rebuilt = _quarantine_for_real(db_path)
+        saved_db, saved_nonce = deps.registry.db, deps.registry.auth_nonce
+        try:
+            deps.registry.db = rebuilt
+            deps.registry.auth_nonce = "the-real-nonce"
+
+            assert deps.token_authorized("not-the-nonce") is False
+            assert credential_state(rebuilt) == RECOVERY_LOCKED, (
+                "a failed nonce attempt lifted the lock")
+        finally:
+            deps.registry.db, deps.registry.auth_nonce = saved_db, saved_nonce
+            rebuilt.close()
+
+    def test_a_session_token_cannot_lift_the_lock(self, db_path):
+        """Only the nonce counts. A session token is network-presented, so it
+        is not out-of-band proof — and on a rebuilt-empty database there is no
+        credential that could have issued one in the first place."""
+        from backend.api import dependencies as deps
+        from backend import auth_service
+
+        _credentialed_db(db_path)
+        rebuilt = _quarantine_for_real(db_path)
+        saved_db, saved_nonce = deps.registry.db, deps.registry.auth_nonce
+        try:
+            deps.registry.db = rebuilt
+            deps.registry.auth_nonce = ""
+            token = auth_service.new_session_token()
+            rebuilt.create_session(auth_service.hash_token(token),
+                                   auth_service.session_expiry())
+
+            assert deps.token_authorized(token) is True, "fixture: valid session"
+            assert credential_state(rebuilt) == RECOVERY_LOCKED, (
+                "a session token lifted the lock")
+        finally:
+            deps.registry.db, deps.registry.auth_nonce = saved_db, saved_nonce
+            rebuilt.close()

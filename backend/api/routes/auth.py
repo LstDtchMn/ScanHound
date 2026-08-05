@@ -177,11 +177,12 @@ def set_password(body: SetPasswordRequest,
             detail="This database was automatically rebuilt after corruption "
                    "was detected, so it has no password even though this "
                    "install previously had one. To prevent an unauthenticated "
-                   "takeover, setting a password here is blocked. Recover by "
-                   "starting with the desktop nonce, or by removing the "
-                   "'.corrupt_flag.json' / '.corrupt_flag.notified.json' file "
-                   "next to the database on the host once you are satisfied "
-                   "the machine is yours.")
+                   "takeover, setting a password here is blocked. To recover, "
+                   "start ScanHound on the desktop with its nonce and sign in "
+                   "once — that lifts the lock automatically. Failing that, "
+                   "remove the '.corrupt_flag.json' or "
+                   "'.corrupt_flag.notified.json' file next to the database on "
+                   "the host once you are satisfied the machine is yours.")
     if state == "unknown":
         # A failed credential read must never be mistaken for "no password
         # configured": that answer both un-gates this route at the middleware

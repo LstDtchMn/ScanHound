@@ -321,6 +321,40 @@ def _absent_or_locked(db, state: str) -> str:
     return state
 
 
+def _clear_recovery_lock(db) -> bool:
+    """Retire the quarantine markers after out-of-band proof. Returns whether
+    anything was retired.
+
+    RENAMED, not deleted. The marker is also the only durable record that a
+    corruption incident happened, and losing that would trade a security
+    problem for a forensic one. ``.corrupt_flag.recovered.json`` is matched by
+    neither lock check, so the install unlocks while the history survives.
+
+    No-throw: a read-only or otherwise awkward filesystem must not turn a
+    successful authentication into a failed request.
+    """
+    path = getattr(db, "db_path", None)
+    if not path:
+        return False
+    retired = False
+    for suffix in (".corrupt_flag.json", ".corrupt_flag.notified.json"):
+        marker = f"{path}{suffix}"
+        try:
+            if os.path.exists(marker):
+                os.replace(marker, f"{path}.corrupt_flag.recovered.json")
+                retired = True
+        except OSError:
+            logger.warning("Could not retire the quarantine marker %s; the "
+                           "install stays recovery-locked until it is removed "
+                           "on the host", marker)
+    if retired:
+        logger.warning(
+            "Quarantine recovery lock lifted: the desktop nonce authenticated, "
+            "so %s is no longer treated as an uninitialised install. The "
+            "incident record is kept as .corrupt_flag.recovered.json", path)
+    return retired
+
+
 def auth_enabled() -> bool:
     """Auth is active when a nonce is configured or a password has been set.
 
@@ -375,6 +409,12 @@ def token_authorized(token: str) -> bool:
     nonce = registry.auth_nonce
     # Constant-time compare so the nonce can't be recovered by timing.
     if nonce and secrets.compare_digest(token, nonce):
+        # Presenting the desktop nonce IS the out-of-band proof the recovery
+        # lock waits for: it comes from the local process, not the network. So
+        # lift the lock here rather than making the operator hand-edit files on
+        # the host. Only the nonce does this -- a session token cannot, because
+        # on a rebuilt-empty database there is no credential to have issued one.
+        _clear_recovery_lock(registry.db)
         return True
     db = registry.db
     if db:
