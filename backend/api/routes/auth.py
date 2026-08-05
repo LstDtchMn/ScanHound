@@ -19,7 +19,10 @@ from typing import Deque, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from backend.api.dependencies import ServiceRegistry, get_registry, allow_open
+from backend.api.dependencies import (
+    ServiceRegistry, get_registry, allow_open, credential_state,
+    issue_ws_ticket, ws_ticket_ttl_seconds,
+)
 from backend import auth_service
 
 logger = logging.getLogger(__name__)
@@ -119,7 +122,15 @@ def login(body: LoginRequest, request: Request,
     _clear_login_fails(ip)
     token = auth_service.new_session_token()
     expires_at = auth_service.session_expiry()
-    reg.db.create_session(auth_service.hash_token(token), expires_at)
+    if not reg.db.create_session(auth_service.hash_token(token), expires_at):
+        # create_session is a _mutate: it returns False on a write failure
+        # rather than raising. Returning the token anyway hands the client a
+        # credential that 401s on every later request, which the frontend
+        # renders as an endless login loop with the correct password.
+        raise HTTPException(
+            status_code=500,
+            detail="Could not persist the login session; "
+                   "the database is not writable")
     reg.db.purge_expired_sessions(auth_service.now_iso())  # opportunistic cleanup
     return {"token": token, "expires_at": expires_at}
 
@@ -140,13 +151,33 @@ def set_password(body: SetPasswordRequest,
         raise HTTPException(
             status_code=400,
             detail=f"Password must be at least {_MIN_PASSWORD_LEN} characters")
-    if reg.db.has_password():
+    state = credential_state(reg.db)
+    if state == "unknown":
+        # A failed credential read must never be mistaken for "no password
+        # configured": that answer both un-gates this route at the middleware
+        # (bootstrap exemption) and skips the current-password check below,
+        # which together allow an unauthenticated password takeover.
+        raise HTTPException(
+            status_code=503,
+            detail="Could not read the stored credential; password unchanged")
+    if state == "present":
         stored = reg.db.get_password_hash()
         if not auth_service.verify_password(body.current_password or "", stored):
             raise HTTPException(
                 status_code=401, detail="Current password is incorrect")
-    reg.db.set_password_hash(auth_service.hash_password(new_password))
-    reg.db.delete_all_sessions()  # force re-login everywhere
+    if not reg.db.set_password_hash(auth_service.hash_password(new_password)):
+        # Bailing out before touching auth_sessions keeps a failed write a
+        # clean no-op instead of "signed out everywhere, old password live".
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save the new password; it is unchanged")
+    if not reg.db.delete_all_sessions():  # force re-login everywhere
+        # The password DID change, so the caller must be told both facts: use
+        # the new password, and previously issued tokens are still valid.
+        raise HTTPException(
+            status_code=500,
+            detail="Password changed, but existing sessions could not be "
+                   "revoked. Sign out all devices manually and retry.")
     return {"ok": True}
 
 
@@ -155,5 +186,34 @@ def logout(request: Request, reg: ServiceRegistry = Depends(get_registry)):
     """Invalidate the caller's current session token (no-op for the nonce)."""
     token = _bearer(request)
     if reg.db and token:
-        reg.db.delete_session(auth_service.hash_token(token))
+        if not reg.db.delete_session(auth_service.hash_token(token)):
+            # delete_session is a _mutate: False means the DELETE never landed,
+            # so the row — and the token — survive for the rest of the 30-day
+            # TTL while the UI shows a clean sign-out. A zero-row DELETE still
+            # returns True, so this distinguishes "write failed" from success,
+            # NOT "row existed"; the nonce path has no row and keeps 200ing.
+            logger.error(
+                "logout: session delete failed; token remains valid until expiry")
+            raise HTTPException(
+                status_code=500,
+                detail="Sign-out could not be completed on the server; "
+                       "the session may still be active")
     return {"ok": True}
+
+
+@router.post("/ws-ticket")
+def ws_ticket(request: Request, reg: ServiceRegistry = Depends(get_registry)):
+    """Mint a short-lived, single-use ticket for the WebSocket handshake.
+
+    Reaching this route already means the middleware authorized the caller.
+    The ticket exists because a browser cannot set an Authorization header on
+    a WebSocket, so the session token would otherwise ride in the URL, where
+    every proxy in front of this app logs it verbatim.
+    """
+    credential = _bearer(request)
+    if not credential:
+        # Open mode (SCANHOUND_ALLOW_OPEN=1) has no credential to stand in
+        # for, and the socket already accepts a tokenless handshake there.
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    return {"ticket": issue_ws_ticket(credential),
+            "expires_in": ws_ticket_ttl_seconds()}

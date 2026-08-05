@@ -134,6 +134,39 @@ def _log_callback(message: str, level: str = "info") -> None:
     })
 
 
+def _scan_was_cancelled(scanner: Any) -> bool:
+    """Whether the scan that just returned was stopped before it finished.
+
+    A stopped scan returns from ``_run_scan_async`` BEFORE the Plex match, so
+    its items carry download-history status only — every title already sitting
+    in Plex still reads MISSING, and enrichment never ran either. Those items
+    must not reach auto-grab, the ``last_scan_time`` stamp or the Scan Complete
+    notification.
+
+    Two signals, because neither covers the other's case. ``/scan/stop`` marks
+    the module state "stopping" (the operator-driven case). ScannerService also
+    raises its own stop flag from inside the crawl when the HDEncode
+    coordinator confirms a shared block, and that path never touches the
+    route's state; ``run_scan`` clears the flag only at the start of the NEXT
+    run, so it still reads True here.
+
+    The scanner flag is honoured only when it is a genuine bool: the real
+    ScannerService backs it with a threading.Event and returns True/False,
+    whereas a Mock scanner auto-creates a truthy attribute that must never be
+    mistaken for the operator pressing Stop.
+    """
+    with _scan_lock:
+        if _scan_state.get("state") == "stopping":
+            return True
+    # ``last_scan_cancelled`` is the explicit outcome flag if ScannerService
+    # exposes one; ``stop_scan_flag`` is the signal that exists today.
+    for attr in ("last_scan_cancelled", "stop_scan_flag"):
+        value = getattr(scanner, attr, None)
+        if isinstance(value, bool) and value:
+            return True
+    return False
+
+
 def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
     """Execute scan in background thread."""
     global _last_scan_items
@@ -207,6 +240,40 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
 
         # Stats
         stats = _compute_stats(items)
+
+        if _scan_was_cancelled(scanner):
+            # The results above are still worth showing — the operator asked to
+            # stop and should see what was found — but the run is NOT a
+            # completed scan: nothing was matched against Plex, so every item
+            # reads MISSING regardless of what is in the library. Skip all
+            # three completion side effects (last_scan_time, the Scan Complete
+            # notification, and auto-grab, which would otherwise re-download
+            # titles the operator already owns).
+            ws_manager.broadcast_sync({
+                "type": "scan:cancelled",
+                "data": {
+                    "partial": True,
+                    "stats": stats,
+                    "total": stats["total"],
+                    "duration": round(duration, 1),
+                },
+            })
+            # The web UI has no scan:cancelled handler yet and leaves its
+            # "Stopping..." state only on scan:complete or scan:error, so emit
+            # scan:error too rather than hang the button. Remove this second
+            # broadcast once the frontend handles scan:cancelled directly.
+            ws_manager.broadcast_sync({
+                "type": "scan:error",
+                "data": {
+                    "message": (
+                        f"Scan stopped before it finished. {stats['total']} "
+                        "partial result(s) are shown; they were not matched "
+                        "against Plex, so their status is not reliable."
+                    ),
+                },
+            })
+            return
+
         ws_manager.broadcast_sync({
             "type": "scan:complete",
             "data": {
@@ -243,10 +310,22 @@ def _run_scan(reg: ServiceRegistry, req: ScanRequest) -> None:
                     "type": "autograb:started",
                     "data": {"count": len(items)},
                 })
-                grabbed = reg.auto_grab.process_items(items)
+                report = reg.auto_grab.process_items(items)
+                # process_items returns an AutoGrabReport, never an int, so the
+                # previous ``isinstance(grabbed, int)`` check always fell
+                # through to 0 — an unattended grab of 12 releases and a run
+                # that grabbed nothing broadcast the same payload, and the UI
+                # (which only toasts when grabbed > 0) said nothing either way.
+                grabbed = getattr(
+                    report, "grabbed", report if isinstance(report, int) else 0)
                 ws_manager.broadcast_sync({
                     "type": "autograb:complete",
-                    "data": {"grabbed": grabbed if isinstance(grabbed, int) else 0, "total": len(items)},
+                    "data": {
+                        "grabbed": grabbed,
+                        "failed": getattr(report, "failed", 0),
+                        "evaluated": getattr(report, "evaluated", len(items)),
+                        "total": len(items),
+                    },
                 })
             except Exception as e:
                 logger.warning("Auto-grab failed: %s", e)

@@ -71,6 +71,32 @@ class BackgroundScanner:
             )
         )
 
+    @staticmethod
+    def _listing_arm_incomplete(scanner, *, err: Optional[str]) -> bool:
+        """Whether the listing (control) arm failed to observe the site at all.
+
+        ``err`` on its own cannot detect this. ``run_scan`` swallows every
+        exception, and a Cloudflare 403 or a whole-crawl connection failure is
+        handled inside the crawl loop, so a completely blocked cycle returns
+        normally with ``err is None`` and a non-zero request count — which is
+        how blocked cycles were being recorded as shadow ``outcome='success'``
+        with zero misses and counted as promotion evidence.
+
+        The durable signal is the crawl's seen-set: ``_crawl_pages`` fills it
+        from every listing page it actually parsed, and ``run_scan`` clears it
+        at the start of each run, so an empty set means no listing page was
+        read this cycle.
+
+        A crawl that early-stopped at already-cached content is deliberately
+        NOT treated as incomplete here: it reached the discovery frontier and
+        its seen-set is non-empty. ``_last_crawl_early_stopped`` is True for
+        that healthy case too, so using it would mark almost every cycle
+        incomplete and stall the shadow evidence entirely.
+        """
+        if err:
+            return True
+        return not getattr(scanner, "_last_crawl_seen_urls", None)
+
     def _qualify_restart_recovery(
         self,
         *,
@@ -408,9 +434,19 @@ class BackgroundScanner:
                             "error": None,
                             "skipped": "rss_primary",
                         })
+                        # Same rule as the disabled-source branch above: the
+                        # listing was intentionally not visited, so nothing
+                        # refreshed last_seen for its cached rows. Purging here
+                        # would age the whole HDEncode cache out over
+                        # background_scan_retain_days with no crawl to blame.
+                        purge_safe = False
                         continue
                     source_pages = 1
                     rss_cycle["listing_fallback_started"] = True
+                    # The fallback is a deliberate PARTIAL visit (one page,
+                    # against a default of three), so its seen-set cannot
+                    # justify aging out rows that only appear on deeper pages.
+                    purge_safe = False
                 else:
                     source_pages = pages
                 err: Optional[str] = None
@@ -467,7 +503,12 @@ class BackgroundScanner:
                         ),
                         normal_feeds_complete=self._rss_normal_feeds_complete(
                             rss_cycle.get("feeds", []),
-                            listing_error=err,
+                            # NOT ``err``: run_scan swallows every exception,
+                            # so a blocked/failed listing crawl arrives here
+                            # with err=None. See _listing_arm_incomplete.
+                            listing_error=self._listing_arm_incomplete(
+                                scanner, err=err
+                            ),
                         ),
                     ).as_dict()
                     completed_at = datetime.now(timezone.utc).isoformat()

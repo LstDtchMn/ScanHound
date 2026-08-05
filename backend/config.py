@@ -295,13 +295,113 @@ _DB_DIR = os.environ.get("SCANHOUND_DB_DIR") or _DATA_DIR
 os.makedirs(_DB_DIR, exist_ok=True)
 
 
+# Retry budget for the pre-migration WAL checkpoint. A competing reader is
+# normally short-lived (a second container overlapping during `up -d --build`,
+# the desktop UI, a one-off script), so a couple of retries usually clears it.
+# The busy timeout is per attempt and SQLite really does burn the whole timeout
+# whenever any reader still holds the WAL, so keep the product modest — this
+# runs once, at startup, and giving up just means "keep using the legacy DB".
+_MIGRATION_CHECKPOINT_ATTEMPTS = 3
+_MIGRATION_CHECKPOINT_BUSY_MS = 2000
+
+
+def _assert_wal_fully_checkpointed(legacy_path: str) -> None:
+    """Fold the legacy DB's WAL into its main file, or raise.
+
+    ``PRAGMA wal_checkpoint(TRUNCATE)`` returns ``(busy, log, checkpointed)``
+    and this is the whole point of reading it: SQLite can only fold frames
+    older than the oldest live read snapshot, so a stale reader yields e.g.
+    ``(1, 54, 4)`` — 4 of 54 frames folded — leaving the main file missing
+    almost every transaction. Copying it then produces a destination DB that
+    is stale or missing whole tables while ``PRAGMA integrity_check`` still
+    says "ok" (it is internally consistent, just old), so nothing downstream
+    can detect the loss.
+
+    ``busy`` on its own is NOT a failure signal: a reader holding a CURRENT
+    snapshot gives ``(1, 53, 53)`` — every frame folded, only the truncate
+    itself blocked, and the copy is complete. The condition that matters is
+    ``checkpointed == log``. A non-WAL DB reports ``(0, -1, -1)``: nothing to
+    fold, which is also fine.
+    """
+    import sqlite3
+    import time as _time
+
+    result = None
+    for attempt in range(_MIGRATION_CHECKPOINT_ATTEMPTS):
+        # isolation_level=None: no implicit transaction around the pragma.
+        conn = sqlite3.connect(legacy_path, isolation_level=None)
+        try:
+            conn.execute(f"PRAGMA busy_timeout={_MIGRATION_CHECKPOINT_BUSY_MS}")
+            result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            conn.close()
+        if result is not None:
+            busy, log, checkpointed = result[0], result[1], result[2]
+            if log <= 0 or checkpointed == log:
+                return
+        if attempt < _MIGRATION_CHECKPOINT_ATTEMPTS - 1:
+            _time.sleep(0.25)
+
+    raise RuntimeError(
+        f"incomplete WAL checkpoint on {legacy_path}: {result} "
+        "(busy, log, checkpointed) — refusing to copy a partially "
+        "checkpointed database")
+
+
+def _assert_copy_matches_source(source_path: str, copy_path: str) -> None:
+    """Raise unless ``copy_path`` holds the same schema and row counts as
+    ``source_path``.
+
+    Reading the source through a fresh connection sees its WAL, while the copy
+    is main-file-only, so comparing the two is the only check that can tell a
+    good copy from a stale one — ``integrity_check`` passes on both.
+    """
+    import sqlite3
+
+    def _snapshot(path):
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(f"PRAGMA busy_timeout={_MIGRATION_CHECKPOINT_BUSY_MS}")
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+            counts = {t: conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
+                      for t in tables}
+            return version, counts
+        finally:
+            conn.close()
+
+    src_version, src_counts = _snapshot(source_path)
+    try:
+        copy_version, copy_counts = _snapshot(copy_path)
+    except sqlite3.DatabaseError as e:
+        raise RuntimeError(f"migrated copy is unreadable: {e}") from e
+
+    if src_version != copy_version:
+        raise RuntimeError(
+            f"migrated copy user_version {copy_version} != source {src_version}")
+    if src_counts != copy_counts:
+        missing = sorted(set(src_counts) - set(copy_counts))
+        differing = sorted(t for t in src_counts
+                           if t in copy_counts and src_counts[t] != copy_counts[t])
+        raise RuntimeError(
+            f"migrated copy does not match {source_path} "
+            f"(missing tables: {missing}; row-count mismatch: {differing})")
+
+
 def _checkpoint_and_copy(legacy_path: str, new_path: str) -> bool:
     """Fold the legacy DB's WAL into its main file, then atomically copy it
     to new_path.
 
-    Returns True on success. Never touches -wal/-shm sidecars at the
-    destination — the copied file is a clean, checkpointed snapshot that
-    SQLite will happily open fresh (WAL/SHM get recreated on first write).
+    Returns True on success and raises on any failure to produce a faithful
+    copy — never returns True for a stale/partial one. _resolve_db_path turns
+    that into "keep using the legacy DB", which is always the safe outcome:
+    the legacy file still holds the data.
+
+    Never touches -wal/-shm sidecars at the destination — the copied file is a
+    clean, checkpointed snapshot that SQLite will happily open fresh (WAL/SHM
+    get recreated on first write).
 
     Atomicity: copy2 goes to a temp sibling (new_path + ".migrating") first,
     then os.replace() swaps it into place. os.replace is atomic on the same
@@ -313,18 +413,20 @@ def _checkpoint_and_copy(legacy_path: str, new_path: str) -> bool:
     next boot instead of mistaking a truncated file for "already migrated").
     """
     import shutil
-    import sqlite3
-    conn = sqlite3.connect(legacy_path)
-    try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.commit()
-    finally:
-        conn.close()
+    _assert_wal_fully_checkpointed(legacy_path)
 
     temp_path = new_path + ".migrating"
     if os.path.exists(temp_path):
         os.remove(temp_path)  # stale leftover from a prior interrupted attempt
     shutil.copy2(legacy_path, temp_path)
+    _assert_copy_matches_source(legacy_path, temp_path)
+    # The verification read above opens the copy, which recreates -wal/-shm
+    # next to the TEMP name. SQLite deletes them on a clean close; drop any
+    # survivor so os.replace() doesn't strand them beside the migrated DB.
+    for suffix in ("-wal", "-shm"):
+        sidecar = temp_path + suffix
+        if os.path.exists(sidecar):
+            os.remove(sidecar)
     os.replace(temp_path, new_path)
     return True
 

@@ -34,7 +34,46 @@ class NotificationBridge:
 
         self._manager = NotificationManager()
 
-        # Map config keys to notification channels
+        try:
+            self._manager.configure_from_dict(self._build_notif_config(config))
+        except Exception as e:
+            logger.warning(f"Failed to configure notifications: {e}")
+
+        # Start async loop in background thread
+        self._start_loop()
+        logger.info("NotificationBridge configured")
+
+    def reconfigure(self, config: Dict[str, Any]):
+        """Rebuild the channel list after the config changed at runtime.
+
+        configure() snapshots scalars out of the config dict into channel
+        objects, so mutating reg.config (what PUT /settings does) can never
+        reach the live channels — without this the running app keeps the
+        startup channel set until the process restarts, while the Settings
+        "Test" button probes the config directly and reports success.
+
+        Rebuilds on the EXISTING manager rather than re-running configure(),
+        which would replace it and discard _history, _callbacks and any
+        in-flight batch.
+        """
+        if self._manager is None:
+            self.configure(config)
+            return
+
+        try:
+            self._manager.clear_channels()
+            self._manager.configure_from_dict(self._build_notif_config(config))
+        except Exception as e:
+            logger.warning(f"Failed to reconfigure notifications: {e}")
+            return
+
+        # No-op when the loop thread is already alive; covers a bridge whose
+        # thread died.
+        self._start_loop()
+        logger.info("NotificationBridge reconfigured")
+
+    def _build_notif_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Map ScanHound config keys onto NotificationManager channel keys."""
         notif_config = {}
 
         # Desktop — default OFF: ScanHound runs headless (Docker), where there
@@ -72,14 +111,7 @@ class NotificationBridge:
             notif_config["webhook_url"] = config["webhook_url"]
             notif_config["webhook_method"] = config.get("webhook_method", "POST")
 
-        try:
-            self._manager.configure_from_dict(notif_config)
-        except Exception as e:
-            logger.warning(f"Failed to configure notifications: {e}")
-
-        # Start async loop in background thread
-        self._start_loop()
-        logger.info("NotificationBridge configured")
+        return notif_config
 
     def _start_loop(self):
         """Start the background asyncio event loop."""

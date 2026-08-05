@@ -49,6 +49,20 @@ SENSITIVE_KEYS = {
     "pushover_token", "slack_webhook", "webhook_url",
 }
 
+# Every config key NotificationBridge._build_notif_config reads. Changing any
+# of them requires rebuilding the live channels — the bridge builds channel
+# objects from a config snapshot, so updating reg.config alone never reaches
+# them. Keep in sync with _build_notif_config.
+NOTIFICATION_KEYS = {
+    "desktop_notifications",
+    "discord_webhook", "discord_username",
+    "slack_webhook",
+    "email_enabled", "smtp_host", "smtp_port", "smtp_username",
+    "smtp_password", "email_from", "email_to", "smtp_tls",
+    "pushover_user", "pushover_token",
+    "webhook_url", "webhook_method",
+}
+
 
 class SettingsUpdate(BaseModel):
     """Validated settings model. All fields optional for partial updates.
@@ -308,6 +322,22 @@ def update_settings(
     reg.config.update(real_updates)
     if reg.backend:
         reg.backend.save_config()
+    # Push notification changes into the running bridge. Done AFTER
+    # save_config() because that restores sensitive keys from disk and can
+    # therefore change the effective value the channels must be built from.
+    if real_updates.keys() & NOTIFICATION_KEYS:
+        bridge = reg.notifications
+        if bridge is not None:
+            try:
+                bridge.reconfigure(reg.config)
+            except Exception as e:
+                # The settings themselves DID save — only the live channel
+                # rebuild failed, so log loudly instead of failing the request
+                # (which would wrongly tell the operator nothing was saved).
+                logger.error(
+                    "Settings saved but notification channels could not be "
+                    "reloaded; they stay on the previous config until "
+                    "restart: %s", e)
     return {"status": "ok", "updated_keys": list(real_updates.keys())}
 
 

@@ -12,6 +12,7 @@ import aiohttp
 import html as html_lib
 import json
 import logging
+import re
 import shutil
 import smtplib
 import string
@@ -25,10 +26,56 @@ from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 from queue import Queue
 
 logger = logging.getLogger(__name__)
+
+# Verbs that carry no request body — the payload has to go in the query
+# string instead. See _post_webhook.
+_BODYLESS_METHODS = ("GET", "HEAD", "DELETE")
+
+
+def _normalize_addrs(value) -> List[str]:
+    """Coerce an address value into a list of addresses.
+
+    config.py declares ``email_to`` as a plain ``str`` (default "") and
+    nothing between the config and EmailChannel coerces it, so a channel
+    built from the real config receives a string where it expects a list —
+    ``", ".join(...)`` then produces a per-character To: header. Accept both
+    forms here so every construction path is safe, and split on , and ;
+    because the field is free text and invites multiple recipients.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = re.split(r"[,;]", value)
+    else:
+        parts = list(value)
+    return [p.strip() for p in parts if isinstance(p, str) and p.strip()]
+
+
+def _payload_to_params(payload: dict) -> Dict[str, Any]:
+    """Flatten a notification payload into query-string-safe values.
+
+    aiohttp's ``params`` accepts only str/int/float — a dict value raises
+    "Invalid variable type". Notification.to_dict()['data'] is a dict, so
+    nested values are JSON-encoded and None values dropped. bool is
+    rejected by aiohttp despite subclassing int, hence the explicit check.
+    """
+    params: Dict[str, str] = {}
+    for key, value in payload.items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            params[key] = str(value)
+        elif isinstance(value, (str, int, float)):
+            params[key] = value
+        elif isinstance(value, (dict, list)):
+            params[key] = json.dumps(value)
+        else:
+            params[key] = str(value)
+    return params
 
 
 class NotificationType(Enum):
@@ -103,7 +150,14 @@ class NotificationChannel(ABC):
         try:
             async with aiohttp.ClientSession() as session:
                 kwargs = {"timeout": aiohttp.ClientTimeout(total=10)}
-                if use_data:
+                if (method or "POST").upper() in _BODYLESS_METHODS:
+                    # A body on GET/HEAD/DELETE is ignored by virtually every
+                    # receiver, so the payload would silently arrive empty
+                    # while any 2xx still counted as delivered. Query string is
+                    # the contract the /settings/test/webhook button already
+                    # uses (requests.get(url, params=payload)).
+                    kwargs["params"] = _payload_to_params(payload)
+                elif use_data:
                     kwargs["data"] = payload
                 else:
                     kwargs["json"] = payload
@@ -385,7 +439,7 @@ class EmailChannel(NotificationChannel):
         username: str,
         password: str,
         from_addr: str,
-        to_addrs: List[str],
+        to_addrs: Union[str, List[str]],
         use_tls: bool = True
     ):
         super().__init__("email")
@@ -394,7 +448,9 @@ class EmailChannel(NotificationChannel):
         self.username = username
         self.password = password
         self.from_addr = from_addr
-        self.to_addrs = to_addrs
+        # config.py types email_to as a str, the tests pass a list — normalize
+        # both here so the To: header and the sendmail envelope agree.
+        self.to_addrs = _normalize_addrs(to_addrs)
         self.use_tls = use_tls
 
     def _build_email(self, notification: Notification) -> MIMEMultipart:
@@ -531,6 +587,14 @@ class NotificationManager:
     def remove_channel(self, name: str):
         """Remove a notification channel by name."""
         self._channels = [c for c in self._channels if c.name != name]
+
+    def clear_channels(self):
+        """Drop every configured channel.
+
+        Used to rebuild the channel list from a changed config without
+        replacing the manager, which would discard _history and _callbacks.
+        """
+        self._channels = []
 
     def add_callback(self, callback: Callable[[Notification], None]):
         """Add a callback to be called when notifications are sent."""

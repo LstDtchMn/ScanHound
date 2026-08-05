@@ -118,6 +118,24 @@ class PlexService:
 
     # ── Library loading ───────────────────────────────────────────────
 
+    def _configured_libs(self) -> tuple[List[str], List[str]]:
+        """Resolve the configured (movie_libs, tv_libs) library names.
+
+        Use `or` so an explicit empty list falls through to the next fallback.
+        Priority: movie_libs (user-assigned) → known_movie_libraries (legacy key).
+        """
+        movie_libs = (
+            self.config.get("movie_libs")
+            or self.config.get("known_movie_libraries")
+            or []
+        )
+        tv_libs = (
+            self.config.get("tv_libs")
+            or self.config.get("known_tv_libraries")
+            or []
+        )
+        return movie_libs, tv_libs
+
     def load_libraries(
         self,
         wait_if_loading: bool = False,
@@ -154,42 +172,51 @@ class PlexService:
         try:
             self._plex_loading = True
 
+            movie_libs, tv_libs = self._configured_libs()
+
             # ── Cache path ────────────────────────────────────────────
             if use_cache:
                 self._log("Loading Plex data from local cache...")
                 cached_movies = self.db.load_plex_cache("Movies")
                 cached_tv = self.db.load_plex_cache("TV Shows")
 
+                # A cache covering only SOME of the configured content types is
+                # not authoritative. Returning it would leave the missing type
+                # indexed with zero items, so every title in it reports Missing
+                # — and rematch_cache's all-or-nothing `have_plex` guard then
+                # writes that downgrade into the background cache. Fall through
+                # to a full load instead (SH-H13).
+                missing_types = []
+                if movie_libs and not cached_movies:
+                    missing_types.append("Movies")
+                if tv_libs and not cached_tv:
+                    missing_types.append("TV Shows")
+
                 if cached_movies or cached_tv:
-                    self.plex_movies = cached_movies
-                    self.plex_tv = cached_tv
-                    self.stats['plex_4k'] = len({m.get('imdb_id') or m.get('clean_title', '') for m in self.plex_movies if m.get('res') == '4K'} - {''})
-                    self.stats['plex_1080'] = len({m.get('imdb_id') or m.get('clean_title', '') for m in self.plex_movies if m.get('res') == '1080p'} - {''})
-                    self.stats['tv_seasons'] = len(self.plex_tv)
-                    self._build_plex_index()
-                    self._emit_stats()
-                    self._last_full_load_time = time.time()
-                    self._log(
-                        f"Loaded Cache: {len(self.plex_movies)} movies, {self.stats['tv_seasons']} seasons",
-                        "success",
-                    )
-                    return
+                    if missing_types:
+                        self._log(
+                            f"Plex cache has no {' or '.join(missing_types)} rows but those "
+                            "libraries are configured — falling back to a full load",
+                            "warning",
+                        )
+                    else:
+                        self.plex_movies = cached_movies
+                        self.plex_tv = cached_tv
+                        self.stats['plex_4k'] = len({m.get('imdb_id') or m.get('clean_title', '') for m in self.plex_movies if m.get('res') == '4K'} - {''})
+                        self.stats['plex_1080'] = len({m.get('imdb_id') or m.get('clean_title', '') for m in self.plex_movies if m.get('res') == '1080p'} - {''})
+                        self.stats['tv_seasons'] = len(self.plex_tv)
+                        self._build_plex_index()
+                        self._emit_stats()
+                        self._last_full_load_time = time.time()
+                        self._log(
+                            f"Loaded Cache: {len(self.plex_movies)} movies, {self.stats['tv_seasons']} seasons",
+                            "success",
+                        )
+                        return
                 else:
                     self._log("Cache empty, falling back to full load...", "warning")
 
             # ── Full load ─────────────────────────────────────────────
-            # Use `or` so an explicit empty list falls through to the next fallback.
-            # Priority: movie_libs (user-assigned) → known_movie_libraries (legacy key)
-            movie_libs = (
-                self.config.get("movie_libs")
-                or self.config.get("known_movie_libraries")
-                or []
-            )
-            tv_libs = (
-                self.config.get("tv_libs")
-                or self.config.get("known_tv_libraries")
-                or []
-            )
             if movie_libs != self.config.get("movie_libs"):
                 logger.warning(
                     "movie_libs is empty — falling back to known_movie_libraries: %s",
@@ -243,7 +270,16 @@ class PlexService:
                 try:
                     lib = self.plex_manager.get_library_section(lib_name)
                     if not lib:
+                        # get_library_section swallows EVERY exception and
+                        # returns None (timeout, NotFound after a Plex-side
+                        # rename, auth blip), so "not found" is
+                        # indistinguishable from "could not be read" — and
+                        # either way this library's items are absent from
+                        # _movies. Mark the content type incomplete so the
+                        # full_replace gate below cannot prune every cached
+                        # row this library owns (SH-H12).
                         self._log(f"Movie library '{lib_name}' not found", "warning")
+                        movies_load_incomplete = True
                         continue
 
                     items = lib.all()
@@ -300,7 +336,12 @@ class PlexService:
                 try:
                     lib = self.plex_manager.get_library_section(lib_name)
                     if not lib:
+                        # Same as the movie branch above: a None section is a
+                        # swallowed error as often as a genuine absence, so the
+                        # TV list is now known incomplete and must not
+                        # full-replace the cache (SH-H12).
                         self._log(f"TV library '{lib_name}' not found", "warning")
+                        tv_load_incomplete = True
                         continue
 
                     items = lib.all()
@@ -656,6 +697,29 @@ class PlexService:
 
     # ── Cache validation ──────────────────────────────────────────────
 
+    def _new_content_probe_ran(self, movie_libs: List[str], tv_libs: List[str]) -> bool:
+        """Could the new-content probe have searched anything at all?
+
+        get_recently_added() skips any library whose section won't resolve and
+        returns the (possibly empty) list it collected, so an empty result only
+        means "nothing new" if at least one configured library was reachable.
+        Resolving ONE is enough to establish that the server answered; the loop
+        stops there, so the healthy path costs a single call.
+
+        With nothing configured there is nothing to corroborate against, so the
+        caller keeps its previous behaviour rather than refreshing forever.
+        """
+        names = list(movie_libs) + list(tv_libs)
+        if not names:
+            return True
+        for name in names:
+            try:
+                if self.plex_manager.get_library_section(name):
+                    return True
+            except Exception as e:
+                logger.debug("Library reachability check failed for '%s': %s", name, e)
+        return False
+
     def check_cache_status(self) -> tuple[bool, str]:
         """Check if Plex cache is valid. Returns (is_valid, message).
 
@@ -663,6 +727,8 @@ class PlexService:
         items, so this is fast even for large libraries.
         """
         try:
+            movie_libs, tv_libs = self._configured_libs()
+
             timestamps = self.db.get_plex_cache_max_timestamp()
             if not timestamps:
                 return False, "Cache not found. Full scan required."
@@ -680,6 +746,17 @@ class PlexService:
                 ages["tv"] = _age(timestamps["TV Shows"])
             if not ages:
                 return False, "Cache not found. Full scan required."
+
+            # Checking only the ages of the content types that HAPPEN to be
+            # present reports a movies-only cache as valid even when TV
+            # libraries are configured — the scan then matches every TV item
+            # against an index holding none (SH-H13). A configured type with
+            # no rows at all is a partial cache, not a fresh one. Types that
+            # aren't configured are legitimately absent and stay ignored.
+            if movie_libs and not timestamps.get("Movies"):
+                return False, "Movies cache missing. Full load required."
+            if tv_libs and not timestamps.get("TV Shows"):
+                return False, "TV Shows cache missing. Full load required."
 
             if any(a > limit_hours for a in ages.values()):
                 age_str = ", ".join(f"{k}: {v:.1f}h" for k, v in ages.items())
@@ -704,8 +781,28 @@ class PlexService:
                             f"Cache is {max_age:.1f}h old but "
                             f"{len(new_items)} new item(s) detected in Plex since last cache."
                         )
+                    # An empty result is NOT the same answer as "nothing new".
+                    # get_recently_added swallows a connect failure, a
+                    # per-library exception and an outer exception alike and
+                    # returns whatever it had collected, so [] is also what a
+                    # mid-restart Plex produces. is_connected cannot separate
+                    # them either — it is `self._server is not None`, which
+                    # stays True after the server goes away. Corroborate the
+                    # empty answer instead, and refresh when it can't be
+                    # trusted rather than scanning against a cache that may
+                    # predate real additions (SH-M25).
+                    if new_items is None or not self._new_content_probe_ran(
+                            movie_libs, tv_libs):
+                        return False, (
+                            "Could not verify whether Plex has new content "
+                            "— refreshing cache."
+                        )
                 except Exception as e:
-                    logger.debug("New content check failed: %s", e)
+                    # Failing closed: the probe's whole purpose is to catch
+                    # additions made since the cache was written, and a probe
+                    # that raised has not ruled them out.
+                    logger.warning("New content check failed: %s", e)
+                    return False, f"New-content check failed ({e}) — refreshing cache."
 
             return True, ""
         except Exception as e:

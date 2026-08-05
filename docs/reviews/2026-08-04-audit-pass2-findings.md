@@ -18,9 +18,32 @@ missing data. That is why they survived this long.
 | Severity | Count | Fixed so far |
 |---|---|---|
 | critical | 1 | 1 |
-| high | 12 | 2 |
-| medium | 13 | 0 |
-| low | 6 | 0 |
+| high | 12 | 11 |
+| medium | 13 | 10 |
+| low | 6 | 3 |
+
+**Where this stands (2026-08-04).** 25 fixed, 1 partial, 6 open.
+
+Still open, and why — these five live in files no fix pass has touched yet:
+
+| # | File | What it costs you |
+|---|---|---|
+| 18 | `app_service.py:785` | on the Docker build the scheduler can never start a scan, yet logs "Scheduled scan triggered" and reports itself active |
+| 20 | `database.py:3241` | nothing ever writes a scan_history row, so Analytics permanently reads 0 scans |
+| 21 | `download_queue.py:1146` | Retry returns HTTP 200 without retrying, and clobbers the batch's paused state |
+| 22 | `download_service.py:1915` | a transient DDLBase/Adit-HD failure is laundered into a permanent non-retryable "no links found" |
+| 26 | `scanner_service.py:376` | `run_scan` swallows every exception, so a failed source is recorded error-free and the cache is still purged |
+
+Plus **#19** (`database.py:5014`), marked NOT FIXED above: the corruption
+flag is still consumed whether or not the notification was delivered. The
+docstring now describes that as intentional; the finding disagrees, and the
+disagreement is left visible rather than silently resolved.
+
+**#17** is PARTIAL. The backend can now mint short-lived single-use
+WebSocket tickets, but the frontend still passes `?token=`, so the session
+token is still written into every proxy access log. The finding does not
+close until the client uses the ticket.
+
 
 ---
 
@@ -57,7 +80,7 @@ api/routes/scanner.py:375-376  `if scanner:` / `        scanner.stop_scan_flag =
 
 ## HIGH
 
-### 2. `backend/api/routes/auth.py:143`
+### 2. `backend/api/routes/auth.py:143`  ✅ FIXED — credential_state three-state read; fails CLOSED on an unreadable DB
 
 *auth-surface*
 
@@ -113,7 +136,7 @@ Production really is in the fail-closed-with-bootstrap-hole posture: docker/entr
 
 ---
 
-### 3. `backend/api/routes/auth.py:148`
+### 3. `backend/api/routes/auth.py:148`  ✅ FIXED — set_password checks both write results
 
 *auth-surface*
 
@@ -147,7 +170,7 @@ Ordering matters: bailing out before touching auth_sessions on a set_password_ha
 
 ---
 
-### 4. `backend/api/routes/scanner.py:240`
+### 4. `backend/api/routes/scanner.py:240`  ✅ FIXED — cancelled scans skip completion, last_scan_time and auto-grab
 
 *scan-pipeline*
 
@@ -167,7 +190,7 @@ api/routes/scanner.py:240-246  `if reg.auto_grab and reg.auto_grab.enabled and i
 
 ---
 
-### 5. `backend/api/routes/settings.py:310`
+### 5. `backend/api/routes/settings.py:310`  ✅ FIXED — NotificationBridge.reconfigure() on settings save
 
 *notifications*
 
@@ -204,7 +227,7 @@ Silence confirmed at notifications.py:735-743: `for channel in self._channels: i
 
 ---
 
-### 6. `backend/background_scanner.py:470`
+### 6. `backend/background_scanner.py:470`  ✅ FIXED — _listing_arm_incomplete: a blocked crawl is no longer promotion evidence
 
 *scan-pipeline*
 
@@ -224,7 +247,7 @@ database.py:2081-2084  `WHERE outcome IN ('success','relevant_miss')` / `  AND n
 
 ---
 
-### 7. `backend/background_scanner.py:405`
+### 7. `backend/background_scanner.py:405`  ✅ FIXED — purge_safe=False when the listing is skipped or only partially visited
 
 *scan-pipeline*
 
@@ -260,7 +283,7 @@ Optional follow-up (better, larger): make retention source-scoped — `purge_bac
 
 ---
 
-### 8. `backend/config.py:325`
+### 8. `backend/config.py:325`  ✅ FIXED — checkpoint verified (checkpointed==log) + copy verified by row counts
 
 *db-integrity*
 
@@ -308,7 +331,7 @@ conn = sqlite3.connect(legacy_path)
 
 ---
 
-### 10. `backend/database.py:1246`
+### 10. `backend/database.py:1246`  ✅ FIXED — WAL checkpointed first; sidecars moved WITH the backup
 
 *db-integrity*
 
@@ -400,7 +423,7 @@ try:
 
 ---
 
-### 12. `backend/plex_service.py:245`
+### 12. `backend/plex_service.py:245`  ✅ FIXED — an unresolved library marks the load incomplete, blocking the prune
 
 *plex-sync*
 
@@ -448,7 +471,7 @@ backend/plex_manager.py:430-434
 
 ---
 
-### 13. `backend/plex_service.py:163`
+### 13. `backend/plex_service.py:163`  ✅ FIXED — cache accepted only when every CONFIGURED content type is present
 
 *plex-sync*
 
@@ -489,7 +512,7 @@ backend/plex_service.py:675-684
 
 ## MEDIUM
 
-### 14. `backend/api/routes/auth.py:122`
+### 14. `backend/api/routes/auth.py:122`  ✅ FIXED — login fails 500 when the session was never persisted
 
 *auth-surface*
 
@@ -511,7 +534,7 @@ token = auth_service.new_session_token()
 
 ---
 
-### 15. `backend/api/routes/scanner.py:249`
+### 15. `backend/api/routes/scanner.py:249`  ✅ FIXED — auto-grab reports the AutoGrabReport counts, not a hardcoded 0
 
 *scan-pipeline*
 
@@ -547,7 +570,7 @@ In frontend/src/lib/stores/scanner.ts:118-124, add an else branch so a completed
 
 ---
 
-### 16. `backend/api/ws.py:139`
+### 16. `backend/api/ws.py:139`  ✅ FIXED — sockets re-check their credential periodically, so logout reaches them
 
 *auth-surface*
 
@@ -568,7 +591,7 @@ await ws_manager.connect(ws)
 
 ---
 
-### 17. `backend/api/ws.py:127`
+### 17. `backend/api/ws.py:127`  ⚠️ PARTIAL — backend can mint short-lived WS tickets; the frontend still sends ?token=, so the finding is NOT closed until it uses them
 
 *auth-surface*
 
@@ -612,7 +635,7 @@ api/routes/scheduler.py:44-48  `"scheduler_active": bool(` / `    backend and` /
 
 ---
 
-### 19. `backend/database.py:5014`
+### 19. `backend/database.py:5014`  ❌ NOT FIXED — docstring now DOCUMENTS the fire-once behaviour as intended; the flag is still consumed whether or not anything was delivered
 
 *notifications*
 
@@ -758,7 +781,7 @@ In `_scrape_ddlbase_links` (download_service.py:2063):
 
 ---
 
-### 23. `backend/notifications.py:574`
+### 23. `backend/notifications.py:574`  ✅ FIXED — email_to accepts a single or comma-separated value (_normalize_addrs)
 
 *notifications*
 
@@ -811,7 +834,7 @@ Add a guard in `configure_from_dict` (line 566) so an enabled-but-unaddressed co
 
 ---
 
-### 24. `backend/notifications.py:339`
+### 24. `backend/notifications.py:339`  ✅ FIXED — bodyless verbs send the payload as a query string, not a JSON body
 
 *notifications*
 
@@ -855,7 +878,7 @@ Two follow-ons in the same edit:
 
 ---
 
-### 25. `backend/plex_service.py:707`
+### 25. `backend/plex_service.py:707`  ✅ FIXED — the new-content probe fails closed and verifies a library resolved
 
 *plex-sync*
 
@@ -943,7 +966,7 @@ End-to-end repro against the real DatabaseManager + BackgroundScanner (scratch D
 
 ## LOW
 
-### 27. `backend/api/routes/auth.py:157`
+### 27. `backend/api/routes/auth.py:157`  ✅ FIXED — logout reports 500 when the session delete did not land
 
 *auth-surface*
 
@@ -964,7 +987,7 @@ token = _bearer(request)
 
 ---
 
-### 28. `backend/database.py:2616`
+### 28. `backend/database.py:2616`  ✅ FIXED — prune counter accumulates per batch instead of reading the last one
 
 *plex-sync*
 
@@ -1035,7 +1058,7 @@ Test that distinguishes right from wrong (the axis the bug is on is the batch co
 
 ---
 
-### 29. `backend/database.py:1263`
+### 29. `backend/database.py:1263`  ✅ FIXED — dead _notify_corruption removed (it read a nonexistent module attribute)
 
 *notifications*
 
@@ -1055,7 +1078,7 @@ import backend.app_service as _app_service
 
 ---
 
-### 30. `backend/database.py:3417`
+### 30. `backend/database.py:3417`  ✅ FIXED — a failed read is no longer cached as "nothing is dismissed"
 
 *db-integrity*
 
@@ -1076,7 +1099,7 @@ if self._dismissed_cache is None:
 
 ---
 
-### 31. `backend/database.py:4749`
+### 31. `backend/database.py:4749`  ✅ FIXED — reset_applying_rename_jobs returns what it RECOVERED, not what it found
 
 *db-integrity*
 
@@ -1122,7 +1145,7 @@ Minimal alternative if the rowcount rewrite is unwanted: `if not self._mutate(..
 
 ---
 
-### 32. `backend/database.py:2616`
+### 32. `backend/database.py:2616`  ✅ FIXED — prune counter accumulates per batch instead of reading the last one
 
 *db-integrity*
 

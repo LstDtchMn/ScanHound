@@ -5,8 +5,9 @@ import logging
 import os
 import secrets
 import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backend.app_service import (
     AppService, clean_string,
@@ -220,6 +221,54 @@ def get_registry() -> ServiceRegistry:
     return registry
 
 
+_CREDENTIAL_STATES = ("present", "absent", "unknown")
+
+
+def credential_state(db: Any = None) -> str:
+    """Three-state read of the stored admin password.
+
+    ``"present"``, ``"absent"``, or ``"unknown"`` when the credential could not
+    be read at all. Security decisions must treat "unknown" as credentialed and
+    fail CLOSED, because the alternative — reading an unreadable database as
+    "no password configured" — un-gates the /auth/set-password bootstrap path.
+
+    The detection itself lives in ``DatabaseManager.credential_state``; only
+    that layer can tell a failed read from an empty one. Here we ask for it and
+    ACCEPT ONLY one of the three known strings.
+
+    Anything else falls back to ``has_password()``, which stays the interface
+    every caller and test double speaks. That fallback is load-bearing, not
+    defensive: a ``MagicMock`` answers every attribute, so
+    ``db.credential_state()`` returns a Mock rather than a string. Treating
+    that as "unknown" would fail every mock-backed request closed and 401 a
+    large part of the existing suite — which is exactly what happened before
+    this was rewritten.
+
+    ``db is None`` maps to ``"absent"`` to preserve the historical
+    ``auth_enabled()`` answer for a registry with no database at all; that case
+    self-mitigates because ``token_authorized`` cannot resolve a session either
+    and ``/auth/set-password`` already 503s on it.
+    """
+    db = registry.db if db is None else db
+    if db is None:
+        return "absent"
+    native = getattr(db, "credential_state", None)
+    if callable(native):
+        try:
+            state = native()
+        except Exception:
+            return "unknown"
+        if state in _CREDENTIAL_STATES:
+            return state
+        # Not a real implementation (a stand-in that answers everything).
+        # Fall through to the boolean interface rather than guessing.
+    try:
+        return "present" if db.has_password() else "absent"
+    except Exception:
+        # The boolean interface itself raised: a genuine read failure.
+        return "unknown"
+
+
 def auth_enabled() -> bool:
     """Auth is active when a nonce is configured or a password has been set.
 
@@ -229,7 +278,11 @@ def auth_enabled() -> bool:
     if registry.auth_nonce:
         return True
     db = registry.db
-    return bool(db and db.has_password())
+    if db is None:
+        return False
+    # "unknown" counts as credentialed so a DB read failure keeps both gates
+    # SHUT instead of dropping through to the no-credential bootstrap path.
+    return credential_state(db) in ("present", "unknown")
 
 
 def has_any_credential() -> bool:
@@ -275,3 +328,58 @@ def token_authorized(token: str) -> bool:
         if expires_at and not auth_service.is_expired(expires_at):
             return True
     return False
+
+
+# ── Short-lived WebSocket tickets ─────────────────────────────────────
+# A browser cannot set an Authorization header on a WebSocket handshake, so the
+# 30-day session token travels as ``?token=…`` — which NPM/nginx, Cloudflare
+# and uvicorn's own access log all record verbatim, turning any log reader into
+# an admin. A ticket is minted by an already-authorized HTTP request, dies in
+# seconds and on first use, so a logged one is worthless. It resolves back to
+# the credential that minted it so the socket can keep re-checking that
+# session's revocation (see backend.api.ws).
+_WS_TICKET_TTL_S = 30.0
+_ws_tickets: Dict[str, Tuple[str, float]] = {}
+_ws_tickets_lock = threading.Lock()
+
+
+def ws_ticket_ttl_seconds() -> float:
+    """Lifetime of a WebSocket ticket, so the client can time its handshake."""
+    return _WS_TICKET_TTL_S
+
+
+def _purge_ws_tickets(now: float) -> None:
+    """Drop expired tickets. Caller must hold ``_ws_tickets_lock``."""
+    for key in [k for k, (_, exp) in _ws_tickets.items() if exp <= now]:
+        _ws_tickets.pop(key, None)
+
+
+def issue_ws_ticket(credential: str) -> str:
+    """Mint a single-use ticket standing in for ``credential`` on the socket."""
+    from backend import auth_service
+    ticket = secrets.token_urlsafe(32)
+    now = time.monotonic()
+    with _ws_tickets_lock:
+        _purge_ws_tickets(now)
+        _ws_tickets[auth_service.hash_token(ticket)] = (
+            credential, now + _WS_TICKET_TTL_S)
+    return ticket
+
+
+def consume_ws_ticket(ticket: str) -> Optional[str]:
+    """Redeem a ticket ONCE, returning the credential it was minted for.
+
+    Removed on the first lookup whether or not it had expired, so a replay of
+    the same ticket never resolves.
+    """
+    if not ticket:
+        return None
+    from backend import auth_service
+    now = time.monotonic()
+    with _ws_tickets_lock:
+        _purge_ws_tickets(now)
+        entry = _ws_tickets.pop(auth_service.hash_token(ticket), None)
+    if entry is None:
+        return None
+    credential, expires_at = entry
+    return credential if expires_at > now else None

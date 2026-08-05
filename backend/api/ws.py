@@ -123,23 +123,67 @@ class ConnectionManager:
 ws_manager = ConnectionManager()
 
 
-@router.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket, token: str = Query(default="")):
-    # Gate the socket with the SAME rule as the HTTP middleware (SH-H01): fail
-    # CLOSED unless the token is authorized. auth_enabled() alone used to gate
-    # this (accepting any/no token whenever no nonce/password existed — e.g. a
-    # wiped/corrupted auth_credentials row), which left the socket wide open
-    # in that state even though the HTTP path was already fail-closed. Both
-    # transports now deny by default and open only under SCANHOUND_ALLOW_OPEN=1.
+# How often an established socket re-checks that its credential is still
+# valid. Sockets live for hours, so a handshake-only check meant logout, a
+# password change and the 30-day expiry never reached the transport that
+# streams every result — the HTTP side 401'd while the socket kept feeding.
+# Module-level so tests can shorten it.
+_REVALIDATE_INTERVAL_S = 60.0
+
+
+def _socket_authorized(credential: str) -> bool:
+    """The handshake rule, in one place so the periodic re-check reuses it.
+
+    Same gate as the HTTP middleware (SH-H01): fail CLOSED unless the token is
+    authorized. auth_enabled() alone used to gate this (accepting any/no token
+    whenever no nonce/password existed — e.g. a wiped/corrupted
+    auth_credentials row), which left the socket wide open in that state even
+    though the HTTP path was already fail-closed. Both transports now deny by
+    default and open only under SCANHOUND_ALLOW_OPEN=1.
+    """
     from backend.api.dependencies import auth_enabled, token_authorized, allow_open
-    if not token_authorized(token):
-        if auth_enabled() or not allow_open():
-            await ws.close(code=1008, reason="Unauthorized")
-            return
+    if token_authorized(credential):
+        return True
+    return not auth_enabled() and allow_open()
+
+
+@router.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket, token: str = Query(default=""),
+                             ticket: str = Query(default="")):
+    from backend.api.dependencies import consume_ws_ticket
+    credential = token
+    if ticket:
+        # A ws-ticket is single-use and expires in seconds, so — unlike the
+        # 30-day token — a copy in a proxy access log is worthless. It
+        # resolves back to the session token that minted it so the re-check
+        # below keeps following that session's revocation.
+        resolved = consume_ws_ticket(ticket)
+        if resolved:
+            credential = resolved
+    if not _socket_authorized(credential):
+        await ws.close(code=1008, reason="Unauthorized")
+        return
     await ws_manager.connect(ws)
+    pending = None
     try:
         while True:
-            raw = await ws.receive_text()
+            if pending is None:
+                pending = asyncio.ensure_future(ws.receive_text())
+            done, _ = await asyncio.wait({pending},
+                                         timeout=_REVALIDATE_INTERVAL_S)
+            if not done:
+                # Idle. Re-check without cancelling the pending receive: a
+                # cancelled receive could drop a frame that arrived in the
+                # same tick.
+                if not _socket_authorized(credential):
+                    await ws.close(code=1008, reason="Session revoked")
+                    return
+                continue
+            raw = pending.result()
+            pending = None
+            if not _socket_authorized(credential):
+                await ws.close(code=1008, reason="Session revoked")
+                return
             try:
                 msg = json.loads(raw)
                 msg_type = msg.get("type", "")
@@ -150,4 +194,6 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(default="")):
     except WebSocketDisconnect:
         pass
     finally:
+        if pending is not None:
+            pending.cancel()
         await ws_manager.disconnect(ws)

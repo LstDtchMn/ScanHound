@@ -1231,8 +1231,23 @@ class DatabaseManager:
         logger.error(
             "DATABASE CORRUPTION DETECTED at %s — quarantining and "
             "rebuilding a fresh database: %s", self.db_path, e)
-        self._notify_corruption(e)
+        # No in-init notification attempt: the API entrypoint builds the
+        # NotificationBridge strictly AFTER init_db() has run, so nothing
+        # reachable from here can deliver. notify_db_corruption_once() (called
+        # at the end of startup, from api/main.py) is the delivery path, fed by
+        # the flag file written below.
         if self.conn:
+            # Fold the WAL into the main file FIRST so the quarantined backup is
+            # a complete database. This path only runs when the DB is already
+            # corrupt, i.e. exactly when the implicit close-time checkpoint is
+            # most likely to fail — so its outcome has to be known, not assumed.
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error as ckpt_err:
+                logger.warning(
+                    "Could not checkpoint WAL before quarantine (%s); the "
+                    "-wal sidecar is preserved alongside the backup instead",
+                    ckpt_err)
             try:
                 self.conn.close()
             except sqlite3.Error:
@@ -1244,29 +1259,32 @@ class DatabaseManager:
             backup_name = f"{self.db_path}.corrupt.{int(time.time())}"
             try:
                 os.rename(self.db_path, backup_name)
-                logger.warning("Renamed corrupt DB to %s. Creating fresh DB.", backup_name)
+                # Move the sidecars WITH the backup (same convention as
+                # config._migrate_db). Two reasons, both load-bearing: a -wal
+                # left under the ORIGINAL name holds every transaction the
+                # failed checkpoint could not fold, and the fresh DB created at
+                # that same path moments later consumes and resets it — so the
+                # operator is pointed at a "backup" that is missing the data,
+                # and the data itself is destroyed. Renamed together, backup +
+                # backup-wal stay a matched pair that SQLite can still recover.
+                preserved = []
+                for suffix in ("-wal", "-shm"):
+                    sidecar = f"{self.db_path}{suffix}"
+                    if os.path.exists(sidecar):
+                        try:
+                            os.rename(sidecar, f"{backup_name}{suffix}")
+                            preserved.append(suffix)
+                        except OSError as sc_err:
+                            logger.error(
+                                "Could not preserve %s alongside the corrupt-DB "
+                                "backup: %s", sidecar, sc_err)
+                logger.warning(
+                    "Renamed corrupt DB to %s%s. Creating fresh DB.", backup_name,
+                    f" (with {', '.join(preserved)} sidecar(s))" if preserved else "")
                 self._write_corruption_flag(backup_name, e)
                 self.init_db()
             except OSError as os_err:
                 logger.critical("Failed to recover DB: %s", os_err)
-
-    def _notify_corruption(self, error) -> None:
-        """Best-effort loud alert for a DB quarantine event.
-
-        Tries the app's notification bridge if one is reachable; falls back
-        silently (the ERROR log line above is always emitted regardless, so
-        this is a bonus channel, not the primary signal).
-        """
-        try:
-            from backend.notification_bridge import NotificationBridge
-            import backend.app_service as _app_service
-            bridge = getattr(_app_service, "notification_bridge", None)
-            if isinstance(bridge, NotificationBridge):
-                bridge.notify_error(
-                    f"ScanHound database corruption detected at {self.db_path} — "
-                    f"quarantined and rebuilt a fresh database. Error: {error}")
-        except Exception:
-            logger.debug("Corruption notification unavailable (non-fatal)", exc_info=True)
 
     def _write_corruption_flag(self, backup_name: str, error) -> None:
         """Persist a marker file recording the quarantine, independent of logs."""
@@ -2606,6 +2624,13 @@ class DatabaseManager:
                         "SELECT key FROM plex_cache WHERE content_type = ?", (mode,)
                     ).fetchall()
                     stale_keys = [row[0] for row in all_existing if row[0] not in fresh_db_keys]
+                    # Accumulate per batch: cursor.rowcount only ever reflects
+                    # the LAST statement, so reading it after the loop reported
+                    # just the final batch (200 of 1200), and on a healthy load
+                    # with nothing stale it reported the preceding SELECT's -1,
+                    # which is truthy -- "Pruned -1 stale rows". This log line is
+                    # the only record that a destructive prune happened.
+                    deleted = 0
                     for i in range(0, len(stale_keys), 500):
                         batch = stale_keys[i:i+500]
                         placeholders = ','.join('?' for _ in batch)
@@ -2613,7 +2638,7 @@ class DatabaseManager:
                             f"DELETE FROM plex_cache WHERE key IN ({placeholders})",
                             batch,
                         )
-                    deleted = cursor.rowcount
+                        deleted += max(cursor.rowcount, 0)
                     if deleted:
                         logger.info("Pruned %d stale rows from plex_cache (%s)", deleted, mode)
 
@@ -3441,9 +3466,18 @@ class DatabaseManager:
 
         Must be called while holding ``self._lock``. Callers that mutate the
         table update this same set so it never goes stale without a re-query.
+
+        A failed read must NOT be cached: ``default=None`` distinguishes it
+        from a genuinely empty table (``fetchall()`` returns ``[]``, never
+        None), so one transient error — a lock timeout, a bind-mount I/O
+        hiccup — can no longer be frozen in as "nothing is dismissed" for the
+        whole life of the process. There is no invalidation path; the only way
+        back is to leave the cache unset so the next call retries.
         """
         if self._dismissed_cache is None:
-            rows = self._query('SELECT url FROM dismissed_items', default=[])
+            rows = self._query('SELECT url FROM dismissed_items', default=None)
+            if rows is None:
+                return set()
             self._dismissed_cache = {row[0] for row in rows}
         return self._dismissed_cache
 
@@ -3646,8 +3680,39 @@ class DatabaseManager:
             one=True, default=None)
         return row[0] if row else None
 
+    #: Distinguishes "the credential read FAILED" from "there is no row".
+    #: _query returns its ``default`` on ANY exception, so a default of None
+    #: makes an unreadable database look exactly like a fresh install -- and
+    #: "fresh install" is what un-gates the /auth/set-password bootstrap path.
+    _CREDENTIAL_READ_FAILED = object()
+
+    def credential_state(self):
+        """Three-state read of the admin credential.
+
+        ``"present"``, ``"absent"``, or ``"unknown"`` when the row could not be
+        read at all (disk error on a failing disk, "database is locked", "no
+        such table" after a partial migration, or a freshly quarantined and
+        rebuilt database). Security decisions must treat "unknown" as
+        credentialed and fail CLOSED.
+
+        This lives here rather than in the API layer because only this layer
+        can tell a failed read from an empty one -- the sentinel has to be
+        passed into _query itself.
+        """
+        row = self._query(
+            "SELECT password_hash FROM auth_credentials WHERE id = 1",
+            one=True, default=self._CREDENTIAL_READ_FAILED)
+        if row is self._CREDENTIAL_READ_FAILED:
+            return "unknown"
+        return "present" if (row and row[0]) else "absent"
+
     def has_password(self):
-        """Whether an admin password has been configured."""
+        """Whether an admin password has been configured.
+
+        Two-state by design and kept as the interface every caller and test
+        double already speaks. Callers that must fail closed on an unreadable
+        database should use :meth:`credential_state` instead.
+        """
         return self.get_password_hash() is not None
 
     def set_password_hash(self, password_hash):
@@ -4749,20 +4814,41 @@ class DatabaseManager:
         stuck there forever (queue_apply skips 'applying'). Called once at
         startup so orphaned applies become retriable again. The move itself is
         crash-safe (verified copy to a .part sidecar, atomic rename, source kept
-        until verified), so re-applying is always safe. Returns the row count."""
+        until verified), so re-applying is always safe.
+
+        Returns the number of jobs actually RECOVERED, not the number found:
+        the caller logs "Recovered N rename job(s)", and returning the pre-UPDATE
+        count made that line affirm a recovery that never happened when the
+        write failed (_mutate returns False, it never raises). Jobs left in
+        'applying' are skipped by queue_apply forever and this is the only
+        pass that would rescue them, so the count has to be truthful."""
         n = self._query(
             "SELECT COUNT(*) FROM rename_jobs WHERE status = 'applying'",
             one=True, default=[0])
         count = (n[0] if n else 0) or 0
-        if count:
-            # Restore the pre-apply status (needs_review stays needs_review, so a
-            # human-gated match isn't silently promoted to auto-appliable);
-            # fall back to 'matched' for legacy rows with no prior_status.
-            self._mutate(
-                "UPDATE rename_jobs SET status = COALESCE(prior_status, 'matched'), "
-                "prior_status = NULL WHERE status = 'applying'",
-                label="reset_applying_rename_jobs")
-        return count
+        if not count:
+            return 0
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    logger.error(
+                        "reset_applying_rename_jobs: no DB connection — %d job(s) "
+                        "remain stuck in 'applying'", count)
+                    return 0
+                # Restore the pre-apply status (needs_review stays needs_review, so a
+                # human-gated match isn't silently promoted to auto-appliable);
+                # fall back to 'matched' for legacy rows with no prior_status.
+                cur = conn.execute(
+                    "UPDATE rename_jobs SET status = COALESCE(prior_status, 'matched'), "
+                    "prior_status = NULL WHERE status = 'applying'")
+                conn.commit()
+                return max(cur.rowcount, 0)
+        except Exception as e:
+            logger.error(
+                "DB Error (reset_applying_rename_jobs): %s — %d job(s) remain "
+                "stuck in 'applying'", e, count)
+            return 0
 
     def count_rename_jobs_by_status(self):
         """Return a ``{status: count}`` map over all rename jobs."""
@@ -4992,10 +5078,10 @@ def db_corruption_flag_present(db_path: str) -> bool:
 def notify_db_corruption_once(db_path: str, bridge) -> bool:
     """If a corruption flag exists for ``db_path``, notify once and rename it.
 
-    Called at the END of startup (after the notification bridge exists,
-    unlike DatabaseManager._notify_corruption's best-effort attempt during
-    init_db, which usually fires before the bridge is wired up and is a
-    bonus channel, not the primary signal). Renaming the flag to
+    Called at the END of startup, which is the earliest the notification
+    bridge exists — _quarantine_corrupt_db runs inside init_db(), long before
+    it is wired up, so this is the ONLY delivery path for a quarantine event
+    (the ERROR log line and the flag file are the other two). Renaming the flag to
     ``.corrupt_flag.notified.json`` after a successful notify means this
     fires exactly once per corruption event, even across many restarts,
     while still leaving a permanent on-disk record of the incident.
