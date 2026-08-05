@@ -80,9 +80,12 @@ wrong thing.
 
 ## Attestation, and its limits
 
-- Full suite: see the run recorded in the branch's CI. Locally, in a throwaway
-  container with the code copied in (not the 9p bind mount) and byte-verified
-  by raw sha256 before each run.
+- Full suite, measured at the committed head: **4369 passed, 14 failed, 4
+  skipped** (627s). Run in a throwaway container with the code copied in (not
+  the 9p bind mount), byte-verified by raw sha256 before the run.
+- That local run is **Python 3.12 only** — the image matches production. CI
+  covers 3.11 as well, and 3.11 is the one axis I did not exercise myself, so
+  take the CI result as authoritative over the number above.
 - **14 failures are PRE-EXISTING.** Not asserted — measured, by running the same
   suites against `git archive HEAD` (committed tree, zero agent work) in a
   separate container and getting the identical list: missing host-detector
