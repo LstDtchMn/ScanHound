@@ -246,9 +246,17 @@ class TestR4Reconciler:
         # here, not something that quietly appears. completed_feed_facts_
         # reparsed is round-14's narrow pass for COMPLETED rows whose
         # feed-authority fields went stale with the grammar.
+        #
+        # detail_authority_backfilled arrived with round-15's per-row authority
+        # model: it reconstructs the detail claim set for rows hydrated before
+        # that column existed, from their retained payloads. Zero here because
+        # this fixture's row was hydrated under the current code and already
+        # carries one. This assertion is exactly why the key had to be added
+        # deliberately — it caught the change rather than absorbing it.
         assert out1 == {"candidates_refetch_required": 0,
                         "candidates_stale": 0, "cache_stale": 0,
                         "candidates_reparsed": 0,
+                        "detail_authority_backfilled": 0,
                         "completed_feed_facts_reparsed": 0}
         assert _row(db)["derived_state"] == "current"
 
