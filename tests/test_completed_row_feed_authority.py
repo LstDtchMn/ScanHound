@@ -261,3 +261,70 @@ def test_a_sparser_refetch_does_not_hand_a_detail_fact_back_to_the_feed(db):
     _set_feed_stamp(db, "grammar-from-last-year")
     db._reparse_completed_feed_only()
     assert _row(db)["resolution"] == "2160P"
+
+
+class TestBackfillForRowsPredatingTheColumn:
+    """Rows hydrated before detail_authority_fields existed carry NULL, and a
+    NULL claim set repairs nothing. Correct, but on the live database that is
+    2466 of 3431 rows stranded until each happens to re-hydrate.
+
+    The stored hydration payload makes reconstruction exact rather than
+    approximate: re-running the same _candidate_updates over it reproduces
+    which fields that row's detail actually supplied.
+    """
+
+    def _completed_row_with_no_claim_set(self, db, updates):
+        _ingest(db, _body("Movie 2026 2160p WEB-DL - 50.0 GB"), "sha-v1")
+        db.complete_hdencode_hydration(
+            URL, payload={"url": URL, "display_title": "Movie", "res": "2160P"},
+            candidate_updates=dict(updates))
+        # Simulate a row written before the column existed.
+        with db.transaction() as conn:
+            conn.execute("UPDATE hdencode_candidates "
+                         "SET detail_authority_fields = NULL "
+                         "WHERE canonical_url = ?", (URL,))
+        assert _row(db)["detail_authority_fields"] is None
+
+    def test_the_claim_set_is_reconstructed_from_the_stored_payload(self, db):
+        self._completed_row_with_no_claim_set(
+            db, {"clean_title": "Movie", "resolution": "2160P"})
+
+        assert db._backfill_detail_authority_fields() == 1
+
+        claimed = json.loads(_row(db)["detail_authority_fields"])
+        assert "clean_title" in claimed and "resolution" in claimed, claimed
+
+    def test_a_backfilled_row_then_heals_its_feed_owned_fields(self, db):
+        """End to end: the point of the backfill is that repair becomes
+        possible, not merely that a column gets populated."""
+        self._completed_row_with_no_claim_set(db, {"clean_title": "Movie"})
+        db._backfill_detail_authority_fields()
+
+        _ingest(db, _body("Movie 2026 1080p WEB-DL - 4.0 GB", "?v=2"), "sha-v2")
+        _set_feed_stamp(db, "grammar-from-last-year")
+        assert db._reparse_completed_feed_only() == 1
+
+        assert _row(db)["clean_title"] == "Movie", "detail still owns this"
+
+    def test_it_is_idempotent_and_leaves_existing_claim_sets_alone(self, db):
+        """POSITIVE CONTROL. A backfill that overwrote real claim sets would
+        pass the tests above while destroying the authority record."""
+        _ingest(db, _body("Movie 2026 2160p WEB-DL - 50.0 GB"), "sha-v1")
+        db.complete_hdencode_hydration(
+            URL, payload={"url": URL},
+            candidate_updates={"clean_title": "Movie", "resolution": "2160P"})
+        before = _row(db)["detail_authority_fields"]
+
+        assert db._backfill_detail_authority_fields() == 0, "nothing to do"
+        assert _row(db)["detail_authority_fields"] == before
+
+    def test_an_undecodable_payload_is_left_unknown_not_invented(self, db):
+        """A fabricated claim set is worse than no claim set: it would let the
+        repair act on an authority record that was guessed."""
+        self._completed_row_with_no_claim_set(db, {"clean_title": "Movie"})
+        with db.transaction() as conn:
+            conn.execute("UPDATE hdencode_candidate_details SET payload = ? "
+                         "WHERE canonical_url = ?", ("{not json", URL))
+
+        assert db._backfill_detail_authority_fields() == 0
+        assert _row(db)["detail_authority_fields"] is None

@@ -2081,6 +2081,7 @@ class DatabaseManager:
                 # /results/cached serve stale parses indefinitely)
                 self._bg_cache_rev += 1
         healed = self._reparse_stale_candidates()
+        backfilled = self._backfill_detail_authority_fields()
         feed_healed = self._reparse_completed_feed_only()
         for url in refetch_urls:
             self.requeue_hdencode_hydration(
@@ -2088,7 +2089,64 @@ class DatabaseManager:
         return {"candidates_refetch_required": refetch,
                 "candidates_stale": stale, "cache_stale": cache_stale,
                 "candidates_reparsed": healed,
+                "detail_authority_backfilled": backfilled,
                 "completed_feed_facts_reparsed": feed_healed}
+
+    def _backfill_detail_authority_fields(self):
+        """Reconstruct the per-row detail claim set for rows hydrated before
+        the column existed. Returns the number reconstructed.
+
+        Rows written before ``detail_authority_fields`` carry NULL, and
+        :meth:`_feed_owned_fields` deliberately repairs NOTHING for those --
+        an unknown claim set must not be read as an empty one. Correct, but on
+        its own it strands every pre-existing completed row: measured against
+        the live database, 2466 of 3431 candidate rows are completed, so a
+        NULL-only policy would leave all 2466 unable to heal their feed-owned
+        facts until each happened to be re-hydrated.
+
+        They do not have to wait. ``hdencode_candidate_details`` retains the
+        exact payload each hydration consumed -- all 2466 of them, verified --
+        so re-running the SAME ``_candidate_updates`` over the stored payload
+        reproduces precisely which protected fields that row's detail supplied.
+        This is reconstruction from the original input, not a guess.
+
+        Idempotent (only NULL rows are considered) and no-throw per row: a
+        payload that will not decode is left NULL, which keeps that row in the
+        safe "repair nothing" state rather than inventing a claim set for it.
+        """
+        from backend.hdencode_candidate_service import _candidate_updates
+        protected = set(self._PROTECTED_FIELDS)
+        done = 0
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT hc.canonical_url, d.payload
+                   FROM hdencode_candidates hc
+                   JOIN hdencode_candidate_details d
+                     ON d.canonical_url = hc.canonical_url
+                   WHERE hc.hydration_state = 'completed'
+                     AND hc.detail_authority_fields IS NULL""")
+            for url, payload_json in cur.fetchall():
+                try:
+                    claimed = set(_candidate_updates(
+                        json.loads(payload_json or "{}"))) & protected
+                except Exception:
+                    # Undecodable or unparseable: leave NULL. "Unknown" is the
+                    # conservative state; a fabricated claim set is not.
+                    logger.debug("authority backfill skipped %s", url,
+                                 exc_info=True)
+                    continue
+                cur.execute(
+                    "UPDATE hdencode_candidates SET detail_authority_fields = ? "
+                    "WHERE canonical_url = ?", (json.dumps(sorted(claimed)), url))
+                done += 1
+            conn.commit()
+        if done:
+            logger.info("Backfilled detail authority for %d completed row(s)", done)
+        return done
 
     def _reparse_completed_feed_only(self):
         """Re-derive the FEED-authority facts of COMPLETED rows (round-14).
