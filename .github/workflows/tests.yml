@@ -2,7 +2,11 @@ name: Tests
 
 on:
   push:
-    branches: [main, master, develop]
+    # agent/** and fix/** are included deliberately. Long-lived work happens on
+    # those branches, often without an open PR, so they otherwise produce NO
+    # status checks at all -- a reviewer inspecting a pushed head finds nothing
+    # machine-attested and every figure is locally produced.
+    branches: [main, master, develop, 'agent/**', 'fix/**']
   pull_request:
     branches: [main, master, develop]
   schedule:
