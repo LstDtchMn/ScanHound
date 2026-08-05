@@ -223,6 +223,45 @@ def get_registry() -> ServiceRegistry:
 
 _CREDENTIAL_STATES = ("present", "absent", "unknown")
 
+#: A fourth state the DB layer cannot report, because it is not a fact about
+#: the database's CONTENTS -- it is a fact about the installation's history.
+#:
+#: A corrupt database is auto-quarantined and a FRESH EMPTY one is rebuilt in
+#: its place. That new database honestly reports "absent": it really has no
+#: credential row. But "absent" is what un-gates the /auth/set-password
+#: bootstrap path, so the sequence
+#:
+#:      a password existed -> the DB was quarantined -> an unauthenticated
+#:      request POSTs /auth/set-password -> the caller is now administrator
+#:
+#: turned automatic corruption recovery into an unauthenticated admin
+#: takeover. The three-state read defends a FAILING read; this defends a
+#: SUCCESSFUL read of a database that was just rebuilt empty.
+#:
+#: "This installation has no credential row" therefore cannot mean "this
+#: installation was never initialised". The quarantine already leaves proof on
+#: disk BEFORE rebuilding -- the pending flag, and a permanent .notified.json
+#: record after the alert is delivered. A genuinely fresh install has neither.
+RECOVERY_LOCKED = "recovery_locked"
+
+
+def _quarantine_marker_present(db) -> bool:
+    """Whether this installation has ever had a database quarantined.
+
+    Checks BOTH markers. The pending flag is consumed once the corruption
+    alert is confirmed delivered, so relying on it alone would silently
+    re-open the takeover as soon as the operator was successfully notified --
+    i.e. exactly when they are least likely to be watching the box.
+    """
+    path = getattr(db, "db_path", None)
+    if not path:
+        return False
+    try:
+        return (os.path.exists(f"{path}.corrupt_flag.json")
+                or os.path.exists(f"{path}.corrupt_flag.notified.json"))
+    except Exception:  # noqa: BLE001 - an unreadable filesystem is not proof
+        return False
+
 
 def credential_state(db: Any = None) -> str:
     """Three-state read of the stored admin password.
@@ -259,14 +298,27 @@ def credential_state(db: Any = None) -> str:
         except Exception:
             return "unknown"
         if state in _CREDENTIAL_STATES:
-            return state
+            return _absent_or_locked(db, state)
         # Not a real implementation (a stand-in that answers everything).
         # Fall through to the boolean interface rather than guessing.
     try:
-        return "present" if db.has_password() else "absent"
+        state = "present" if db.has_password() else "absent"
     except Exception:
         # The boolean interface itself raised: a genuine read failure.
         return "unknown"
+    return _absent_or_locked(db, state)
+
+
+def _absent_or_locked(db, state: str) -> str:
+    """Upgrade a bare "absent" to RECOVERY_LOCKED when the DB was rebuilt.
+
+    Applied to every path that can answer "absent", including the DB layer's
+    own three-state read -- otherwise the hole simply moves to whichever
+    branch answered first.
+    """
+    if state == "absent" and _quarantine_marker_present(db):
+        return RECOVERY_LOCKED
+    return state
 
 
 def auth_enabled() -> bool:
@@ -282,7 +334,10 @@ def auth_enabled() -> bool:
         return False
     # "unknown" counts as credentialed so a DB read failure keeps both gates
     # SHUT instead of dropping through to the no-credential bootstrap path.
-    return credential_state(db) in ("present", "unknown")
+    # RECOVERY_LOCKED counts too, and that is the whole point: it makes
+    # _BOOTSTRAP_EXEMPT_PATHS unreachable on a quarantined install, so the
+    # rebuilt-empty database cannot be mistaken for a fresh one.
+    return credential_state(db) in ("present", "unknown", RECOVERY_LOCKED)
 
 
 def has_any_credential() -> bool:

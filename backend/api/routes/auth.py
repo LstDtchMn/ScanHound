@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 from backend.api.dependencies import (
     ServiceRegistry, get_registry, allow_open, credential_state,
-    issue_ws_ticket, ws_ticket_ttl_seconds,
+    issue_ws_ticket, ws_ticket_ttl_seconds, RECOVERY_LOCKED,
 )
 from backend import auth_service
 
@@ -94,12 +94,22 @@ def auth_status(reg: ServiceRegistry = Depends(get_registry)):
     # auth_required, whose protected fetches would 401 anyway. Not set when
     # SCANHOUND_ALLOW_OPEN=1 (that no-credential state is an intentional
     # escape hatch, not a fresh install needing a prompt).
-    setup_required = not has_password and not nonce_active and not allow_open()
+    state = credential_state(reg.db) if reg.db else "absent"
+    recovery_locked = state == RECOVERY_LOCKED
+    # NOT a setup prompt when recovery-locked: showing "create a password"
+    # invites the very request the gate refuses, so the operator would see a
+    # form that always fails. The frontend needs the distinct signal.
+    setup_required = (not has_password and not nonce_active
+                      and not allow_open() and not recovery_locked)
     return {
         "auth_required": has_password or nonce_active,
         "has_password": has_password,
         "nonce_active": nonce_active,
         "setup_required": setup_required,
+        # Distinct from setup_required on purpose: the operator must be told
+        # the install is locked pending recovery, not invited to create a
+        # password the gate will refuse.
+        "recovery_locked": recovery_locked,
     }
 
 
@@ -152,6 +162,26 @@ def set_password(body: SetPasswordRequest,
             status_code=400,
             detail=f"Password must be at least {_MIN_PASSWORD_LEN} characters")
     state = credential_state(reg.db)
+    if state == RECOVERY_LOCKED:
+        # The database was auto-quarantined and rebuilt empty, so it honestly
+        # reports no credential -- but this installation HAS been initialised.
+        # Letting the bootstrap path run here hands admin to whoever asks
+        # first. Recovery needs out-of-band proof, and the message says which
+        # kinds, because a lockout nobody can explain is its own outage.
+        logger.error(
+            "set_password refused: database was quarantined (marker beside "
+            "%s). Recovery requires the desktop nonce or removing the marker "
+            "on the host.", getattr(reg.db, "db_path", "the database"))
+        raise HTTPException(
+            status_code=409,
+            detail="This database was automatically rebuilt after corruption "
+                   "was detected, so it has no password even though this "
+                   "install previously had one. To prevent an unauthenticated "
+                   "takeover, setting a password here is blocked. Recover by "
+                   "starting with the desktop nonce, or by removing the "
+                   "'.corrupt_flag.json' / '.corrupt_flag.notified.json' file "
+                   "next to the database on the host once you are satisfied "
+                   "the machine is yours.")
     if state == "unknown":
         # A failed credential read must never be mistaken for "no password
         # configured": that answer both un-gates this route at the middleware
