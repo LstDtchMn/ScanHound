@@ -1287,15 +1287,40 @@ class ScannerService:
         # background_scanner already holds when it calls in, and a
         # try_acquire would silently make its rematch a permanent no-op.
         # Removing the shared-state mutation removes the race outright.
+        #
+        # matched is initialised BEFORE the try: an exception inside must leave
+        # it False so the abandonment check below refuses to persist.
+        matched = False
         try:
             loop = asyncio.new_event_loop()
             try:
-                loop.run_until_complete(
+                matched = loop.run_until_complete(
                     self._match_against_plex("Deep Scan", items=items))
             finally:
                 loop.close()
         except Exception:
             logger.exception("Cache re-match: Plex matching failed")
+
+        # The blanking above is only safe because the match was expected to put
+        # the Plex state back. If it did not run to completion, every item is
+        # sitting in the cleared state and persisting that would rewrite the
+        # whole cache as "missing" with no Plex match -- silently, and logged as
+        # a successful re-match.
+        #
+        # The realistic trigger is not someone pressing Stop during a re-match:
+        # stop_scan_flag is set internally when the traffic coordinator reports
+        # a Cloudflare block (an ordinary, expected event), and is cleared ONLY
+        # at the top of the next run_scan. Any re-match in between -- the one
+        # after a completed download, or at startup -- inherits it.
+        if have_plex and not matched:
+            self._log(
+                "Cache re-match abandoned: the Plex match did not finish, so "
+                "the cached library state was left as it was.", "warning")
+            logger.warning(
+                "Cache re-match abandoned before persisting: matched=%s "
+                "stop_scan_flag=%s items=%d",
+                matched, self.stop_scan_flag, len(items))
+            return 0
 
         # Persist only rows whose status/info changed (preserve last_seen).
         updates = []
@@ -1325,16 +1350,23 @@ class ScannerService:
     # ── Plex matching ─────────────────────────────────────────────────
 
     async def _match_against_plex(self, scan_type: str = "Deep Scan",
-                                  items: Optional[List[MediaItem]] = None):
+                                  items: Optional[List[MediaItem]] = None) -> bool:
         """Compare scan results against the Plex library index.
 
         Updates each MediaItem's status (IN_LIBRARY, UPGRADE, DV_UPGRADE)
         and plex_info field based on matching results.
 
+        Returns True only when EVERY item was matched. False means the results
+        are partial -- no Plex index, or a Stop cut the loop short -- and any
+        caller that cleared state in anticipation of this filling it back in
+        must not persist what it has. Callers used to have no way to tell a
+        completed match from an abandoned one, and treating the second as the
+        first rewrote an entire cache as "missing".
+
         ``items`` lets a caller match a list it OWNS instead of the shared
         ``self.items``. rematch_cache uses it: it previously published its
         reconstructed cache rows into self.items and restored them in a
-        finally, which corrupted a concurrent scan's results — and two of its
+        finally, which corrupted a concurrent scan's results -- and two of its
         callers (downloads.py's grab annotation, main.py's queue-delivery
         hook) run with no scan slot held. Passing the list is the fix that
         does NOT introduce a lock: acquiring the scan slot here would
@@ -1344,7 +1376,7 @@ class ScannerService:
         plex_index = self.plex.plex_index
         if not plex_index["all_items"]:
             self._log("No Plex data available, skipping matching", "warning")
-            return
+            return False
 
         if items is not None:
             items_snapshot = list(items)
@@ -1354,7 +1386,7 @@ class ScannerService:
         total = len(items_snapshot)
         for idx, item in enumerate(items_snapshot):
             if self.stop_scan_flag:
-                break
+                return False
             self._progress(idx / total, f"Matching {idx}/{total}")
 
             if item.status in (ScanStatus.DOWNLOADED, ScanStatus.DOWNLOADED_SIMILAR):
@@ -1509,6 +1541,8 @@ class ScannerService:
 
             except Exception as e:
                 logger.debug(f"Match error for '{item.title}': {e}")
+
+        return True
 
     # ── Missing-season detection (post-Plex) ────────────────────────
 
