@@ -469,6 +469,12 @@ class BackgroundScanner:
                             rss_cycle.get("feeds", []),
                             listing_error=err,
                         ),
+                        # Per-feed provenance was already sitting in the cycle
+                        # dict; the old code reduced it to a single boolean and
+                        # threw the rest away. Passing it lets compare_shadow
+                        # decide validity per release instead of per cycle, so a
+                        # movie gap can still block when only the TV feed failed.
+                        normal_feed_outcomes=normal,
                     ).as_dict()
                     completed_at = datetime.now(timezone.utc).isoformat()
                     restart_recovery = self._qualify_restart_recovery(

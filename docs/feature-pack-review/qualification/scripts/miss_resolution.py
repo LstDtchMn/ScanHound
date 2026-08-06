@@ -36,6 +36,7 @@ hypothetical.)
 """
 import json
 import sqlite3
+import sys
 from datetime import datetime
 
 GREEN_H, YELLOW_H = 6.0, 24.0
@@ -73,14 +74,46 @@ for r in con.execute(
     if c["usable"]:
         usable.append(c)
 
+# MISS SOURCING. This JOIN was originally unfiltered, so a miss recorded during
+# a cycle this script itself refuses to trust as an OBSERVATION still entered the
+# graded population. A first fix filtered on rss_requests>0; a 2026-08-06 peer
+# review refuted that proxy, because poll_cycle counts `requested` across
+# normal + catch-up feeds and marks a failed attempt as requested. It therefore
+# admitted catch-up-only, failed-fetch and half-stale comparisons.
+#
+# WHAT THIS WINDOW CAN AND CANNOT SUPPORT. Attribution -- the correct rule, now
+# live in compare_shadow -- needs to know which normal feed succeeded. Nothing
+# recorded that: hdencode_shadow_cycles carried only a cycle-level boolean until
+# 2026-08-06. So the 2026-07-22..08-05 window cannot be graded under attribution
+# at any level of effort. The evidence to do so was never written.
+#
+# It is therefore graded CONSERVATIVELY: a miss counts only when both normal
+# feeds completed in its cycle. That is stricter for ADMISSION than attribution
+# -- a mixed cycle (movies_all changed, tv_all failed) contributes nothing here,
+# whereas attribution would admit its valid movie half -- so the figure is a
+# LOWER bound on blocking misses.
+#
+# WHAT THAT DOES AND DOES NOT SUPPORT. It guarantees the grader never FALSELY
+# ACCUSES the feed of a miss. It does NOT establish overall health: zero blockers
+# in the smaller admitted set says nothing about the larger attribution-valid
+# set, because an omitted mixed-cycle row could itself be permanently missing. An
+# earlier version of this comment claimed it "can never overstate health", which
+# is backwards. The supportable claim is only about the ADMITTED records.
 misses = [dict(r) for r in con.execute(
     "SELECT m.canonical_url u, m.title, m.status, s.completed_at at "
     "FROM hdencode_shadow_misses m "
-    "JOIN hdencode_shadow_cycles s ON s.cycle_uuid = m.cycle_uuid")]
+    "JOIN hdencode_shadow_cycles s ON s.cycle_uuid = m.cycle_uuid "
+    "WHERE s.normal_feeds_complete = 1")]
+excluded = con.execute(
+    "SELECT COUNT(*) FROM hdencode_shadow_misses m "
+    "JOIN hdencode_shadow_cycles s ON s.cycle_uuid = m.cycle_uuid "
+    "WHERE s.normal_feeds_complete != 1").fetchone()[0]
 
 print(f"cycles: {len(all_cycles)} total, {len(usable)} usable as observations "
       f"({len(all_cycles) - len(usable)} rejected: incomplete/partial/killed)")
-print(f"recorded misses: {len(misses)}")
+print(f"recorded misses: {len(misses)} graded, "
+      f"{excluded} excluded as recorded during a cycle whose normal feeds "
+      f"did not both complete (conservative bound; see MISS SOURCING)")
 if len(usable) > 1:
     gaps = sorted((usable[i + 1]["at"] - usable[i]["at"]).total_seconds() / 60
                   for i in range(len(usable) - 1))
@@ -149,3 +182,25 @@ if buckets["ambiguous"]:
 print("\nGATE: closure requires 0 RED, 0 PENDING and 0 AMBIGUOUS.")
 print("Continue the observation tail past the nominal window end until every")
 print("miss is conclusively classified.")
+
+# --json emits the verdict as one machine-readable line, so the collector can
+# act on the GRADED classification instead of a raw miss count. Added
+# 2026-08-05 alongside the graded stop condition: the collector stopped on
+# `if misses:`, which treats "the feed caught up an hour later" as permanent
+# coverage loss. Jesse's tiered rule (2026-07-24) says <=6h is GREEN, and on
+# 2026-08-05 the live data was 149 GREEN / 0 YELLOW / 0 RED / 1 AMBIGUOUS --
+# so the raw count stopped the window 150 times for 1 unprovable miss.
+# Printed LAST and prefixed, so the human report above stays readable.
+if "--json" in sys.argv:
+    print("JSON_VERDICT " + json.dumps({
+        "green": len(buckets["green"]),
+        "yellow": len(buckets["yellow"]),
+        "red": len(buckets["red"]),
+        "pending": len(buckets["pending"]),
+        "ambiguous": len(buckets["ambiguous"]),
+        "total": sum(len(v) for v in buckets.values()),
+        "green_hours": GREEN_H,
+        "yellow_hours": YELLOW_H,
+        "ambiguous_urls": [u for u, _ in buckets["ambiguous"]],
+        "red_urls": [u for u, _ in buckets["red"]],
+    }))

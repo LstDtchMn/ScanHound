@@ -1,0 +1,29 @@
+{
+  "generated_at": "2026-08-06T17:28:38.458512+00:00",
+  "source": "/dbvol/crawler.db",
+  "table": "background_scan_cache",
+  "rows": 3136,
+  "unparseable_payloads": 0,
+  "by_category": {
+    "4k": 1702,
+    "tv": 1236,
+    "remux": 198
+  },
+  "by_attribution_effect": {
+    "movie_evidence": 1900,
+    "tv_evidence": 1236
+  },
+  "structured_signals": {
+    "season_set": 1214,
+    "episodes_set": 1214
+  },
+  "cross_checks": {
+    "tv_category_without_season": 22,
+    "season_without_tv_category": 0,
+    "note": "The two TV signals are independent. Close agreement supports treating either as authoritative; wide disagreement would not."
+  },
+  "interpretation": {
+    "unknown_is_rare_if": "absent + no_evidence_unrecognised is small",
+    "caveat": "This measures rows the scanner has CACHED, not the miss corpus. Historical miss rows predate the category field entirely, which is why the retrospective window is bounded conservatively instead of attributed."
+  }
+}
