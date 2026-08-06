@@ -347,3 +347,47 @@ def test_probe_specs_parses_ffprobe_still_passes_with_frame_probe_added(tmp_path
         s = mediainfo.probe_specs(str(f))
     assert s["present"] is True
     assert s["hdr"] == "Dolby Vision"  # DV path — frame probe skipped, no crash
+
+
+class TestCachedProbeDoesNotFreezeDvLayer:
+    """A media_probe cache HIT used to return the stored blob verbatim, which
+    froze dv_layer at whatever it was on first probe -- null for every DV
+    file, because plex_metadata_scan probes BEFORE it runs dovi_tool. Nothing
+    invalidates that row either: dovi_tool only READS the file, so mtime/size
+    never move and media_probe_is_current stays True forever. The result was a
+    later DV scan never reaching conflict_preview/rank_conflict, while the
+    jobs-list badge (which reads dv_scan directly) showed the right layer --
+    the same file disagreeing with itself in two places.
+    """
+
+    def _db(self, probe_json, dv_layer):
+        db = MagicMock()
+        db.media_probe_is_current.return_value = True
+        db.get_media_probe.return_value = {"probe_json": probe_json}
+        db.dv_scan_is_current.return_value = True
+        db.get_dv_scan.return_value = {"dv_layer": dv_layer}
+        return db
+
+    def test_cache_hit_reflects_a_dv_scan_that_landed_later(self, tmp_path):
+        f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+        # the cached blob was written before any DV scan existed
+        db = self._db(json.dumps({"present": True, "hdr": "Dolby Vision",
+                                  "dv_layer": None}), "fel")
+        specs = mediainfo.probe_specs(str(f), db=db)
+        assert specs["dv_layer"] == "fel"
+        # the whole point of the cache still holds: no ffprobe subprocess
+        db.get_media_probe.assert_called_once()
+
+    def test_every_other_cached_field_is_still_reused(self, tmp_path):
+        f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+        db = self._db(json.dumps({"present": True, "hdr": "Dolby Vision",
+                                  "width": 3840, "dv_layer": None}), "mel")
+        specs = mediainfo.probe_specs(str(f), db=db)
+        assert specs["hdr"] == "Dolby Vision" and specs["width"] == 3840
+
+    def test_no_dv_scan_row_still_yields_none(self, tmp_path):
+        # negative control: the refresh must not invent a layer
+        f = tmp_path / "m.mkv"; f.write_bytes(b"x")
+        db = self._db(json.dumps({"present": True, "dv_layer": None}), None)
+        db.dv_scan_is_current.return_value = False
+        assert mediainfo.probe_specs(str(f), db=db)["dv_layer"] is None

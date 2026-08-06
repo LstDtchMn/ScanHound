@@ -101,3 +101,50 @@ class TestDvScanDB:
 
         assert before == "2026-01-01 00:00:00"
         assert after > before
+
+
+class TestFailedDetectionNeverDestroysAGoodLayer:
+    """'unknown' means detection FAILED (dv_detect resolves every error to it).
+
+    The host scanner writes such a row with a NULL signature so the next run
+    retries -- but the upsert overwrote the layer unconditionally, so one
+    unreadable file on a network mount replaced a real 'fel' with 'unknown',
+    and the labeler then had no evidence to keep the Kometa overlay labels.
+    The same statement already COALESCE-preserves title/rating_key/imdb_id.
+    """
+
+    def test_unknown_does_not_overwrite_a_known_layer(self, db):
+        db.upsert_dv_scan("/lib/A.mkv", "fel", title="A",
+                          sig_mtime=1000.0, sig_size=42, source="scan")
+        db.upsert_dv_scan("/lib/A.mkv", "unknown", source="scan")
+        row = db.get_dv_scan("/lib/A.mkv")
+        assert row["dv_layer"] == "fel"
+
+    def test_the_retry_signature_still_lands(self, db):
+        # The NULL sig is what makes the next host run re-detect; preserving
+        # the layer must not also preserve a stale "already scanned" marker.
+        db.upsert_dv_scan("/lib/B.mkv", "mel", sig_mtime=1000.0, sig_size=42,
+                          source="scan")
+        db.upsert_dv_scan("/lib/B.mkv", "unknown", sig_mtime=None,
+                          sig_size=None, source="scan")
+        row = db.get_dv_scan("/lib/B.mkv")
+        assert row["dv_layer"] == "mel"
+        assert row["sig_mtime"] is None and row["sig_size"] is None
+
+    def test_a_real_layer_change_still_applies(self, db):
+        # Negative control: authoritative findings must still overwrite.
+        db.upsert_dv_scan("/lib/C.mkv", "mel", source="scan")
+        db.upsert_dv_scan("/lib/C.mkv", "fel", source="scan")
+        assert db.get_dv_scan("/lib/C.mkv")["dv_layer"] == "fel"
+
+    def test_authoritative_none_still_applies(self, db):
+        # 'none' is a finding ("the tool ran, there is no DV"), not a failure.
+        db.upsert_dv_scan("/lib/D.mkv", "fel", source="scan")
+        db.upsert_dv_scan("/lib/D.mkv", "none", source="scan")
+        assert db.get_dv_scan("/lib/D.mkv")["dv_layer"] == "none"
+
+    def test_first_write_of_unknown_is_stored(self, db):
+        # Nothing to preserve: a fresh failure must still be recorded so the
+        # row exists with its NULL signature for the retry.
+        db.upsert_dv_scan("/lib/E.mkv", "unknown", source="scan")
+        assert db.get_dv_scan("/lib/E.mkv")["dv_layer"] == "unknown"

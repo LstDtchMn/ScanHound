@@ -111,6 +111,8 @@ class SettingsUpdate(BaseModel):
 
     # Auto-rename + Plex sort + optional Ollama assist
     auto_rename_enabled: Optional[bool] = None
+    rename_manual_apply_enabled: Optional[bool] = None
+    dv_auto_sync_enabled: Optional[bool] = None
     auto_rename_confidence_threshold: Optional[int] = None
     auto_rename_require_confirmation: Optional[bool] = None
     auto_rename_move_method: Optional[str] = None

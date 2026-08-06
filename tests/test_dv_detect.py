@@ -111,6 +111,38 @@ class TestDetectLayer:
         assert r["layer"] == dv_detect.LAYER_UNKNOWN
         assert "corrupt" in r["error"]
 
+    def test_hard_error_with_NO_rpu_written_is_unknown_not_none(self, tmp_path):
+        """The realistic failure shape, and the one the suite used to miss.
+
+        dovi_tool writes the output file only on success, and mkstemp has
+        already pre-created it at zero bytes — so a genuine failure leaves
+        returncode != 0 AND rpu_size == 0 together. The old ordering tested
+        the empty file first and reported an authoritative 'no Dolby Vision'
+        with error=None. The existing hard-error test above passed only
+        because it used rpu_size=5, a state dovi_tool never actually leaves
+        behind on failure.
+        """
+        r = self._run_with_stages(
+            tmp_path, _proc(returncode=1, stderr=b"Failed to read file"),
+            rpu_size=0)
+        assert r["layer"] == dv_detect.LAYER_UNKNOWN
+        assert r["error"] and "Failed to read" in r["error"]
+
+    def test_silent_hard_error_with_no_rpu_is_still_unknown(self, tmp_path):
+        # Nonzero exit, no stderr at all, nothing written: still a failure,
+        # so still 'unknown' -- and the error string must not be empty.
+        r = self._run_with_stages(
+            tmp_path, _proc(returncode=1, stderr=b""), rpu_size=0)
+        assert r["layer"] == dv_detect.LAYER_UNKNOWN
+        assert r["error"]
+
+    def test_clean_exit_with_empty_rpu_is_no_dolby_vision(self, tmp_path):
+        # The tool ran fine and produced nothing: a real, positive "no DV".
+        r = self._run_with_stages(
+            tmp_path, _proc(returncode=0, stderr=b""), rpu_size=0)
+        assert r["layer"] == dv_detect.LAYER_NONE
+        assert r["error"] is None
+
     def test_info_failure_is_unknown_not_none(self, tmp_path):
         # extract-rpu succeeds (valid RPU) but `info` fails → must be 'unknown',
         # NOT 'none' (which would falsely claim the file has no Dolby Vision).
@@ -143,3 +175,54 @@ class TestDependencyStatus:
     def test_reports_dovi_tool_key(self):
         s = dv_detect.dependency_status()
         assert set(s) == {"dovi_tool"} and isinstance(s["dovi_tool"], bool)
+
+
+class TestOnlyRpuSpecificMessagesMeanNoDolbyVision:
+    """Peer review caught this: a bare "not found" test also matched failures
+    like "input file not found" and "video track not found" -- and a file CAN
+    vanish between the isfile() check and the subprocess, which is exactly the
+    mount failure this module exists to classify honestly. Those must stay
+    'unknown'; only dovi_tool positively reporting an absent RPU means 'none'.
+    """
+
+    def _run(self, tmp_path, stderr, rc=1, rpu_size=0):
+        f = tmp_path / "movie.mkv"; f.write_bytes(b"x")
+
+        def fake_run(args, **kw):
+            if "extract-rpu" in args:
+                out_idx = args.index("-o") + 1
+                with open(args[out_idx], "wb") as fh:
+                    fh.write(b"\0" * rpu_size)
+                return _proc(returncode=rc, stderr=stderr)
+            return _proc(stdout=b"")
+
+        with patch("shutil.which", return_value="/usr/local/bin/dovi_tool"), \
+             patch("subprocess.run", side_effect=fake_run):
+            return dv_detect.detect_layer(str(f))
+
+    @pytest.mark.parametrize("stderr", [
+        b"No RPU found",
+        b"RPU not found in stream",
+        b"No Dolby Vision RPU present",
+    ])
+    def test_rpu_specific_absence_is_no_dolby_vision(self, tmp_path, stderr):
+        r = self._run(tmp_path, stderr)
+        assert r["layer"] == dv_detect.LAYER_NONE
+        assert r["error"] is None
+
+    @pytest.mark.parametrize("stderr", [
+        b"input file not found",
+        b"video track not found",
+        b"NAL unit not found",
+        b"Error: configuration record not found",
+    ])
+    def test_generic_not_found_failures_stay_unknown(self, tmp_path, stderr):
+        r = self._run(tmp_path, stderr)
+        assert r["layer"] == dv_detect.LAYER_UNKNOWN, stderr
+        assert r["error"]
+
+    def test_clean_exit_with_no_rpu_is_still_no_dolby_vision(self, tmp_path):
+        # rc == 0 needs no message: the tool ran and produced nothing.
+        r = self._run(tmp_path, b"", rc=0)
+        assert r["layer"] == dv_detect.LAYER_NONE
+        assert r["error"] is None

@@ -1,0 +1,245 @@
+# Full backend suite on agent/audit-fixes-2026-08 @ 0d2f224
+#
+# Covers all six confirmed audit findings plus the five peer-review blockers.
+# 4248 passed / 0 failed / 4 skipped / exit 0.
+#
+# The count is LOWER than the hybrid branch's 4793 for a structural reason,
+# not a missing-tests one: this branch is cut from main, which does not carry
+# the hybrid branch's RSS-authority test suites.
+#
+# Clean-room: the container ran nothing else; source verified to carry zero
+# mutation markers before the run. Dependency set per
+# .github/workflows/tests.yml. Raw output follows verbatim.
+# ----------------------------------------------------------------------------
+
+============================= test session starts ==============================
+platform linux -- Python 3.12.13, pytest-9.1.1, pluggy-1.6.0
+rootdir: /app
+configfile: pytest.ini
+plugins: json-report-1.5.0, cov-7.1.0, asyncio-1.4.0, metadata-3.1.1, anyio-4.14.2
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 4248 items / 4 skipped
+
+tests/test_analytics.py ................................................ [  1%]
+.....                                                                    [  1%]
+tests/test_api_analytics_watchlist.py ...........................        [  1%]
+tests/test_api_auth.py ................................                  [  2%]
+tests/test_api_background.py .......                                     [  2%]
+tests/test_api_lifecycle.py .....                                        [  2%]
+tests/test_api_rename.py ............................................... [  4%]
+........................                                                 [  4%]
+tests/test_api_results.py .............................................. [  5%]
+............                                                             [  5%]
+tests/test_api_routes.py ............................................... [  7%]
+........................................................................ [  8%]
+........................................................................ [ 10%]
+...................................                                      [ 11%]
+tests/test_api_system.py ..................                              [ 11%]
+tests/test_api_ws.py .........                                           [ 11%]
+tests/test_app_service.py .............................................. [ 12%]
+.......................................................................  [ 14%]
+tests/test_app_service_extended.py ..................................... [ 15%]
+.................................................................        [ 17%]
+tests/test_app_service_maintenance.py .                                  [ 17%]
+tests/test_apply_conflict_strategy.py ........                           [ 17%]
+tests/test_auth_service.py ......                                        [ 17%]
+tests/test_auto_grab.py ................................................ [ 18%]
+.............                                                            [ 18%]
+tests/test_auto_grab_service.py ........................................ [ 19%]
+.......                                                                  [ 19%]
+tests/test_background_scanner.py .........................               [ 20%]
+tests/test_candidate_evidence.py .......                                 [ 20%]
+tests/test_commit5_config_queue_polish.py ..................             [ 21%]
+tests/test_concurrency_stress.py ....................................... [ 22%]
+..                                                                       [ 22%]
+tests/test_confidence.py ..........                                      [ 22%]
+tests/test_config.py ................................................... [ 23%]
+....................................................                     [ 24%]
+tests/test_config_db_dir.py ..........                                   [ 25%]
+tests/test_conflict_analyzer.py ............                             [ 25%]
+tests/test_conflict_preview.py ...........                               [ 25%]
+tests/test_conflicts_rank.py ..................................          [ 26%]
+tests/test_database.py ................................................. [ 27%]
+........................................................................ [ 29%]
+......                                                                   [ 29%]
+tests/test_database_hardening.py ................                        [ 29%]
+tests/test_database_media_probe.py ........                              [ 29%]
+tests/test_detail_scraper.py ..............................              [ 30%]
+tests/test_detail_scraper_pacing.py .........                            [ 30%]
+tests/test_download_queue_and_browser.py .................               [ 31%]
+tests/test_download_service.py ......................................... [ 32%]
+........................................................................ [ 33%]
+........................................................................ [ 35%]
+...................                                                      [ 36%]
+tests/test_dv_acceptance.py .                                            [ 36%]
+tests/test_dv_detect.py ............................                     [ 36%]
+tests/test_dv_host_export.py .....                                       [ 36%]
+tests/test_dv_host_scan.py .........                                     [ 37%]
+tests/test_dv_import.py .....                                            [ 37%]
+tests/test_dv_label_writepath.py ....                                    [ 37%]
+tests/test_dv_labeler.py ..............................                  [ 37%]
+tests/test_dv_paths.py ............                                      [ 38%]
+tests/test_dv_scan_db.py ................                                [ 38%]
+tests/test_dv_scan_source_filter.py ..                                   [ 38%]
+tests/test_dv_settings.py .............                                  [ 38%]
+tests/test_edge_case_gauntlet.py ....................................... [ 39%]
+........................................................................ [ 41%]
+.........                                                                [ 41%]
+tests/test_episode_rescan.py ..........                                  [ 42%]
+tests/test_feature_pack_integration.py ...                               [ 42%]
+tests/test_filename_utils.py ........................................... [ 43%]
+...................................                                      [ 43%]
+tests/test_fileops_dedupe.py .....                                       [ 44%]
+tests/test_fileops_writer_guard_contract.py ....                         [ 44%]
+tests/test_full_disc_exclusion.py ...................................... [ 45%]
+......                                                                   [ 45%]
+tests/test_hdencode_action_database.py ...                               [ 45%]
+tests/test_hdencode_actions.py .........                                 [ 45%]
+tests/test_hdencode_candidate_service.py ..........                      [ 45%]
+tests/test_hdencode_constructor_gate.py ...                              [ 45%]
+tests/test_hdencode_coordinator.py ............                          [ 46%]
+tests/test_hdencode_download_reliability.py .......................      [ 46%]
+tests/test_hdencode_feed_pinning.py ..                                   [ 46%]
+tests/test_hdencode_final_adversarial_followup.py .......                [ 46%]
+tests/test_hdencode_identity_promotion.py ............                   [ 47%]
+tests/test_hdencode_off_switch.py ....                                   [ 47%]
+tests/test_hdencode_priority.py ..                                       [ 47%]
+tests/test_hdencode_readiness_integrity.py ...                           [ 47%]
+tests/test_hdencode_rss_completion.py ........                           [ 47%]
+tests/test_hdencode_rss_foundation.py ...........                        [ 47%]
+tests/test_hdencode_rss_primary.py ......                                [ 47%]
+tests/test_hdencode_rss_shadow.py .........                              [ 48%]
+tests/test_hdencode_source_capabilities.py .                             [ 48%]
+tests/test_hdencode_year_provenance.py ...                               [ 48%]
+tests/test_hdr10plus_detect.py ....                                      [ 48%]
+tests/test_imdb_scraper.py ...............                               [ 48%]
+tests/test_integration_scenarios.py .................................... [ 49%]
+.....................                                                    [ 49%]
+tests/test_link_scraper.py .................................             [ 50%]
+tests/test_llm_identify.py ................................              [ 51%]
+tests/test_matching.py ................................................. [ 52%]
+..............................                                           [ 53%]
+tests/test_media_inventory_api.py .......                                [ 53%]
+tests/test_mediainfo.py ..........................                       [ 54%]
+tests/test_metadata_enricher.py ........................................ [ 55%]
+..                                                                       [ 55%]
+tests/test_metadata_inventory_schema.py .....                            [ 55%]
+tests/test_metadata_scan_runbook.py ..                                   [ 55%]
+tests/test_metadata_scan_runs.py .........                               [ 55%]
+tests/test_metadata_seed_reconciliation.py ...                           [ 55%]
+tests/test_misc.py .......................................               [ 56%]
+tests/test_naming.py .....................                               [ 56%]
+tests/test_network.py ............................................       [ 58%]
+tests/test_notification_bridge.py ...................................... [ 58%]
+.                                                                        [ 58%]
+tests/test_notifications.py ............................................ [ 59%]
+........................................................................ [ 61%]
+.......                                                                  [ 61%]
+tests/test_path_translation.py .................                         [ 62%]
+tests/test_pipeline_service.py ......................................... [ 63%]
+..................                                                       [ 63%]
+tests/test_plex_manager.py ............................................. [ 64%]
+........................................................................ [ 66%]
+.................................                                        [ 67%]
+tests/test_plex_metadata_scan.py .............                           [ 67%]
+tests/test_plex_routes.py ......                                         [ 67%]
+tests/test_plex_service.py ............................................. [ 68%]
+.............................................................            [ 70%]
+tests/test_process_control.py .                                          [ 70%]
+tests/test_property_based.py ........................................... [ 71%]
+.                                                                        [ 71%]
+tests/test_public_error_boundary.py ....                                 [ 71%]
+tests/test_rename_core.py .............................................. [ 72%]
+...............................                                          [ 73%]
+tests/test_rename_pipeline_regression.py ............................... [ 73%]
+...                                                                      [ 73%]
+tests/test_rename_poster_migration.py ..                                 [ 73%]
+tests/test_rename_service.py ........................................... [ 74%]
+........................................................................ [ 76%]
+........................................................                 [ 77%]
+tests/test_resolution_canonical.py ....................                  [ 78%]
+tests/test_rss_action_routes.py ..                                       [ 78%]
+tests/test_rss_routes.py ......                                          [ 78%]
+tests/test_rt_scraper.py ............................................    [ 79%]
+tests/test_runtime_lock.py ..........                                    [ 79%]
+tests/test_scan_block_cancellation.py ......                             [ 80%]
+tests/test_scan_conflict_dv.py .......                                   [ 80%]
+tests/test_scan_rescan_item.py ....                                      [ 80%]
+tests/test_scanner_service.py .......................................... [ 81%]
+....................                                                     [ 81%]
+tests/test_scanner_service_extended.py ................................. [ 82%]
+........................................................................ [ 84%]
+.                                                                        [ 84%]
+tests/test_scrape_outcomes.py ......................                     [ 84%]
+tests/test_scrapers.py ...............................                   [ 85%]
+tests/test_scrapers_extended.py ........................................ [ 86%]
+.......................................................                  [ 87%]
+tests/test_security_review_20260731.py ...................               [ 88%]
+tests/test_source_adithd.py ............................................ [ 89%]
+........................................................................ [ 90%]
+........                                                                 [ 91%]
+tests/test_source_ddlbase.py ........................................... [ 92%]
+......................................                                   [ 92%]
+tests/test_source_hdencode.py .......................................... [ 93%]
+.......................................................                  [ 95%]
+tests/test_source_health.py ........                                     [ 95%]
+tests/test_source_registry.py .......................................... [ 96%]
+..................                                                       [ 96%]
+tests/test_test_isolation.py .                                           [ 96%]
+tests/test_tmdb_client.py .............................................. [ 97%]
+....                                                                     [ 98%]
+tests/test_trash_durability.py ............                              [ 98%]
+tests/test_trash_lifecycle_transaction.py ........                       [ 98%]
+tests/test_watchlist.py ................................................ [ 99%]
+..............                                                           [100%]
+
+=============================== warnings summary ===============================
+../usr/local/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /usr/local/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+tests/test_rename_service.py:2225
+  /app/tests/test_rename_service.py:2225: SyntaxWarning: invalid escape sequence '\D'
+    svc = self._svc(db, "F:\Downloads => /library/movies")
+
+tests/test_rename_service.py:2226
+  /app/tests/test_rename_service.py:2226: SyntaxWarning: invalid escape sequence '\D'
+    assert svc._translate_path("F:\Downloads\Movie (2020)") == "/library/movies/Movie (2020)"
+
+tests/test_rename_service.py:2231
+  /app/tests/test_rename_service.py:2231: SyntaxWarning: invalid escape sequence '\D'
+    svc = self._svc(db, "F:\Downloads => /a\nF:\Downloads\4k => /b")
+
+tests/test_rename_service.py:2232
+  /app/tests/test_rename_service.py:2232: SyntaxWarning: invalid escape sequence '\D'
+    assert svc._translate_path("F:\Downloads\4k\X") == "/b/X"
+
+tests/test_rename_service.py:2237
+  /app/tests/test_rename_service.py:2237: SyntaxWarning: invalid escape sequence '\D'
+    svc = self._svc(db, "F:\Downloads => /library/movies")
+
+tests/test_rename_service.py:2238
+tests/test_rename_service.py:2238
+  /app/tests/test_rename_service.py:2238: SyntaxWarning: invalid escape sequence '\O'
+    assert svc._translate_path("Z:\Other\X") == "Z:\Other\X"
+
+tests/test_rename_service.py:2244
+tests/test_rename_service.py:2244
+  /app/tests/test_rename_service.py:2244: SyntaxWarning: invalid escape sequence '\D'
+    assert svc._translate_path("F:\Downloads\X") == "F:\Downloads\X"
+
+tests/test_rename_service.py:2491
+  /app/tests/test_rename_service.py:2491: SyntaxWarning: invalid escape sequence '\D'
+    auto_rename_path_mappings="F:\Downloads => " + str(real))
+
+tests/test_rename_service.py:2492
+  /app/tests/test_rename_service.py:2492: SyntaxWarning: invalid escape sequence '\D'
+    result = svc.process_folder("F:\Downloads")
+
+tests/test_rename_service.py:2772
+  /app/tests/test_rename_service.py:2772: SyntaxWarning: invalid escape sequence '\D'
+    auto_rename_path_mappings="F:\Downloads => /library/movies")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========== 4248 passed, 4 skipped, 13 warnings in 569.69s (0:09:29) ===========
+EXIT=0

@@ -61,6 +61,23 @@ ScanHound is a standalone Dockerized media-management app (private repo `LstDtch
 
 ## 4. NOT YET BUILT / TODO
 
+> **SUPERSEDED 2026-08-04.** This section is historical. The "whole back
+> half" it describes as missing is built and RUNNING: the Plex label
+> write-path exists (`backend/rename/dv_labeler.py`), a real sync ran on
+> 2026-07-26 writing 457 rating_keys, Plex currently carries 171 DV FEL /
+> 159 DV MEL / 81 DV P8 / 33 DV P5, and Kometa drew badges from those
+> labels as recently as 2026-08-03. Detection, file tagging and the config
+> plumbing all landed too. Read the items below as the original plan, not
+> as outstanding work.
+>
+> What IS outstanding, measured 2026-08-04: the host detector has scanned
+> only 466 files of the ~2,465 the 4K library flags as Dolby Vision,
+> because `dv_library_roots` lists four "4K DV" SUBfolders rather than the
+> four top-level roots; the nightly scheduled task was never created, so
+> the inventory has been frozen since 2026-07-05; and Kometa's live
+> overlay file draws FEL and MEL only, so 114 P8/P5 titles carry a label
+> with no badge. See `docs/reviews/2026-08-06-dv-full-coverage-setup.md`.
+
 **DV end-to-end output path (the whole back half is missing):**
 - **Per-file detection hook** — call `detect_layer()` inside `_process_file_inner()` behind a **default-off `dv_detection_enabled`** flag; decide inline vs queued (adds seconds per 4K file).
 - **Plex label write-path** — no `addLabel('DV FEL')` / `removeLabel()` exists anywhere in `plex_service.py` (only the read-only `_check_dovi()`). Needs: map `dv_scan` row → Plex item → set/clear label, write `rating_key` back to `dv_scan`.

@@ -429,3 +429,41 @@ class TestWatchlistImport:
         )
         assert resp.status_code == 200
         assert resp.json()["imported"] == 1
+
+
+class TestTraktImportCallsTheRealManagerMethod:
+    """Regression: the route called mgr.add_item(), which does not exist on
+    WatchlistManager (its method is add()). Every item raised AttributeError
+    into the per-item `except Exception`, so the endpoint always answered
+    200 with imported: 0 and silently imported nothing.
+
+    The mock is spec'd ON PURPOSE: a bare MagicMock invents add_item and
+    would keep this test green against the defect.
+    """
+
+    TRAKT_JSON = [
+        {"movie": {"title": "Dune", "year": 2021,
+                   "ids": {"imdb": "tt1160419", "tmdb": 438631}}},
+        {"movie": {"title": "Arrival", "year": 2016,
+                   "ids": {"imdb": "tt2543164", "tmdb": 329865}}},
+    ]
+
+    def _import(self, client):
+        from backend.watchlist import WatchlistManager
+        mgr = MagicMock(spec=WatchlistManager)
+        mgr.add.return_value = 1
+        registry._watchlist_manager = mgr
+        registry.config = {"trakt_client_id": "cid"}
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = self.TRAKT_JSON
+        with patch("requests.get", return_value=resp):
+            r = client.post("/watchlist/import/trakt", json={"username": "someone"})
+        return r, mgr
+
+    def test_every_item_is_actually_added(self, client):
+        r, mgr = self._import(client)
+        assert r.status_code == 200
+        assert r.json()["imported"] == 2
+        assert mgr.add.call_count == 2
+        titles = {c.args[0].title for c in mgr.add.call_args_list}
+        assert titles == {"Dune", "Arrival"}

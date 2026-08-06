@@ -138,6 +138,12 @@ class AppConfig(TypedDict, total=False):
 
     # Auto-rename (post-extraction) + Plex sort + optional Ollama assist
     auto_rename_enabled: bool
+    #: Whether the Renames page's Apply button may place files. Independent of
+    #: auto_rename_enabled ON PURPOSE: that switch arms the automatic
+    #: JDownloader hook, and pausing automation should not force you to give
+    #: up manual renaming (nor should re-enabling one silently re-arm the
+    #: other). Applying is the single irreversible step in this feature.
+    rename_manual_apply_enabled: bool
     auto_rename_confidence_threshold: int
     auto_rename_require_confirmation: bool
     auto_rename_move_method: str
@@ -506,6 +512,11 @@ _DEFAULT_CONFIG: AppConfig = {
     "background_scan_retain_days": 7,
     "background_scan_last_run": 0,
     "auto_rename_enabled": False,
+    #: Default True: manual renaming has always worked out of the box and the
+    #: Apply button is behind an explicit user click plus (by default) a
+    #: confirmation. Set False to freeze the manual path -- e.g. during a
+    #: file-operation safety review -- without touching the automatic hook.
+    "rename_manual_apply_enabled": True,
     "auto_rename_confidence_threshold": 70,
     "auto_rename_require_confirmation": True,
     "auto_rename_move_method": "hardlink",

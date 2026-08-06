@@ -91,7 +91,8 @@ EXPECTED_DEFAULT_KEYS = {
     "background_scan_pages", "background_scan_sources",
     "background_scan_retain_days", "background_scan_last_run",
     # Auto-rename + Plex sort + Ollama
-    "auto_rename_enabled", "auto_rename_confidence_threshold",
+    "auto_rename_enabled", "rename_manual_apply_enabled",
+    "auto_rename_confidence_threshold",
     "auto_rename_require_confirmation", "auto_rename_move_method",
     "auto_rename_movie_library", "auto_rename_movie_library_4k", "auto_rename_movie_flat", "auto_rename_tv_library",
     "auto_rename_template_movie", "auto_rename_template_tv",

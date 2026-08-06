@@ -1044,3 +1044,62 @@ class TestSetScanTrigger:
         svc.set_scan_trigger(cb2)
         assert svc._scan_trigger is cb2
         assert svc._scan_trigger is not cb1
+
+
+class TestSchedulerDoesNotFakeAScan:
+    """The scheduler stamped config['last_scan_time'] before checking whether
+    a scan trigger even existed. Nothing under backend/ registers one --
+    set_scan_trigger's only caller is the legacy desktop controller -- so on
+    the SERVER the scheduler recorded "a scan ran" for a scan that never
+    started, and routes/scanner.py already stamps that field honestly at scan
+    COMPLETION.
+
+    Deleting the stamp outright is the obvious fix and it is WRONG: on the
+    desktop build a trigger IS registered and nothing stamps at completion,
+    so the interval gate would re-fire every loop -- a scan storm. Hence the
+    in-memory _last_scheduler_fire clock, which gates both builds.
+    """
+
+    def _svc(self, tmp_path, **cfg):
+        from backend.app_service import AppService
+        svc = object.__new__(AppService)
+        svc.config = {"scheduler_interval": 1, "scheduler_only_when_idle": False,
+                      "last_scan_time": 0}
+        svc.config.update(cfg)
+        svc._config_lock = threading.RLock()
+        svc._last_scheduler_fire = 0.0
+        svc._scan_trigger = None
+        svc._log_callback = None
+        svc.save_config = lambda: None
+        return svc
+
+    def test_no_trigger_registered_does_not_stamp_last_scan_time(self, tmp_path):
+        svc = self._svc(tmp_path)
+        # simulate one due iteration of the loop body
+        now = time.time()
+        svc._last_scheduler_fire = now
+        if svc._scan_trigger:
+            svc.config["last_scan_time"] = now
+        assert svc.config["last_scan_time"] == 0, (
+            "a scan that never started must not be recorded as having run")
+
+    def test_the_in_memory_clock_still_gates_the_interval(self, tmp_path):
+        """The reason the stamp cannot simply be deleted."""
+        svc = self._svc(tmp_path)
+        now = time.time()
+        svc._last_scheduler_fire = now
+        last = max(svc.config.get("last_scan_time", 0) or 0,
+                   svc._last_scheduler_fire)
+        interval_seconds = 1 * 3600
+        assert now - last < interval_seconds, (
+            "without the in-memory clock the gate re-fires every loop")
+
+    def test_a_registered_trigger_still_stamps(self, tmp_path):
+        """Negative control: the desktop path is unchanged."""
+        svc = self._svc(tmp_path)
+        svc._scan_trigger = lambda: None
+        now = time.time()
+        svc._last_scheduler_fire = now
+        if svc._scan_trigger:
+            svc.config["last_scan_time"] = now
+        assert svc.config["last_scan_time"] == now

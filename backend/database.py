@@ -4325,7 +4325,15 @@ class DatabaseManager:
     def upsert_dv_scan(self, path, dv_layer, *, title=None, sig_mtime=None,
                        sig_size=None, source="scan", rating_key=None, imdb_id=None):
         """Insert/update a DV-layer record for ``path``. Refreshes last_seen_at;
-        preserves scanned_at on update. Returns True on success."""
+        preserves scanned_at on update. Returns True on success.
+
+        A dv_layer of 'unknown' records that detection FAILED (dv_detect
+        resolves every error to it). It must not destroy a known-good layer:
+        the sig columns still take the incoming values, so the NULL signature
+        a failed host scan writes keeps forcing a retry on the next run, but
+        the last real finding survives to keep the Kometa labels correct in
+        the meantime. Same preserve-on-worse rule the title/rating_key/imdb_id
+        COALESCEs in this statement already apply."""
         if not path:
             return False
         return self._mutate('''
@@ -4335,7 +4343,13 @@ class DatabaseManager:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(path) DO UPDATE SET
                 title = COALESCE(excluded.title, dv_scan.title),
-                dv_layer = excluded.dv_layer,
+                dv_layer = CASE
+                    WHEN excluded.dv_layer = 'unknown'
+                     AND dv_scan.dv_layer IS NOT NULL
+                     AND dv_scan.dv_layer != 'unknown'
+                    THEN dv_scan.dv_layer
+                    ELSE excluded.dv_layer
+                END,
                 sig_mtime = excluded.sig_mtime,
                 sig_size = excluded.sig_size,
                 source = excluded.source,
@@ -4734,10 +4748,21 @@ class DatabaseManager:
                 label="reset_applying_rename_jobs")
         return count
 
-    def count_rename_jobs_by_status(self):
-        """Return a ``{status: count}`` map over all rename jobs."""
-        rows = self._query(
-            "SELECT status, COUNT(*) FROM rename_jobs GROUP BY status", default=[])
+    def count_rename_jobs_by_status(self, include_archived=False):
+        """Return a ``{status: count}`` map over rename jobs.
+
+        Excludes archived jobs by DEFAULT, because list_rename_jobs excludes
+        them by default too, and these counts label the cards above that very
+        list. Counting archived rows here made every card disagree with what
+        clicking it showed -- "Applied 89" opening a list of 78 -- while the
+        separate Archived card counted those same jobs a second time. A
+        number you cannot reconcile with the screen teaches you to distrust
+        the screen.
+        """
+        sql = "SELECT status, COUNT(*) FROM rename_jobs"
+        if not include_archived:
+            sql += " WHERE archived_at IS NULL"
+        rows = self._query(sql + " GROUP BY status", default=[])
         return {r[0]: r[1] for r in (rows or [])}
 
     def package_has_rename_job(self, package_name):

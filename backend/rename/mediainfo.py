@@ -91,17 +91,40 @@ def probe_specs(
         disk_mtime, disk_size = _st.st_mtime, _st.st_size
     except OSError:
         disk_mtime, disk_size = None, None
-    # Cache check: a signature-matching prior probe is reused verbatim,
-    # skipping the ffprobe subprocess entirely. A probe FAILURE (None) is
+    # Cache check: a signature-matching prior probe reuses every ffprobe-derived
+    # field, skipping the ffprobe subprocess entirely. A probe FAILURE (None) is
     # never cached (see the bottom of this function), so there's nothing to
     # hit here for a file that previously failed to probe.
     if db is not None and disk_mtime is not None and db.media_probe_is_current(path, disk_mtime, disk_size):
         cached_row = db.get_media_probe(path)
         if cached_row and cached_row.get("probe_json"):
+            cached = None
             try:
-                return json.loads(cached_row["probe_json"])
+                cached = json.loads(cached_row["probe_json"])
             except (json.JSONDecodeError, TypeError):
-                pass  # corrupt cache row — fall through and re-probe
+                cached = None  # corrupt cache row — fall through and re-probe
+            if isinstance(cached, dict):
+                # dv_layer is the ONE field here that does NOT come from
+                # ffprobe: it is read live from the dv_scan cache, which is
+                # written AFTER this row (plex_metadata_scan probes first, then
+                # runs dovi_tool) and which dovi_tool can update at any time
+                # WITHOUT touching the file's mtime/size -- so
+                # media_probe_is_current stays True forever and nothing
+                # invalidates this row. Reusing the stored dv_layer verbatim
+                # froze it at the null it held on first probe, which is why a
+                # later DV scan never reached conflict_preview/rank_conflict
+                # and needs_dv_layer_scan kept re-triggering full detections.
+                # Re-resolve it exactly as the cache-MISS path does below; the
+                # expensive ffprobe skip is untouched (two indexed lookups).
+                #
+                # Deliberately OUTSIDE the try: a TypeError/KeyError from this
+                # line must surface, not be swallowed into a needless full
+                # re-probe. The isinstance guard makes the assignment
+                # unraisable and _cached_dv_layer is already fail-safe, so the
+                # net new exception surface is zero.
+                cached["dv_layer"] = _cached_dv_layer(
+                    path, disk_mtime, disk_size, db)
+                return cached
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return None
