@@ -2304,8 +2304,21 @@ class DatabaseManager:
         # reporting zero.
         for cycle,slot in per_cycle.items():
             unreported=slot["unsupported"]+slot["corrupt"]
+            # The orphan clause that used to sit here was removed on peer-review
+            # instruction: orphan rows never enter per_cycle at all (the miss
+            # query inner-joins, orphans are found separately by NOT EXISTS), so
+            # a global orphan count can never legitimately prove that a specific
+            # cycle's bucket was reported -- it could only suppress this check by
+            # numeric coincidence.
+            #
+            # KNOWN LIMITATION, recorded because the previous comment here
+            # overstated it. This is still string association, not structural
+            # accounting: one reported finding for a cycle satisfies the check
+            # for any number of unreported bad rows in that same cycle. Round 6
+            # replaces it with per-bucket reported counters. Readiness stays
+            # fail-closed either way, because any masking finding is itself in
+            # the blocking list.
             if unreported and not any(f.endswith(cycle) or f":{cycle}:" in f
-                                      or f==f"orphan_miss_rows:{unreported}"
                                       for f in integrity):
                 integrity.append(f"unreported_unsupported_rows:{cycle}:{unreported}")
         # Pre-attribution rows cannot be re-derived at all: nothing recorded
