@@ -90,3 +90,77 @@ def test_restart_marker_is_process_lifetime_not_service_lifetime():
     assert scanner._rss_first_cycle_after_startup is True
     scanner._rss_first_cycle_after_startup = False
     assert scanner._rss_first_cycle_after_startup is False
+
+
+def test_misses_from_zero_fetch_cycles_do_not_fail_the_gate(tmp_path):
+    """A cycle that never fetched cannot condemn the window.
+
+    rss_urls comes from list_hdencode_current_feed_urls(), which reads the last
+    persisted feed snapshot from the database -- not that cycle's fetch. With
+    rss_requests=0 the comparison is listing-vs-stale-snapshot, listing_only is
+    inflated by everything the feed had merely not collected yet, and every
+    relevant row in it was booked as a miss. Over 2026-07-22..2026-08-05, 41
+    such cycles produced 89 of 150 recorded misses and none was a real loss
+    (median catch-up 1.10h, worst 4.06h).
+
+    compare_shadow no longer records these; this filter stops the 89 already on
+    disk from failing the gate forever.
+    """
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="eligible-clean",
+                  completed_at="2026-07-21T00:00:00+00:00",
+                  normal=1, rss=2, listing=10, misses=0)
+    # 89 of the 90 real contested records looked exactly like this.
+    _insert_cycle(db, uuid="feed-never-fetched",
+                  completed_at="2026-07-22T00:00:00+00:00",
+                  normal=0, rss=0, listing=4, misses=8,
+                  outcome="relevant_miss")
+    _insert_cycle(db, uuid="feed-never-fetched-2",
+                  completed_at="2026-07-23T00:00:00+00:00",
+                  normal=0, rss=0, listing=5, misses=81,
+                  outcome="relevant_miss")
+
+    summary = db.get_hdencode_shadow_summary()
+    assert summary["relevant_misses"] == 0
+    assert summary["successful_cycles"] == 1
+
+
+def test_a_degraded_cycle_that_fetched_still_fails_the_gate(tmp_path):
+    """The 2026-07-21 audit rule (f5e3c6e), preserved rather than reversed.
+
+    test_relevant_miss_blocks_even_when_cycle_is_incomplete above is the
+    original. This is its sharper form: the exclusion must key on rss_requests,
+    NOT on normal_feeds_complete, so a degraded cycle that DID fetch still
+    reports. Widening the exclusion to all incomplete cycles would silence the
+    real 2026-07-28 record (rss_requests=2), which grades green at 1.25h -- so
+    keeping it costs nothing and dropping it would cost the protection.
+    """
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="degraded-but-fetched",
+                  completed_at="2026-07-28T01:32:02+00:00",
+                  normal=0, rss=2, listing=27, misses=1,
+                  outcome="relevant_miss")
+    _insert_cycle(db, uuid="feed-never-fetched",
+                  completed_at="2026-07-30T02:26:28+00:00",
+                  normal=0, rss=0, listing=4, misses=97,
+                  outcome="relevant_miss")
+
+    summary = db.get_hdencode_shadow_summary()
+    # The 1 that fetched, not the 97 that did not, and not 0.
+    assert summary["relevant_misses"] == 1
+
+
+def test_a_real_miss_on_an_eligible_cycle_still_fails_the_gate(tmp_path):
+    """The protection this change must not weaken at all."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="eligible-with-a-real-gap",
+                  completed_at="2026-07-21T00:00:00+00:00",
+                  normal=1, rss=2, listing=10, misses=3,
+                  outcome="relevant_miss")
+    _insert_cycle(db, uuid="feed-never-fetched",
+                  completed_at="2026-07-22T00:00:00+00:00",
+                  normal=0, rss=0, listing=4, misses=97,
+                  outcome="relevant_miss")
+
+    summary = db.get_hdencode_shadow_summary()
+    assert summary["relevant_misses"] == 3

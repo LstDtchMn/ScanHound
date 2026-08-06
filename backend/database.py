@@ -2083,11 +2083,30 @@ class DatabaseManager:
                  AND rss_requests>0
                  AND listing_requests>0""",
             one=True,default=None)
-        # A relevant miss is a mandatory stop condition even when the cycle was
-        # otherwise incomplete, so miss accounting deliberately spans every row.
+        # Miss accounting deliberately spans rows the eligibility filter above
+        # rejects: a 2026-07-21 ChatGPT adversarial audit (f5e3c6e) established
+        # that a degraded cycle must not be able to HIDE a real gap, and that
+        # rule stands. The one case it could not anticipate -- the window was 0
+        # days old -- is a cycle that never fetched at all. rss_urls comes from
+        # list_hdencode_current_feed_urls(), which reads the last persisted feed
+        # snapshot out of the database, so with rss_requests=0 the comparison is
+        # listing-vs-stale-snapshot and listing_only is inflated by everything
+        # the feed had merely not collected yet. Every relevant row in it was
+        # then booked as a miss.
+        #
+        # Measured over 2026-07-22..2026-08-05: 41 zero-fetch cycles produced 89
+        # of the 150 recorded misses; grading all 150 against later cycles found
+        # zero permanent losses (median catch-up 1.10h, worst 4.06h).
+        #
+        # So this excludes ONLY the zero-fetch case, not everything the
+        # eligibility filter rejects. The single partial-fetch record
+        # (rss_requests=2, 2026-07-28) is still counted, and still grades green.
+        # compare_shadow() no longer writes these rows; this filter is what stops
+        # the 89 already on disk from failing the gate forever.
         misses=self._query(
             "SELECT SUM(relevant_miss_count) AS relevant_misses "
-            "FROM hdencode_shadow_cycles",
+            "FROM hdencode_shadow_cycles "
+            "WHERE rss_requests>0",
             one=True,default=None)
         latest=self._query(
             "SELECT * FROM hdencode_shadow_cycles "

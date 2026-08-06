@@ -36,6 +36,7 @@ hypothetical.)
 """
 import json
 import sqlite3
+import sys
 from datetime import datetime
 
 GREEN_H, YELLOW_H = 6.0, 24.0
@@ -73,14 +74,34 @@ for r in con.execute(
     if c["usable"]:
         usable.append(c)
 
+# MISS SOURCING (fixed 2026-08-05). This JOIN used to be unfiltered, so a miss
+# recorded during a cycle this script itself refuses to trust as an OBSERVATION
+# still entered the population being graded. That asymmetry is not defensible:
+# rss_urls comes from list_hdencode_current_feed_urls(), which reads the last
+# persisted feed snapshot from the database, so a cycle with rss_requests=0
+# compared the listing against a stale set and every relevant row in
+# listing_only was booked as a miss. 41 such cycles produced 89 of the 150
+# records.
+#
+# The filter is rss_requests>0, NOT the full `usable` rule, deliberately: a
+# 2026-07-21 ChatGPT adversarial audit (f5e3c6e) established that a degraded
+# cycle must not be able to HIDE a real gap, and that still holds. Only the
+# zero-fetch case is excluded. The one partial-fetch record (rss_requests=2,
+# 2026-07-28) is still graded, and comes out green at 1.25h.
 misses = [dict(r) for r in con.execute(
     "SELECT m.canonical_url u, m.title, m.status, s.completed_at at "
     "FROM hdencode_shadow_misses m "
-    "JOIN hdencode_shadow_cycles s ON s.cycle_uuid = m.cycle_uuid")]
+    "JOIN hdencode_shadow_cycles s ON s.cycle_uuid = m.cycle_uuid "
+    "WHERE s.rss_requests > 0")]
+excluded = con.execute(
+    "SELECT COUNT(*) FROM hdencode_shadow_misses m "
+    "JOIN hdencode_shadow_cycles s ON s.cycle_uuid = m.cycle_uuid "
+    "WHERE s.rss_requests <= 0").fetchone()[0]
 
 print(f"cycles: {len(all_cycles)} total, {len(usable)} usable as observations "
       f"({len(all_cycles) - len(usable)} rejected: incomplete/partial/killed)")
-print(f"recorded misses: {len(misses)}")
+print(f"recorded misses: {len(misses)} graded, "
+      f"{excluded} excluded as recorded during a zero-fetch cycle")
 if len(usable) > 1:
     gaps = sorted((usable[i + 1]["at"] - usable[i]["at"]).total_seconds() / 60
                   for i in range(len(usable) - 1))
@@ -149,3 +170,25 @@ if buckets["ambiguous"]:
 print("\nGATE: closure requires 0 RED, 0 PENDING and 0 AMBIGUOUS.")
 print("Continue the observation tail past the nominal window end until every")
 print("miss is conclusively classified.")
+
+# --json emits the verdict as one machine-readable line, so the collector can
+# act on the GRADED classification instead of a raw miss count. Added
+# 2026-08-05 alongside the graded stop condition: the collector stopped on
+# `if misses:`, which treats "the feed caught up an hour later" as permanent
+# coverage loss. Jesse's tiered rule (2026-07-24) says <=6h is GREEN, and on
+# 2026-08-05 the live data was 149 GREEN / 0 YELLOW / 0 RED / 1 AMBIGUOUS --
+# so the raw count stopped the window 150 times for 1 unprovable miss.
+# Printed LAST and prefixed, so the human report above stays readable.
+if "--json" in sys.argv:
+    print("JSON_VERDICT " + json.dumps({
+        "green": len(buckets["green"]),
+        "yellow": len(buckets["yellow"]),
+        "red": len(buckets["red"]),
+        "pending": len(buckets["pending"]),
+        "ambiguous": len(buckets["ambiguous"]),
+        "total": sum(len(v) for v in buckets.values()),
+        "green_hours": GREEN_H,
+        "yellow_hours": YELLOW_H,
+        "ambiguous_urls": [u for u, _ in buckets["ambiguous"]],
+        "red_urls": [u for u, _ in buckets["red"]],
+    }))
