@@ -213,8 +213,21 @@ including a parametrised case over all four states seen live (119 `missing`, 15
 assertions over the two pure gate functions. Discrimination check: **11 of 21
 fail** against the pre-change rule.
 
-**Full suite** — see the commit message for counts at this head, with a baseline
-run on `main` in an identical container for attribution.
+**Full suite** — this head: **12 failed, 4270 passed, 4 skipped** (597.91s).
+Baseline on `main` @ `d909b44`, identical container method and whole tree:
+**12 failed, 4248 passed, 4 skipped** (592.85s). The failure sets are
+**identical test-for-test** (`diff` empty), so this change introduces no new
+failures; the +22 are the tests added here.
+
+**Correction to the commit message.** It states that all 12 pre-existing failures
+are an artifact of the harness copying `backend/tests/docs` without `scripts/`.
+That is true of **9** of them (all in `test_dv_host_scan.py`) — re-running with
+`scripts/` present leaves **3 failed, 241 passed**. The remaining 3
+(`test_dv_settings`, `test_notifications`, `test_source_hdencode`) are a
+different environment gap: absent frontend build files, no selenium, no
+notification backend in the container. Both arms show all 12 identically, so
+attribution is unaffected — but the commit message overstated the explanation and
+cannot be amended without a force-push.
 
 ---
 
