@@ -20,6 +20,10 @@ class ScrapeCode(str, Enum):
     BROWSER_NAVIGATION_FAILED = "browser_navigation_failed"
     INTERACTIVE_CHALLENGE = "interactive_challenge"
     LAYOUT_CHANGED = "layout_changed"
+    # The reveal control existed but never left its "Verifying... Please wait"
+    # state. Distinct from SOURCE_TEMPORARILY_BLOCKED, whose message says no
+    # request was made -- here the page was fetched and the control was found.
+    REVEAL_VERIFICATION_STALLED = "reveal_verification_stalled"
     REQUESTED_HOST_MISSING = "requested_host_missing"
     NO_FILE_HOST_LINKS = "no_file_host_links"
     SCRAPE_EXCEPTION = "scrape_exception"
@@ -52,6 +56,11 @@ _MESSAGES = {
     ),
     ScrapeCode.REQUESTED_HOST_MISSING: "The page loaded, but it does not contain links for the requested file host.",
     ScrapeCode.NO_FILE_HOST_LINKS: "The page loaded, but no supported file-host links were found.",
+    ScrapeCode.REVEAL_VERIFICATION_STALLED: (
+        "The source did not finish verifying the link-reveal control, which it "
+        "does when it is rate-limiting. The item is queued to retry after a "
+        "cooldown; nothing is wrong with this release."
+    ),
     ScrapeCode.SCRAPE_EXCEPTION: "The link scrape failed before download links could be retrieved.",
 }
 
@@ -60,6 +69,7 @@ _MESSAGES = {
 # worth persisting alongside the message. Every other code names its own cause.
 _SIGNAL_BEARING_CODES = frozenset({
     ScrapeCode.LAYOUT_CHANGED,
+    ScrapeCode.REVEAL_VERIFICATION_STALLED,
     ScrapeCode.NO_FILE_HOST_LINKS,
     ScrapeCode.REQUESTED_HOST_MISSING,
 })

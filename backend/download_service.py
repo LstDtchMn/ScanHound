@@ -1455,6 +1455,10 @@ class DownloadService:
         *,
         stage: str = "page",
         source_kind: str = "hdencode",
+        # The reveal-control tier from _find_reveal_control. "not-ready" means
+        # the control existed but never finished verifying, which is the source
+        # rate-limiting rather than a changed page.
+        reveal_tier: Optional[str] = None,
     ) -> ScrapeDiagnostic:
         """Log page evidence and return a structured operation classification."""
         try:
@@ -1600,7 +1604,50 @@ class DownloadService:
                         else "outcome_recorder"
                     ),
                 )
+            if stage == "access_control" and reveal_tier == "not-ready":
+                # A STALLED VERIFY IS A THROTTLE, NOT A BROKEN PAGE.
+                #
+                # This previously fell through to LAYOUT_CHANGED: retryable=False,
+                # no cooldown, no coordinator notification. The consequence was
+                # not one lost item. The batch never paused, the queue kept
+                # marching at its configured spacing, and every remaining item
+                # hit the same closed door and became permanently terminal. 78
+                # items accumulated that way, with automated_retry_count 0 on
+                # every one.
+                #
+                # observe_challenge sets the shared cooldown and returns the
+                # cooldown_until the queue needs to pause the batch and later
+                # auto-resume.
+                decision = None
+                if source_kind == "hdencode":
+                    decision = get_hdencode_coordinator().observe_challenge(
+                        "reveal_verification_stalled")
+                signals.append("reveal-tier:not-ready")
+                return ScrapeDiagnostic(
+                    ScrapeCode.REVEAL_VERIFICATION_STALLED,
+                    # RETRYABLE: the release is fine, the source was busy.
+                    retryable=True,
+                    affects_source_health=True,
+                    signals=tuple(signals),
+                    stage="access_control",
+                    cause_code="reveal_verification_stalled",
+                    cooldown_until=(
+                        decision.cooldown_until if decision is not None else None
+                    ),
+                    transport_attempted=True,
+                    # The SOURCE is throttled, not this one item, so the batch
+                    # must pause rather than burn the rest of the queue.
+                    affected_scope="source",
+                    retry_mode="after_cooldown",
+                    action_code="wait_for_cooldown",
+                    health_owner=(
+                        "coordinator" if source_kind == "hdencode"
+                        else "outcome_recorder"
+                    ),
+                )
             if stage == "access_control":
+                # Genuinely absent or wrong-destination: tier "none",
+                # "ambiguous", "destination-rejected". A real layout change.
                 return ScrapeDiagnostic(
                     ScrapeCode.LAYOUT_CHANGED,
                     retryable=False,
@@ -1685,6 +1732,10 @@ class DownloadService:
         # not_ready_seen separates "countdown ran then finished" from "the page
         # was simply slow", so the real countdown duration can be measured and
         # the temporary 60s ceiling replaced with a tuned value.
+        # The tier IS the diagnosis and was previously logged then discarded, so
+        # the caller could only report "no button found". Stored on the instance,
+        # matching the existing _last_cf_mitigated pattern, so no signatures move.
+        self._last_reveal_tier = tier
         self._log(
             f"[HDEncode] reveal-control tier={tier} "
             f"elapsed={time.monotonic() - started:.1f}s "
@@ -1972,13 +2023,30 @@ class DownloadService:
                     access_btn = self._find_reveal_control(driver)
 
                     if not access_btn:
-                        self._log(
-                            f"[HDEncode] No 'View links' button found (title: {page_title!r}). "
-                            "Page may be a Cloudflare wall, login gate, or changed layout.",
-                            "warning",
-                        )
+                        tier = getattr(self, "_last_reveal_tier", None)
+                        if tier == "not-ready":
+                            # Not a missing button. HDEncode served the unlock
+                            # form and never finished verifying it. Production
+                            # evidence 2026-08-06: three reveals succeeded in
+                            # 0.1-0.8s, then five consecutive attempts sat at
+                            # "Verifying... Please wait" for the full 60s
+                            # ceiling, with the page shape identical throughout
+                            # (6 forms, same #unlocked action, 92-94 links).
+                            # That is rate-limiting.
+                            self._log(
+                                "[HDEncode] The reveal control never finished "
+                                f"verifying (title: {page_title!r}). The source "
+                                "is rate-limiting; cooling down.",
+                                "warning",
+                            )
+                        else:
+                            self._log(
+                                f"[HDEncode] No 'View links' button found (title: {page_title!r}). "
+                                "Page may be a Cloudflare wall, login gate, or changed layout.",
+                                "warning",
+                            )
                         diagnostic = self._log_page_diagnostics(
-                            driver, stage="access_control"
+                            driver, stage="access_control", reveal_tier=tier
                         )
                         return ScrapedLinks(diagnostic=diagnostic)
 

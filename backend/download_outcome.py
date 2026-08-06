@@ -24,6 +24,13 @@ _SOURCE_WIDE_REASONS = {
     ScrapeCode.SOURCE_DISABLED.value,
     ScrapeCode.SOURCE_TEMPORARILY_BLOCKED.value,
     ScrapeCode.INTERACTIVE_CHALLENGE.value,
+    # A stalled link-reveal verification throttles the whole source, not one
+    # item: once HDEncode stops clearing the countdown, every subsequent item in
+    # the queue meets the same closed door. Without membership here,
+    # is_source_wide_denial returns False, the outcome routes to _fail instead of
+    # _pause_for_source, and the batch grinds on converting the rest of the queue
+    # into permanent failures -- which is exactly how 78 items accumulated.
+    ScrapeCode.REVEAL_VERIFICATION_STALLED.value,
 }
 
 
