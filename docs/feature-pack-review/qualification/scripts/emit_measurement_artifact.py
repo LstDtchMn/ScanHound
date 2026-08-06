@@ -19,22 +19,31 @@ first version conflated them:
 Mixing them lets an Aug 6 miss be admitted while Aug 6 cycles also resolve
 earlier misses -- a moving denominator.
 
-SOURCE BINDING. The artifact records a generated-at timestamp, the SHA-256 of the
-database file, and a digest of the cohort's cycle UUIDs, so a later rerun can be
-shown to describe the same cohort or a different one.
+SOURCE BINDING. VACUUM INTO produces a consistent snapshot BEFORE any measurement
+query, and that snapshot -- not the live file -- is what gets hashed and queried.
+The earlier version hashed crawler.db after querying it, which bound nothing: the
+app runs WAL mode, so returned rows could live in crawler.db-wal, and the reads
+and the digest could observe different moments.
 
-PRIVACY. URLs are emitted as truncated SHA-256 hashes by default, which keeps the
-per-record manifest auditable (the same release hashes the same way across runs)
-without publishing the corpus. --include-urls opts into plaintext.
+REPLAY. --replay-out writes a redacted dataset carrying the hashed per-cycle
+listing_only and feed_only sets, so a reviewer can recompute the resolution
+calculation ("did this URL later appear in feed_only?") from repository contents
+alone. The per-record manifest is output; this is INPUT. Hash equality is
+sufficient for the algorithm, so no plaintext URL is needed.
+
+PRIVACY. URLs are emitted as full SHA-256 digests by default. The same release
+hashes identically across runs, so records stay comparable and replayable without
+publishing the corpus. --include-urls opts into plaintext.
 
     python emit_measurement_artifact.py --db PATH \\
         [--admission-start ISO] [--admission-end ISO] [--observation-end ISO] \\
-        [--include-urls]
+        [--replay-out PATH] [--snapshot PATH] [--no-snapshot] [--include-urls]
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import json
 import sqlite3
 import sys
@@ -71,17 +80,36 @@ def sha256_file(path, chunk=1 << 20):
 
 
 def url_id(url, *, plaintext):
+    """Full SHA-256, not a truncated prefix.
+
+    The review asked for full-length identifiers in an audit artifact: 16 hex
+    characters is fine for eyeballing, but a digest that anchors evidence should
+    not be shortened.
+    """
     if plaintext:
         return str(url)
-    return hashlib.sha256(str(url).encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(str(url).encode("utf-8")).hexdigest()
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="/dbvol/crawler.db")
+    ap.add_argument("--snapshot", default=None,
+                    help="path for the VACUUM INTO snapshot (default: "
+                         "<db>.measure-snapshot)")
+    ap.add_argument("--no-snapshot", action="store_true",
+                    help="query the live database directly. The digest then "
+                         "does NOT bind the queried bytes. Exploration only.")
+    ap.add_argument("--replay-out", default=None,
+                    help="write a redacted replay dataset here: hashed "
+                         "per-cycle listing_only/feed_only sets and hashed miss "
+                         "identities, sufficient to recompute the resolution "
+                         "calculation without the production corpus")
     ap.add_argument("--admission-start", default=None,
-                    help="earliest completed_at a miss may be admitted from "
-                         "(default: the first eligible cycle)")
+                    help="earliest completed_at a miss may be admitted from. "
+                         "DEFAULT: unbounded -- every cycle is admitted. (The "
+                         "help previously claimed 'the first eligible cycle', "
+                         "which was wrong.)")
     ap.add_argument("--admission-end", default=None,
                     help="latest completed_at a miss may be admitted from "
                          "(default: unbounded -- and then the cohort is NOT "
@@ -93,7 +121,45 @@ def main() -> int:
                     help="emit plaintext URLs instead of truncated hashes")
     args = ap.parse_args()
 
-    con = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+    # SNAPSHOT FIRST, THEN MEASURE. The previous version opened the live
+    # database read-only, ran many independent queries, and hashed crawler.db at
+    # the end. A 2026-08-06 review showed that binds nothing:
+    #
+    #   * the application runs SQLite in WAL mode, so rows returned by these
+    #     queries may live in crawler.db-wal, which was never hashed;
+    #   * hashing after the reads means the reads and the digest can observe
+    #     different moments of a live file.
+    #
+    # VACUUM INTO produces a single consistent file containing the WAL contents,
+    # and every query below runs against that. The digest then genuinely
+    # identifies the bytes that produced the counts.
+    snapshot_path = args.snapshot or (args.db + ".measure-snapshot")
+    snapshot_note = None
+    if args.no_snapshot:
+        snapshot_note = ("--no-snapshot: queried the live database directly. "
+                         "The digest does NOT bind the queried bytes; WAL "
+                         "contents are excluded and the file may change between "
+                         "reads. Use for exploration only.")
+        query_path = args.db
+    else:
+        try:
+            if os.path.exists(snapshot_path):
+                os.remove(snapshot_path)
+            src = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+            try:
+                src.execute("VACUUM INTO ?", (snapshot_path,))
+            finally:
+                src.close()
+            query_path = snapshot_path
+            snapshot_note = ("VACUUM INTO snapshot taken before any measurement "
+                             "query; WAL contents are folded in and the file is "
+                             "closed before hashing.")
+        except sqlite3.Error as exc:
+            print(f"snapshot failed: {exc}", file=sys.stderr)
+            return 2
+
+    source_digest = sha256_file(query_path)
+    con = sqlite3.connect(f"file:{query_path}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
 
     cycle_cols = {r[1] for r in con.execute(
@@ -117,6 +183,13 @@ def main() -> int:
     adm_start = as_utc(args.admission_start) if args.admission_start else None
     adm_end = as_utc(args.admission_end) if args.admission_end else None
     obs_end = as_utc(args.observation_end) if args.observation_end else None
+    # An observation window that ends before admission would deny a
+    # late-admitted miss any chance to resolve, which silently manufactures
+    # PENDING and AMBIGUOUS verdicts.
+    if adm_end and obs_end and obs_end < adm_end:
+        print("observation-end precedes admission-end: admitted misses would "
+              "have no window in which to resolve", file=sys.stderr)
+        return 2
 
     def in_admission(r):
         at = as_utc(r["completed_at"])
@@ -146,6 +219,7 @@ def main() -> int:
         except Exception:
             details = {}
         cyc[r["cycle_uuid"]] = {
+            "uuid": r["cycle_uuid"],
             "at": r["completed_at"],
             "listing_only": set(details.get("listing_only") or ()),
             "feed_only": set(details.get("feed_only") or ()),
@@ -160,7 +234,7 @@ def main() -> int:
         key=lambda pair: pair[0])
 
     def classify(url, first_seen):
-        """Return (state, hours, resolving_cycle_at)."""
+        """Return (state, hours, resolving_cycle_at, resolving_cycle_uuid)."""
         last_missing = first_seen
         for at, c in observations:
             if at <= first_seen:
@@ -168,13 +242,17 @@ def main() -> int:
             if url in c["listing_only"]:
                 last_missing = at
             elif url in c["feed_only"]:
-                return "resolved", (at - first_seen).total_seconds() / 3600, c["at"]
+                # The resolving cycle's UUID travels with its timestamp: a
+                # timestamp alone cannot be joined back to the cycle that
+                # supplied the evidence.
+                return ("resolved", (at - first_seen).total_seconds() / 3600,
+                        c["at"], c["uuid"])
         newest = observations[-1][0] if observations else first_seen
         unresolved_h = (newest - first_seen).total_seconds() / 3600
         if last_missing > first_seen:
             state = "red" if unresolved_h > YELLOW_H else "pending"
-            return state, unresolved_h, None
-        return "ambiguous", unresolved_h, None
+            return state, unresolved_h, None, None
+        return "ambiguous", unresolved_h, None, None
 
     select_media = " m.media_type," if "media_type" in miss_cols else " NULL AS media_type,"
     select_basis = (" m.attribution_basis," if "attribution_basis" in miss_cols
@@ -195,7 +273,8 @@ def main() -> int:
         manifest = []
         blocking = []
         for m in sorted(population, key=lambda x: str(x["at"])):
-            state, h, resolving_at = classify(m["u"], as_utc(m["at"]))
+            state, h, resolving_at, resolving_uuid = classify(
+                m["u"], as_utc(m["at"]))
             tier = (("green" if h <= GREEN_H else
                      "yellow" if h <= YELLOW_H else "red")
                     if state == "resolved" else state)
@@ -207,6 +286,7 @@ def main() -> int:
                 "source_cycle": m["cycle_uuid"],
                 "first_seen": m["at"],
                 "resolving_cycle_at": resolving_at,
+                "resolving_cycle_uuid": resolving_uuid,
                 "latency_hours": round(h, 3),
                 "status": m["status"],
                 "media_type": m["media_type"],
@@ -261,12 +341,15 @@ def main() -> int:
     artifact = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": {
-            "path": args.db,
-            "sha256": sha256_file(args.db),
-            "note": ("A live database changes under a reader. The digest fixes "
-                     "WHICH bytes produced these counts; it does not make the "
-                     "source immutable. For a citable result, export a snapshot "
-                     "and run against that."),
+            "live_path": args.db,
+            "queried_path": query_path,
+            "snapshotted": not args.no_snapshot,
+            "sha256": source_digest,
+            "sha256_covers": ("the exact file every query below ran against"
+                              if not args.no_snapshot else
+                              "crawler.db only -- NOT the WAL, and NOT pinned "
+                              "to the moment of reading"),
+            "note": snapshot_note,
         },
         "bounds": {
             "admission_start": args.admission_start,
@@ -359,6 +442,69 @@ def main() -> int:
                            "valid. Peer review 2026-08-06, Finding 3."),
         },
     }
+    # ── redacted replay input ────────────────────────────────────────────────
+    #
+    # The manifest above records what this run CONCLUDED. That cannot be checked
+    # without rerunning the same script against the same private database. This
+    # block records what the algorithm CONSUMED, hashed, so the resolution
+    # calculation can be recomputed from repository contents alone.
+    if args.replay_out:
+        replay = {
+            "generated_at": artifact["generated_at"],
+            "source_sha256": source_digest,
+            "bounds": artifact["bounds"],
+            "grading_rule": artifact["grading_rule"],
+            "eligibility_predicate": artifact["cohort"]["eligibility_predicate"],
+            "url_ids_are": ("plaintext" if args.include_urls
+                            else "sha256(canonical_url) full digest"),
+            "cycles": [
+                {
+                    "cycle_uuid": c["uuid"],
+                    "completed_at": c["at"],
+                    "eligible": c["eligible"],
+                    "normal_feeds_complete": c["complete"],
+                    "in_observation_window": c["observable"],
+                    "admitted": c["uuid"] in admitted_cycle_ids,
+                    "provenance": c["provenance"],
+                    # The two difference sets the resolution rule reads. Without
+                    # these a reviewer cannot replay "later appeared in
+                    # feed_only" at all.
+                    "listing_only_ids": sorted(
+                        url_id(u, plaintext=args.include_urls)
+                        for u in c["listing_only"]),
+                    "feed_only_ids": sorted(
+                        url_id(u, plaintext=args.include_urls)
+                        for u in c["feed_only"]),
+                }
+                for c in sorted(cyc.values(), key=lambda x: str(x["at"]))
+            ],
+            "misses": [
+                {
+                    "url_id": url_id(m["u"], plaintext=args.include_urls),
+                    "source_cycle": m["cycle_uuid"],
+                    "first_seen": m["at"],
+                    "status": m["status"],
+                    "media_type": m["media_type"],
+                    "attribution_basis": m["attribution_basis"],
+                    "source_cycle_normal_feeds_complete": m["complete"],
+                    "source_cycle_provenance": m["provenance"],
+                }
+                for m in sorted(all_misses, key=lambda x: str(x["at"]))
+            ],
+        }
+        with open(args.replay_out, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(replay, handle, indent=2, sort_keys=False)
+            handle.write("\n")
+        artifact["replay_dataset"] = {
+            "path": args.replay_out,
+            "sha256": sha256_file(args.replay_out),
+            "cycles": len(replay["cycles"]),
+            "misses": len(replay["misses"]),
+            "note": ("Sufficient to recompute the resolution calculation "
+                     "without the production database. Hash equality is all the "
+                     "algorithm needs."),
+        }
+
     json.dump(artifact, sys.stdout, indent=2, sort_keys=False)
     sys.stdout.write("\n")
     return 0

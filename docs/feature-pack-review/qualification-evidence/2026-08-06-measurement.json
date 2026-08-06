@@ -1,9 +1,12 @@
 {
-  "generated_at": "2026-08-06T16:05:01.673739+00:00",
+  "generated_at": "2026-08-06T17:27:46.647137+00:00",
   "source": {
-    "path": "/dbvol/crawler.db",
-    "sha256": "3328a6a6fd5ee4e89593edd986776f2a2fe4248a4044e0faa1795e875ac1a2cf",
-    "note": "A live database changes under a reader. The digest fixes WHICH bytes produced these counts; it does not make the source immutable. For a citable result, export a snapshot and run against that."
+    "live_path": "/dbvol/crawler.db",
+    "queried_path": "/out/snap.db",
+    "snapshotted": true,
+    "sha256": "afa181ffc0b1e5c307d2c62aa16d606f9ef5e76907e124756cd39aa63684f78b",
+    "sha256_covers": "the exact file every query below ran against",
+    "note": "VACUUM INTO snapshot taken before any measurement query; WAL contents are folded in and the file is closed before hashing."
   },
   "bounds": {
     "admission_start": "2026-07-22T00:00:00Z",
@@ -69,12 +72,13 @@
       "blocking_records": [],
       "record_manifest": [
         {
-          "url_id": "d040862e2ed17966",
+          "url_id": "d040862e2ed179663828bd138f948d93b0509915f29f708abaa729c670e4852d",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "ab53fac0-71bc-4b82-a325-9c0364e94cd9",
           "first_seen": "2026-07-22T07:48:19.038216+00:00",
           "resolving_cycle_at": "2026-07-22T08:58:38.773203+00:00",
+          "resolving_cycle_uuid": "fa66ddab-4d4a-4368-ad51-2223cccb7d3d",
           "latency_hours": 1.172,
           "status": "missing",
           "media_type": null,
@@ -82,12 +86,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "0a5b5460d4ca8df1",
+          "url_id": "0a5b5460d4ca8df1d3d240ee216042cb3cfbcd00aca4181e6298487ea876d838",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "ab53fac0-71bc-4b82-a325-9c0364e94cd9",
           "first_seen": "2026-07-22T07:48:19.038216+00:00",
           "resolving_cycle_at": "2026-07-22T08:58:38.773203+00:00",
+          "resolving_cycle_uuid": "fa66ddab-4d4a-4368-ad51-2223cccb7d3d",
           "latency_hours": 1.172,
           "status": "missing",
           "media_type": null,
@@ -95,12 +100,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "a3dc063dd942287d",
+          "url_id": "a3dc063dd942287de2f265f36a6ea2bcc03b7339a5d6f38eb8d1fe3e816e0ae2",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "45bd5101-2d5d-439a-b6e7-c1a6b8f34e08",
           "first_seen": "2026-07-22T13:42:07.190587+00:00",
           "resolving_cycle_at": "2026-07-22T14:59:11.471018+00:00",
+          "resolving_cycle_uuid": "87d44d90-63e0-4b7c-a6ec-1a00d81eae1f",
           "latency_hours": 1.285,
           "status": "missing",
           "media_type": null,
@@ -108,12 +114,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "064db34956f43a4b",
+          "url_id": "064db34956f43a4ba1f1efa630c62c81572a8cd3d47937b215fa7ed4c052d56e",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "495d38da-cffe-4fae-9ab5-8bf2c5369f82",
           "first_seen": "2026-07-23T09:58:48.449818+00:00",
           "resolving_cycle_at": "2026-07-23T11:01:24.731577+00:00",
+          "resolving_cycle_uuid": "1720909b-adfc-4704-9399-e902d2d10b5b",
           "latency_hours": 1.043,
           "status": "missing",
           "media_type": null,
@@ -121,12 +128,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "231be3ff772cc58b",
+          "url_id": "231be3ff772cc58b0381e750314322be040b3f5d8aa5af6582b9e6df998bcd52",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "495d38da-cffe-4fae-9ab5-8bf2c5369f82",
           "first_seen": "2026-07-23T09:58:48.449818+00:00",
           "resolving_cycle_at": "2026-07-23T11:01:24.731577+00:00",
+          "resolving_cycle_uuid": "1720909b-adfc-4704-9399-e902d2d10b5b",
           "latency_hours": 1.043,
           "status": "missing_season",
           "media_type": null,
@@ -134,12 +142,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "d91413b4ae05ae7b",
+          "url_id": "d91413b4ae05ae7b64b08b764fe52d2cb22b9d90a6e425fb4c024d06c097676b",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "1720909b-adfc-4704-9399-e902d2d10b5b",
           "first_seen": "2026-07-23T11:01:24.731577+00:00",
           "resolving_cycle_at": "2026-07-23T12:21:36.830244+00:00",
+          "resolving_cycle_uuid": "2d4ba38b-bd8b-4974-ba59-42e9a8e7940e",
           "latency_hours": 1.337,
           "status": "missing",
           "media_type": null,
@@ -147,12 +156,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "ed0d68348b22daff",
+          "url_id": "ed0d68348b22daffbc28187a9162c965373f4e91957b626a511814c2655e3b6e",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "2d4ba38b-bd8b-4974-ba59-42e9a8e7940e",
           "first_seen": "2026-07-23T12:21:36.830244+00:00",
           "resolving_cycle_at": "2026-07-23T14:03:30.703046+00:00",
+          "resolving_cycle_uuid": "2f094c86-90ad-43f2-9010-df8d5a4a1c0e",
           "latency_hours": 1.698,
           "status": "missing",
           "media_type": null,
@@ -160,12 +170,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "6373420a860cb236",
+          "url_id": "6373420a860cb2367a5088febb086001c422df0afe1ae84b1722b1193b6d31cf",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "2d4ba38b-bd8b-4974-ba59-42e9a8e7940e",
           "first_seen": "2026-07-23T12:21:36.830244+00:00",
           "resolving_cycle_at": "2026-07-23T14:03:30.703046+00:00",
+          "resolving_cycle_uuid": "2f094c86-90ad-43f2-9010-df8d5a4a1c0e",
           "latency_hours": 1.698,
           "status": "missing",
           "media_type": null,
@@ -173,12 +184,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "2ad296c10076d03e",
+          "url_id": "2ad296c10076d03e6d59d3f6b40e605f613be4203791c4941bd20d96e85ef683",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "2d4ba38b-bd8b-4974-ba59-42e9a8e7940e",
           "first_seen": "2026-07-23T12:21:36.830244+00:00",
           "resolving_cycle_at": "2026-07-23T14:03:30.703046+00:00",
+          "resolving_cycle_uuid": "2f094c86-90ad-43f2-9010-df8d5a4a1c0e",
           "latency_hours": 1.698,
           "status": "missing",
           "media_type": null,
@@ -186,12 +198,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "d9d2f3c7d922bb0d",
+          "url_id": "d9d2f3c7d922bb0de9e093c05958a104baab8e33d5325172372d355dfe8867e4",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "e8b5d707-e71d-4f79-995c-197d8dc9a3fe",
           "first_seen": "2026-07-23T19:40:43.399517+00:00",
           "resolving_cycle_at": "2026-07-23T20:49:57.221428+00:00",
+          "resolving_cycle_uuid": "6d1755ab-42fd-4102-a0d7-1840a32e37f1",
           "latency_hours": 1.154,
           "status": "missing",
           "media_type": null,
@@ -199,12 +212,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "8e4f968f99df9bd2",
+          "url_id": "8e4f968f99df9bd283b4445e0ac06dc8deca282dba5666f7ac37dfca41fa5a5d",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "6d1755ab-42fd-4102-a0d7-1840a32e37f1",
           "first_seen": "2026-07-23T20:49:57.221428+00:00",
           "resolving_cycle_at": "2026-07-23T21:52:08.893347+00:00",
+          "resolving_cycle_uuid": "71496d15-b019-453c-a78c-fa7c7cd34daa",
           "latency_hours": 1.037,
           "status": "missing_season",
           "media_type": null,
@@ -212,12 +226,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "47bc9fdbfe9d3cbf",
+          "url_id": "47bc9fdbfe9d3cbf5ccc4f9da4a02b1a1757474dc272a9ec6ab52b2517f97336",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "b14bda8a-be95-46f4-80f9-d98a2adff9eb",
           "first_seen": "2026-07-24T06:57:26.705810+00:00",
           "resolving_cycle_at": "2026-07-24T08:29:08.782616+00:00",
+          "resolving_cycle_uuid": "71e62ae7-247b-4a80-b160-69c3a0d4d0d2",
           "latency_hours": 1.528,
           "status": "missing",
           "media_type": null,
@@ -225,12 +240,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "3123daae94f7457a",
+          "url_id": "3123daae94f7457a62a584ebbf2b3bdc1b4cf89ee8e011ae58c7f13627357fa1",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "71e62ae7-247b-4a80-b160-69c3a0d4d0d2",
           "first_seen": "2026-07-24T08:29:08.782616+00:00",
           "resolving_cycle_at": "2026-07-24T09:30:58.210092+00:00",
+          "resolving_cycle_uuid": "f41c8a2b-212d-4e2f-a7bc-95e320d80d00",
           "latency_hours": 1.03,
           "status": "missing",
           "media_type": null,
@@ -238,12 +254,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "8ebcef9923029c6a",
+          "url_id": "8ebcef9923029c6a84236281039da0fe73a49d7f5aebff23ec67054711852292",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "71e62ae7-247b-4a80-b160-69c3a0d4d0d2",
           "first_seen": "2026-07-24T08:29:08.782616+00:00",
           "resolving_cycle_at": "2026-07-24T09:30:58.210092+00:00",
+          "resolving_cycle_uuid": "f41c8a2b-212d-4e2f-a7bc-95e320d80d00",
           "latency_hours": 1.03,
           "status": "missing",
           "media_type": null,
@@ -251,25 +268,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "eea1a8789732f117",
+          "url_id": "eea1a8789732f11762bf1d6c7bbed775c2ab7bfe0d23c846caf52bb9c8a0d15c",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "71e62ae7-247b-4a80-b160-69c3a0d4d0d2",
           "first_seen": "2026-07-24T08:29:08.782616+00:00",
           "resolving_cycle_at": "2026-07-24T09:30:58.210092+00:00",
-          "latency_hours": 1.03,
-          "status": "missing_season",
-          "media_type": null,
-          "attribution_basis": null,
-          "provenance_present": false
-        },
-        {
-          "url_id": "e1001d5ea9913bd6",
-          "tier": "green",
-          "state": "resolved",
-          "source_cycle": "71e62ae7-247b-4a80-b160-69c3a0d4d0d2",
-          "first_seen": "2026-07-24T08:29:08.782616+00:00",
-          "resolving_cycle_at": "2026-07-24T09:30:58.210092+00:00",
+          "resolving_cycle_uuid": "f41c8a2b-212d-4e2f-a7bc-95e320d80d00",
           "latency_hours": 1.03,
           "status": "missing_season",
           "media_type": null,
@@ -277,12 +282,27 @@
           "provenance_present": false
         },
         {
-          "url_id": "55c9902260ec2045",
+          "url_id": "e1001d5ea9913bd6c2a6d27111caa299285a0bd8e451fa0196974b890f308a9f",
+          "tier": "green",
+          "state": "resolved",
+          "source_cycle": "71e62ae7-247b-4a80-b160-69c3a0d4d0d2",
+          "first_seen": "2026-07-24T08:29:08.782616+00:00",
+          "resolving_cycle_at": "2026-07-24T09:30:58.210092+00:00",
+          "resolving_cycle_uuid": "f41c8a2b-212d-4e2f-a7bc-95e320d80d00",
+          "latency_hours": 1.03,
+          "status": "missing_season",
+          "media_type": null,
+          "attribution_basis": null,
+          "provenance_present": false
+        },
+        {
+          "url_id": "55c9902260ec204556f101ec6f27af35defc7c8e2eac3ecd3588fb8346de833a",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "6cd79e89-159d-4713-863f-888e836036cf",
           "first_seen": "2026-07-26T07:20:52.407639+00:00",
           "resolving_cycle_at": "2026-07-26T08:35:26.551818+00:00",
+          "resolving_cycle_uuid": "0f5f5978-fbd0-4be8-86a2-590d5297bf12",
           "latency_hours": 1.243,
           "status": "missing",
           "media_type": null,
@@ -290,12 +310,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "05593917b848a21a",
+          "url_id": "05593917b848a21a34be825cc06bcb57c4c84140914ffdd9f422530d23333104",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "6cd79e89-159d-4713-863f-888e836036cf",
           "first_seen": "2026-07-26T07:20:52.407639+00:00",
           "resolving_cycle_at": "2026-07-26T08:35:26.551818+00:00",
+          "resolving_cycle_uuid": "0f5f5978-fbd0-4be8-86a2-590d5297bf12",
           "latency_hours": 1.243,
           "status": "missing",
           "media_type": null,
@@ -303,12 +324,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "7f03e60b024cee6a",
+          "url_id": "7f03e60b024cee6a72c589fad1c72c18d7f1aac7b8a7f6ac1dab2a78f8e627c1",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "0f5f5978-fbd0-4be8-86a2-590d5297bf12",
           "first_seen": "2026-07-26T08:35:26.551818+00:00",
           "resolving_cycle_at": "2026-07-26T09:38:18.122597+00:00",
+          "resolving_cycle_uuid": "2a75132f-245c-4d01-8c26-3583d3d64932",
           "latency_hours": 1.048,
           "status": "missing",
           "media_type": null,
@@ -316,12 +338,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "f740359939a992a9",
+          "url_id": "f740359939a992a957714a43147f74e85a477b9de37df015852affd03046f308",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "128d5800-1669-468b-86e9-3c78002af56e",
           "first_seen": "2026-07-26T11:55:44.377530+00:00",
           "resolving_cycle_at": "2026-07-26T15:59:23.223590+00:00",
+          "resolving_cycle_uuid": "db64cd2a-810b-453f-a116-856c710f5e51",
           "latency_hours": 4.061,
           "status": "missing",
           "media_type": null,
@@ -329,12 +352,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "42eb0eda6beb1573",
+          "url_id": "42eb0eda6beb157381ed13953e06403e046f8f80994e711bd04c5dafb39c3d18",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "c5e5d430-5764-42f8-8e62-8d213676c6fa",
           "first_seen": "2026-07-26T17:15:10.921033+00:00",
           "resolving_cycle_at": "2026-07-26T20:33:08.813026+00:00",
+          "resolving_cycle_uuid": "43d68f7c-8532-4246-a75a-6bacc7c137d9",
           "latency_hours": 3.299,
           "status": "missing",
           "media_type": null,
@@ -342,12 +366,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "4a15905923faa62c",
+          "url_id": "4a15905923faa62cce2e5b88d8bdfca8ccd1678c2de2f20eace0b45afb9eb577",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "8d99210c-986a-42e0-92fa-99f8a4bb3c52",
           "first_seen": "2026-07-27T04:28:27.435413+00:00",
           "resolving_cycle_at": "2026-07-27T05:42:14.186364+00:00",
+          "resolving_cycle_uuid": "45aaf4ea-f3ce-4485-a9f1-6d0bdf554a82",
           "latency_hours": 1.23,
           "status": "missing",
           "media_type": null,
@@ -355,12 +380,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "6b37ecbb25f8ee54",
+          "url_id": "6b37ecbb25f8ee54d8d9a717e4af61cb680db11689c46e4639c90e02b3c2c9c5",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "875c1dea-1901-443f-a315-f9a59b656e18",
           "first_seen": "2026-07-27T14:52:02.782557+00:00",
           "resolving_cycle_at": "2026-07-27T16:07:28.856996+00:00",
+          "resolving_cycle_uuid": "f5dcb6dd-c0c5-4702-abd3-6db2d2a20454",
           "latency_hours": 1.257,
           "status": "missing",
           "media_type": null,
@@ -368,12 +394,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "499907cf9a15e883",
+          "url_id": "499907cf9a15e88338fcea928739557906e6d147c75bc0ebf2a051d869d459e0",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "ad765871-b350-4c55-83f0-1f1bf0525df2",
           "first_seen": "2026-07-27T18:19:30.950906+00:00",
           "resolving_cycle_at": "2026-07-27T19:25:41.228304+00:00",
+          "resolving_cycle_uuid": "d0ca17be-e31e-4094-8865-fafe19da26f0",
           "latency_hours": 1.103,
           "status": "missing",
           "media_type": null,
@@ -381,12 +408,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "335f417470aff41e",
+          "url_id": "335f417470aff41e6aee57bf838e7e329b9ed9284651f55bfbd5ac377b9d1553",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "afbb4c0a-f9f3-4e2b-9a22-d2f619038f5c",
           "first_seen": "2026-07-28T02:46:59.838219+00:00",
           "resolving_cycle_at": "2026-07-28T04:55:55.431871+00:00",
+          "resolving_cycle_uuid": "459e6b4a-87dd-434f-94d5-8db17039ef11",
           "latency_hours": 2.149,
           "status": "missing",
           "media_type": null,
@@ -394,12 +422,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "db6444b99f9d5567",
+          "url_id": "db6444b99f9d556765e1b337e5aa06cbb553f952096648229bc2c52a24733169",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "afbb4c0a-f9f3-4e2b-9a22-d2f619038f5c",
           "first_seen": "2026-07-28T02:46:59.838219+00:00",
           "resolving_cycle_at": "2026-07-28T04:55:55.431871+00:00",
+          "resolving_cycle_uuid": "459e6b4a-87dd-434f-94d5-8db17039ef11",
           "latency_hours": 2.149,
           "status": "upgrade",
           "media_type": null,
@@ -407,12 +436,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "eb03297c816e46bb",
+          "url_id": "eb03297c816e46bb407df23cd29e77123ee0bea6b88843e67cf894581b818cf6",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "afbb4c0a-f9f3-4e2b-9a22-d2f619038f5c",
           "first_seen": "2026-07-28T02:46:59.838219+00:00",
           "resolving_cycle_at": "2026-07-28T04:55:55.431871+00:00",
+          "resolving_cycle_uuid": "459e6b4a-87dd-434f-94d5-8db17039ef11",
           "latency_hours": 2.149,
           "status": "missing",
           "media_type": null,
@@ -420,12 +450,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "41a608e959822a5b",
+          "url_id": "41a608e959822a5bf74abd76b6af51ae1536e2dcb4ebe5ab40a9586a3b8227b5",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "ee482ed5-44d7-42a6-ad71-578ef99ce4bd",
           "first_seen": "2026-07-28T13:13:54.209522+00:00",
           "resolving_cycle_at": "2026-07-28T14:23:58.224644+00:00",
+          "resolving_cycle_uuid": "b6a1e021-3e24-4727-aa5b-e71ecef0d7a7",
           "latency_hours": 1.168,
           "status": "missing_season",
           "media_type": null,
@@ -433,12 +464,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "f8c564f5b69d10be",
+          "url_id": "f8c564f5b69d10bebd947aa4ce6e92b4202116c9a5c546f05860f38ca8a99829",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "1a465a7d-dd59-4ec7-b1a9-e2f634c627bf",
           "first_seen": "2026-07-28T21:49:30.207486+00:00",
           "resolving_cycle_at": "2026-07-28T22:55:36.046116+00:00",
+          "resolving_cycle_uuid": "9ac46780-e664-4b9c-bcf0-075e83171c87",
           "latency_hours": 1.102,
           "status": "upgrade",
           "media_type": null,
@@ -446,12 +478,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "68615c9f6ff888fb",
+          "url_id": "68615c9f6ff888fbc09f32769123f5946db149251846901b4971971371676f14",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "62dce397-a194-4def-a618-dfa19962b0a6",
           "first_seen": "2026-07-29T00:03:42.567107+00:00",
           "resolving_cycle_at": "2026-07-29T01:06:13.410256+00:00",
+          "resolving_cycle_uuid": "acc7e149-89fa-40f5-95ee-e3301411fe5a",
           "latency_hours": 1.042,
           "status": "missing",
           "media_type": null,
@@ -459,12 +492,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "b37c9d7b50b16f01",
+          "url_id": "b37c9d7b50b16f01064d4ccfce272ec99a0b106849e31c6c8027f56ef59988df",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "8ebd355b-20db-4cf9-9592-834062bcd722",
           "first_seen": "2026-07-29T02:15:52.751909+00:00",
           "resolving_cycle_at": "2026-07-29T03:22:16.566813+00:00",
+          "resolving_cycle_uuid": "3db6229e-5155-4d1b-aba6-8e185d2c1dfb",
           "latency_hours": 1.107,
           "status": "missing",
           "media_type": null,
@@ -472,12 +506,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "e233c91b56eda5ab",
+          "url_id": "e233c91b56eda5abadc19766782432e7c0e2f1c400c73c5a03ed3394d891a47b",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "8ebd355b-20db-4cf9-9592-834062bcd722",
           "first_seen": "2026-07-29T02:15:52.751909+00:00",
           "resolving_cycle_at": "2026-07-29T03:22:16.566813+00:00",
+          "resolving_cycle_uuid": "3db6229e-5155-4d1b-aba6-8e185d2c1dfb",
           "latency_hours": 1.107,
           "status": "missing_season",
           "media_type": null,
@@ -485,12 +520,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "ca24a7707c11d4ee",
+          "url_id": "ca24a7707c11d4eeecc4852de44b4d90030445b805d58209ddbdab03a247fd05",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "9367a3c3-e44d-4186-a531-2c890e9822b0",
           "first_seen": "2026-07-29T17:02:55.312404+00:00",
           "resolving_cycle_at": "2026-07-29T18:06:11.644541+00:00",
+          "resolving_cycle_uuid": "55091732-d268-4b49-bf63-45df23f834b7",
           "latency_hours": 1.055,
           "status": "missing",
           "media_type": null,
@@ -498,12 +534,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "31fa626736c54537",
+          "url_id": "31fa626736c54537b3ccd415d19a7ef5a2192bbcc20af32683f0d01ba5a8af68",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "5bca0968-f258-4278-ad9e-5e2c5a06a570",
           "first_seen": "2026-07-29T20:25:42.011053+00:00",
           "resolving_cycle_at": "2026-07-29T21:40:10.071444+00:00",
+          "resolving_cycle_uuid": "9ca09d22-1313-43a1-94c6-3673109375d8",
           "latency_hours": 1.241,
           "status": "dv_upgrade",
           "media_type": null,
@@ -511,12 +548,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "2a3620497f449dee",
+          "url_id": "2a3620497f449dee1f75bd4bb7905b4b53b51f8618ca3a7699ee69d3918ff0a4",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "5bca0968-f258-4278-ad9e-5e2c5a06a570",
           "first_seen": "2026-07-29T20:25:42.011053+00:00",
           "resolving_cycle_at": "2026-07-29T21:40:10.071444+00:00",
+          "resolving_cycle_uuid": "9ca09d22-1313-43a1-94c6-3673109375d8",
           "latency_hours": 1.241,
           "status": "missing",
           "media_type": null,
@@ -524,12 +562,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "7ae1c72680d4222a",
+          "url_id": "7ae1c72680d4222ad9112edd4503a3d7a2ebc449ff8551779e10bcfa08acc0d9",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "5bca0968-f258-4278-ad9e-5e2c5a06a570",
           "first_seen": "2026-07-29T20:25:42.011053+00:00",
           "resolving_cycle_at": "2026-07-29T21:40:10.071444+00:00",
+          "resolving_cycle_uuid": "9ca09d22-1313-43a1-94c6-3673109375d8",
           "latency_hours": 1.241,
           "status": "missing",
           "media_type": null,
@@ -537,12 +576,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "d0d7c11cfa052997",
+          "url_id": "d0d7c11cfa052997f68c7fc27ae51294e225fe8fa3649091d784868e016595d6",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "9ca09d22-1313-43a1-94c6-3673109375d8",
           "first_seen": "2026-07-29T21:40:10.071444+00:00",
           "resolving_cycle_at": "2026-07-29T23:35:21.215416+00:00",
+          "resolving_cycle_uuid": "34393491-2828-4431-b755-e517cf250a82",
           "latency_hours": 1.92,
           "status": "missing",
           "media_type": null,
@@ -550,12 +590,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "70c214c7cdf3195e",
+          "url_id": "70c214c7cdf3195e868aac7063f105073f6fc5bb8bc4eb7144fcb4db1b9c6151",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "70117c48-5c38-435c-94c2-41aa6d259fb9",
           "first_seen": "2026-07-30T08:01:28.480028+00:00",
           "resolving_cycle_at": "2026-07-30T09:11:09.114386+00:00",
+          "resolving_cycle_uuid": "b18dbea0-0cab-4663-8383-6f0551ad38ae",
           "latency_hours": 1.161,
           "status": "upgrade",
           "media_type": null,
@@ -563,12 +604,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "d518acf40eaf785a",
+          "url_id": "d518acf40eaf785aee6d21391d523ea7c416de84feb5742e56f525a510044e56",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "b18dbea0-0cab-4663-8383-6f0551ad38ae",
           "first_seen": "2026-07-30T09:11:09.114386+00:00",
           "resolving_cycle_at": "2026-07-30T10:19:26.554082+00:00",
+          "resolving_cycle_uuid": "d755e7d5-be94-41d1-98de-7ecaeefaa118",
           "latency_hours": 1.138,
           "status": "upgrade",
           "media_type": null,
@@ -576,12 +618,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "ba6d6212bd8ad97e",
+          "url_id": "ba6d6212bd8ad97ec527561805bea8c9cd736780acde48195ccd547cabc3353a",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "d755e7d5-be94-41d1-98de-7ecaeefaa118",
           "first_seen": "2026-07-30T10:19:26.554082+00:00",
           "resolving_cycle_at": "2026-07-30T12:26:27.854641+00:00",
+          "resolving_cycle_uuid": "f718b996-97e3-4de3-8c61-dc6478e6f008",
           "latency_hours": 2.117,
           "status": "upgrade",
           "media_type": null,
@@ -589,12 +632,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "3449af94810d18ee",
+          "url_id": "3449af94810d18eeb25442cf5bb27408813fe54dff0d6745719bbc4e2e3bea76",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "82a56925-b420-47a2-a343-b6aeecda65e3",
           "first_seen": "2026-07-30T14:18:23.199157+00:00",
           "resolving_cycle_at": "2026-07-30T15:23:02.004714+00:00",
+          "resolving_cycle_uuid": "ed879312-8386-46d1-b989-264d311af605",
           "latency_hours": 1.077,
           "status": "missing",
           "media_type": null,
@@ -602,12 +646,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "063c6ac926e1ff39",
+          "url_id": "063c6ac926e1ff39e725c7f49441c07b573558dd246adc00eeb3fc050c532678",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "ed879312-8386-46d1-b989-264d311af605",
           "first_seen": "2026-07-30T15:23:02.004714+00:00",
           "resolving_cycle_at": "2026-07-30T16:26:46.867199+00:00",
+          "resolving_cycle_uuid": "a02a0804-e041-458b-81aa-012b4e3f88f1",
           "latency_hours": 1.062,
           "status": "missing",
           "media_type": null,
@@ -615,12 +660,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "26c1111f2429115f",
+          "url_id": "26c1111f2429115ffbd3a597dcf7c0a40cce4097a66afeefac263bd1f8523080",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "0bbbb2ef-94e0-4b61-86c3-8809dfce18a3",
           "first_seen": "2026-07-30T18:38:17.964200+00:00",
           "resolving_cycle_at": "2026-07-30T20:43:34.799148+00:00",
+          "resolving_cycle_uuid": "c516891c-15fc-43ac-8f7d-ccebe4675ab9",
           "latency_hours": 2.088,
           "status": "missing",
           "media_type": null,
@@ -628,12 +674,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "7151140aebdf901d",
+          "url_id": "7151140aebdf901d378e6c3d574b2062ae2db8de7d130d8ee5c686562d112637",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "b3dd4afb-ee9c-4e88-b307-70fe14631a52",
           "first_seen": "2026-07-31T04:26:24.000548+00:00",
           "resolving_cycle_at": "2026-07-31T05:25:02.341457+00:00",
+          "resolving_cycle_uuid": "72e8c2e0-4673-4eb7-ad7b-2f1779b24194",
           "latency_hours": 0.977,
           "status": "missing",
           "media_type": null,
@@ -641,12 +688,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "9c7ff9d7ec19e2fd",
+          "url_id": "9c7ff9d7ec19e2fdeda731bb43bf2df8285c234e42b63f9942f1d5b84675bf30",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "b3dd4afb-ee9c-4e88-b307-70fe14631a52",
           "first_seen": "2026-07-31T04:26:24.000548+00:00",
           "resolving_cycle_at": "2026-07-31T05:25:02.341457+00:00",
+          "resolving_cycle_uuid": "72e8c2e0-4673-4eb7-ad7b-2f1779b24194",
           "latency_hours": 0.977,
           "status": "missing",
           "media_type": null,
@@ -654,12 +702,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "c196acc20fa9a565",
+          "url_id": "c196acc20fa9a565e82cde8d2ffdd4b05a5ac861c15f6d16093381f5ad53ef1a",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "b3dd4afb-ee9c-4e88-b307-70fe14631a52",
           "first_seen": "2026-07-31T04:26:24.000548+00:00",
           "resolving_cycle_at": "2026-07-31T05:25:02.341457+00:00",
+          "resolving_cycle_uuid": "72e8c2e0-4673-4eb7-ad7b-2f1779b24194",
           "latency_hours": 0.977,
           "status": "missing",
           "media_type": null,
@@ -667,12 +716,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "b8bf7bcdc110e7c2",
+          "url_id": "b8bf7bcdc110e7c2d9b64f1f9c8cd047e4686dd9d9fedfd4535b64c253de7804",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "5970505b-114d-42fd-b04a-b0457d501ab1",
           "first_seen": "2026-07-31T07:19:59.150591+00:00",
           "resolving_cycle_at": "2026-07-31T08:32:20.637726+00:00",
+          "resolving_cycle_uuid": "6d920cf5-94f2-46d5-bcb7-c8108daddf58",
           "latency_hours": 1.206,
           "status": "missing",
           "media_type": null,
@@ -680,12 +730,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "351b04b1e083cbc1",
+          "url_id": "351b04b1e083cbc189c4de97e0da89437253447250b3ce1386e1347bd04d7aa7",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "71896366-54a5-4537-b9a9-c5c0c040f17d",
           "first_seen": "2026-07-31T17:54:35.240537+00:00",
           "resolving_cycle_at": "2026-07-31T18:58:26.240152+00:00",
+          "resolving_cycle_uuid": "689dbfdf-8b58-4295-9d8a-15e118b23272",
           "latency_hours": 1.064,
           "status": "upgrade",
           "media_type": null,
@@ -693,12 +744,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "4357ab3b520ccd49",
+          "url_id": "4357ab3b520ccd49bccfe465c1ea517c27350710644718a4f471fcc6a97f06f6",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "f383f066-b719-4811-b07b-d8f5eb4fca5e",
           "first_seen": "2026-08-01T04:03:12.337713+00:00",
           "resolving_cycle_at": "2026-08-01T05:17:31.080573+00:00",
+          "resolving_cycle_uuid": "6e4e3736-74ff-43c7-aa4a-b9274c8196db",
           "latency_hours": 1.239,
           "status": "missing",
           "media_type": null,
@@ -706,12 +758,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "4bcea3496e28cd92",
+          "url_id": "4bcea3496e28cd92d54408ce8e1216aa8fe46e3b57b624a1b54e6dad443c0ece",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "5e4539bf-4a73-45e2-af63-d26ee8b783ee",
           "first_seen": "2026-08-01T17:51:52.102526+00:00",
           "resolving_cycle_at": "2026-08-01T18:57:34.431517+00:00",
+          "resolving_cycle_uuid": "125d1977-0aa7-4eac-9906-9bf62476cc17",
           "latency_hours": 1.095,
           "status": "upgrade",
           "media_type": null,
@@ -719,12 +772,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "a02b79d22cae5195",
+          "url_id": "a02b79d22cae51954e3980bc94611f24814b2f20f1f38352590328586cef41b9",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "de40f67c-b01a-4ae4-a59c-9d415269bf08",
           "first_seen": "2026-08-01T20:03:34.197456+00:00",
           "resolving_cycle_at": "2026-08-01T21:11:20.041595+00:00",
+          "resolving_cycle_uuid": "bcb4561e-d28a-4fea-b050-9b31fd68d758",
           "latency_hours": 1.129,
           "status": "upgrade",
           "media_type": null,
@@ -732,12 +786,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "a6d1f99e82730636",
+          "url_id": "a6d1f99e827306367ce91d16f7731e90a84c2d470ae258d0d333049e51563926",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "356d0fdc-276d-4264-a83e-721ff1df63ea",
           "first_seen": "2026-08-02T02:43:36.274365+00:00",
           "resolving_cycle_at": "2026-08-02T03:48:31.808934+00:00",
+          "resolving_cycle_uuid": "f15dba0e-ee9c-4c28-bd35-7a62ac56fe4e",
           "latency_hours": 1.082,
           "status": "missing",
           "media_type": null,
@@ -745,12 +800,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "f7d69288f6c3e708",
+          "url_id": "f7d69288f6c3e708f02563c616233dcb7fef56517bf6e4c305070067da9e81aa",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "9c6bdeb1-625b-4067-9496-f19ebab60483",
           "first_seen": "2026-08-02T05:47:04.523344+00:00",
           "resolving_cycle_at": "2026-08-02T06:56:04.638498+00:00",
+          "resolving_cycle_uuid": "e7d3289b-b452-417a-bae9-b25757f8997c",
           "latency_hours": 1.15,
           "status": "missing",
           "media_type": null,
@@ -758,12 +814,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "efc2a53b47863aa7",
+          "url_id": "efc2a53b47863aa7eba5c14b8520aa76adcf728e55f9e3f04cf790165ccd133e",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "0b961b8a-dc94-481e-92af-828b2f46efc4",
           "first_seen": "2026-08-03T05:18:12.609079+00:00",
           "resolving_cycle_at": "2026-08-03T07:25:56.002616+00:00",
+          "resolving_cycle_uuid": "86593491-618c-45de-8951-5e5f37037e65",
           "latency_hours": 2.129,
           "status": "upgrade",
           "media_type": null,
@@ -771,12 +828,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "ad29425257730590",
+          "url_id": "ad29425257730590fd5a2c267f2a13a5439d1f736ce9feb161b5ff596b57c17d",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "38abc20d-605f-45fa-ab0d-5dddaee39d31",
           "first_seen": "2026-08-03T08:32:53.248092+00:00",
           "resolving_cycle_at": "2026-08-03T09:47:12.745029+00:00",
+          "resolving_cycle_uuid": "7cfe710c-52c2-4b30-adf3-c558c08ba07a",
           "latency_hours": 1.239,
           "status": "missing",
           "media_type": null,
@@ -784,12 +842,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "b929ea47b8a2ed5a",
+          "url_id": "b929ea47b8a2ed5af38e185f4278d910c5e881557a8f1436bf66e191d7c882c2",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "8d06c2db-1f4c-436d-9dd7-07d93293a366",
           "first_seen": "2026-08-03T16:01:09.620429+00:00",
           "resolving_cycle_at": "2026-08-03T17:07:10.948033+00:00",
+          "resolving_cycle_uuid": "a3f2ee38-efab-4f97-8cd8-e921f31387f5",
           "latency_hours": 1.1,
           "status": "missing",
           "media_type": null,
@@ -797,12 +856,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "7b24f89eb55cf207",
+          "url_id": "7b24f89eb55cf2072fa1dc63f62e76284e41e10454bb99a7257cf21966f7583f",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "3a71e886-028d-4c38-8384-7b0292779051",
           "first_seen": "2026-08-04T06:36:00.613355+00:00",
           "resolving_cycle_at": "2026-08-04T08:44:30.775760+00:00",
+          "resolving_cycle_uuid": "a567d89f-58a0-4793-8348-cfe28b6deb31",
           "latency_hours": 2.142,
           "status": "missing",
           "media_type": null,
@@ -810,12 +870,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "da8482fb33946536",
+          "url_id": "da8482fb33946536bf1338d78e4d6682a1ebd1a5cec3ea961b122616de6b70d8",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "e870e640-e8a5-4f81-b3c5-5945d3449108",
           "first_seen": "2026-08-04T21:51:36.286941+00:00",
           "resolving_cycle_at": "2026-08-04T23:29:09.971734+00:00",
+          "resolving_cycle_uuid": "4019ad3b-0580-4060-8fa4-5a972470fd43",
           "latency_hours": 1.626,
           "status": "missing",
           "media_type": null,
@@ -823,12 +884,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "529c4521df788508",
+          "url_id": "529c4521df788508e4b72799808de445d386fe9383dfa2bfa26efc06cdebb2a7",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "7daceff5-b22c-4e3b-805e-9cfa4092c64a",
           "first_seen": "2026-08-05T01:28:55.902464+00:00",
           "resolving_cycle_at": "2026-08-05T02:35:34.945371+00:00",
+          "resolving_cycle_uuid": "a325cea2-a210-43d3-bace-07550de1f067",
           "latency_hours": 1.111,
           "status": "missing",
           "media_type": null,
@@ -836,12 +898,13 @@
           "provenance_present": false
         },
         {
-          "url_id": "a57c9b4e6f774393",
+          "url_id": "a57c9b4e6f774393099477bf6c659f75cbc9c865df9af7ed75e99c996463fd3a",
           "tier": "green",
           "state": "resolved",
           "source_cycle": "d47d8bd4-cbd6-4dc7-9fa1-808bbed810a9",
           "first_seen": "2026-08-05T08:57:59.455696+00:00",
           "resolving_cycle_at": "2026-08-05T11:03:05.546244+00:00",
+          "resolving_cycle_uuid": "9647da61-849c-4d28-95e5-70c9dda69ded",
           "latency_hours": 2.085,
           "status": "missing",
           "media_type": null,
@@ -869,5 +932,12 @@
   "resolution_evidence": {
     "rule": "a miss is resolved only when its canonical URL later appears in feed_only during an eligible cycle inside the observation bound",
     "limitation": "proves the feed had acquired the URL by that later cycle; it does NOT prove the original comparison was valid. Peer review 2026-08-06, Finding 3."
+  },
+  "replay_dataset": {
+    "path": "/out/replay.json",
+    "sha256": "481e7cc7111acfc3c6fa8d8938b379c532518f9d898b54fee16ae69312a465e2",
+    "cycles": 315,
+    "misses": 159,
+    "note": "Sufficient to recompute the resolution calculation without the production database. Hash equality is all the algorithm needs."
   }
 }

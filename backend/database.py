@@ -2145,61 +2145,129 @@ class DatabaseManager:
         # states are now integrity blockers surfaced in readiness reasons.
         from backend.hdencode_shadow import feed_observation_valid
         integrity=[]
+        # EVERY ROW IS ACCOUNTED FOR. The Round 3 version incremented on a valid
+        # observation and did nothing otherwise, and reconciled counts only where
+        # relevant_miss_count > 0. So a row unsupported by its own provenance was
+        # silently dropped whenever the stored count happened to equal the row
+        # count -- another route from contradictory evidence to ready=true. My own
+        # test asserted that behaviour was correct, which is how it survived.
+        #
+        # Now each row is sorted into supported / unsupported / corrupt, and
+        # anything that is not supported is either counted or flagged. Nothing
+        # falls off the end.
+        _VALID_MEDIA_TYPES={"movie","tv","unknown"}
         attributed=0
+        per_cycle={}
         rows=self._query_dicts(
-            "SELECT m.cycle_uuid AS cycle_uuid, m.media_type AS media_type, "
+            "SELECT m.cycle_uuid AS cycle_uuid, m.canonical_url AS url, "
+            "       m.media_type AS media_type, "
             "       c.normal_feed_outcomes AS provenance, "
             "       c.normal_feeds_complete AS complete, "
             "       c.relevant_miss_count AS stored_count "
             "FROM hdencode_shadow_misses m "
             "JOIN hdencode_shadow_cycles c ON c.cycle_uuid=m.cycle_uuid "
             "WHERE c.normal_feed_outcomes IS NOT NULL",default=[])
-        rows_per_cycle={}
         for row in rows:
             cycle=str(row.get("cycle_uuid") or "")
-            rows_per_cycle[cycle]=rows_per_cycle.get(cycle,0)+1
+            slot=per_cycle.setdefault(cycle,{"total":0,"supported":0,
+                                             "unsupported":0,"corrupt":0})
+            slot["total"]+=1
+            media_type=row.get("media_type")
+            # A persisted media_type outside the vocabulary is corrupt evidence.
+            # "unknown" is a legitimate classifier result; NULL or arbitrary text
+            # is not, and must not be silently coerced into it.
+            if media_type is None or str(media_type) not in _VALID_MEDIA_TYPES:
+                integrity.append(
+                    f"media_type_invalid:{cycle}:{media_type!r}")
+                slot["corrupt"]+=1
+                continue
             raw=row.get("provenance")
             try:
                 provenance=json.loads(raw or "{}")
             except (TypeError,ValueError):
-                # Malformed JSON is an impossible state. Counting zero here is
-                # how the gate used to be deflated by corrupt data.
                 integrity.append(f"provenance_unparseable:{cycle}")
+                slot["corrupt"]+=1
                 continue
             if not isinstance(provenance,dict):
                 integrity.append(f"provenance_not_an_object:{cycle}")
+                slot["corrupt"]+=1
                 continue
             if "_derived_from" in provenance:
-                # A caller that supplied no per-feed provenance. The marker
-                # deliberately does not fabricate feed outcomes, so fall back to
-                # the cycle-level rule it was genuinely derived from.
+                # Written by a caller that supplied no per-feed provenance. The
+                # marker deliberately does not fabricate feed outcomes, so the
+                # decision falls back to the cycle-level rule it came from -- but
+                # the marker's own shape and self-consistency are checked, since
+                # an unrecognised or contradictory marker is corrupt evidence
+                # rather than a licence to use the fallback.
+                if str(provenance.get("_derived_from"))!="cycle_level_completeness":
+                    integrity.append(
+                        f"derived_marker_unknown:{cycle}:"
+                        f"{provenance.get('_derived_from')!r}")
+                    slot["corrupt"]+=1
+                    continue
+                recorded=provenance.get("normal_feeds_complete")
+                if recorded is not None and bool(recorded)!=bool(row.get("complete")):
+                    integrity.append(f"derived_marker_contradicts_cycle:{cycle}")
+                    slot["corrupt"]+=1
+                    continue
                 if row.get("complete"):
                     attributed+=1
+                    slot["supported"]+=1
+                else:
+                    # Derived from an incomplete cycle: not a miss, and not a
+                    # contradiction either -- compare_shadow records the marker
+                    # before knowing the outcome. Counted as unsupported so the
+                    # reconciliation below sees it.
+                    slot["unsupported"]+=1
                 continue
             if not provenance:
                 # Supplied-empty provenance with a miss row attached is
                 # contradictory: compare_shadow cannot attribute anything with no
-                # observed feed, so it would never have written this row. Either
-                # the row was inserted directly or the writer dropped the field.
+                # observed feed, so it would never have written this row.
                 integrity.append(f"miss_row_with_empty_provenance:{cycle}")
+                slot["corrupt"]+=1
                 continue
-            if feed_observation_valid(str(row.get("media_type") or "unknown"),
-                                      provenance):
+            if feed_observation_valid(str(media_type),provenance):
                 attributed+=1
-        # A stored aggregate that disagrees with the rows on disk means one of
-        # them is wrong, and the gate must not silently prefer either.
+                slot["supported"]+=1
+            else:
+                # THE ROUND 3 HOLE. compare_shadow would never persist a row
+                # whose own feed was not observed, so this row should not exist.
+                # Dropping it quietly is exactly the fail-open that was supposed
+                # to have been removed.
+                integrity.append(
+                    f"miss_row_unsupported_by_provenance:{cycle}:{media_type}")
+                slot["unsupported"]+=1
+        # Orphan rows are invisible to the join above, and the declared foreign
+        # key is not proof they cannot exist: this connection does not enable
+        # PRAGMA foreign_keys, so it is not enforced.
+        orphans=self._query(
+            "SELECT COUNT(*) AS n FROM hdencode_shadow_misses m "
+            "WHERE NOT EXISTS (SELECT 1 FROM hdencode_shadow_cycles c "
+            "                  WHERE c.cycle_uuid=m.cycle_uuid)",
+            one=True,default=None)
+        orphan_count=int((orphans["n"] if orphans else 0) or 0)
+        if orphan_count:
+            integrity.append(f"orphan_miss_rows:{orphan_count}")
+        # Reconcile EVERY provenance-aware cycle, including stored zero. The
+        # previous query filtered relevant_miss_count > 0, so a cycle claiming
+        # zero while carrying rows was never checked -- and would either invent a
+        # count or discard the rows, depending on whether they validated.
         for claim in self._query_dicts(
                 "SELECT cycle_uuid, relevant_miss_count AS n "
                 "FROM hdencode_shadow_cycles "
-                "WHERE normal_feed_outcomes IS NOT NULL "
-                "  AND relevant_miss_count > 0",default=[]):
+                "WHERE normal_feed_outcomes IS NOT NULL",default=[]):
             cycle=str(claim.get("cycle_uuid") or "")
             stored=int(claim.get("n") or 0)
-            present=rows_per_cycle.get(cycle,0)
-            if present==0:
+            slot=per_cycle.get(cycle)
+            total=slot["total"] if slot else 0
+            if stored==0 and total==0:
+                continue
+            if total==0:
                 integrity.append(f"count_without_rows:{cycle}:{stored}")
-            elif present!=stored:
-                integrity.append(f"count_row_disagreement:{cycle}:{stored}!={present}")
+            elif stored!=total:
+                integrity.append(
+                    f"count_row_disagreement:{cycle}:{stored}!={total}")
         # Pre-attribution rows cannot be re-derived at all: nothing recorded
         # which feed succeeded, and they carry no media_type to attribute. They
         # are bounded CONSERVATIVELY -- counted only when both normal feeds
@@ -2219,8 +2287,16 @@ class DatabaseManager:
             "FROM hdencode_shadow_cycles "
             "WHERE normal_feed_outcomes IS NULL AND normal_feeds_complete=1",
             one=True,default=None)
+        # Categorised so an operator can tell "coverage miss" from "evidence
+        # store corrupt" without the gate ever reporting ready.
+        findings=sorted(set(integrity))
+        by_category={}
+        for finding in findings:
+            by_category[finding.split(":",1)[0]]=by_category.get(
+                finding.split(":",1)[0],0)+1
         misses={"relevant_misses":attributed+int((legacy["n"] if legacy else 0) or 0),
-                "miss_evidence_integrity":sorted(set(integrity))}
+                "miss_evidence_integrity":findings,
+                "miss_evidence_integrity_by_category":by_category}
         latest=self._query(
             "SELECT * FROM hdencode_shadow_cycles "
             "ORDER BY completed_at DESC LIMIT 1",
@@ -2237,6 +2313,8 @@ class DatabaseManager:
             # means the stored evidence contradicts itself, which blocks
             # readiness rather than being silently resolved to zero.
             "miss_evidence_integrity":list((misses or {}).get("miss_evidence_integrity") or []),
+            "miss_evidence_integrity_by_category":dict(
+                (misses or {}).get("miss_evidence_integrity_by_category") or {}),
             "rss_requests":rss,
             "listing_requests":listing,
             "request_reduction_pct":round(reduction,2),

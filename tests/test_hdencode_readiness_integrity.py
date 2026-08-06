@@ -4,6 +4,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 
+import pytest
+
 from backend.database import DatabaseManager
 from backend.background_scanner import BackgroundScanner
 
@@ -143,7 +145,16 @@ def test_a_degraded_cycle_with_no_valid_relevant_feed_does_not_block(tmp_path):
     )
     _insert_miss(db, uuid="degraded-nothing-valid", media_type="movie",
                  url="https://hdencode.org/a-movie-2026-2160p-x-9-gb")
-    assert db.get_hdencode_shadow_summary()["relevant_misses"] == 0
+    summary = db.get_hdencode_shadow_summary()
+    assert summary["relevant_misses"] == 0
+    # AND it must be flagged. A 2026-08-06 review pointed out that this test
+    # previously asserted only the zero count, which certified the fail-open it
+    # was meant to guard against: compare_shadow could not have written a row
+    # whose own feed was unobserved, so this store is self-contradictory and must
+    # block rather than merely count zero.
+    assert any("unsupported_by_provenance" in r
+               for r in summary["miss_evidence_integrity"]), (
+        "an unsupported miss row was silently discarded")
 
 
 def test_a_catchup_only_cycle_cannot_validate_a_comparison(tmp_path):
@@ -354,3 +365,153 @@ def test_consistent_evidence_raises_no_integrity_flag(tmp_path):
     summary = db.get_hdencode_shadow_summary()
     assert summary["relevant_misses"] == 1
     assert summary["miss_evidence_integrity"] == []
+
+# -- every row accounted for (2026-08-06 Round 3 review, Finding 1) -----------
+#
+# The Round 3 check incremented on a valid observation and did nothing otherwise,
+# and reconciled counts only where relevant_miss_count > 0. So a row unsupported
+# by its own provenance vanished whenever the stored count happened to equal the
+# row count. These are the cases the review required.
+
+def _integrity(db):
+    return db.get_hdencode_shadow_summary()["miss_evidence_integrity"]
+
+
+def _blocks(db):
+    return "miss_evidence_integrity_failed" in db.get_hdencode_rss_readiness(
+        min_cycles=1, min_days=0)["reasons"]
+
+
+def test_one_row_count_one_relevant_feed_failed(tmp_path):
+    """The exact false-pass the review constructed: counts agree, row invalid."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="c", completed_at="2026-07-21T00:00:00+00:00",
+                  normal=0, rss=1, listing=1, misses=1,
+                  outcome="incomplete_feeds",
+                  feed_outcomes={"movies_all": "failed", "tv_all": "failed"})
+    _insert_miss(db, uuid="c", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    summary = db.get_hdencode_shadow_summary()
+    assert summary["relevant_misses"] == 0
+    assert any("unsupported_by_provenance" in r
+               for r in summary["miss_evidence_integrity"])
+    assert _blocks(db)
+
+
+def test_one_row_count_zero_relevant_feed_valid(tmp_path):
+    """Stored zero with a row present: previously never reconciled at all."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="c", completed_at="2026-07-21T00:00:00+00:00",
+                  normal=1, rss=2, listing=10, misses=0, outcome="success",
+                  feed_outcomes={"movies_all": "changed", "tv_all": "changed"})
+    _insert_miss(db, uuid="c", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    assert any("count_row_disagreement" in r for r in _integrity(db))
+    assert _blocks(db)
+
+
+def test_one_row_count_zero_relevant_feed_failed(tmp_path):
+    """Both contradictions at once; both reported."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="c", completed_at="2026-07-21T00:00:00+00:00",
+                  normal=0, rss=1, listing=1, misses=0,
+                  outcome="incomplete_feeds",
+                  feed_outcomes={"movies_all": "failed", "tv_all": "failed"})
+    _insert_miss(db, uuid="c", media_type="tv",
+                 url="https://hdencode.org/s-s01-1080p-x-5-gb")
+    findings = _integrity(db)
+    assert any("unsupported_by_provenance" in r for r in findings)
+    assert any("count_row_disagreement" in r for r in findings)
+    assert _blocks(db)
+
+
+@pytest.mark.parametrize("media_type", [None, "film", "MOVIE", "", "tv-show"])
+def test_media_type_outside_the_vocabulary_is_corrupt(tmp_path, media_type):
+    """unknown is a legitimate classifier result; NULL and arbitrary text are
+    not. Coercing these into "unknown" let them count whenever both feeds
+    validated, which is how corrupt evidence reached the gate."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="c", completed_at="2026-07-21T00:00:00+00:00",
+                  normal=1, rss=2, listing=10, misses=1,
+                  outcome="relevant_miss",
+                  feed_outcomes={"movies_all": "changed", "tv_all": "changed"})
+    _insert_miss(db, uuid="c", media_type=media_type,
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    assert any("media_type_invalid" in r for r in _integrity(db))
+    assert _blocks(db)
+
+
+@pytest.mark.parametrize("media_type", ["movie", "tv", "unknown"])
+def test_the_three_legitimate_media_types_are_accepted(tmp_path, media_type):
+    """Positive control: the vocabulary check must not fire on valid values."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="c", completed_at="2026-07-21T00:00:00+00:00",
+                  normal=1, rss=2, listing=10, misses=1,
+                  outcome="relevant_miss",
+                  feed_outcomes={"movies_all": "changed", "tv_all": "changed"})
+    _insert_miss(db, uuid="c", media_type=media_type,
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    summary = db.get_hdencode_shadow_summary()
+    assert summary["miss_evidence_integrity"] == []
+    assert summary["relevant_misses"] == 1
+
+
+def test_an_unrecognised_derived_marker_is_corrupt(tmp_path):
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _cycle_with_raw_provenance(
+        db, uuid="c", raw=json.dumps({"_derived_from": "something_invented"}))
+    _insert_miss(db, uuid="c", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    assert any("derived_marker_unknown" in r for r in _integrity(db))
+    assert _blocks(db)
+
+
+def test_a_derived_marker_contradicting_its_cycle_is_corrupt(tmp_path):
+    """The marker records the completeness it was derived from. If that
+    disagrees with the cycle column, one of the two was rewritten."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _cycle_with_raw_provenance(
+        db, uuid="c",
+        raw=json.dumps({"_derived_from": "cycle_level_completeness",
+                        "normal_feeds_complete": False}))
+    _insert_miss(db, uuid="c", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    # _cycle_with_raw_provenance writes normal_feeds_complete=1.
+    assert any("derived_marker_contradicts_cycle" in r for r in _integrity(db))
+    assert _blocks(db)
+
+
+def test_an_orphan_miss_row_is_detected(tmp_path):
+    """The join cannot see these, and the declared foreign key is not proof they
+    cannot exist: this connection does not enable PRAGMA foreign_keys."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO hdencode_shadow_misses "
+        "(cycle_uuid, canonical_url, title, status, media_type) "
+        "VALUES ('no-such-cycle', 'https://hdencode.org/x-1-gb', 'T',"
+        " 'missing', 'movie')")
+    conn.commit()
+    assert any("orphan_miss_rows" in r for r in _integrity(db))
+    assert _blocks(db)
+
+
+def test_findings_are_categorised_for_diagnosis(tmp_path):
+    """Readiness must block, but an operator needs to tell corruption from a
+    coverage miss. The review asked for categorised counts, not one string."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="c1", completed_at="2026-07-21T00:00:00+00:00",
+                  normal=0, rss=1, listing=1, misses=1,
+                  outcome="incomplete_feeds",
+                  feed_outcomes={"movies_all": "failed", "tv_all": "failed"})
+    _insert_miss(db, uuid="c1", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    _cycle_with_raw_provenance(db, uuid="c2", raw="{broken",
+                               completed_at="2026-07-22T00:00:00+00:00")
+    _insert_miss(db, uuid="c2", media_type="movie",
+                 url="https://hdencode.org/b-2026-2160p-x-9-gb")
+    by_category = db.get_hdencode_shadow_summary()[
+        "miss_evidence_integrity_by_category"]
+    assert by_category.get("miss_row_unsupported_by_provenance") == 1
+    assert by_category.get("provenance_unparseable") == 1
+    assert _blocks(db)

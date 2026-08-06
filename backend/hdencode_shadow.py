@@ -76,7 +76,9 @@ def attribution_evidence(row: Mapping[str, Any]) -> tuple[str, tuple[str, ...]]:
                        for the TV Packs listings, "4k"/"remux" for the movie
                        listings, "search" for search results. "search" carries no
                        type evidence at all and must not be read as either.
-      is_tv            An explicit boolean if a caller supplies one.
+      is_tv            True is affirmative TV evidence. False is NOT read as
+                       movie evidence -- a parser negative means "the TV pattern
+                       did not match", not "this is a film".
       season/episodes  Structured series evidence.
       series-only status  e.g. missing_season.
       sNN / sNNeNN slug   POSITIVE TV evidence only. Its absence says nothing:
@@ -99,11 +101,14 @@ def attribution_evidence(row: Mapping[str, Any]) -> tuple[str, tuple[str, ...]]:
     elif category in _MOVIE_CATEGORIES:
         movie.append(f"category={category}")
 
-    is_tv = row.get("is_tv")
-    if is_tv is True:
+    # is_tv=True is affirmative TV evidence. is_tv=False is NOT movie evidence:
+    # the detail scraper's false value means only "the TV regex did not match",
+    # which is the same absence-as-opposite inference removed from the slug. A
+    # 2026-08-06 review required this either dropped or explicitly qualified.
+    # MediaItem does not currently retain the field, but the helper accepts
+    # dicts, so the latent bug was reachable.
+    if row.get("is_tv") is True:
         tv.append("is_tv=True")
-    elif is_tv is False:
-        movie.append("is_tv=False")
 
     season = row.get("season")
     if season is not None and str(season).strip() not in ("", "None"):
