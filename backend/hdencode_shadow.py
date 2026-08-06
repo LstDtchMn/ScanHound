@@ -38,44 +38,97 @@ _FEED_FOR_MEDIA_TYPE = {"movie": "movies_all", "tv": "tv_all"}
 # Statuses that only exist for a series.
 _TV_ONLY_STATES = frozenset({"missing_season"})
 
+# Crawl categories that affirmatively identify a film. Assigned at source
+# construction in scanner_service alongside "type": "movie". "search" is
+# deliberately absent: a search result carries no type evidence either way, and
+# treating it as a movie is how a real TV row reached movies_all.
+_MOVIE_CATEGORIES = frozenset({"4k", "remux"})
+
 # A season (and optional episode) marker in an HDEncode slug, e.g.
-# ".../will-and-grace-s07-1080p-..." or ".../show-s01e04-720p-...". Used only
-# for rows that carry no season field of their own, which is every historical
-# row: hdencode_shadow_misses stores canonical_url, title and status, so a
-# retrospective re-grade has nothing else to go on.
+# ".../will-and-grace-s07-1080p-..." or ".../show-s01e04-720p-...".
+#
+# POSITIVE TV EVIDENCE ONLY. Its absence proves nothing -- many series filenames
+# do not match, and reading "no sNN" as "movie" is precisely the defect a
+# 2026-08-06 peer review found. It exists for rows carrying no structured
+# evidence, mainly historical ones: hdencode_shadow_misses stored only
+# canonical_url, title and status before this branch.
 _SEASON_SLUG = re.compile(r"-s\d{1,3}(?:e\d{1,3})?[-/]")
 
 
-def attribute_listing_media_type(row: Mapping[str, Any]) -> str:
-    """Return "movie", "tv", or "unknown" for the feed that should carry a row.
+def attribution_evidence(row: Mapping[str, Any]) -> tuple[str, tuple[str, ...]]:
+    """Return (media_type, basis) for the feed that should carry a row.
 
-    Pure and importable on purpose: this decides which misses are allowed to
-    block qualification, and a gate whose only proof is a code read is the
-    situation that produced the previous defect.
+    media_type is "movie", "tv", or "unknown". basis lists the signals that
+    decided it, so a counted miss can be audited after the fact instead of
+    re-derived by guesswork.
 
-    "unknown" is a real answer, not a fallback to the common case. Guessing
-    "movie" would be unsafe in one direction that matters: if a TV release were
-    attributed to movies_all during a cycle where movies_all failed and tv_all
-    succeeded, the row would be checked against the failed feed and silently
-    dropped -- a false pass, which is the exact failure class this whole change
-    exists to remove. Callers must treat "unknown" as requiring BOTH normal
-    feeds to have been validated.
+    EVIDENCE, NOT A GUESS CHAIN. The first version of this function ended with
+    "if the url is non-empty, it is a movie", which made "unknown" reachable only
+    for an empty url. A 2026-08-06 peer review found that it therefore
+    contradicted its own docstring: the docstring argued that guessing movie is
+    unsafe because it can suppress a real TV miss, and then the code guessed
+    movie for essentially every row. It also dropped the scanner's explicit
+    category, which is the authoritative signal.
+
+    THE SIGNALS, and why absence of one is not evidence of the other:
+
+      category         Assigned at source construction (scanner_service): "tv"
+                       for the TV Packs listings, "4k"/"remux" for the movie
+                       listings, "search" for search results. "search" carries no
+                       type evidence at all and must not be read as either.
+      is_tv            An explicit boolean if a caller supplies one.
+      season/episodes  Structured series evidence.
+      series-only status  e.g. missing_season.
+      sNN / sNNeNN slug   POSITIVE TV evidence only. Its absence says nothing:
+                       plenty of series filenames do not match the pattern, and
+                       that is exactly how a real TV row was being attributed to
+                       movies_all.
+
+    CONFLICTS RESOLVE TO "unknown". Neither misattribution direction is safe: a
+    TV row checked against a failed movie feed is dropped, and so is a movie row
+    checked against a failed TV feed. When signals disagree, the honest answer is
+    that we do not know, and "unknown" requires BOTH feeds validated -- so an
+    ambiguous row can never be discarded on the strength of one healthy feed.
     """
+    tv: list[str] = []
+    movie: list[str] = []
+
+    category = str(row.get("category") or "").strip().lower()
+    if category == "tv":
+        tv.append("category=tv")
+    elif category in _MOVIE_CATEGORIES:
+        movie.append(f"category={category}")
+
+    is_tv = row.get("is_tv")
+    if is_tv is True:
+        tv.append("is_tv=True")
+    elif is_tv is False:
+        movie.append("is_tv=False")
+
     season = row.get("season")
     if season is not None and str(season).strip() not in ("", "None"):
-        return "tv"
+        tv.append("season")
     if row.get("episodes"):
-        return "tv"
+        tv.append("episodes")
     if _status_value(row) in _TV_ONLY_STATES:
-        return "tv"
+        tv.append("status_series_only")
+
     url = str(row.get("url") or row.get("canonical_url") or "").lower()
-    if _SEASON_SLUG.search(url):
-        return "tv"
-    if url:
-        # A slug with no season marker and no series-only status is a movie. The
-        # movie feed is the one that should have carried it.
-        return "movie"
-    return "unknown"
+    if url and _SEASON_SLUG.search(url):
+        tv.append("slug_season_marker")
+
+    if tv and movie:
+        return "unknown", tuple(["conflict"] + tv + movie)
+    if tv:
+        return "tv", tuple(tv)
+    if movie:
+        return "movie", tuple(movie)
+    return "unknown", ("no_affirmative_evidence",)
+
+
+def attribute_listing_media_type(row: Mapping[str, Any]) -> str:
+    """media_type only. See attribution_evidence for the reasoning and basis."""
+    return attribution_evidence(row)[0]
 
 
 def feed_observation_valid(media_type: str,
@@ -155,7 +208,13 @@ def _row_dict(item: Any) -> dict:
     # season/episodes are read for feed attribution: a MediaItem with a season is
     # a series and belongs to tv_all. Without them every listing row would fall
     # back to slug matching, which is all a historical row can offer.
-    return {name:getattr(item,name,None) for name in ('url','status','status_text','posted_date','title','season','episodes')}
+    # category is the AUTHORITATIVE attribution signal and was previously
+    # dropped here, so attribution fell back to a slug heuristic that read every
+    # non-sNN url as a movie. scanner_service sets it at source construction:
+    # "tv" for the TV Packs listings, "4k"/"remux" for movie listings, "search"
+    # for search results. Losing it is what allowed a genuine TV miss to be
+    # attributed to movies_all and suppressed.
+    return {name:getattr(item,name,None) for name in ('url','status','status_text','posted_date','title','season','episodes','category','is_tv')}
 
 def _status_value(row: Mapping[str,Any]) -> str:
     value=row.get('status')
@@ -218,9 +277,12 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
     for url in sorted(listing_only):
         row=listing[url]
         if _status_value(row) not in _RELEVANT_STATES: continue
-        media_type=attribute_listing_media_type({**row,'url':url})
+        media_type,basis=attribution_evidence({**row,'url':url})
         record={'canonical_url':url,'title':row.get('title'),
-                'status':_status_value(row),'media_type':media_type}
+                'status':_status_value(row),'media_type':media_type,
+                # Persisted so a counted miss's attribution can be audited
+                # later rather than re-derived by guesswork.
+                'attribution_basis':','.join(basis)}
         # PER-FEED VALIDITY. A miss is only a miss if the feed that should have
         # carried this release was observed in this cycle. See
         # feed_observation_valid: catch-up feeds cannot validate a normal-feed

@@ -993,6 +993,7 @@ class DatabaseManager:
                         title TEXT,
                         status TEXT,
                         media_type TEXT,
+                        attribution_basis TEXT,
                         PRIMARY KEY (cycle_uuid, canonical_url),
                         FOREIGN KEY (cycle_uuid)
                             REFERENCES hdencode_shadow_cycles(cycle_uuid)
@@ -1013,6 +1014,10 @@ class DatabaseManager:
                     "ALTER TABLE hdencode_shadow_cycles "
                     "ADD COLUMN normal_feed_outcomes TEXT",
                     "ALTER TABLE hdencode_shadow_misses ADD COLUMN media_type TEXT",
+                    # The signals that decided the attribution, so a counted
+                    # miss can be audited rather than re-derived by guesswork.
+                    "ALTER TABLE hdencode_shadow_misses "
+                    "ADD COLUMN attribution_basis TEXT",
                 ):
                     try:
                         cursor.execute(_shadow_alter)
@@ -2068,10 +2073,11 @@ class DatabaseManager:
             for miss in misses:
                 conn.execute(
                     "INSERT OR REPLACE INTO hdencode_shadow_misses "
-                    "(cycle_uuid, canonical_url, title, status, media_type) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "(cycle_uuid, canonical_url, title, status, media_type, "
+                    " attribution_basis) VALUES (?, ?, ?, ?, ?, ?)",
                     (cycle_uuid,miss.get("canonical_url"),miss.get("title"),
-                     miss.get("status"),miss.get("media_type")),
+                     miss.get("status"),miss.get("media_type"),
+                     miss.get("attribution_basis")),
                 )
 
     def get_hdencode_rss_dashboard_counts(self):
@@ -2114,77 +2120,107 @@ class DatabaseManager:
             one=True,default=None)
         # MISS ACCOUNTING. The 2026-07-21 adversarial audit (f5e3c6e) established
         # that a degraded cycle must not be able to HIDE a real gap. That rule is
-        # preserved here by ATTRIBUTION rather than by any cycle-level proxy: a
-        # real movie miss still blocks when tv_all failed, and vice versa.
+        # preserved by ATTRIBUTION rather than any cycle-level proxy: a real movie
+        # miss still blocks when tv_all failed, and vice versa.
         #
-        # compare_shadow() now applies per-feed validity at WRITE time, so for
-        # any row it produced, relevant_miss_count already contains only misses
-        # whose own feed was observed. Those rows need no filter here.
+        # An earlier attempt used `WHERE rss_requests>0`. Peer review refuted it:
+        # that count spans catch-up feeds and counts attempted-but-failed
+        # requests, so it admitted the stale comparisons it was meant to exclude.
+        # Do not reintroduce a request-count proxy here.
         #
-        # Legacy rows are different and must not be trusted. They were written
-        # before per-feed provenance existed -- normal_feed_outcomes IS NULL --
-        # and their counts came from the old unfiltered logic. They cannot be
-        # re-graded under attribution because nothing recorded which feed
-        # succeeded; only a cycle-level boolean survives. So they are bounded
-        # CONSERVATIVELY: counted only when both normal feeds completed.
+        # WHAT THIS CHECK IS, precisely. It is a COUNT- AND EVIDENCE-INTEGRITY
+        # check, not independent validation of the producer. A 2026-08-06 review
+        # corrected an overstatement on exactly this point: recomputing from the
+        # stored rows catches a lying aggregate count, but it reads only the rows
+        # the writer chose to insert and trusts the media_type the writer stored.
+        # It therefore CANNOT detect a classifier bug, a wrong stored media_type,
+        # or a suppressed row -- semantic correctness is established by the
+        # adversarial tests over real MediaItem inputs, not here.
         #
-        # That bound is strictly stricter than attribution would be. A mixed
-        # cycle (movies_all changed, tv_all failed) contributes nothing under the
-        # conservative rule, whereas attribution would admit its valid movie
-        # half. The legacy figure is therefore a lower bound on blocking misses,
-        # never an overstatement of health.
-        #
-        # An earlier attempt used `WHERE rss_requests>0` and was refuted by peer
-        # review: that count spans catch-up feeds and counts attempted-but-failed
-        # requests, so it admitted the very stale comparisons it was meant to
-        # exclude. Do not reintroduce a request-count proxy here.
-        # The gate RE-DERIVES validity rather than trusting the count the writer
-        # stored. compare_shadow already applies attribution when it records, so
-        # trusting relevant_miss_count would usually agree -- but the review's
-        # standing objection applies: "consistency between two consumers does not
-        # make the producer evidence valid." A writer bug, a hand-inserted row, or
-        # a future caller that forgets provenance must not be able to inflate or
-        # deflate the gate. So attribution is recomputed here from the stored
-        # per-miss media_type and per-cycle provenance, using the SAME pure
-        # function the writer used.
+        # What it must do is FAIL CLOSED. The first version silently converted
+        # malformed provenance to {} and counted zero, and the writer stores a
+        # missing normal_feed_outcomes as {} rather than NULL -- so a forgetful
+        # caller could file misses that this reader then suppressed. Both
+        # deflated the gate, the opposite of the claim made for it. Impossible
+        # states are now integrity blockers surfaced in readiness reasons.
         from backend.hdencode_shadow import feed_observation_valid
+        integrity=[]
         attributed=0
-        for row in self._query_dicts(
-                "SELECT m.media_type AS media_type, "
-                "       c.normal_feed_outcomes AS provenance, "
-                "       c.normal_feeds_complete AS complete "
-                "FROM hdencode_shadow_misses m "
-                "JOIN hdencode_shadow_cycles c ON c.cycle_uuid=m.cycle_uuid "
-                "WHERE c.normal_feed_outcomes IS NOT NULL",default=[]):
+        rows=self._query_dicts(
+            "SELECT m.cycle_uuid AS cycle_uuid, m.media_type AS media_type, "
+            "       c.normal_feed_outcomes AS provenance, "
+            "       c.normal_feeds_complete AS complete, "
+            "       c.relevant_miss_count AS stored_count "
+            "FROM hdencode_shadow_misses m "
+            "JOIN hdencode_shadow_cycles c ON c.cycle_uuid=m.cycle_uuid "
+            "WHERE c.normal_feed_outcomes IS NOT NULL",default=[])
+        rows_per_cycle={}
+        for row in rows:
+            cycle=str(row.get("cycle_uuid") or "")
+            rows_per_cycle[cycle]=rows_per_cycle.get(cycle,0)+1
+            raw=row.get("provenance")
             try:
-                provenance=json.loads(row.get("provenance") or "{}")
+                provenance=json.loads(raw or "{}")
             except (TypeError,ValueError):
-                provenance={}
+                # Malformed JSON is an impossible state. Counting zero here is
+                # how the gate used to be deflated by corrupt data.
+                integrity.append(f"provenance_unparseable:{cycle}")
+                continue
             if not isinstance(provenance,dict):
-                provenance={}
+                integrity.append(f"provenance_not_an_object:{cycle}")
+                continue
             if "_derived_from" in provenance:
-                # Recorded by a caller that supplied no per-feed provenance. The
-                # marker deliberately does NOT fabricate feed outcomes, so fall
-                # back to the cycle-level rule it was actually derived from.
+                # A caller that supplied no per-feed provenance. The marker
+                # deliberately does not fabricate feed outcomes, so fall back to
+                # the cycle-level rule it was genuinely derived from.
                 if row.get("complete"):
                     attributed+=1
+                continue
+            if not provenance:
+                # Supplied-empty provenance with a miss row attached is
+                # contradictory: compare_shadow cannot attribute anything with no
+                # observed feed, so it would never have written this row. Either
+                # the row was inserted directly or the writer dropped the field.
+                integrity.append(f"miss_row_with_empty_provenance:{cycle}")
                 continue
             if feed_observation_valid(str(row.get("media_type") or "unknown"),
                                       provenance):
                 attributed+=1
-        # Pre-attribution rows cannot be re-derived: nothing recorded which feed
-        # succeeded, so there is no media_type to attribute against either. They
+        # A stored aggregate that disagrees with the rows on disk means one of
+        # them is wrong, and the gate must not silently prefer either.
+        for claim in self._query_dicts(
+                "SELECT cycle_uuid, relevant_miss_count AS n "
+                "FROM hdencode_shadow_cycles "
+                "WHERE normal_feed_outcomes IS NOT NULL "
+                "  AND relevant_miss_count > 0",default=[]):
+            cycle=str(claim.get("cycle_uuid") or "")
+            stored=int(claim.get("n") or 0)
+            present=rows_per_cycle.get(cycle,0)
+            if present==0:
+                integrity.append(f"count_without_rows:{cycle}:{stored}")
+            elif present!=stored:
+                integrity.append(f"count_row_disagreement:{cycle}:{stored}!={present}")
+        # Pre-attribution rows cannot be re-derived at all: nothing recorded
+        # which feed succeeded, and they carry no media_type to attribute. They
         # are bounded CONSERVATIVELY -- counted only when both normal feeds
-        # completed. That bound is strictly stricter than attribution (a mixed
-        # cycle contributes nothing here, where attribution would admit its valid
-        # half), so it can understate health, never overstate it. Every row in the
-        # live 2026-07-22..08-05 window is of this kind.
+        # completed.
+        #
+        # DIRECTION OF THAT BOUND, corrected 2026-08-06. Because
+        # conservative_admitted is a SUBSET of attribution_admitted, it follows
+        # that blocking(conservative) <= blocking(attribution). So this bound is
+        # safe against FALSELY ACCUSING the feed of a miss, and NOT safe as
+        # evidence of overall health: finding zero blockers in the smaller set
+        # does not establish zero in the larger one, because an omitted
+        # mixed-cycle row could itself be permanently missing. Earlier revisions
+        # of this comment claimed it "cannot overstate health", which is
+        # backwards. It supports only the admitted-record claim.
         legacy=self._query(
             "SELECT SUM(relevant_miss_count) AS n "
             "FROM hdencode_shadow_cycles "
             "WHERE normal_feed_outcomes IS NULL AND normal_feeds_complete=1",
             one=True,default=None)
-        misses={"relevant_misses":attributed+int((legacy["n"] if legacy else 0) or 0)}
+        misses={"relevant_misses":attributed+int((legacy["n"] if legacy else 0) or 0),
+                "miss_evidence_integrity":sorted(set(integrity))}
         latest=self._query(
             "SELECT * FROM hdencode_shadow_cycles "
             "ORDER BY completed_at DESC LIMIT 1",
@@ -2197,6 +2233,10 @@ class DatabaseManager:
             "first_completed_at":eligible["first_completed_at"] if eligible else None,
             "last_completed_at":eligible["last_completed_at"] if eligible else None,
             "relevant_misses":int((misses["relevant_misses"] if misses else 0) or 0),
+            # Impossible states found while re-deriving the miss count. Non-empty
+            # means the stored evidence contradicts itself, which blocks
+            # readiness rather than being silently resolved to zero.
+            "miss_evidence_integrity":list((misses or {}).get("miss_evidence_integrity") or []),
             "rss_requests":rss,
             "listing_requests":listing,
             "request_reduction_pct":round(reduction,2),
@@ -2228,6 +2268,14 @@ class DatabaseManager:
         if summary["successful_cycles"]<required_cycles: reasons.append("insufficient_comparison_cycles")
         if observed_days<required_days: reasons.append("insufficient_observation_days")
         if summary["relevant_misses"]>0: reasons.append("relevant_misses_detected")
+        # An integrity failure is not "zero misses". Malformed provenance, a
+        # count that disagrees with the rows on disk, a nonzero count with no
+        # rows, or a miss row filed against supplied-empty provenance all mean
+        # the evidence contradicts itself. Before 2026-08-06 each of these
+        # silently contributed zero, which DEFLATED the gate -- the opposite of
+        # the protection claimed for it. They must block instead.
+        if summary.get("miss_evidence_integrity"):
+            reasons.append("miss_evidence_integrity_failed")
         if summary["request_reduction_pct"]<=0: reasons.append("request_reduction_not_proven")
         if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
         if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")

@@ -162,10 +162,13 @@ def main():
             #   provenance NULL -> pre-attribution. Nothing recorded which feed
             #     succeeded, so these can never be graded under attribution.
             #     Bounded conservatively: counted only when both normal feeds
-            #     completed. That is strictly stricter than attribution (a mixed
-            #     cycle contributes nothing, where attribution would admit its
-            #     valid half), so it can understate health, never overstate it.
-            #     Every row in the 2026-07-22..08-05 window is of this kind.
+            #     completed. That is stricter for ADMISSION than attribution -- a
+            #     mixed cycle contributes nothing where attribution would admit
+            #     its valid half -- so the figure is a lower bound on blocking
+            #     misses. It guarantees no FALSE ACCUSATION of a miss; it does
+            #     NOT establish health, because zero blockers in the smaller set
+            #     says nothing about the larger attribution-valid set. Every row
+            #     in the 2026-07-22..08-05 window is of this kind.
             #
             # Known limitation, stated because it is easy to over-trust this
             # file: a mirror that must track the thing it mirrors cannot catch a

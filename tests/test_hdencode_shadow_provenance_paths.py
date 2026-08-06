@@ -51,10 +51,14 @@ TV_RSS = b"""<?xml version="1.0"?>
 
 # Listing rows the feed side does NOT have. One film, one series, so a partial
 # cycle can be shown to discriminate between them.
+# category mirrors production: scanner_service assigns "4k"/"remux" to the
+# movie listings and "tv" to TV Packs. Without it a row is "unknown".
 LISTING_MOVIE = {"url": "https://hdencode.org/gap-film-2026-2160p-web-x-9-gb",
-                 "status": "missing", "title": "Gap Film", "season": None}
+                 "status": "missing", "title": "Gap Film", "season": None,
+                 "category": "4k"}
 LISTING_TV = {"url": "https://hdencode.org/gap-series-s03-1080p-web-y-5-gb",
-              "status": "missing", "title": "Gap Series", "season": 3}
+              "status": "missing", "title": "Gap Series", "season": 3,
+              "category": "tv"}
 
 
 class Boom(Exception):
@@ -326,3 +330,77 @@ def test_changing_only_rss_requests_cannot_validate_an_invalid_cycle(injected):
         normal_feeds_complete=False, normal_feed_outcomes=normal)
     assert cmp_.relevant_miss_count == 0, (
         f"rss_requests={injected} validated a cycle where both feeds failed")
+
+
+# ── the adapter the Round 2 tests stopped short of ────────────────────────────
+#
+# The review's Finding 1: "They do not drive a real ScannerService MediaItem, do
+# not test _row_dict(), and do not test the production category='tv' signal."
+# These do. A dict fixture cannot catch a field being dropped by _row_dict,
+# because the dict passes straight through.
+
+def _media_item(**kw):
+    from backend.scanner_service import MediaItem
+    base = dict(id="i1", title="T", year=2026, url="https://hdencode.org/x-1-gb")
+    base.update(kw)
+    return MediaItem(**base)
+
+
+def test_row_dict_preserves_the_category_from_a_real_media_item():
+    """The regression guard for the dropped field itself."""
+    from backend.hdencode_shadow import _row_dict
+    row = _row_dict(_media_item(category="tv"))
+    assert row.get("category") == "tv", (
+        "_row_dict dropped category -- attribution falls back to the slug "
+        "heuristic and a genuine TV miss can be suppressed")
+
+
+def test_a_real_tv_media_item_without_sNN_blocks_when_the_tv_feed_is_valid():
+    """The exact false-pass the review constructed, through the real class.
+
+    category='tv', no season, no episodes, no sNN in the URL, during a cycle
+    where movies_all failed and tv_all succeeded. Before the fix this was
+    attributed to movies_all and suppressed.
+    """
+    item = _media_item(title="Odd Show", category="tv", season=None,
+                       episodes=None,
+                       url="https://hdencode.org/odd-show-1080p-web-x-5-gb")
+    _, cmp_ = run_cycle({"/tag/movies/feed/": Boom("down"),
+                         "/tag/tv-shows/feed/": OK_TV}, listing=[item])
+    assert cmp_.relevant_miss_count == 1, (
+        "a real TV item was suppressed despite tv_all being observed")
+    assert cmp_.relevant_misses[0]["media_type"] == "tv"
+    assert "category=tv" in cmp_.relevant_misses[0]["attribution_basis"]
+
+
+def test_the_same_real_tv_item_is_suppressed_when_the_tv_feed_failed():
+    """The other direction: correct suppression, not blanket counting."""
+    item = _media_item(title="Odd Show", category="tv", season=None,
+                       episodes=None,
+                       url="https://hdencode.org/odd-show-1080p-web-x-5-gb")
+    _, cmp_ = run_cycle({"/tag/movies/feed/": OK_MOVIE,
+                         "/tag/tv-shows/feed/": Boom("down")}, listing=[item])
+    assert cmp_.relevant_miss_count == 0
+    assert len(cmp_.unattributable) == 1
+
+
+def test_a_real_movie_media_item_follows_its_explicit_category():
+    item = _media_item(title="Odd Film", category="4k",
+                       url="https://hdencode.org/odd-film-1080p-web-x-5-gb")
+    _, cmp_ = run_cycle({"/tag/movies/feed/": OK_MOVIE,
+                         "/tag/tv-shows/feed/": Boom("down")}, listing=[item])
+    assert cmp_.relevant_miss_count == 1
+    assert cmp_.relevant_misses[0]["media_type"] == "movie"
+
+
+def test_a_real_search_sourced_item_needs_both_feeds():
+    """No affirmative evidence -> unknown -> both feeds required."""
+    item = _media_item(title="Ambiguous", category="search",
+                       url="https://hdencode.org/ambiguous-2026-1080p-1-gb")
+    _, half = run_cycle({"/tag/movies/feed/": OK_MOVIE,
+                         "/tag/tv-shows/feed/": Boom("down")}, listing=[item])
+    assert half.relevant_miss_count == 0, "unknown must not pass on one feed"
+    _, both = run_cycle({"/tag/movies/feed/": OK_MOVIE,
+                         "/tag/tv-shows/feed/": OK_TV}, listing=[item])
+    assert both.relevant_miss_count == 1
+    assert both.relevant_misses[0]["media_type"] == "unknown"

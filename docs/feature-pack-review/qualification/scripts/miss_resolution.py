@@ -88,12 +88,17 @@ for r in con.execute(
 # at any level of effort. The evidence to do so was never written.
 #
 # It is therefore graded CONSERVATIVELY: a miss counts only when both normal
-# feeds completed in its cycle. That bound is strictly stricter than attribution
-# would be -- a mixed cycle (movies_all changed, tv_all failed) contributes
-# nothing here, whereas attribution would admit its valid movie half. The
-# resulting figure is a LOWER bound on blocking misses and can never overstate
-# health. It also preserves the 2026-07-21 audit rule's protection, since a
-# degraded cycle still cannot hide a gap that a fully-observed cycle would show.
+# feeds completed in its cycle. That is stricter for ADMISSION than attribution
+# -- a mixed cycle (movies_all changed, tv_all failed) contributes nothing here,
+# whereas attribution would admit its valid movie half -- so the figure is a
+# LOWER bound on blocking misses.
+#
+# WHAT THAT DOES AND DOES NOT SUPPORT. It guarantees the grader never FALSELY
+# ACCUSES the feed of a miss. It does NOT establish overall health: zero blockers
+# in the smaller admitted set says nothing about the larger attribution-valid
+# set, because an omitted mixed-cycle row could itself be permanently missing. An
+# earlier version of this comment claimed it "can never overstate health", which
+# is backwards. The supportable claim is only about the ADMITTED records.
 misses = [dict(r) for r in con.execute(
     "SELECT m.canonical_url u, m.title, m.status, s.completed_at at "
     "FROM hdencode_shadow_misses m "

@@ -106,7 +106,14 @@ def test_relevant_miss_blocks_even_when_cycle_is_incomplete(tmp_path):
     _insert_cycle(
         db, uuid="incomplete-miss",
         completed_at="2026-07-21T00:00:00+00:00",
-        normal=0, rss=1, listing=1, misses=1, outcome="relevant_miss",
+        # outcome matches what compare_shadow actually labels a mixed-feed
+        # cycle: incomplete_feeds, while still persisting its attributable miss
+        # rows. The review noted the old fixture said relevant_miss, which no
+        # longer reflects the production writer. Miss accounting is independent
+        # of the eligible-window outcome, so the assertion is unaffected -- but
+        # a fixture that cannot occur in production is a trap for the next
+        # reader.
+        normal=0, rss=1, listing=1, misses=1, outcome="incomplete_feeds",
         feed_outcomes={"movies_all": "changed", "tv_all": "failed"},
     )
     _insert_miss(db, uuid="incomplete-miss", media_type="movie",
@@ -166,8 +173,15 @@ def test_legacy_rows_are_bounded_conservatively(tmp_path):
     The live window holds 300 such rows and none can be graded under
     attribution -- nothing recorded which feed succeeded. Counting them only
     when both normal feeds completed is a strict LOWER bound on blocking
-    misses: a mixed cycle contributes nothing here, whereas attribution would
-    admit its valid half. It can understate health, never overstate it.
+    misses, because a mixed cycle contributes nothing here whereas attribution
+    would admit its valid half.
+
+    DIRECTION OF THAT BOUND. It guarantees the gate never FALSELY ACCUSES the
+    feed of a miss. It does NOT establish health: finding zero blockers in the
+    smaller admitted set says nothing about the larger attribution-valid set,
+    since an omitted mixed-cycle row could itself be permanently missing. An
+    earlier revision of this docstring claimed the bound "can understate
+    health, never overstate it", which is exactly backwards.
     """
     db = DatabaseManager(str(tmp_path / "db.sqlite"))
     _insert_cycle(db, uuid="legacy-complete",
@@ -226,3 +240,117 @@ def test_the_gate_does_not_trust_the_stored_count(tmp_path):
     _insert_miss(db, uuid="lying-count", media_type="movie",
                  url="https://hdencode.org/only-one-2026-2160p-x-9-gb")
     assert db.get_hdencode_shadow_summary()["relevant_misses"] == 1
+
+
+# ── evidence integrity (2026-08-06 review, Finding 2) ────────────────────────
+#
+# Each of these silently contributed ZERO before the fix, which DEFLATED the
+# gate. Round 2 claimed a writer bug or forgetful caller could not move the
+# gate; the review showed both could. These pin the correction.
+
+def _cycle_with_raw_provenance(db, *, uuid, raw, misses=1,
+                               completed_at="2026-07-21T00:00:00+00:00"):
+    """Insert a cycle with provenance written EXACTLY as given (may be invalid)."""
+    conn = db.get_connection()
+    conn.execute(
+        """INSERT INTO hdencode_shadow_cycles (
+               cycle_uuid, started_at, completed_at, normal_feeds_complete,
+               rss_requests, listing_requests, rss_count, listing_count,
+               duplicate_count, feed_only_count, listing_only_count,
+               relevant_miss_count, request_reduction_pct, catchup_used,
+               restart_recovery, outcome, details_json, normal_feed_outcomes
+           ) VALUES (?, ?, ?, 1, 2, 10, 0, 0, 0, 0, 0, ?, 0, 0, 0,
+                     'relevant_miss', '{}', ?)""",
+        (uuid, completed_at, completed_at, misses, raw),
+    )
+    conn.commit()
+
+
+def test_malformed_provenance_blocks_instead_of_counting_zero(tmp_path):
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _cycle_with_raw_provenance(db, uuid="bad-json", raw="{not json at all")
+    _insert_miss(db, uuid="bad-json", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    summary = db.get_hdencode_shadow_summary()
+    assert summary["miss_evidence_integrity"], "corrupt provenance must be flagged"
+    assert any("unparseable" in r for r in summary["miss_evidence_integrity"])
+    readiness = db.get_hdencode_rss_readiness(min_cycles=1, min_days=0)
+    assert "miss_evidence_integrity_failed" in readiness["reasons"]
+    assert readiness["ready"] is False
+
+
+def test_provenance_that_is_not_an_object_blocks(tmp_path):
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _cycle_with_raw_provenance(db, uuid="a-list", raw='["movies_all"]')
+    _insert_miss(db, uuid="a-list", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    summary = db.get_hdencode_shadow_summary()
+    assert any("not_an_object" in r for r in summary["miss_evidence_integrity"])
+
+
+def test_a_miss_row_with_supplied_empty_provenance_blocks(tmp_path):
+    """The forgetful-caller path.
+
+    record_hdencode_shadow_comparison serializes a missing
+    normal_feed_outcomes as {} rather than NULL. compare_shadow could never
+    attribute a row with no observed feed, so a miss row against empty
+    provenance is contradictory -- it means the row was inserted directly or the
+    writer dropped the field. Previously it silently contributed zero.
+    """
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _cycle_with_raw_provenance(db, uuid="empty-prov", raw="{}")
+    _insert_miss(db, uuid="empty-prov", media_type="tv",
+                 url="https://hdencode.org/s-s01-1080p-x-5-gb")
+    summary = db.get_hdencode_shadow_summary()
+    assert any("empty_provenance" in r for r in summary["miss_evidence_integrity"])
+    assert summary["relevant_misses"] == 0
+    assert "miss_evidence_integrity_failed" in db.get_hdencode_rss_readiness(
+        min_cycles=1, min_days=0)["reasons"]
+
+
+def test_a_count_with_no_rows_blocks(tmp_path):
+    """A cycle claiming misses with nothing on disk to support them."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="count-no-rows",
+                  completed_at="2026-07-21T00:00:00+00:00",
+                  normal=1, rss=2, listing=10, misses=4,
+                  outcome="relevant_miss",
+                  feed_outcomes={"movies_all": "changed", "tv_all": "changed"})
+    summary = db.get_hdencode_shadow_summary()
+    assert any("count_without_rows" in r
+               for r in summary["miss_evidence_integrity"])
+
+
+def test_a_count_that_disagrees_with_the_rows_blocks(tmp_path):
+    """The lying-count case, now flagged rather than quietly corrected.
+
+    Round 2 reported 1 here and called it protection. Reporting a number for
+    self-contradictory evidence is not protection -- it hides that the store is
+    inconsistent.
+    """
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="lying", completed_at="2026-07-21T00:00:00+00:00",
+                  normal=1, rss=2, listing=10, misses=99,
+                  outcome="relevant_miss",
+                  feed_outcomes={"movies_all": "changed", "tv_all": "changed"})
+    _insert_miss(db, uuid="lying", media_type="movie",
+                 url="https://hdencode.org/only-one-2026-2160p-x-9-gb")
+    summary = db.get_hdencode_shadow_summary()
+    assert summary["relevant_misses"] == 1, "the rows still decide the count"
+    assert any("disagreement" in r for r in summary["miss_evidence_integrity"])
+    assert "miss_evidence_integrity_failed" in db.get_hdencode_rss_readiness(
+        min_cycles=1, min_days=0)["reasons"]
+
+
+def test_consistent_evidence_raises_no_integrity_flag(tmp_path):
+    """The positive control: a healthy store must stay silent."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="clean", completed_at="2026-07-21T00:00:00+00:00",
+                  normal=1, rss=2, listing=10, misses=1,
+                  outcome="relevant_miss",
+                  feed_outcomes={"movies_all": "changed", "tv_all": "changed"})
+    _insert_miss(db, uuid="clean", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    summary = db.get_hdencode_shadow_summary()
+    assert summary["relevant_misses"] == 1
+    assert summary["miss_evidence_integrity"] == []

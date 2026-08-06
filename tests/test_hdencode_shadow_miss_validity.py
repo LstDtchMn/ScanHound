@@ -37,8 +37,11 @@ from backend.hdencode_shadow import (
     normal_feed_outcomes_from_results,
 )
 
+# category is what production supplies (scanner_service sets "4k"/"remux"
+# for the movie listings). A fixture WITHOUT it is now "unknown", which is
+# correct: absence of an sNN token is not evidence of a film.
 MOVIE = {"url": "https://hdencode.org/a-movie-2026-2160p-web-x-9-9-gb",
-         "status": "missing", "title": "A Movie 2026"}
+         "status": "missing", "title": "A Movie 2026", "category": "4k"}
 SHOW = {"url": "https://hdencode.org/a-show-s02-1080p-web-y-5-5-gb",
         "status": "missing", "title": "A Show S02"}
 FEED_HAS_NEITHER = ["https://hdencode.org/z-2020-1080p-web-q-1-1-gb"]
@@ -65,14 +68,27 @@ def titles(records):
 class TestAttribution:
     """Which feed should have carried a row. Pure, so it is tested directly."""
 
-    @pytest.mark.parametrize("url,expected", [
-        ("https://hdencode.org/will-and-grace-s07-1080p-amzn-x-42-7-gb", "tv"),
-        ("https://hdencode.org/show-s01e04-720p-web-y-2-0-gb", "tv"),
-        ("https://hdencode.org/some-film-2026-2160p-web-z-9-0-gb", "movie"),
-        ("https://hdencode.org/dune-part-two-2024-2160p-uhd-remux-50-2-gb", "movie"),
+    @pytest.mark.parametrize("url", [
+        "https://hdencode.org/will-and-grace-s07-1080p-amzn-x-42-7-gb",
+        "https://hdencode.org/show-s01e04-720p-web-y-2-0-gb",
     ])
-    def test_from_the_slug(self, url, expected):
-        assert attribute_listing_media_type({"url": url}) == expected
+    def test_a_season_marker_is_positive_tv_evidence(self, url):
+        assert attribute_listing_media_type({"url": url}) == "tv"
+
+    @pytest.mark.parametrize("url", [
+        "https://hdencode.org/some-film-2026-2160p-web-z-9-0-gb",
+        "https://hdencode.org/dune-part-two-2024-2160p-uhd-remux-50-2-gb",
+    ])
+    def test_a_slug_alone_is_not_movie_evidence(self, url):
+        """These asserted "movie" until the 2026-08-06 review.
+
+        The slug regex is positive TV evidence only. Reading its ABSENCE as a
+        film is the inference that suppressed a real TV miss. Note the second
+        URL contains "remux" as free text -- a substring match on category
+        vocabulary would wrongly call it affirmative movie evidence, which is
+        why category is read from the field and never from the slug.
+        """
+        assert attribute_listing_media_type({"url": url}) == "unknown"
 
     def test_a_season_field_beats_the_slug(self):
         # Production path: MediaItem carries season, so no slug guessing.
@@ -84,11 +100,49 @@ class TestAttribution:
             {"url": "https://hdencode.org/x-2026-1080p-a-1-gb",
              "status": "missing_season"}) == "tv"
 
-    def test_season_none_is_not_tv(self):
-        # A movie row still carries season=None; that must not read as a series.
+    def test_season_none_is_not_tv_but_is_not_movie_evidence_either(self):
+        """season=None must not read as a series -- and must not imply a film.
+
+        This assertion was "movie" until a 2026-08-06 peer review pointed out
+        that treating the absence of TV evidence as movie evidence is the defect,
+        not the safeguard. With no category and no sNN token there is nothing
+        affirmative, so the answer is unknown -- which requires both feeds.
+        """
         assert attribute_listing_media_type(
             {"url": "https://hdencode.org/x-2026-1080p-a-1-gb",
-             "season": None}) == "movie"
+             "season": None}) == "unknown"
+
+    def test_a_tv_category_with_no_sNN_and_no_season_is_still_tv(self):
+        """The false-pass case the review described.
+
+        A TV Packs item whose filename does not match the Sxx pattern. Before
+        the fix this attributed to movies_all, so during a movies-failed /
+        tv-healthy cycle a genuine TV miss was silently suppressed.
+        """
+        assert attribute_listing_media_type(
+            {"category": "tv", "season": None, "episodes": None,
+             "status": "missing",
+             "url": "https://hdencode.org/some-show-1080p-web-x-5-gb"}) == "tv"
+
+    def test_search_category_carries_no_evidence(self):
+        # scanner_service labels search results "search". They identify nothing.
+        assert attribute_listing_media_type(
+            {"category": "search",
+             "url": "https://hdencode.org/thing-2026-1080p-x-1-gb"}) == "unknown"
+
+    def test_conflicting_signals_resolve_to_unknown(self):
+        # Neither misattribution direction is safe, so a disagreement must not
+        # be resolved by precedence.
+        assert attribute_listing_media_type(
+            {"category": "4k", "season": 2,
+             "url": "https://hdencode.org/x-1080p-1-gb"}) == "unknown"
+
+    def test_the_basis_is_reported(self):
+        from backend.hdencode_shadow import attribution_evidence
+        media_type, basis = attribution_evidence(
+            {"category": "tv", "url": "https://hdencode.org/x-s03-1080p-1-gb"})
+        assert media_type == "tv"
+        assert "category=tv" in basis and "slug_season_marker" in basis
 
     def test_unattributable_is_its_own_answer(self):
         # Deliberately NOT defaulted to "movie". Guessing wrong in that
@@ -175,6 +229,12 @@ class TestPartialCycles:
         r = cmp_(outcomes=BOTH_OK)
         assert {m["title"]: m["media_type"] for m in r.relevant_misses} == {
             "A Movie 2026": "movie", "A Show S02": "tv"}
+
+    def test_each_miss_records_why(self):
+        r = cmp_(outcomes=BOTH_OK)
+        basis = {m["title"]: m["attribution_basis"] for m in r.relevant_misses}
+        assert "category=4k" in basis["A Movie 2026"]
+        assert "slug_season_marker" in basis["A Show S02"]
 
 
 class TestEvidenceIsNotDiscarded:
