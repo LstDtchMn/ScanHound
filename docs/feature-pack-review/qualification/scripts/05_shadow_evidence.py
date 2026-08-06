@@ -140,28 +140,57 @@ def main():
                       AND listing_requests>0""",
                 CYCLE_OUTCOMES,
             ).fetchone()
-            # Mirrors get_hdencode_rss_readiness, INCLUDING its rss_requests>0
-            # filter (see backend/database.py). A cycle with rss_requests=0 never
-            # fetched: rss_urls came from list_hdencode_current_feed_urls(), i.e.
-            # the last persisted feed snapshot, so listing_only was inflated by
-            # everything the feed had merely not collected yet and every relevant
-            # row in it was booked as a miss. 41 such cycles produced 89 of 150
-            # records over 2026-07-22..2026-08-05, none a real loss.
+            # Mirrors get_hdencode_rss_readiness, which as of 2026-08-06 counts
+            # a miss only when the normal feed responsible for that release was
+            # observed in that cycle.
             #
-            # This filter MUST track the app's. This script exists to
-            # cross-check the app independently, so if the two diverge the
-            # reconciliation reports ready_matches=False and the gate stops --
-            # which is exactly what would happen if the app shipped fixed and
-            # this did not.
+            # An earlier version of this file mirrored an rss_requests>0 filter.
+            # A peer review refuted that proxy: poll_cycle counts `requested`
+            # over normal + catch-up feeds and marks a failed attempt as
+            # requested, so it admitted catch-up-only, failed-fetch and
+            # half-stale cycles -- exactly the stale comparisons it was meant to
+            # exclude. Do not reintroduce a request-count filter here.
+            #
+            # Two populations, because they are not equally knowable:
+            #
+            #   provenance NOT NULL -> the cycle recorded per-feed outcomes.
+            #     compare_shadow already applied attribution when it wrote the
+            #     row, so its count is trusted here. The app additionally
+            #     re-derives from the miss rows; this mirror deliberately does
+            #     NOT, so the two are not identical implementations.
+            #
+            #   provenance NULL -> pre-attribution. Nothing recorded which feed
+            #     succeeded, so these can never be graded under attribution.
+            #     Bounded conservatively: counted only when both normal feeds
+            #     completed. That is strictly stricter than attribution (a mixed
+            #     cycle contributes nothing, where attribution would admit its
+            #     valid half), so it can understate health, never overstate it.
+            #     Every row in the 2026-07-22..08-05 window is of this kind.
             #
             # Known limitation, stated because it is easy to over-trust this
-            # file: a mirror cannot catch a logic error present in both copies.
-            # It cross-checks the app's PLUMBING, not the correctness of a rule
-            # they share.
-            all_misses = con.execute(
-                "SELECT COALESCE(SUM(relevant_miss_count),0) "
-                "FROM hdencode_shadow_cycles WHERE rss_requests>0"
-            ).fetchone()[0]
+            # file: a mirror that must track the thing it mirrors cannot catch a
+            # logic error present in both. It cross-checks PLUMBING, not the
+            # correctness of a shared rule.
+            # COLUMN-TOLERANT. This script opens the database directly and does
+            # NOT run migrations -- only the app does. So between committing this
+            # and deploying, normal_feed_outcomes does not exist yet and a bare
+            # reference would make every scheduled collection abort. Degrade to
+            # the conservative bound instead, which needs no new column and is
+            # the correct treatment for pre-attribution rows anyway.
+            _cycle_cols = {r[1] for r in con.execute(
+                "PRAGMA table_info(hdencode_shadow_cycles)")}
+            if "normal_feed_outcomes" in _cycle_cols:
+                all_misses = con.execute(
+                    "SELECT COALESCE(SUM(relevant_miss_count),0) "
+                    "FROM hdencode_shadow_cycles "
+                    "WHERE normal_feed_outcomes IS NOT NULL "
+                    "   OR (normal_feed_outcomes IS NULL AND normal_feeds_complete=1)"
+                ).fetchone()[0]
+            else:
+                all_misses = con.execute(
+                    "SELECT COALESCE(SUM(relevant_miss_count),0) "
+                    "FROM hdencode_shadow_cycles WHERE normal_feeds_complete=1"
+                ).fetchone()[0]
             cycle_rows = [
                 dict(r)
                 for r in con.execute(

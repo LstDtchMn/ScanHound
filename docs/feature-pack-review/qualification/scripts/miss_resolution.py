@@ -74,34 +74,41 @@ for r in con.execute(
     if c["usable"]:
         usable.append(c)
 
-# MISS SOURCING (fixed 2026-08-05). This JOIN used to be unfiltered, so a miss
-# recorded during a cycle this script itself refuses to trust as an OBSERVATION
-# still entered the population being graded. That asymmetry is not defensible:
-# rss_urls comes from list_hdencode_current_feed_urls(), which reads the last
-# persisted feed snapshot from the database, so a cycle with rss_requests=0
-# compared the listing against a stale set and every relevant row in
-# listing_only was booked as a miss. 41 such cycles produced 89 of the 150
-# records.
+# MISS SOURCING. This JOIN was originally unfiltered, so a miss recorded during
+# a cycle this script itself refuses to trust as an OBSERVATION still entered the
+# graded population. A first fix filtered on rss_requests>0; a 2026-08-06 peer
+# review refuted that proxy, because poll_cycle counts `requested` across
+# normal + catch-up feeds and marks a failed attempt as requested. It therefore
+# admitted catch-up-only, failed-fetch and half-stale comparisons.
 #
-# The filter is rss_requests>0, NOT the full `usable` rule, deliberately: a
-# 2026-07-21 ChatGPT adversarial audit (f5e3c6e) established that a degraded
-# cycle must not be able to HIDE a real gap, and that still holds. Only the
-# zero-fetch case is excluded. The one partial-fetch record (rss_requests=2,
-# 2026-07-28) is still graded, and comes out green at 1.25h.
+# WHAT THIS WINDOW CAN AND CANNOT SUPPORT. Attribution -- the correct rule, now
+# live in compare_shadow -- needs to know which normal feed succeeded. Nothing
+# recorded that: hdencode_shadow_cycles carried only a cycle-level boolean until
+# 2026-08-06. So the 2026-07-22..08-05 window cannot be graded under attribution
+# at any level of effort. The evidence to do so was never written.
+#
+# It is therefore graded CONSERVATIVELY: a miss counts only when both normal
+# feeds completed in its cycle. That bound is strictly stricter than attribution
+# would be -- a mixed cycle (movies_all changed, tv_all failed) contributes
+# nothing here, whereas attribution would admit its valid movie half. The
+# resulting figure is a LOWER bound on blocking misses and can never overstate
+# health. It also preserves the 2026-07-21 audit rule's protection, since a
+# degraded cycle still cannot hide a gap that a fully-observed cycle would show.
 misses = [dict(r) for r in con.execute(
     "SELECT m.canonical_url u, m.title, m.status, s.completed_at at "
     "FROM hdencode_shadow_misses m "
     "JOIN hdencode_shadow_cycles s ON s.cycle_uuid = m.cycle_uuid "
-    "WHERE s.rss_requests > 0")]
+    "WHERE s.normal_feeds_complete = 1")]
 excluded = con.execute(
     "SELECT COUNT(*) FROM hdencode_shadow_misses m "
     "JOIN hdencode_shadow_cycles s ON s.cycle_uuid = m.cycle_uuid "
-    "WHERE s.rss_requests <= 0").fetchone()[0]
+    "WHERE s.normal_feeds_complete != 1").fetchone()[0]
 
 print(f"cycles: {len(all_cycles)} total, {len(usable)} usable as observations "
       f"({len(all_cycles) - len(usable)} rejected: incomplete/partial/killed)")
 print(f"recorded misses: {len(misses)} graded, "
-      f"{excluded} excluded as recorded during a zero-fetch cycle")
+      f"{excluded} excluded as recorded during a cycle whose normal feeds "
+      f"did not both complete (conservative bound; see MISS SOURCING)")
 if len(usable) > 1:
     gaps = sorted((usable[i + 1]["at"] - usable[i]["at"]).total_seconds() / 60
                   for i in range(len(usable) - 1))

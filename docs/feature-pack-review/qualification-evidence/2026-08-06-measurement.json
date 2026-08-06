@@ -1,0 +1,70 @@
+{
+  "generated_from": "/dbvol/crawler.db",
+  "schema": {
+    "has_per_feed_provenance": false,
+    "note": "Attribution requires per-feed provenance. Where this is false, every row predates it and the window can only be bounded conservatively -- attribution is not recoverable at any level of effort, because the evidence was never written."
+  },
+  "window": {
+    "cycles_total": 311,
+    "cycles_eligible": 267,
+    "eligibility_predicate": "outcome IN ('success','relevant_miss') AND normal_feeds_complete=1 AND rss_requests>0 AND listing_requests>0",
+    "first_eligible": "2026-07-22T00:34:08.579853+00:00",
+    "last_eligible": "2026-08-06T12:38:32.816523+00:00",
+    "observed_days": 15.503,
+    "required_cycles": 20,
+    "required_days": 7
+  },
+  "request_reduction": {
+    "feed_requests": 584,
+    "listing_requests": 3843,
+    "reduction_pct": 84.8,
+    "requests_avoided": 3259,
+    "population": "eligible cycles only"
+  },
+  "miss_populations": {
+    "all_recorded": {
+      "denominator": 157,
+      "predicate": "every row in hdencode_shadow_misses",
+      "note": "Includes rows whose comparison cannot support a miss claim. Reported for completeness, not as evidence."
+    },
+    "conservative_bound": {
+      "predicate": "source cycle normal_feeds_complete = 1",
+      "note": "Strictly stricter than attribution: a mixed cycle (movies_all changed, tv_all failed) contributes nothing here, whereas attribution would admit its valid movie half. A lower bound on blocking misses; cannot overstate health.",
+      "denominator": 61,
+      "tiers": {
+        "green": 61,
+        "yellow": 0,
+        "red": 0,
+        "pending": 0,
+        "ambiguous": 0
+      },
+      "blocking_total": 0,
+      "catch_up_latency": {
+        "n": 61,
+        "median_hours": 1.168,
+        "min_hours": 0.977,
+        "max_hours": 4.061,
+        "within_1h": 3,
+        "within_2h": 51,
+        "within_6h": 61
+      },
+      "blocking_records": []
+    }
+  },
+  "status_mix": {
+    "missing": 125,
+    "missing_season": 13,
+    "upgrade": 16,
+    "dv_upgrade": 3
+  },
+  "grading_rule": {
+    "green_hours": 6.0,
+    "yellow_hours": 24.0,
+    "source": "Jesse's tiered criterion, 2026-07-24"
+  },
+  "resolution_evidence": {
+    "rule": "a miss is resolved only when its canonical URL later appears in feed_only during an ELIGIBLE cycle",
+    "limitation": "proves the feed had acquired the URL by that later cycle; it does NOT prove the original comparison was valid. Peer review, 2026-08-06, Finding 3.",
+    "observation_cycles": 267
+  }
+}

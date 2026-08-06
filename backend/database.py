@@ -982,7 +982,8 @@ class DatabaseManager:
                         catchup_used INTEGER NOT NULL DEFAULT 0,
                         restart_recovery INTEGER NOT NULL DEFAULT 0,
                         outcome TEXT NOT NULL,
-                        details_json TEXT NOT NULL DEFAULT '{}'
+                        details_json TEXT NOT NULL DEFAULT '{}',
+                        normal_feed_outcomes TEXT
                     )
                 """)
                 cursor.execute("""
@@ -991,12 +992,34 @@ class DatabaseManager:
                         canonical_url TEXT NOT NULL,
                         title TEXT,
                         status TEXT,
+                        media_type TEXT,
                         PRIMARY KEY (cycle_uuid, canonical_url),
                         FOREIGN KEY (cycle_uuid)
                             REFERENCES hdencode_shadow_cycles(cycle_uuid)
                             ON DELETE CASCADE
                     )
                 """)
+                # Additive migrations for the two tables above, kept HERE rather
+                # than in the shared _column_migrations list several hundred
+                # lines earlier. That list runs before these CREATE statements,
+                # so an ALTER placed there fails with "no such table", and the
+                # guard only swallows "duplicate column" -- it logs the failure
+                # and carries on, leaving the column absent. Which is exactly
+                # what happened on the first attempt: every new test failed with
+                # "table hdencode_shadow_cycles has no column named
+                # normal_feed_outcomes" while the migration warning scrolled past
+                # in the log.
+                for _shadow_alter in (
+                    "ALTER TABLE hdencode_shadow_cycles "
+                    "ADD COLUMN normal_feed_outcomes TEXT",
+                    "ALTER TABLE hdencode_shadow_misses ADD COLUMN media_type TEXT",
+                ):
+                    try:
+                        cursor.execute(_shadow_alter)
+                    except sqlite3.OperationalError as _e:
+                        if "duplicate column" not in str(_e).lower():
+                            logger.warning("Shadow migration failed: %s — %s",
+                                           _shadow_alter, _e)
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_hdencode_shadow_completed
                     ON hdencode_shadow_cycles(completed_at, outcome)
@@ -2027,8 +2050,8 @@ class DatabaseManager:
                     rss_requests, listing_requests, rss_count, listing_count,
                     duplicate_count, feed_only_count, listing_only_count,
                     relevant_miss_count, request_reduction_pct, catchup_used,
-                    restart_recovery, outcome, details_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    restart_recovery, outcome, details_json, normal_feed_outcomes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (cycle_uuid,started_at,completed_at,1 if metrics.get("normal_feeds_complete") else 0,
                  int(metrics.get("rss_requests") or 0),int(metrics.get("listing_requests") or 0),
                  int(metrics.get("rss_count") or 0),int(metrics.get("listing_count") or 0),
@@ -2036,13 +2059,19 @@ class DatabaseManager:
                  int(metrics.get("listing_only_count") or 0),int(metrics.get("relevant_miss_count") or 0),
                  float(metrics.get("request_reduction_pct") or 0),1 if catchup_used else 0,
                  1 if restart_recovery else 0,str(metrics.get("outcome") or "unknown"),
-                 json.dumps(details,default=str)),
+                 json.dumps(details,default=str),
+                 # Written NON-NULL by every attribution-aware caller, including
+                 # the empty-dict case. Only pre-attribution rows are NULL, and
+                 # get_hdencode_shadow_summary depends on that distinction.
+                 json.dumps(dict(metrics.get("normal_feed_outcomes") or {}),default=str)),
             )
             for miss in misses:
                 conn.execute(
                     "INSERT OR REPLACE INTO hdencode_shadow_misses "
-                    "(cycle_uuid, canonical_url, title, status) VALUES (?, ?, ?, ?)",
-                    (cycle_uuid,miss.get("canonical_url"),miss.get("title"),miss.get("status")),
+                    "(cycle_uuid, canonical_url, title, status, media_type) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (cycle_uuid,miss.get("canonical_url"),miss.get("title"),
+                     miss.get("status"),miss.get("media_type")),
                 )
 
     def get_hdencode_rss_dashboard_counts(self):
@@ -2083,31 +2112,79 @@ class DatabaseManager:
                  AND rss_requests>0
                  AND listing_requests>0""",
             one=True,default=None)
-        # Miss accounting deliberately spans rows the eligibility filter above
-        # rejects: a 2026-07-21 ChatGPT adversarial audit (f5e3c6e) established
-        # that a degraded cycle must not be able to HIDE a real gap, and that
-        # rule stands. The one case it could not anticipate -- the window was 0
-        # days old -- is a cycle that never fetched at all. rss_urls comes from
-        # list_hdencode_current_feed_urls(), which reads the last persisted feed
-        # snapshot out of the database, so with rss_requests=0 the comparison is
-        # listing-vs-stale-snapshot and listing_only is inflated by everything
-        # the feed had merely not collected yet. Every relevant row in it was
-        # then booked as a miss.
+        # MISS ACCOUNTING. The 2026-07-21 adversarial audit (f5e3c6e) established
+        # that a degraded cycle must not be able to HIDE a real gap. That rule is
+        # preserved here by ATTRIBUTION rather than by any cycle-level proxy: a
+        # real movie miss still blocks when tv_all failed, and vice versa.
         #
-        # Measured over 2026-07-22..2026-08-05: 41 zero-fetch cycles produced 89
-        # of the 150 recorded misses; grading all 150 against later cycles found
-        # zero permanent losses (median catch-up 1.10h, worst 4.06h).
+        # compare_shadow() now applies per-feed validity at WRITE time, so for
+        # any row it produced, relevant_miss_count already contains only misses
+        # whose own feed was observed. Those rows need no filter here.
         #
-        # So this excludes ONLY the zero-fetch case, not everything the
-        # eligibility filter rejects. The single partial-fetch record
-        # (rss_requests=2, 2026-07-28) is still counted, and still grades green.
-        # compare_shadow() no longer writes these rows; this filter is what stops
-        # the 89 already on disk from failing the gate forever.
-        misses=self._query(
-            "SELECT SUM(relevant_miss_count) AS relevant_misses "
+        # Legacy rows are different and must not be trusted. They were written
+        # before per-feed provenance existed -- normal_feed_outcomes IS NULL --
+        # and their counts came from the old unfiltered logic. They cannot be
+        # re-graded under attribution because nothing recorded which feed
+        # succeeded; only a cycle-level boolean survives. So they are bounded
+        # CONSERVATIVELY: counted only when both normal feeds completed.
+        #
+        # That bound is strictly stricter than attribution would be. A mixed
+        # cycle (movies_all changed, tv_all failed) contributes nothing under the
+        # conservative rule, whereas attribution would admit its valid movie
+        # half. The legacy figure is therefore a lower bound on blocking misses,
+        # never an overstatement of health.
+        #
+        # An earlier attempt used `WHERE rss_requests>0` and was refuted by peer
+        # review: that count spans catch-up feeds and counts attempted-but-failed
+        # requests, so it admitted the very stale comparisons it was meant to
+        # exclude. Do not reintroduce a request-count proxy here.
+        # The gate RE-DERIVES validity rather than trusting the count the writer
+        # stored. compare_shadow already applies attribution when it records, so
+        # trusting relevant_miss_count would usually agree -- but the review's
+        # standing objection applies: "consistency between two consumers does not
+        # make the producer evidence valid." A writer bug, a hand-inserted row, or
+        # a future caller that forgets provenance must not be able to inflate or
+        # deflate the gate. So attribution is recomputed here from the stored
+        # per-miss media_type and per-cycle provenance, using the SAME pure
+        # function the writer used.
+        from backend.hdencode_shadow import feed_observation_valid
+        attributed=0
+        for row in self._query_dicts(
+                "SELECT m.media_type AS media_type, "
+                "       c.normal_feed_outcomes AS provenance, "
+                "       c.normal_feeds_complete AS complete "
+                "FROM hdencode_shadow_misses m "
+                "JOIN hdencode_shadow_cycles c ON c.cycle_uuid=m.cycle_uuid "
+                "WHERE c.normal_feed_outcomes IS NOT NULL",default=[]):
+            try:
+                provenance=json.loads(row.get("provenance") or "{}")
+            except (TypeError,ValueError):
+                provenance={}
+            if not isinstance(provenance,dict):
+                provenance={}
+            if "_derived_from" in provenance:
+                # Recorded by a caller that supplied no per-feed provenance. The
+                # marker deliberately does NOT fabricate feed outcomes, so fall
+                # back to the cycle-level rule it was actually derived from.
+                if row.get("complete"):
+                    attributed+=1
+                continue
+            if feed_observation_valid(str(row.get("media_type") or "unknown"),
+                                      provenance):
+                attributed+=1
+        # Pre-attribution rows cannot be re-derived: nothing recorded which feed
+        # succeeded, so there is no media_type to attribute against either. They
+        # are bounded CONSERVATIVELY -- counted only when both normal feeds
+        # completed. That bound is strictly stricter than attribution (a mixed
+        # cycle contributes nothing here, where attribution would admit its valid
+        # half), so it can understate health, never overstate it. Every row in the
+        # live 2026-07-22..08-05 window is of this kind.
+        legacy=self._query(
+            "SELECT SUM(relevant_miss_count) AS n "
             "FROM hdencode_shadow_cycles "
-            "WHERE rss_requests>0",
+            "WHERE normal_feed_outcomes IS NULL AND normal_feeds_complete=1",
             one=True,default=None)
+        misses={"relevant_misses":attributed+int((legacy["n"] if legacy else 0) or 0)}
         latest=self._query(
             "SELECT * FROM hdencode_shadow_cycles "
             "ORDER BY completed_at DESC LIMIT 1",

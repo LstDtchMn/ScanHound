@@ -2,13 +2,24 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 from backend.database import DatabaseManager
 from backend.background_scanner import BackgroundScanner
 
 
 def _insert_cycle(db, *, uuid, completed_at, normal=1, rss=2, listing=10,
-                  misses=0, restart=0, catchup=0, outcome="success"):
+                  misses=0, restart=0, catchup=0, outcome="success",
+                  feed_outcomes=None):
+    """Insert a shadow cycle.
+
+    ``feed_outcomes`` is per-normal-feed provenance, e.g.
+    ``{"movies_all": "changed", "tv_all": "failed"}``. Passing None leaves the
+    column NULL, which marks the row PRE-ATTRIBUTION: its relevant_miss_count
+    came from the old unfiltered logic, so get_hdencode_shadow_summary bounds it
+    conservatively. Every row the live 2026-07-22..08-05 window produced is of
+    that kind, because per-feed provenance was never recorded.
+    """
     conn = db.get_connection()
     conn.execute(
         """INSERT INTO hdencode_shadow_cycles (
@@ -16,12 +27,27 @@ def _insert_cycle(db, *, uuid, completed_at, normal=1, rss=2, listing=10,
                rss_requests, listing_requests, rss_count, listing_count,
                duplicate_count, feed_only_count, listing_only_count,
                relevant_miss_count, request_reduction_pct, catchup_used,
-               restart_recovery, outcome, details_json
-           ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, 0, ?, ?, ?, '{}')""",
+               restart_recovery, outcome, details_json, normal_feed_outcomes
+           ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, 0, ?, ?, ?, '{}', ?)""",
         (
             uuid, completed_at, completed_at, normal, rss, listing,
             misses, catchup, restart, outcome,
+            None if feed_outcomes is None else json.dumps(feed_outcomes),
         ),
+    )
+    conn.commit()
+
+
+def _insert_miss(db, *, uuid, url, media_type, status="missing", title="T"):
+    """Insert a miss ROW. The gate re-derives attribution from these, not from
+    the cycle's aggregate count, so a test that only sets relevant_miss_count
+    proves nothing about attribution."""
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT OR REPLACE INTO hdencode_shadow_misses "
+        "(cycle_uuid, canonical_url, title, status, media_type) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (uuid, url, title, status, media_type),
     )
     conn.commit()
 
@@ -54,15 +80,105 @@ def test_incomplete_and_degenerate_cycles_do_not_advance_readiness(tmp_path):
 
 
 def test_relevant_miss_blocks_even_when_cycle_is_incomplete(tmp_path):
+    """The 2026-07-21 audit rule (f5e3c6e), restated in terms of attribution.
+
+    ORIGINAL INTENT, unchanged and still enforced: a degraded cycle must not be
+    able to HIDE a genuine gap.
+
+    WHAT CHANGED, and why. The original row carried no per-feed provenance and
+    asserted that ANY miss from a degraded cycle blocks. A 2026-08-06 peer review
+    showed that cannot be right: with rss_requests=1 the feed side may be a
+    catch-up feed, or an attempted request that failed, leaving the comparison
+    listing-versus-stale-snapshot, which can prove neither success nor failure.
+    Counting such a row does not protect against a hidden gap -- it invents one.
+
+    What this now asserts is the rule the review prescribes: a degraded cycle
+    still contributes a blocking miss when the normal feed RELEVANT TO THAT
+    RELEASE was successfully validated. Here movies_all validated and tv_all
+    failed, so the cycle is degraded and the movie miss still blocks. Same
+    protection, on a defensible evidence boundary instead of a cycle proxy.
+
+    The other half is
+    test_a_degraded_cycle_with_no_valid_relevant_feed_does_not_block -- the case
+    the original assertion wrongly admitted.
+    """
     db = DatabaseManager(str(tmp_path / "db.sqlite"))
     _insert_cycle(
         db, uuid="incomplete-miss",
         completed_at="2026-07-21T00:00:00+00:00",
         normal=0, rss=1, listing=1, misses=1, outcome="relevant_miss",
+        feed_outcomes={"movies_all": "changed", "tv_all": "failed"},
     )
+    _insert_miss(db, uuid="incomplete-miss", media_type="movie",
+                 url="https://hdencode.org/a-movie-2026-2160p-x-9-gb")
     summary = db.get_hdencode_shadow_summary()
-    assert summary["successful_cycles"] == 0
-    assert summary["relevant_misses"] == 1
+    assert summary["successful_cycles"] == 0, (
+        "a degraded cycle must still not advance the window length")
+    assert summary["relevant_misses"] == 1, (
+        "a miss whose own feed validated must still block in a degraded cycle "
+        "-- this is the 2026-07-21 protection")
+
+
+def test_a_degraded_cycle_with_no_valid_relevant_feed_does_not_block(tmp_path):
+    """The half the original assertion wrongly admitted.
+
+    Both normal feeds failed, so candidate_urls was entirely the persisted
+    snapshot from an earlier cycle. Nothing here can establish that the feed
+    lacked the release. This is the case that kept the live window red for 15
+    days.
+    """
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(
+        db, uuid="degraded-nothing-valid",
+        completed_at="2026-07-21T00:00:00+00:00",
+        normal=0, rss=1, listing=1, misses=1, outcome="relevant_miss",
+        feed_outcomes={"movies_all": "failed", "tv_all": "failed"},
+    )
+    _insert_miss(db, uuid="degraded-nothing-valid", media_type="movie",
+                 url="https://hdencode.org/a-movie-2026-2160p-x-9-gb")
+    assert db.get_hdencode_shadow_summary()["relevant_misses"] == 0
+
+
+def test_a_catchup_only_cycle_cannot_validate_a_comparison(tmp_path):
+    """A catch-up fetch must not admit misses.
+
+    The refuted proxy counted this: poll_cycle sums `requested` over
+    normal + catch-up feeds, so a catch-up fetch while both normal feeds were
+    not_due gave rss_requests=1. Provenance records only the normal feeds, so
+    there is nothing to validate against.
+    """
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(
+        db, uuid="catchup-only",
+        completed_at="2026-07-21T00:00:00+00:00",
+        normal=0, rss=1, listing=4, misses=8, outcome="relevant_miss",
+        feed_outcomes={},
+    )
+    for i in range(8):
+        _insert_miss(db, uuid="catchup-only", media_type="movie",
+                     url=f"https://hdencode.org/m{i}-2026-1080p-x-1-gb")
+    assert db.get_hdencode_shadow_summary()["relevant_misses"] == 0
+
+
+def test_legacy_rows_are_bounded_conservatively(tmp_path):
+    """Pre-attribution rows (provenance NULL) use the cycle-level rule.
+
+    The live window holds 300 such rows and none can be graded under
+    attribution -- nothing recorded which feed succeeded. Counting them only
+    when both normal feeds completed is a strict LOWER bound on blocking
+    misses: a mixed cycle contributes nothing here, whereas attribution would
+    admit its valid half. It can understate health, never overstate it.
+    """
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="legacy-complete",
+                  completed_at="2026-07-21T00:00:00+00:00",
+                  normal=1, rss=2, listing=10, misses=3,
+                  outcome="relevant_miss")
+    _insert_cycle(db, uuid="legacy-degraded",
+                  completed_at="2026-07-22T00:00:00+00:00",
+                  normal=0, rss=1, listing=4, misses=97,
+                  outcome="relevant_miss")
+    assert db.get_hdencode_shadow_summary()["relevant_misses"] == 3
 
 
 class _Registry:
@@ -92,75 +208,21 @@ def test_restart_marker_is_process_lifetime_not_service_lifetime():
     assert scanner._rss_first_cycle_after_startup is False
 
 
-def test_misses_from_zero_fetch_cycles_do_not_fail_the_gate(tmp_path):
-    """A cycle that never fetched cannot condemn the window.
+def test_the_gate_does_not_trust_the_stored_count(tmp_path):
+    """A wrong relevant_miss_count cannot inflate or deflate the gate.
 
-    rss_urls comes from list_hdencode_current_feed_urls(), which reads the last
-    persisted feed snapshot from the database -- not that cycle's fetch. With
-    rss_requests=0 the comparison is listing-vs-stale-snapshot, listing_only is
-    inflated by everything the feed had merely not collected yet, and every
-    relevant row in it was booked as a miss. Over 2026-07-22..2026-08-05, 41
-    such cycles produced 89 of 150 recorded misses and none was a real loss
-    (median catch-up 1.10h, worst 4.06h).
-
-    compare_shadow no longer records these; this filter stops the 89 already on
-    disk from failing the gate forever.
+    The summary re-derives attribution from the miss rows and the cycle's
+    provenance using the same pure function the writer used. This is the
+    review's standing point: two consumers agreeing does not make the producer
+    valid. Here the cycle claims 99 misses and carries one attributable row, and
+    the gate reports 1.
     """
     db = DatabaseManager(str(tmp_path / "db.sqlite"))
-    _insert_cycle(db, uuid="eligible-clean",
+    _insert_cycle(db, uuid="lying-count",
                   completed_at="2026-07-21T00:00:00+00:00",
-                  normal=1, rss=2, listing=10, misses=0)
-    # 89 of the 90 real contested records looked exactly like this.
-    _insert_cycle(db, uuid="feed-never-fetched",
-                  completed_at="2026-07-22T00:00:00+00:00",
-                  normal=0, rss=0, listing=4, misses=8,
-                  outcome="relevant_miss")
-    _insert_cycle(db, uuid="feed-never-fetched-2",
-                  completed_at="2026-07-23T00:00:00+00:00",
-                  normal=0, rss=0, listing=5, misses=81,
-                  outcome="relevant_miss")
-
-    summary = db.get_hdencode_shadow_summary()
-    assert summary["relevant_misses"] == 0
-    assert summary["successful_cycles"] == 1
-
-
-def test_a_degraded_cycle_that_fetched_still_fails_the_gate(tmp_path):
-    """The 2026-07-21 audit rule (f5e3c6e), preserved rather than reversed.
-
-    test_relevant_miss_blocks_even_when_cycle_is_incomplete above is the
-    original. This is its sharper form: the exclusion must key on rss_requests,
-    NOT on normal_feeds_complete, so a degraded cycle that DID fetch still
-    reports. Widening the exclusion to all incomplete cycles would silence the
-    real 2026-07-28 record (rss_requests=2), which grades green at 1.25h -- so
-    keeping it costs nothing and dropping it would cost the protection.
-    """
-    db = DatabaseManager(str(tmp_path / "db.sqlite"))
-    _insert_cycle(db, uuid="degraded-but-fetched",
-                  completed_at="2026-07-28T01:32:02+00:00",
-                  normal=0, rss=2, listing=27, misses=1,
-                  outcome="relevant_miss")
-    _insert_cycle(db, uuid="feed-never-fetched",
-                  completed_at="2026-07-30T02:26:28+00:00",
-                  normal=0, rss=0, listing=4, misses=97,
-                  outcome="relevant_miss")
-
-    summary = db.get_hdencode_shadow_summary()
-    # The 1 that fetched, not the 97 that did not, and not 0.
-    assert summary["relevant_misses"] == 1
-
-
-def test_a_real_miss_on_an_eligible_cycle_still_fails_the_gate(tmp_path):
-    """The protection this change must not weaken at all."""
-    db = DatabaseManager(str(tmp_path / "db.sqlite"))
-    _insert_cycle(db, uuid="eligible-with-a-real-gap",
-                  completed_at="2026-07-21T00:00:00+00:00",
-                  normal=1, rss=2, listing=10, misses=3,
-                  outcome="relevant_miss")
-    _insert_cycle(db, uuid="feed-never-fetched",
-                  completed_at="2026-07-22T00:00:00+00:00",
-                  normal=0, rss=0, listing=4, misses=97,
-                  outcome="relevant_miss")
-
-    summary = db.get_hdencode_shadow_summary()
-    assert summary["relevant_misses"] == 3
+                  normal=1, rss=2, listing=10, misses=99,
+                  outcome="relevant_miss",
+                  feed_outcomes={"movies_all": "changed", "tv_all": "changed"})
+    _insert_miss(db, uuid="lying-count", media_type="movie",
+                 url="https://hdencode.org/only-one-2026-2160p-x-9-gb")
+    assert db.get_hdencode_shadow_summary()["relevant_misses"] == 1

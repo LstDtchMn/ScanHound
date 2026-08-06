@@ -1,176 +1,243 @@
-"""A miss may only be asserted from a comparison whose feed side fetched.
+"""A miss may only be asserted when the feed responsible for it was observed.
 
-Background. compare_shadow() derives misses from listing_only = listing - rss.
-When normal_feeds_complete is False the caller passes the LAST PERSISTED feed
-snapshot (list_hdencode_current_feed_urls reads the database, not that cycle's
-fetch), so listing_only is inflated by everything the feed had merely not
-collected yet. The old code booked all of it as misses AND overwrote the
-incomplete_feeds label that said the comparison was invalid.
+HISTORY, because this file has been wrong once already. Its first version gated
+on ``rss_requests > 0``. A 2026-08-06 peer review refuted that, and the
+production code confirms the refutation:
 
-Measured over 2026-07-22..2026-08-05: 41 such cycles produced 89 of 150
-recorded misses; grading all 150 against later cycles found zero permanent
-losses (median catch-up 1.10h, worst 4.06h).
+    # hdencode_rss_service.poll_cycle
+    feeds = normal + (list(catchup_feeds()) if include_catchup else [])
+    ...
+    "requests": sum(1 for r in results if r.get("requested"))
 
-These tests are written to fail against the old behaviour in BOTH directions.
-The risk of this change is silencing a real miss, so the healthy-cycle cases
-below are the ones that matter most: they must keep reporting.
+    # hdencode_rss_service.poll_feed, exception path
+    return {"feed": feed.key, "outcome": "failed", ..., "requested": True}
+
+So ``rss_requests > 0`` is satisfied by a catch-up-only cycle, by an attempted
+request that failed, and by a cycle where one normal feed succeeded and the other
+did not. In all of those, candidate_urls is wholly or partly the persisted
+snapshot from an earlier cycle. The count means "something was attempted
+somewhere", not "this release's feed was validly observed" -- and the earlier
+version of this file codified that proxy as a test rather than proving it.
+
+The rule now under test is per-feed attribution: a listing row is booked as a
+miss only when the normal feed that should have carried it
+(movies_all for a film, tv_all for a series) returned changed or not_modified in
+THAT cycle.
+
+These are unit-level. tests/test_hdencode_shadow_provenance_paths.py drives the
+real HDEncodeRSSService.poll_cycle for the same rules, which is what the review
+required -- injecting an integer cannot test what that integer means.
 """
 import pytest
 
-from backend.hdencode_shadow import compare_shadow
+from backend.hdencode_shadow import (
+    attribute_listing_media_type,
+    compare_shadow,
+    feed_observation_valid,
+    normal_feed_outcomes_from_results,
+)
+
+MOVIE = {"url": "https://hdencode.org/a-movie-2026-2160p-web-x-9-9-gb",
+         "status": "missing", "title": "A Movie 2026"}
+SHOW = {"url": "https://hdencode.org/a-show-s02-1080p-web-y-5-5-gb",
+        "status": "missing", "title": "A Show S02"}
+FEED_HAS_NEITHER = ["https://hdencode.org/z-2020-1080p-web-q-1-1-gb"]
+
+BOTH_OK = {"movies_all": "changed", "tv_all": "not_modified"}
+MOVIE_OK_TV_DEAD = {"movies_all": "changed", "tv_all": "failed"}
+TV_OK_MOVIE_DEAD = {"movies_all": "failed", "tv_all": "changed"}
+BOTH_DEAD = {"movies_all": "failed", "tv_all": "failed"}
+NOTHING_RAN = {}
 
 
-# Two listing rows the feed does not have. 'missing' is a relevant state, so
-# each is a miss candidate; 'ignored' must never be one either way.
-LISTING = [
-    {"url": "https://hdencode.org/a-2026-2160p-web-h265-x-9-9-gb",
-     "status": "missing", "title": "A 2026 2160p"},
-    {"url": "https://hdencode.org/b-2026-1080p-web-h264-y-5-5-gb",
-     "status": "missing", "title": "B 2026 1080p"},
-]
-FEED_HAS_NEITHER = ["https://hdencode.org/z-2020-1080p-web-h264-q-1-1-gb"]
-
-
-def cmp_(*, complete, rss_requests, rss=None, listing=None):
+def cmp_(*, outcomes, listing=None, rss_requests=2, complete=True):
     return compare_shadow(
-        rss_urls=FEED_HAS_NEITHER if rss is None else rss,
-        listing_items=LISTING if listing is None else listing,
+        rss_urls=FEED_HAS_NEITHER,
+        listing_items=listing if listing is not None else [MOVIE, SHOW],
         rss_requests=rss_requests, listing_requests=7,
-        normal_feeds_complete=complete)
+        normal_feeds_complete=complete, normal_feed_outcomes=outcomes)
 
 
-class TestFeedNeverFetched:
-    """rss_requests=0 -> the feed URL set is not this cycle's, so no miss.
+def titles(records):
+    return sorted(r["title"] for r in records)
 
-    This is the ONLY excluded case. Completeness is not the criterion; see
-    TestTheAuditRuleIsPreservedNotReversed below.
-    """
 
-    def test_no_misses_are_recorded(self):
-        r = cmp_(complete=False, rss_requests=0)
+class TestAttribution:
+    """Which feed should have carried a row. Pure, so it is tested directly."""
+
+    @pytest.mark.parametrize("url,expected", [
+        ("https://hdencode.org/will-and-grace-s07-1080p-amzn-x-42-7-gb", "tv"),
+        ("https://hdencode.org/show-s01e04-720p-web-y-2-0-gb", "tv"),
+        ("https://hdencode.org/some-film-2026-2160p-web-z-9-0-gb", "movie"),
+        ("https://hdencode.org/dune-part-two-2024-2160p-uhd-remux-50-2-gb", "movie"),
+    ])
+    def test_from_the_slug(self, url, expected):
+        assert attribute_listing_media_type({"url": url}) == expected
+
+    def test_a_season_field_beats_the_slug(self):
+        # Production path: MediaItem carries season, so no slug guessing.
+        assert attribute_listing_media_type(
+            {"url": "https://hdencode.org/x-2026-1080p-a-1-gb", "season": 3}) == "tv"
+
+    def test_a_series_only_status_is_tv(self):
+        assert attribute_listing_media_type(
+            {"url": "https://hdencode.org/x-2026-1080p-a-1-gb",
+             "status": "missing_season"}) == "tv"
+
+    def test_season_none_is_not_tv(self):
+        # A movie row still carries season=None; that must not read as a series.
+        assert attribute_listing_media_type(
+            {"url": "https://hdencode.org/x-2026-1080p-a-1-gb",
+             "season": None}) == "movie"
+
+    def test_unattributable_is_its_own_answer(self):
+        # Deliberately NOT defaulted to "movie". Guessing wrong in that
+        # direction would let a TV release be checked against a failed movie
+        # feed and silently dropped -- a false pass, the exact class of failure
+        # this change removes.
+        assert attribute_listing_media_type({"url": "", "status": "missing"}) == "unknown"
+
+
+class TestFeedValidity:
+    """The review's disagreeing cases, each pinned."""
+
+    def test_catchup_only_is_not_an_observation(self):
+        # A catch-up feed request while both normal feeds were not_due.
+        assert feed_observation_valid("movie", NOTHING_RAN) is False
+        assert feed_observation_valid("tv", NOTHING_RAN) is False
+
+    def test_not_due_is_not_an_observation(self):
+        assert feed_observation_valid(
+            "movie", {"movies_all": "not_due", "tv_all": "not_due"}) is False
+
+    def test_an_attempted_failure_is_not_an_observation(self):
+        assert feed_observation_valid("movie", BOTH_DEAD) is False
+
+    def test_the_relevant_feed_decides(self):
+        assert feed_observation_valid("movie", MOVIE_OK_TV_DEAD) is True
+        assert feed_observation_valid("tv", MOVIE_OK_TV_DEAD) is False
+        assert feed_observation_valid("tv", TV_OK_MOVIE_DEAD) is True
+        assert feed_observation_valid("movie", TV_OK_MOVIE_DEAD) is False
+
+    def test_unknown_requires_both(self):
+        assert feed_observation_valid("unknown", MOVIE_OK_TV_DEAD) is False
+        assert feed_observation_valid("unknown", BOTH_OK) is True
+
+    def test_catchup_feeds_never_enter_provenance(self):
+        got = normal_feed_outcomes_from_results([
+            {"feed": "movies_all", "outcome": "changed"},
+            {"feed": "tv_all", "outcome": "failed"},
+            {"feed": "movies_10", "outcome": "changed"},
+            {"feed": "tv_webdl", "outcome": "changed"},
+        ])
+        assert got == {"movies_all": "changed", "tv_all": "failed"}
+
+
+class TestTheRefutedProxyCannotComeBack:
+    """rss_requests must have no influence on whether a miss counts."""
+
+    @pytest.mark.parametrize("rss_requests", [0, 1, 2, 17, 999])
+    def test_no_request_count_rescues_an_invalid_comparison(self, rss_requests):
+        r = cmp_(outcomes=NOTHING_RAN, rss_requests=rss_requests, complete=False)
+        assert r.relevant_miss_count == 0, (
+            f"rss_requests={rss_requests} made an unobserved comparison count")
+
+    @pytest.mark.parametrize("rss_requests", [0, 1, 999])
+    def test_no_request_count_suppresses_a_valid_one(self, rss_requests):
+        r = cmp_(outcomes=BOTH_OK, rss_requests=rss_requests)
+        assert r.relevant_miss_count == 2
+
+
+class TestPartialCycles:
+    """The case a cycle-level boolean cannot express."""
+
+    def test_a_movie_gap_blocks_when_only_the_tv_feed_failed(self):
+        r = cmp_(outcomes=MOVIE_OK_TV_DEAD, complete=False)
+        assert titles(r.relevant_misses) == ["A Movie 2026"]
+        assert titles(r.unattributable) == ["A Show S02"]
+
+    def test_a_tv_gap_blocks_when_only_the_movie_feed_failed(self):
+        r = cmp_(outcomes=TV_OK_MOVIE_DEAD, complete=False)
+        assert titles(r.relevant_misses) == ["A Show S02"]
+        assert titles(r.unattributable) == ["A Movie 2026"]
+
+    def test_both_block_when_both_feeds_are_healthy(self):
+        r = cmp_(outcomes=BOTH_OK)
+        assert titles(r.relevant_misses) == ["A Movie 2026", "A Show S02"]
+        assert r.unattributable == ()
+
+    def test_neither_blocks_when_both_feeds_died(self):
+        r = cmp_(outcomes=BOTH_DEAD, complete=False)
         assert r.relevant_miss_count == 0
-        assert r.relevant_misses == ()
+        assert titles(r.unattributable) == ["A Movie 2026", "A Show S02"]
 
-    def test_the_invalid_label_survives(self):
-        # The specific old bug: `if misses: outcome='relevant_miss'` ran
-        # unconditionally and erased this.
-        assert cmp_(complete=False, rss_requests=0).outcome == "incomplete_feeds"
+    def test_each_miss_records_the_feed_it_was_attributed_to(self):
+        r = cmp_(outcomes=BOTH_OK)
+        assert {m["title"]: m["media_type"] for m in r.relevant_misses} == {
+            "A Movie 2026": "movie", "A Show S02": "tv"}
 
-    def test_diagnostic_detail_is_not_lost(self):
-        # Dropping the miss rows must not drop the evidence. listing_only is
-        # persisted in details_json, which is how the 41 cycles were diagnosed
-        # in the first place -- if this regressed, the next investigation of the
-        # same question would have nothing to read.
-        r = cmp_(complete=False, rss_requests=0)
+
+class TestEvidenceIsNotDiscarded:
+    """Dropping a miss CLAIM must not drop the underlying observation."""
+
+    def test_listing_only_survives(self):
+        r = cmp_(outcomes=BOTH_DEAD, complete=False)
         assert r.listing_only_count == 2
         assert len(r.listing_only) == 2
-        assert all("hdencode.org" in u for u in r.listing_only)
 
-    def test_counts_still_describe_the_comparison(self):
-        r = cmp_(complete=False, rss_requests=0)
-        assert r.rss_count == 1
-        assert r.listing_count == 2
-        assert r.duplicate_count == 0
+    def test_suppressed_rows_are_kept_with_a_reason(self):
+        r = cmp_(outcomes=BOTH_DEAD, complete=False)
+        assert len(r.unattributable) == 2
+        assert all(rec.get("unattributable_reason") for rec in r.unattributable)
 
+    def test_provenance_is_recorded(self):
+        assert cmp_(outcomes=MOVIE_OK_TV_DEAD).normal_feed_outcomes == MOVIE_OK_TV_DEAD
 
-class TestTheAuditRuleIsPreservedNotReversed:
-    """A degraded cycle that DID fetch must still report its misses.
-
-    On 2026-07-21 a ChatGPT adversarial audit (f5e3c6e) added
-    test_relevant_miss_blocks_even_when_cycle_is_incomplete, establishing that a
-    degraded cycle must not be able to HIDE a real gap. This change narrows that
-    rule to exclude only the zero-fetch case; it does not reverse it. These tests
-    exist so that a later change cannot quietly widen the exclusion into the
-    reversal, which is the failure mode the audit was guarding against.
-
-    Empirically the narrowing is what the data supports: of the 90 contested
-    records 89 are zero-fetch, and the single partial-fetch one (rss_requests=2,
-    2026-07-28) grades green at 1.25h -- so keeping it costs nothing and losing
-    it would have cost the protection.
-    """
-
-    def test_a_partial_fetch_still_reports_its_misses(self):
-        # The real 2026-07-28 shape: feeds did not complete, but the feed side
-        # DID fetch. rss_requests is the criterion, not completeness.
-        r = cmp_(complete=False, rss_requests=2)
-        assert r.relevant_miss_count == 2, (
-            "narrowing became a reversal: a cycle that fetched must still "
-            "report its misses (ChatGPT audit f5e3c6e)")
-        assert r.relevant_misses != ()
-
-    def test_but_the_invalid_label_is_still_not_overwritten(self):
-        # Two independent bugs. The miss survives; the label saying the cycle
-        # was degraded must ALSO survive, so the row stays distinguishable from
-        # a clean cycle that found a gap.
-        assert cmp_(complete=False, rss_requests=2).outcome == "incomplete_feeds"
-
-    def test_one_request_is_enough_to_count(self):
-        # Exactly the audit test's shape (normal=0, rss=1, misses>=1). If this
-        # regresses, test_relevant_miss_blocks_even_when_cycle_is_incomplete in
-        # test_hdencode_readiness_integrity.py breaks too.
-        assert cmp_(complete=False, rss_requests=1).relevant_miss_count == 2
+    def test_derived_provenance_is_not_fabricated(self):
+        # A caller supplying no provenance falls back to the cycle-level rule,
+        # but the RECORD must not claim feed outcomes that never happened.
+        r = compare_shadow(rss_urls=FEED_HAS_NEITHER, listing_items=[MOVIE],
+                           rss_requests=2, listing_requests=7,
+                           normal_feeds_complete=True)
+        assert r.relevant_miss_count == 1, "old callers must keep working"
+        assert r.normal_feed_outcomes.get("_derived_from") == "cycle_level_completeness"
+        assert "movies_all" not in r.normal_feed_outcomes
 
 
-class TestFeedDidFetch:
-    """normal_feeds_complete=True -> a real gap must still be reported."""
+class TestOutcomeLabel:
+    """The invalidity label must survive, independently of the miss count."""
 
-    def test_a_genuine_miss_is_still_recorded(self):
-        r = cmp_(complete=True, rss_requests=4)
-        assert r.relevant_miss_count == 2
-        assert r.outcome == "relevant_miss"
-        assert {m["canonical_url"] for m in r.relevant_misses} == {
-            "https://hdencode.org/a-2026-2160p-web-h265-x-9-9-gb",
-            "https://hdencode.org/b-2026-1080p-web-h264-y-5-5-gb"}
+    @pytest.mark.parametrize("outcomes,complete,expected", [
+        (BOTH_OK, True, "relevant_miss"),
+        (MOVIE_OK_TV_DEAD, False, "incomplete_feeds"),
+        (BOTH_DEAD, False, "incomplete_feeds"),
+        (NOTHING_RAN, False, "incomplete_feeds"),
+    ])
+    def test_label(self, outcomes, complete, expected):
+        assert cmp_(outcomes=outcomes, complete=complete).outcome == expected
 
-    def test_miss_rows_carry_title_and_status(self):
-        r = cmp_(complete=True, rss_requests=4)
-        for m in r.relevant_misses:
-            assert m["status"] == "missing"
-            assert m["title"]
-
-    def test_a_clean_cycle_is_success(self):
-        # Feed has everything the listing has -> no gap, no miss.
-        r = cmp_(complete=True, rss_requests=4,
-                 rss=[row["url"] for row in LISTING])
-        assert r.relevant_miss_count == 0
+    def test_a_clean_cycle_with_no_gap_is_success(self):
+        r = compare_shadow(rss_urls=[MOVIE["url"], SHOW["url"]],
+                           listing_items=[MOVIE, SHOW], rss_requests=2,
+                           listing_requests=7, normal_feeds_complete=True,
+                           normal_feed_outcomes=BOTH_OK)
         assert r.outcome == "success"
+        assert r.relevant_miss_count == 0
         assert r.duplicate_count == 2
-
-    def test_irrelevant_states_are_not_misses(self):
-        r = cmp_(complete=True, rss_requests=4,
-                 listing=[{"url": "https://hdencode.org/c-2026-1080p-web-1-1-gb",
-                           "status": "ignored", "title": "C"}])
-        assert r.relevant_miss_count == 0
-        assert r.outcome == "success"
 
     @pytest.mark.parametrize("state", ["missing", "upgrade", "missing_season",
                                        "dv_upgrade"])
-    def test_every_state_seen_in_the_live_window_still_counts(self, state):
-        # The 150 real records were 119 missing, 15 upgrade, 13 missing_season,
-        # 3 dv_upgrade. All four must survive as reportable misses.
-        r = cmp_(complete=True, rss_requests=4,
-                 listing=[{"url": "https://hdencode.org/d-2026-2160p-web-2-2-gb",
-                           "status": state, "title": "D"}])
+    def test_every_state_seen_live_still_counts(self, state):
+        # The 150 live records were 119 missing, 15 upgrade, 13 missing_season,
+        # 3 dv_upgrade. All four must remain reportable.
+        row = {"url": "https://hdencode.org/d-2026-2160p-web-2-2-gb",
+               "status": state, "title": "D"}
+        r = cmp_(outcomes=BOTH_OK, listing=[row])
         assert r.relevant_miss_count == 1, f"{state} stopped being a miss"
-        assert r.outcome == "relevant_miss"
 
-
-class TestTheTwoAxesAreIndependent:
-    """Completeness and the presence of a gap must not be conflated."""
-
-    @pytest.mark.parametrize("complete,has_gap,expect_outcome,expect_misses", [
-        (True,  True,  "relevant_miss",    2),
-        (True,  False, "success",          0),
-        (False, True,  "incomplete_feeds", 0),
-        (False, False, "incomplete_feeds", 0),
-    ])
-    def test_full_truth_table(self, complete, has_gap, expect_outcome,
-                              expect_misses):
-        r = cmp_(complete=complete, rss_requests=4 if complete else 0,
-                 rss=FEED_HAS_NEITHER if has_gap
-                     else [row["url"] for row in LISTING])
-        assert r.outcome == expect_outcome
-        assert r.relevant_miss_count == expect_misses
-        # normal_feeds_complete must be reported as passed in, never inferred
-        # from whether a gap was found.
-        assert r.normal_feeds_complete is complete
+    def test_an_irrelevant_state_is_never_a_miss(self):
+        row = {"url": "https://hdencode.org/c-2026-1080p-1-1-gb",
+               "status": "ignored", "title": "C"}
+        r = cmp_(outcomes=BOTH_OK, listing=[row])
+        assert r.relevant_miss_count == 0
+        assert r.unattributable == ()
