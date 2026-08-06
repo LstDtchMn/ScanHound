@@ -133,13 +133,22 @@
   // --- Dolby Vision Plex label sync ---
   // The POST returns immediately; we stay "running" until dv:sync_done arrives
   // (the store's WS handler flips dvSyncRunning back to false — success or error).
-  async function dvSync() {
+  // The API has always supported dry_run, and the documented rollout gate
+  // depends on previewing first -- but the UI hardcoded a LIVE write, so the
+  // only way to preview was curl. Every click wrote labels across the whole
+  // 4K library. `dryRun` is now a parameter and Preview is its own button.
+  async function dvSync(dryRun = false) {
     if ($dvSyncRunning) return; // guard: one sync at a time
     dvSyncRunning.set(true);
     dvSyncResult.set(null);
     try {
-      await api.dvSyncLabels(false);
-      addToast('Dolby Vision', 'Syncing Plex labels — matching detected layers to the copy Plex serves.');
+      await api.dvSyncLabels(dryRun);
+      addToast(
+        'Dolby Vision',
+        dryRun
+          ? 'Previewing — reporting what WOULD change. No labels are being written.'
+          : 'Syncing Plex labels — matching detected layers to the copy Plex serves.'
+      );
     } catch (e) {
       dvSyncRunning.set(false);
       addToast('Error', e instanceof Error ? e.message : 'Failed to start label sync', 'error');
@@ -525,11 +534,17 @@
         <div class="mt-3 pt-3 border-t border-[var(--border)]">
           <div class="flex items-center gap-2 flex-wrap">
             <button
-              onclick={dvSync}
+              onclick={() => dvSync(true)}
+              disabled={$dvSyncRunning}
+              class="px-3 py-1.5 text-sm rounded-lg border border-[var(--border)] hover:bg-[var(--bg-tertiary)] font-medium transition disabled:opacity-50"
+            >{$dvSyncRunning ? 'Working…' : 'Preview'}</button>
+            <button
+              onclick={() => dvSync(false)}
               disabled={$dvSyncRunning}
               class="px-3 py-1.5 text-sm rounded-lg bg-[var(--accent)] hover:opacity-90 text-white font-medium transition disabled:opacity-50"
             >{$dvSyncRunning ? 'Syncing…' : 'Sync Plex labels'}</button>
             <span class="text-xs text-[var(--text-secondary)]">
+              <strong>Preview</strong> reports what would change without writing anything — worth running first, since Sync writes labels across the whole 4K library.
               Applies <code>DV FEL/MEL/P8/P5</code> to the exact copy Plex serves. Only these four labels are managed — your own labels are never touched.
             </span>
           </div>

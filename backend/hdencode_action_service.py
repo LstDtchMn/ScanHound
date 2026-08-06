@@ -41,14 +41,19 @@ class HDEncodeActionService:
     """
 
     def __init__(self, config, db, download_service):
+        # Construction is deliberately SIDE-EFFECT FREE. This service is built
+        # per API request (routes/rss.py) and per scan cycle
+        # (background_scanner), and recover_hdencode_actions() is a blanket
+        # state-keyed UPDATE with no owner or generation column -- so doing it
+        # here let one construction reset another thread's IN-FLIGHT action,
+        # discarding links it had already scraped and mislabelling a
+        # submission that had actually succeeded. Recovery is a restart
+        # concern; it runs exactly once per lifespan, from
+        # backend/api/main.py's startup.
         self.config = config if isinstance(config, dict) else {}
         self.db = db
         self.download = download_service
         self.coordinator = get_hdencode_coordinator()
-        try:
-            self.db.recover_hdencode_actions()
-        except Exception:
-            logger.exception("Failed to recover interrupted HDEncode actions")
 
     def queue_action(
         self,

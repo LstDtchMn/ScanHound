@@ -1434,6 +1434,18 @@
           </label>
 
           <label class="flex items-center gap-3">
+            <input type="checkbox" checked={$settings.rename_manual_apply_enabled ?? true}
+              onchange={(e) => settings.update((s) => ({ ...s, rename_manual_apply_enabled: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm font-medium">Allow manual renames</span>
+          </label>
+          <p class="text-xs text-[var(--text-secondary)] -mt-2 ml-7">
+            The Apply button on the Renames page. Independent of auto-rename above:
+            turn this off to freeze all file moves while still leaving the rest of the
+            page usable, or leave it on to rename by hand without arming automation.
+          </p>
+
+          <label class="flex items-center gap-3">
             <input type="checkbox" checked={$settings.auto_rename_require_confirmation ?? true}
               onchange={(e) => settings.update((s) => ({ ...s, auto_rename_require_confirmation: e.currentTarget.checked }))}
               class="accent-[var(--accent)]" />
@@ -1643,6 +1655,18 @@
               class="accent-[var(--accent)]" />
             <span class="text-sm font-medium">Tag MKV track name with the detected layer</span>
           </label>
+
+          <label class="flex items-center gap-3 mt-3">
+            <input type="checkbox" checked={$settings.dv_auto_sync_enabled ?? true}
+              onchange={(e) => settings.update((s) => ({ ...s, dv_auto_sync_enabled: e.currentTarget.checked }))}
+              class="accent-[var(--accent)]" />
+            <span class="text-sm font-medium">Keep Plex labels in sync automatically</span>
+          </label>
+          <p class="text-xs text-[var(--text-secondary)] -mt-2 ml-7">
+            Hourly, and only when new detections have landed &mdash; it never runs just
+            because the app restarted. Adds missing labels; it will not remove a label
+            from a title it could not match. Turn off to stop all automatic label writes.
+          </p>
 
           <label class="block mt-3">
             <span class="text-sm text-[var(--text-secondary)]">Library roots (host-native, one per line)</span>

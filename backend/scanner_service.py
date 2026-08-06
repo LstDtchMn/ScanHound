@@ -528,7 +528,7 @@ class ScannerService:
 
         # ── Process posts (parallel) ──────────────────────────────────
         num_threads = self.config.get("scan_threads", 10)
-        await self._process_posts(all_posts, scraper, num_threads)
+        completed_urls = await self._process_posts(all_posts, scraper, num_threads)
 
         if self.stop_scan_flag:
             return
@@ -536,8 +536,17 @@ class ScannerService:
         # Save scanned URLs only after all posts are processed — avoids
         # permanently marking unvisited URLs as "seen" if the scan is stopped.
         if track_urls and all_posts and scan_type != "Site Search":
-            urls_to_save = [{'url': p['url'], 'title': None, 'source': p.get('source')} for p in all_posts]
-            self.db.add_scanned_urls_batch(urls_to_save)
+            # Record ONLY the posts that actually completed. Recording every
+            # crawled URL meant a post whose detail scrape failed (three
+            # transient timeouts, or a worker exception) was marked scanned
+            # and then skipped by every future incremental scan -- so a
+            # transient network blip removed a release from the catalogue
+            # permanently. A URL left out here is simply retried next time.
+            urls_to_save = [{'url': p['url'], 'title': None,
+                             'source': p.get('source')}
+                            for p in all_posts if p['url'] in completed_urls]
+            if urls_to_save:
+                self.db.add_scanned_urls_batch(urls_to_save)
 
         # ── Sort by posted date (newest first) ────────────────────────
         self.items.sort(key=self._posted_date_sort_key, reverse=True)
@@ -963,9 +972,18 @@ class ScannerService:
 
     # ── Post processing ───────────────────────────────────────────────
 
-    async def _process_posts(self, all_posts: List[Dict], scraper, num_threads: int):
+    async def _process_posts(self, all_posts: List[Dict], scraper,
+                             num_threads: int) -> Set[str]:
+        """Scrape each post's detail page and turn it into a MediaItem.
+
+        Returns the set of post URLs that completed END TO END -- the detail
+        scrape succeeded AND a MediaItem was created. Callers record only
+        these in ``scanned_urls``; a URL left out is retried on the next scan
+        instead of being skipped forever.
+        """
         processed = 0
         total_posts = len(all_posts)
+        completed_urls: Set[str] = set()
 
         def process_post(post_info):
             if self.stop_scan_flag:
@@ -1014,8 +1032,12 @@ class ScannerService:
                             item.id = f"item_{self._item_counter}"
                             self._item_counter += 1
                             self.items.append(item)
+                        # Only a post that produced an item counts as scanned.
+                        if result.get('url'):
+                            completed_urls.add(result['url'])
 
         self._log(f"Processing complete: {len(self.items)} items created from {total_posts} posts")
+        return completed_urls
 
     # ── Item creation ─────────────────────────────────────────────────
 
@@ -1249,21 +1271,31 @@ class ScannerService:
         if not items:
             return 0
 
-        # Run the same Plex matcher over the reconstructed items.
-        with self._items_lock:
-            saved_items = self.items
-            self.items = items
+        # Run the same Plex matcher over the reconstructed items -- passed in
+        # explicitly, NOT published into the shared self.items.
+        #
+        # This method is called from three places and only ONE of them holds
+        # the scan slot (background_scanner, right after its cycle). The other
+        # two -- downloads.py's post-grab annotation and main.py's
+        # queue-delivery hook -- fire from request and download-queue threads
+        # while a scan may be mid-flight. The old code swapped these cache
+        # rows into self.items and restored them in a finally, so a
+        # concurrent scan matched and published the WRONG item list.
+        #
+        # The fix deliberately adds no lock. Taking the scan slot here would
+        # deadlock: it is a non-reentrant threading.Lock that
+        # background_scanner already holds when it calls in, and a
+        # try_acquire would silently make its rematch a permanent no-op.
+        # Removing the shared-state mutation removes the race outright.
         try:
             loop = asyncio.new_event_loop()
             try:
-                loop.run_until_complete(self._match_against_plex("Deep Scan"))
+                loop.run_until_complete(
+                    self._match_against_plex("Deep Scan", items=items))
             finally:
                 loop.close()
         except Exception:
             logger.exception("Cache re-match: Plex matching failed")
-        finally:
-            with self._items_lock:
-                self.items = saved_items
 
         # Persist only rows whose status/info changed (preserve last_seen).
         updates = []
@@ -1292,19 +1324,33 @@ class ScannerService:
 
     # ── Plex matching ─────────────────────────────────────────────────
 
-    async def _match_against_plex(self, scan_type: str = "Deep Scan"):
-        """Compare all scan results against the Plex library index.
+    async def _match_against_plex(self, scan_type: str = "Deep Scan",
+                                  items: Optional[List[MediaItem]] = None):
+        """Compare scan results against the Plex library index.
 
         Updates each MediaItem's status (IN_LIBRARY, UPGRADE, DV_UPGRADE)
         and plex_info field based on matching results.
+
+        ``items`` lets a caller match a list it OWNS instead of the shared
+        ``self.items``. rematch_cache uses it: it previously published its
+        reconstructed cache rows into self.items and restored them in a
+        finally, which corrupted a concurrent scan's results — and two of its
+        callers (downloads.py's grab annotation, main.py's queue-delivery
+        hook) run with no scan slot held. Passing the list is the fix that
+        does NOT introduce a lock: acquiring the scan slot here would
+        deadlock, because background_scanner already holds that
+        non-reentrant lock when it calls in.
         """
         plex_index = self.plex.plex_index
         if not plex_index["all_items"]:
             self._log("No Plex data available, skipping matching", "warning")
             return
 
-        with self._items_lock:
-            items_snapshot = list(self.items)
+        if items is not None:
+            items_snapshot = list(items)
+        else:
+            with self._items_lock:
+                items_snapshot = list(self.items)
         total = len(items_snapshot)
         for idx, item in enumerate(items_snapshot):
             if self.stop_scan_flag:
