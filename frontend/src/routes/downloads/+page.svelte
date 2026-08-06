@@ -465,6 +465,17 @@
     </button>
   </div>
 </div>
+<!-- ONE scroll container for the whole desktop body.
+     The shell (+layout.svelte) wraps every page in overflow-hidden and expects
+     the page to provide its own scrolling. This page previously emitted six
+     siblings -- header, VerificationRetries, jdInfo, results, progress, queue --
+     and made only the LAST one (the history list) scrollable. Any sibling taller
+     than the viewport was therefore clipped with no way to reach it: with 72
+     retained verification-retry cards the page could not be scrolled at all.
+     Keeping the header outside and everything else inside means no future tall
+     panel can reproduce it. min-h-0 is required for a flex child to shrink
+     below its content height, without which overflow-auto never engages. -->
+<div class="flex-1 overflow-auto min-h-0" bind:this={historyContainer}>
 
 <VerificationRetries />
 
@@ -697,7 +708,7 @@
   </div>
 {/if}
 
-<div class="flex-1 overflow-auto p-4" bind:this={historyContainer}>
+<div class="p-4">
   {#if error}
     <ErrorCard message={error} onretry={loadHistory} />
   {:else if loading}
@@ -823,5 +834,6 @@
   :global(.animate-shimmer) {
     animation: shimmer 1.5s infinite;
   }
+</div>
 </style>
 {/if}
