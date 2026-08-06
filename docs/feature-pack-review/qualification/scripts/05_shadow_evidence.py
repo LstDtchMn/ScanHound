@@ -140,9 +140,27 @@ def main():
                       AND listing_requests>0""",
                 CYCLE_OUTCOMES,
             ).fetchone()
+            # Mirrors get_hdencode_rss_readiness, INCLUDING its rss_requests>0
+            # filter (see backend/database.py). A cycle with rss_requests=0 never
+            # fetched: rss_urls came from list_hdencode_current_feed_urls(), i.e.
+            # the last persisted feed snapshot, so listing_only was inflated by
+            # everything the feed had merely not collected yet and every relevant
+            # row in it was booked as a miss. 41 such cycles produced 89 of 150
+            # records over 2026-07-22..2026-08-05, none a real loss.
+            #
+            # This filter MUST track the app's. This script exists to
+            # cross-check the app independently, so if the two diverge the
+            # reconciliation reports ready_matches=False and the gate stops --
+            # which is exactly what would happen if the app shipped fixed and
+            # this did not.
+            #
+            # Known limitation, stated because it is easy to over-trust this
+            # file: a mirror cannot catch a logic error present in both copies.
+            # It cross-checks the app's PLUMBING, not the correctness of a rule
+            # they share.
             all_misses = con.execute(
                 "SELECT COALESCE(SUM(relevant_miss_count),0) "
-                "FROM hdencode_shadow_cycles"
+                "FROM hdencode_shadow_cycles WHERE rss_requests>0"
             ).fetchone()[0]
             cycle_rows = [
                 dict(r)

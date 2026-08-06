@@ -102,6 +102,64 @@ The same asymmetry existed in the grader
 cycles for usability before trusting them as **observations**, then drew misses
 with an unfiltered `JOIN`.
 
+### Defect 2b — the same query, a THIRD time
+
+`docs/feature-pack-review/qualification/scripts/05_shadow_evidence.py:143` — the
+collector's *independent* readiness mirror — summed misses unfiltered as well:
+
+```python
+all_misses = con.execute(
+    "SELECT COALESCE(SUM(relevant_miss_count),0) "
+    "FROM hdencode_shadow_cycles"          # every row
+).fetchone()[0]
+```
+
+Found late, and worth stating why it matters: this file exists to cross-check the
+app. Had the app shipped fixed and this not, the app would report ready while the
+mirror reported not-ready, `ready_matches` would go false, and the reconciliation
+blocker would fire. The fix is incomplete without it.
+
+**Please also judge this**: a mirror that must be edited in lockstep with the
+thing it mirrors cannot catch a logic error present in both copies. It
+cross-checks plumbing, not the correctness of a shared rule. I have kept the
+mirror design and noted the limitation in the file. If you think the
+cross-check is now weak enough to be misleading, say so.
+
+---
+
+## What this change does NOT do — please confirm you agree
+
+With all three sites fixed, the mirror computes, live:
+
+```
+successful_cycles: 259      relevant_misses: 61   (was 150)
+observed_days: 14.99        request_reduction_pct: 85.09
+ready: False                reasons: ['relevant_misses_detected']
+```
+
+`ready` is still **False**, and deliberately so. The readiness rule is:
+
+```python
+if relevant_misses > 0:
+    reasons.append("relevant_misses_detected")
+```
+
+**Any** miss blocks readiness, regardless of grade. The tiered classification
+(≤6h GREEN / 6–24h YELLOW / >24h RED) exists only in the collector's stop
+condition, not in the app's readiness rule. So this change corrects *which*
+misses count; it does not make the gate pass, and I have not touched the rule
+that would.
+
+That leaves a genuine open question I am **not** deciding: closing the RSS row
+requires either (a) the readiness rule accepting graded-green misses, or (b) the
+row closing on the graded evidence rather than on `ready=True`. (a) is a
+substantive behavioural change well beyond an accounting fix. **Which of those is
+right, or whether neither is, is squarely in scope for this review.**
+
+Net effect on the live gate as it stands: the miss-based stop condition clears
+(61 graded, all green, zero blockers), reconciliation agrees because both sides
+now compute 61, and the run ends without a stop and without a pass.
+
 ---
 
 ## Relationship to your prior audit — please check this closely
