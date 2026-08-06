@@ -20,6 +20,10 @@ class ScrapeCode(str, Enum):
     BROWSER_NAVIGATION_FAILED = "browser_navigation_failed"
     INTERACTIVE_CHALLENGE = "interactive_challenge"
     LAYOUT_CHANGED = "layout_changed"
+    # The reveal control existed but never left its "Verifying... Please wait"
+    # state. Distinct from SOURCE_TEMPORARILY_BLOCKED, whose message says no
+    # request was made -- here the page was fetched and the control was found.
+    REVEAL_VERIFICATION_STALLED = "reveal_verification_stalled"
     REQUESTED_HOST_MISSING = "requested_host_missing"
     NO_FILE_HOST_LINKS = "no_file_host_links"
     SCRAPE_EXCEPTION = "scrape_exception"
@@ -34,11 +38,41 @@ _MESSAGES = {
     ScrapeCode.BROWSER_NETWORK_ERROR: "Chromium could not reach the source because of a browser network or DNS error.",
     ScrapeCode.BROWSER_NAVIGATION_FAILED: "The browser failed while navigating to the source page.",
     ScrapeCode.INTERACTIVE_CHALLENGE: "The source presented an interactive verification challenge that did not clear.",
-    ScrapeCode.LAYOUT_CHANGED: "The expected link-reveal control was not found; the page layout may have changed.",
+    # Asserting "the layout changed" overstates what this code knows. It fires
+    # only after the challenge branch above has already ruled out a cf-mitigated
+    # header, captcha frames and challenge markers -- so what remains is "the
+    # control was not there and it was not a recognised challenge", which is a
+    # login/region gate, an error page, an unrecognised block, OR a real layout
+    # change. download_service's own log at the access_control call site says
+    # exactly that: "may be a Cloudflare wall, login gate, or changed layout".
+    # The user-facing text said only the last of those, which reads as "the
+    # scraper is broken" when 64 such failures appeared in bursts on 2026-07-30,
+    # 07-31 and 08-04 and then stopped on their own -- a real layout change does
+    # not heal twice.
+    ScrapeCode.LAYOUT_CHANGED: (
+        "The link-reveal control was not on the page, and this was not a "
+        "recognised verification challenge. The page may be a login or region "
+        "gate, an unrecognised block, an error page, or a changed layout."
+    ),
     ScrapeCode.REQUESTED_HOST_MISSING: "The page loaded, but it does not contain links for the requested file host.",
     ScrapeCode.NO_FILE_HOST_LINKS: "The page loaded, but no supported file-host links were found.",
+    ScrapeCode.REVEAL_VERIFICATION_STALLED: (
+        "The source did not finish verifying the link-reveal control, which it "
+        "does when it is rate-limiting. The item is queued to retry after a "
+        "cooldown; nothing is wrong with this release."
+    ),
     ScrapeCode.SCRAPE_EXCEPTION: "The link scrape failed before download links could be retrieved.",
 }
+
+
+# The codes whose cause is genuinely ambiguous, so the collected signals are
+# worth persisting alongside the message. Every other code names its own cause.
+_SIGNAL_BEARING_CODES = frozenset({
+    ScrapeCode.LAYOUT_CHANGED,
+    ScrapeCode.REVEAL_VERIFICATION_STALLED,
+    ScrapeCode.NO_FILE_HOST_LINKS,
+    ScrapeCode.REQUESTED_HOST_MISSING,
+})
 
 
 @dataclass(frozen=True)
@@ -66,6 +100,31 @@ class ScrapeDiagnostic:
         return _MESSAGES[self.code]
 
     @property
+    def persisted_message(self) -> str:
+        """User-facing text, plus the signals when the code is ambiguous.
+
+        WHY THIS EXISTS. The diagnostic collects rich signals
+        (access_control_present/absent, cf-mitigated:challenge, keyword
+        presence) and to_dict() serialises them -- but nothing persisted them.
+        download_queue_items stores only last_reason_code, last_cause_code and
+        last_message. So when the 2026-07-31 burst of 64 layout_changed failures
+        was investigated on 08-06, the signals existed only in the app log, which
+        had rotated. The failures could be counted and dated but NOT explained,
+        and that root cause is now permanently unknowable.
+
+        Only the ambiguous codes carry signals; the rest already name their own
+        cause, so appending would be noise. Raw exception detail is still never
+        included -- signals are a fixed vocabulary produced by our own code.
+        """
+        base = _MESSAGES[self.code]
+        if self.code not in _SIGNAL_BEARING_CODES:
+            return base
+        seen = [str(s) for s in self.signals if s is not None]
+        if not seen:
+            return base
+        return f"{base} [signals: {', '.join(seen)}]"
+
+    @property
     def message(self) -> str:
         """Internal diagnostic text; may include a logged exception detail."""
         return self.detail or self.public_message
@@ -74,7 +133,10 @@ class ScrapeDiagnostic:
         return {
             "reason_code": self.code.value,
             "cause_code": self.cause_code,
-            "message": self.public_message,
+            # persisted_message, not public_message: this dict is what reaches
+            # download_queue_items.last_message, and for the ambiguous codes the
+            # signals are the only durable record of what the page actually was.
+            "message": self.persisted_message,
             "retryable": self.retryable,
             "retry_mode": self.retry_mode,
             "cooldown_until": self.cooldown_until,
