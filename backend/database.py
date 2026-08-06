@@ -2195,30 +2195,57 @@ class DatabaseManager:
             if "_derived_from" in provenance:
                 # Written by a caller that supplied no per-feed provenance. The
                 # marker deliberately does not fabricate feed outcomes, so the
-                # decision falls back to the cycle-level rule it came from -- but
-                # the marker's own shape and self-consistency are checked, since
-                # an unrecognised or contradictory marker is corrupt evidence
-                # rather than a licence to use the fallback.
-                if str(provenance.get("_derived_from"))!="cycle_level_completeness":
+                # decision falls back to the cycle-level rule it came from.
+                #
+                # EXACT SCHEMA. Round 4 checked only the marker value and a
+                # truthiness comparison, which a 2026-08-06 review showed accepts
+                # a missing normal_feeds_complete key, arbitrary extra keys, and
+                # pseudo-booleans -- the string "false" is truthy in Python, so a
+                # contradictory marker could pass the consistency check and then
+                # take the silent-discard path below.
+                if set(provenance) != {"_derived_from", "normal_feeds_complete"}:
+                    integrity.append(
+                        f"derived_marker_schema:{cycle}:"
+                        f"{sorted(provenance)!r}")
+                    slot["corrupt"]+=1
+                    continue
+                if provenance.get("_derived_from")!="cycle_level_completeness":
                     integrity.append(
                         f"derived_marker_unknown:{cycle}:"
                         f"{provenance.get('_derived_from')!r}")
                     slot["corrupt"]+=1
                     continue
                 recorded=provenance.get("normal_feeds_complete")
-                if recorded is not None and bool(recorded)!=bool(row.get("complete")):
+                if not isinstance(recorded,bool):
+                    # bool() would accept "false", 0.0, [] and friends.
+                    integrity.append(
+                        f"derived_marker_not_a_boolean:{cycle}:{recorded!r}")
+                    slot["corrupt"]+=1
+                    continue
+                if recorded!=bool(row.get("complete")):
                     integrity.append(f"derived_marker_contradicts_cycle:{cycle}")
                     slot["corrupt"]+=1
                     continue
                 if row.get("complete"):
                     attributed+=1
                     slot["supported"]+=1
-                else:
-                    # Derived from an incomplete cycle: not a miss, and not a
-                    # contradiction either -- compare_shadow records the marker
-                    # before knowing the outcome. Counted as unsupported so the
-                    # reconciliation below sees it.
-                    slot["unsupported"]+=1
+                    continue
+                # THE ROUND 4 HOLE, one branch over from the one Round 4 closed.
+                #
+                # This previously incremented "unsupported" and continued with no
+                # integrity finding, and the reconciliation below compares the
+                # stored count against TOTAL rows rather than SUPPORTED rows -- so
+                # stored=1, total=1, supported=0 went completely silent. A comment
+                # here claimed "the reconciliation below sees it". It did not.
+                #
+                # compare_shadow cannot legitimately produce this store: with no
+                # per-feed provenance and cycle completeness false, its derived
+                # observation set is empty and it cannot emit a miss row at all. A
+                # row attached to this marker is therefore writer drift, direct
+                # insertion, or corruption -- exactly what this layer exists for.
+                integrity.append(
+                    f"miss_row_unsupported_by_derived_completeness:{cycle}")
+                slot["unsupported"]+=1
                 continue
             if not provenance:
                 # Supplied-empty provenance with a miss row attached is
@@ -2268,6 +2295,19 @@ class DatabaseManager:
             elif stored!=total:
                 integrity.append(
                     f"count_row_disagreement:{cycle}:{stored}!={total}")
+        # BACKSTOP. Every nonzero unsupported/corrupt bucket must have produced at
+        # least one integrity finding. Twice now a branch incremented a diagnostic
+        # bucket and then fell off the end without reporting anything, and both
+        # times a test certified the silence as correct. This makes that class of
+        # mistake structurally impossible: if a future branch forgets, the gate
+        # blocks with an explicit marker naming the cycle rather than quietly
+        # reporting zero.
+        for cycle,slot in per_cycle.items():
+            unreported=slot["unsupported"]+slot["corrupt"]
+            if unreported and not any(f.endswith(cycle) or f":{cycle}:" in f
+                                      or f==f"orphan_miss_rows:{unreported}"
+                                      for f in integrity):
+                integrity.append(f"unreported_unsupported_rows:{cycle}:{unreported}")
         # Pre-attribution rows cannot be re-derived at all: nothing recorded
         # which feed succeeded, and they carry no media_type to attribute. They
         # are bounded CONSERVATIVELY -- counted only when both normal feeds

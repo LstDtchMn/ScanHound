@@ -100,6 +100,14 @@ def main() -> int:
             "note": ("The two TV signals are independent. Close agreement "
                      "supports treating either as authoritative; wide "
                      "disagreement would not."),
+            "what_tv_category_without_season_shows": (
+                "These rows demonstrate that category supplies TV evidence "
+                "where the season field does not. It does NOT establish that "
+                "each one was previously misattributed: that also requires no "
+                "episodes evidence, no series-only status, and no season token "
+                "in the URL, none of which this script measures per row. An "
+                "earlier write-up called them 'exactly the false-pass shape', "
+                "which overstated what these counts support."),
         },
         "interpretation": {
             "unknown_is_rare_if": "absent + no_evidence_unrecognised is small",

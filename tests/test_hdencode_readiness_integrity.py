@@ -458,8 +458,13 @@ def test_the_three_legitimate_media_types_are_accepted(tmp_path, media_type):
 
 def test_an_unrecognised_derived_marker_is_corrupt(tmp_path):
     db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    # Full schema with a bad VALUE, so this isolates the value check. Omitting
+    # normal_feeds_complete would trip the exact-schema check first and report
+    # derived_marker_schema instead -- correct, but it would stop this test from
+    # exercising the condition it names.
     _cycle_with_raw_provenance(
-        db, uuid="c", raw=json.dumps({"_derived_from": "something_invented"}))
+        db, uuid="c", raw=json.dumps({"_derived_from": "something_invented",
+                                      "normal_feeds_complete": True}))
     _insert_miss(db, uuid="c", media_type="movie",
                  url="https://hdencode.org/a-2026-2160p-x-9-gb")
     assert any("derived_marker_unknown" in r for r in _integrity(db))
@@ -515,3 +520,147 @@ def test_findings_are_categorised_for_diagnosis(tmp_path):
     assert by_category.get("miss_row_unsupported_by_provenance") == 1
     assert by_category.get("provenance_unparseable") == 1
     assert _blocks(db)
+
+# -- derived-marker shape and incomplete-cycle rows (Round 4 review, F1) ------
+#
+# Round 4 closed the fail-open on ORDINARY per-feed provenance and left the same
+# defect one branch over, in the _derived_from path: it incremented "unsupported"
+# and continued with no integrity finding, while the reconciliation compared the
+# stored count against TOTAL rows rather than SUPPORTED rows. So stored=1,
+# total=1, supported=0 went silent -- another route from contradictory evidence
+# to ready=true.
+#
+# A comment in that branch asserted "the reconciliation below sees it". It did
+# not. These pin the correction.
+
+def _derived(complete, **extra):
+    marker = {"_derived_from": "cycle_level_completeness",
+              "normal_feeds_complete": complete}
+    marker.update(extra)
+    return json.dumps(marker)
+
+
+def test_a_derived_incomplete_cycle_with_a_row_blocks(tmp_path):
+    """The exact construction from the Round 4 review.
+
+    compare_shadow cannot produce this: with no per-feed provenance and cycle
+    completeness false, its derived observation set is empty and it cannot emit a
+    miss row. A row here is writer drift, direct insertion, or corruption.
+    """
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    conn = db.get_connection()
+    conn.execute(
+        """INSERT INTO hdencode_shadow_cycles (
+               cycle_uuid, started_at, completed_at, normal_feeds_complete,
+               rss_requests, listing_requests, rss_count, listing_count,
+               duplicate_count, feed_only_count, listing_only_count,
+               relevant_miss_count, request_reduction_pct, catchup_used,
+               restart_recovery, outcome, details_json, normal_feed_outcomes
+           ) VALUES ('d1', ?, ?, 0, 2, 10, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+                     'incomplete_feeds', '{}', ?)""",
+        ("2026-07-21T00:00:00+00:00", "2026-07-21T00:00:00+00:00",
+         _derived(False)))
+    conn.commit()
+    _insert_miss(db, uuid="d1", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    summary = db.get_hdencode_shadow_summary()
+    assert summary["relevant_misses"] == 0
+    assert any("unsupported_by_derived_completeness" in r
+               for r in summary["miss_evidence_integrity"]), (
+        "a derived-incomplete row was silently discarded, exactly as in Round 4")
+    assert _blocks(db)
+
+
+def test_a_derived_complete_cycle_with_a_row_is_legitimate(tmp_path):
+    """Positive control. The blocker must not fire on the valid shape."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _cycle_with_raw_provenance(db, uuid="d2", raw=_derived(True))
+    _insert_miss(db, uuid="d2", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    summary = db.get_hdencode_shadow_summary()
+    assert summary["miss_evidence_integrity"] == []
+    assert summary["relevant_misses"] == 1
+
+
+def test_a_marker_missing_normal_feeds_complete_is_corrupt(tmp_path):
+    """Round 4 accepted this and fell through to the silent path."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _cycle_with_raw_provenance(
+        db, uuid="d3",
+        raw=json.dumps({"_derived_from": "cycle_level_completeness"}))
+    _insert_miss(db, uuid="d3", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    assert any("derived_marker_schema" in r for r in _integrity(db))
+    assert _blocks(db)
+
+
+def test_a_marker_with_extra_keys_is_corrupt(tmp_path):
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _cycle_with_raw_provenance(db, uuid="d4",
+                               raw=_derived(True, movies_all="changed"))
+    _insert_miss(db, uuid="d4", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    assert any("derived_marker_schema" in r for r in _integrity(db))
+    assert _blocks(db)
+
+
+@pytest.mark.parametrize("pseudo", ["false", "true", 0, 1, "", "0"])
+def test_pseudo_boolean_completeness_is_corrupt(tmp_path, pseudo):
+    """bool("false") is True in Python, so a string marker could pass the
+    consistency check and then take the silent-discard path."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _cycle_with_raw_provenance(
+        db, uuid="d5",
+        raw=json.dumps({"_derived_from": "cycle_level_completeness",
+                        "normal_feeds_complete": pseudo}))
+    _insert_miss(db, uuid="d5", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    assert any("derived_marker_not_a_boolean" in r for r in _integrity(db))
+    assert _blocks(db)
+
+
+def test_a_derived_incomplete_row_with_stored_zero_blocks(tmp_path):
+    """Both contradictions together: the marker says incomplete AND the stored
+    count disagrees with the rows."""
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    conn = db.get_connection()
+    conn.execute(
+        """INSERT INTO hdencode_shadow_cycles (
+               cycle_uuid, started_at, completed_at, normal_feeds_complete,
+               rss_requests, listing_requests, rss_count, listing_count,
+               duplicate_count, feed_only_count, listing_only_count,
+               relevant_miss_count, request_reduction_pct, catchup_used,
+               restart_recovery, outcome, details_json, normal_feed_outcomes
+           ) VALUES ('d6', ?, ?, 0, 2, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                     'incomplete_feeds', '{}', ?)""",
+        ("2026-07-21T00:00:00+00:00", "2026-07-21T00:00:00+00:00",
+         _derived(False)))
+    conn.commit()
+    _insert_miss(db, uuid="d6", media_type="tv",
+                 url="https://hdencode.org/s-s01-1080p-x-5-gb")
+    findings = _integrity(db)
+    assert any("unsupported_by_derived_completeness" in r for r in findings)
+    assert any("count_row_disagreement" in r for r in findings)
+    assert _blocks(db)
+
+
+def test_no_bucket_can_be_incremented_without_being_reported(tmp_path):
+    """The backstop.
+
+    Twice a branch incremented a diagnostic bucket and fell off the end without
+    reporting, and both times a test certified the silence. Every nonzero
+    unsupported/corrupt bucket must now carry at least one finding, so the same
+    class of mistake cannot recur silently.
+    """
+    db = DatabaseManager(str(tmp_path / "db.sqlite"))
+    _insert_cycle(db, uuid="b1", completed_at="2026-07-21T00:00:00+00:00",
+                  normal=0, rss=1, listing=1, misses=1,
+                  outcome="incomplete_feeds",
+                  feed_outcomes={"movies_all": "failed", "tv_all": "failed"})
+    _insert_miss(db, uuid="b1", media_type="movie",
+                 url="https://hdencode.org/a-2026-2160p-x-9-gb")
+    summary = db.get_hdencode_shadow_summary()
+    # Whatever the specific finding, the row must not vanish unreported.
+    assert summary["miss_evidence_integrity"], (
+        "a counted-unsupported row produced no finding at all")
+    assert summary["relevant_misses"] == 0
