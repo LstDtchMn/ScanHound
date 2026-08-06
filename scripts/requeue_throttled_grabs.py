@@ -66,7 +66,8 @@ def main() -> int:
     placeholders = ",".join("?" for _ in RECOVERABLE)
     rows = list(con.execute(
         f"SELECT item_uuid, title, last_reason_code, last_attempt_at, "
-        f"       attempt_count, automated_retry_count "
+        f"       attempt_count, automated_retry_count, source, "
+        f"       canonical_url, service_type "
         f"FROM download_queue_items "
         f"WHERE state = 'failed' AND last_reason_code IN ({placeholders}) "
         f"ORDER BY last_attempt_at", RECOVERABLE))
@@ -100,21 +101,54 @@ def main() -> int:
         print("\nDRY RUN. Nothing written. Re-run with --apply to requeue.")
         return 0
 
+    # ONE SURVIVOR PER RELEASE. download_queue_items has a UNIQUE constraint on
+    # (source, canonical_url, service_type) across live states, and the failed set
+    # contains DUPLICATE rows for the same release -- two terminal attempts on the
+    # same URL. A blanket UPDATE flips both to 'scheduled', creating two live rows
+    # with the same key, and the whole transaction aborts with IntegrityError.
+    # That is exactly what the first run did: it wrote nothing at all.
+    #
+    # Measured on the live data: 79 recoverable rows, 0 colliding with live work,
+    # 7 duplicate keys within the failed set. So each release revives its most
+    # recent attempt and CANCELS the older duplicates -- cancelled rather than
+    # deleted, so the record of the attempt stays auditable.
+    groups = {}
+    for row in rows:
+        groups.setdefault(
+            (row["source"], row["canonical_url"], row["service_type"]), []
+        ).append(row)
+
+    survivors, superseded = [], []
+    for members in groups.values():
+        members.sort(key=lambda r: str(r["last_attempt_at"] or ""), reverse=True)
+        survivors.append(members[0]["item_uuid"])
+        superseded.extend(m["item_uuid"] for m in members[1:])
+
+    print("")
+    print(f"releases: {len(groups)}   revive: {len(survivors)}   "
+          f"cancel as duplicate: {len(superseded)}")
+
     now = datetime.now(timezone.utc).isoformat()
+    changed = cancelled = 0
     with con:
-        changed = con.execute(
-            f"UPDATE download_queue_items "
-            f"SET state = 'scheduled', "
-            f"    scheduled_for = ?, "
-            f"    cooldown_until = NULL, "
-            f"    claimed_by = NULL, "
-            f"    claim_expires_at = NULL, "
-            f"    last_message = 'Requeued: the previous failure was a source "
-            f"rate-limit recorded as a permanent error.', "
-            f"    updated_at = ? "
-            f"WHERE state = 'failed' AND last_reason_code IN ({placeholders})",
-            (now, now, *RECOVERABLE)).rowcount
-    print(f"\nrequeued {changed} item(s) to state='scheduled'.")
+        for uuid in survivors:
+            changed += con.execute(
+                "UPDATE download_queue_items "
+                "SET state='scheduled', scheduled_for=?, cooldown_until=NULL, "
+                "    claimed_by=NULL, claim_expires_at=NULL, "
+                "    last_message='Requeued: the previous failure was a source "
+                "rate-limit recorded as a permanent error.', updated_at=? "
+                "WHERE item_uuid=? AND state='failed'",
+                (now, now, uuid)).rowcount
+        for uuid in superseded:
+            cancelled += con.execute(
+                "UPDATE download_queue_items "
+                "SET state='cancelled', cancelled_at=?, "
+                "    last_message='Superseded: a newer attempt on the same "
+                "release was requeued.', updated_at=? "
+                "WHERE item_uuid=? AND state='failed'",
+                (now, now, uuid)).rowcount
+    print(f"requeued {changed} item(s); cancelled {cancelled} duplicate(s).")
     print("The queue will work through them at its configured spacing. If the "
           "source throttles again, the batch now pauses and auto-resumes after "
           "the cooldown instead of burning the rest.")
