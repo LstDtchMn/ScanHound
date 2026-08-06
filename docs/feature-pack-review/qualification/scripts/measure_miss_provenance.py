@@ -17,6 +17,12 @@ overwrites the incomplete_feeds label that says the comparison was invalid.
 
 This script only MEASURES. It changes nothing and asserts nothing about the
 right fix. Read-only.
+CORRECTED 2026-08-06: this script shipped querying a nonexistent `miss_count`
+column (the schema defines `relevant_miss_count`), so the final section threw
+`no such column` on any database built from this branch. I hit that error while
+writing the script, routed around it into a separate file, and committed the
+broken query anyway; a peer review found it. Reproduction scripts must be run
+against a fresh schema, not only the live snapshot that happened to work.
 """
 import json
 import sqlite3
@@ -88,13 +94,13 @@ print("\nstored comparison for each unusable miss-bearing cycle:")
 for cu in {m["cycle_uuid"] for m, _ in from_unusable}:
     r = con.execute("SELECT details_json, rss_count, listing_count, "
                     "duplicate_count, feed_only_count, listing_only_count, "
-                    "miss_count FROM hdencode_shadow_cycles "
+                    "relevant_miss_count FROM hdencode_shadow_cycles "
                     "WHERE cycle_uuid=?", (cu,)).fetchone()
     if r is None:
         continue
     print(f"  rss={r['rss_count']} listing={r['listing_count']} "
           f"dup={r['duplicate_count']} feed_only={r['feed_only_count']} "
-          f"listing_only={r['listing_only_count']} misses={r['miss_count']}")
+          f"listing_only={r['listing_only_count']} misses={r['relevant_miss_count']}")
     try:
         d = json.loads(r["details_json"])
         print(f"  details keys: {sorted(d)}")
