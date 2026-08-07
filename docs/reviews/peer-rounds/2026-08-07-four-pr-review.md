@@ -1,6 +1,6 @@
-# Peer review request — four open PRs, 2026-08-07
+# Peer review request — five open PRs, 2026-08-07
 
-**You are reviewing four related pull requests as a set, not individually.** They
+**You are reviewing five related pull requests as a set, not individually.** They
 were produced in one session and they interact: #48 and #50 both touch the evidence
 machinery that decides whether the RSS work is finished, and #47 and #49 both touch
 the throttle-recovery path deployed earlier the same night.
@@ -19,6 +19,7 @@ proceeding from this description.
 | #48 | `agent/rss-round6-backstop` | `main` @ `5ed18e2` |
 | #49 | `agent/throttle-lifecycle-test` | `main` @ `5ed18e2` |
 | #50 | `agent/miss-rule-acquisition` | `main` @ `5ed18e2` |
+| #51 | `agent/repeatable-batch-resume` | `main` @ `5ed18e2` |
 
 ## Start here: the whole `ready=True` result rests on ONE decision I made after seeing the gate fail
 
@@ -120,6 +121,53 @@ the headline. If you find a reason it should NOT close again, that is a finding 
 Still worth your challenge: is "no usable cycle after the row" a sound exclusion, or
 does it silently absorb rows whose later cycles were rejected for *other* reasons,
 making an eligibility failure look like mere recency?
+
+## #51, added after the rest: the change that makes us knock on the source's door MORE
+
+This one was written in response to production behaviour that occurred after the
+other four PRs were drafted, and it is the only change here that increases how often
+ScanHound retries against a source that has already rate-limited it twice in twelve
+hours. **Treat it as the most operationally risky item in this set**, ahead of #50's
+gate change, because #50 can only mis-report while #51 can generate traffic.
+
+What happened: the single automatic resume fired at 03:25Z and worked — 24 of 69
+stranded grabs delivered over 50 minutes. At 04:07Z the source throttled again, four
+batches re-paused, and `auto_resume_used = 1` meant they could never self-resume.
+44 items parked behind a spent retry.
+
+The change: a batch may make up to N **consecutive fruitless** automatic resumes
+(default 3, clamped 1..10, and 1 reproduces the old behaviour exactly). A resume that
+delivered anything refunds the budget, so the budget only runs down on retries that
+achieved nothing.
+
+**Please attack these specifically:**
+
+- **Can it loop?** A batch making partial progress can retry indefinitely by design.
+  Every retry waits out the coordinator's escalating cooldown (1h/2h/4h), so it should
+  spread rather than tighten — but verify that, because "it escalates" is my claim,
+  not a proven property of the composition. Is there a path where progress is credited
+  without a real delivery, or where the cooldown is not consulted?
+- **Is "progress" the right currency?** It is measured as completed-item count versus
+  a mark taken at the last automatic resume. Can that count move for a reason other
+  than a successful delivery — a manual retry, a cancellation, a requeue — and thereby
+  buy retries the batch did not earn?
+- **The two halves.** Eligibility admits a batch whose completed count exceeds its
+  mark *regardless of the counter*, and `_resume_batch` then resets the counter. My
+  first version had only the second half, and a test showed the refund was
+  unreachable exactly when it mattered: a batch at its limit was never selected, so
+  the code containing the refund never ran. Check that the fix did not leave a
+  different unreachable branch behind.
+- **The schema migration** is placed immediately after the `download_queue_batches`
+  CREATE, not in the shared `_column_migrations` list, because that list runs before
+  the CREATE and its guard only swallows "duplicate column" — an ALTER there logs a
+  failure and leaves the column absent. Verify the placement is actually correct and
+  that a fresh database and an existing one both end up with the column.
+
+Mutations I ran: neutering the budget fails 6 of 9 tests; disabling the refund fails
+the refund assertion. Without the refund, a batch that delivered and then stalled
+gets zero further attempts rather than a fresh budget.
+
+**Nothing here is deployed.** #46 is the only throttle work running in production.
 
 ## What I most want challenged
 
@@ -243,6 +291,7 @@ old rule: would have blocked on all 66
 | `agent/rss-round6-backstop` (#48) | 4421 passed, 4 skipped, 0 failed | +12 = the 12 new tests |
 | `agent/throttle-lifecycle-test` (#49) | 4415 passed, 4 skipped, 0 failed | +6 = the 6 new tests |
 | `agent/miss-rule-acquisition` (#50) | 4432 passed, 4 skipped, 0 failed | +23 = the 23 new tests |
+| `agent/repeatable-batch-resume` (#51) | _running when this was written_ | expected +9 |
 
 Every delta equals exactly the number of tests that branch adds, and no branch
 introduces a failure. All five runs used the same method: whole tree via
