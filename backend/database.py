@@ -2375,6 +2375,66 @@ class DatabaseManager:
             "latest":dict(latest) if latest is not None else None,
         }
 
+    def get_hdencode_miss_resolution(self):
+        """Classify every recorded miss as acquired / never acquired / undetermined.
+
+        Implements the rule Jesse chose on 2026-08-07: a listing-only release
+        counts against RSS only if it was NEVER acquired, with no time limit. See
+        summarise_miss_resolutions for the reasoning and the recorded reservation.
+
+        Cycle eligibility mirrors the readiness rule exactly -- both normal feeds
+        completed, and both sides actually requested -- because a cycle we will
+        not trust as an observation must not be used to resolve a miss either.
+        """
+        from backend.hdencode_shadow import summarise_miss_resolutions
+
+        def _at(value):
+            """ISO -> aware UTC datetime, or None. Never raises: an unparseable
+            timestamp must degrade to 'undetermined', not take the gate down."""
+            try:
+                parsed=datetime.datetime.fromisoformat(str(value))
+            except (TypeError,ValueError):
+                return None
+            if parsed.tzinfo is None:
+                parsed=parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
+
+        cycles=[]
+        for row in self._query_dicts(
+                "SELECT completed_at, outcome, normal_feeds_complete, "
+                "       rss_requests, listing_requests, details_json "
+                "FROM hdencode_shadow_cycles "
+                "WHERE details_json IS NOT NULL ORDER BY completed_at",
+                default=[]):
+            if not (row.get("outcome") in ("success","relevant_miss")
+                    and row.get("normal_feeds_complete")==1
+                    and int(row.get("rss_requests") or 0)>0
+                    and int(row.get("listing_requests") or 0)>0):
+                continue
+            at=_at(row.get("completed_at"))
+            if at is None:
+                continue
+            try:
+                details=json.loads(row.get("details_json") or "{}")
+            except (TypeError,ValueError):
+                # An unreadable cycle cannot resolve anything. Skipping it is
+                # conservative: fewer resolutions, never a false acquisition.
+                continue
+            if not isinstance(details,dict):
+                continue
+            cycles.append({"at":at,
+                           "listing_only":set(details.get("listing_only") or ()),
+                           "feed_only":set(details.get("feed_only") or ())})
+        misses=[]
+        for row in self._query_dicts(
+                "SELECT m.canonical_url AS url, c.completed_at AS at "
+                "FROM hdencode_shadow_misses m "
+                "JOIN hdencode_shadow_cycles c ON c.cycle_uuid=m.cycle_uuid "
+                "WHERE c.normal_feeds_complete=1",default=[]):
+            misses.append({"url":row.get("url"),
+                           "at":_at(row.get("at"))})
+        return summarise_miss_resolutions(misses,cycles)
+
     def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180):
         required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days)); summary=self.get_hdencode_shadow_summary()
         first=summary.get("first_completed_at"); last=summary.get("last_completed_at"); observed_days=0.0
@@ -2398,7 +2458,23 @@ class DatabaseManager:
         reasons=[]
         if summary["successful_cycles"]<required_cycles: reasons.append("insufficient_comparison_cycles")
         if observed_days<required_days: reasons.append("insufficient_observation_days")
-        if summary["relevant_misses"]>0: reasons.append("relevant_misses_detected")
+        # THE MISS RULE, changed 2026-08-07 on Jesse's decision. This used to be
+        # `if summary["relevant_misses"] > 0`, which blocked on ANY listing-only
+        # observation ever recorded. That could never pass: 99 of 100 such
+        # releases were acquired anyway, median about an hour, all via the normal
+        # feeds, so the gate treated ordinary polling latency as permanent
+        # coverage loss and RSS would have stayed in shadow mode indefinitely.
+        #
+        # Now only a release that was NEVER acquired counts, with no deadline.
+        # UNDETERMINED rows -- ones that left the listing without ever appearing
+        # in the feed -- still block, because "cannot be proven either way" is not
+        # evidence of health, and calling it health is the fail-open shape that
+        # produced two HIGH findings in this same subsystem.
+        resolution=self.get_hdencode_miss_resolution()
+        if int(resolution.get("never_acquired") or 0)>0:
+            reasons.append("unacquired_misses_detected")
+        if int(resolution.get("undetermined") or 0)>0:
+            reasons.append("miss_resolution_undetermined")
         # An integrity failure is not "zero misses". Malformed provenance, a
         # count that disagrees with the rows on disk, a nonzero count with no
         # rows, or a miss row filed against supplied-empty provenance all mean
@@ -2410,7 +2486,7 @@ class DatabaseManager:
         if summary["request_reduction_pct"]<=0: reasons.append("request_reduction_not_proven")
         if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
         if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")
-        return {"ready":not reasons,"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
+        return {"ready":not reasons,"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"misses_acquired":int(resolution.get("acquired") or 0),"misses_never_acquired":int(resolution.get("never_acquired") or 0),"misses_undetermined":int(resolution.get("undetermined") or 0),"misses_not_yet_assessable":int(resolution.get("not_yet_assessable") or 0),"worst_acquisition_lag_hours":resolution.get("worst_acquisition_lag_hours"),"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
 
     # ── HDEncode candidate actions ─────────────────────────────────────
 
