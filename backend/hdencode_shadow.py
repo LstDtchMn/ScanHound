@@ -232,17 +232,6 @@ class ShadowComparison:
     relevant_miss_count:int; rss_requests:int; listing_requests:int; request_reduction_pct:float
     normal_feeds_complete:bool; outcome:str; feed_only:tuple[str,...]; listing_only:tuple[str,...]
     relevant_misses:tuple[dict,...]
-    #: Whether the LISTING arm of this comparison is trustworthy, independent of
-    #: feed health. None means "not recorded" (cycles written before this field).
-    #:
-    #: WHY THIS IS SEPARATE, added 2026-08-07 on peer review. `normal_feeds_complete`
-    #: conflates two different failures: _rss_normal_feeds_complete() returns False
-    #: when a normal feed failed AND when the listing crawl errored. So the stored
-    #: outcome "incomplete_feeds" cannot tell those apart, and resolution needs
-    #: both authorities separately -- a movie miss can be resolved by a cycle where
-    #: tv_all failed, but NOT by one where the listing itself was broken, because
-    #: the listing is the other half of the comparison.
-    listing_complete:Optional[bool]=None
     # Per-normal-feed provenance for THIS cycle, e.g.
     # {"movies_all": "changed", "tv_all": "failed"}. Persisted so a miss can be
     # attributed retrospectively; without it a re-grade has only a cycle-level
@@ -255,6 +244,22 @@ class ShadowComparison:
     # observation, which is a coverage-observability gap even though it is not a
     # proven miss.
     unattributable:tuple[dict,...]=()
+    #: Whether the LISTING arm of this comparison is trustworthy, independent of
+    #: feed health. None means "not recorded" (cycles written before this field).
+    #:
+    #: WHY THIS IS SEPARATE, added 2026-08-07 on peer review. `normal_feeds_complete`
+    #: conflates two failures: _rss_normal_feeds_complete() returns False when a
+    #: normal feed failed AND when the listing crawl errored. So the stored outcome
+    #: "incomplete_feeds" cannot tell those apart, and resolution needs both
+    #: authorities separately -- a movie miss can be resolved by a cycle where
+    #: tv_all failed, but NOT by one whose listing was broken, because the listing
+    #: is the other half of the comparison.
+    #:
+    #: DECLARED LAST, DELIBERATELY. I first inserted it after `relevant_misses`,
+    #: which shifted every positional argument in the constructor call: `recorded`
+    #: landed here and the keyword then collided, breaking 47 existing tests. This
+    #: dataclass is constructed POSITIONALLY, so a new field must go at the end.
+    listing_complete:Optional[bool]=None
     def as_dict(self): return asdict(self)
 
 def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss_requests:int, listing_requests:int, normal_feeds_complete:bool, normal_feed_outcomes: Optional[Mapping[str,str]]=None, listing_complete: Optional[bool]=None) -> ShadowComparison:
