@@ -264,9 +264,16 @@ class ShadowComparison:
     #: attribution. Before 2026-08-07 these silently became `feed_only`, which the
     #: miss resolver reads as proof of acquisition.
     detail_dropped:tuple[str,...]=()
+    #: Detail URLs absent from the raw seen-set. Production cannot produce this, so
+    #: a non-empty value is an authority contradiction and must deny membership.
+    membership_contradiction:tuple[str,...]=()
+    #: URLs the crawl intended to attribute and could not -- scheduled minus
+    #: completed. Unlike detail_dropped this excludes cached skips and policy
+    #: exclusions, so it is safe to block on.
+    detail_failed:tuple[str,...]=()
     def as_dict(self): return asdict(self)
 
-def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss_requests:int, listing_requests:int, normal_feeds_complete:bool, normal_feed_outcomes: Optional[Mapping[str,str]]=None, listing_complete: Optional[bool]=None, raw_listing_urls: Optional[Iterable[str]]=None) -> ShadowComparison:
+def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss_requests:int, listing_requests:int, normal_feeds_complete:bool, normal_feed_outcomes: Optional[Mapping[str,str]]=None, listing_complete: Optional[bool]=None, raw_listing_urls: Optional[Iterable[str]]=None, detail_failed_urls: Optional[Iterable[str]]=None) -> ShadowComparison:
     rss={canonical_url(u) for u in rss_urls if u}
     listing={}
     for item in listing_items:
@@ -294,11 +301,31 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
     if raw_listing_urls is not None:
         raw={canonical_url(u) for u in raw_listing_urls if u}
         raw.discard('')
-    membership=detail_urls if raw is None else (raw | detail_urls)
+    # RAW IS AUTHORITATIVE, not a peer of the detail set. Round 6 established the
+    # production invariant: _crawl_pages adds a URL to seen_post_urls BEFORE
+    # appending it to all_posts, _process_posts only handles all_posts, and
+    # run_scan clears self.items each run -- so after canonicalisation
+    # `detail_urls` MUST be a subset of `raw`.
+    #
+    # My first version used `raw | detail_urls`, reasoning that a union could not
+    # lose an observation. But a non-empty `detail_urls - raw` is not a second
+    # source of truth, it is a CONTRADICTION -- and the union silently repaired it,
+    # which could suppress a legitimate feed_only whenever raw membership had been
+    # lost or truncated. I had even written a test asserting that repair, so the
+    # test protected the defect.
+    membership=detail_urls if raw is None else raw
+    membership_contradiction=(
+        tuple(sorted(detail_urls-raw)) if raw is not None else ())
     duplicate=rss & membership; feed_only=rss-membership; listing_only=membership-rss
     # Listing rows we could not attribute because their detail scrape produced
     # nothing. Recorded rather than silently dropped: they are the population that
     # used to corrupt feed_only, and they are a real observability gap.
+    # Listing rows with no detail row. NOTE this is NOT the blocking signal: the
+    # crawler adds a URL to its seen set BEFORE deciding to skip it as cached or
+    # exclude it by policy, so this set mixes intentional skips with real failures.
+    # The blocking signal is detail_failed, supplied by the caller from
+    # scheduled-minus-completed, where those intentional states are absent by
+    # construction.
     detail_dropped=tuple(sorted(listing_only-detail_urls))
     listing_urls=membership
     # THREE-STATE, and the distinction is load-bearing.
@@ -391,8 +418,18 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
     # admitted exactly the stale comparisons it was meant to exclude.
     if misses and normal_feeds_complete: outcome='relevant_miss'
     return ShadowComparison(len(rss),len(listing_urls),len(duplicate),len(feed_only),len(listing_only),len(misses),int(rss_requests),int(listing_requests),round(reduction,2),bool(normal_feeds_complete),outcome,tuple(sorted(feed_only)),tuple(sorted(listing_only)),tuple(misses),dict(recorded),tuple(unattributable),
-        listing_complete=(None if listing_complete is None else bool(listing_complete)),
-        detail_dropped=detail_dropped)
+        # A CONTRADICTION WITHHOLDS THE AUTHORITY CLAIM, it does not merely get
+        # logged. Recording a problem and then still asserting listing authority
+        # would be the "signal nothing consumes" mistake that has appeared in three
+        # separate rounds of this review. The comparison knows its own evidence is
+        # inconsistent, so it declines to certify it.
+        listing_complete=(
+            None if listing_complete is None
+            else (bool(listing_complete) and not membership_contradiction)),
+        detail_dropped=detail_dropped,
+        membership_contradiction=membership_contradiction,
+        detail_failed=tuple(sorted(
+            {canonical_url(u) for u in (detail_failed_urls or ()) if u} - {''})))
 
 
 # ---------------------------------------------------------------------------

@@ -2526,6 +2526,7 @@ class DatabaseManager:
 
         problems=[]
         cycles=[]
+        unattributed_total=0
         for row in self._query_dicts(
                 "SELECT cycle_uuid, completed_at, outcome, normal_feeds_complete, "
                 "       rss_requests, listing_requests, details_json, "
@@ -2565,6 +2566,13 @@ class DatabaseManager:
             if not isinstance(details,dict):
                 problems.append(f"details_json_not_an_object:{cycle}")
                 continue
+            # Genuine attribution failures recorded by the crawl. Distinct from
+            # detail_dropped, which mixes in cached skips and policy exclusions.
+            failed=details.get("detail_failed")
+            if isinstance(failed,(list,tuple)):
+                unattributed_total += len([u for u in failed if u])
+            elif failed:
+                problems.append(f"detail_failed_not_a_list:{cycle}")
             listing=_urlset(details.get("listing_only"),"listing_only",cycle,problems)
             feed=_urlset(details.get("feed_only"),"feed_only",cycle,problems)
             if listing is None or feed is None:
@@ -2618,6 +2626,7 @@ class DatabaseManager:
                            "at":_at(row.get("at"))})
         summary=summarise_miss_resolutions(misses,cycles)
         summary["evidence_problems"]=problems
+        summary["unattributed_candidates"]=unattributed_total
         return summary
 
     def _normal_feed_outcomes(self, row, cycle, problems):
@@ -2713,6 +2722,19 @@ class DatabaseManager:
         # reported rather than absorbed.
         if resolution.get("evidence_problems"):
             reasons.append("miss_resolution_evidence_unreadable")
+        # UNATTRIBUTED IN-SCOPE CANDIDATES BLOCK. Round 6: a listing-only release
+        # whose detail scrape failed is not booked as a miss (it has no media type,
+        # so it cannot be attributed to a feed) -- and it was therefore vanishing
+        # from readiness entirely. A false-health under-count. It must block the
+        # claim that no unacquired misses exist, without invalidating the cycle's
+        # membership evidence for resolving OTHER misses.
+        # Counted STRUCTURALLY by the loader, which already parses details_json.
+        # My first attempt here used `details_json LIKE '%detail_failed%'` -- string
+        # matching against JSON, which is the exact anti-pattern the RSS
+        # round-6 work removed from this same file. A schema change or a key
+        # appearing inside a URL would break it silently.
+        if int(resolution.get("unattributed_candidates") or 0) > 0:
+            reasons.append("unattributed_listing_candidates")
         # An integrity failure is not "zero misses". Malformed provenance, a
         # count that disagrees with the rows on disk, a nonzero count with no
         # rows, or a miss row filed against supplied-empty provenance all mean

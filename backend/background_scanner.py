@@ -502,10 +502,24 @@ class BackgroundScanner:
                         # every listing URL the crawl actually saw.
                         raw_listing_urls=getattr(
                             scanner, "_last_crawl_seen_urls", None),
+                        # Genuine attribution failures -- scheduled minus completed.
+                        # Round 6: an in-scope listing-only release whose detail
+                        # scrape failed must not vanish from readiness, and this is
+                        # the only signal clean enough to block on (cached skips and
+                        # policy exclusions are excluded by construction).
+                        detail_failed_urls=(
+                            scanner.last_crawl_detail_failed()
+                            if hasattr(scanner, "last_crawl_detail_failed")
+                            else None),
                         listing_complete=(
                             not bool(err)
-                            and getattr(scanner, "_last_crawl_status", "not_run")
-                            == "complete"
+                            # Keyed on the EXPLICIT termination reason. Round 6's
+                            # counterexample: `if self.stop_scan_flag: break` set no
+                            # boolean at all, so an externally cancelled crawl fell
+                            # through to "complete" and a partial listing certified
+                            # itself. Only a crawl that ran to the end qualifies.
+                            and getattr(scanner, "_last_crawl_termination",
+                                        "not_run") == "complete"
                         ),
                     ).as_dict()
                     completed_at = datetime.now(timezone.utc).isoformat()

@@ -238,6 +238,23 @@ class ScannerService:
         #   not_run         no crawl has happened on this instance yet
         self._last_crawl_status: str = "not_run"
         self._last_crawl_page_errors: int = 0
+        # EXPLICIT TERMINATION REASON. Round 6 found the decisive counterexample to
+        # deriving this from scattered booleans: `if self.stop_scan_flag: break`
+        # appears twice in the page/source loops and sets NOTHING, so an external
+        # stop left a PARTIAL raw listing set stamped "complete" -- and a miss
+        # sitting on an unvisited page then read as feed-only, i.e. as acquired.
+        # That is the same wrong answer Thread A exists to remove, by another route.
+        #
+        # So every exit now says why it stopped, and only "complete" grants
+        # membership authority.
+        self._last_crawl_termination: str = "not_run"
+        # THE DETAIL PIPELINE, tracked separately from membership. Cached skips and
+        # policy exclusions never reach all_posts, so scheduled-minus-completed is
+        # ONLY genuine attribution failures -- unlike the earlier
+        # `listing_only - detail_urls`, which conflated all three and was therefore
+        # unusable as a blocking signal.
+        self._last_crawl_detail_scheduled: set = set()
+        self._last_crawl_detail_completed: set = set()
         #: Full-disc releases excluded by policy this crawl: rows the caller
         #: persists, plus the total (new + already-known) for reporting.
         self._last_crawl_policy_excluded_observed: List[Dict] = []
@@ -549,6 +566,11 @@ class ScannerService:
         # ── Process posts (parallel) ──────────────────────────────────
         num_threads = self.config.get("scan_threads", 10)
         completed_urls = await self._process_posts(all_posts, scraper, num_threads)
+        # DETAIL COMPLETION, recorded so scheduled-minus-completed is available as a
+        # blocking signal. _process_posts already returns this; nothing was reading
+        # it for authority purposes.
+        self._last_crawl_detail_completed = {
+            str(u) for u in (completed_urls or ()) if u}
 
         if self.stop_scan_flag:
             return
@@ -663,6 +685,18 @@ class ScannerService:
 
     # ── Page crawling ─────────────────────────────────────────────────
 
+    def last_crawl_detail_failed(self) -> set:
+        """URLs the crawl INTENDED to attribute and could not.
+
+        `_process_posts()` drops a post when `scrape_details()` returns nothing or
+        raises, so a scheduled URL with no completion is a genuine attribution
+        failure. Cached skips and policy exclusions are excluded by construction --
+        they never enter `all_posts` -- which is what makes this usable as a
+        blocking signal where the earlier `listing_only - detail_urls` was not.
+        """
+        return set(self._last_crawl_detail_scheduled) - set(
+            self._last_crawl_detail_completed)
+
     async def _crawl_pages(
         self, sources: List[Dict], pages: int, base_url: str,
         scraper, loop, previously_scanned: Optional[Set[str]] = None,
@@ -697,6 +731,9 @@ class ScannerService:
         # this one's verdict.
         self._last_crawl_page_errors = 0
         self._last_crawl_status = "not_run"
+        self._last_crawl_termination = "not_run"
+        self._last_crawl_detail_scheduled = set()
+        self._last_crawl_detail_completed = set()
         all_posts = []
         skip_urls = previously_scanned or set()
         # Explicit arguments win (tests pass them); otherwise read the live
@@ -749,6 +786,11 @@ class ScannerService:
 
         for source in sources:
             if self.stop_scan_flag:
+                # Externally cancelled (/scan/stop or BackgroundScanner.stop()).
+                # This MUST be recorded: it truncates membership traversal, and
+                # round 6 showed that leaving it silent stamps a partial listing
+                # set "complete".
+                self._last_crawl_termination = "cancelled"
                 break
 
             source_name = source["name"]
@@ -771,6 +813,7 @@ class ScannerService:
 
             for page_num in range(1, pages + 1):
                 if self.stop_scan_flag:
+                    self._last_crawl_termination = "cancelled"
                     break
 
                 current_page += 1
@@ -804,6 +847,7 @@ class ScannerService:
                         resp = await loop.run_in_executor(None, _fetch_page)
                     except (HDEncodeTrafficDenied, HDEncodeRequestCancelled):
                         early_stopped = True
+                        self._last_crawl_termination = "cancelled"
                         self.stop_scan_flag = True
                         self._log(
                             f"{source_name}: coordinator stopped remaining traffic",
@@ -991,14 +1035,27 @@ class ScannerService:
         self._last_crawl_early_stopped = early_stopped
         # The crawl's own verdict on itself, in precedence order: a stop that cut
         # it short, then pages that failed, then a suspicious empty result.
-        if early_stopped:
+        # A recorded cancellation WINS over everything below it. Previously the
+        # chain started at `early_stopped`, which the bare breaks never set, so a
+        # cancelled crawl could fall all the way through to "complete".
+        if self._last_crawl_termination == "cancelled":
+            self._last_crawl_status = "cancelled"
+        elif early_stopped:
+            self._last_crawl_termination = "early_stopped"
             self._last_crawl_status = "early_stopped"
         elif self._last_crawl_page_errors:
+            self._last_crawl_termination = "page_errors"
             self._last_crawl_status = "page_errors"
         elif not all_posts:
+            self._last_crawl_termination = "empty_untrusted"
             self._last_crawl_status = "empty_untrusted"
         else:
+            self._last_crawl_termination = "complete"
             self._last_crawl_status = "complete"
+        # Everything the crawl intended to detail-process. Cached skips and policy
+        # exclusions are already absent: they `continue` before all_posts.append.
+        self._last_crawl_detail_scheduled = {
+            str(post.get("url")) for post in all_posts if post.get("url")}
 
         return all_posts
 

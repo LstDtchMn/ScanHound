@@ -123,18 +123,48 @@ class TestADetailFailureIsNotAcquisition:
 
 class TestTheRawSetIsAuthoritativeButNotDestructive:
 
-    def test_a_detail_row_the_raw_set_missed_is_still_counted(self):
-        """The raw set is a superset in principle, but a crawl that recorded an item
-        without adding it to the seen-set must not lose it. Membership is the UNION,
-        so neither source can silently delete evidence the other has."""
+    def test_a_detail_row_the_raw_set_MISSED_is_a_contradiction(self):
+        """REVERSED after round 6, and this one is worth reading.
+
+        My first version asserted that a detail row absent from the raw set should
+        still count as membership -- reasoning that a union "cannot lose an
+        observation". The reviewer showed that is fail-open reconciliation of
+        contradictory evidence, and that production establishes the opposite
+        invariant: `_crawl_pages` adds a URL to `seen_post_urls` BEFORE appending it
+        to `all_posts`, `_process_posts` only handles `all_posts`, and `run_scan`
+        clears `self.items` each run. So `detail_urls` MUST be a subset of `raw`.
+
+        A non-empty `detail_urls - raw` is therefore impossible in a healthy run.
+        The union silently repaired it and could suppress a legitimate `feed_only`
+        whenever raw membership had been truncated -- and my test ASSERTED that
+        repair, so the test was protecting the defect.
+        """
         result = _compare(
             rss=[],
             details=[_item(LISTED)],
-            raw=[],                            # raw set inexplicably empty
+            raw=[],                            # impossible in healthy production
         )
-        assert C(LISTED) in result.listing_only, (
-            "a detail row must still count as listing membership even if the raw "
-            "set omitted it -- otherwise a crawler bug erases real observations")
+        assert C(LISTED) in result.membership_contradiction, (
+            "a detail row with no raw sighting must be recorded as a contradiction, "
+            f"not absorbed: {result.membership_contradiction}")
+        assert result.listing_complete is False, (
+            "and the contradiction must WITHHOLD listing authority -- recording it "
+            "while still certifying the cycle would be a signal nothing consumes")
+        assert C(LISTED) not in result.listing_only, (
+            "raw is authoritative; the detail set is derived from it and cannot "
+            "add membership of its own")
+
+    def test_a_healthy_subset_relationship_keeps_authority(self):
+        """POSITIVE CONTROL. detail_urls being a strict subset of raw is the NORMAL
+        case -- cached skips and policy exclusions guarantee it -- so it must not
+        trip the contradiction check."""
+        result = _compare(
+            rss=[],
+            details=[_item(LISTED)],
+            raw=[LISTED, DROPPED],             # raw is a superset: healthy
+        )
+        assert result.membership_contradiction == ()
+        assert result.listing_complete is True
 
     def test_omitting_the_raw_set_preserves_the_old_behaviour(self):
         """Callers and tests written before this argument must be unaffected."""
@@ -160,3 +190,106 @@ class TestTheRawSetIsAuthoritativeButNotDestructive:
             f"the same release in three spellings must match; feed_only="
             f"{result.feed_only}")
         assert result.duplicate_count == 1
+
+
+class TestCancellationCannotCertifyAPartialCrawl:
+    """The counterexample round 6 supplied, asserted directly.
+
+    I claimed an early stop always denies listing authority, via a four-hop chain:
+    early stop -> early_stopped -> status "early_stopped" -> listing_complete False
+    -> cycle_is_valid_evidence_for False. I flagged it as the kind of composition
+    claim I keep getting wrong and asked for it to be checked. It was wrong.
+
+    `_crawl_pages` has TWO bare `if self.stop_scan_flag: break` guards -- one in the
+    source loop, one in the page loop -- and neither set `early_stopped`. Both
+    `/scan/stop` and `BackgroundScanner.stop()` can set that flag externally. So:
+
+        page 1 succeeds and yields posts
+        something sets stop_scan_flag
+        page 2 is never visited        -> raw seen-set is PARTIAL
+        all_posts is non-empty
+        early_stopped is still False
+        status -> "complete"           -> listing authority granted
+
+    A miss sitting on the unvisited page is absent from the partial raw set, so it
+    emits as feed_only, and the resolver reads that as acquisition. The same wrong
+    answer by a different route.
+
+    These tests assert the STATE MACHINE rather than mocking a crawl, because a
+    mocked crawl would prove only that my mock behaves as I expect.
+    """
+
+    def test_every_cancellation_guard_records_a_reason(self):
+        """Structural, and deliberately so: the defect was a guard that recorded
+        nothing. If a third cancellation point is added without a reason, this
+        fails."""
+        import inspect
+        import re
+        from backend.scanner_service import ScannerService
+        src = inspect.getsource(ScannerService._crawl_pages)
+        # Examine the whole guard BLOCK up to its break, not just the first line.
+        # My first version asserted against line one and failed on my own comment --
+        # a test that was checking its author's formatting, not the behaviour.
+        blocks = []
+        for match in re.finditer(r"if self\.stop_scan_flag:\n", src):
+            tail = src[match.end():]
+            blocks.append(tail[:tail.index("break") + 5])
+        assert blocks, "the cancellation guards vanished; this test is stale"
+        for block in blocks:
+            assert "_last_crawl_termination" in block, (
+                "a `if self.stop_scan_flag:` guard breaks without recording a "
+                f"termination reason:\n{block}\nThat is the round-6 counterexample: "
+                "a cancelled crawl fell through to 'complete' and certified a "
+                "partial listing set as trustworthy evidence.")
+
+    def test_a_recorded_cancellation_wins_over_the_boolean_chain(self):
+        """The precedence matters. `early_stopped` is False on this path, so if the
+        chain still started there, a cancelled crawl would reach 'complete'."""
+        import inspect
+        from backend.scanner_service import ScannerService
+        src = inspect.getsource(ScannerService._crawl_pages)
+        tail = src[src.index('self._last_crawl_status = "cancelled"') - 400:]
+        assert 'if self._last_crawl_termination == "cancelled"' in tail, (
+            "the status chain must test the recorded cancellation FIRST")
+
+    def test_authority_is_keyed_on_the_termination_reason(self):
+        """And the consumer must read that field, not the older status string."""
+        import inspect
+        from backend.background_scanner import BackgroundScanner
+        src = inspect.getsource(BackgroundScanner)
+        assert '_last_crawl_termination' in src, (
+            "background_scanner must key listing authority on the explicit "
+            "termination reason")
+        assert 'listing_complete=(' in src
+
+    def test_detail_failed_excludes_intentional_skips(self):
+        """Round 6's other subtlety: the crawler adds a URL to its seen set BEFORE
+        deciding to skip it as cached or exclude it by policy. So
+        `listing_only - detail_urls` mixes intentional states with real failures and
+        cannot be blocked on. `detail_failed` is scheduled-minus-completed, where
+        those intentional states are absent by construction."""
+        import inspect
+        from backend.scanner_service import ScannerService
+        src = inspect.getsource(ScannerService.last_crawl_detail_failed)
+        assert "_last_crawl_detail_scheduled" in src
+        assert "_last_crawl_detail_completed" in src
+        # And the scheduled set is built from all_posts, which cached skips and
+        # policy exclusions never enter.
+        crawl = inspect.getsource(ScannerService._crawl_pages)
+        assert "_last_crawl_detail_scheduled = {" in crawl
+        assert "for post in all_posts" in crawl
+
+    def test_detail_failed_reaches_the_comparison(self):
+        """It must be plumbed, not merely computed -- the recurring failure."""
+        result = _compare(rss=[], details=[_item(LISTED)], raw=[LISTED])
+        assert result.detail_failed == ()
+        with_failure = compare_shadow(
+            rss_urls=[], listing_items=[_item(LISTED)], rss_requests=2,
+            listing_requests=1, normal_feeds_complete=True,
+            normal_feed_outcomes=BOTH, listing_complete=True,
+            raw_listing_urls=[LISTED, DROPPED],
+            detail_failed_urls=[DROPPED],
+        )
+        assert C(DROPPED) in with_failure.detail_failed, (
+            "a genuine attribution failure must survive into the comparison, or "
+            "readiness can never block on it")
