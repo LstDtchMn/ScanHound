@@ -260,15 +260,47 @@ class ShadowComparison:
     #: landed here and the keyword then collided, breaking 47 existing tests. This
     #: dataclass is constructed POSITIONALLY, so a new field must go at the end.
     listing_complete:Optional[bool]=None
+    #: Raw-listing URLs whose detail scrape produced nothing, so they carry no
+    #: attribution. Before 2026-08-07 these silently became `feed_only`, which the
+    #: miss resolver reads as proof of acquisition.
+    detail_dropped:tuple[str,...]=()
     def as_dict(self): return asdict(self)
 
-def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss_requests:int, listing_requests:int, normal_feeds_complete:bool, normal_feed_outcomes: Optional[Mapping[str,str]]=None, listing_complete: Optional[bool]=None) -> ShadowComparison:
+def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss_requests:int, listing_requests:int, normal_feeds_complete:bool, normal_feed_outcomes: Optional[Mapping[str,str]]=None, listing_complete: Optional[bool]=None, raw_listing_urls: Optional[Iterable[str]]=None) -> ShadowComparison:
     rss={canonical_url(u) for u in rss_urls if u}
     listing={}
     for item in listing_items:
         row=_row_dict(item); url=canonical_url(row.get('url'))
         if url: listing[url]=row
-    listing_urls=set(listing); duplicate=rss & listing_urls; feed_only=rss-listing_urls; listing_only=listing_urls-rss
+    # MEMBERSHIP COMES FROM THE RAW LISTING, attribution from the detail rows.
+    #
+    # THE FALSE-ACQUISITION BUG THIS FIXES, found by peer review in round 5. These
+    # sets used to be derived from `listing_items`, which is the DETAIL-PROCESSED
+    # list. `_process_posts()` returns None when `scrape_details()` yields nothing
+    # or throws, so that URL is dropped. A release present in BOTH the raw listing
+    # and the feed, whose detail scrape merely failed, therefore landed in
+    # `feed_only` -- and the miss resolver reads `feed_only` as AFFIRMATIVE
+    # ACQUISITION. A real miss resolved as acquired: a wrong answer, not a policy
+    # problem.
+    #
+    # Raw membership is the authority for "was this on the listing at all". The
+    # detail rows remain the authority for status and media attribution, which is
+    # what CREATING a miss needs. One signal must not certify both.
+    #
+    # When no raw set is supplied the old detail-derived behaviour stands, so
+    # callers and tests that predate this argument are unaffected.
+    detail_urls=set(listing)
+    raw=None
+    if raw_listing_urls is not None:
+        raw={canonical_url(u) for u in raw_listing_urls if u}
+        raw.discard('')
+    membership=detail_urls if raw is None else (raw | detail_urls)
+    duplicate=rss & membership; feed_only=rss-membership; listing_only=membership-rss
+    # Listing rows we could not attribute because their detail scrape produced
+    # nothing. Recorded rather than silently dropped: they are the population that
+    # used to corrupt feed_only, and they are a real observability gap.
+    detail_dropped=tuple(sorted(listing_only-detail_urls))
+    listing_urls=membership
     # THREE-STATE, and the distinction is load-bearing.
     #
     #   None  -> the caller supplies no provenance. Fall back to the
@@ -296,7 +328,12 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
         recorded=dict(outcomes)
     misses=[]; unattributable=[]
     for url in sorted(listing_only):
-        row=listing[url]
+        row=listing.get(url)
+        if row is None:
+            # Raw-listing URL with no detail row: no status and no media type, so
+            # it cannot be attributed to a feed and must not be booked as a miss.
+            # It is reported via detail_dropped instead of being invented or lost.
+            continue
         if _status_value(row) not in _RELEVANT_STATES: continue
         media_type,basis=attribution_evidence({**row,'url':url})
         record={'canonical_url':url,'title':row.get('title'),
@@ -354,7 +391,8 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
     # admitted exactly the stale comparisons it was meant to exclude.
     if misses and normal_feeds_complete: outcome='relevant_miss'
     return ShadowComparison(len(rss),len(listing_urls),len(duplicate),len(feed_only),len(listing_only),len(misses),int(rss_requests),int(listing_requests),round(reduction,2),bool(normal_feeds_complete),outcome,tuple(sorted(feed_only)),tuple(sorted(listing_only)),tuple(misses),dict(recorded),tuple(unattributable),
-        listing_complete=(None if listing_complete is None else bool(listing_complete)))
+        listing_complete=(None if listing_complete is None else bool(listing_complete)),
+        detail_dropped=detail_dropped)
 
 
 # ---------------------------------------------------------------------------

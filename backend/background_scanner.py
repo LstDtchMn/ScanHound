@@ -496,6 +496,12 @@ class BackgroundScanner:
                         #
                         # Only the crawler's "complete" state counts, and an
                         # exception that escaped to here still disqualifies it.
+                        # RAW LISTING MEMBERSHIP. `items` is detail-processed and
+                        # drops anything whose detail scrape failed, which used to
+                        # turn a real miss into apparent acquisition. This set is
+                        # every listing URL the crawl actually saw.
+                        raw_listing_urls=getattr(
+                            scanner, "_last_crawl_seen_urls", None),
                         listing_complete=(
                             not bool(err)
                             and getattr(scanner, "_last_crawl_status", "not_run")
