@@ -1134,6 +1134,12 @@ class DatabaseManager:
                         deferred_items INTEGER NOT NULL DEFAULT 0,
                         auto_resume_after_cooldown INTEGER NOT NULL DEFAULT 0,
                         auto_resume_used INTEGER NOT NULL DEFAULT 0,
+                        -- Completed-item count at the moment of the last
+                        -- automatic resume. Lets the retry budget be REFUNDED
+                        -- when a resume actually delivered something, so a batch
+                        -- that keeps making progress is not cut off after N
+                        -- attempts. See _maybe_auto_resume.
+                        auto_resume_progress_mark INTEGER NOT NULL DEFAULT 0,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
                         paused_at TEXT,
@@ -1142,6 +1148,24 @@ class DatabaseManager:
                         last_cause_code TEXT
                     )
                 """)
+                # Additive migration for the table above, placed HERE and not in
+                # the shared _column_migrations list several hundred lines
+                # earlier. That list runs BEFORE this CREATE, so an ALTER there
+                # fails with "no such table", and the guard only swallows
+                # "duplicate column" -- it logs the failure and carries on,
+                # leaving the column absent. That exact mistake cost a round of
+                # confusing test failures on the shadow tables; see the note
+                # beside their migrations.
+                for _batch_alter in (
+                    "ALTER TABLE download_queue_batches "
+                    "ADD COLUMN auto_resume_progress_mark INTEGER "
+                    "NOT NULL DEFAULT 0",
+                ):
+                    try:
+                        cursor.execute(_batch_alter)
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS download_queue_items (
                         item_uuid TEXT PRIMARY KEY,

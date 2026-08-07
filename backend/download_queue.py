@@ -1076,6 +1076,30 @@ class DownloadQueueService:
             ),
         )
 
+    def _auto_resume_max_attempts(self) -> int:
+        """How many CONSECUTIVE fruitless automatic resumes a batch may make.
+
+        Only fruitless ones count: _resume_batch refunds the budget whenever the
+        previous resume delivered anything, so a batch making progress is never
+        cut off. Clamped to 1..10 -- 1 restores the old single-shot behaviour, and
+        the ceiling exists because an unbounded retry loop against a source that
+        is rate-limiting us is how this incident started.
+        """
+        try:
+            value = int(self.config.get(
+                "download_queue_auto_resume_max_attempts", 3))
+        except (TypeError, ValueError):
+            value = 3
+        return max(1, min(10, value))
+
+    def _completed_count(self, conn, batch_uuid: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM download_queue_items "
+            "WHERE batch_uuid = ? AND state = 'completed'",
+            (batch_uuid,),
+        ).fetchone()
+        return int((row["n"] if row is not None else 0) or 0)
+
     def _maybe_auto_resume(self) -> None:
         if self.db is None:
             return
@@ -1083,17 +1107,54 @@ class DownloadQueueService:
         if snapshot.get("blocked"):
             return
         now = _utcnow()
+        # A RETRY BUDGET, not a single shot. Changed 2026-08-07 after the
+        # single shot was observed to be the binding constraint in production.
+        #
+        # WHAT HAPPENED. At 03:25Z the one automatic resume fired and WORKED: 24
+        # of 69 stranded grabs completed over the next 50 minutes -- the first
+        # fully automatic recovery from a source throttle this system has done.
+        # Then at 04:07Z HDEncode throttled again, four batches re-paused, and
+        # because `auto_resume_used` had reached 1 they could never resume
+        # themselves again. 44 items sat parked behind a spent retry.
+        #
+        # A resume that delivered 24 items is not a failed attempt. So the budget
+        # is REFUNDED whenever a resume made progress -- see _resume_batch, which
+        # resets the counter if the batch completed anything since the last
+        # automatic resume. The budget therefore only runs down on resumes that
+        # achieved NOTHING, which is the case where giving up is correct.
+        #
+        # The escalating cooldown from the coordinator (1h -> 2h -> 4h) composes
+        # with this: later attempts wait longer, so repeated retries do not
+        # hammer a source that is still shut.
         batches = self.db._query_dicts(
             """
             SELECT *
             FROM download_queue_batches
             WHERE state = 'paused_source'
               AND auto_resume_after_cooldown = 1
-              AND auto_resume_used = 0
+              AND (
+                    auto_resume_used < ?
+                 OR (SELECT COUNT(*) FROM download_queue_items i
+                     WHERE i.batch_uuid = download_queue_batches.batch_uuid
+                       AND i.state = 'completed')
+                    > auto_resume_progress_mark
+              )
             ORDER BY created_at
             """,
+            (self._auto_resume_max_attempts(),),
             default=[],
         )
+        # PROGRESS IS AN INDEPENDENT PATH TO ELIGIBILITY, and it has to be.
+        #
+        # My first version refunded the budget inside _resume_batch and gated
+        # eligibility on `auto_resume_used < max` alone. A test caught that the
+        # refund was then unreachable exactly when it mattered: a batch at its
+        # limit never got selected, so _resume_batch never ran, so the refund it
+        # contained could never fire. The batch stayed stuck despite delivering.
+        #
+        # So the second clause above lets a batch that completed something since
+        # its last automatic resume through regardless of the counter, and
+        # _resume_batch then resets the counter and re-marks the baseline.
         for batch in batches:
             until = _parse(batch.get("cooldown_until"))
             if until is None or until > now:
@@ -1330,18 +1391,58 @@ class DownloadQueueService:
                     ).rowcount
                 if updated == 1:
                     cursor += timedelta(minutes=interval)
+            # REFUND THE BUDGET IF THE LAST AUTOMATIC RESUME ACHIEVED SOMETHING.
+            #
+            # Observed in production on 2026-08-07: one resume delivered 24 items
+            # and then the source throttled again. Counting that as a spent
+            # attempt is wrong -- the retry worked, the source simply shut a
+            # second time. So a batch that completed anything since its previous
+            # automatic resume starts its budget over, and the budget only runs
+            # down on resumes that delivered NOTHING, which is exactly the case
+            # where giving up is the right answer.
+            #
+            # Consequence worth being explicit about: a batch that keeps making
+            # partial progress can retry indefinitely. That is intended -- it is
+            # making progress -- and it is still spaced by the coordinator's
+            # escalating cooldown, so it cannot become a tight loop.
+            used_delta = 1 if automated else 0
+            reset_budget = False
+            if automated:
+                completed_now = self._completed_count(conn, batch_uuid)
+                prior = conn.execute(
+                    "SELECT auto_resume_progress_mark AS mark "
+                    "FROM download_queue_batches WHERE batch_uuid = ?",
+                    (batch_uuid,),
+                ).fetchone()
+                mark = int((prior["mark"] if prior is not None else 0) or 0)
+                if completed_now > mark:
+                    reset_budget = True
+                    logger.info(
+                        "Batch %s delivered %d item(s) since its last automatic "
+                        "resume; restoring its retry budget.",
+                        batch_uuid, completed_now - mark,
+                    )
             conn.execute(
                 """
                 UPDATE download_queue_batches
                 SET state = 'scheduled', interval_seconds = ?,
                     cooldown_until = NULL,
-                    auto_resume_used = auto_resume_used + ?,
+                    auto_resume_used = CASE WHEN ? THEN ? ELSE
+                        auto_resume_used + ? END,
+                    auto_resume_progress_mark = CASE WHEN ?
+                        THEN (SELECT COUNT(*) FROM download_queue_items
+                              WHERE batch_uuid = ? AND state = 'completed')
+                        ELSE auto_resume_progress_mark END,
                     updated_at = ?
                 WHERE batch_uuid = ?
                 """,
                 (
                     interval * 60,
+                    1 if reset_budget else 0,
+                    used_delta,
+                    used_delta,
                     1 if automated else 0,
+                    batch_uuid,
                     _iso(now),
                     batch_uuid,
                 ),
