@@ -287,37 +287,89 @@ class TestAutoResumePolicy:
         _, states = _states(service, uuid)
         assert list(states.values()).count("completed") >= 2, states
 
-    def test_the_second_stall_proves_the_one_shot_policy(self, rig):
-        """(10) The retry is one per batch for its LIFETIME, not per pause.
+    def test_the_retry_budget_replaces_the_one_shot_policy(self, rig):
+        """(10) REWRITTEN for the retry budget. Was: the one-shot policy.
 
-        Documented here because it was described to the user as one-per-pause and
-        it is not: the resume query requires auto_resume_used = 0 and the column
-        only ever increments.
+        This test previously asserted that after `auto_resume_used == 1` no further
+        attempt could ever occur. #51 deliberately removes that: a batch may make up
+        to N CONSECUTIVE FRUITLESS automatic resumes, and a resume that produced real
+        source progress refunds the budget.
+
+        The conflict was not hypothetical. Merging #49 and #51 produces a tree git
+        resolves cleanly and whose test run FAILS, which is exactly the reviewer's
+        point that five individually green PRs prove nothing about the set. This
+        rewrite is what makes the combined tree honest.
+
+        Default budget is 3, so the rig is configured to 2 here to reach exhaustion
+        without a long test.
         """
         clock, db, downloads, service = rig
-        batch = _schedule(service, 3, auto_resume=True)
+        service.config["download_queue_auto_resume_max_attempts"] = 2
+        batch = _schedule(service, 4, auto_resume=True)
         uuid = batch["batch_uuid"]
 
+        # First stall, then a resume that also stalls: fruitless attempt #1.
         downloads.queue(stall_outcome(clock, minutes=60))
         _tick(service)
+        assert _states(service, uuid)[0]["state"] == "paused_source"
+
         clock.advance(minutes=61)
-        downloads.queue(stall_outcome(clock, minutes=60))   # stalls AGAIN
-        assert _tick(service) is not None, "the first resume should have fired"
+        downloads.queue(stall_outcome(clock, minutes=60))
+        assert _tick(service) is not None, "the first automatic resume must fire"
         current, _ = _states(service, uuid)
         assert current["auto_resume_used"] == 1
-        assert current["state"] == "paused_source", (
-            "the second stall must pause the batch again")
+        assert current["state"] == "paused_source", "the second stall re-pauses it"
 
-        clock.advance(hours=4)
+        # Second fruitless resume: allowed now, and this is the behaviour whose
+        # absence stranded 44 items in production.
+        clock.advance(minutes=61)
+        downloads.queue(stall_outcome(clock, minutes=60))
+        assert _tick(service) is not None, (
+            "a SECOND automatic attempt must be permitted -- the single shot is what "
+            "left four batches permanently parked on 2026-08-07")
+        assert _states(service, uuid)[0]["auto_resume_used"] == 2
+
+        # Budget spent with nothing delivered: it must now stop.
+        clock.advance(hours=6)
         calls_before = len(downloads.calls)
         for _ in range(6):
             _tick(service)
         current, _ = _states(service, uuid)
         assert current["state"] == "paused_source", (
-            "the one-shot policy must hold: a batch that has spent its automatic "
-            "resume never resumes itself again, however long you wait")
+            "a batch that burned its whole budget without delivering anything must "
+            "stop and wait for a human")
         assert len(downloads.calls) == calls_before, (
-            "no attempt may follow a spent resume")
+            "no request may follow an exhausted budget")
+
+    def test_real_source_progress_refunds_the_budget(self, rig):
+        """The other half of #51's policy, exercised through the real worker.
+
+        A resume that DELIVERED is not a spent attempt. Verified here end to end
+        rather than by writing state='completed' into a row -- the fixture defect
+        peer review named, since a pre-scrape duplicate also reaches 'completed'
+        without contacting the source.
+        """
+        clock, db, downloads, service = rig
+        service.config["download_queue_auto_resume_max_attempts"] = 1
+        batch = _schedule(service, 4, auto_resume=True)
+        uuid = batch["batch_uuid"]
+
+        downloads.queue(stall_outcome(clock, minutes=60))
+        _tick(service)
+        clock.advance(minutes=61)
+
+        # The resume delivers for real, then the source shuts again.
+        downloads.queue(success_outcome())
+        assert _tick(service) is not None
+        downloads.queue(stall_outcome(clock, minutes=60))
+        _tick(service)
+        assert _states(service, uuid)[0]["state"] == "paused_source"
+
+        clock.advance(minutes=61)
+        downloads.queue(success_outcome())
+        assert _tick(service) is not None, (
+            "the previous resume delivered a real item, so the budget must have "
+            "been refunded even though max_attempts is 1")
 
 
 class TestLayoutChangeStaysTerminal:
