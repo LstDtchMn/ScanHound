@@ -1180,7 +1180,16 @@ class DownloadQueueService:
             (maximum,), default=[],
         ):
             batch_uuid = str(row.get("batch_uuid") or "")
-            if batch_uuid in self._exhausted_warned:
+            # PER EPISODE, not once per process. Peer review noted that keying on
+            # the batch alone means a batch that recovers and later exhausts again
+            # is silent the second time. The attempt count and progress mark both
+            # change when a refund or resume happens, so keying on the triple makes
+            # a genuinely new exhaustion a new key -- without another schema column
+            # or a write on the polling path.
+            episode = (batch_uuid,
+                       int(row.get("auto_resume_used") or 0),
+                       int(row.get("auto_resume_progress_mark") or 0))
+            if episode in self._exhausted_warned:
                 continue
             until = _parse(row.get("cooldown_until"))
             if until is not None and until > now:
@@ -1190,7 +1199,7 @@ class DownloadQueueService:
                 "WHERE batch_uuid = ? AND state IN "
                 "      ('waiting_source','verification_required')",
                 (batch_uuid,), one=True, default=None)
-            self._exhausted_warned.add(batch_uuid)
+            self._exhausted_warned.add(episode)
             logger.warning(
                 "Batch %s has spent all %d automatic resume attempts without any "
                 "further source delivery and will NOT retry on its own. "
@@ -1263,37 +1272,49 @@ class DownloadQueueService:
         recognised = int(counts["reason_recognised"] or 0)
         unknown = int(counts["unknown_outcome"] or 0)
 
+        # REPORT EVERY FAILED PREDICATE, not one cause chosen by precedence.
+        #
+        # THE DEFECT THIS FIXES, raised by peer review. This was an if/elif chain,
+        # so a batch whose rows had BOTH a cooldown mismatch AND
+        # operation_timeout_unknown was reported as a cooldown problem only. But
+        # matching the timestamps would not make those rows safe to retry -- they
+        # are excluded deliberately because a retry could double-submit a delivery
+        # that already happened. The diagnostic hid the safety-critical reason and
+        # sent the reader to fix the wrong thing, which is the exact failure class
+        # this method exists to prevent.
+        causes = []
         if matched == 0:
-            cause = (
+            causes.append(
                 "no deferred item carries the batch's cooldown timestamp "
                 f"({batch.get('cooldown_until')!r}), so the eligibility check "
-                "cannot see any of them. This usually means the batch cooldown "
-                "was changed without changing the items. THE BATCH WILL NEVER "
-                "RESUME ON ITS OWN until they match."
-            )
-        elif recognised == 0:
-            cause = (
-                "every deferred item carries a queue_reason the resume path "
-                "does not recognise (it accepts only 'interactive_challenge' "
-                "and 'source_deferred')."
-            )
-        elif unknown >= deferred:
-            cause = (
-                "every deferred item ended in an unknown execution state "
-                "(operation_timeout_unknown / interrupted_unknown_outcome), "
-                "which is excluded deliberately: retrying could double-submit "
-                "a delivery that already happened. These need adjudicating by "
-                "hand, not resuming."
-            )
-        else:
-            cause = (
-                f"{deferred} deferred item(s), {matched} with a matching "
-                f"cooldown, {recognised} with a recognised queue_reason, "
-                f"{unknown} in an unknown execution state -- no single item "
-                "satisfies all three conditions at once."
-            )
+                "cannot see any of them -- usually because the batch cooldown was "
+                "changed without changing the items. THE BATCH WILL NEVER RESUME "
+                "ON ITS OWN until they match; this is permanent, not transient")
+        if recognised == 0:
+            causes.append(
+                "no deferred item carries a queue_reason the resume path accepts "
+                "(only 'interactive_challenge' and 'source_deferred')")
+        if unknown:
+            # Reported whenever ANY row is affected, not only when all are, and
+            # never suppressed by another cause.
+            causes.append(
+                f"{unknown} of {deferred} deferred item(s) ended in an unknown "
+                "execution state (operation_timeout_unknown / "
+                "interrupted_unknown_outcome). Those are excluded deliberately: a "
+                "retry could double-submit a delivery that already happened. They "
+                "need adjudicating by hand, and fixing anything else will not make "
+                "them resumable")
+        if not causes:
+            causes.append(
+                "each condition is satisfied by some row, but no single row "
+                "satisfies all of them at once")
+
         logger.warning(
-            "Batch %s is due to auto-resume but cannot: %s", batch_uuid, cause,
+            "Batch %s is due to auto-resume but cannot. Predicates: deferred=%d "
+            "cooldown_match=%d recognised_reason=%d unknown_outcome=%d. "
+            "Cause(s): %s",
+            batch_uuid, deferred, matched, recognised, unknown,
+            "; ".join(causes),
         )
 
     def _maybe_auto_resume(self) -> None:
@@ -1319,9 +1340,14 @@ class DownloadQueueService:
         # automatic resume. The budget therefore only runs down on resumes that
         # achieved NOTHING, which is the case where giving up is correct.
         #
-        # The escalating cooldown from the coordinator (1h -> 2h -> 4h) composes
-        # with this: later attempts wait longer, so repeated retries do not
-        # hammer a source that is still shut.
+        # NOTE ON PACING, corrected 2026-08-07. An earlier version of this comment
+        # claimed the coordinator's 1h -> 2h -> 4h escalation "composes with" this
+        # budget so repeated retries spread out. That composition is NOT proven
+        # here and the claim is withdrawn: peer review found that
+        # observe_reveal_success() has no production call site, so the streak never
+        # resets, and no test in this branch exercises the real coordinator
+        # alongside the queue. What IS true is that fruitless retries are capped
+        # and each one waits for whatever cooldown the coordinator set.
         batches = self.db._query_dicts(
             """
             SELECT *

@@ -211,3 +211,79 @@ class TestTheOtherCausesAreDistinguished:
                 "an ordinary batch with nothing waiting must stay quiet")
         finally:
             db.close()
+
+
+class TestCombinedCausesAreAllReported:
+    """A batch can be blocked for several reasons at once.
+
+    THE DEFECT THIS FIXES, from peer review. The diagnostic was an if/elif chain,
+    so a batch whose rows had BOTH a cooldown mismatch AND
+    `operation_timeout_unknown` was reported as a cooldown problem only. Matching
+    the timestamps would not have made those rows safe to retry -- they are
+    excluded deliberately because a retry could double-submit a delivery that
+    already happened. So the message hid the safety-critical reason and sent the
+    reader to fix the wrong thing, which is the exact failure class this method
+    exists to prevent.
+    """
+
+    def _messages(self, caplog):
+        return " ".join(r.getMessage() for r in caplog.records
+                        if r.levelno >= logging.WARNING)
+
+    def test_a_timestamp_mismatch_AND_unknown_outcome_reports_both(
+            self, tmp_path, caplog):
+        db = DatabaseManager(str(tmp_path / "both-causes.db"))
+        try:
+            service, uuid = _paused_batch(
+                db, item_cooldown=EXPIRED, batch_cooldown=EXPIRED,
+                queue_reason="source_deferred",
+                last_reason_code="operation_timeout_unknown")
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE download_queue_items SET cooldown_until = ? "
+                    "WHERE batch_uuid = ?", (DIVERGED, uuid))
+            with caplog.at_level(logging.WARNING):
+                service._maybe_auto_resume()
+            joined = self._messages(caplog)
+            assert "cooldown timestamp" in joined, joined
+            assert "unknown execution state" in joined, (
+                "the unknown-outcome rows must be reported EVEN THOUGH the "
+                "cooldown also mismatches -- hiding it is what sends the reader "
+                "to fix the wrong thing")
+            assert "double-submit" in joined, (
+                "the reader must learn WHY those rows are excluded")
+        finally:
+            db.close()
+
+    def test_the_predicate_vector_is_always_printed(self, tmp_path, caplog):
+        """Counts, not just prose, so the reader can see the whole picture."""
+        db = DatabaseManager(str(tmp_path / "vector.db"))
+        try:
+            service, uuid = _paused_batch(
+                db, item_cooldown=EXPIRED, batch_cooldown=EXPIRED,
+                queue_reason="manual_retry",
+                last_reason_code="source_temporarily_blocked")
+            with caplog.at_level(logging.WARNING):
+                service._maybe_auto_resume()
+            joined = self._messages(caplog)
+            for token in ("deferred=", "cooldown_match=", "recognised_reason=",
+                          "unknown_outcome="):
+                assert token in joined, (token, joined)
+        finally:
+            db.close()
+
+    def test_a_healthy_resume_still_says_nothing(self, tmp_path, caplog):
+        """NEGATIVE CONTROL. Reporting more causes must not make it noisy."""
+        db = DatabaseManager(str(tmp_path / "quiet.db"))
+        try:
+            service, uuid = _paused_batch(
+                db, item_cooldown=EXPIRED, batch_cooldown=EXPIRED,
+                queue_reason="source_deferred",
+                last_reason_code="source_temporarily_blocked")
+            with caplog.at_level(logging.WARNING):
+                service._maybe_auto_resume()
+            assert service.get_batch(uuid)["state"] != "paused_source"
+            assert not [r for r in caplog.records
+                        if r.levelno >= logging.WARNING]
+        finally:
+            db.close()

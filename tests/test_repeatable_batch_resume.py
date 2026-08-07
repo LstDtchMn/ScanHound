@@ -468,3 +468,38 @@ class TestAnExhaustedBudgetIsVisible:
                         if r.levelno >= logging.WARNING]
         finally:
             db.close()
+
+    def test_a_second_exhaustion_episode_warns_again(self, tmp_path, caplog):
+        """PER EPISODE, not once per process.
+
+        Peer review noted that keying the warning on the batch alone means a batch
+        that recovers and later exhausts again is silent the second time -- so the
+        operator is told once and never again, which is most of the way back to the
+        silence #47 exists to remove.
+        """
+        db = DatabaseManager(str(tmp_path / "second-episode.db"))
+        try:
+            service, uuid = _rig(db, count=8, config={
+                "download_queue_auto_resume_max_attempts": 1})
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            _pause(db, service, uuid)
+            with caplog.at_level(logging.WARNING):
+                service._maybe_auto_resume()
+            assert any(uuid in r.getMessage() for r in caplog.records
+                       if r.levelno >= logging.WARNING), "first episode silent"
+
+            # A real delivery refunds the budget, the batch resumes, then exhausts
+            # a SECOND time. That is a new episode and must produce a fresh signal.
+            _complete_one(db, service, uuid, method="jdownloader")
+            service._maybe_auto_resume()
+            _pause(db, service, uuid)
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                service._maybe_auto_resume()
+            assert any(uuid in r.getMessage() for r in caplog.records
+                       if r.levelno >= logging.WARNING), (
+                "the second exhaustion episode produced no warning; keyed on the "
+                "batch alone it would be silent forever after the first")
+        finally:
+            db.close()

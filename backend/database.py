@@ -2627,8 +2627,22 @@ class DatabaseManager:
             problems.append(f"normal_feed_outcomes_not_an_object:{cycle}")
             return {}
         if "_derived_from" in parsed:
-            # A cycle-level fallback marker, deliberately not fabricated feed
-            # outcomes. It cannot validate any specific feed.
+            # A CYCLE-LEVEL FALLBACK MARKER. Corrected 2026-08-07 on peer review.
+            #
+            # This returned {} -- an explicit "no feed observed" -- which meant a
+            # miss recorded under such a marker was never ADMITTED (admission tests
+            # `is None` to decide the legacy fallback, and {} is not None). But the
+            # marker's whole purpose is to say "no per-feed data was recorded here,
+            # use the cycle-level rule", which is exactly the legacy case. So it
+            # must read as None, not as an empty observation.
+            #
+            # Validate the schema before granting that fallback: an unrecognised or
+            # malformed marker is corrupt evidence, not a licence to fall back.
+            if (set(parsed) == {"_derived_from", "normal_feeds_complete"}
+                    and parsed.get("_derived_from") == "cycle_level_completeness"
+                    and isinstance(parsed.get("normal_feeds_complete"), bool)):
+                return None
+            problems.append(f"derived_marker_invalid:{cycle}:{sorted(parsed)!r}")
             return {}
         return {str(k):str(v) for k,v in parsed.items()}
 

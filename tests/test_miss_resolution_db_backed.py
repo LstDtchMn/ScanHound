@@ -211,3 +211,68 @@ class TestTheColumnExists:
             assert "listing_complete" in cols, cols
         finally:
             db.close()
+
+
+class TestTheCycleLevelMarkerFallsBack:
+    """A validated `_derived_from` marker means "use the cycle-level rule".
+
+    THE DEFECT THIS FIXES, from peer review. `_normal_feed_outcomes()` returned
+    `{}` for such a marker -- an explicit "no feed was observed" -- and miss
+    ADMISSION decides the legacy fallback on `is None`. So `{}` is not None, the
+    marker got no fallback, and misses recorded under it were silently omitted from
+    the gate entirely. The marker's whole purpose is to say "no per-feed data here",
+    which is exactly the legacy case, so it must read as None.
+
+    Collapsing `{}` and the marker together was the round-3 R2-4 finding.
+    """
+
+    MARKER = {"_derived_from": "cycle_level_completeness",
+              "normal_feeds_complete": True}
+
+    def test_a_miss_under_a_validated_marker_is_admitted_and_resolvable(
+            self, tmp_path):
+        db = DatabaseManager(str(tmp_path / "marker-ok.db"))
+        try:
+            _cycle(db, "c1", STAMP, outcomes=self.MARKER, complete=True,
+                   listing_complete=True, listing_only=[MOVIE], miss=MOVIE)
+            _cycle(db, "c2", LATER, outcomes=None, complete=True,
+                   listing_complete=None, feed_only=[MOVIE])
+            res = db.get_hdencode_miss_resolution()
+            assert len(res["rows"]) == 1, (
+                "the miss must be ADMITTED; a marker is a legacy signal, not an "
+                f"empty observation. rows={res['rows']}")
+            assert res["rows"][0]["state"] == "acquired", res["rows"]
+        finally:
+            db.close()
+
+    def test_a_malformed_marker_is_corrupt_not_a_licence_to_fall_back(
+            self, tmp_path):
+        """Validating the schema first: an unrecognised marker must not buy the
+        fallback it is shaped like."""
+        db = DatabaseManager(str(tmp_path / "marker-bad.db"))
+        try:
+            _cycle(db, "c1", STAMP,
+                   outcomes={"_derived_from": "something_else"}, complete=True,
+                   listing_complete=True, listing_only=[MOVIE], miss=MOVIE)
+            res = db.get_hdencode_miss_resolution()
+            assert any("derived_marker_invalid" in p
+                       for p in res["evidence_problems"]), \
+                res["evidence_problems"]
+        finally:
+            db.close()
+
+    def test_a_marker_whose_flag_is_not_a_boolean_is_corrupt(self, tmp_path):
+        db = DatabaseManager(str(tmp_path / "marker-str.db"))
+        try:
+            _cycle(db, "c1", STAMP,
+                   outcomes={"_derived_from": "cycle_level_completeness",
+                             "normal_feeds_complete": "false"},
+                   complete=True, listing_complete=True,
+                   listing_only=[MOVIE], miss=MOVIE)
+            res = db.get_hdencode_miss_resolution()
+            assert any("derived_marker_invalid" in p
+                       for p in res["evidence_problems"]), (
+                'the string "false" is truthy in Python; a pseudo-boolean must '
+                "not pass as a validated marker")
+        finally:
+            db.close()
