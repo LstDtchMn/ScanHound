@@ -33,6 +33,50 @@ class RenameJobDBError(Exception):
     DB problem" apart from "legitimately skipped" should catch this."""
 
 
+#: Diagnostic buckets in the shadow-miss integrity check that must never hold a
+#: row without a matching explanation.
+_MISS_DIAGNOSTIC_BUCKETS = ("unsupported", "corrupt")
+
+
+def reconcile_bucket_reporting(per_cycle):
+    """Every row counted as bad must have produced its own finding.
+
+    Returns the findings for any cycle whose bucket count and reported count
+    disagree. Empty means the accounting is consistent.
+
+    WHY THIS IS A MODULE-LEVEL FUNCTION AND NOT AN INLINE LOOP. Round 5's version
+    of this check lived inline and asked whether ANY integrity finding mentioned
+    the cycle, which one unrelated finding satisfied for any number of unreported
+    rows in the same cycle. Its test passed with the check deleted -- the test
+    could not construct the state that reaches it, because production code always
+    reports correctly, so there was nothing to detect. I recorded that rather than
+    reword it.
+
+    Pulling it out makes the state constructible: the reviewer's case
+    (unsupported=2 with one reported, corrupt=1 with one reported) is now three
+    lines of a dict, and the assertion is that exactly ONE finding appears --
+    naming the unsupported bucket -- despite a corrupt finding already existing
+    for that same cycle. That is the case the string match got wrong.
+
+    A shortfall can only arise if a branch increments a bucket without going
+    through the reporting helper, which is exactly the mistake being guarded.
+    """
+    findings = []
+    for cycle, slot in per_cycle.items():
+        for bucket in _MISS_DIAGNOSTIC_BUCKETS:
+            counted = int(slot.get(bucket) or 0)
+            reported = int(slot.get("reported_" + bucket) or 0)
+            shortfall = counted - reported
+            if shortfall > 0:
+                findings.append(f"unreported_{bucket}_rows:{cycle}:{shortfall}")
+            elif shortfall < 0:
+                # More explanations than bad rows means this accounting is itself
+                # wrong, which is no better than the bug it looks for.
+                findings.append(
+                    f"overreported_{bucket}_rows:{cycle}:{-shortfall}")
+    return findings
+
+
 class DatabaseManager:
     """Thread-safe SQLite database manager with connection pooling and auto-recovery."""
 
@@ -2158,6 +2202,28 @@ class DatabaseManager:
         _VALID_MEDIA_TYPES={"movie","tv","unknown"}
         attributed=0
         per_cycle={}
+
+        def _flag(slot,bucket,finding):
+            """Count a bad row AND explain it, in one action that cannot split.
+
+            ROUND 6, replacing a backstop that matched strings. Every branch below
+            used to do `integrity.append(...)` and `slot[bucket]+=1` as two
+            separate statements, and twice a branch did the second without the
+            first -- a row counted as bad while the gate reported nothing. The old
+            backstop caught that by asking whether ANY finding mentioned the
+            cycle, which one unrelated finding satisfies for any number of
+            unreported rows in that same cycle. I recorded that limitation rather
+            than claiming it closed.
+
+            Now the two are inseparable here, and the reported_* counters make the
+            invariant checkable: a future branch that increments a bucket directly
+            leaves reported_* behind, and the reconciliation at the end names the
+            bucket, the cycle, and the exact shortfall.
+            """
+            slot[bucket]+=1
+            slot["reported_"+bucket]+=1
+            integrity.append(finding)
+
         rows=self._query_dicts(
             "SELECT m.cycle_uuid AS cycle_uuid, m.canonical_url AS url, "
             "       m.media_type AS media_type, "
@@ -2170,27 +2236,26 @@ class DatabaseManager:
         for row in rows:
             cycle=str(row.get("cycle_uuid") or "")
             slot=per_cycle.setdefault(cycle,{"total":0,"supported":0,
-                                             "unsupported":0,"corrupt":0})
+                                             "unsupported":0,"corrupt":0,
+                                             "reported_unsupported":0,
+                                             "reported_corrupt":0})
             slot["total"]+=1
             media_type=row.get("media_type")
             # A persisted media_type outside the vocabulary is corrupt evidence.
             # "unknown" is a legitimate classifier result; NULL or arbitrary text
             # is not, and must not be silently coerced into it.
             if media_type is None or str(media_type) not in _VALID_MEDIA_TYPES:
-                integrity.append(
-                    f"media_type_invalid:{cycle}:{media_type!r}")
-                slot["corrupt"]+=1
+                _flag(slot,"corrupt",
+                      f"media_type_invalid:{cycle}:{media_type!r}")
                 continue
             raw=row.get("provenance")
             try:
                 provenance=json.loads(raw or "{}")
             except (TypeError,ValueError):
-                integrity.append(f"provenance_unparseable:{cycle}")
-                slot["corrupt"]+=1
+                _flag(slot,"corrupt",f"provenance_unparseable:{cycle}")
                 continue
             if not isinstance(provenance,dict):
-                integrity.append(f"provenance_not_an_object:{cycle}")
-                slot["corrupt"]+=1
+                _flag(slot,"corrupt",f"provenance_not_an_object:{cycle}")
                 continue
             if "_derived_from" in provenance:
                 # Written by a caller that supplied no per-feed provenance. The
@@ -2204,27 +2269,24 @@ class DatabaseManager:
                 # contradictory marker could pass the consistency check and then
                 # take the silent-discard path below.
                 if set(provenance) != {"_derived_from", "normal_feeds_complete"}:
-                    integrity.append(
-                        f"derived_marker_schema:{cycle}:"
-                        f"{sorted(provenance)!r}")
-                    slot["corrupt"]+=1
+                    _flag(slot,"corrupt",
+                          f"derived_marker_schema:{cycle}:"
+                          f"{sorted(provenance)!r}")
                     continue
                 if provenance.get("_derived_from")!="cycle_level_completeness":
-                    integrity.append(
-                        f"derived_marker_unknown:{cycle}:"
-                        f"{provenance.get('_derived_from')!r}")
-                    slot["corrupt"]+=1
+                    _flag(slot,"corrupt",
+                          f"derived_marker_unknown:{cycle}:"
+                          f"{provenance.get('_derived_from')!r}")
                     continue
                 recorded=provenance.get("normal_feeds_complete")
                 if not isinstance(recorded,bool):
                     # bool() would accept "false", 0.0, [] and friends.
-                    integrity.append(
-                        f"derived_marker_not_a_boolean:{cycle}:{recorded!r}")
-                    slot["corrupt"]+=1
+                    _flag(slot,"corrupt",
+                          f"derived_marker_not_a_boolean:{cycle}:{recorded!r}")
                     continue
                 if recorded!=bool(row.get("complete")):
-                    integrity.append(f"derived_marker_contradicts_cycle:{cycle}")
-                    slot["corrupt"]+=1
+                    _flag(slot,"corrupt",
+                          f"derived_marker_contradicts_cycle:{cycle}")
                     continue
                 if row.get("complete"):
                     attributed+=1
@@ -2243,16 +2305,14 @@ class DatabaseManager:
                 # observation set is empty and it cannot emit a miss row at all. A
                 # row attached to this marker is therefore writer drift, direct
                 # insertion, or corruption -- exactly what this layer exists for.
-                integrity.append(
-                    f"miss_row_unsupported_by_derived_completeness:{cycle}")
-                slot["unsupported"]+=1
+                _flag(slot,"unsupported",
+                      f"miss_row_unsupported_by_derived_completeness:{cycle}")
                 continue
             if not provenance:
                 # Supplied-empty provenance with a miss row attached is
                 # contradictory: compare_shadow cannot attribute anything with no
                 # observed feed, so it would never have written this row.
-                integrity.append(f"miss_row_with_empty_provenance:{cycle}")
-                slot["corrupt"]+=1
+                _flag(slot,"corrupt",f"miss_row_with_empty_provenance:{cycle}")
                 continue
             if feed_observation_valid(str(media_type),provenance):
                 attributed+=1
@@ -2262,9 +2322,8 @@ class DatabaseManager:
                 # whose own feed was not observed, so this row should not exist.
                 # Dropping it quietly is exactly the fail-open that was supposed
                 # to have been removed.
-                integrity.append(
-                    f"miss_row_unsupported_by_provenance:{cycle}:{media_type}")
-                slot["unsupported"]+=1
+                _flag(slot,"unsupported",
+                      f"miss_row_unsupported_by_provenance:{cycle}:{media_type}")
         # Orphan rows are invisible to the join above, and the declared foreign
         # key is not proof they cannot exist: this connection does not enable
         # PRAGMA foreign_keys, so it is not enforced.
@@ -2295,32 +2354,22 @@ class DatabaseManager:
             elif stored!=total:
                 integrity.append(
                     f"count_row_disagreement:{cycle}:{stored}!={total}")
-        # BACKSTOP. Every nonzero unsupported/corrupt bucket must have produced at
-        # least one integrity finding. Twice now a branch incremented a diagnostic
-        # bucket and then fell off the end without reporting anything, and both
-        # times a test certified the silence as correct. This makes that class of
-        # mistake structurally impossible: if a future branch forgets, the gate
-        # blocks with an explicit marker naming the cycle rather than quietly
-        # reporting zero.
-        for cycle,slot in per_cycle.items():
-            unreported=slot["unsupported"]+slot["corrupt"]
-            # The orphan clause that used to sit here was removed on peer-review
-            # instruction: orphan rows never enter per_cycle at all (the miss
-            # query inner-joins, orphans are found separately by NOT EXISTS), so
-            # a global orphan count can never legitimately prove that a specific
-            # cycle's bucket was reported -- it could only suppress this check by
-            # numeric coincidence.
-            #
-            # KNOWN LIMITATION, recorded because the previous comment here
-            # overstated it. This is still string association, not structural
-            # accounting: one reported finding for a cycle satisfies the check
-            # for any number of unreported bad rows in that same cycle. Round 6
-            # replaces it with per-bucket reported counters. Readiness stays
-            # fail-closed either way, because any masking finding is itself in
-            # the blocking list.
-            if unreported and not any(f.endswith(cycle) or f":{cycle}:" in f
-                                      for f in integrity):
-                integrity.append(f"unreported_unsupported_rows:{cycle}:{unreported}")
+        # RECONCILIATION, round 6. Every row counted into a diagnostic bucket must
+        # have produced its own finding. Twice a branch incremented a bucket and
+        # fell off the end reporting nothing, and both times a test certified the
+        # silence as correct.
+        #
+        # WHAT CHANGED FROM ROUND 5. The previous version asked whether ANY
+        # integrity finding mentioned the cycle. That is string association, not
+        # accounting: one finding satisfied the check for any number of unreported
+        # bad rows in the same cycle, and a test could pass with the backstop
+        # deleted. Now each bucket is compared against its own reported counter,
+        # so the check is per bucket, per cycle, and reports the exact shortfall.
+        #
+        # This can only fire if a future branch increments a bucket without going
+        # through _flag, which is precisely the mistake being guarded. Readiness
+        # stays fail-closed: any finding here is in the blocking list.
+        integrity.extend(reconcile_bucket_reporting(per_cycle))
         # Pre-attribution rows cannot be re-derived at all: nothing recorded
         # which feed succeeded, and they carry no media_type to attribute. They
         # are bounded CONSERVATIVELY -- counted only when both normal feeds
