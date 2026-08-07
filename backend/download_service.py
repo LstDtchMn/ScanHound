@@ -18,6 +18,10 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 
 from backend.database import DatabaseManager
+from backend.source_identity import (
+    source_kind as _shared_source_kind,
+    url_matches_domain as _shared_url_matches_domain,
+)
 from backend.config import source_enabled
 from backend.hdencode_coordinator import (
     HDEncodeTrafficDenied,
@@ -96,6 +100,11 @@ _DDLBASE_SHORTLINK_DOMAINS = (
 )
 # Only these domains go through the automated cuttlinks resolution flow
 _AUTOMATABLE_SHORTLINK_DOMAINS = ("cuty.io", "cuttlinks.com")
+#: The narrower question of which direct hosts the downloader can hand off, as
+#: distinct from identity. Kept separate on purpose -- "is this a direct file host"
+#: and "can we send it to JDownloader" are different questions -- but a test asserts
+#: this stays a SUBSET of source_identity.DIRECT_FILE_HOSTS so the two lists cannot
+#: drift apart again, which is what peer review found had already happened.
 _SUPPORTED_DOWNLOAD_HOSTS = (
     "1fichier.com",
     "rapidgator.net",
@@ -107,30 +116,33 @@ _SUPPORTED_DOWNLOAD_HOSTS = (
 def _url_matches_domain(url: str, domains: tuple) -> bool:
     """Check a URL's parsed hostname against one or more registrable domains.
 
-    Path and query text must never influence source routing.  ``hostname`` also
-    strips credentials and ports, unlike a raw ``netloc`` comparison.
+    Delegates to the shared implementation so hostname parsing cannot diverge
+    between the two modules that classify sources.
     """
-    try:
-        raw = (url or "").strip()
-        parsed = urlparse(raw if "://" in raw else "https://" + raw)
-        host = (parsed.hostname or "").lower().rstrip(".")
-        return any(host == d or host.endswith("." + d) for d in domains)
-    except Exception:
-        return False
+    return _shared_url_matches_domain(url, domains)
 
 
-def _source_page_kind(url: str) -> str:
-    """Classify a source-page URL using only its hostname.
+def _source_page_kind(url: str, hdencode_host: str = "hdencode.org") -> str:
+    """Classify a source-page URL. Delegates to the ONE shared classifier.
 
-    ``scrape_links`` historically treats every page that is not DDLBase or
-    Adit-HD as the HDEncode/default path.  Keep that compatibility while making
-    the decision once and reusing it for both gating and dispatch.
+    UNIFIED 2026-08-07 on peer review. This used to default every page that was not
+    DDLBase or Adit-HD to ``"hdencode"``. That decided three things:
+
+      * whether the request goes through the HDEncode traffic coordinator;
+      * whether the HDEncode off switch refuses it;
+      * whether its scrape outcome is recorded against HDEncode's health.
+
+    All three were therefore being applied to direct file-host URLs, which the batch
+    API accepts. Each is a CORRECTION rather than a regression: a Rapidgator link
+    should not consume HDEncode's rate budget, should not be refused when HDEncode is
+    switched off, and should not pollute HDEncode's scrape statistics. Direct hosts
+    already bypass ``scrape_links`` entirely, so dispatch is unaffected.
+
+    Returns a value from :data:`backend.source_identity.SOURCE_KINDS`, so callers
+    comparing against ``"hdencode"`` keep working and everything else is now named
+    instead of assumed.
     """
-    if _url_matches_domain(url, ("ddlbase.com",)):
-        return "ddlbase"
-    if _url_matches_domain(url, ("adit-hd.com",)):
-        return "adithd"
-    return "hdencode"
+    return _shared_source_kind(url, hdencode_host)
 
 
 def _challenge_iframe_signal(src: str) -> str:

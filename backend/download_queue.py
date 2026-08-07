@@ -41,70 +41,40 @@ def _parse(value: Optional[str]) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
-#: File hosts that appear as DIRECT download URLs. A batch may legitimately
-#: contain one of these instead of a source page, and it is not HDEncode.
-_DIRECT_FILE_HOSTS = (
-    "rapidgator.net", "1fichier.com", "nitroflare.com", "ddownload.com",
-    "katfile.com", "turbobit.net", "hitfile.net", "fikper.com", "frdl.io",
-    "uploady.io", "filestore.to", "clicknupload.to", "mega.nz",
-)
+from backend.source_identity import source_kind as _source_kind
 
 
-def _host_of(url: str) -> str:
-    try:
-        return (urlparse(url).hostname or "").lower().rstrip(".")
-    except Exception:
-        return ""
-
-
-def _matches(host: str, domain: str) -> bool:
-    domain = (domain or "").lower().rstrip(".")
-    return bool(domain) and (host == domain or host.endswith("." + domain))
+#: Queue-row source values, mapped from the shared identity kinds. The queue stores
+#: `filehost` where the shared module says `direct_file`, because that string is
+#: already in `download_queue_items.source` on this branch and the active unique
+#: index `(source, canonical_url, service_type)` is built on it.
+_KIND_TO_QUEUE_SOURCE = {
+    "hdencode": "hdencode",
+    "ddlbase": "ddlbase",
+    "adithd": "adithd",
+    "direct_file": "filehost",
+    "other": "other",
+}
 
 
 def _source(url: str, hdencode_host: str = "hdencode.org") -> str:
-    """Classify a download URL's source AFFIRMATIVELY.
+    """The durable queue row's source, from the ONE shared classifier.
 
-    THE DEFECT THIS FIXES, found by peer review in round 4. This used to be:
+    UNIFIED 2026-08-07 on peer review. This function and
+    `download_service._source_page_kind()` were deciding the same question
+    independently, and had already drifted: both originally defaulted everything
+    that was not DDLBase or Adit-HD to "hdencode", round 4 fixed only this one, and
+    their host lists differed as well. Two registries answering one question is how
+    that happened, so both now call `backend.source_identity.source_kind`.
 
-        if ddlbase -> "ddlbase"
-        if adit-hd -> "adithd"
-        return "hdencode"          # <-- everything else
-
-    So Rapidgator, 1fichier, Nitroflare, ddownload and any future host all became
-    "hdencode". That is a real production path -- `download_item()` supports direct
-    file-host URLs and the batch API accepts arbitrary download URLs. A mixed batch
-    could therefore store a direct-host row as source="hdencode", have it grouped
-    under an HDEncode pause, and -- once the refund began working -- let it
-    increment the counter that refunds HDEncode's retry budget.
-
-    My own mixed-batch test could not see it: it used DDLBase, one of the two hosts
-    the old function actually recognised.
-
-    Now every classification is affirmative:
-
-        the configured HDEncode host (default hdencode.org) -> "hdencode"
-        ddlbase / adit-hd                                   -> their own ids
-        a known direct file host                            -> "filehost"
-        anything else                                       -> "other"
-
-    Callers that gate HDEncode behaviour on `source == "hdencode"` -- the retry
-    availability check, the coordinator status shown in the UI, source-wide pause,
-    and the retry-budget refund -- therefore stop applying it to hosts that are not
-    HDEncode. That is the intended correction in every one of those cases.
+    What the old default cost: Rapidgator, 1fichier, Nitroflare, ddownload and any
+    future host were stored as `source="hdencode"`, so a direct-host row could be
+    grouped under an HDEncode pause and -- once the retry refund worked -- could
+    refund HDEncode's budget. My own mixed-batch test could not catch it because it
+    used DDLBase, one of the only two hosts the old function actually recognised.
     """
-    host = _host_of(url)
-    if not host:
-        return "other"
-    if _matches(host, "ddlbase.com"):
-        return "ddlbase"
-    if _matches(host, "adit-hd.com"):
-        return "adithd"
-    if _matches(host, _host_of(hdencode_host) or hdencode_host):
-        return "hdencode"
-    if any(_matches(host, d) for d in _DIRECT_FILE_HOSTS):
-        return "filehost"
-    return "other"
+    return _KIND_TO_QUEUE_SOURCE.get(
+        _source_kind(url, hdencode_host), "other")
 
 
 class DownloadQueueError(RuntimeError):
