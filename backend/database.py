@@ -2576,8 +2576,12 @@ class DatabaseManager:
             raw_listing_ok=row.get("listing_complete")
             if raw_listing_ok is None:
                 listing_ok=None
-            elif int(raw_listing_ok) in (0,1):
-                listing_ok=bool(int(raw_listing_ok))
+            elif raw_listing_ok in (0,1,True,False):
+                # Identity against the allowed values, NOT int() coercion. Round 5
+                # pointed out that int() accepts "1" and RAISES on "garbage" --
+                # taking readiness down with a ValueError instead of recording an
+                # evidence problem. SQLite affinity does not prevent stored text.
+                listing_ok=bool(raw_listing_ok)
             else:
                 problems.append(
                     f"listing_complete_invalid:{cycle}:{raw_listing_ok!r}")

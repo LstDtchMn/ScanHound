@@ -21,9 +21,15 @@ WHY THIS IS NOT AN UNBOUNDED RETRY LOOP — the thing to be suspicious of, since
 hammering a rate-limiting source is what caused the incident:
 
   * fruitless retries are capped, and the cap cannot exceed 10;
-  * every retry waits for the coordinator's cooldown, which escalates 1h -> 2h -> 4h
-    across consecutive stalls, so repeated attempts get further apart;
-  * only progress refunds the budget, and progress means items actually delivered.
+  * every retry waits for whatever cooldown the coordinator has stored;
+  * only real source progress refunds the budget -- and "real" means a delivery that
+    crossed the source boundary, not any completed row.
+
+NOT CLAIMED HERE: that the waits GROW. An earlier version of this docstring said the
+coordinator escalates 1h -> 2h -> 4h so repeated attempts get further apart. Peer
+review found `observe_reveal_success()` has no production call site and nothing in
+this branch drives the real coordinator, so that composition is unproven. The claim
+is withdrawn rather than restated.
 
 A batch that keeps making partial progress can retry indefinitely. That is intended
 and `test_progress_can_extend_retries_indefinitely` pins it, so it is a documented

@@ -837,6 +837,19 @@ class ScannerService:
                                     "warning",
                                 )
                                 break  # session can't clear the block this run
+                        else:
+                            # NOT a block: 500/502/504 and friends. Named in
+                            # round 4, still open in round 5, closed here. These
+                            # skip a page and used to leave the crawl reporting
+                            # "complete" -- so a partial listing could certify
+                            # itself as trustworthy resolution evidence. A page we
+                            # did not read is a page we cannot vouch for.
+                            self._last_crawl_page_errors += 1
+                            self._log(
+                                f"{source_name}: page returned "
+                                f"{resp.status_code}; listing is incomplete",
+                                "warning",
+                            )
                         continue
                     blocked_streak = 0  # coordinator reset the global streak
 
