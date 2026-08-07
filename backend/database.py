@@ -2458,6 +2458,145 @@ class DatabaseManager:
             "latest":dict(latest) if latest is not None else None,
         }
 
+    def get_hdencode_miss_resolution(self):
+        """Classify every recorded miss as acquired / never acquired / unresolved.
+
+        PER-FEED AUTHORITY, restored 2026-08-07 on peer review. The first version
+        sourced misses with `WHERE c.normal_feeds_complete = 1` and admitted
+        observation cycles on the same condition. That is the CYCLE-LEVEL rule
+        this project spent five review rounds replacing. compare_shadow emits a
+        miss when the feed responsible for THAT release was observed -- so a movie
+        miss is legitimately recorded in a cycle where movies_all validated and
+        tv_all failed, i.e. with normal_feeds_complete = 0. My filter dropped
+        exactly those rows out of the gate: a real movie gap stopped blocking
+        because an unrelated TV feed had failed. That was a false-ready path.
+
+        Now both halves use `feed_observation_valid`, the same predicate that
+        governs miss creation:
+
+          * a miss is ADMITTED if its own feed was observed in its source cycle;
+          * a later cycle may RESOLVE it only if that cycle observed its feed.
+
+        Rows whose source cycle predates per-feed provenance keep the older,
+        conservative cycle-complete rule -- there is nothing finer to use.
+
+        Malformed evidence is reported, never silently skipped: dropping a cycle
+        because its JSON will not parse can remove the only observation after a
+        miss, which would quietly turn a decidable row into an unresolved one.
+        """
+        from backend.hdencode_shadow import (
+            feed_observation_valid, summarise_miss_resolutions,
+        )
+
+        def _at(value):
+            """ISO -> aware UTC datetime, or None. Never raises."""
+            try:
+                parsed=datetime.datetime.fromisoformat(str(value))
+            except (TypeError,ValueError):
+                return None
+            if parsed.tzinfo is None:
+                parsed=parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
+
+        def _urlset(value,label,cycle,problems):
+            """A URL container, or a recorded problem. `set(5)` would raise."""
+            if value is None:
+                return set()
+            if isinstance(value,(str,bytes)) or not isinstance(value,(list,tuple,set)):
+                problems.append(f"{label}_not_a_list:{cycle}:{type(value).__name__}")
+                return None
+            return {str(v) for v in value}
+
+        problems=[]
+        cycles=[]
+        for row in self._query_dicts(
+                "SELECT cycle_uuid, completed_at, outcome, normal_feeds_complete, "
+                "       rss_requests, listing_requests, details_json, "
+                "       normal_feed_outcomes "
+                "FROM hdencode_shadow_cycles "
+                "WHERE details_json IS NOT NULL ORDER BY completed_at",
+                default=[]):
+            cycle=str(row.get("cycle_uuid") or "")
+            if not (row.get("outcome") in ("success","relevant_miss")
+                    and int(row.get("rss_requests") or 0)>0
+                    and int(row.get("listing_requests") or 0)>0):
+                continue
+            at=_at(row.get("completed_at"))
+            if at is None:
+                problems.append(f"cycle_completed_at_unparseable:{cycle}")
+                continue
+            try:
+                details=json.loads(row.get("details_json") or "{}")
+            except (TypeError,ValueError):
+                problems.append(f"details_json_unparseable:{cycle}")
+                continue
+            if not isinstance(details,dict):
+                problems.append(f"details_json_not_an_object:{cycle}")
+                continue
+            listing=_urlset(details.get("listing_only"),"listing_only",cycle,problems)
+            feed=_urlset(details.get("feed_only"),"feed_only",cycle,problems)
+            if listing is None or feed is None:
+                continue
+            outcomes=self._normal_feed_outcomes(row, cycle, problems)
+            cycles.append({"at":at,"listing_only":listing,"feed_only":feed,
+                           "outcomes":outcomes,
+                           "cycle_complete":bool(row.get("normal_feeds_complete"))})
+
+        misses=[]
+        for row in self._query_dicts(
+                "SELECT m.canonical_url AS url, m.media_type AS media_type, "
+                "       c.cycle_uuid AS cycle_uuid, c.completed_at AS at, "
+                "       c.normal_feeds_complete AS complete, "
+                "       c.normal_feed_outcomes AS provenance "
+                "FROM hdencode_shadow_misses m "
+                "JOIN hdencode_shadow_cycles c ON c.cycle_uuid=m.cycle_uuid",
+                default=[]):
+            cycle=str(row.get("cycle_uuid") or "")
+            media_type=row.get("media_type")
+            source_outcomes=self._normal_feed_outcomes(row, cycle, problems)
+            if source_outcomes is None:
+                # Pre-provenance row: fall back to the conservative cycle rule.
+                admitted=bool(row.get("complete"))
+            else:
+                # NULL media_type is a pre-attribution legacy row, not a
+                # movie: read it as "unknown", which requires both feeds.
+                admitted=feed_observation_valid(
+                    str(media_type) if media_type is not None else "unknown",
+                    source_outcomes)
+            if not admitted:
+                continue
+            misses.append({"url":row.get("url"),"media_type":media_type,
+                           "at":_at(row.get("at"))})
+        summary=summarise_miss_resolutions(misses,cycles)
+        summary["evidence_problems"]=problems
+        return summary
+
+    def _normal_feed_outcomes(self, row, cycle, problems):
+        """Parse a cycle's per-feed outcome map. None means 'not recorded'.
+
+        Distinguishes "this cycle predates provenance" (None -> caller falls back
+        to the cycle-level rule) from "provenance is present but unreadable"
+        (recorded as a problem, treated as no observation) -- because silently
+        reading corrupt provenance as an empty map would make every miss look
+        unobservable, which is not the same thing as absent.
+        """
+        raw=row.get("provenance") if "provenance" in row else row.get("normal_feed_outcomes")
+        if raw is None:
+            return None
+        try:
+            parsed=json.loads(raw or "{}")
+        except (TypeError,ValueError):
+            problems.append(f"normal_feed_outcomes_unparseable:{cycle}")
+            return {}
+        if not isinstance(parsed,dict):
+            problems.append(f"normal_feed_outcomes_not_an_object:{cycle}")
+            return {}
+        if "_derived_from" in parsed:
+            # A cycle-level fallback marker, deliberately not fabricated feed
+            # outcomes. It cannot validate any specific feed.
+            return {}
+        return {str(k):str(v) for k,v in parsed.items()}
+
     def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180):
         required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days)); summary=self.get_hdencode_shadow_summary()
         first=summary.get("first_completed_at"); last=summary.get("last_completed_at"); observed_days=0.0
@@ -2481,7 +2620,36 @@ class DatabaseManager:
         reasons=[]
         if summary["successful_cycles"]<required_cycles: reasons.append("insufficient_comparison_cycles")
         if observed_days<required_days: reasons.append("insufficient_observation_days")
-        if summary["relevant_misses"]>0: reasons.append("relevant_misses_detected")
+        # THE MISS RULE, changed 2026-08-07 on Jesse's decision. This used to be
+        # `if summary["relevant_misses"] > 0`, which blocked on ANY listing-only
+        # observation ever recorded. That could never pass: 99 of 100 such
+        # releases were acquired anyway, median about an hour, all via the normal
+        # feeds, so the gate treated ordinary polling latency as permanent
+        # coverage loss and RSS would have stayed in shadow mode indefinitely.
+        #
+        # Now only a release that was NEVER acquired counts, with no deadline.
+        # UNDETERMINED rows -- ones that left the listing without ever appearing
+        # in the feed -- still block, because "cannot be proven either way" is not
+        # evidence of health, and calling it health is the fail-open shape that
+        # produced two HIGH findings in this same subsystem.
+        resolution=self.get_hdencode_miss_resolution()
+        if int(resolution.get("never_acquired") or 0)>0:
+            reasons.append("unacquired_misses_detected")
+        if int(resolution.get("undetermined") or 0)>0:
+            reasons.append("miss_resolution_undetermined")
+        # PENDING BLOCKS, reversed 2026-08-07 on peer review. I had excluded
+        # not_yet_assessable so the gate could pass. The review showed why that is
+        # unsafe rather than merely optimistic: the shadow comparison is recorded
+        # only while discovery_mode == "rss_shadow", so promoting to rss_primary
+        # stops producing the very observations a pending row needs. The gate
+        # would open on evidence its own promoted mode destroys.
+        if int(resolution.get("not_yet_assessable") or 0)>0:
+            reasons.append("miss_resolution_pending")
+        # Unreadable evidence is not the same as clean evidence. Skipping a
+        # malformed cycle can remove the only observation after a miss, so it is
+        # reported rather than absorbed.
+        if resolution.get("evidence_problems"):
+            reasons.append("miss_resolution_evidence_unreadable")
         # An integrity failure is not "zero misses". Malformed provenance, a
         # count that disagrees with the rows on disk, a nonzero count with no
         # rows, or a miss row filed against supplied-empty provenance all mean
@@ -2493,7 +2661,7 @@ class DatabaseManager:
         if summary["request_reduction_pct"]<=0: reasons.append("request_reduction_not_proven")
         if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
         if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")
-        return {"ready":not reasons,"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
+        return {"ready":not reasons,"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"misses_acquired":int(resolution.get("acquired") or 0),"misses_never_acquired":int(resolution.get("never_acquired") or 0),"misses_undetermined":int(resolution.get("undetermined") or 0),"misses_not_yet_assessable":int(resolution.get("not_yet_assessable") or 0),"miss_evidence_problems":list(resolution.get("evidence_problems") or []),"worst_acquisition_lag_hours":resolution.get("worst_acquisition_lag_hours"),"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
 
     # ── HDEncode candidate actions ─────────────────────────────────────
 
