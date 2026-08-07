@@ -1138,37 +1138,49 @@ class DownloadQueueService:
         recognised = int(counts["reason_recognised"] or 0)
         unknown = int(counts["unknown_outcome"] or 0)
 
+        # REPORT EVERY FAILED PREDICATE, not one cause chosen by precedence.
+        #
+        # THE DEFECT THIS FIXES, raised by peer review. This was an if/elif chain,
+        # so a batch whose rows had BOTH a cooldown mismatch AND
+        # operation_timeout_unknown was reported as a cooldown problem only. But
+        # matching the timestamps would not make those rows safe to retry -- they
+        # are excluded deliberately because a retry could double-submit a delivery
+        # that already happened. The diagnostic hid the safety-critical reason and
+        # sent the reader to fix the wrong thing, which is the exact failure class
+        # this method exists to prevent.
+        causes = []
         if matched == 0:
-            cause = (
+            causes.append(
                 "no deferred item carries the batch's cooldown timestamp "
                 f"({batch.get('cooldown_until')!r}), so the eligibility check "
-                "cannot see any of them. This usually means the batch cooldown "
-                "was changed without changing the items. THE BATCH WILL NEVER "
-                "RESUME ON ITS OWN until they match."
-            )
-        elif recognised == 0:
-            cause = (
-                "every deferred item carries a queue_reason the resume path "
-                "does not recognise (it accepts only 'interactive_challenge' "
-                "and 'source_deferred')."
-            )
-        elif unknown >= deferred:
-            cause = (
-                "every deferred item ended in an unknown execution state "
-                "(operation_timeout_unknown / interrupted_unknown_outcome), "
-                "which is excluded deliberately: retrying could double-submit "
-                "a delivery that already happened. These need adjudicating by "
-                "hand, not resuming."
-            )
-        else:
-            cause = (
-                f"{deferred} deferred item(s), {matched} with a matching "
-                f"cooldown, {recognised} with a recognised queue_reason, "
-                f"{unknown} in an unknown execution state -- no single item "
-                "satisfies all three conditions at once."
-            )
+                "cannot see any of them -- usually because the batch cooldown was "
+                "changed without changing the items. THE BATCH WILL NEVER RESUME "
+                "ON ITS OWN until they match; this is permanent, not transient")
+        if recognised == 0:
+            causes.append(
+                "no deferred item carries a queue_reason the resume path accepts "
+                "(only 'interactive_challenge' and 'source_deferred')")
+        if unknown:
+            # Reported whenever ANY row is affected, not only when all are, and
+            # never suppressed by another cause.
+            causes.append(
+                f"{unknown} of {deferred} deferred item(s) ended in an unknown "
+                "execution state (operation_timeout_unknown / "
+                "interrupted_unknown_outcome). Those are excluded deliberately: a "
+                "retry could double-submit a delivery that already happened. They "
+                "need adjudicating by hand, and fixing anything else will not make "
+                "them resumable")
+        if not causes:
+            causes.append(
+                "each condition is satisfied by some row, but no single row "
+                "satisfies all of them at once")
+
         logger.warning(
-            "Batch %s is due to auto-resume but cannot: %s", batch_uuid, cause,
+            "Batch %s is due to auto-resume but cannot. Predicates: deferred=%d "
+            "cooldown_match=%d recognised_reason=%d unknown_outcome=%d. "
+            "Cause(s): %s",
+            batch_uuid, deferred, matched, recognised, unknown,
+            "; ".join(causes),
         )
 
     def _maybe_auto_resume(self) -> None:
