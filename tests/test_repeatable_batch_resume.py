@@ -73,16 +73,39 @@ def _pause(db, service, batch_uuid):
         service._refresh_batch_locked(conn, batch_uuid, STAMP)
 
 
-def _complete_one(db, batch_uuid):
-    """Simulate a delivery, which is what makes a resume 'fruitful'."""
+def _outcome(method, *, transport=True):
+    """An outcome dict shaped like the real one public_download_result emits."""
+    return {"success": True, "method": method, "link_count": 1,
+            "message": "x", "reason_code": "", "stage": "download",
+            "retryable": False, "retry_mode": "none",
+            "transport_attempted": transport, "affected_scope": "item",
+            "action_code": "", "signals": []}
+
+
+def _complete_one(db, service, batch_uuid, method="jdownloader", transport=True):
+    """Complete an item through the REAL production path.
+
+    THE FIXTURE DEFECT THIS REPLACES, named by peer review. The old helper wrote
+    `state='completed'` straight into the row, so it could not tell a real source
+    delivery from a pre-scrape duplicate -- which is exactly the distinction the
+    refund depends on. It certified the proxy, not the property. Now it goes
+    through `_complete`, so the outcome's method and transport flag decide whether
+    the source counter moves, as in production.
+    """
     with db.transaction() as conn:
         row = conn.execute(
-            "SELECT item_uuid FROM download_queue_items WHERE batch_uuid=? "
-            "AND state != 'completed' LIMIT 1", (batch_uuid,)).fetchone()
+            "SELECT * FROM download_queue_items WHERE batch_uuid=? "
+            "AND state NOT IN ('completed','cancelled') LIMIT 1",
+            (batch_uuid,)).fetchone()
         assert row is not None, "no item left to complete; widen the fixture"
-        conn.execute(
-            "UPDATE download_queue_items SET state='completed', updated_at=? "
-            "WHERE item_uuid=?", (STAMP, row["item_uuid"]))
+        item = dict(row)
+        # _complete requires the row to be claimed BY THIS WORKER; without
+        # claimed_by it logs "ignored stale completion" and changes nothing, which
+        # would make these tests pass for the wrong reason.
+        conn.execute("UPDATE download_queue_items SET state='claimed', "
+                     "claimed_by=? WHERE item_uuid=?",
+                     (service.worker_id, item["item_uuid"]))
+    service._complete(item, _outcome(method, transport=transport))
 
 
 def _state(service, batch_uuid):
@@ -164,7 +187,7 @@ class TestProgressRefundsTheBudget:
             service._maybe_auto_resume()
             assert _state(service, uuid)[1] == 1
 
-            _complete_one(db, uuid)            # the resume delivered something
+            _complete_one(db, service, uuid)            # the resume delivered something
             _pause(db, service, uuid)
             with caplog.at_level(logging.INFO):
                 service._maybe_auto_resume()
@@ -194,7 +217,7 @@ class TestProgressRefundsTheBudget:
                 assert _state(service, uuid)[0] != "paused_source", (
                     "each cycle delivered an item, so each resume must be "
                     "permitted even with a budget of 1")
-                _complete_one(db, uuid)
+                _complete_one(db, service, uuid)
         finally:
             db.close()
 
@@ -252,5 +275,180 @@ class TestTheConfigIsSane:
             cols = [r["name"] for r in db._query_dicts(
                 "PRAGMA table_info(download_queue_batches)", default=[])]
             assert "auto_resume_progress_mark" in cols, cols
+        finally:
+            db.close()
+
+
+class TestOnlyRealSourceProgressRefundsTheBudget:
+    """THE HIGH BLOCKER from peer review, and why the old test could not see it.
+
+    #51 refunded the retry budget whenever the batch's count of `completed` items
+    grew, and its own text claimed "progress means items actually delivered". That
+    is not what `completed` means. `download_item()` deduplicates BEFORE scraping:
+    if the release is already grabbed it returns success with method='duplicate'
+    having contacted nothing. So a batch could earn another automatic retry against
+    a throttling source purely because an item was already satisfied elsewhere.
+
+    The old fixture wrote `state='completed'` directly, so it certified the proxy
+    rather than the property. These go through the real `_complete`.
+    """
+
+    def test_a_real_delivery_refunds(self, tmp_path):
+        db = DatabaseManager(str(tmp_path / "real.db"))
+        try:
+            service, uuid = _rig(db, config={
+                "download_queue_auto_resume_max_attempts": 2})
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            assert _state(service, uuid)[1] == 1
+            _complete_one(db, service, uuid, method="jdownloader")
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            assert _state(service, uuid)[1] == 1, (
+                "a genuine source delivery must restore the budget")
+        finally:
+            db.close()
+
+    def test_an_exact_duplicate_does_NOT_refund(self, tmp_path):
+        """The counterexample the review supplied. Nothing reached HDEncode."""
+        db = DatabaseManager(str(tmp_path / "dupe.db"))
+        try:
+            service, uuid = _rig(db, config={
+                "download_queue_auto_resume_max_attempts": 2})
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            _complete_one(db, service, uuid, method="duplicate", transport=False)
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            assert _state(service, uuid)[1] == 2, (
+                "a pre-scrape duplicate proves nothing about the source and must "
+                "not buy another retry")
+        finally:
+            db.close()
+
+    def test_duplicate_similar_does_NOT_refund(self, tmp_path):
+        db = DatabaseManager(str(tmp_path / "dupesim.db"))
+        try:
+            service, uuid = _rig(db, config={
+                "download_queue_auto_resume_max_attempts": 2})
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            _complete_one(db, service, uuid, method="duplicate_similar",
+                          transport=False)
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            assert _state(service, uuid)[1] == 2
+        finally:
+            db.close()
+
+    def test_a_completion_without_transport_does_not_refund(self, tmp_path):
+        """Belt and braces: even an unrecognised method must not count when the
+        outcome says transport never happened, so a future short-circuit that
+        forgets to name itself is still handled."""
+        db = DatabaseManager(str(tmp_path / "notransport.db"))
+        try:
+            service, uuid = _rig(db, config={
+                "download_queue_auto_resume_max_attempts": 2})
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            _complete_one(db, service, uuid, method="some_future_shortcut",
+                          transport=False)
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            assert _state(service, uuid)[1] == 2
+        finally:
+            db.close()
+
+    def test_the_predicate_itself(self):
+        """Direct coverage, so a wiring change cannot hide a semantics change."""
+        assert DownloadQueueService.is_source_delivery(
+            {"method": "jdownloader", "transport_attempted": True})
+        for bad in ({"method": "duplicate", "transport_attempted": True},
+                    {"method": "duplicate_similar", "transport_attempted": True},
+                    {"method": "", "transport_attempted": True},
+                    {"method": "jdownloader", "transport_attempted": False},
+                    {"method": "jdownloader"}, {}):
+            assert not DownloadQueueService.is_source_delivery(bad), bad
+
+
+class TestMigratedBatchesGetNoFreeCredit:
+    """MEDIUM from review: the additive column left every existing batch with a
+    progress mark of 0, so an old batch with historical completions satisfied
+    `completed > 0` and earned an extra resume even at max_attempts=1 -- making the
+    claim "1 restores the previous behaviour exactly" false for migrated batches.
+
+    Keying the refund on `source_delivery_count` fixes it by construction: counter
+    and mark both start at 0, so `0 > 0` is false and no history is inferred.
+    """
+
+    def test_an_old_batch_with_completions_gets_no_extra_resume(self, tmp_path):
+        db = DatabaseManager(str(tmp_path / "migrated.db"))
+        try:
+            service, uuid = _rig(db, count=6, config={
+                "download_queue_auto_resume_max_attempts": 1})
+            with db.transaction() as conn:
+                for row in conn.execute(
+                        "SELECT item_uuid FROM download_queue_items "
+                        "WHERE batch_uuid=? LIMIT 3", (uuid,)).fetchall():
+                    conn.execute(
+                        "UPDATE download_queue_items SET state='completed' "
+                        "WHERE item_uuid=?", (row["item_uuid"],))
+                conn.execute(
+                    "UPDATE download_queue_batches SET source_delivery_count=0, "
+                    "auto_resume_progress_mark=0 WHERE batch_uuid=?", (uuid,))
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            assert _state(service, uuid)[1] == 1
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            assert _state(service, uuid)[0] == "paused_source", (
+                "max_attempts=1 must restore the old behaviour EXACTLY, including "
+                "for a migrated batch that already had completed rows")
+        finally:
+            db.close()
+
+
+class TestAnExhaustedBudgetIsVisible:
+    """MEDIUM combined-set blocker: #51 created a new terminal automatic state that
+    the eligibility query filters out, so it never reaches #47's diagnostic. The
+    tests said "stop and wait for a human"; nothing told the human."""
+
+    def test_exhaustion_warns_once_naming_the_batch(self, tmp_path, caplog):
+        db = DatabaseManager(str(tmp_path / "exhausted.db"))
+        try:
+            service, uuid = _rig(db, config={
+                "download_queue_auto_resume_max_attempts": 1})
+            _pause(db, service, uuid)
+            service._maybe_auto_resume()
+            _pause(db, service, uuid)
+            with caplog.at_level(logging.WARNING):
+                service._maybe_auto_resume()
+            msgs = [r.getMessage() for r in caplog.records
+                    if r.levelno >= logging.WARNING]
+            assert any(uuid in m and "auto_resume_budget_exhausted" in m
+                       for m in msgs), msgs
+            assert any("will NOT retry on its own" in m for m in msgs)
+
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                service._maybe_auto_resume()
+                service._maybe_auto_resume()
+            assert not [r for r in caplog.records
+                        if r.levelno >= logging.WARNING], (
+                "it must warn once, not on every worker poll")
+        finally:
+            db.close()
+
+    def test_a_healthy_batch_does_not_warn(self, tmp_path, caplog):
+        """NEGATIVE CONTROL: a batch with budget left must stay quiet."""
+        db = DatabaseManager(str(tmp_path / "healthy.db"))
+        try:
+            service, uuid = _rig(db, config={
+                "download_queue_auto_resume_max_attempts": 3})
+            _pause(db, service, uuid)
+            with caplog.at_level(logging.WARNING):
+                service._maybe_auto_resume()
+            assert not [r for r in caplog.records
+                        if r.levelno >= logging.WARNING]
         finally:
             db.close()

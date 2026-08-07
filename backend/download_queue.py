@@ -882,6 +882,17 @@ class DownloadQueueService:
                     item.get("item_uuid"),
                 )
                 return False
+            # REAL SOURCE PROGRESS, recorded separately from 'completed'.
+            # A pre-scrape dedup returns success without contacting the source, so
+            # counting completions would refund retry budget the source never
+            # earned. See is_source_delivery().
+            if self.is_source_delivery(outcome):
+                conn.execute(
+                    "UPDATE download_queue_batches "
+                    "SET source_delivery_count = source_delivery_count + 1 "
+                    "WHERE batch_uuid = ?",
+                    (item["batch_uuid"],),
+                )
             self._refresh_batch_locked(conn, item["batch_uuid"], now)
         self._emit(
             "download:queue_updated",
@@ -1092,13 +1103,100 @@ class DownloadQueueService:
             value = 3
         return max(1, min(10, value))
 
-    def _completed_count(self, conn, batch_uuid: str) -> int:
+    #: Completion methods that do NOT prove the source served anything.
+    #: download_item() returns success with these BEFORE scraping, when the
+    #: release (or a same/lower-quality copy) was already grabbed by another
+    #: route -- so HDEncode was never contacted.
+    _NON_SOURCE_METHODS = frozenset({"", "duplicate", "duplicate_similar"})
+
+    @classmethod
+    def is_source_delivery(cls, outcome: dict) -> bool:
+        """Did this completion actually cross the source boundary?
+
+        THE DEFECT THIS REPLACES, found by peer review. #51 refunded retry budget
+        whenever the batch's COUNT of completed items grew, and its own text
+        claimed "progress means items actually delivered". That is not what
+        `completed` means. `download_item()` deduplicates before scraping: if the
+        URL is already grabbed it returns success with method='duplicate' having
+        contacted nothing. So a batch could earn another automatic retry against a
+        throttling source purely because an item was already satisfied elsewhere.
+
+        Both conditions are required, deliberately:
+
+        * the method is not one of the pre-scrape dedup outcomes, and
+        * the outcome reports transport was attempted.
+
+        `transport_attempted` alone is not sufficient: `_complete` writes the
+        COLUMN as 1 unconditionally, so the persisted field cannot discriminate --
+        only the outcome dict can. The method check alone would also miss any
+        future short-circuit that forgets to name itself.
+        """
+        method = str((outcome or {}).get("method") or "").strip().lower()
+        if method in cls._NON_SOURCE_METHODS:
+            return False
+        return bool((outcome or {}).get("transport_attempted"))
+
+    def _source_delivery_count(self, conn, batch_uuid: str) -> int:
         row = conn.execute(
-            "SELECT COUNT(*) AS n FROM download_queue_items "
-            "WHERE batch_uuid = ? AND state = 'completed'",
+            "SELECT source_delivery_count AS n FROM download_queue_batches "
+            "WHERE batch_uuid = ?",
             (batch_uuid,),
         ).fetchone()
         return int((row["n"] if row is not None else 0) or 0)
+
+    def _warn_exhausted_batches(self, now) -> None:
+        """A batch that has spent its automatic budget must SAY so, once.
+
+        THE DEFECT THIS CLOSES, raised by peer review as a combined-set blocker.
+        #47 exists because a due batch could stay parked forever without saying
+        why. #51 then created a NEW terminal automatic state -- paused, resume
+        enabled, budget spent, no fresh source progress -- and that state is
+        filtered out by the eligibility query itself, so it never reaches #47's
+        diagnostic. The tests said the batch should "stop and wait for a human";
+        nothing told the human. That recreates the invisibility #47 removes, just
+        after three attempts instead of one.
+
+        Warned once per batch per process. A persisted marker would survive
+        restarts, but this deliberately avoids another schema column and another
+        write on the polling path; the tradeoff is that a restart can re-warn.
+        """
+        if not hasattr(self, "_exhausted_warned"):
+            self._exhausted_warned = set()
+        maximum = self._auto_resume_max_attempts()
+        for row in self.db._query_dicts(
+            """
+            SELECT batch_uuid, auto_resume_used, cooldown_until,
+                   last_reason_code, source_delivery_count,
+                   auto_resume_progress_mark
+            FROM download_queue_batches
+            WHERE state = 'paused_source'
+              AND auto_resume_after_cooldown = 1
+              AND auto_resume_used >= ?
+              AND source_delivery_count <= auto_resume_progress_mark
+            """,
+            (maximum,), default=[],
+        ):
+            batch_uuid = str(row.get("batch_uuid") or "")
+            if batch_uuid in self._exhausted_warned:
+                continue
+            until = _parse(row.get("cooldown_until"))
+            if until is not None and until > now:
+                continue  # not yet due; nothing to report
+            deferred = self.db._query(
+                "SELECT COUNT(*) AS n FROM download_queue_items "
+                "WHERE batch_uuid = ? AND state IN "
+                "      ('waiting_source','verification_required')",
+                (batch_uuid,), one=True, default=None)
+            self._exhausted_warned.add(batch_uuid)
+            logger.warning(
+                "Batch %s has spent all %d automatic resume attempts without any "
+                "further source delivery and will NOT retry on its own. "
+                "%s item(s) remain deferred; last source reason %r. "
+                "Manual action is required: reason auto_resume_budget_exhausted.",
+                batch_uuid, maximum,
+                int((deferred["n"] if deferred else 0) or 0),
+                row.get("last_reason_code"),
+            )
 
     def _maybe_auto_resume(self) -> None:
         if self.db is None:
@@ -1134,10 +1232,7 @@ class DownloadQueueService:
               AND auto_resume_after_cooldown = 1
               AND (
                     auto_resume_used < ?
-                 OR (SELECT COUNT(*) FROM download_queue_items i
-                     WHERE i.batch_uuid = download_queue_batches.batch_uuid
-                       AND i.state = 'completed')
-                    > auto_resume_progress_mark
+                 OR source_delivery_count > auto_resume_progress_mark
               )
             ORDER BY created_at
             """,
@@ -1155,6 +1250,7 @@ class DownloadQueueService:
         # So the second clause above lets a batch that completed something since
         # its last automatic resume through regardless of the counter, and
         # _resume_batch then resets the counter and re-marks the baseline.
+        self._warn_exhausted_batches(now)
         for batch in batches:
             until = _parse(batch.get("cooldown_until"))
             if until is None or until > now:
@@ -1408,19 +1504,19 @@ class DownloadQueueService:
             used_delta = 1 if automated else 0
             reset_budget = False
             if automated:
-                completed_now = self._completed_count(conn, batch_uuid)
+                delivered_now = self._source_delivery_count(conn, batch_uuid)
                 prior = conn.execute(
                     "SELECT auto_resume_progress_mark AS mark "
                     "FROM download_queue_batches WHERE batch_uuid = ?",
                     (batch_uuid,),
                 ).fetchone()
                 mark = int((prior["mark"] if prior is not None else 0) or 0)
-                if completed_now > mark:
+                if delivered_now > mark:
                     reset_budget = True
                     logger.info(
-                        "Batch %s delivered %d item(s) since its last automatic "
-                        "resume; restoring its retry budget.",
-                        batch_uuid, completed_now - mark,
+                        "Batch %s recorded %d real source delivery(ies) since its "
+                        "last automatic resume; restoring its retry budget.",
+                        batch_uuid, delivered_now - mark,
                     )
             conn.execute(
                 """
@@ -1430,8 +1526,7 @@ class DownloadQueueService:
                     auto_resume_used = CASE WHEN ? THEN ? ELSE
                         auto_resume_used + ? END,
                     auto_resume_progress_mark = CASE WHEN ?
-                        THEN (SELECT COUNT(*) FROM download_queue_items
-                              WHERE batch_uuid = ? AND state = 'completed')
+                        THEN source_delivery_count
                         ELSE auto_resume_progress_mark END,
                     updated_at = ?
                 WHERE batch_uuid = ?
@@ -1442,7 +1537,6 @@ class DownloadQueueService:
                     used_delta,
                     used_delta,
                     1 if automated else 0,
-                    batch_uuid,
                     _iso(now),
                     batch_uuid,
                 ),

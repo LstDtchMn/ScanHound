@@ -1140,6 +1140,7 @@ class DatabaseManager:
                         -- that keeps making progress is not cut off after N
                         -- attempts. See _maybe_auto_resume.
                         auto_resume_progress_mark INTEGER NOT NULL DEFAULT 0,
+                        source_delivery_count INTEGER NOT NULL DEFAULT 0,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
                         paused_at TEXT,
@@ -1159,6 +1160,15 @@ class DatabaseManager:
                 for _batch_alter in (
                     "ALTER TABLE download_queue_batches "
                     "ADD COLUMN auto_resume_progress_mark INTEGER "
+                    "NOT NULL DEFAULT 0",
+                    # Incremented ONLY when a completion genuinely crossed the
+                    # source boundary -- see DownloadQueueService._complete.
+                    # Generic 'completed' cannot be used: download_item() returns
+                    # success with method='duplicate' BEFORE scraping when the
+                    # release was already grabbed, so counting completions would
+                    # refund retry budget for work the source never did.
+                    "ALTER TABLE download_queue_batches "
+                    "ADD COLUMN source_delivery_count INTEGER "
                     "NOT NULL DEFAULT 0",
                 ):
                     try:
