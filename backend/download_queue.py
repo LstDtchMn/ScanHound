@@ -1376,11 +1376,17 @@ class DownloadQueueService:
         # NOTE ON PACING, corrected 2026-08-07. An earlier version of this comment
         # claimed the coordinator's 1h -> 2h -> 4h escalation "composes with" this
         # budget so repeated retries spread out. That composition is NOT proven
-        # here and the claim is withdrawn: peer review found that
-        # observe_reveal_success() has no production call site, so the streak never
-        # resets, and no test in this branch exercises the real coordinator
-        # alongside the queue. What IS true is that fruitless retries are capped
-        # and each one waits for whatever cooldown the coordinator set.
+        # here and the claim is withdrawn: no test in this branch exercises the
+        # real coordinator alongside the queue. What IS true is that fruitless
+        # retries are capped and each one waits for whatever cooldown the
+        # coordinator set.
+        #
+        # UPDATED 2026-08-07: the half of that finding about
+        # observe_reveal_success() having no production call site is now FIXED --
+        # download_service calls it when HDEncode actually delivers file-host
+        # links, so the streak does reset on evidence of health. The composition
+        # claim stays withdrawn regardless, because it is still untested here, and
+        # "the mechanism now exists" is not the same as "the behaviour is proven".
         batches = self.db._query_dicts(
             """
             SELECT *
@@ -1663,11 +1669,17 @@ class DownloadQueueService:
             # delivering. Each retry still waits for whatever cooldown the
             # coordinator has stored, so it is not a tight loop.
             #
-            # NOT CLAIMED: that those waits GROW. Peer review pointed out that
-            # observe_reveal_success() has no production call site and no test here
-            # exercises the real coordinator alongside the queue, so the
-            # 1h -> 2h -> 4h composition is unproven. An earlier version of this
-            # comment asserted it; that claim is withdrawn.
+            # NOT CLAIMED: that those waits GROW. No test here exercises the real
+            # coordinator alongside the queue, so the 1h -> 2h -> 4h composition is
+            # unproven. An earlier version of this comment asserted it; that claim
+            # is withdrawn and stays withdrawn.
+            #
+            # The other half of that finding IS fixed as of 2026-08-07:
+            # observe_reveal_success() now has a production call site (see
+            # download_service, where HDEncode delivers file-host links), so the
+            # streak resets on evidence of health rather than only on a container
+            # restart. That makes the escalation dial behave as designed; it does
+            # not by itself prove the composition above.
             used_delta = 1 if automated else 0
             reset_budget = False
             if automated:

@@ -792,7 +792,21 @@ class TestScrapeLinksRouting:
 
 
 class TestScrapeLinksHDEncode:
-    """Test the default HDEncode scraping path."""
+    """Test the HDEncode scraping path.
+
+    THE URLS HERE WERE `hdencode.com`, WHICH IS NOT A REAL HOST -- production code
+    never mentions it. These tests reached the HDEncode scraper only through the
+    default-to-HDEncode fall-through that peer review round 7 required be removed,
+    so they were asserting HDEncode behaviour for a URL HDEncode does not own.
+
+    Two of the three did not even fail when the fall-through went away: they assert
+    `result == []`, and the new `unsupported_source` outcome is also empty, so they
+    passed for an entirely different reason than the one they were written for. Only
+    the third -- the one that asserts links are actually found -- broke, which is how
+    the wrong host was noticed at all.
+
+    Corrected to `hdencode.org`, the configured default.
+    """
 
     @patch("backend.download_service._ensure_selenium")
     @patch("backend.download_service._WebDriverWait")
@@ -823,7 +837,7 @@ class TestScrapeLinksHDEncode:
 
         from bs4 import BeautifulSoup as RealBS
         with patch("bs4.BeautifulSoup", side_effect=lambda html, parser: RealBS(html, parser)):
-            result = svc.scrape_links("http://hdencode.com/movie123", "Rapidgator")
+            result = svc.scrape_links("http://hdencode.org/movie123", "Rapidgator")
 
         assert len(result) == 2
         assert all("rapidgator" in link for link in result)
@@ -845,7 +859,7 @@ class TestScrapeLinksHDEncode:
         # CSS fallback also fails
         mock_driver.find_element.side_effect = Exception("not found")
 
-        result = svc.scrape_links("http://hdencode.com/movie123", "Rapidgator")
+        result = svc.scrape_links("http://hdencode.org/movie123", "Rapidgator")
         assert result == []
 
     @patch("backend.download_service._ensure_selenium")
@@ -859,7 +873,7 @@ class TestScrapeLinksHDEncode:
         mock_driver.title = "ok"
         mock_driver.get.side_effect = RuntimeError("nav fail")
 
-        result = svc.scrape_links("http://hdencode.com/movie123", "Rapidgator")
+        result = svc.scrape_links("http://hdencode.org/movie123", "Rapidgator")
         assert result == []
 
 

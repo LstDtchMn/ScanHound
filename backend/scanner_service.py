@@ -388,6 +388,26 @@ class ScannerService:
             self._item_counter = 0
         self._last_crawl_seen_urls = set()
         self._last_crawl_request_count = 0
+        # RESET THE WHOLE CRAWL-AUTHORITY STATE HERE, at run entry, beside the
+        # resets above. Round 7 found the consequence of my having put this reset
+        # inside _crawl_pages() instead: any path that leaves run_scan() WITHOUT
+        # entering the crawl inherits the previous run's termination -- while the
+        # seen-set two lines above was already emptied. A stale "complete" beside
+        # an empty listing turns every RSS URL into `feed_only`, which the
+        # resolver reads as affirmative acquisition. Mass false acquisition: the
+        # exact wrong answer this machinery exists to prevent.
+        #
+        # And it is not only reachable by exception. `_run_scan_async` returns
+        # early at "No sources selected" and at "HDEncode is disabled in
+        # Settings" -- an ordinary configuration state, no error involved. So a
+        # disabled-source scan could publish the last good crawl's authority over
+        # an empty listing. The correct place was always three lines from where
+        # the other per-run resets already were.
+        self._last_crawl_termination = "not_run"
+        self._last_crawl_status = "not_run"
+        self._last_crawl_page_errors = 0
+        self._last_crawl_detail_scheduled = set()
+        self._last_crawl_detail_completed = set()
 
         # Load download history
         self.download_history = self._load_download_history()
@@ -411,6 +431,11 @@ class ScannerService:
             # successful one -- which is exactly how a broken listing came to be
             # recorded as trustworthy evidence.
             self._last_crawl_status = "scan_error"
+            # AND the termination, which is what listing authority is actually
+            # keyed on. Recording only the status left the termination free to
+            # hold whatever the previous run put there, so the consumer that
+            # matters was still reading a stale verdict.
+            self._last_crawl_termination = "scan_error"
         finally:
             self.is_scanning = False
 

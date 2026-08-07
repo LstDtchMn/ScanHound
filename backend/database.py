@@ -2197,9 +2197,24 @@ class DatabaseManager:
 
     def get_hdencode_shadow_summary(self):
         # Readiness evidence is derived only from structurally eligible cycles:
-        # both normal feeds completed and both comparison sides made at least
-        # one request.  Incomplete/degenerate rows must not stretch the
-        # observation window or improve the request-reduction percentage.
+        # both normal feeds completed, listing membership uncontradicted, and both
+        # comparison sides made at least one request.  Incomplete/degenerate rows
+        # must not stretch the observation window or improve the request-reduction
+        # percentage.
+        #
+        # LISTING AUTHORITY WAS MISSING FROM THIS WINDOW UNTIL ROUND 7.
+        # compare_shadow() withholds `listing_complete` when detail attribution
+        # contradicts raw membership, and the per-release resolver honours that --
+        # but this query did not, so a cycle the resolver refused to trust still
+        # incremented `cycles`, stretched first/last_completed_at, improved the
+        # request-reduction figure and counted as restart/catch-up recovery
+        # evidence. The top-level qualification claim was therefore calling cycles
+        # successful on evidence its own resolver had rejected.
+        #
+        # NULL is admitted for cycles written before the column existed; those
+        # fall back to the aggregate rule, the same legacy compatibility used by
+        # cycle_is_valid_evidence_for(). A cycle recorded SINCE the column exists
+        # must be an explicit 1.
         eligible=self._query(
             """SELECT COUNT(*) AS cycles,
                       MIN(completed_at) AS first_completed_at,
@@ -2210,6 +2225,7 @@ class DatabaseManager:
                FROM hdencode_shadow_cycles
                WHERE outcome IN ('success','relevant_miss')
                  AND normal_feeds_complete=1
+                 AND (listing_complete IS NULL OR listing_complete=1)
                  AND rss_requests>0
                  AND listing_requests>0""",
             one=True,default=None)
@@ -2526,7 +2542,23 @@ class DatabaseManager:
 
         problems=[]
         cycles=[]
-        unattributed_total=0
+        # UNRESOLVED LISTING-ONLY CANDIDATES, keyed by URL. Replaces a running
+        # total of every historical detail failure, which round 7 showed was the
+        # wrong granularity in two directions:
+        #
+        #   * A URL present in BOTH the RSS feed and the raw listing whose detail
+        #     scrape failed is a DUPLICATE -- the thing RSS is supposed to find,
+        #     found. It cannot be an RSS miss, and it was blocking readiness.
+        #   * A genuinely listing-only URL that failed detail once and was
+        #     attributed fine on the next cycle blocked FOREVER, because a sum over
+        #     history has no way to subtract. Readiness could never recover from a
+        #     single transient scrape failure, which is not a property anyone chose.
+        #
+        # So candidacy is `detail_failed & listing_only` -- a listing row we could
+        # not attribute AND that RSS did not carry -- and later evidence clears it.
+        # The dict is keyed by URL rather than counted so that the same URL failing
+        # in three cycles is one unresolved candidate, not three.
+        candidate_state={}
         for row in self._query_dicts(
                 "SELECT cycle_uuid, completed_at, outcome, normal_feeds_complete, "
                 "       rss_requests, listing_requests, details_json, "
@@ -2570,9 +2602,11 @@ class DatabaseManager:
             # detail_dropped, which mixes in cached skips and policy exclusions.
             failed=details.get("detail_failed")
             if isinstance(failed,(list,tuple)):
-                unattributed_total += len([u for u in failed if u])
-            elif failed:
-                problems.append(f"detail_failed_not_a_list:{cycle}")
+                failed_urls={str(u) for u in failed if u}
+            else:
+                if failed:
+                    problems.append(f"detail_failed_not_a_list:{cycle}")
+                failed_urls=set()
             listing=_urlset(details.get("listing_only"),"listing_only",cycle,problems)
             feed=_urlset(details.get("feed_only"),"feed_only",cycle,problems)
             if listing is None or feed is None:
@@ -2594,6 +2628,28 @@ class DatabaseManager:
                 problems.append(
                     f"listing_complete_invalid:{cycle}:{raw_listing_ok!r}")
                 listing_ok=None
+            # CANDIDATE BOOKKEEPING. Chronological -- the query above is
+            # ORDER BY completed_at -- so a later cycle's evidence overwrites an
+            # earlier cycle's verdict for the same URL.
+            #
+            # The asymmetry is deliberate. CREATING a candidate is conservative
+            # (it blocks), so an untrusted cycle may still raise one. CLEARING is
+            # permissive, so a cycle whose listing membership is contradicted
+            # (listing_complete=False) must not clear anything -- otherwise a
+            # cycle the resolver refuses to trust could still be the thing that
+            # unblocks readiness, which is the same fail-open shape as HIGH 2.
+            # Legacy NULL is allowed to clear: those cycles predate the column and
+            # are governed by the aggregate rule everywhere else.
+            for url in failed_urls & listing:
+                candidate_state[url]=True
+            if listing_ok is not False:
+                # Observed on this cycle AND attributed -- the detail scrape did
+                # not fail for it. Note (listing|feed) is disjoint from
+                # failed_urls here by construction, so no URL is both raised and
+                # cleared by one cycle.
+                for url in (listing | feed) - failed_urls:
+                    if url in candidate_state:
+                        candidate_state[url]=False
             cycles.append({"at":at,"listing_only":listing,"feed_only":feed,
                            "outcomes":outcomes,
                            "listing_complete":listing_ok,
@@ -2626,7 +2682,11 @@ class DatabaseManager:
                            "at":_at(row.get("at"))})
         summary=summarise_miss_resolutions(misses,cycles)
         summary["evidence_problems"]=problems
-        summary["unattributed_candidates"]=unattributed_total
+        unresolved=sorted(u for u,pending in candidate_state.items() if pending)
+        summary["unattributed_candidates"]=len(unresolved)
+        # The URLs themselves, so the readiness reason can be acted on instead of
+        # only counted. A bare "3 candidates" cannot be investigated.
+        summary["unattributed_candidate_urls"]=unresolved
         return summary
 
     def _normal_feed_outcomes(self, row, cycle, problems):

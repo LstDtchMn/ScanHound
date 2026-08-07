@@ -27,6 +27,15 @@ class ScrapeCode(str, Enum):
     REQUESTED_HOST_MISSING = "requested_host_missing"
     NO_FILE_HOST_LINKS = "no_file_host_links"
     SCRAPE_EXCEPTION = "scrape_exception"
+    # The URL IS the download link -- a direct file host, not a source page. There
+    # is nothing to scrape, so this is not a failure: download_item hands the URL
+    # straight to the downloader. Added because dispatch previously fell through
+    # to the HDEncode reveal-page path for these.
+    DIRECT_LINK_NO_SOURCE_PAGE = "direct_link_no_source_page"
+    # A host we have no scraper for. Naming it is the point: it used to be handled
+    # by the HDEncode implementation, which reported a reveal-control failure for
+    # a site that was never HDEncode.
+    UNSUPPORTED_SOURCE = "unsupported_source"
 
 
 _MESSAGES = {
@@ -62,6 +71,13 @@ _MESSAGES = {
         "cooldown; nothing is wrong with this release."
     ),
     ScrapeCode.SCRAPE_EXCEPTION: "The link scrape failed before download links could be retrieved.",
+    ScrapeCode.DIRECT_LINK_NO_SOURCE_PAGE: (
+        "This link is already a file-host download link, so there is no source "
+        "page to read. It is being sent to the downloader as-is."
+    ),
+    ScrapeCode.UNSUPPORTED_SOURCE: (
+        "This website is not one ScanHound knows how to read download links from."
+    ),
 }
 
 

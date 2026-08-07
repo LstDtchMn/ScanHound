@@ -18,6 +18,21 @@ _FAILURE_TITLES = {
     ScrapeCode.REQUESTED_HOST_MISSING.value: "Requested host unavailable",
     ScrapeCode.NO_FILE_HOST_LINKS.value: "No supported links found",
     ScrapeCode.SCRAPE_EXCEPTION.value: "Link retrieval failed",
+    # FOUND BY THE NEW EXHAUSTIVENESS TEST, not by review. I added
+    # REVEAL_VERIFICATION_STALLED earlier this session precisely so a source
+    # throttle would stop being reported as a broken scraper -- and then left it
+    # out of this map, so `.get(reason, "Download Failed")` rendered it as
+    # "Download Failed". The item's own message said "nothing is wrong with this
+    # release" underneath a title that said the opposite, on the exact code behind
+    # the 45 items currently parked in cooldown. The fix I shipped was undone in
+    # the UI by the omission.
+    ScrapeCode.REVEAL_VERIFICATION_STALLED.value: "HDEncode is throttling",
+    # Reached only when the link IS a direct file host we identify but cannot hand
+    # off; the ordinary direct-host path clears this diagnostic before it is ever
+    # rendered. Titled without "HDEncode" on purpose -- these two codes are for
+    # URLs that are not HDEncode, which is the whole reason they exist.
+    ScrapeCode.DIRECT_LINK_NO_SOURCE_PAGE.value: "Direct link not supported",
+    ScrapeCode.UNSUPPORTED_SOURCE.value: "Website not supported",
 }
 
 _SOURCE_WIDE_REASONS = {

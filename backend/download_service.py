@@ -369,6 +369,34 @@ def _ensure_selenium():
 class DownloadService:
     """Manages download operations, JDownloader, and WebDriver link scraping."""
 
+    def _source_kind_of(self, url: str) -> str:
+        """This service's source identity for a URL, under the CONFIGURED host.
+
+        WHY THIS EXISTS AS A METHOD. `_source_page_kind` grew an `hdencode_host`
+        parameter so identity could follow configuration, and then none of its
+        three call sites passed it -- a parameter added in the very commit whose
+        message said identity should follow configuration, which is the fourth
+        time a review has caught me adding a signal nothing consumes.
+
+        The consequence was a split brain with the queue, which does pass its
+        configured host. With `base_url = https://hdencode.example.net`:
+
+            download_queue:  hdencode
+            DownloadService: other
+
+        so a configured mirror skipped the HDEncode traffic coordinator, the
+        service-level off switch, and HDEncode scrape-outcome health ownership --
+        while still being paused, resumed and refunded as an HDEncode row. The
+        disagreement runs the other way too: once a mirror is configured, a
+        leftover `hdencode.org` URL is `hdencode` here and not in the queue.
+
+        Reading the config through one accessor is the point. Three call sites each
+        reaching for `base_url` themselves is how the two classifiers drifted in
+        the first place.
+        """
+        cfg = getattr(self, "config", None) or {}
+        return _source_page_kind(url, cfg.get("base_url") or "https://hdencode.org")
+
     def __init__(self, config: Dict[str, Any], db: DatabaseManager, server_mode: bool = False):
         self.config = config
         self.db = db
@@ -1374,7 +1402,7 @@ class DownloadService:
     ):
         """Load a source page through the appropriate traffic policy."""
         last_diag: Optional[ScrapeDiagnostic] = None
-        hdencode_request = _source_page_kind(url) == "hdencode"
+        hdencode_request = self._source_kind_of(url) == "hdencode"
 
         for attempt in range(1, attempts + 1):
             try:
@@ -1936,7 +1964,7 @@ class DownloadService:
         """
         # Classify once by parsed hostname. Query/path text such as
         # `?next=https://ddlbase.com` must not bypass the HDEncode off switch.
-        source_kind = _source_page_kind(url)
+        source_kind = self._source_kind_of(url)
         if source_kind == "hdencode" and not source_enabled(
             self.config,
             "hdencode_enabled",
@@ -1956,6 +1984,62 @@ class DownloadService:
             )
             self._log(f"[HDEncode] {diagnostic.message}", "warning")
             return ScrapedLinks(diagnostic=diagnostic)
+
+        # EXHAUSTIVE DISPATCH over source_identity.SOURCE_KINDS. Handled here,
+        # before the browser is started, because neither of these kinds has a
+        # source page to read and launching Chromium for them is pure waste.
+        #
+        # ROUND 7 CORRECTED A CLAIM I MADE TWICE. I wrote -- in a commit message
+        # and again in a review package -- that direct file hosts "already bypass
+        # scrape_links entirely", and used that to argue the classifier change was
+        # safe for dispatch. It is false. download_item() calls scrape_links()
+        # FIRST and only falls back to `links = [url]` after it returns nothing.
+        # So a pasted Rapidgator URL was being run through HDEncode reveal-page
+        # logic: it clicked for a reveal control that cannot exist, then reported
+        # layout_changed or a reveal stall -- attributing the failure to HDEncode's
+        # source health, and on the throttle path putting the whole source into a
+        # cooldown, because of a URL that has nothing to do with HDEncode.
+        #
+        # There is deliberately NO `else` here. When a sixth kind is added, the
+        # branch below raises on the unhandled value rather than silently treating
+        # it as HDEncode, which is how `other` came to mean `hdencode` in the first
+        # place.
+        if source_kind == "direct_file":
+            # Not a failure. Returning no links is what makes download_item's own
+            # supported-host fallback hand the URL straight to the downloader; it
+            # clears this diagnostic when it does. The diagnostic only survives for
+            # a direct host we identify but cannot hand off, which is a real and
+            # previously mislabelled outcome.
+            return ScrapedLinks(diagnostic=ScrapeDiagnostic(
+                ScrapeCode.DIRECT_LINK_NO_SOURCE_PAGE,
+                retryable=False,
+                affects_source_health=False,
+                stage="source_gate",
+                cause_code="direct_link",
+                transport_attempted=False,
+                affected_scope="item",
+                retry_mode="none",
+                health_owner="none",
+            ))
+        if source_kind == "other":
+            return ScrapedLinks(diagnostic=ScrapeDiagnostic(
+                ScrapeCode.UNSUPPORTED_SOURCE,
+                retryable=False,
+                affects_source_health=False,
+                stage="source_gate",
+                cause_code="unsupported_source",
+                transport_attempted=False,
+                affected_scope="item",
+                retry_mode="none",
+                action_code="remove_item",
+                health_owner="none",
+            ))
+        if source_kind not in ("hdencode", "ddlbase", "adithd"):
+            raise AssertionError(
+                f"unhandled source kind {source_kind!r} in scrape_links dispatch; "
+                "add an explicit branch rather than letting it reach the HDEncode "
+                "implementation"
+            )
 
         try:
             if source_kind != "hdencode":
@@ -1990,7 +2074,11 @@ class DownloadService:
                         self._scrape_adithd_links(url, service_type)
                     )
 
-                # Default: HDEncode. Map the requested host to its link keyword.
+                # HDEncode -- reached only for source_kind == "hdencode" now that
+                # the four other kinds are dispatched explicitly above. This was
+                # the `default` branch, i.e. the semantic default-to-HDEncode the
+                # affirmative classifier was built to remove.
+                # Map the requested host to its link keyword.
                 # The old `== "Rapidgator" else "nitroflare"` silently searched
                 # nitroflare for ANY other value (1fichier/ddownload/lowercase).
                 _host_keywords = {"rapidgator": "rapidgator", "nitroflare": "nitroflare",
@@ -2033,6 +2121,20 @@ class DownloadService:
                             f"{service_type} link(s)",
                             "success",
                         )
+                        # SECOND success path, and I only found it because the
+                        # wiring test for the reset came back with the links
+                        # present and the coordinator never called. I had put the
+                        # reset on the post-click branch alone and would have
+                        # reported the reset "wired" on a diff read.
+                        #
+                        # It counts as success for the same reason the other one
+                        # does: HDEncode delivered file-host links. The rule is
+                        # deliberately "the source served links", not "the reveal
+                        # control worked" -- a page that needs no reveal is still
+                        # a page HDEncode is not throttling, and leaving the streak
+                        # inflated here would half-fix the escalation ratchet.
+                        if source_kind == "hdencode":
+                            get_hdencode_coordinator().observe_reveal_success()
                         return ScrapedLinks(visible_links)
 
                     self._log("[HDEncode] Looking for the 'View links' button...")
@@ -2121,6 +2223,26 @@ class DownloadService:
 
                     if links:
                         self._log(f"[HDEncode] Found {len(links)} {service_type} link(s); first: {links[0]}", "success")
+                        # THE MIRROR OF observe_reveal_stall, wired 2026-08-07.
+                        #
+                        # observe_reveal_success() existed with NO production
+                        # caller -- the fifth "signal nothing consumes" of this
+                        # effort, and its own docstring named the consequence:
+                        # the stall streak ratchets up and every later stall draws
+                        # the maximum cooldown regardless of how healthy the source
+                        # had been in between. The streak is in-memory with no
+                        # persistence, so the only thing that cleared it was a
+                        # container restart -- a throttle dial reset by process
+                        # lifetime instead of by evidence.
+                        #
+                        # HERE, and not at tier == "links-control", because a
+                        # control being present is not proof the reveal completed:
+                        # the click can still be challenged, time out, or yield
+                        # nothing. Delivered file-host links are unambiguous. The
+                        # `source_kind` gate matches observe_reveal_stall's exactly
+                        # so the two cannot drift.
+                        if source_kind == "hdencode":
+                            get_hdencode_coordinator().observe_reveal_success()
                     else:
                         self._log(f"[HDEncode] 0 {service_type} links parsed from the page", "warning")
                         diagnostic = self._log_page_diagnostics(
@@ -2736,7 +2858,7 @@ class DownloadService:
         try:
             links = self.scrape_links(url, service_type, progress_callback=_cb)
             diagnostic = getattr(links, "diagnostic", None)
-            if _source_page_kind(url) == "hdencode":
+            if self._source_kind_of(url) == "hdencode":
                 record_scrape_outcome(self.db, "hdencode", links)
         except Exception as e:
             links = []
