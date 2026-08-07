@@ -1076,6 +1076,101 @@ class DownloadQueueService:
             ),
         )
 
+    def _log_unresumable_batch(self, batch: dict) -> None:
+        """Say WHY a due batch could not be resumed, instead of failing silently.
+
+        The eligibility query above requires an item whose `cooldown_until`
+        matches the BATCH's `cooldown_until` exactly, as strings. That coupling
+        is easy to break -- an operator raising one and not the other, or any
+        future code path that updates one side -- and when it breaks the batch is
+        parked permanently with no error, no warning, and a database that looks
+        entirely correct.
+
+        That happened on 2026-08-06: the batch cooldown was moved to 03:25Z to
+        wait out a source throttle while its 69 items kept 00:02Z, so the resume
+        would have skipped all five batches. Nothing would have said so.
+
+        This runs only on the skip path, which is rare, so the extra query costs
+        nothing in the normal case. It never changes behaviour -- it only makes
+        the existing behaviour visible.
+        """
+        batch_uuid = batch.get("batch_uuid")
+        counts = self.db._query(
+            """
+            SELECT
+                COUNT(*) AS deferred,
+                SUM(CASE WHEN cooldown_until = ? THEN 1 ELSE 0 END)
+                    AS cooldown_match,
+                SUM(CASE WHEN queue_reason IN (
+                        'interactive_challenge', 'source_deferred'
+                    ) THEN 1 ELSE 0 END) AS reason_recognised,
+                SUM(CASE WHEN COALESCE(last_reason_code, '') IN (
+                        'operation_timeout_unknown',
+                        'interrupted_unknown_outcome'
+                    ) THEN 1 ELSE 0 END) AS unknown_outcome
+            FROM download_queue_items
+            WHERE batch_uuid = ?
+              AND state IN ('verification_required', 'waiting_source')
+            """,
+            (batch.get("cooldown_until"), batch_uuid),
+            one=True,
+            default=None,
+        )
+        if counts is None:
+            logger.warning(
+                "Batch %s is due to auto-resume but the diagnostic query "
+                "returned nothing; the batch stays paused.", batch_uuid,
+            )
+            return
+        # _query(one=True) yields a sqlite3.Row, which supports indexing but not
+        # .get(). Every column below is in the SELECT above, so indexing is safe.
+        deferred = int(counts["deferred"] or 0)
+        if deferred == 0:
+            # Benign: nothing is waiting. Items were retried, cancelled or
+            # completed by other means, so there is genuinely nothing to resume.
+            logger.debug(
+                "Batch %s is past its cooldown but holds no deferred items; "
+                "nothing to resume.", batch_uuid,
+            )
+            return
+
+        matched = int(counts["cooldown_match"] or 0)
+        recognised = int(counts["reason_recognised"] or 0)
+        unknown = int(counts["unknown_outcome"] or 0)
+
+        if matched == 0:
+            cause = (
+                "no deferred item carries the batch's cooldown timestamp "
+                f"({batch.get('cooldown_until')!r}), so the eligibility check "
+                "cannot see any of them. This usually means the batch cooldown "
+                "was changed without changing the items. THE BATCH WILL NEVER "
+                "RESUME ON ITS OWN until they match."
+            )
+        elif recognised == 0:
+            cause = (
+                "every deferred item carries a queue_reason the resume path "
+                "does not recognise (it accepts only 'interactive_challenge' "
+                "and 'source_deferred')."
+            )
+        elif unknown >= deferred:
+            cause = (
+                "every deferred item ended in an unknown execution state "
+                "(operation_timeout_unknown / interrupted_unknown_outcome), "
+                "which is excluded deliberately: retrying could double-submit "
+                "a delivery that already happened. These need adjudicating by "
+                "hand, not resuming."
+            )
+        else:
+            cause = (
+                f"{deferred} deferred item(s), {matched} with a matching "
+                f"cooldown, {recognised} with a recognised queue_reason, "
+                f"{unknown} in an unknown execution state -- no single item "
+                "satisfies all three conditions at once."
+            )
+        logger.warning(
+            "Batch %s is due to auto-resume but cannot: %s", batch_uuid, cause,
+        )
+
     def _maybe_auto_resume(self) -> None:
         if self.db is None:
             return
@@ -1122,6 +1217,12 @@ class DownloadQueueService:
                 default=None,
             )
             if blocked is None:
+                # A batch that is paused, resume-enabled, unspent, and past its
+                # cooldown found NOTHING to resume. Before 2026-08-07 this was a
+                # bare `continue`: the batch stayed parked forever and emitted no
+                # signal of any kind. Five batches holding 69 grabs sat that way,
+                # and the cause was only found by reading this query by hand.
+                self._log_unresumable_batch(batch)
                 continue
             self._resume_batch(
                 batch["batch_uuid"],
