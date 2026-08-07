@@ -223,6 +223,21 @@ class ScannerService:
         # True when the last crawl stopped early at cached content — the scanner
         # then never saw deeper pages, so it must NOT purge against this crawl.
         self._last_crawl_early_stopped: bool = False
+        # LISTING AUTHORITY, owned by the crawler. Peer review found that callers
+        # were inferring "the listing arm completed" from whether run_scan() threw,
+        # which is not the same thing: run_scan CATCHES its own exception and still
+        # returns list(self.items), _crawl_pages swallows per-page errors, and a
+        # non-200 page simply continues. So a broken crawl looked complete.
+        #
+        # Only "complete" may be treated as listing authority by a consumer.
+        #   complete        every requested page fetched, nothing stopped it early
+        #   early_stopped   coordinator stop / blocked / cached frontier reached
+        #   scan_error      an exception was caught rather than propagated
+        #   page_errors     one or more pages failed but the crawl carried on
+        #   empty_untrusted finished with zero posts, which is not trustworthy
+        #   not_run         no crawl has happened on this instance yet
+        self._last_crawl_status: str = "not_run"
+        self._last_crawl_page_errors: int = 0
         #: Full-disc releases excluded by policy this crawl: rows the caller
         #: persists, plus the total (new + already-known) for reporting.
         self._last_crawl_policy_excluded_observed: List[Dict] = []
@@ -374,6 +389,11 @@ class ScannerService:
                 loop.close()
         except Exception as e:
             self._log(f"Scan error: {e}", "error")
+            # RECORDED, not just logged. This handler returns list(self.items)
+            # anyway, so without this the caller cannot tell a failed scan from a
+            # successful one -- which is exactly how a broken listing came to be
+            # recorded as trustworthy evidence.
+            self._last_crawl_status = "scan_error"
         finally:
             self.is_scanning = False
 
@@ -672,6 +692,11 @@ class ScannerService:
         Returns:
             List of post dicts: [{"url": str, "type": "movie"|"tv", "source": str}, ...]
         """
+        # Reset the per-crawl authority counters here, with the rest of the
+        # crawl-local state, so a previous crawl's failures cannot leak into
+        # this one's verdict.
+        self._last_crawl_page_errors = 0
+        self._last_crawl_status = "not_run"
         all_posts = []
         skip_urls = previously_scanned or set()
         # Explicit arguments win (tests pass them); otherwise read the live
@@ -904,6 +929,11 @@ class ScannerService:
                     await asyncio.sleep(0.3)
                 except Exception as e:
                     self._log(f"Crawl error: {e}", "error")
+                    # COUNTED, not only logged. This handler lets the crawl carry
+                    # on, so without counting it the caller cannot tell a partial
+                    # crawl from a clean one -- which is how a broken listing came
+                    # to be recorded as trustworthy resolution evidence.
+                    self._last_crawl_page_errors += 1
 
             if blocked_total:
                 # A blocked source's crawl is INCOMPLETE — treat it like an
@@ -946,6 +976,16 @@ class ScannerService:
         # A crawl that stopped early never visited deeper pages, so its seen-set
         # is partial — the caller must not age out items it simply didn't revisit.
         self._last_crawl_early_stopped = early_stopped
+        # The crawl's own verdict on itself, in precedence order: a stop that cut
+        # it short, then pages that failed, then a suspicious empty result.
+        if early_stopped:
+            self._last_crawl_status = "early_stopped"
+        elif self._last_crawl_page_errors:
+            self._last_crawl_status = "page_errors"
+        elif not all_posts:
+            self._last_crawl_status = "empty_untrusted"
+        else:
+            self._last_crawl_status = "complete"
 
         return all_posts
 

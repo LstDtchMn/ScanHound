@@ -60,14 +60,45 @@ class TestTheProducerEmitsTheSignal:
             "the result dict must initialise source_progress to False; without "
             "that, a missing key would read as absent rather than negative")
 
+    def test_a_REAL_jdownloader_success_sets_it_end_to_end(self, tmp_path):
+        """THE POSITIVE CONTRACT, EXECUTED. Peer review's round-4 MEDIUM.
+
+        My previous positive test read the source text and then hand-built a result
+        dict -- so only the NEGATIVE (duplicate) case actually ran production code.
+        A real positive does not need live JDownloader: stub scrape_links,
+        send_to_jdownloader and save_to_history, run download_item() for real, then
+        push its OWN returned dict through the mapper and the queue's predicate.
+        """
+        svc = _service(tmp_path)
+        svc.config = {"download_method": "jdownloader", "jd_enabled": True,
+                      "jd_method": "api", "jd_folder": "",
+                      "jd_movies_folder": "/movies"}
+        svc.scrape_links = lambda *a, **k: ["https://rapidgator.net/file/1"]
+        svc.send_to_jdownloader = lambda *a, **k: True
+        svc.save_to_history = lambda *a, **k: True
+
+        raw = svc.download_item(url=URL, title="Some Release", year=2026,
+                                season=None, resolution="2160p", size="10 GB",
+                                hdr="", dovi=False, service_type="Rapidgator")
+        assert raw["success"] is True, raw
+        assert raw["method"] == "jdownloader", raw
+        assert raw.get("source_progress") is True, (
+            "a real jdownloader delivery must set source_progress; without it the "
+            "retry-budget refund never fires -- the round-3 defect")
+
+        outcome = public_download_result(raw, title="Some Release", url=URL)
+        assert DownloadQueueService.is_source_delivery(outcome) is True, (
+            "the producer's own dict, through the real mapper, must satisfy the "
+            "queue's predicate")
+
     @pytest.mark.parametrize("method", ["jdownloader", "clipboard", "browser"])
     def test_every_real_success_path_sets_it(self, method):
-        """The three paths that actually deliver must each set the signal.
+        """A structural guard COMPLEMENTING the executed test above.
 
-        Asserted against the source rather than executed, because each path needs
-        a live JDownloader / clipboard / browser. The end-to-end contract test
-        below executes the mapper and the queue for real; this pins the producer
-        so a fourth delivery path cannot be added silently without it.
+        clipboard and browser need a live clipboard/browser, so they are pinned by
+        source inspection: a fourth delivery path cannot be added without the
+        signal. The jdownloader path is additionally executed for real above --
+        because a structural assertion alone was the round-4 MEDIUM.
         """
         from backend.download_service import DownloadService
         import inspect
@@ -202,5 +233,99 @@ class TestSourceOwnership:
             assert counter() == 1, (
                 "positive control: an HDEncode delivery must increment it, or "
                 "the exclusion above passes for the wrong reason")
+        finally:
+            db.close()
+
+
+class TestSourceIdentityIsAffirmative:
+    """`_source()` must NAME a source, never default to HDEncode.
+
+    THE DEFECT THIS FIXES, found by peer review in round 4. The classifier was:
+
+        ddlbase -> "ddlbase"; adit-hd -> "adithd"; EVERYTHING ELSE -> "hdencode"
+
+    So Rapidgator, 1fichier, Nitroflare, ddownload and any future host became
+    "hdencode". `download_item()` supports direct file-host URLs and the batch API
+    accepts arbitrary download URLs, so a mixed batch could store a direct-host row
+    as source="hdencode", group it under an HDEncode pause, and -- once the refund
+    began working -- let it refund HDEncode's retry budget.
+
+    **My own mixed-batch test could not see this**: it used DDLBase, one of the two
+    hosts the old function actually recognised. These use direct file hosts, which
+    is the case that was broken.
+    """
+
+    def test_direct_file_hosts_are_not_hdencode(self):
+        from backend.download_queue import _source
+        for url in ("https://rapidgator.net/file/abc/x.rar",
+                    "https://1fichier.com/?abc123",
+                    "https://nitroflare.com/view/ABC/x.rar",
+                    "https://ddownload.com/abc123",
+                    "https://katfile.com/abc123"):
+            assert _source(url) == "filehost", url
+
+    def test_an_unknown_host_is_other_not_hdencode(self):
+        from backend.download_queue import _source
+        assert _source("https://some-new-host.example/file/1") == "other"
+        assert _source("") == "other"
+        assert _source("not a url") == "other"
+
+    def test_the_recognised_sources_still_classify(self):
+        from backend.download_queue import _source
+        assert _source("https://hdencode.org/a-release-2160p/") == "hdencode"
+        assert _source("https://www.hdencode.org/a/") == "hdencode"
+        assert _source("https://ddlbase.com/release/1") == "ddlbase"
+        assert _source("https://adit-hd.com/x") == "adithd"
+
+    def test_a_configured_mirror_is_recognised(self):
+        """Identity follows configuration, so a changed domain or mirror still
+        classifies as HDEncode instead of falling through to 'other'."""
+        from backend.download_queue import _source
+        assert _source("https://hdencode.example.net/a/",
+                       "https://hdencode.example.net") == "hdencode"
+        assert _source("https://hdencode.org/a/",
+                       "https://hdencode.example.net") == "other", (
+            "with a mirror configured, the old default domain is no longer "
+            "authoritative -- it must not be silently accepted")
+
+    def test_a_direct_host_row_cannot_refund_the_hdencode_budget(self, tmp_path):
+        """THE PRODUCTION PATH the review described, end to end."""
+        from unittest.mock import MagicMock
+        from backend.database import DatabaseManager
+        db = DatabaseManager(str(tmp_path / "filehost-refund.db"))
+        try:
+            service = DownloadQueueService({}, db, MagicMock())
+            service._coordinator_snapshot = MagicMock(
+                return_value={"blocked": False})
+            batch = service.schedule_batch(
+                [{"url": "https://hdencode.org/a-2160p/", "title": "A",
+                  "media_type": "movie"},
+                 {"url": "https://rapidgator.net/file/xyz/b.rar", "title": "B",
+                  "media_type": "movie"}],
+                interval_minutes=0, mode="immediate",
+                auto_resume_after_cooldown=True)
+            uuid = batch["batch_uuid"]
+            rows = service.get_batch(uuid)["items"]
+            sources = {r["title"]: r["source"] for r in rows}
+            assert sources["B"] == "filehost", (
+                f"a direct Rapidgator URL must not be stored as hdencode; got "
+                f"{sources}")
+
+            direct = next(r for r in rows if r["source"] == "filehost")
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE download_queue_items SET state='claimed', "
+                    "claimed_by=? WHERE item_uuid=?",
+                    (service.worker_id, direct["item_uuid"]))
+            service._complete(dict(direct), {
+                "success": True, "method": "jdownloader", "link_count": 1,
+                "message": "x", "source_progress": True,
+                "transport_attempted": None})
+            row = db._query(
+                "SELECT source_delivery_count AS n FROM download_queue_batches "
+                "WHERE batch_uuid=?", (uuid,), one=True, default=None)
+            assert int((row["n"] if row else 0) or 0) == 0, (
+                "a direct file-host delivery must not increment the counter that "
+                "refunds HDEncode's retry budget")
         finally:
             db.close()

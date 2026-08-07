@@ -483,7 +483,24 @@ class BackgroundScanner:
                         # by a cycle where tv_all failed, but never by one whose
                         # listing was broken -- the listing is the other half of
                         # the comparison.
-                        listing_complete=not bool(err),
+                        # LISTING AUTHORITY from the crawler's OWN verdict, not
+                        # from whether run_scan threw. Peer review found `err` is
+                        # not equivalent to "the listing completed": run_scan
+                        # CATCHES its own exception and still returns
+                        # list(self.items), _crawl_pages swallows per-page errors,
+                        # and a non-200 page simply continues. Worse, this very
+                        # block already distrusts a partial crawl for cache purge
+                        # via _last_crawl_early_stopped while I was writing
+                        # listing_complete=True from `err` alone -- one cycle could
+                        # be "too partial to purge" and "listing complete" at once.
+                        #
+                        # Only the crawler's "complete" state counts, and an
+                        # exception that escaped to here still disqualifies it.
+                        listing_complete=(
+                            not bool(err)
+                            and getattr(scanner, "_last_crawl_status", "not_run")
+                            == "complete"
+                        ),
                     ).as_dict()
                     completed_at = datetime.now(timezone.utc).isoformat()
                     restart_recovery = self._qualify_restart_recovery(

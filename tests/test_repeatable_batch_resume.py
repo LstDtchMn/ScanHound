@@ -207,7 +207,13 @@ class TestProgressRefundsTheBudget:
 
     def test_progress_can_extend_retries_indefinitely(self, tmp_path):
         """PINNED DECISION, not an oversight. A batch that keeps delivering keeps
-        earning retries. It is still spaced by the escalating cooldown."""
+        earning retries, and each retry still waits for the cooldown the coordinator
+        has stored.
+
+        NOT ASSERTED: that those waits grow. The 1h -> 2h -> 4h composition is
+        unproven -- observe_reveal_success() has no production call site and nothing
+        here drives the real coordinator -- so that claim is withdrawn rather than
+        restated."""
         db = DatabaseManager(str(tmp_path / "forever.db"))
         try:
             service, uuid = _rig(db, count=8, config={

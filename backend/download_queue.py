@@ -41,16 +41,70 @@ def _parse(value: Optional[str]) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
-def _source(url: str) -> str:
+#: File hosts that appear as DIRECT download URLs. A batch may legitimately
+#: contain one of these instead of a source page, and it is not HDEncode.
+_DIRECT_FILE_HOSTS = (
+    "rapidgator.net", "1fichier.com", "nitroflare.com", "ddownload.com",
+    "katfile.com", "turbobit.net", "hitfile.net", "fikper.com", "frdl.io",
+    "uploady.io", "filestore.to", "clicknupload.to", "mega.nz",
+)
+
+
+def _host_of(url: str) -> str:
     try:
-        host = (urlparse(url).hostname or "").lower().rstrip(".")
+        return (urlparse(url).hostname or "").lower().rstrip(".")
     except Exception:
-        host = ""
-    if host == "ddlbase.com" or host.endswith(".ddlbase.com"):
+        return ""
+
+
+def _matches(host: str, domain: str) -> bool:
+    domain = (domain or "").lower().rstrip(".")
+    return bool(domain) and (host == domain or host.endswith("." + domain))
+
+
+def _source(url: str, hdencode_host: str = "hdencode.org") -> str:
+    """Classify a download URL's source AFFIRMATIVELY.
+
+    THE DEFECT THIS FIXES, found by peer review in round 4. This used to be:
+
+        if ddlbase -> "ddlbase"
+        if adit-hd -> "adithd"
+        return "hdencode"          # <-- everything else
+
+    So Rapidgator, 1fichier, Nitroflare, ddownload and any future host all became
+    "hdencode". That is a real production path -- `download_item()` supports direct
+    file-host URLs and the batch API accepts arbitrary download URLs. A mixed batch
+    could therefore store a direct-host row as source="hdencode", have it grouped
+    under an HDEncode pause, and -- once the refund began working -- let it
+    increment the counter that refunds HDEncode's retry budget.
+
+    My own mixed-batch test could not see it: it used DDLBase, one of the two hosts
+    the old function actually recognised.
+
+    Now every classification is affirmative:
+
+        the configured HDEncode host (default hdencode.org) -> "hdencode"
+        ddlbase / adit-hd                                   -> their own ids
+        a known direct file host                            -> "filehost"
+        anything else                                       -> "other"
+
+    Callers that gate HDEncode behaviour on `source == "hdencode"` -- the retry
+    availability check, the coordinator status shown in the UI, source-wide pause,
+    and the retry-budget refund -- therefore stop applying it to hosts that are not
+    HDEncode. That is the intended correction in every one of those cases.
+    """
+    host = _host_of(url)
+    if not host:
+        return "other"
+    if _matches(host, "ddlbase.com"):
         return "ddlbase"
-    if host == "adit-hd.com" or host.endswith(".adit-hd.com"):
+    if _matches(host, "adit-hd.com"):
         return "adithd"
-    return "hdencode"
+    if _matches(host, _host_of(hdencode_host) or hdencode_host):
+        return "hdencode"
+    if any(_matches(host, d) for d in _DIRECT_FILE_HOSTS):
+        return "filehost"
+    return "other"
 
 
 class DownloadQueueError(RuntimeError):
@@ -329,7 +383,7 @@ class DownloadQueueService:
         seen = set()
         for raw in items:
             item = self._request_dict(dict(raw))
-            source = _source(item["url"])
+            source = _source(item["url"], self._hdencode_host())
             key = (source, item["url"], item["service_type"])
             if not item["url"] or key in seen:
                 continue
@@ -461,7 +515,7 @@ class DownloadQueueService:
             else dict(request)
         )
         item = self._request_dict(data)
-        source = _source(item["url"])
+        source = _source(item["url"], self._hdencode_host())
         reason = str(outcome.get("reason_code") or "")
         direct = reason == "interactive_challenge" or bool(outcome.get("transport_attempted"))
         state = "verification_required" if direct else "waiting_source"
@@ -1094,6 +1148,15 @@ class DownloadQueueService:
             ),
         )
 
+    def _hdencode_host(self) -> str:
+        """The configured HDEncode host, so identity follows configuration.
+
+        `base_url` is the operator-set source base (default https://hdencode.org),
+        so a mirror or changed domain classifies correctly instead of relying on a
+        hard-coded literal.
+        """
+        return str((self.config or {}).get("base_url") or "https://hdencode.org")
+
     def _auto_resume_max_attempts(self) -> int:
         """How many CONSECUTIVE fruitless automatic resumes a batch may make.
 
@@ -1626,9 +1689,15 @@ class DownloadQueueService:
             # where giving up is the right answer.
             #
             # Consequence worth being explicit about: a batch that keeps making
-            # partial progress can retry indefinitely. That is intended -- it is
-            # making progress -- and it is still spaced by the coordinator's
-            # escalating cooldown, so it cannot become a tight loop.
+            # real source progress can retry indefinitely. That is intended -- it is
+            # delivering. Each retry still waits for whatever cooldown the
+            # coordinator has stored, so it is not a tight loop.
+            #
+            # NOT CLAIMED: that those waits GROW. Peer review pointed out that
+            # observe_reveal_success() has no production call site and no test here
+            # exercises the real coordinator alongside the queue, so the
+            # 1h -> 2h -> 4h composition is unproven. An earlier version of this
+            # comment asserted it; that claim is withdrawn.
             used_delta = 1 if automated else 0
             reset_budget = False
             if automated:

@@ -2570,11 +2570,21 @@ class DatabaseManager:
             if listing is None or feed is None:
                 continue
             outcomes=self._normal_feed_outcomes(row, cycle, problems)
+            # STRICTLY NULL/0/1. The column is an unconstrained INTEGER, and
+            # bool() would turn 2 or -1 into True -- i.e. corrupt data would grant
+            # listing authority. Anything else is an evidence problem.
             raw_listing_ok=row.get("listing_complete")
+            if raw_listing_ok is None:
+                listing_ok=None
+            elif int(raw_listing_ok) in (0,1):
+                listing_ok=bool(int(raw_listing_ok))
+            else:
+                problems.append(
+                    f"listing_complete_invalid:{cycle}:{raw_listing_ok!r}")
+                listing_ok=None
             cycles.append({"at":at,"listing_only":listing,"feed_only":feed,
                            "outcomes":outcomes,
-                           "listing_complete":(None if raw_listing_ok is None
-                                               else bool(raw_listing_ok)),
+                           "listing_complete":listing_ok,
                            "cycle_complete":bool(row.get("normal_feeds_complete"))})
 
         misses=[]
