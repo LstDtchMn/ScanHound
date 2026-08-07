@@ -11,18 +11,31 @@ Offered a 6-hour tolerance or "never acquired at all", Jesse chose the latter.
 Recorded reservation: with no deadline, a release acquired three days late counts
 as a success, so the rule stops measuring the latency RSS exists to improve. The
 lag is still computed per row so it can be REPORTED — it just no longer GATES.
-`test_a_very_late_acquisition_still_counts_as_acquired` pins that consequence
-explicitly rather than leaving it implied, so nobody later reads the behaviour as
-a bug.
 
-WHAT IS DELIBERATELY NOT WIDENED. "Acquired" needs evidence and so does "never
-acquired". A row that can be shown neither way is UNDETERMINED and still blocks.
-Calling unprovable rows healthy is the fail-open shape that produced two HIGH
-findings in this same subsystem, and the qualification grader already gates on
-"0 RED, 0 PENDING and 0 AMBIGUOUS".
+## TWO THINGS PEER REVIEW REVERSED, 2026-08-07 — read before editing
+
+**1. `not_yet_assessable` BLOCKS.** I had made it non-blocking so the gate could
+pass, and defended that as "otherwise the gate is unpassable by construction". The
+review showed the composition that makes it unsafe rather than merely optimistic:
+the shadow comparison is recorded only while `discovery_mode == "rss_shadow"`
+(`background_scanner.py:449`), so promoting to `rss_primary` STOPS producing the
+observations a pending row needs. The gate could open on evidence its own promoted
+mode then destroys. The honest way to pass is a frozen cohort — fix an admission
+cutoff, collect an observation tail, require every admitted row to resolve — not to
+make a live unresolved row vanish because it is newest.
+
+**2. Per-feed authority, not cycle completeness.** See
+`test_miss_resolution_per_feed.py`, which holds those cases. `classify_miss_resolution`
+now takes a `media_type` and each cycle carries its per-feed `outcomes`.
+
+This file keeps what is unique to it: the no-deadline consequence, malformed-input
+handling, lag reporting, and the WIRING — that readiness actually consumes this and
+that the old unconditional blocker is gone.
 """
 from datetime import datetime, timedelta, timezone
 
+from backend import database as database_module
+from backend.database import DatabaseManager
 from backend.hdencode_shadow import (
     classify_miss_resolution,
     summarise_miss_resolutions,
@@ -32,18 +45,25 @@ T0 = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
 URL = "https://hdencode.org/some-release-2160p/"
 OTHER = "https://hdencode.org/unrelated-1080p/"
 
+#: Both normal feeds observed — so these cycles are valid evidence for any row.
+BOTH = {"movies_all": "changed", "tv_all": "changed"}
 
-def cycle(hours, *, listing_only=(), feed_only=()):
+
+def cycle(hours, *, listing_only=(), feed_only=(), outcomes=None):
     return {"at": T0 + timedelta(hours=hours),
+            "outcomes": dict(BOTH if outcomes is None else outcomes),
             "listing_only": set(listing_only),
             "feed_only": set(feed_only)}
 
 
-class TestAcquisitionIsProvenByTheFeedTransition:
+def classify(url=URL, media_type="movie", first_seen=T0, cycles=()):
+    return classify_miss_resolution(url, media_type, first_seen, list(cycles))
+
+
+class TestTheNoDeadlineConsequence:
 
     def test_the_feed_picking_it_up_is_acquisition(self):
-        state, hours, _ = classify_miss_resolution(
-            URL, T0, [cycle(1, feed_only=[URL])])
+        state, hours, _ = classify(cycles=[cycle(1, feed_only=[URL])])
         assert state == "acquired"
         assert hours == 1.0
 
@@ -51,115 +71,58 @@ class TestAcquisitionIsProvenByTheFeedTransition:
         """THE CONSEQUENCE OF THE CHOSEN RULE, pinned deliberately.
 
         72 hours late is still a success under "never acquired at all". This is
-        the trade Jesse accepted over a 6-hour budget. If this ever needs to
-        change, change the RULE here -- do not let it drift by accident.
+        the trade Jesse accepted over a 6-hour budget. If it should change, change
+        the RULE — do not let it drift by accident.
         """
-        state, hours, _ = classify_miss_resolution(
-            URL, T0, [cycle(6, listing_only=[URL]), cycle(72, feed_only=[URL])])
-        assert state == "acquired", (
-            "under the chosen rule there is no deadline; only 'never' fails")
+        state, hours, _ = classify(cycles=[cycle(6, listing_only=[URL]),
+                                           cycle(72, feed_only=[URL])])
+        assert state == "acquired", "there is no deadline; only 'never' fails"
         assert hours == 72.0, "the lag is still measured so it can be reported"
 
     def test_earlier_cycles_are_ignored(self):
-        """A sighting BEFORE the row was recorded says nothing about it."""
-        state, _, _ = classify_miss_resolution(
-            URL, T0, [cycle(-5, feed_only=[URL])])
-        assert state != "acquired", (
-            "a feed sighting predating the miss cannot resolve it; accepting it "
-            "would let any historical presence excuse a later disappearance")
+        """A feed sighting predating the row cannot resolve it; accepting it would
+        let any historical presence excuse a later disappearance."""
+        assert classify(cycles=[cycle(-5, feed_only=[URL])])[0] != "acquired"
 
     def test_another_release_being_acquired_proves_nothing(self):
-        state, _, _ = classify_miss_resolution(
-            URL, T0, [cycle(2, feed_only=[OTHER], listing_only=[URL])])
-        assert state == "never_acquired"
-
-
-class TestNeverAcquiredRequiresEvidence:
-
-    def test_still_missing_later_and_never_acquired_is_a_failure(self):
-        state, hours, detail = classify_miss_resolution(
-            URL, T0, [cycle(3, listing_only=[URL]),
-                      cycle(9, listing_only=[URL])])
-        assert state == "never_acquired"
-        assert hours == 9.0
-        assert "never acquired" in detail
-
-    def test_vanishing_from_both_sides_is_undetermined_not_healthy(self):
-        """THE FAIL-OPEN THIS REFUSES. The listing pages away over time, so a URL
-        absent from both sides is not evidence of acquisition. Counting it as
-        acquired would let ordinary listing churn manufacture a passing gate."""
-        state, _, detail = classify_miss_resolution(
-            URL, T0, [cycle(4, listing_only=[OTHER])])
-        assert state == "undetermined", (
-            "absence from both sides proves nothing in either direction")
-        assert "neither" in detail
-
-    def test_no_cycles_at_all_is_not_yet_assessable(self):
-        """CHANGED DELIBERATELY 2026-08-07, not quietly relaxed.
-
-        This originally asserted "undetermined" — which blocks. Measuring against
-        live data showed that rule made the gate unpassable by construction: rows
-        from the newest cycle can never have a later observation, and every poll
-        can record one. See TestNotYetAssessableIsNotAFailure for the reasoning and
-        for the assertions keeping the exclusion narrow.
-        """
-        state, hours, _ = classify_miss_resolution(URL, T0, [])
-        assert state == "not_yet_assessable"
-        assert hours == 0.0
+        assert classify(cycles=[cycle(2, feed_only=[OTHER],
+                                      listing_only=[URL])])[0] == "never_acquired"
 
     def test_acquisition_wins_over_an_earlier_still_missing_sighting(self):
-        """Observed missing, then acquired: the acquisition is what matters."""
-        state, hours, _ = classify_miss_resolution(
-            URL, T0, [cycle(2, listing_only=[URL]),
-                      cycle(5, feed_only=[URL]),
-                      cycle(8, listing_only=[OTHER])])
+        state, hours, _ = classify(cycles=[cycle(2, listing_only=[URL]),
+                                           cycle(5, feed_only=[URL]),
+                                           cycle(8, listing_only=[OTHER])])
         assert state == "acquired"
         assert hours == 5.0
 
+    def test_vanishing_from_both_sides_is_undetermined_not_healthy(self):
+        """The listing pages away over time, so absence from both sides is not
+        evidence of acquisition. Counting it as acquired would let ordinary
+        listing churn manufacture a passing gate."""
+        state, _, detail = classify(cycles=[cycle(4, listing_only=[OTHER])])
+        assert state == "undetermined"
+        assert "neither" in detail
 
-class TestTheSummaryThatReadinessGatesOn:
 
-    def test_only_unacquired_and_undetermined_block(self):
-        cycles = [cycle(2, listing_only=["b", "c"]),
-                  cycle(4, feed_only=["a"], listing_only=["c"]),
-                  cycle(9, listing_only=["c"])]
-        summary = summarise_miss_resolutions(
-            [{"url": "a", "at": T0},    # acquired at 4h
-             {"url": "c", "at": T0},    # still missing at 9h -> never acquired
-             {"url": "d", "at": T0}],   # never seen again -> undetermined
-            cycles)
-        assert summary["acquired"] == 1
-        assert summary["never_acquired"] == 1
-        assert summary["undetermined"] == 1
-        assert summary["blocking"] == 2, (
-            "acquired must not block at any lag; the other two must")
-
-    def test_an_all_acquired_population_is_clean(self):
-        """POSITIVE CONTROL. This is the shape the live data is expected to have,
-        and the whole reason for the rule change. If it cannot pass, the new rule
-        is no better than the old one."""
-        cycles = [cycle(1, feed_only=["a", "b"]), cycle(2, feed_only=["c"])]
-        summary = summarise_miss_resolutions(
-            [{"url": u, "at": T0} for u in ("a", "b", "c")], cycles)
-        assert summary["acquired"] == 3
-        assert summary["blocking"] == 0
-        assert summary["worst_acquisition_lag_hours"] == 2.0
+class TestTheSummaryReadinessGatesOn:
 
     def test_the_worst_lag_is_reported_even_though_it_does_not_gate(self):
-        """The reservation is kept visible: the number survives even though the
-        rule ignores it, so latency regression stays observable."""
-        cycles = [cycle(1, feed_only=["a"]), cycle(100, feed_only=["b"])]
+        """The reservation stays visible: the number survives even though the rule
+        ignores it, so a latency regression remains observable."""
         summary = summarise_miss_resolutions(
-            [{"url": "a", "at": T0}, {"url": "b", "at": T0}], cycles)
+            [{"url": "a", "media_type": "movie", "at": T0},
+             {"url": "b", "media_type": "movie", "at": T0}],
+            [cycle(1, feed_only=["a"]), cycle(100, feed_only=["b"])])
         assert summary["blocking"] == 0
         assert summary["worst_acquisition_lag_hours"] == 100.0, (
-            "a 100-hour acquisition passes the gate by design, but it must not "
-            "become invisible")
+            "a 100-hour acquisition passes by design, but must not be invisible")
 
     def test_a_malformed_row_counts_as_undetermined_not_ignored(self):
         """Dropping unreadable rows is how a gate silently reports zero."""
         summary = summarise_miss_resolutions(
-            [{"url": None, "at": T0}, {"url": "a"}, {}], [cycle(1)])
+            [{"url": None, "media_type": "movie", "at": T0},
+             {"url": "a", "media_type": "movie"}, {}],
+            [cycle(1)])
         assert summary["undetermined"] == 3
         assert summary["blocking"] == 3
         assert summary["acquired"] == 0
@@ -167,145 +130,121 @@ class TestTheSummaryThatReadinessGatesOn:
     def test_no_misses_at_all_is_clean(self):
         summary = summarise_miss_resolutions([], [cycle(1)])
         assert summary["blocking"] == 0
-        assert summary["acquired"] == 0
         assert summary["rows"] == []
 
 
-class TestReadinessActuallyUsesTheRule:
-    """The wiring, not just the logic.
+def _seed_one_valid_cycle(db):
+    """One cycle with per-feed provenance and one attributable miss row."""
+    import json
+    cyc = "cycle-round6"
+    stamp = "2026-08-06T12:00:00+00:00"
+    with db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO hdencode_shadow_cycles "
+            "(cycle_uuid, started_at, completed_at, normal_feed_outcomes, "
+            " normal_feeds_complete, rss_requests, listing_requests, rss_count, "
+            " listing_count, duplicate_count, feed_only_count, "
+            " listing_only_count, relevant_miss_count, request_reduction_pct, "
+            " outcome, details_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (cyc, stamp, stamp, json.dumps(BOTH), 1, 2, 1, 20, 4, 3, 1, 1, 1,
+             85.0, "relevant_miss",
+             json.dumps({"listing_only": ["https://hdencode.org/x/"],
+                         "feed_only": []})))
+        conn.execute(
+            "INSERT INTO hdencode_shadow_misses "
+            "(cycle_uuid, canonical_url, media_type) VALUES (?,?,?)",
+            (cyc, "https://hdencode.org/x/", "movie"))
+    return cyc
 
-    Five times in this project I have proved a function correct and never checked
-    that anything calls it. The old blocker was one line -- `relevant_misses > 0`
-    -- so if that line survived, or if the new one were never reached, the rule
-    would be decorative and every test above would still pass.
-    """
+
+class TestTheProductionPathActuallyUsesIt:
+    """Five times in this project I have proved a function correct and never
+    checked that anything calls it. So prove the call."""
 
     def test_the_old_unconditional_blocker_is_gone(self):
         import inspect
-
-        from backend.database import DatabaseManager
         src = inspect.getsource(DatabaseManager.get_hdencode_rss_readiness)
         assert "relevant_misses_detected" not in src, (
             "the old rule still blocks on any miss at all, so the new "
             "classification cannot change the outcome")
-        assert "unacquired_misses_detected" in src
-        assert "miss_resolution_undetermined" in src
+        for reason in ("unacquired_misses_detected", "miss_resolution_undetermined",
+                       "miss_resolution_pending",
+                       "miss_resolution_evidence_unreadable"):
+            assert reason in src, reason
 
     def test_readiness_consumes_the_summary(self, tmp_path, monkeypatch):
-        from backend import database as database_module
-        from backend.database import DatabaseManager
-
         db = DatabaseManager(str(tmp_path / "miss-rule-consumer.db"))
         try:
             monkeypatch.setattr(
-                database_module, "summarise_miss_resolutions", None,
-                raising=False)
-            monkeypatch.setattr(
                 DatabaseManager, "get_hdencode_miss_resolution",
                 lambda self: {"acquired": 7, "never_acquired": 2,
-                              "undetermined": 3, "blocking": 5,
-                              "worst_acquisition_lag_hours": 41.5, "rows": []})
+                              "undetermined": 3, "not_yet_assessable": 4,
+                              "blocking": 9, "worst_acquisition_lag_hours": 41.5,
+                              "rows": [], "evidence_problems": ["bad:c1"]})
             out = db.get_hdencode_rss_readiness()
-            assert "unacquired_misses_detected" in out["reasons"], (
-                "two never-acquired releases must block")
-            assert "miss_resolution_undetermined" in out["reasons"], (
-                "three undetermined releases must block; treating unprovable as "
-                "healthy is the fail-open this rule refuses")
+            assert "unacquired_misses_detected" in out["reasons"]
+            assert "miss_resolution_undetermined" in out["reasons"]
+            assert "miss_resolution_pending" in out["reasons"], (
+                "pending must block; see the module docstring for why")
+            assert "miss_resolution_evidence_unreadable" in out["reasons"]
             assert out["misses_acquired"] == 7
-            assert out["misses_never_acquired"] == 2
-            assert out["misses_undetermined"] == 3
-            assert out["worst_acquisition_lag_hours"] == 41.5, (
-                "the lag must stay visible even though it no longer gates")
+            assert out["misses_not_yet_assessable"] == 4
+            assert out["worst_acquisition_lag_hours"] == 41.5
+            assert out["miss_evidence_problems"] == ["bad:c1"]
         finally:
             db.close()
 
-    def test_an_all_acquired_population_does_not_block_on_misses(
+    def test_a_healthy_resolved_population_does_not_block_on_misses(
             self, tmp_path, monkeypatch):
-        """THE POINT OF THE CHANGE. Under the old rule this could never happen."""
-        from backend.database import DatabaseManager
-
+        """POSITIVE CONTROL. Making pending block must not make everything block."""
         db = DatabaseManager(str(tmp_path / "miss-rule-clean.db"))
         try:
             monkeypatch.setattr(
                 DatabaseManager, "get_hdencode_miss_resolution",
                 lambda self: {"acquired": 60, "never_acquired": 0,
-                              "undetermined": 0, "blocking": 0,
-                              "worst_acquisition_lag_hours": 3.2, "rows": []})
+                              "undetermined": 0, "not_yet_assessable": 0,
+                              "blocking": 0, "worst_acquisition_lag_hours": 3.2,
+                              "rows": [], "evidence_problems": []})
             out = db.get_hdencode_rss_readiness()
-            assert "unacquired_misses_detected" not in out["reasons"]
-            assert "miss_resolution_undetermined" not in out["reasons"]
+            for reason in ("unacquired_misses_detected",
+                           "miss_resolution_undetermined",
+                           "miss_resolution_pending",
+                           "miss_resolution_evidence_unreadable"):
+                assert reason not in out["reasons"], reason
             assert out["misses_acquired"] == 60
-            # Other blockers (cycle counts, feed health) still apply on an empty
-            # database -- this asserts only that MISSES stopped blocking.
         finally:
             db.close()
 
+    def test_unreadable_cycle_evidence_is_reported_not_absorbed(self, tmp_path):
+        """Skipping a malformed cycle can remove the only observation after a
+        miss, which would quietly turn a decidable row into an unresolved one."""
+        db = DatabaseManager(str(tmp_path / "miss-rule-malformed.db"))
+        try:
+            cyc = _seed_one_valid_cycle(db)
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE hdencode_shadow_cycles SET details_json='{not json' "
+                    "WHERE cycle_uuid=?", (cyc,))
+            res = db.get_hdencode_miss_resolution()
+            assert any("details_json_unparseable" in p
+                       for p in res["evidence_problems"]), res["evidence_problems"]
+        finally:
+            db.close()
 
-class TestNotYetAssessableIsNotAFailure:
-    """The refinement measuring forced, and the line it must not cross.
-
-    My first implementation returned "undetermined" whenever acquisition could
-    not be proven -- including for rows recorded during the newest cycle, which by
-    definition have no later observation. Live data: 62 acquired, 0 never
-    acquired, 4 undetermined, and ALL FOUR were from the newest cycle, one hour
-    old. Since any poll can record a miss, that would have left the gate
-    permanently unpassable for a new reason instead of the old one.
-
-    The split is between "unproven because no observation has happened yet" and
-    "unproven because we observed and still cannot tell". The first is excluded;
-    the second still blocks. Everything below exists to keep that line where it
-    is, because widening it is how this subsystem produced two HIGH findings.
-    """
-
-    def test_a_row_with_no_later_cycle_is_not_yet_assessable(self):
-        state, hours, detail = classify_miss_resolution(
-            URL, T0, [cycle(-2, feed_only=[OTHER])])
-        assert state == "not_yet_assessable", (
-            "no completed observation exists after this row, so no resolution "
-            "could have been seen; calling it a failure makes the gate "
-            "unpassable by construction")
-        assert hours == 0.0
-        assert "yet" in detail
-
-    def test_the_newest_cycle_case_from_the_live_data(self):
-        """The exact shape of all four live rows: recorded AT the newest cycle."""
-        newest = cycle(0)          # same instant as first_seen
-        state, _, _ = classify_miss_resolution(URL, T0, [cycle(-5), newest])
-        assert state == "not_yet_assessable"
-
-    def test_one_later_cycle_makes_it_assessable_again(self):
-        """The exclusion must be narrow: a SINGLE later observation is enough to
-        put the row back under judgement."""
-        state, _, _ = classify_miss_resolution(
-            URL, T0, [cycle(1, listing_only=[OTHER])])
-        assert state == "undetermined", (
-            "once any later observation exists, an unprovable row must block "
-            "again -- otherwise 'not yet assessable' becomes a permanent excuse")
-
-    def test_a_later_cycle_that_still_shows_it_missing_is_a_real_failure(self):
-        state, _, _ = classify_miss_resolution(
-            URL, T0, [cycle(1, listing_only=[URL]), cycle(5, listing_only=[URL])])
-        assert state == "never_acquired"
-
-    def test_not_yet_assessable_does_not_count_toward_blocking(self):
-        summary = summarise_miss_resolutions(
-            [{"url": URL, "at": T0}], [cycle(-1)])
-        assert summary["not_yet_assessable"] == 1
-        assert summary["blocking"] == 0
-        assert summary["undetermined"] == 0
-
-    def test_it_is_still_reported_so_the_exclusion_is_visible(self):
-        """A silent exclusion is indistinguishable from a bug."""
-        summary = summarise_miss_resolutions(
-            [{"url": URL, "at": T0}, {"url": OTHER, "at": T0}], [cycle(-1)])
-        assert summary["not_yet_assessable"] == 2, (
-            "the count must appear in the summary; if excluded rows vanish, a "
-            "reader cannot tell a clean gate from a gate that dropped its "
-            "evidence")
-
-    def test_malformed_rows_are_still_undetermined_not_excused(self):
-        """The new state must not become a dumping ground for bad data."""
-        summary = summarise_miss_resolutions([{"url": None, "at": T0}], [cycle(-1)])
-        assert summary["undetermined"] == 1
-        assert summary["not_yet_assessable"] == 0
-        assert summary["blocking"] == 1
+    def test_a_non_list_url_container_does_not_raise(self, tmp_path):
+        """`set(5)` raises TypeError, which would take the whole readiness call
+        down rather than degrade. Peer review found this path."""
+        db = DatabaseManager(str(tmp_path / "miss-rule-badtype.db"))
+        try:
+            cyc = _seed_one_valid_cycle(db)
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE hdencode_shadow_cycles "
+                    "SET details_json='{\"listing_only\": 5, \"feed_only\": []}' "
+                    "WHERE cycle_uuid=?", (cyc,))
+            res = db.get_hdencode_miss_resolution()
+            assert any("listing_only_not_a_list" in p
+                       for p in res["evidence_problems"]), res["evidence_problems"]
+        finally:
+            db.close()

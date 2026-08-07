@@ -370,80 +370,105 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
 _RESOLUTION_STATES = ("acquired", "never_acquired", "undetermined",
                       "not_yet_assessable")
 
+#: The only media types a miss row may carry. Anything else is corrupt evidence
+#: and cannot be resolved, because the responsible feed is unknown.
+_VALID_MEDIA_TYPES = frozenset({"movie", "tv", "unknown"})
 
-def classify_miss_resolution(url, first_seen, usable_cycles):
+
+def cycle_is_valid_evidence_for(media_type, cycle):
+    """May this cycle be used as an observation for a miss of ``media_type``?
+
+    Two regimes, and getting the split wrong breaks the rule in OPPOSITE ways --
+    I managed both in one session.
+
+    * **Per-feed provenance present** -> use it. A cycle where movies_all
+      validated and tv_all failed is good evidence about a movie and useless
+      about TV. Requiring both feeds here was the peer-reviewed regression: it
+      discarded legitimate evidence and dropped real misses out of the gate.
+
+    * **No per-feed provenance** (NULL, or a `_derived_from` cycle-level marker)
+      -> fall back to that cycle's own `normal_feeds_complete`. 319 of 331 live
+      cycles predate per-feed provenance, so treating them as evidence for
+      nothing is not "stricter", it is blind: my first correction did exactly
+      that and turned 70 genuinely-acquired rows into "undetermined". The review
+      allowed this fallback explicitly -- there is nothing finer to use for a row
+      recorded before the finer data existed.
+    """
+    outcomes = cycle.get("outcomes")
+    if outcomes:
+        return feed_observation_valid(str(media_type), outcomes)
+    return bool(cycle.get("cycle_complete"))
+
+
+def classify_miss_resolution(url, media_type, first_seen, cycles):
     """Was ``url`` -- listing-only at ``first_seen`` -- ever provably acquired?
 
-    ``usable_cycles`` is an ordered sequence of mappings with ``at`` (datetime),
-    ``listing_only`` and ``feed_only`` (containers of canonical URLs). Only cycles
-    strictly after ``first_seen`` are considered.
+    ``cycles`` is an ordered sequence of mappings with ``at`` (datetime),
+    ``listing_only`` / ``feed_only`` (containers of canonical URLs) and
+    ``outcomes`` (that cycle's per-normal-feed outcome map). Only cycles strictly
+    after ``first_seen`` count, and only those whose relevant feed was actually
+    observed for THIS media type.
 
-    Returns ``(state, hours, detail)`` where state is one of
-    ``acquired`` / ``never_acquired`` / ``undetermined``.
+    Returns ``(state, hours, detail)`` with state in ``acquired`` /
+    ``never_acquired`` / ``undetermined`` / ``not_yet_assessable``.
 
-    The only affirmative evidence of acquisition is a later cycle in which the
-    feed has the URL and the listing no longer does -- the same transition the
+    PER-FEED AUTHORITY, restored 2026-08-07 after peer review. The first version
+    admitted an observation cycle only when ``normal_feeds_complete == 1``. That
+    is the cycle-level rule this project spent five review rounds REPLACING: a
+    cycle where movies_all validated and tv_all failed is perfectly good evidence
+    about a movie, and useless about TV. compare_shadow already emits misses on
+    exactly that basis -- its own comment says "a cycle where movies_all
+    succeeded says nothing about a tv_all gap" -- so filtering resolution on
+    cycle completeness threw away legitimate evidence and, worse, dropped
+    legitimately-recorded misses out of the gate entirely. That was a false-ready
+    path and it was mine.
+
+    The only affirmative evidence of acquisition is a later valid cycle in which
+    the feed has the URL and the listing no longer does -- the transition the
     qualification grader treats as definitive. Absence from both sides proves
-    nothing: the listing simply pages away over time.
+    nothing: the listing pages away over time.
     """
-    # NOT YET ASSESSABLE vs UNDETERMINED, split 2026-08-07 after measuring.
-    #
-    # My first cut returned "undetermined" whenever acquisition could not be
-    # proven, including for rows recorded during the MOST RECENT cycle -- rows
-    # that no later observation exists for yet. Measured against live data that
-    # produced 62 acquired, 0 never acquired, and 4 undetermined, all four from
-    # the newest cycle, one hour old. Since every poll can record a miss, that
-    # rule would leave the gate permanently unpassable for a new reason instead
-    # of the old one. Replacing an unpassable gate with a differently unpassable
-    # gate is not progress.
-    #
-    # So: if NO usable cycle exists after the row, no resolution could have been
-    # observed and the row is not yet assessable -- excluded from the verdict, not
-    # counted as a failure. That is not fail-open. It is the difference between
-    # "unproven because we have not looked yet" and "unproven because we looked
-    # and could not tell", and the second still blocks.
-    later = [c for c in usable_cycles
-             if c.get("at") is not None and c["at"] > first_seen]
-    if not later:
+    valid_later = [c for c in cycles
+                   if c.get("at") is not None and c["at"] > first_seen
+                   and cycle_is_valid_evidence_for(str(media_type), c)]
+    if not valid_later:
         return ("not_yet_assessable", 0.0,
-                "no completed observation exists after this row yet")
+                "no completed observation of this release's own feed exists "
+                "after this row yet")
 
     last_missing = None
-    for cycle in usable_cycles:
-        at = cycle.get("at")
-        if at is None or at <= first_seen:
-            continue
+    for cycle in valid_later:
         if url in (cycle.get("feed_only") or ()):
-            # DEFINITIVE: the feed holds it and the listing has let it go.
-            return ("acquired", (at - first_seen).total_seconds() / 3600.0, "")
+            return ("acquired",
+                    (cycle["at"] - first_seen).total_seconds() / 3600.0, "")
         if url in (cycle.get("listing_only") or ()):
-            last_missing = at
-    newest = None
-    for cycle in usable_cycles:
-        at = cycle.get("at")
-        if at is not None and (newest is None or at > newest):
-            newest = at
-    span = ((newest - first_seen).total_seconds() / 3600.0
-            if newest and newest > first_seen else 0.0)
+            last_missing = cycle["at"]
+    newest = max(c["at"] for c in valid_later)
+    span = (newest - first_seen).total_seconds() / 3600.0
     if last_missing is not None:
-        # Seen still absent from the feed at a later observation, and never
-        # afterwards seen in it. That is the affirmative negative.
         return ("never_acquired", span,
-                "observed still missing at a later cycle, never acquired")
+                "observed still missing at a later valid cycle, never acquired")
     return ("undetermined", span,
             "left the listing without ever appearing in the feed, so neither "
             "acquisition nor loss can be proven")
 
 
-def summarise_miss_resolutions(misses, usable_cycles):
+def summarise_miss_resolutions(misses, cycles):
     """Aggregate per-row classifications into the counts readiness gates on.
 
-    ``misses`` is a sequence of mappings with ``url`` and ``at`` (datetime).
+    ``misses`` is a sequence of mappings with ``url``, ``media_type`` and ``at``.
 
-    Returns a mapping with a count per state, the worst observed acquisition lag
-    in hours, and the per-row detail. Only ``never_acquired`` and ``undetermined``
-    are failures; ``acquired`` is a success at ANY lag, which is the whole point
-    of the rule.
+    NOT_YET_ASSESSABLE NOW BLOCKS, reversed 2026-08-07 on peer review. I had
+    excluded it so the gate could pass, and the review showed that is unsafe in a
+    way I had not considered: the shadow comparison is recorded only while
+    ``discovery_mode == "rss_shadow"`` (background_scanner.py:449). So promoting
+    to rss_primary STOPS producing the observations a pending row needs. The gate
+    could open on evidence its own promoted mode then destroys, turning
+    "temporarily unassessable" into a permanent blind spot.
+
+    The honest way to pass is a frozen cohort -- fix an admission cutoff, collect
+    an observation tail, require every admitted row to resolve -- not to make a
+    live unresolved row vanish because it happens to be newest.
     """
     counts = {state: 0 for state in _RESOLUTION_STATES}
     rows = []
@@ -451,23 +476,42 @@ def summarise_miss_resolutions(misses, usable_cycles):
     for miss in misses:
         url = miss.get("url")
         first_seen = miss.get("at")
+        media_type = miss.get("media_type")
         if not url or first_seen is None:
-            # A row we cannot even locate in time is not evidence of health.
             counts["undetermined"] += 1
             rows.append({"url": url, "state": "undetermined", "hours": 0.0,
                          "detail": "missing url or timestamp"})
             continue
+        if media_type is None:
+            # PRE-ATTRIBUTION LEGACY ROW. media_type was added by the RSS
+            # accounting work, so every miss recorded before that migration has
+            # NULL here -- 70 of 72 rows in the live database. Treating those as
+            # corrupt blocked the gate on all of them, which is a false BLOCK
+            # exactly as bad as the false ready it replaced. I only found it
+            # because the measurement swung from 62 acquired to 1.
+            #
+            # "unknown" is the honest reading: the responsible feed was never
+            # recorded, so resolution requires BOTH feeds where per-feed data
+            # exists, and falls back to that cycle's completeness where it does
+            # not. Conservative without being blind.
+            media_type = "unknown"
+        elif str(media_type) not in _VALID_MEDIA_TYPES:
+            # A value that is present but outside the vocabulary is corrupt
+            # evidence, not a legacy gap, and must not be silently coerced.
+            counts["undetermined"] += 1
+            rows.append({"url": url, "state": "undetermined", "hours": 0.0,
+                         "detail": f"invalid media_type {media_type!r}"})
+            continue
         state, hours, detail = classify_miss_resolution(
-            url, first_seen, usable_cycles)
+            url, media_type, first_seen, cycles)
         counts[state] += 1
         if state == "acquired":
             worst_lag = max(worst_lag, hours)
-        rows.append({"url": url, "state": state, "hours": round(hours, 3),
-                     "detail": detail})
+        rows.append({"url": url, "media_type": str(media_type), "state": state,
+                     "hours": round(hours, 3), "detail": detail})
     counts["worst_acquisition_lag_hours"] = round(worst_lag, 3)
     counts["rows"] = rows
-    # not_yet_assessable is deliberately EXCLUDED from blocking; see
-    # classify_miss_resolution for why, and note it is still reported so the
-    # exclusion is visible rather than silent.
-    counts["blocking"] = counts["never_acquired"] + counts["undetermined"]
+    # not_yet_assessable is INCLUDED here; see the docstring above.
+    counts["blocking"] = (counts["never_acquired"] + counts["undetermined"]
+                          + counts["not_yet_assessable"])
     return counts
