@@ -1620,7 +1620,11 @@ class DownloadService:
                 # auto-resume.
                 decision = None
                 if source_kind == "hdencode":
-                    decision = get_hdencode_coordinator().observe_challenge(
+                    # observe_reveal_stall, not observe_challenge: the latter
+                    # hard-codes the 1h Cloudflare value, which measurement on
+                    # 2026-08-06 showed is far shorter than a real reveal
+                    # throttle (~5h and still active at the first probe).
+                    decision = get_hdencode_coordinator().observe_reveal_stall(
                         "reveal_verification_stalled")
                 signals.append("reveal-tier:not-ready")
                 return ScrapeDiagnostic(

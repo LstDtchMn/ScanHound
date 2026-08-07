@@ -44,6 +44,20 @@ class _FakeCoordinator:
         self.observed.append(reason_code)
         return _FakeDecision()
 
+    def observe_reveal_stall(self, reason_code="reveal_verification_stalled",
+                             **kwargs):
+        # The production path calls THIS, not observe_challenge, since the
+        # reveal cooldown became configurable and escalating. When this method
+        # was missing the AttributeError was swallowed by a broad handler and
+        # surfaced as SCRAPE_EXCEPTION -- a silent degradation worth knowing
+        # about: a real coordinator API mismatch would look like a generic
+        # scrape failure rather than a wiring error.
+        self.observed.append(reason_code)
+        return _FakeDecision()
+
+    def observe_reveal_success(self):
+        self.observed.append("reveal_success")
+
     def snapshot(self):
         return {"blocked": False}
 

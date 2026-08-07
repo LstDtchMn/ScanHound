@@ -5,6 +5,7 @@ import contextlib
 import contextvars
 import heapq
 from dataclasses import dataclass
+import random
 from datetime import datetime, timedelta, timezone
 import threading
 import time
@@ -147,6 +148,14 @@ class HDEncodeTrafficCoordinator:
         }
         self._block_streak = 0
         self._local_cooldown_until: Optional[datetime] = None
+        # Reveal-stall escalation state. streak counts consecutive
+        # stalls with no intervening success; observe_reveal_success
+        # resets it.
+        self._reveal_stall_streak: int = 0
+        self._reveal_last_stall_at: Optional[str] = None
+        self._reveal_last_success_at: Optional[str] = None
+        self._reveal_last_cooldown_seconds: Optional[int] = None
+        self._reveal_last_escalation_step: Optional[int] = None
         self._local_cooldown_reason: Optional[str] = None
         self._health_cache = {}
         self._health_cache_at = 0.0
@@ -480,6 +489,103 @@ class HDEncodeTrafficCoordinator:
         with self._priority_condition:
             self._priority_condition.notify_all()
         return HDEncodeDecision(True, "cooldown", reason_code, until.isoformat())
+
+    # ---- reveal-verification stalls -------------------------------------
+    #
+    # WHY THIS IS NOT observe_challenge(). A reveal stall was previously routed
+    # through observe_challenge, which hard-codes 60 * 60. That value was chosen
+    # for Cloudflare interstitials, and a 2026-08-06 peer review flagged
+    # inheriting it as "a reasonable emergency safety value, but not a validated
+    # source policy".
+    #
+    # MEASURED THE SAME NIGHT: reveal stalls began ~18:00Z, the cooldown expired
+    # at 22:49Z, the one automatic probe at 23:02Z was STILL refused, and the
+    # source was still throttling ~5 hours in. One hour is too short. Because
+    # batch auto-resume is one-shot, a too-short cooldown spends the single
+    # probe against a closed door and leaves the batch parked until a human
+    # intervenes -- which is exactly what happened, and was corrected by hand.
+    #
+    # So: configurable base, escalate on consecutive stalls, reset on success,
+    # and jitter so a fleet of items does not resume in lockstep.
+    _REVEAL_ESCALATION = (1, 2, 4)  # multipliers: 1h -> 2h -> 4h, then held
+
+    def observe_reveal_stall(
+        self,
+        reason_code: str = "reveal_verification_stalled",
+        *,
+        base_minutes: Optional[int] = None,
+        rng=None,
+    ) -> HDEncodeDecision:
+        """Cool down after the reveal control never left its verifying state.
+
+        Escalates while stalls repeat without an intervening success, so the
+        one-shot batch resume is not spent probing a source that is still shut.
+        """
+        configured = base_minutes
+        if configured is None:
+            configured = self._config_int(
+                "hdencode_reveal_cooldown_minutes", 60)
+        base = max(1, min(int(configured), 24 * 60))
+
+        with self._state_lock:
+            streak = self._reveal_stall_streak
+            self._reveal_stall_streak = streak + 1
+            step = self._REVEAL_ESCALATION[
+                min(streak, len(self._REVEAL_ESCALATION) - 1)]
+            self._metrics["reveal_stalls"] = (
+                self._metrics.get("reveal_stalls", 0) + 1)
+
+        minutes = base * step
+        # Jitter +/-10%, so many deferred items do not all probe at once.
+        source = rng or random
+        jitter = source.uniform(-0.1, 0.1)
+        seconds = max(60, int(minutes * 60 * (1.0 + jitter)))
+        until = _utcnow() + timedelta(seconds=seconds)
+
+        with self._state_lock:
+            self._local_cooldown_until = until
+            self._local_cooldown_reason = reason_code
+            self._health_cache_at = 0.0
+            # Telemetry the review asked for, readable via snapshot().
+            self._reveal_last_stall_at = _utcnow().isoformat()
+            self._reveal_last_cooldown_seconds = seconds
+            self._reveal_last_escalation_step = step
+        self._persist_failure("cooldown", reason_code, seconds)
+        with self._priority_condition:
+            self._priority_condition.notify_all()
+        return HDEncodeDecision(True, "cooldown", reason_code, until.isoformat())
+
+    def observe_reveal_success(self) -> None:
+        """A reveal completed: the source is serving again, so reset escalation.
+
+        Without this the streak would ratchet up forever and every later stall
+        would draw the maximum cooldown regardless of how healthy the source had
+        been in between.
+        """
+        with self._state_lock:
+            self._reveal_stall_streak = 0
+            self._reveal_last_success_at = _utcnow().isoformat()
+            self._metrics["reveal_successes"] = (
+                self._metrics.get("reveal_successes", 0) + 1)
+
+    def reveal_telemetry(self) -> dict:
+        """Everything needed to choose a real cooldown policy from evidence."""
+        with self._state_lock:
+            return {
+                "stall_streak": self._reveal_stall_streak,
+                "last_stall_at": self._reveal_last_stall_at,
+                "last_success_at": self._reveal_last_success_at,
+                "last_cooldown_seconds": self._reveal_last_cooldown_seconds,
+                "last_escalation_step": self._reveal_last_escalation_step,
+                "stalls": self._metrics.get("reveal_stalls", 0),
+                "successes": self._metrics.get("reveal_successes", 0),
+            }
+
+    def _config_int(self, key: str, default: int) -> int:
+        try:
+            return int((self._config or {}).get(key, default))
+        except (TypeError, ValueError):
+            return default
 
     def observe_network_failure(self, reason_code: str) -> None:
         with self._state_lock:
