@@ -191,6 +191,7 @@ class SettingsUpdate(BaseModel):
     hdencode_browser_profile_dir: Optional[str] = None
     download_batch_interval_minutes: Optional[int] = None
     download_queue_auto_resume_after_cooldown: Optional[bool] = None
+    download_queue_auto_resume_max_attempts: Optional[int] = None
     download_queue_claim_lease_seconds: Optional[int] = Field(
         default=None, ge=60, le=7200
     )

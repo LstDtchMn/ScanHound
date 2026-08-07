@@ -97,6 +97,7 @@ class AppConfig(TypedDict, total=False):
     hdencode_browser_profile_dir: str
     download_batch_interval_minutes: int
     download_queue_auto_resume_after_cooldown: bool
+    download_queue_auto_resume_max_attempts: int
     download_queue_claim_lease_seconds: int
 
     # DDLBase / Cuty.io
@@ -477,6 +478,10 @@ _DEFAULT_CONFIG: AppConfig = {
     # Multi-title grabs are deliberately spaced by default. Set 0 for immediate.
     "download_batch_interval_minutes": 10,
     "download_queue_auto_resume_after_cooldown": False,
+    # Consecutive FRUITLESS automatic resumes a batch may make. Resumes that
+    # deliver something refund the budget, so this only limits repeated futile
+    # retries. 1 restores the old single-shot behaviour.
+    "download_queue_auto_resume_max_attempts": 3,
     # Fail-stop lease for the single durable queue worker. Tunable without code.
     "download_queue_claim_lease_seconds": 600,
     "ddlbase_enabled": True,
