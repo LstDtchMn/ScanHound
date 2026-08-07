@@ -49,9 +49,19 @@ OTHER = "https://hdencode.org/unrelated-1080p/"
 BOTH = {"movies_all": "changed", "tv_all": "changed"}
 
 
-def cycle(hours, *, listing_only=(), feed_only=(), outcomes=None):
+def cycle(hours, *, listing_only=(), feed_only=(), outcomes=None,
+          listing_complete=True):
+    """A cycle dict as the DB reader now builds one.
+
+    `listing_complete` is REQUIRED evidence since 2026-08-07: peer review showed
+    that admitting mixed-feed cycles is only safe when the listing arm is verified
+    independently, because `normal_feeds_complete` folds a listing-crawl error into
+    itself. A cycle with no listing verdict falls back to the aggregate rule.
+    """
     return {"at": T0 + timedelta(hours=hours),
             "outcomes": dict(BOTH if outcomes is None else outcomes),
+            "listing_complete": listing_complete,
+            "cycle_complete": True,
             "listing_only": set(listing_only),
             "feed_only": set(feed_only)}
 

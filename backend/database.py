@@ -1027,7 +1027,13 @@ class DatabaseManager:
                         restart_recovery INTEGER NOT NULL DEFAULT 0,
                         outcome TEXT NOT NULL,
                         details_json TEXT NOT NULL DEFAULT '{}',
-                        normal_feed_outcomes TEXT
+                        normal_feed_outcomes TEXT,
+                        -- Listing-arm trustworthiness, recorded SEPARATELY from
+                        -- feed health. NULL on cycles written before 2026-08-07.
+                        -- normal_feeds_complete conflates a failed feed with a
+                        -- failed listing crawl, so resolution cannot tell them
+                        -- apart from it; see cycle_is_valid_evidence_for().
+                        listing_complete INTEGER
                     )
                 """)
                 cursor.execute("""
@@ -1062,6 +1068,11 @@ class DatabaseManager:
                     # miss can be audited rather than re-derived by guesswork.
                     "ALTER TABLE hdencode_shadow_misses "
                     "ADD COLUMN attribution_basis TEXT",
+                    # Listing-arm authority, so a mixed-feed cycle can resolve a
+                    # miss for the feed that DID succeed without also trusting a
+                    # listing crawl that failed.
+                    "ALTER TABLE hdencode_shadow_cycles "
+                    "ADD COLUMN listing_complete INTEGER",
                 ):
                     try:
                         cursor.execute(_shadow_alter)
@@ -2133,8 +2144,9 @@ class DatabaseManager:
                     rss_requests, listing_requests, rss_count, listing_count,
                     duplicate_count, feed_only_count, listing_only_count,
                     relevant_miss_count, request_reduction_pct, catchup_used,
-                    restart_recovery, outcome, details_json, normal_feed_outcomes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    restart_recovery, outcome, details_json, normal_feed_outcomes,
+                    listing_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (cycle_uuid,started_at,completed_at,1 if metrics.get("normal_feeds_complete") else 0,
                  int(metrics.get("rss_requests") or 0),int(metrics.get("listing_requests") or 0),
                  int(metrics.get("rss_count") or 0),int(metrics.get("listing_count") or 0),
@@ -2146,7 +2158,12 @@ class DatabaseManager:
                  # Written NON-NULL by every attribution-aware caller, including
                  # the empty-dict case. Only pre-attribution rows are NULL, and
                  # get_hdencode_shadow_summary depends on that distinction.
-                 json.dumps(dict(metrics.get("normal_feed_outcomes") or {}),default=str)),
+                 json.dumps(dict(metrics.get("normal_feed_outcomes") or {}),default=str),
+                 # Three-state, matching the column: None when the caller did not
+                 # record it (so resolution falls back to the aggregate rule), else
+                 # an explicit 0/1.
+                 (None if metrics.get("listing_complete") is None
+                  else (1 if metrics.get("listing_complete") else 0))),
             )
             for miss in misses:
                 conn.execute(
@@ -2512,12 +2529,27 @@ class DatabaseManager:
         for row in self._query_dicts(
                 "SELECT cycle_uuid, completed_at, outcome, normal_feeds_complete, "
                 "       rss_requests, listing_requests, details_json, "
-                "       normal_feed_outcomes "
+                "       normal_feed_outcomes, listing_complete "
                 "FROM hdencode_shadow_cycles "
                 "WHERE details_json IS NOT NULL ORDER BY completed_at",
                 default=[]):
             cycle=str(row.get("cycle_uuid") or "")
-            if not (row.get("outcome") in ("success","relevant_miss")
+            # ADMIT incomplete_feeds, corrected 2026-08-07 on peer review.
+            #
+            # This filter used to require outcome in ("success","relevant_miss"),
+            # and compare_shadow writes "incomplete_feeds" whenever
+            # normal_feeds_complete is false -- which is exactly the mixed-feed
+            # case the per-feed rule exists to handle. So a cycle with
+            # movies_all=changed and tv_all=failed was discarded HERE, before
+            # cycle_is_valid_evidence_for() could ever see it. The helper was
+            # right and unreachable.
+            #
+            # Admitting it is only safe because listing trustworthiness is now a
+            # separate authority: cycle_is_valid_evidence_for() requires the
+            # listing arm AND the relevant feed, so an "incomplete_feeds" cycle
+            # whose LISTING failed still cannot resolve anything.
+            if not (row.get("outcome") in ("success","relevant_miss",
+                                           "incomplete_feeds")
                     and int(row.get("rss_requests") or 0)>0
                     and int(row.get("listing_requests") or 0)>0):
                 continue
@@ -2538,8 +2570,11 @@ class DatabaseManager:
             if listing is None or feed is None:
                 continue
             outcomes=self._normal_feed_outcomes(row, cycle, problems)
+            raw_listing_ok=row.get("listing_complete")
             cycles.append({"at":at,"listing_only":listing,"feed_only":feed,
                            "outcomes":outcomes,
+                           "listing_complete":(None if raw_listing_ok is None
+                                               else bool(raw_listing_ok)),
                            "cycle_complete":bool(row.get("normal_feeds_complete"))})
 
         misses=[]

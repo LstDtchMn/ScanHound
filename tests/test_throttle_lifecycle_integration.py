@@ -131,7 +131,8 @@ def success_outcome():
     return {"success": True, "method": "jdownloader", "link_count": 1,
             "message": "sent", "reason_code": "", "stage": "download",
             "retryable": False, "retry_mode": "none",
-            "transport_attempted": True, "affected_scope": "item",
+            "transport_attempted": None, "source_progress": True,
+            "affected_scope": "item",
             "action_code": "", "signals": []}
 
 

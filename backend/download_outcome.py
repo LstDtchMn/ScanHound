@@ -333,6 +333,10 @@ def public_download_result(
         "retry_mode": source.get("retry_mode"),
         "cooldown_until": source.get("cooldown_until"),
         "transport_attempted": source.get("transport_attempted"),
+        # Carried through so the queue can tell a real source delivery from a
+        # pre-scrape duplicate. Dropping it here would make the producer's signal
+        # invisible to its only consumer.
+        "source_progress": bool(source.get("source_progress")),
         "affected_scope": source.get("affected_scope") or "item",
         "action_code": source.get("action_code"),
         "signals": signals,

@@ -2649,6 +2649,18 @@ class DownloadService:
             "retry_mode": "none",
             "cooldown_until": None,
             "transport_attempted": None,
+            # AFFIRMATIVE SOURCE-PROGRESS SIGNAL, added 2026-08-07 on peer review.
+            # Set to True ONLY by a path that genuinely crossed the source
+            # boundary. The pre-scrape dedup returns success without contacting
+            # the source and leaves this False, which is the distinction the
+            # queue's retry-budget refund depends on.
+            #
+            # A previous attempt inferred this from transport_attempted, which
+            # does not work: that field is initialised None here and NONE of the
+            # real success paths set it, so the inference silently never fired.
+            # Only an explicit signal, set where the delivery actually happens,
+            # is trustworthy.
+            "source_progress": False,
             "affected_scope": "item",
             "action_code": None,
             "deferred": False,
@@ -2790,6 +2802,7 @@ class DownloadService:
             if self.send_to_jdownloader(links, package_name, destination=destination, progress_callback=_cb):
                 result["success"] = True
                 result["method"] = "jdownloader"
+                result["source_progress"] = True
                 result["message"] = f"Sent {len(links)} links to JDownloader"
                 result["history_saved"] = self.save_to_history(
                     url, title, season, resolution, size, status="completed",
@@ -2811,6 +2824,7 @@ class DownloadService:
         if not self.server_mode and self.copy_to_clipboard(links):
             result["success"] = True
             result["method"] = "clipboard"
+            result["source_progress"] = True
             result["message"] = f"Copied {len(links)} links to clipboard"
             result["history_saved"] = self.save_to_history(
                 url, title, season, resolution, size, status="clipboard",
@@ -2826,6 +2840,7 @@ class DownloadService:
         if not self.server_mode and self.open_url(url):
             result["success"] = True
             result["method"] = "browser"
+            result["source_progress"] = True
             result["message"] = "Opened URL in browser"
             result["history_saved"] = self.save_to_history(
                 url, title, season, resolution, size, status="browser",

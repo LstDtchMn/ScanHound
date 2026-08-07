@@ -886,7 +886,14 @@ class DownloadQueueService:
             # A pre-scrape dedup returns success without contacting the source, so
             # counting completions would refund retry budget the source never
             # earned. See is_source_delivery().
-            if self.is_source_delivery(outcome):
+            # SOURCE OWNERSHIP, added 2026-08-07 on peer review. schedule_batch
+            # permits mixed-source batches (it labels them "mixed"), and
+            # _claim_due does not require the parent batch to be scheduled, so a
+            # DDLBase or Adit-HD item can complete while the batch is paused for
+            # HDEncode. A batch-global counter therefore let another source refund
+            # HDEncode's retry budget. Only work from the owning source counts.
+            if (self.is_source_delivery(outcome)
+                    and str(item.get("source") or "") == self.AUTO_RESUME_SOURCE):
                 conn.execute(
                     "UPDATE download_queue_batches "
                     "SET source_delivery_count = source_delivery_count + 1 "
@@ -1103,38 +1110,34 @@ class DownloadQueueService:
             value = 3
         return max(1, min(10, value))
 
-    #: Completion methods that do NOT prove the source served anything.
-    #: download_item() returns success with these BEFORE scraping, when the
-    #: release (or a same/lower-quality copy) was already grabbed by another
-    #: route -- so HDEncode was never contacted.
-    _NON_SOURCE_METHODS = frozenset({"", "duplicate", "duplicate_similar"})
+    #: The source whose retry budget the auto-resume machinery manages. The
+    #: coordinator, the reveal cooldown and the batch pause are all HDEncode
+    #: concepts, so only HDEncode work may refund an HDEncode retry.
+    AUTO_RESUME_SOURCE = "hdencode"
 
-    @classmethod
-    def is_source_delivery(cls, outcome: dict) -> bool:
+    @staticmethod
+    def is_source_delivery(outcome: dict) -> bool:
         """Did this completion actually cross the source boundary?
 
-        THE DEFECT THIS REPLACES, found by peer review. #51 refunded retry budget
-        whenever the batch's COUNT of completed items grew, and its own text
-        claimed "progress means items actually delivered". That is not what
-        `completed` means. `download_item()` deduplicates before scraping: if the
-        URL is already grabbed it returns success with method='duplicate' having
-        contacted nothing. So a batch could earn another automatic retry against a
-        throttling source purely because an item was already satisfied elsewhere.
+        Keyed on ONE affirmative signal the producer sets where the delivery
+        happens (`source_progress`), for a reason worth recording.
 
-        Both conditions are required, deliberately:
+        THE PREVIOUS VERSION DID NOTHING. It required
+        `transport_attempted` to be truthy on top of a method check, and peer
+        review found that no real success path sets that field --
+        `download_item()` initialises it to None and the jdownloader, clipboard
+        and browser paths never touch it. The only writers are failure
+        diagnostics. So the counter never incremented in production and the
+        refund could never fire, while the tests passed because they fabricated
+        the flag. The extra condition I added as "belt and braces" is precisely
+        what made the whole mechanism inert.
 
-        * the method is not one of the pre-scrape dedup outcomes, and
-        * the outcome reports transport was attempted.
-
-        `transport_attempted` alone is not sufficient: `_complete` writes the
-        COLUMN as 1 unconditionally, so the persisted field cannot discriminate --
-        only the outcome dict can. The method check alone would also miss any
-        future short-circuit that forgets to name itself.
+        The lesson applied here: infer nothing. One field, set by the code that
+        performs the delivery, checked by the code that rewards it -- and an
+        integration test that runs the real producer rather than a hand-built
+        dict.
         """
-        method = str((outcome or {}).get("method") or "").strip().lower()
-        if method in cls._NON_SOURCE_METHODS:
-            return False
-        return bool((outcome or {}).get("transport_attempted"))
+        return bool((outcome or {}).get("source_progress"))
 
     def _source_delivery_count(self, conn, batch_uuid: str) -> int:
         row = conn.execute(

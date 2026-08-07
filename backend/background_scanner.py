@@ -475,6 +475,15 @@ class BackgroundScanner:
                         # decide validity per release instead of per cycle, so a
                         # movie gap can still block when only the TV feed failed.
                         normal_feed_outcomes=normal,
+                        # LISTING-ARM AUTHORITY, separate from feed health.
+                        # _rss_normal_feeds_complete() folds listing_error into
+                        # normal_feeds_complete, so the stored outcome cannot tell
+                        # "a feed failed" from "the listing crawl failed". Miss
+                        # resolution needs them apart: a movie miss may be resolved
+                        # by a cycle where tv_all failed, but never by one whose
+                        # listing was broken -- the listing is the other half of
+                        # the comparison.
+                        listing_complete=not bool(err),
                     ).as_dict()
                     completed_at = datetime.now(timezone.utc).isoformat()
                     restart_recovery = self._qualify_restart_recovery(

@@ -78,7 +78,8 @@ def _outcome(method, *, transport=True):
     return {"success": True, "method": method, "link_count": 1,
             "message": "x", "reason_code": "", "stage": "download",
             "retryable": False, "retry_mode": "none",
-            "transport_attempted": transport, "affected_scope": "item",
+            "transport_attempted": None, "source_progress": transport,
+            "affected_scope": "item",
             "action_code": "", "signals": []}
 
 
@@ -360,15 +361,30 @@ class TestOnlyRealSourceProgressRefundsTheBudget:
             db.close()
 
     def test_the_predicate_itself(self):
-        """Direct coverage, so a wiring change cannot hide a semantics change."""
-        assert DownloadQueueService.is_source_delivery(
-            {"method": "jdownloader", "transport_attempted": True})
-        for bad in ({"method": "duplicate", "transport_attempted": True},
-                    {"method": "duplicate_similar", "transport_attempted": True},
-                    {"method": "", "transport_attempted": True},
-                    {"method": "jdownloader", "transport_attempted": False},
-                    {"method": "jdownloader"}, {}):
+        """Direct coverage of the predicate.
+
+        REWRITTEN 2026-08-07. This previously asserted the transport_attempted
+        contract, and peer review showed that contract was unsatisfiable in
+        production: no real success path sets that field, so the counter never
+        incremented and the refund could never fire. The predicate now keys on the
+        affirmative `source_progress` signal the producer sets where the delivery
+        happens. See tests/test_source_progress_contract.py, which asserts the
+        producer actually emits it -- the check whose absence let this go unnoticed.
+        """
+        assert DownloadQueueService.is_source_delivery({"source_progress": True})
+        for bad in ({"source_progress": False},
+                    {"method": "jdownloader", "transport_attempted": True},
+                    {"method": "duplicate", "source_progress": False},
+                    {}):
             assert not DownloadQueueService.is_source_delivery(bad), bad
+
+    def test_a_real_success_shape_still_counts(self):
+        """A production success carries transport_attempted=None. If anything
+        re-introduces a requirement on that field, real deliveries silently stop
+        counting again -- which is exactly what happened."""
+        assert DownloadQueueService.is_source_delivery(
+            {"success": True, "method": "jdownloader",
+             "transport_attempted": None, "source_progress": True})
 
 
 class TestMigratedBatchesGetNoFreeCredit:

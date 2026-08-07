@@ -34,8 +34,15 @@ MOVIES_ONLY = {"movies_all": "changed", "tv_all": "failed"}
 TV_ONLY = {"movies_all": "failed", "tv_all": "not_modified"}
 
 
-def cyc(hours, outcomes, *, listing_only=(), feed_only=()):
+def cyc(hours, outcomes, *, listing_only=(), feed_only=(),
+        listing_complete=True):
+    """A cycle with per-feed provenance AND an explicit listing verdict.
+
+    Both authorities are required since 2026-08-07; see the listing control in
+    tests/test_miss_resolution_db_backed.py for why.
+    """
     return {"at": T0 + timedelta(hours=hours), "outcomes": outcomes,
+            "listing_complete": listing_complete, "cycle_complete": True,
             "listing_only": set(listing_only), "feed_only": set(feed_only)}
 
 
@@ -157,13 +164,13 @@ class TestLegacyCyclesFallBackRatherThanGoBlind:
 
     def test_a_legacy_complete_cycle_still_resolves(self):
         legacy = {"at": T0 + timedelta(hours=2), "outcomes": None,
-                  "cycle_complete": True,
+                  "listing_complete": None, "cycle_complete": True,
                   "listing_only": set(), "feed_only": {MOVIE}}
         assert classify_miss_resolution(MOVIE, "movie", T0, [legacy])[0] == "acquired"
 
     def test_a_legacy_incomplete_cycle_is_not_evidence(self):
         legacy = {"at": T0 + timedelta(hours=2), "outcomes": None,
-                  "cycle_complete": False,
+                  "listing_complete": None, "cycle_complete": False,
                   "listing_only": set(), "feed_only": {MOVIE}}
         assert classify_miss_resolution(
             MOVIE, "movie", T0, [legacy])[0] == "not_yet_assessable"
@@ -172,12 +179,12 @@ class TestLegacyCyclesFallBackRatherThanGoBlind:
         """Where per-feed data exists it is authoritative in BOTH directions: it
         can admit a cycle the flag would reject, and reject one the flag admits."""
         admits = {"at": T0 + timedelta(hours=2), "outcomes": MOVIES_ONLY,
-                  "cycle_complete": False,
+                  "listing_complete": True, "cycle_complete": False,
                   "listing_only": set(), "feed_only": {MOVIE}}
         assert classify_miss_resolution(MOVIE, "movie", T0,
                                         [admits])[0] == "acquired"
         rejects = {"at": T0 + timedelta(hours=2), "outcomes": TV_ONLY,
-                   "cycle_complete": True,
+                   "listing_complete": True, "cycle_complete": True,
                    "listing_only": set(), "feed_only": {MOVIE}}
         assert classify_miss_resolution(MOVIE, "movie", T0,
                                         [rejects])[0] == "not_yet_assessable"
@@ -199,7 +206,7 @@ class TestLegacyRowsWithNoMediaType:
 
     def test_a_null_media_type_can_still_resolve_via_a_complete_cycle(self):
         legacy_cycle = {"at": T0 + timedelta(hours=2), "outcomes": None,
-                        "cycle_complete": True,
+                        "listing_complete": None, "cycle_complete": True,
                         "listing_only": set(), "feed_only": {MOVIE}}
         summary = summarise_miss_resolutions(
             [{"url": MOVIE, "media_type": None, "at": T0}], [legacy_cycle])

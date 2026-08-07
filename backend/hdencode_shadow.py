@@ -232,6 +232,17 @@ class ShadowComparison:
     relevant_miss_count:int; rss_requests:int; listing_requests:int; request_reduction_pct:float
     normal_feeds_complete:bool; outcome:str; feed_only:tuple[str,...]; listing_only:tuple[str,...]
     relevant_misses:tuple[dict,...]
+    #: Whether the LISTING arm of this comparison is trustworthy, independent of
+    #: feed health. None means "not recorded" (cycles written before this field).
+    #:
+    #: WHY THIS IS SEPARATE, added 2026-08-07 on peer review. `normal_feeds_complete`
+    #: conflates two different failures: _rss_normal_feeds_complete() returns False
+    #: when a normal feed failed AND when the listing crawl errored. So the stored
+    #: outcome "incomplete_feeds" cannot tell those apart, and resolution needs
+    #: both authorities separately -- a movie miss can be resolved by a cycle where
+    #: tv_all failed, but NOT by one where the listing itself was broken, because
+    #: the listing is the other half of the comparison.
+    listing_complete:Optional[bool]=None
     # Per-normal-feed provenance for THIS cycle, e.g.
     # {"movies_all": "changed", "tv_all": "failed"}. Persisted so a miss can be
     # attributed retrospectively; without it a re-grade has only a cycle-level
@@ -246,7 +257,7 @@ class ShadowComparison:
     unattributable:tuple[dict,...]=()
     def as_dict(self): return asdict(self)
 
-def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss_requests:int, listing_requests:int, normal_feeds_complete:bool, normal_feed_outcomes: Optional[Mapping[str,str]]=None) -> ShadowComparison:
+def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss_requests:int, listing_requests:int, normal_feeds_complete:bool, normal_feed_outcomes: Optional[Mapping[str,str]]=None, listing_complete: Optional[bool]=None) -> ShadowComparison:
     rss={canonical_url(u) for u in rss_urls if u}
     listing={}
     for item in listing_items:
@@ -337,7 +348,8 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
     # spans catch-up feeds and counts attempted-but-failed requests, so it
     # admitted exactly the stale comparisons it was meant to exclude.
     if misses and normal_feeds_complete: outcome='relevant_miss'
-    return ShadowComparison(len(rss),len(listing_urls),len(duplicate),len(feed_only),len(listing_only),len(misses),int(rss_requests),int(listing_requests),round(reduction,2),bool(normal_feeds_complete),outcome,tuple(sorted(feed_only)),tuple(sorted(listing_only)),tuple(misses),dict(recorded),tuple(unattributable))
+    return ShadowComparison(len(rss),len(listing_urls),len(duplicate),len(feed_only),len(listing_only),len(misses),int(rss_requests),int(listing_requests),round(reduction,2),bool(normal_feeds_complete),outcome,tuple(sorted(feed_only)),tuple(sorted(listing_only)),tuple(misses),dict(recorded),tuple(unattributable),
+        listing_complete=(None if listing_complete is None else bool(listing_complete)))
 
 
 # ---------------------------------------------------------------------------
@@ -378,26 +390,42 @@ _VALID_MEDIA_TYPES = frozenset({"movie", "tv", "unknown"})
 def cycle_is_valid_evidence_for(media_type, cycle):
     """May this cycle be used as an observation for a miss of ``media_type``?
 
-    Two regimes, and getting the split wrong breaks the rule in OPPOSITE ways --
-    I managed both in one session.
+    TWO INDEPENDENT AUTHORITIES, both required. Peer review found that round 2 had
+    the per-feed rule right in this helper and then never reached it, because the
+    database reader filtered cycles on ``outcome in ("success","relevant_miss")``
+    while `compare_shadow` stores every aggregate-incomplete comparison as
+    ``incomplete_feeds``. A cycle with movies_all=changed and tv_all=failed -- the
+    exact case this helper exists for -- was discarded before it ran.
 
-    * **Per-feed provenance present** -> use it. A cycle where movies_all
-      validated and tv_all failed is good evidence about a movie and useless
-      about TV. Requiring both feeds here was the peer-reviewed regression: it
-      discarded legitimate evidence and dropped real misses out of the gate.
+    But simply admitting ``incomplete_feeds`` is not safe either, because
+    `_rss_normal_feeds_complete()` also returns False when the LISTING crawl
+    errored, and the listing is the other half of the comparison. So:
 
-    * **No per-feed provenance** (NULL, or a `_derived_from` cycle-level marker)
-      -> fall back to that cycle's own `normal_feeds_complete`. 319 of 331 live
-      cycles predate per-feed provenance, so treating them as evidence for
-      nothing is not "stricter", it is blind: my first correction did exactly
-      that and turned 70 genuinely-acquired rows into "undetermined". The review
-      allowed this fallback explicitly -- there is nothing finer to use for a row
-      recorded before the finer data existed.
+    1. **the listing arm must be trustworthy**, and
+    2. **the feed responsible for this media type must have been observed**.
+
+    ``listing_complete`` carries (1) explicitly. ``None`` means the cycle predates
+    that field, and then the conservative cycle-level rule stands in for both --
+    which is the same legacy fallback the review accepted, and the same information
+    loss: old mixed cycles cannot be re-derived at per-feed precision.
+
+    ``outcomes`` carries (2) as a per-feed map, and the fallback is decided on
+    ``is None`` rather than truthiness -- an explicit empty map means "no feed was
+    observed", which is NOT the same as "no per-feed data was recorded". Collapsing
+    those two was a separate review finding.
     """
+    listing_ok = cycle.get("listing_complete")
     outcomes = cycle.get("outcomes")
-    if outcomes:
-        return feed_observation_valid(str(media_type), outcomes)
-    return bool(cycle.get("cycle_complete"))
+
+    if listing_ok is None or outcomes is None:
+        # Legacy cycle: nothing finer than the aggregate flag exists.
+        return bool(cycle.get("cycle_complete"))
+    if not listing_ok:
+        # The listing arm is untrustworthy, so this cycle cannot resolve anything
+        # however healthy its feeds were.
+        return False
+    # An explicit empty map means no normal feed was observed this cycle.
+    return feed_observation_valid(str(media_type), outcomes)
 
 
 def classify_miss_resolution(url, media_type, first_seen, cycles):
