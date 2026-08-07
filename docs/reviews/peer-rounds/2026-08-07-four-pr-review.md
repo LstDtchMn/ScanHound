@@ -45,10 +45,9 @@ load-bearing for the claim that RSS is ready, and I made it under pressure from 
 unwanted result.** Attack that first. If it is wrong, `ready=True` is wrong, and
 nothing else in these four PRs matters as much.
 
-Specifically worth probing:
+### Two questions I raised and then answered myself
 
-Two questions I raised and then answered myself, rather than sending you work I
-could do:
+Rather than sending you work I could do:
 
 **Does a cycle resolve its own rows?** No. The comparison is strict (`at >
 first_seen`), and a row's `first_seen` is its recording cycle's `completed_at`, so
