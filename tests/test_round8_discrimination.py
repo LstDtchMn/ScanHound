@@ -502,3 +502,42 @@ def test_scrape_route_attributes_a_configured_mirror_to_hdencode_health(monkeypa
         routes.ScrapeRequest(url="https://hdencode.org/a-movie-2160p/"), reg)
     assert recorded == [], (
         "once a mirror is configured, the old default host is NOT HDEncode")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The reveal stall must not assert a cause it has not measured
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_reveal_stall_text_claims_no_unmeasured_cause():
+    """THE WRONG ANSWER: prose that states rate limiting as established fact.
+
+    Round 9 required this independently of the eventual root cause. All the code
+    observes is "the reveal widget had not finished when OUR 60s window expired" --
+    and every such observation is right-censored, so it cannot distinguish a widget
+    that would have finished at 62s from one that never finishes. Source-side
+    limiting is also indistinguishable here from browser/session state, because
+    ScanHound reuses a persistent Chromium profile across restarts.
+
+    The reason CODE was always neutral; only the human-readable text overstated, and
+    that text is what a reader takes as the finding. It cost me days.
+    """
+    import inspect
+    from backend import download_service as ds
+    from backend.scrape_outcome import ScrapeCode, _MESSAGES
+
+    message = _MESSAGES[ScrapeCode.REVEAL_VERIFICATION_STALLED].lower()
+    for claim in ("rate-limiting", "rate limiting", "throttl"):
+        assert claim not in message, (
+            f"the user-facing stall message asserts {claim!r}, which is not "
+            f"measured: {message!r}")
+    # It must still tell the user the two things that ARE true.
+    assert "retry" in message and "nothing is wrong" in message
+
+    # And the emitted log line must not assert it either.
+    src = inspect.getsource(ds.DownloadService.scrape_links)
+    emitted = [ln for ln in src.splitlines()
+               if "reveal control" in ln.lower() and "self._log" not in ln
+               and not ln.strip().startswith("#")]
+    joined = " ".join(emitted).lower()
+    assert "is rate-limiting" not in joined, (
+        f"the log still asserts rate limiting as fact: {joined!r}")

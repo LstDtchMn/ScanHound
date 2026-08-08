@@ -65,10 +65,15 @@ _MESSAGES = {
     ),
     ScrapeCode.REQUESTED_HOST_MISSING: "The page loaded, but it does not contain links for the requested file host.",
     ScrapeCode.NO_FILE_HOST_LINKS: "The page loaded, but no supported file-host links were found.",
+    # NO CAUSAL CLAIM. This used to say the stall is what the source "does when it
+    # is rate-limiting", which was never measured -- see the long note at the
+    # emission site in download_service. The reason CODE
+    # (`reveal_verification_stalled`) was always neutral and correct; only this
+    # user-facing prose overstated. What Jesse needs to know is unchanged and true:
+    # the release is fine and it will be retried.
     ScrapeCode.REVEAL_VERIFICATION_STALLED: (
-        "The source did not finish verifying the link-reveal control, which it "
-        "does when it is rate-limiting. The item is queued to retry after a "
-        "cooldown; nothing is wrong with this release."
+        "The source did not finish showing the download links in time. The item is "
+        "queued to retry after a cooldown; nothing is wrong with this release."
     ),
     ScrapeCode.SCRAPE_EXCEPTION: "The link scrape failed before download links could be retrieved.",
     ScrapeCode.DIRECT_LINK_NO_SOURCE_PAGE: (
