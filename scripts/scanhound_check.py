@@ -157,6 +157,43 @@ else:
             print(f"                automatic retries used: {used} of "
                   f"{_MAX_AUTO_RESUME} (refunded on real source progress)")
 
+# ---- 3b. ORPHANS: deferred items whose batch is no longer paused -------------
+#
+# ADDED 2026-08-08, because this tool printed "NO batches are paused - everything
+# resumed or completed" while 34 of Jesse's downloads were permanently stuck.
+#
+# Both recovery routes key on the BATCH being paused_source:
+#   * the auto-resume sweep selects WHERE state = 'paused_source';
+#   * item selection then joins items on cooldown_until EQUALITY with the batch.
+#
+# So an item left in waiting_source/verification_required after its batch has moved
+# on -- especially with a stale cooldown the now-NULL batch cooldown cannot match --
+# is invisible to every path. Nothing throttles it and nothing will ever retry it.
+# Reporting only on paused batches meant the one state that needs a human was the
+# one state this tool called healthy.
+print("\n3b. Deferred items whose batch has moved on (orphans)")
+orphans = list(con.execute(
+    "SELECT i.batch_uuid, b.state AS batch_state, b.cooldown_until AS batch_cd, "
+    "       COUNT(*) n, MIN(i.cooldown_until) icd "
+    "FROM download_queue_items i "
+    "LEFT JOIN download_queue_batches b ON b.batch_uuid = i.batch_uuid "
+    "WHERE i.state IN ('waiting_source', 'verification_required') "
+    "  AND COALESCE(b.state, '') != 'paused_source' "
+    "GROUP BY i.batch_uuid ORDER BY n DESC"))
+if not orphans:
+    print(OK + "none - every deferred item sits in a batch that can resume it")
+else:
+    total = sum(o["n"] for o in orphans)
+    print(BAD + f"{total} item(s) in {len(orphans)} batch(es) cannot be reached by "
+                "auto-resume OR by the scheduler")
+    for o in orphans:
+        print(f"        {str(o['batch_uuid'])[:8]}  n={o['n']}  "
+              f"batch_state={o['batch_state']}  "
+              f"item_cooldown={str(o['icd'])[:19]}  "
+              f"batch_cooldown={str(o['batch_cd'])[:19]}")
+    problems.append(f"{total} deferred item(s) are orphaned: their batch is not "
+                    "paused_source, so no resume path can see them")
+
 failed = list(con.execute(
     "SELECT last_reason_code, COUNT(*) n FROM download_queue_items "
     "WHERE state = 'failed' GROUP BY 1 ORDER BY 2 DESC"))

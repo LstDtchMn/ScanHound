@@ -93,7 +93,23 @@ def _diagnose(svc, ds, *, tier, html="<html><body><form></form></body></html>"):
         reveal_tier=tier)
 
 
-class TestStalledVerifyIsAThrottle:
+class TestStalledVerifyIsRetryableNotALayoutChange:
+    """What a stalled reveal IS, stated only as far as the evidence goes.
+
+    RENAMED 2026-08-08 from TestStalledVerifyIsAThrottle. The old name asserted the
+    conclusion in its title, and every test inside inherited that framing -- which is
+    how `assert "rate-limit" in message` came to look like a reasonable thing to
+    require. A stalled reveal is established to be: retryable, not a layout change,
+    cooldown-bearing, and reported to the coordinator. Whether the SOURCE is
+    throttling us is not established; see
+    docs/reviews/peer-rounds/reveal-stall-root-cause.md.
+
+    NOTE the tests below still assert source-wide scope and coordinator notification,
+    because that is the behaviour as built. Round 9 argues the scope is too broad --
+    a per-item reveal failure should trip a reveal circuit breaker, not a global
+    source breaker -- but that is a design change, not a claim correction, so it is
+    left for its own round rather than quietly altered here.
+    """
 
     def test_it_is_not_reported_as_a_layout_change(self, service):
         svc, _, ds = service
@@ -130,10 +146,28 @@ class TestStalledVerifyIsAThrottle:
         assert d.action_code == "wait_for_cooldown"
 
     def test_the_message_does_not_blame_the_release(self, service):
+        """Assert the property this test is NAMED for, not a mechanism.
+
+        CORRECTED 2026-08-08. This asserted `"rate-limit" in message` -- so a test of
+        mine REQUIRED the causal claim that peer review round 9 showed is unmeasured,
+        and it failed the moment I removed it. Fourth time one of my tests has
+        protected the thing it should have caught.
+
+        The proxy was also wrong on its own terms: naming a mechanism is not what
+        makes a message not blame the release. What must hold is that the user is
+        told the release is fine and will be retried, and is not told the page
+        changed. Both of those ARE established.
+        """
         svc, _, ds = service
         message = _diagnose(svc, ds, tier="not-ready").public_message.lower()
-        assert "rate-limit" in message
+        assert "nothing is wrong with this release" in message
+        assert "retry" in message
         assert "layout" not in message
+        # And it must not assert a cause nobody has measured.
+        for unproven in ("rate-limit", "rate limiting", "throttl"):
+            assert unproven not in message, (
+                f"the message asserts {unproven!r}; every 60s stall observation is "
+                "right-censored and cannot establish it")
 
     def test_the_tier_is_recorded_in_the_signals(self, service):
         svc, _, ds = service
