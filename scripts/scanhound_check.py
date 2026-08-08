@@ -54,18 +54,11 @@ except Exception as exc:                                   # noqa: BLE001
     print(BAD + f"could not load the coordinator: {type(exc).__name__}: {exc}")
     problems.append("coordinator did not load")
 
-# The retry budget, read from the SAME config key production reads, and clamped the
-# same way (backend.download_queue._auto_resume_max_attempts). Hardcoding a second
-# copy of "3" here is how this tool came to disagree with the code in the first
-# place: it reported healthy batches as permanently exhausted.
-_MAX_AUTO_RESUME = 3
-try:
-    from backend.config import CONFIG_FILE as _CF
-    with open(_CF, encoding="utf-8") as _fh:
-        _MAX_AUTO_RESUME = max(1, min(10, int(json.load(_fh).get(
-            "download_queue_auto_resume_max_attempts", 3))))
-except Exception:                                          # noqa: BLE001
-    pass
+# The retry budget is NOT parsed here any more. It lives in
+# backend/queue_recovery_policy.parse_max_attempts, which production also
+# uses. Round 13 caught this file still keeping its own copy in section 3
+# while section 3b imported the shared one -- so 'one shared policy' was
+# false in the same file that claimed it.
 
 # ---- 2. did the auto-resume setting survive the restart? --------------------
 print("\n2. Auto-resume setting (governs FilterBar + SwipeDeck grabs)")
@@ -119,43 +112,18 @@ else:
         print(f"        {b['batch_uuid'][:8]}  resume={b['a']} used={b['u']}"
               f"  due={str(due)[:19]}{overdue}")
 
-        # The eligibility query the resume path itself runs, verbatim.
-        hit = con.execute(
-            "SELECT source FROM download_queue_items WHERE batch_uuid = ? "
-            "  AND state IN ('verification_required','waiting_source') "
-            "  AND cooldown_until = ? "
-            "  AND queue_reason IN ('interactive_challenge','source_deferred') "
-            "  AND COALESCE(last_reason_code,'') NOT IN "
-            "      ('operation_timeout_unknown','interrupted_unknown_outcome') "
-            "LIMIT 1", (b["batch_uuid"], b["cooldown_until"])).fetchone()
-        if hit:
-            print("                will be seen by auto-resume: YES")
-        else:
-            print("                will be seen by auto-resume: NO - it will be"
-                  " SKIPPED SILENTLY")
-            problems.append(f"batch {b['batch_uuid'][:8]} cannot be seen by "
-                            "auto-resume (timestamp mismatch)")
-        if not b["a"]:
-            problems.append(f"batch {b['batch_uuid'][:8]} has auto-resume off")
-        # BUDGET IS 3 AND REFUNDABLE, corrected 2026-08-08.
-        #
-        # This used to flag ANY nonzero auto_resume_used as "already spent its one
-        # automatic retry". That was true of the deployed code at the time -- one
-        # automatic resume per batch for its whole lifetime -- and it is why 45
-        # downloads sat stranded for seven hours: nothing could re-drive them.
-        #
-        # The retry budget is now 3 by default and is REFUNDED when a resume makes
-        # real source progress, so `used=1` or `used=2` is an ordinary healthy state,
-        # not a dead end. Reporting it as exhausted sent me looking for a throttle
-        # that was not there. Only a batch at or over the limit is actually stuck.
-        used = int(b["u"] or 0)
-        if used >= _MAX_AUTO_RESUME:
-            problems.append(
-                f"batch {b['batch_uuid'][:8]} has used all {_MAX_AUTO_RESUME} "
-                "automatic retries and will not self-resume again")
-        elif used:
-            print(f"                automatic retries used: {used} of "
-                  f"{_MAX_AUTO_RESUME} (refunded on real source progress)")
+        # RAW FACTS ONLY. Round 13: this ran the deleted item/batch cooldown-EQUALITY
+        # query and called it "the eligibility query the resume path itself runs,
+        # verbatim" -- which stopped being true when item-first recovery landed, so a
+        # benign timestamp difference was still reported as "cannot be seen by
+        # auto-resume". Every conclusion now comes from section 3b, which asks the
+        # shared policy. This section shows what is in the row and nothing more.
+        deferred_here = con.execute(
+            "SELECT COUNT(*) FROM download_queue_items WHERE batch_uuid = ? "
+            "AND state IN ('verification_required','waiting_source')",
+            (b["batch_uuid"],)).fetchone()[0]
+        print(f"                deferred items: {deferred_here}"
+              f"  (verdicts in section 3b)")
 
 # ---- 3b. can every deferred download still recover? -------------------------
 #
@@ -173,24 +141,26 @@ else:
 print("\n3b. Can every deferred download still recover?")
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from queue_recovery_state import (JOINED_DEFERRED_SQL, NEEDS_HUMAN,
-                                      classify_all, max_auto_resume_attempts)
+    from queue_recovery_state import (JOINED_DEFERRED_SQL, LABELS, classify_rows,
+                                      needs_human)
+    from backend.queue_recovery_policy import NEEDS_HUMAN
     rows = [dict(r) for r in con.execute(JOINED_DEFERRED_SQL)]
-    verdicts = classify_all(rows, max_attempts=max_auto_resume_attempts())
+    verdicts = classify_rows(rows)
     if not rows:
         print(OK + "nothing is deferred")
     else:
         for verdict in sorted(verdicts):
             items = verdicts[verdict]
             marker = BAD if verdict in NEEDS_HUMAN else INFO
-            print(marker + f"{len(items)} item(s): {verdict}")
+            print(marker + f"{len(items)} item(s): "
+                  f"{LABELS.get(verdict, verdict)}")
             for it in items[:4]:
                 print(f"        {str(it.get('title'))[:42]:42s} "
                       f"batch={str(it.get('batch_uuid'))[:8]} "
                       f"own_cooldown={str(it.get('cooldown_until'))[:19]}")
             if len(items) > 4:
                 print(f"        ... and {len(items) - 4} more")
-        stuck = sum(len(verdicts.get(v, [])) for v in NEEDS_HUMAN)
+        stuck = needs_human(verdicts)
         if stuck:
             problems.append(f"{stuck} deferred item(s) have no automatic recovery "
                             "path and need an explicit resume")

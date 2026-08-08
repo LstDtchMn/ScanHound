@@ -26,30 +26,37 @@ GRACE = timedelta(minutes=12)   # scheduler tick slack past the cooldown
 POLL = 120
 
 
-def _orphan_count():
-    """Deferred items with NO automatic recovery path, per the shared classifier.
+def _recovery_state():
+    """(needs_human, still_deferred) per the SHARED policy, or (-1, -1) if unavailable.
 
-    Items merely waiting for their own cooldown, or held by the shared source brake,
-    or held for unknown-outcome safety are NOT orphans -- they recover on their own or
-    are held on purpose. Only the classifier's NEEDS_HUMAN verdicts count.
+    ROUND 13 CAUGHT THE FALSE SUCCESS AGAIN, third variant. This returned only the
+    human-required count, and the caller read "nothing needs a human" as "nothing is
+    deferred" -- so a row merely waiting for its own cooldown made the watcher print
+    RESOLVED and exit 0, while the very recovery event it was watching for had not
+    happened. Round 10 had it calling the orphan state SUCCESS; round 12 caught my fix
+    inverting that to a false FAILURE; this is the third shape of the same mistake.
+
+    So both numbers are returned and the caller must distinguish:
+        needs_human > 0   -> ACTION REQUIRED
+        still_deferred > 0 -> WAITING, keep polling
+        both zero          -> RESOLVED
     """
     try:
         import os
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from queue_recovery_state import (JOINED_DEFERRED_SQL, NEEDS_HUMAN,
-                                          classify_all, max_auto_resume_attempts)
+        from queue_recovery_state import (JOINED_DEFERRED_SQL, classify_rows,
+                                          needs_human, still_deferred)
         con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
         try:
             rows = [dict(r) for r in con.execute(JOINED_DEFERRED_SQL)]
         finally:
             con.close()
-        verdicts = classify_all(rows, max_attempts=max_auto_resume_attempts())
-        return sum(len(verdicts.get(v, [])) for v in NEEDS_HUMAN)
+        verdicts = classify_rows(rows)
+        return needs_human(verdicts), still_deferred(verdicts)
     except Exception:                                          # noqa: BLE001
-        # Unknown is not the same as zero. Returning 0 here would resurrect the
-        # false-SUCCESS this script was fixed for, so report it as needing a look.
-        return -1
+        # Unknown is not zero. Reporting an unknown as all-clear is the original bug.
+        return -1, -1
 
 
 def say(msg):
@@ -100,7 +107,7 @@ if not paused0:
     # caught as the opposite error, because item-first recovery deliberately made
     # that state recoverable. Two wrong answers from the same cause: a second copy
     # of the policy. The copy is gone; queue_recovery_state owns it.
-    orphaned = _orphan_count()
+    orphaned, waiting = _recovery_state()
     if orphaned < 0:
         say("UNKNOWN: the recovery classifier could not run, so I cannot say "
             "whether anything is stranded. Treat this as needing a look, not as "
@@ -108,13 +115,19 @@ if not paused0:
             "script was fixed for.")
         sys.exit(1)
     if orphaned:
-        say(f"ORPHANED: no batch is paused, but {orphaned} item(s) are still "
-            "deferred. Nothing owns their recovery. Run "
-            "`python /data/scanhound_check.py` (section 3b) for the batch, then "
-            "resume it explicitly -- this will not clear on its own.")
+        say(f"ACTION REQUIRED: {orphaned} item(s) have no automatic recovery path. "
+            "Run `python /data/scanhound_check.py` (section 3b) for the verdicts, "
+            "then resume explicitly -- this will not clear on its own.")
         sys.exit(1)
-    say("RESOLVED: nothing is paused and nothing is deferred.")
-    sys.exit(0)
+    if waiting:
+        # WAITING IS NOT RESOLVED. Round 13: reading "nothing needs a human" as
+        # "nothing is deferred" made this exit 0 while the recovery event being
+        # watched had not happened -- the third shape of this script's false success.
+        say(f"WAITING: {waiting} item(s) are deferred but all have a recovery path; "
+            "continuing to watch.")
+    else:
+        say("RESOLVED: nothing is paused and nothing is deferred.")
+        sys.exit(0)
 
 prev = (len(paused0), states0.get("waiting_source", 0),
         states0.get("failed", 0), sum(b["u"] or 0 for b in paused0))
@@ -140,13 +153,13 @@ while True:
         prev = cur
 
     if not paused:
-        deferred = _orphan_count()
-        if deferred < 0:
+        stuck, deferred = _recovery_state()
+        if stuck < 0:
             say("UNKNOWN: the recovery classifier could not run; not calling this "
                 "a success.")
             sys.exit(1)
-        if deferred:
-            say(f"ORPHANED: no batch is paused, but {deferred} item(s) are STILL "
+        if stuck:
+            say(f"ACTION REQUIRED: {stuck} item(s) have no automatic recovery path "
                 f"deferred (waiting_source={waiting}). The batch moved on without "
                 "them, so no automatic path can reach them. This is a FAILURE, not "
                 "a success -- the old version of this script called it SUCCESS "

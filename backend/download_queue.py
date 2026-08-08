@@ -1478,47 +1478,24 @@ class DownloadQueueService:
         # So the second clause above lets a batch that completed something since
         # its last automatic resume through regardless of the counter, and
         # _resume_batch then resets the counter and re-marks the baseline.
+        self._last_auto_resumed_batches = set()
         self._warn_exhausted_batches(now)
+        # DISCOVERY IS DELIBERATELY DUMB NOW. It answers only "which (batch, source)
+        # groups hold a deferred row worth looking at?" -- never whether any row may
+        # run. Rounds 12 and 13 were both caused by this gate deciding authorisation
+        # too, with logic that differed from the transactional gate:
+        #
+        #   round 12  MIN(cooldown) said the group was due, then every sibling was
+        #             promoted -- including one due in 2030 and one with no retry time.
+        #   round 13  MIN() ignores NULLs, so an item with NO cooldown plus a sibling
+        #             due in 2030 gave MIN = 2030 and the whole group was SKIPPED.
+        #             An ineligible sibling vetoed an eligible one -- the exact mirror.
+        #
+        # I answered round 12 by adding a per-item predicate to the transaction and
+        # LEAVING this gate in place, so two places decided the same thing differently.
+        # Round 13 was the direct consequence. The gate is gone: _resume_batch's
+        # transaction is the single authority, and it re-reads every fact itself.
         for group in groups:
-            # TWO COOLDOWNS, EACH READ ON ITS OWN TERMS -- never compared to each
-            # other. The batch cooldown is the shared breaker: while it is in the
-            # future, this source is deliberately quiet and nothing in the group
-            # runs. The item cooldown is that item's own deferral. Requiring the two
-            # strings to be EQUAL, as this did before, meant a benign one-second
-            # difference between two timestamps that mean the same thing was enough
-            # to strand the work permanently.
-            batch_until = _parse(group.get("batch_cooldown"))
-            if batch_until is not None and batch_until > now:
-                continue
-            item_until = _parse(group.get("earliest_item_cooldown"))
-            if item_until is not None and item_until > now:
-                continue
-            # SOMETHING MUST SAY WHEN, and the old safety rule is kept.
-            #
-            # `if until is None: continue` used to skip any batch with no cooldown. I
-            # first read that as pure fallout from the equality join and made NULL mean
-            # "no hold" -- which broke test_null_cooldown_batch_does_not_auto_resume,
-            # a rule with no docstring that I nearly "fixed" by rewriting the test.
-            # It is a real rule: a deferred row with NO retry time anywhere has nothing
-            # saying when it is safe to go, and firing immediately would probe a source
-            # that just refused.
-            #
-            # Both properties hold together, because the orphan is not that case. The
-            # orphan has a NULL BATCH cooldown -- retry_item cleared it -- while its
-            # items still carry theirs. So: the item's own deferral time is what
-            # authorises the retry, and the batch cooldown is only a shared brake. If
-            # NEITHER side has a time, nothing authorises anything and we leave it
-            # alone; the unresumable diagnostic below then explains it.
-            shared_brake_passed = batch_until is not None      # and, checked above,
-                                                               # already in the past
-            if batch_until is None and item_until is None:
-                continue
-            # MIN() DECIDES ONLY WHETHER THE GROUP IS WORTH VISITING, never which
-            # rows may run. Round 12 caught it deciding both: the earliest child
-            # authorised every sibling, so a due item dragged along one due in 2030
-            # and one with no retry time at all. `authorised_at` and
-            # `shared_brake_passed` carry the rule down so _resume_batch re-evaluates
-            # it PER ROW, inside its own transaction.
             self._resume_batch(
                 group["batch_uuid"],
                 interval_minutes=max(
@@ -1527,25 +1504,14 @@ class DownloadQueueService:
                 ),
                 automated=True,
                 blocked_source=str(group["source"]),
-                authorised_at=now,
-                shared_brake_passed=shared_brake_passed,
             )
 
-        # THE DIAGNOSTIC SURVIVES THE REWRITE, and now means something sharper.
-        #
-        # I removed the `if blocked is None: self._log_unresumable_batch(...)` branch
-        # along with the equality join, which silently deleted the only signal
-        # explaining why a parked batch stays parked -- five tests caught it. Losing
-        # observability while fixing a liveness bug would be a poor trade, and this
-        # whole effort has repeatedly been slowed by absent evidence.
-        #
-        # It also reports a BETTER fact now. Previously it fired for timestamp
-        # artifacts -- two copies of one cooldown drifting apart -- which is no
-        # longer a blocker at all. Now a paused, due, in-budget batch reaches this
-        # only when every one of its deferred items is EXCLUDED ON PURPOSE: an
-        # unknown execution state, or a queue_reason automatic resume does not own.
-        # That is a real operator-facing fact rather than a bookkeeping mismatch.
-        resumable = {str(g["batch_uuid"]) for g in groups}
+        # THE DIAGNOSTIC. Reachability corrected on round 13: this set used to be
+        # built from `groups`, i.e. "held a candidate row", which is not the same as
+        # "actually resumed something". A NULL/NULL batch was therefore listed as
+        # resumable and the diagnostic never ran for it -- the exact case its own
+        # comment said it would explain. It now records what really resumed.
+        resumable = self._last_auto_resumed_batches
         stuck = self.db._query_dicts(
             """
             SELECT *
@@ -1675,8 +1641,6 @@ class DownloadQueueService:
         interval_minutes: int,
         automated: bool,
         blocked_source: Optional[str] = None,
-        authorised_at: Optional[datetime] = None,
-        shared_brake_passed: bool = False,
     ) -> dict:
         if not automated:
             self._assert_hdencode_available()
@@ -1688,62 +1652,74 @@ class DownloadQueueService:
             if not conn:
                 raise DownloadQueueError("The database is unavailable.")
             if automated:
-                rows = conn.execute(
+                # THE SINGLE AUTHORITY. Every fact is read HERE, inside the
+                # transaction that will flip the rows -- the batch row, the retry
+                # budget, the shared brake, and each item's own cooldown. Nothing is
+                # trusted from the discovery pass.
+                #
+                # Round 13 found the residual hole in my previous attempt: item
+                # cooldowns were re-read but `shared_brake_passed` was computed
+                # OUTSIDE and passed as a stale boolean, so an operator extending the
+                # batch cooldown between discovery and update could still authorise an
+                # early retry. I had claimed that race was closed. It was closed for
+                # item cooldowns only.
+                from backend.queue_recovery_policy import (
+                    AUTHORISED, ItemFacts, SharedFacts, decide, parse_max_attempts,
+                )
+                brow = conn.execute(
+                    "SELECT cooldown_until, auto_resume_after_cooldown, "
+                    "       auto_resume_used, source_delivery_count, "
+                    "       auto_resume_progress_mark "
+                    "FROM download_queue_batches WHERE batch_uuid = ?",
+                    (batch_uuid,),
+                ).fetchone()
+                if brow is None:
+                    raise DownloadQueueError("The batch no longer exists.")
+                shared = SharedFacts(
+                    cooldown_until=_parse(brow["cooldown_until"]),
+                    auto_resume_enabled=bool(brow["auto_resume_after_cooldown"]),
+                    attempts_used=int(brow["auto_resume_used"] or 0),
+                    source_delivery_count=int(brow["source_delivery_count"] or 0),
+                    progress_mark=int(brow["auto_resume_progress_mark"] or 0),
+                    max_attempts=parse_max_attempts(self.config),
+                )
+                candidates = conn.execute(
                     """
-                    SELECT item_uuid
+                    SELECT item_uuid, state, cooldown_until, queue_reason,
+                           COALESCE(last_reason_code, '') AS last_reason_code
                     FROM download_queue_items
                     WHERE batch_uuid = ?
                       AND source = ?
                       AND state IN (
                           'verification_required', 'waiting_source'
                       )
-                      AND queue_reason IN (
-                          'interactive_challenge', 'source_deferred'
-                      )
-                      AND COALESCE(last_reason_code, '') NOT IN (
-                          'operation_timeout_unknown',
-                          'interrupted_unknown_outcome'
-                      )
-                      -- PER-ITEM AUTHORISATION, added on peer review round 12.
-                      --
-                      -- THE BUG THIS CLOSES, and it was mine, introduced in the very
-                      -- commit that fixed the liveness hole. Discovery grouped by
-                      -- (batch, source) and took MIN(cooldown_until) to decide the
-                      -- group was due -- then this query promoted EVERY deferred
-                      -- child regardless of its own time. So one due item dragged
-                      -- its siblings along:
-                      --
-                      --   A due 2000, B due 2030  -> B went ready five years early
-                      --   A due 2000, B cooldown NULL -> B retried with NO
-                      --                                  authorisation time at all
-                      --
-                      -- The second case defeats the safety rule I had preserved
-                      -- FIFTEEN LINES EARLIER in the same function, with a paragraph
-                      -- explaining why NULL on both sides must decline. Gating one
-                      -- door and leaving the next one open, at the shortest range yet.
-                      --
-                      -- The predicate now lives in the SAME query that selects the
-                      -- rows, so discovery and authorisation cannot drift apart, and
-                      -- it is evaluated INSIDE this transaction rather than trusted
-                      -- from a discovery pass that may already be stale -- an operator
-                      -- can extend a cooldown in between.
-                      -- THE RULE, stated exactly as the group gate states it:
-                      --   own cooldown, and it has passed        -> authorised
-                      --   no own cooldown, shared brake has passed -> authorised
-                      --                                             (the brake IS
-                      --                                              the authorisation)
-                      --   no own cooldown and no shared brake    -> DECLINED
-                      -- The third line is the safety rule preserved in
-                      -- _maybe_auto_resume; it now holds at both gates instead of one.
-                      AND (
-                            (cooldown_until IS NOT NULL AND cooldown_until <= ?)
-                         OR (cooldown_until IS NULL AND ? = 1)
-                      )
                     ORDER BY sequence_number
                     """,
-                    (batch_uuid, blocked_source, _iso(authorised_at or now),
-                     1 if shared_brake_passed else 0),
+                    (batch_uuid, blocked_source),
                 ).fetchall()
+                # PER ROW, and only ever about that row. No MIN(), no group verdict,
+                # so one item's future cooldown can neither authorise nor veto another.
+                rows = [
+                    r for r in candidates
+                    if decide(
+                        ItemFacts(
+                            state=str(r["state"]),
+                            cooldown_until=_parse(r["cooldown_until"]),
+                            queue_reason=str(r["queue_reason"] or ""),
+                            last_reason_code=str(r["last_reason_code"] or ""),
+                        ),
+                        shared,
+                        now,
+                    ) == AUTHORISED
+                ]
+                if not rows:
+                    # NOTHING AUTHORISED: do not spend budget and do not promote the
+                    # batch. Round 13 required this explicitly -- a fruitless visit
+                    # must not look like an attempt.
+                    return self.get_batch(batch_uuid) or {}
+                # RECORDED so the unresumable diagnostic can tell "this batch really
+                # resumed something" from "this batch merely held a candidate row".
+                self._note_auto_resumed(batch_uuid)
             else:
                 rows = conn.execute(
                     """
@@ -1875,6 +1851,17 @@ class DownloadQueueService:
         batch = self.get_batch(batch_uuid) or {"batch_uuid": batch_uuid}
         self._emit("download:batch_schedule", batch)
         return batch
+
+    def _note_auto_resumed(self, batch_uuid: str) -> None:
+        """Remember that THIS batch really resumed something automatically.
+
+        The diagnostic used to skip any batch that merely held a candidate row, so a
+        NULL/NULL hold -- the case its own comment promised to explain -- was never
+        reported. Recording actual resumes instead of candidates fixes that.
+        """
+        if not hasattr(self, "_last_auto_resumed_batches"):
+            self._last_auto_resumed_batches = set()
+        self._last_auto_resumed_batches.add(str(batch_uuid))
 
     def resume_batch(self, batch_uuid: str, interval_minutes: int = 10) -> dict:
         return self._resume_batch(

@@ -1,148 +1,63 @@
-"""One read-only classifier for "can this deferred download still recover?".
+"""Read-only view of download-queue recovery, for the operator tools.
 
-WHY THIS EXISTS. Three separate things have now answered that question and disagreed
-with each other and with production:
+THIS FILE NO LONGER CONTAINS ANY POLICY. It maps database rows onto the typed facts in
+`backend/queue_recovery_policy.py` and renders the decision that module returns.
 
-  * scanhound_check.py reported ANY nonzero auto_resume_used as a spent one-shot,
-    which was true of a deployed container and false of the code. It told me 45
-    recoverable downloads were permanently dead, and that is a large part of why I
-    spent a session refining a throttle response for a source that was serving links
-    in five seconds.
-  * scanhound_check.py section 3b then declared every deferred item whose batch was
-    not `paused_source` an orphan. True before item-first recovery, FALSE after it --
-    so the fix that rescued 34 downloads made the diagnostic start crying wolf.
-  * watch_resume.py used "no paused batch" as its success predicate, printing
-    `SUCCESS: no batches are paused. waiting_source=34` -- the stranded count inside
-    the success line. Round 10 caught that; round 12 caught that my fix had merely
-    inverted the polarity to false FAILURE.
+WHY IT WAS EMPTIED. I wrote its first version to end policy drift between the app and
+its diagnostics, on the reasoning that a diagnostic which imports the thing it inspects
+cannot notice when that thing is wrong. That reasoning produced a THIRD copy of the
+rules, and round 13 found it wrong in two ways at once:
 
-Every one of those was a second copy of a policy drifting from the first. So the
-policy lives here once, both tools import it, and neither keeps its own idea of what
-recovery requires.
+  * `classify_all()` passed the same flattened row as BOTH the item and the batch, so
+    `batch["cooldown_until"]` silently read the ITEM's cooldown and `batch_cooldown`
+    was never consumed. `item PAST / batch FUTURE` reported "recoverable" when
+    production holds it; `item NULL / batch PAST` reported "ORPHANED" when production
+    resumes it. Live rows usually have identical item and batch cooldowns, which is
+    exactly why checking it against the live database missed the bug.
+  * scanhound_check.py kept its own retry-budget parser and the deleted cooldown-equality
+    query in the same file that imported this one, so "one shared policy" was false when
+    I wrote it.
 
-DELIBERATELY NOT THE PRODUCTION CODE. This is a read-only interpreter of the same
-RULES, not a call into DownloadQueueService -- the tools must run against a database
-without constructing a service, and a diagnostic that imports the thing it inspects
-cannot notice when that thing is wrong. The liveness-model oracle stays independent of
-both, for the same reason.
+The independence I was reaching for belongs in the liveness/safety MODEL, which
+deliberately does not import the policy and judges it from an independently stated
+invariant. Two executable copies of "the same rules" are not independent; they are just
+two things that can disagree, and they did.
 
-Keep in step with backend/download_queue.py::_maybe_auto_resume and _resume_batch.
+Passing typed dataclasses also makes the aliasing bug impossible to write again: there
+is no field name that means one thing on ItemFacts and another on SharedFacts.
 """
 from __future__ import annotations
 
 import json
+import os
+import sys
 from datetime import datetime, timezone
 
-#: States that are deliberately not runnable and therefore need a recovery path.
-DEFERRED_STATES = ("waiting_source", "verification_required")
+sys.path.insert(0, "/app")
 
-#: queue_reason values automatic recovery owns. Anything else it will not touch.
-RECOGNISED_REASONS = ("interactive_challenge", "source_deferred")
+from backend.queue_recovery_policy import (  # noqa: E402
+    AUTHORISED, BUDGET_SPENT, DISABLED, NEEDS_HUMAN, NO_AUTHORISATION, SAFETY_HOLD,
+    UNOWNED_REASON, WAITING_BRAKE, WAITING_OWN, WILL_CLEAR, ItemFacts, SharedFacts,
+    decide, parse_max_attempts,
+)
 
-#: Outcomes never auto-retried: we do not know whether the previous attempt took
-#: effect, so retrying could duplicate a delivery that already happened.
-UNKNOWN_OUTCOMES = ("operation_timeout_unknown", "interrupted_unknown_outcome")
+#: Plain-language rendering, because these are read by a person deciding whether to
+#: intervene -- not by code. Only the NEEDS_HUMAN ones require action.
+LABELS = {
+    AUTHORISED: "due now, waiting for the next scheduler pass",
+    WAITING_OWN: "waiting for its own retry time",
+    WAITING_BRAKE: "held by the shared source cooldown",
+    SAFETY_HOLD: "held for unknown-outcome safety (needs adjudication)",
+    NO_AUTHORISATION: "NO retry time anywhere - needs an explicit resume",
+    UNOWNED_REASON: "automatic recovery does not own this row - needs a resume",
+    DISABLED: "auto-resume is switched off for its batch",
+    BUDGET_SPENT: "retry budget spent with no progress - needs a resume",
+}
 
-#: Verdicts. Only ORPHANED means "no automatic path exists and no future time will
-#: create one" -- the single state that actually needs a human.
-RECOVERABLE = "recoverable by automatic machinery"
-WAITING_ITEM = "waiting for its own retry time"
-WAITING_BRAKE = "held by the shared source cooldown"
-SAFETY_HOLD = "held for unknown-outcome safety"
-ORPHANED = "ORPHANED: no automatic path"
-
-NEEDS_HUMAN = (ORPHANED,)
-
-
-def max_auto_resume_attempts(config_path=None, default=3):
-    """The retry budget, read from the SAME config key production reads.
-
-    Clamped 1..10 exactly as _auto_resume_max_attempts does. Hardcoding a second copy
-    of the number is what started this whole class of problem.
-    """
-    try:
-        if config_path is None:
-            from backend.config import CONFIG_FILE as config_path
-        with open(config_path, encoding="utf-8") as fh:
-            raw = json.load(fh).get(
-                "download_queue_auto_resume_max_attempts", default)
-        return max(1, min(10, int(raw)))
-    except Exception:                                          # noqa: BLE001
-        return default
-
-
-def _parse(value):
-    try:
-        return datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def classify_item(item, batch, *, now=None, max_attempts=3):
-    """Why this deferred item is not running, and whether that will ever change.
-
-    ``item`` needs state, cooldown_until, queue_reason, last_reason_code.
-    ``batch`` needs state, cooldown_until, auto_resume_after_cooldown,
-    auto_resume_used, source_delivery_count, auto_resume_progress_mark.
-
-    NOTE what is NOT consulted: whether the batch is `paused_source`, and whether the
-    item's cooldown EQUALS the batch's. Both were liveness prerequisites before
-    item-first recovery and are prerequisites for nothing now. A diagnostic that keeps
-    checking them reports faults that cannot occur.
-    """
-    now = now or datetime.now(timezone.utc)
-    state = str(item.get("state") or "")
-    if state not in DEFERRED_STATES:
-        return None                       # not deferred; nothing to explain
-
-    # SAFETY FIRST, and it outranks everything below. These rows are excluded on
-    # purpose and no amount of waiting or configuration changes that.
-    if str(item.get("last_reason_code") or "") in UNKNOWN_OUTCOMES:
-        return SAFETY_HOLD
-
-    if str(item.get("queue_reason") or "") not in RECOGNISED_REASONS:
-        return ORPHANED                   # automatic recovery does not own this row
-
-    if not int(batch.get("auto_resume_after_cooldown") or 0):
-        return ORPHANED                   # the operator turned it off for this batch
-
-    used = int(batch.get("auto_resume_used") or 0)
-    progressed = (int(batch.get("source_delivery_count") or 0)
-                  > int(batch.get("auto_resume_progress_mark") or 0))
-    if used >= max_attempts and not progressed:
-        # Budget spent on resumes that achieved nothing. A deliberate policy stop --
-        # but it still needs a human, so it is reported as such rather than as a
-        # healthy wait.
-        return ORPHANED
-
-    brake = _parse(batch.get("cooldown_until"))
-    own = _parse(item.get("cooldown_until"))
-    if brake is not None and brake > now:
-        return WAITING_BRAKE              # transient: the source is quiet on purpose
-    if own is not None and own > now:
-        return WAITING_ITEM               # transient: this row asked to wait
-    if own is None and brake is None:
-        # Nothing anywhere says when this may run. The preserved safety rule: an
-        # automatic retry needs an authorisation time, so this needs an explicit
-        # operator resume.
-        return ORPHANED
-    return RECOVERABLE
-
-
-def classify_all(rows, *, now=None, max_attempts=3):
-    """Classify joined item+batch rows. Returns {verdict: [row, ...]}."""
-    out = {}
-    for row in rows:
-        verdict = classify_item(row, row, now=now, max_attempts=max_attempts)
-        if verdict is not None:
-            out.setdefault(verdict, []).append(row)
-    return out
-
-
-#: The SQL both tools use, so they cannot select different populations either.
+#: The SQL both tools use, so they cannot even select different populations.
 JOINED_DEFERRED_SQL = """
     SELECT i.item_uuid, i.batch_uuid, i.title, i.state, i.cooldown_until,
-           i.queue_reason, i.last_reason_code,
+           i.queue_reason, COALESCE(i.last_reason_code, '') AS last_reason_code,
            b.state                       AS batch_state,
            b.cooldown_until              AS batch_cooldown,
            b.auto_resume_after_cooldown  AS auto_resume_after_cooldown,
@@ -154,3 +69,69 @@ JOINED_DEFERRED_SQL = """
     WHERE i.state IN ('waiting_source', 'verification_required')
     ORDER BY i.batch_uuid, i.sequence_number
 """
+
+
+def _dt(value):
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def load_max_attempts():
+    """Read the budget from the same config production reads."""
+    try:
+        from backend.config import CONFIG_FILE
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            return parse_max_attempts(json.load(fh))
+    except Exception:                                          # noqa: BLE001
+        return parse_max_attempts({})
+
+
+def facts_from_row(row):
+    """Map one JOINED_DEFERRED_SQL row onto the two DISTINCT fact types.
+
+    THE MAPPING IS THE WHOLE POINT. `i.cooldown_until` and `b.cooldown_until` arrive
+    under different column names precisely so this function must choose deliberately;
+    the previous version handed the same dict to both parameters and the shared brake
+    was never read.
+    """
+    item = ItemFacts(
+        state=str(row["state"] or ""),
+        cooldown_until=_dt(row["cooldown_until"]),
+        queue_reason=str(row["queue_reason"] or ""),
+        last_reason_code=str(row["last_reason_code"] or ""),
+    )
+    shared = SharedFacts(
+        cooldown_until=_dt(row["batch_cooldown"]),          # <- the batch's, not the item's
+        auto_resume_enabled=bool(row["auto_resume_after_cooldown"]),
+        attempts_used=int(row["auto_resume_used"] or 0),
+        source_delivery_count=int(row["source_delivery_count"] or 0),
+        progress_mark=int(row["auto_resume_progress_mark"] or 0),
+        max_attempts=load_max_attempts(),
+    )
+    return item, shared
+
+
+def classify_rows(rows, now=None):
+    """Return {decision: [row, ...]} for JOINED_DEFERRED_SQL rows."""
+    now = now or datetime.now(timezone.utc)
+    out = {}
+    for row in rows:
+        item, shared = facts_from_row(row)
+        out.setdefault(decide(item, shared, now), []).append(row)
+    return out
+
+
+def needs_human(verdicts):
+    return sum(len(verdicts.get(v, [])) for v in NEEDS_HUMAN)
+
+
+def still_deferred(verdicts):
+    """Rows that are deferred but WILL clear on their own, plus those merely due.
+
+    A watcher must not call these "resolved": the recovery event it is watching for has
+    not happened yet. Round 13 caught watch_resume.py exiting success on exactly this.
+    """
+    return sum(len(verdicts.get(v, []))
+               for v in tuple(WILL_CLEAR) + (AUTHORISED, SAFETY_HOLD))
