@@ -183,6 +183,57 @@ except Exception as exc:                                   # noqa: BLE001
     print(BAD + f"recovery classifier unavailable: {type(exc).__name__}: {exc}")
     problems.append("could not classify deferred items")
 
+# ---- 3c. POLICY MIGRATION AUDIT: rows the strict timing rule now leaves to you ----
+#
+# WHY THIS EXISTS. Peer review round 14 made automatic retry require an item's OWN retry
+# time: an expired shared batch cooldown no longer authorises a row that has none. The
+# reasoning is that a healthy source pause always writes the item its own timestamp, so a
+# NULL there means the outcome carried no time, or the row is legacy/manual, or an
+# invariant broke -- the worst cases in which to infer permission from a batch scalar
+# that has no cooldown_source and no episode identity, and that a later pause overwrites.
+#
+# That change can convert a row from self-recovering to needing a human. Measured on the
+# live database when it shipped: ZERO such rows. This section proves that number rather
+# than assuming it, and will notice if some future path starts producing them.
+#
+# DELIBERATELY READ-ONLY. Do NOT "fix" these by setting
+# item.cooldown_until = batch.cooldown_until -- that backfill would silently undo the
+# provenance decision this rule exists to make.
+#
+# Retire or demote this section once the count has stayed zero for a reasonable period.
+print("\n3c. Policy migration audit (strict item-level retry timing)")
+try:
+    orphan_time = list(con.execute(
+        "SELECT i.item_uuid, i.title, i.queue_reason q, "
+        "       COALESCE(i.last_reason_code,'') lr, i.source src, "
+        "       b.state bstate, b.cooldown_until bcd, b.source bsrc "
+        "FROM download_queue_items i "
+        "LEFT JOIN download_queue_batches b ON b.batch_uuid = i.batch_uuid "
+        "WHERE i.state IN ('waiting_source','verification_required') "
+        "  AND i.cooldown_until IS NULL"))
+    if not orphan_time:
+        print(OK + "0 deferred item(s) lack their own retry time - the strict rule "
+                   "creates no manual work")
+    else:
+        print(BAD + f"{len(orphan_time)} deferred item(s) have NO retry time of their "
+                    "own and will NOT auto-retry")
+        print(INFO + "these need an explicit resume; do NOT backfill the batch's "
+                     "timestamp onto them")
+        for r in orphan_time[:8]:
+            mixed = " batch=MIXED-SOURCE" if str(r["bsrc"]) == "mixed" else ""
+            print(f"        {str(r['title'])[:34]:34s} reason={r['q']} "
+                  f"last={r['lr'] or '-'} src={r['src']} batch_state={r['bstate']} "
+                  f"batch_cooldown={'yes' if r['bcd'] else 'no'}{mixed}")
+        if len(orphan_time) > 8:
+            print(f"        ... and {len(orphan_time) - 8} more")
+        problems.append(
+            f"{len(orphan_time)} deferred item(s) have no retry time of their own "
+            "(strict-timing migration); each needs an explicit resume")
+except Exception as exc:                                   # noqa: BLE001
+    print(BAD + f"migration audit failed: {type(exc).__name__}: {exc}")
+    problems.append("could not run the policy migration audit")
+
+
 failed = list(con.execute(
     "SELECT last_reason_code, COUNT(*) n FROM download_queue_items "
     "WHERE state = 'failed' GROUP BY 1 ORDER BY 2 DESC"))
