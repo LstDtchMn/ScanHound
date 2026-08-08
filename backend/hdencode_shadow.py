@@ -551,10 +551,17 @@ def classify_miss_resolution(url, media_type, first_seen, cycles):
     legitimately-recorded misses out of the gate entirely. That was a false-ready
     path and it was mine.
 
-    The only affirmative evidence of acquisition is a later valid cycle in which
-    the feed has the URL and the listing no longer does -- the transition the
-    qualification grader treats as definitive. Absence from both sides proves
-    nothing: the listing pages away over time.
+    The only affirmative evidence of acquisition is a later valid cycle in which the
+    FEED CARRIES THE URL -- either `feed_only` (feed has it, listing has paged it
+    away) or `duplicate_urls` (feed and listing both have it). Absence from both
+    sides proves nothing: the listing pages away over time.
+
+    CORRECTED round 9. This used to require `feed_only` specifically, described as
+    "the feed has the URL and the listing no longer does". Requiring the listing to
+    have dropped it was wrong -- RSS carrying a release is what acquisition means,
+    and whether the listing still shows it is irrelevant. The consequence was that
+    the most ordinary success case, RSS catching up while the release is still
+    listed, produced no evidence and blocked qualification indefinitely.
     """
     valid_later = [c for c in cycles
                    if c.get("at") is not None and c["at"] > first_seen
@@ -566,7 +573,22 @@ def classify_miss_resolution(url, media_type, first_seen, cycles):
 
     last_missing = None
     for cycle in valid_later:
-        if url in (cycle.get("feed_only") or ()):
+        # RSS CARRIED IT = ACQUIRED, whether or not the listing still lists it.
+        #
+        # CORRECTED on peer review round 9. This checked `feed_only` alone, and the
+        # docstring above justified it as "the feed has the URL AND THE LISTING NO
+        # LONGER DOES". That second clause is wrong, and it made the ordinary
+        # success case unresolvable: when RSS catches up while the release is still
+        # on the listing, the URL is a DUPLICATE -- in neither feed_only nor
+        # listing_only -- so RSS demonstrably having found it counted as no
+        # evidence at all.
+        #
+        # This is the same predicate the candidate state machine already uses
+        # (feed_only | duplicate_urls), and I had wired duplicate_urls to THAT
+        # consumer while leaving this one blind to it. Failing closed rather than
+        # open, so it blocked qualification on releases RSS had actually acquired.
+        if url in (cycle.get("feed_only") or ()) or \
+                url in (cycle.get("duplicate_urls") or ()):
             return ("acquired",
                     (cycle["at"] - first_seen).total_seconds() / 3600.0, "")
         if url in (cycle.get("listing_only") or ()):

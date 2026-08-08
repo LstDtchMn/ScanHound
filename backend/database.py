@@ -2676,6 +2676,15 @@ class DatabaseManager:
                     if url in candidate_state:
                         candidate_state[url]=False
             cycles.append({"at":at,"listing_only":listing,"feed_only":feed,
+                           # CARRIED TO THE RESOLVER TOO, added on peer review
+                           # round 9. I parsed `duplicates` above, used it for
+                           # candidate clearing, and then did not put it in the
+                           # records the miss resolver reads -- so the resolver
+                           # could not see the evidence even in principle. Sixth
+                           # time in this effort that I have wired new evidence to
+                           # ONE consumer and left another consumer of the SAME
+                           # function blind to it.
+                           "duplicate_urls":duplicates,
                            "outcomes":outcomes,
                            "listing_complete":listing_ok,
                            "cycle_complete":bool(row.get("normal_feeds_complete"))})

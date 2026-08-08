@@ -169,6 +169,73 @@ def test_duplicate_urls_survive_the_persistence_round_trip(db):
     assert stored.get("duplicate_urls") == [U], stored.get("duplicate_urls")
 
 
+def test_candidate_then_admitted_miss_then_rss_catch_up_resolves(db):
+    """THE ROUND-9 BLOCKING DEFECT: the hand-off across BOTH state machines.
+
+    Round 8 asked me to make RSS catch-up clear a candidate, and I did — then wired
+    `duplicate_urls` to the candidate state machine ONLY. The miss resolver reads the
+    same cycles from the same function and never received the field, and its
+    acquisition test required `feed_only` specifically. So:
+
+        cycle 1  U listing-only, detail fails      -> unattributed candidate
+        cycle 2  detail succeeds, feed valid       -> admitted miss takes ownership
+        cycle 3  RSS catches up, U still listed    -> U is a DUPLICATE
+                                                   -> resolver sees no evidence
+                                                   -> blocked forever
+
+    Fails CLOSED, so it does not fabricate readiness — it withholds it on releases
+    RSS actually acquired. Neither of my two earlier tests covered this: one went
+    candidate -> duplicate with no intervening miss, the other stopped at the
+    transfer. This asserts BOTH counts, because either alone passes on a
+    half-wired implementation.
+    """
+    _cycle(db, "c1", "2026-08-01T00:00:00+00:00", rss=[], raw=[U], detail=[],
+           failed=[U])
+    assert db.get_hdencode_miss_resolution()["unattributed_candidates"] == 1, (
+        "positive control: U must start as an unattributed candidate")
+
+    _cycle(db, "c2", "2026-08-02T00:00:00+00:00", rss=[], raw=[U], detail=[U])
+    mid = db.get_hdencode_miss_resolution()
+    assert mid["unattributed_candidates"] == 0, "the miss row owns U now"
+    assert int(mid.get("acquired") or 0) == 0, (
+        "positive control: not acquired yet — RSS has not carried U")
+
+    # RSS catches up while U is STILL on the listing -> duplicate, not feed_only.
+    _cycle(db, "c3", "2026-08-03T00:00:00+00:00", rss=[U], raw=[U], detail=[U])
+    res = db.get_hdencode_miss_resolution()
+    assert res["unattributed_candidates"] == 0, res.get("unattributed_candidate_urls")
+    assert int(res.get("acquired") or 0) == 1, (
+        "RSS carried U, so it is ACQUIRED — whether or not the listing still lists "
+        f"it. Got acquired={res.get('acquired')} never={res.get('never_acquired')} "
+        f"undetermined={res.get('undetermined')} "
+        f"not_yet={res.get('not_yet_assessable')}")
+
+
+def test_duplicate_reaches_the_resolver_cycle_records(db):
+    """Verify the CONSUMER, not the component — one layer deeper than last time.
+
+    The bug was not that duplicates were unpersisted (round 8 fixed that); it was
+    that `get_hdencode_miss_resolution` parsed them and did not put them in the
+    cycle records it hands the resolver. So this asserts the resolver's own input.
+    """
+    from backend.hdencode_shadow import classify_miss_resolution
+    from datetime import datetime, timezone
+
+    _cycle(db, "c1", "2026-08-01T00:00:00+00:00", rss=[], raw=[U], detail=[U])
+    _cycle(db, "c2", "2026-08-02T00:00:00+00:00", rss=[U], raw=[U], detail=[U])
+
+    # Drive the classifier directly with a duplicate-only cycle: no feed_only at all.
+    state, hours, _detail = classify_miss_resolution(
+        url=U, media_type="movie",
+        first_seen=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        cycles=[{"at": datetime(2026, 8, 2, tzinfo=timezone.utc),
+                 "listing_only": {U}, "feed_only": set(), "duplicate_urls": {U},
+                 "outcomes": {"movies_all": "changed", "tv_all": "changed"},
+                 "listing_complete": True, "cycle_complete": True}])
+    assert state == "acquired", (
+        f"a duplicate is affirmative RSS carriage; classifier said {state!r}")
+
+
 def test_a_contradicted_cycle_cannot_clear_via_rss_carriage(db):
     """The create/clear asymmetry still holds on the new evidence path."""
     _cycle(db, "c1", "2026-08-01T00:00:00+00:00", rss=[], raw=[U], detail=[],
