@@ -1027,7 +1027,13 @@ class DatabaseManager:
                         restart_recovery INTEGER NOT NULL DEFAULT 0,
                         outcome TEXT NOT NULL,
                         details_json TEXT NOT NULL DEFAULT '{}',
-                        normal_feed_outcomes TEXT
+                        normal_feed_outcomes TEXT,
+                        -- Listing-arm trustworthiness, recorded SEPARATELY from
+                        -- feed health. NULL on cycles written before 2026-08-07.
+                        -- normal_feeds_complete conflates a failed feed with a
+                        -- failed listing crawl, so resolution cannot tell them
+                        -- apart from it; see cycle_is_valid_evidence_for().
+                        listing_complete INTEGER
                     )
                 """)
                 cursor.execute("""
@@ -1062,6 +1068,11 @@ class DatabaseManager:
                     # miss can be audited rather than re-derived by guesswork.
                     "ALTER TABLE hdencode_shadow_misses "
                     "ADD COLUMN attribution_basis TEXT",
+                    # Listing-arm authority, so a mixed-feed cycle can resolve a
+                    # miss for the feed that DID succeed without also trusting a
+                    # listing crawl that failed.
+                    "ALTER TABLE hdencode_shadow_cycles "
+                    "ADD COLUMN listing_complete INTEGER",
                 ):
                     try:
                         cursor.execute(_shadow_alter)
@@ -1178,6 +1189,13 @@ class DatabaseManager:
                         deferred_items INTEGER NOT NULL DEFAULT 0,
                         auto_resume_after_cooldown INTEGER NOT NULL DEFAULT 0,
                         auto_resume_used INTEGER NOT NULL DEFAULT 0,
+                        -- Completed-item count at the moment of the last
+                        -- automatic resume. Lets the retry budget be REFUNDED
+                        -- when a resume actually delivered something, so a batch
+                        -- that keeps making progress is not cut off after N
+                        -- attempts. See _maybe_auto_resume.
+                        auto_resume_progress_mark INTEGER NOT NULL DEFAULT 0,
+                        source_delivery_count INTEGER NOT NULL DEFAULT 0,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
                         paused_at TEXT,
@@ -1186,6 +1204,33 @@ class DatabaseManager:
                         last_cause_code TEXT
                     )
                 """)
+                # Additive migration for the table above, placed HERE and not in
+                # the shared _column_migrations list several hundred lines
+                # earlier. That list runs BEFORE this CREATE, so an ALTER there
+                # fails with "no such table", and the guard only swallows
+                # "duplicate column" -- it logs the failure and carries on,
+                # leaving the column absent. That exact mistake cost a round of
+                # confusing test failures on the shadow tables; see the note
+                # beside their migrations.
+                for _batch_alter in (
+                    "ALTER TABLE download_queue_batches "
+                    "ADD COLUMN auto_resume_progress_mark INTEGER "
+                    "NOT NULL DEFAULT 0",
+                    # Incremented ONLY when a completion genuinely crossed the
+                    # source boundary -- see DownloadQueueService._complete.
+                    # Generic 'completed' cannot be used: download_item() returns
+                    # success with method='duplicate' BEFORE scraping when the
+                    # release was already grabbed, so counting completions would
+                    # refund retry budget for work the source never did.
+                    "ALTER TABLE download_queue_batches "
+                    "ADD COLUMN source_delivery_count INTEGER "
+                    "NOT NULL DEFAULT 0",
+                ):
+                    try:
+                        cursor.execute(_batch_alter)
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS download_queue_items (
                         item_uuid TEXT PRIMARY KEY,
@@ -2099,8 +2144,9 @@ class DatabaseManager:
                     rss_requests, listing_requests, rss_count, listing_count,
                     duplicate_count, feed_only_count, listing_only_count,
                     relevant_miss_count, request_reduction_pct, catchup_used,
-                    restart_recovery, outcome, details_json, normal_feed_outcomes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    restart_recovery, outcome, details_json, normal_feed_outcomes,
+                    listing_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (cycle_uuid,started_at,completed_at,1 if metrics.get("normal_feeds_complete") else 0,
                  int(metrics.get("rss_requests") or 0),int(metrics.get("listing_requests") or 0),
                  int(metrics.get("rss_count") or 0),int(metrics.get("listing_count") or 0),
@@ -2112,7 +2158,12 @@ class DatabaseManager:
                  # Written NON-NULL by every attribution-aware caller, including
                  # the empty-dict case. Only pre-attribution rows are NULL, and
                  # get_hdencode_shadow_summary depends on that distinction.
-                 json.dumps(dict(metrics.get("normal_feed_outcomes") or {}),default=str)),
+                 json.dumps(dict(metrics.get("normal_feed_outcomes") or {}),default=str),
+                 # Three-state, matching the column: None when the caller did not
+                 # record it (so resolution falls back to the aggregate rule), else
+                 # an explicit 0/1.
+                 (None if metrics.get("listing_complete") is None
+                  else (1 if metrics.get("listing_complete") else 0))),
             )
             for miss in misses:
                 conn.execute(
@@ -2146,9 +2197,24 @@ class DatabaseManager:
 
     def get_hdencode_shadow_summary(self):
         # Readiness evidence is derived only from structurally eligible cycles:
-        # both normal feeds completed and both comparison sides made at least
-        # one request.  Incomplete/degenerate rows must not stretch the
-        # observation window or improve the request-reduction percentage.
+        # both normal feeds completed, listing membership uncontradicted, and both
+        # comparison sides made at least one request.  Incomplete/degenerate rows
+        # must not stretch the observation window or improve the request-reduction
+        # percentage.
+        #
+        # LISTING AUTHORITY WAS MISSING FROM THIS WINDOW UNTIL ROUND 7.
+        # compare_shadow() withholds `listing_complete` when detail attribution
+        # contradicts raw membership, and the per-release resolver honours that --
+        # but this query did not, so a cycle the resolver refused to trust still
+        # incremented `cycles`, stretched first/last_completed_at, improved the
+        # request-reduction figure and counted as restart/catch-up recovery
+        # evidence. The top-level qualification claim was therefore calling cycles
+        # successful on evidence its own resolver had rejected.
+        #
+        # NULL is admitted for cycles written before the column existed; those
+        # fall back to the aggregate rule, the same legacy compatibility used by
+        # cycle_is_valid_evidence_for(). A cycle recorded SINCE the column exists
+        # must be an explicit 1.
         eligible=self._query(
             """SELECT COUNT(*) AS cycles,
                       MIN(completed_at) AS first_completed_at,
@@ -2159,6 +2225,7 @@ class DatabaseManager:
                FROM hdencode_shadow_cycles
                WHERE outcome IN ('success','relevant_miss')
                  AND normal_feeds_complete=1
+                 AND (listing_complete IS NULL OR listing_complete=1)
                  AND rss_requests>0
                  AND listing_requests>0""",
             one=True,default=None)
@@ -2424,6 +2491,290 @@ class DatabaseManager:
             "latest":dict(latest) if latest is not None else None,
         }
 
+    def get_hdencode_miss_resolution(self):
+        """Classify every recorded miss as acquired / never acquired / unresolved.
+
+        PER-FEED AUTHORITY, restored 2026-08-07 on peer review. The first version
+        sourced misses with `WHERE c.normal_feeds_complete = 1` and admitted
+        observation cycles on the same condition. That is the CYCLE-LEVEL rule
+        this project spent five review rounds replacing. compare_shadow emits a
+        miss when the feed responsible for THAT release was observed -- so a movie
+        miss is legitimately recorded in a cycle where movies_all validated and
+        tv_all failed, i.e. with normal_feeds_complete = 0. My filter dropped
+        exactly those rows out of the gate: a real movie gap stopped blocking
+        because an unrelated TV feed had failed. That was a false-ready path.
+
+        Now both halves use `feed_observation_valid`, the same predicate that
+        governs miss creation:
+
+          * a miss is ADMITTED if its own feed was observed in its source cycle;
+          * a later cycle may RESOLVE it only if that cycle observed its feed.
+
+        Rows whose source cycle predates per-feed provenance keep the older,
+        conservative cycle-complete rule -- there is nothing finer to use.
+
+        Malformed evidence is reported, never silently skipped: dropping a cycle
+        because its JSON will not parse can remove the only observation after a
+        miss, which would quietly turn a decidable row into an unresolved one.
+        """
+        from backend.hdencode_shadow import (
+            feed_observation_valid, summarise_miss_resolutions,
+        )
+
+        def _at(value):
+            """ISO -> aware UTC datetime, or None. Never raises."""
+            try:
+                parsed=datetime.datetime.fromisoformat(str(value))
+            except (TypeError,ValueError):
+                return None
+            if parsed.tzinfo is None:
+                parsed=parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
+
+        def _urlset(value,label,cycle,problems):
+            """A URL container, or a recorded problem. `set(5)` would raise."""
+            if value is None:
+                return set()
+            if isinstance(value,(str,bytes)) or not isinstance(value,(list,tuple,set)):
+                problems.append(f"{label}_not_a_list:{cycle}:{type(value).__name__}")
+                return None
+            return {str(v) for v in value}
+
+        problems=[]
+        cycles=[]
+        # UNRESOLVED LISTING-ONLY CANDIDATES, keyed by URL. Replaces a running
+        # total of every historical detail failure, which round 7 showed was the
+        # wrong granularity in two directions:
+        #
+        #   * A URL present in BOTH the RSS feed and the raw listing whose detail
+        #     scrape failed is a DUPLICATE -- the thing RSS is supposed to find,
+        #     found. It cannot be an RSS miss, and it was blocking readiness.
+        #   * A genuinely listing-only URL that failed detail once and was
+        #     attributed fine on the next cycle blocked FOREVER, because a sum over
+        #     history has no way to subtract. Readiness could never recover from a
+        #     single transient scrape failure, which is not a property anyone chose.
+        #
+        # So candidacy is `detail_failed & listing_only` -- a listing row we could
+        # not attribute AND that RSS did not carry -- and later evidence clears it.
+        # The dict is keyed by URL rather than counted so that the same URL failing
+        # in three cycles is one unresolved candidate, not three.
+        candidate_state={}
+        for row in self._query_dicts(
+                "SELECT cycle_uuid, completed_at, outcome, normal_feeds_complete, "
+                "       rss_requests, listing_requests, details_json, "
+                "       normal_feed_outcomes, listing_complete "
+                "FROM hdencode_shadow_cycles "
+                "WHERE details_json IS NOT NULL ORDER BY completed_at",
+                default=[]):
+            cycle=str(row.get("cycle_uuid") or "")
+            # ADMIT incomplete_feeds, corrected 2026-08-07 on peer review.
+            #
+            # This filter used to require outcome in ("success","relevant_miss"),
+            # and compare_shadow writes "incomplete_feeds" whenever
+            # normal_feeds_complete is false -- which is exactly the mixed-feed
+            # case the per-feed rule exists to handle. So a cycle with
+            # movies_all=changed and tv_all=failed was discarded HERE, before
+            # cycle_is_valid_evidence_for() could ever see it. The helper was
+            # right and unreachable.
+            #
+            # Admitting it is only safe because listing trustworthiness is now a
+            # separate authority: cycle_is_valid_evidence_for() requires the
+            # listing arm AND the relevant feed, so an "incomplete_feeds" cycle
+            # whose LISTING failed still cannot resolve anything.
+            if not (row.get("outcome") in ("success","relevant_miss",
+                                           "incomplete_feeds")
+                    and int(row.get("rss_requests") or 0)>0
+                    and int(row.get("listing_requests") or 0)>0):
+                continue
+            at=_at(row.get("completed_at"))
+            if at is None:
+                problems.append(f"cycle_completed_at_unparseable:{cycle}")
+                continue
+            try:
+                details=json.loads(row.get("details_json") or "{}")
+            except (TypeError,ValueError):
+                problems.append(f"details_json_unparseable:{cycle}")
+                continue
+            if not isinstance(details,dict):
+                problems.append(f"details_json_not_an_object:{cycle}")
+                continue
+            # Genuine attribution failures recorded by the crawl. Distinct from
+            # detail_dropped, which mixes in cached skips and policy exclusions.
+            failed=details.get("detail_failed")
+            if isinstance(failed,(list,tuple)):
+                failed_urls={str(u) for u in failed if u}
+            else:
+                if failed:
+                    problems.append(f"detail_failed_not_a_list:{cycle}")
+                failed_urls=set()
+            listing=_urlset(details.get("listing_only"),"listing_only",cycle,problems)
+            feed=_urlset(details.get("feed_only"),"feed_only",cycle,problems)
+            # Cycles written before round 8 have no duplicate_urls; _urlset returns
+            # an empty set for a missing key, which is the conservative reading --
+            # absent evidence clears nothing.
+            duplicates=_urlset(
+                details.get("duplicate_urls"),"duplicate_urls",cycle,problems)
+            if listing is None or feed is None or duplicates is None:
+                continue
+            outcomes=self._normal_feed_outcomes(row, cycle, problems)
+            # STRICTLY NULL/0/1. The column is an unconstrained INTEGER, and
+            # bool() would turn 2 or -1 into True -- i.e. corrupt data would grant
+            # listing authority. Anything else is an evidence problem.
+            raw_listing_ok=row.get("listing_complete")
+            if raw_listing_ok is None:
+                listing_ok=None
+            elif raw_listing_ok in (0,1,True,False):
+                # Identity against the allowed values, NOT int() coercion. Round 5
+                # pointed out that int() accepts "1" and RAISES on "garbage" --
+                # taking readiness down with a ValueError instead of recording an
+                # evidence problem. SQLite affinity does not prevent stored text.
+                listing_ok=bool(raw_listing_ok)
+            else:
+                problems.append(
+                    f"listing_complete_invalid:{cycle}:{raw_listing_ok!r}")
+                listing_ok=None
+            # CANDIDATE BOOKKEEPING. Chronological -- the query above is
+            # ORDER BY completed_at -- so a later cycle's evidence overwrites an
+            # earlier cycle's verdict for the same URL.
+            #
+            # The asymmetry is deliberate. CREATING a candidate is conservative
+            # (it blocks), so an untrusted cycle may still raise one. CLEARING is
+            # permissive, so a cycle whose listing membership is contradicted
+            # (listing_complete=False) must not clear anything -- otherwise a
+            # cycle the resolver refuses to trust could still be the thing that
+            # unblocks readiness, which is the same fail-open shape as HIGH 2.
+            # Legacy NULL is allowed to clear: those cycles predate the column and
+            # are governed by the aggregate rule everywhere else.
+            for url in failed_urls & listing:
+                candidate_state[url]=True
+            # CLEARING REQUIRES AFFIRMATIVE RSS CARRIAGE. Corrected on peer review
+            # round 8, which found the previous rule fail-open -- and it was worse
+            # than the review described. It cleared on
+            #
+            #     (listing_only | feed_only) - detail_failed
+            #
+            # but `listing_only` MEANS RSS DID NOT CARRY THE URL. That is the
+            # miss-candidate set. So a later cycle where the release was still
+            # missing from RSS -- and merely had a working detail scrape -- deleted
+            # the blocker. I was clearing an RSS-coverage blocker using evidence of
+            # an RSS coverage gap, and if the relevant feed had not been validly
+            # observed that cycle, no graded miss row was created to take over. The
+            # blocker vanished and nothing replaced it.
+            #
+            # The only affirmative evidence that RSS carried a URL is:
+            #   feed_only      -- in RSS, not in the listing
+            #   duplicate_urls -- in RSS AND in the listing  <-- see Finding 2
+            # Their union is exactly "this cycle's RSS set, as far as it concerns
+            # URLs we know about". Nothing else in a persisted cycle establishes it.
+            #
+            # The second legitimate exit is OWNERSHIP TRANSFER to a graded miss row,
+            # applied after the miss loop below, since that is where admission by
+            # feed validity is decided.
+            rss_carried=feed | duplicates
+            if listing_ok is not False:
+                for url in rss_carried:
+                    if url in candidate_state:
+                        candidate_state[url]=False
+            cycles.append({"at":at,"listing_only":listing,"feed_only":feed,
+                           "outcomes":outcomes,
+                           "listing_complete":listing_ok,
+                           "cycle_complete":bool(row.get("normal_feeds_complete"))})
+
+        misses=[]
+        for row in self._query_dicts(
+                "SELECT m.canonical_url AS url, m.media_type AS media_type, "
+                "       c.cycle_uuid AS cycle_uuid, c.completed_at AS at, "
+                "       c.normal_feeds_complete AS complete, "
+                "       c.normal_feed_outcomes AS provenance "
+                "FROM hdencode_shadow_misses m "
+                "JOIN hdencode_shadow_cycles c ON c.cycle_uuid=m.cycle_uuid",
+                default=[]):
+            cycle=str(row.get("cycle_uuid") or "")
+            media_type=row.get("media_type")
+            source_outcomes=self._normal_feed_outcomes(row, cycle, problems)
+            if source_outcomes is None:
+                # Pre-provenance row: fall back to the conservative cycle rule.
+                admitted=bool(row.get("complete"))
+            else:
+                # NULL media_type is a pre-attribution legacy row, not a
+                # movie: read it as "unknown", which requires both feeds.
+                admitted=feed_observation_valid(
+                    str(media_type) if media_type is not None else "unknown",
+                    source_outcomes)
+            if not admitted:
+                continue
+            misses.append({"url":row.get("url"),"media_type":media_type,
+                           "at":_at(row.get("at"))})
+        # OWNERSHIP TRANSFER, the second and only other legitimate way out of
+        # candidate state. Applied HERE and not in the cycles loop because this is
+        # where admission is decided: a miss row only lands in `misses` if its
+        # relevant feed observation was valid (or, for a pre-provenance row, the
+        # conservative cycle rule held).
+        #
+        # The distinction round 8 required: a later detail success must not merely
+        # DELETE the blocker, it must hand the URL over to something that still
+        # blocks. Once an admitted miss row exists, the normal miss-resolution
+        # machinery owns that URL -- it will be graded acquired / never_acquired /
+        # undetermined / not_yet_assessable, and every one of those states except
+        # `acquired` blocks readiness on its own. So dropping it from the
+        # unattributed set is a genuine transfer of responsibility rather than an
+        # erasure.
+        #
+        # Note this deliberately does NOT check whether the miss row's own verdict
+        # is favourable. That is not this function's job, and making candidacy
+        # depend on the outcome would double-count the same URL in two blockers.
+        for url in {str(m.get("url") or "") for m in misses}:
+            if url in candidate_state:
+                candidate_state[url]=False
+        summary=summarise_miss_resolutions(misses,cycles)
+        summary["evidence_problems"]=problems
+        unresolved=sorted(u for u,pending in candidate_state.items() if pending)
+        summary["unattributed_candidates"]=len(unresolved)
+        # The URLs themselves, so the readiness reason can be acted on instead of
+        # only counted. A bare "3 candidates" cannot be investigated.
+        summary["unattributed_candidate_urls"]=unresolved
+        return summary
+
+    def _normal_feed_outcomes(self, row, cycle, problems):
+        """Parse a cycle's per-feed outcome map. None means 'not recorded'.
+
+        Distinguishes "this cycle predates provenance" (None -> caller falls back
+        to the cycle-level rule) from "provenance is present but unreadable"
+        (recorded as a problem, treated as no observation) -- because silently
+        reading corrupt provenance as an empty map would make every miss look
+        unobservable, which is not the same thing as absent.
+        """
+        raw=row.get("provenance") if "provenance" in row else row.get("normal_feed_outcomes")
+        if raw is None:
+            return None
+        try:
+            parsed=json.loads(raw or "{}")
+        except (TypeError,ValueError):
+            problems.append(f"normal_feed_outcomes_unparseable:{cycle}")
+            return {}
+        if not isinstance(parsed,dict):
+            problems.append(f"normal_feed_outcomes_not_an_object:{cycle}")
+            return {}
+        if "_derived_from" in parsed:
+            # A CYCLE-LEVEL FALLBACK MARKER. Corrected 2026-08-07 on peer review.
+            #
+            # This returned {} -- an explicit "no feed observed" -- which meant a
+            # miss recorded under such a marker was never ADMITTED (admission tests
+            # `is None` to decide the legacy fallback, and {} is not None). But the
+            # marker's whole purpose is to say "no per-feed data was recorded here,
+            # use the cycle-level rule", which is exactly the legacy case. So it
+            # must read as None, not as an empty observation.
+            #
+            # Validate the schema before granting that fallback: an unrecognised or
+            # malformed marker is corrupt evidence, not a licence to fall back.
+            if (set(parsed) == {"_derived_from", "normal_feeds_complete"}
+                    and parsed.get("_derived_from") == "cycle_level_completeness"
+                    and isinstance(parsed.get("normal_feeds_complete"), bool)):
+                return None
+            problems.append(f"derived_marker_invalid:{cycle}:{sorted(parsed)!r}")
+            return {}
+        return {str(k):str(v) for k,v in parsed.items()}
+
     def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180):
         required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days)); summary=self.get_hdencode_shadow_summary()
         first=summary.get("first_completed_at"); last=summary.get("last_completed_at"); observed_days=0.0
@@ -2447,7 +2798,49 @@ class DatabaseManager:
         reasons=[]
         if summary["successful_cycles"]<required_cycles: reasons.append("insufficient_comparison_cycles")
         if observed_days<required_days: reasons.append("insufficient_observation_days")
-        if summary["relevant_misses"]>0: reasons.append("relevant_misses_detected")
+        # THE MISS RULE, changed 2026-08-07 on Jesse's decision. This used to be
+        # `if summary["relevant_misses"] > 0`, which blocked on ANY listing-only
+        # observation ever recorded. That could never pass: 99 of 100 such
+        # releases were acquired anyway, median about an hour, all via the normal
+        # feeds, so the gate treated ordinary polling latency as permanent
+        # coverage loss and RSS would have stayed in shadow mode indefinitely.
+        #
+        # Now only a release that was NEVER acquired counts, with no deadline.
+        # UNDETERMINED rows -- ones that left the listing without ever appearing
+        # in the feed -- still block, because "cannot be proven either way" is not
+        # evidence of health, and calling it health is the fail-open shape that
+        # produced two HIGH findings in this same subsystem.
+        resolution=self.get_hdencode_miss_resolution()
+        if int(resolution.get("never_acquired") or 0)>0:
+            reasons.append("unacquired_misses_detected")
+        if int(resolution.get("undetermined") or 0)>0:
+            reasons.append("miss_resolution_undetermined")
+        # PENDING BLOCKS, reversed 2026-08-07 on peer review. I had excluded
+        # not_yet_assessable so the gate could pass. The review showed why that is
+        # unsafe rather than merely optimistic: the shadow comparison is recorded
+        # only while discovery_mode == "rss_shadow", so promoting to rss_primary
+        # stops producing the very observations a pending row needs. The gate
+        # would open on evidence its own promoted mode destroys.
+        if int(resolution.get("not_yet_assessable") or 0)>0:
+            reasons.append("miss_resolution_pending")
+        # Unreadable evidence is not the same as clean evidence. Skipping a
+        # malformed cycle can remove the only observation after a miss, so it is
+        # reported rather than absorbed.
+        if resolution.get("evidence_problems"):
+            reasons.append("miss_resolution_evidence_unreadable")
+        # UNATTRIBUTED IN-SCOPE CANDIDATES BLOCK. Round 6: a listing-only release
+        # whose detail scrape failed is not booked as a miss (it has no media type,
+        # so it cannot be attributed to a feed) -- and it was therefore vanishing
+        # from readiness entirely. A false-health under-count. It must block the
+        # claim that no unacquired misses exist, without invalidating the cycle's
+        # membership evidence for resolving OTHER misses.
+        # Counted STRUCTURALLY by the loader, which already parses details_json.
+        # My first attempt here used `details_json LIKE '%detail_failed%'` -- string
+        # matching against JSON, which is the exact anti-pattern the RSS
+        # round-6 work removed from this same file. A schema change or a key
+        # appearing inside a URL would break it silently.
+        if int(resolution.get("unattributed_candidates") or 0) > 0:
+            reasons.append("unattributed_listing_candidates")
         # An integrity failure is not "zero misses". Malformed provenance, a
         # count that disagrees with the rows on disk, a nonzero count with no
         # rows, or a miss row filed against supplied-empty provenance all mean
@@ -2459,7 +2852,7 @@ class DatabaseManager:
         if summary["request_reduction_pct"]<=0: reasons.append("request_reduction_not_proven")
         if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
         if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")
-        return {"ready":not reasons,"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
+        return {"ready":not reasons,"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"misses_acquired":int(resolution.get("acquired") or 0),"misses_never_acquired":int(resolution.get("never_acquired") or 0),"misses_undetermined":int(resolution.get("undetermined") or 0),"misses_not_yet_assessable":int(resolution.get("not_yet_assessable") or 0),"miss_evidence_problems":list(resolution.get("evidence_problems") or []),"worst_acquisition_lag_hours":resolution.get("worst_acquisition_lag_hours"),"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
 
     # ── HDEncode candidate actions ─────────────────────────────────────
 

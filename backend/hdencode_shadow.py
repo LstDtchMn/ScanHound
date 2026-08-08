@@ -244,15 +244,109 @@ class ShadowComparison:
     # observation, which is a coverage-observability gap even though it is not a
     # proven miss.
     unattributable:tuple[dict,...]=()
+    #: Whether the LISTING arm of this comparison is trustworthy, independent of
+    #: feed health. None means "not recorded" (cycles written before this field).
+    #:
+    #: WHY THIS IS SEPARATE, added 2026-08-07 on peer review. `normal_feeds_complete`
+    #: conflates two failures: _rss_normal_feeds_complete() returns False when a
+    #: normal feed failed AND when the listing crawl errored. So the stored outcome
+    #: "incomplete_feeds" cannot tell those apart, and resolution needs both
+    #: authorities separately -- a movie miss can be resolved by a cycle where
+    #: tv_all failed, but NOT by one whose listing was broken, because the listing
+    #: is the other half of the comparison.
+    #:
+    #: DECLARED LAST, DELIBERATELY. I first inserted it after `relevant_misses`,
+    #: which shifted every positional argument in the constructor call: `recorded`
+    #: landed here and the keyword then collided, breaking 47 existing tests. This
+    #: dataclass is constructed POSITIONALLY, so a new field must go at the end.
+    listing_complete:Optional[bool]=None
+    #: Raw-listing URLs whose detail scrape produced nothing, so they carry no
+    #: attribution. Before 2026-08-07 these silently became `feed_only`, which the
+    #: miss resolver reads as proof of acquisition.
+    detail_dropped:tuple[str,...]=()
+    #: Detail URLs absent from the raw seen-set. Production cannot produce this, so
+    #: a non-empty value is an authority contradiction and must deny membership.
+    membership_contradiction:tuple[str,...]=()
+    #: URLs the crawl intended to attribute and could not -- scheduled minus
+    #: completed. Unlike detail_dropped this excludes cached skips and policy
+    #: exclusions, so it is safe to block on.
+    detail_failed:tuple[str,...]=()
+    #: URLs carried by BOTH the RSS feed and the listing, by URL rather than only
+    #: counted. Added 2026-08-07 on peer review round 8.
+    #:
+    #: WHY THE COUNT WAS NOT ENOUGH. `duplicate_count` existed, so the ordinary
+    #: SUCCESS case was invisible: a listing-only URL whose detail scrape failed
+    #: becomes an unresolved candidate, and when RSS later catches up while the
+    #: release is still listed, that URL is a DUPLICATE -- in neither `feed_only`
+    #: nor `listing_only`. The candidate loader could therefore never see the one
+    #: piece of evidence that resolves it, and it blocked forever.
+    #:
+    #: `feed_only | duplicate_urls` is the affirmative "RSS carried this URL" set:
+    #: feed_only is RSS-and-not-listing, duplicates are RSS-and-listing. Nothing
+    #: else in a persisted cycle can establish that, which is why Finding 1's
+    #: ownership rule needs this field too.
+    #:
+    #: DECLARED LAST for the reason spelled out on `listing_complete` above: this
+    #: dataclass is constructed POSITIONALLY and inserting a field mid-list shifted
+    #: every later argument and broke 47 tests.
+    duplicate_urls:tuple[str,...]=()
     def as_dict(self): return asdict(self)
 
-def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss_requests:int, listing_requests:int, normal_feeds_complete:bool, normal_feed_outcomes: Optional[Mapping[str,str]]=None) -> ShadowComparison:
+def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss_requests:int, listing_requests:int, normal_feeds_complete:bool, normal_feed_outcomes: Optional[Mapping[str,str]]=None, listing_complete: Optional[bool]=None, raw_listing_urls: Optional[Iterable[str]]=None, detail_failed_urls: Optional[Iterable[str]]=None) -> ShadowComparison:
     rss={canonical_url(u) for u in rss_urls if u}
     listing={}
     for item in listing_items:
         row=_row_dict(item); url=canonical_url(row.get('url'))
         if url: listing[url]=row
-    listing_urls=set(listing); duplicate=rss & listing_urls; feed_only=rss-listing_urls; listing_only=listing_urls-rss
+    # MEMBERSHIP COMES FROM THE RAW LISTING, attribution from the detail rows.
+    #
+    # THE FALSE-ACQUISITION BUG THIS FIXES, found by peer review in round 5. These
+    # sets used to be derived from `listing_items`, which is the DETAIL-PROCESSED
+    # list. `_process_posts()` returns None when `scrape_details()` yields nothing
+    # or throws, so that URL is dropped. A release present in BOTH the raw listing
+    # and the feed, whose detail scrape merely failed, therefore landed in
+    # `feed_only` -- and the miss resolver reads `feed_only` as AFFIRMATIVE
+    # ACQUISITION. A real miss resolved as acquired: a wrong answer, not a policy
+    # problem.
+    #
+    # Raw membership is the authority for "was this on the listing at all". The
+    # detail rows remain the authority for status and media attribution, which is
+    # what CREATING a miss needs. One signal must not certify both.
+    #
+    # When no raw set is supplied the old detail-derived behaviour stands, so
+    # callers and tests that predate this argument are unaffected.
+    detail_urls=set(listing)
+    raw=None
+    if raw_listing_urls is not None:
+        raw={canonical_url(u) for u in raw_listing_urls if u}
+        raw.discard('')
+    # RAW IS AUTHORITATIVE, not a peer of the detail set. Round 6 established the
+    # production invariant: _crawl_pages adds a URL to seen_post_urls BEFORE
+    # appending it to all_posts, _process_posts only handles all_posts, and
+    # run_scan clears self.items each run -- so after canonicalisation
+    # `detail_urls` MUST be a subset of `raw`.
+    #
+    # My first version used `raw | detail_urls`, reasoning that a union could not
+    # lose an observation. But a non-empty `detail_urls - raw` is not a second
+    # source of truth, it is a CONTRADICTION -- and the union silently repaired it,
+    # which could suppress a legitimate feed_only whenever raw membership had been
+    # lost or truncated. I had even written a test asserting that repair, so the
+    # test protected the defect.
+    membership=detail_urls if raw is None else raw
+    membership_contradiction=(
+        tuple(sorted(detail_urls-raw)) if raw is not None else ())
+    duplicate=rss & membership; feed_only=rss-membership; listing_only=membership-rss
+    # Listing rows we could not attribute because their detail scrape produced
+    # nothing. Recorded rather than silently dropped: they are the population that
+    # used to corrupt feed_only, and they are a real observability gap.
+    # Listing rows with no detail row. NOTE this is NOT the blocking signal: the
+    # crawler adds a URL to its seen set BEFORE deciding to skip it as cached or
+    # exclude it by policy, so this set mixes intentional skips with real failures.
+    # The blocking signal is detail_failed, supplied by the caller from
+    # scheduled-minus-completed, where those intentional states are absent by
+    # construction.
+    detail_dropped=tuple(sorted(listing_only-detail_urls))
+    listing_urls=membership
     # THREE-STATE, and the distinction is load-bearing.
     #
     #   None  -> the caller supplies no provenance. Fall back to the
@@ -280,7 +374,12 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
         recorded=dict(outcomes)
     misses=[]; unattributable=[]
     for url in sorted(listing_only):
-        row=listing[url]
+        row=listing.get(url)
+        if row is None:
+            # Raw-listing URL with no detail row: no status and no media type, so
+            # it cannot be attributed to a feed and must not be booked as a miss.
+            # It is reported via detail_dropped instead of being invented or lost.
+            continue
         if _status_value(row) not in _RELEVANT_STATES: continue
         media_type,basis=attribution_evidence({**row,'url':url})
         record={'canonical_url':url,'title':row.get('title'),
@@ -337,4 +436,210 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
     # spans catch-up feeds and counts attempted-but-failed requests, so it
     # admitted exactly the stale comparisons it was meant to exclude.
     if misses and normal_feeds_complete: outcome='relevant_miss'
-    return ShadowComparison(len(rss),len(listing_urls),len(duplicate),len(feed_only),len(listing_only),len(misses),int(rss_requests),int(listing_requests),round(reduction,2),bool(normal_feeds_complete),outcome,tuple(sorted(feed_only)),tuple(sorted(listing_only)),tuple(misses),dict(recorded),tuple(unattributable))
+    return ShadowComparison(len(rss),len(listing_urls),len(duplicate),len(feed_only),len(listing_only),len(misses),int(rss_requests),int(listing_requests),round(reduction,2),bool(normal_feeds_complete),outcome,tuple(sorted(feed_only)),tuple(sorted(listing_only)),tuple(misses),dict(recorded),tuple(unattributable),
+        # A CONTRADICTION WITHHOLDS THE AUTHORITY CLAIM, it does not merely get
+        # logged. Recording a problem and then still asserting listing authority
+        # would be the "signal nothing consumes" mistake that has appeared in three
+        # separate rounds of this review. The comparison knows its own evidence is
+        # inconsistent, so it declines to certify it.
+        listing_complete=(
+            None if listing_complete is None
+            else (bool(listing_complete) and not membership_contradiction)),
+        detail_dropped=detail_dropped,
+        membership_contradiction=membership_contradiction,
+        detail_failed=tuple(sorted(
+            {canonical_url(u) for u in (detail_failed_urls or ()) if u} - {''})),
+        duplicate_urls=tuple(sorted(duplicate)))
+
+
+# ---------------------------------------------------------------------------
+# Miss resolution: was a listing-only release ever acquired?
+# ---------------------------------------------------------------------------
+#
+# THE RULE, decided by Jesse on 2026-08-07: a release counts against RSS only if
+# it was NEVER acquired, by any route, with no time limit.
+#
+# WHAT IT REPLACES. Readiness blocked on `relevant_misses > 0` -- any listing-only
+# observation, ever, blocked permanently. The measurement showed those are not
+# losses: 99 of 100 were acquired anyway, median about an hour, all through the
+# normal feeds. They were late, not lost. Exactly one was never acquired. Under
+# the old rule 60 records that all grade GREEN could never pass, so RSS would
+# stay in shadow mode however well it worked.
+#
+# MY RESERVATION, recorded once and not re-argued: with no deadline a release
+# acquired three days late counts as a success, so the rule stops measuring the
+# latency RSS exists to improve. I offered a 6-hour budget; Jesse chose the
+# simpler rule. The lag is still returned per row so it can be reported even
+# though it no longer gates.
+#
+# WHAT IS DELIBERATELY *NOT* WIDENED. "Never acquired" is a claim requiring
+# evidence, and so is "acquired". A row we cannot decide either way is neither:
+# it is UNDETERMINED and it still blocks. Treating unprovable as fine is the
+# fail-open shape that produced two HIGH findings in this same subsystem, and the
+# existing grader already gates on "0 RED, 0 PENDING and 0 AMBIGUOUS".
+
+#: A cycle only counts as an observation when both sides genuinely completed.
+_RESOLUTION_STATES = ("acquired", "never_acquired", "undetermined",
+                      "not_yet_assessable")
+
+#: The only media types a miss row may carry. Anything else is corrupt evidence
+#: and cannot be resolved, because the responsible feed is unknown.
+_VALID_MEDIA_TYPES = frozenset({"movie", "tv", "unknown"})
+
+
+def cycle_is_valid_evidence_for(media_type, cycle):
+    """May this cycle be used as an observation for a miss of ``media_type``?
+
+    TWO INDEPENDENT AUTHORITIES, both required. Peer review found that round 2 had
+    the per-feed rule right in this helper and then never reached it, because the
+    database reader filtered cycles on ``outcome in ("success","relevant_miss")``
+    while `compare_shadow` stores every aggregate-incomplete comparison as
+    ``incomplete_feeds``. A cycle with movies_all=changed and tv_all=failed -- the
+    exact case this helper exists for -- was discarded before it ran.
+
+    But simply admitting ``incomplete_feeds`` is not safe either, because
+    `_rss_normal_feeds_complete()` also returns False when the LISTING crawl
+    errored, and the listing is the other half of the comparison. So:
+
+    1. **the listing arm must be trustworthy**, and
+    2. **the feed responsible for this media type must have been observed**.
+
+    ``listing_complete`` carries (1) explicitly. ``None`` means the cycle predates
+    that field, and then the conservative cycle-level rule stands in for both --
+    which is the same legacy fallback the review accepted, and the same information
+    loss: old mixed cycles cannot be re-derived at per-feed precision.
+
+    ``outcomes`` carries (2) as a per-feed map, and the fallback is decided on
+    ``is None`` rather than truthiness -- an explicit empty map means "no feed was
+    observed", which is NOT the same as "no per-feed data was recorded". Collapsing
+    those two was a separate review finding.
+    """
+    listing_ok = cycle.get("listing_complete")
+    outcomes = cycle.get("outcomes")
+
+    if listing_ok is None or outcomes is None:
+        # Legacy cycle: nothing finer than the aggregate flag exists.
+        return bool(cycle.get("cycle_complete"))
+    if not listing_ok:
+        # The listing arm is untrustworthy, so this cycle cannot resolve anything
+        # however healthy its feeds were.
+        return False
+    # An explicit empty map means no normal feed was observed this cycle.
+    return feed_observation_valid(str(media_type), outcomes)
+
+
+def classify_miss_resolution(url, media_type, first_seen, cycles):
+    """Was ``url`` -- listing-only at ``first_seen`` -- ever provably acquired?
+
+    ``cycles`` is an ordered sequence of mappings with ``at`` (datetime),
+    ``listing_only`` / ``feed_only`` (containers of canonical URLs) and
+    ``outcomes`` (that cycle's per-normal-feed outcome map). Only cycles strictly
+    after ``first_seen`` count, and only those whose relevant feed was actually
+    observed for THIS media type.
+
+    Returns ``(state, hours, detail)`` with state in ``acquired`` /
+    ``never_acquired`` / ``undetermined`` / ``not_yet_assessable``.
+
+    PER-FEED AUTHORITY, restored 2026-08-07 after peer review. The first version
+    admitted an observation cycle only when ``normal_feeds_complete == 1``. That
+    is the cycle-level rule this project spent five review rounds REPLACING: a
+    cycle where movies_all validated and tv_all failed is perfectly good evidence
+    about a movie, and useless about TV. compare_shadow already emits misses on
+    exactly that basis -- its own comment says "a cycle where movies_all
+    succeeded says nothing about a tv_all gap" -- so filtering resolution on
+    cycle completeness threw away legitimate evidence and, worse, dropped
+    legitimately-recorded misses out of the gate entirely. That was a false-ready
+    path and it was mine.
+
+    The only affirmative evidence of acquisition is a later valid cycle in which
+    the feed has the URL and the listing no longer does -- the transition the
+    qualification grader treats as definitive. Absence from both sides proves
+    nothing: the listing pages away over time.
+    """
+    valid_later = [c for c in cycles
+                   if c.get("at") is not None and c["at"] > first_seen
+                   and cycle_is_valid_evidence_for(str(media_type), c)]
+    if not valid_later:
+        return ("not_yet_assessable", 0.0,
+                "no completed observation of this release's own feed exists "
+                "after this row yet")
+
+    last_missing = None
+    for cycle in valid_later:
+        if url in (cycle.get("feed_only") or ()):
+            return ("acquired",
+                    (cycle["at"] - first_seen).total_seconds() / 3600.0, "")
+        if url in (cycle.get("listing_only") or ()):
+            last_missing = cycle["at"]
+    newest = max(c["at"] for c in valid_later)
+    span = (newest - first_seen).total_seconds() / 3600.0
+    if last_missing is not None:
+        return ("never_acquired", span,
+                "observed still missing at a later valid cycle, never acquired")
+    return ("undetermined", span,
+            "left the listing without ever appearing in the feed, so neither "
+            "acquisition nor loss can be proven")
+
+
+def summarise_miss_resolutions(misses, cycles):
+    """Aggregate per-row classifications into the counts readiness gates on.
+
+    ``misses`` is a sequence of mappings with ``url``, ``media_type`` and ``at``.
+
+    NOT_YET_ASSESSABLE NOW BLOCKS, reversed 2026-08-07 on peer review. I had
+    excluded it so the gate could pass, and the review showed that is unsafe in a
+    way I had not considered: the shadow comparison is recorded only while
+    ``discovery_mode == "rss_shadow"`` (background_scanner.py:449). So promoting
+    to rss_primary STOPS producing the observations a pending row needs. The gate
+    could open on evidence its own promoted mode then destroys, turning
+    "temporarily unassessable" into a permanent blind spot.
+
+    The honest way to pass is a frozen cohort -- fix an admission cutoff, collect
+    an observation tail, require every admitted row to resolve -- not to make a
+    live unresolved row vanish because it happens to be newest.
+    """
+    counts = {state: 0 for state in _RESOLUTION_STATES}
+    rows = []
+    worst_lag = 0.0
+    for miss in misses:
+        url = miss.get("url")
+        first_seen = miss.get("at")
+        media_type = miss.get("media_type")
+        if not url or first_seen is None:
+            counts["undetermined"] += 1
+            rows.append({"url": url, "state": "undetermined", "hours": 0.0,
+                         "detail": "missing url or timestamp"})
+            continue
+        if media_type is None:
+            # PRE-ATTRIBUTION LEGACY ROW. media_type was added by the RSS
+            # accounting work, so every miss recorded before that migration has
+            # NULL here -- 70 of 72 rows in the live database. Treating those as
+            # corrupt blocked the gate on all of them, which is a false BLOCK
+            # exactly as bad as the false ready it replaced. I only found it
+            # because the measurement swung from 62 acquired to 1.
+            #
+            # "unknown" is the honest reading: the responsible feed was never
+            # recorded, so resolution requires BOTH feeds where per-feed data
+            # exists, and falls back to that cycle's completeness where it does
+            # not. Conservative without being blind.
+            media_type = "unknown"
+        elif str(media_type) not in _VALID_MEDIA_TYPES:
+            # A value that is present but outside the vocabulary is corrupt
+            # evidence, not a legacy gap, and must not be silently coerced.
+            counts["undetermined"] += 1
+            rows.append({"url": url, "state": "undetermined", "hours": 0.0,
+                         "detail": f"invalid media_type {media_type!r}"})
+            continue
+        state, hours, detail = classify_miss_resolution(
+            url, media_type, first_seen, cycles)
+        counts[state] += 1
+        if state == "acquired":
+            worst_lag = max(worst_lag, hours)
+        rows.append({"url": url, "media_type": str(media_type), "state": state,
+                     "hours": round(hours, 3), "detail": detail})
+    counts["worst_acquisition_lag_hours"] = round(worst_lag, 3)
+    counts["rows"] = rows
+    # not_yet_assessable is INCLUDED here; see the docstring above.
+    counts["blocking"] = (counts["never_acquired"] + counts["undetermined"]
+                          + counts["not_yet_assessable"])
+    return counts

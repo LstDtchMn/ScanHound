@@ -141,6 +141,7 @@ EXPECTED_DEFAULT_KEYS = {
     "hdencode_browser_profile_dir", "download_batch_interval_minutes",
     "download_queue_claim_lease_seconds",
     "download_queue_auto_resume_after_cooldown",
+    "download_queue_auto_resume_max_attempts",
 }
 
 

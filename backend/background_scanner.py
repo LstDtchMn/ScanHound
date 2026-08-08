@@ -475,6 +475,52 @@ class BackgroundScanner:
                         # decide validity per release instead of per cycle, so a
                         # movie gap can still block when only the TV feed failed.
                         normal_feed_outcomes=normal,
+                        # LISTING-ARM AUTHORITY, separate from feed health.
+                        # _rss_normal_feeds_complete() folds listing_error into
+                        # normal_feeds_complete, so the stored outcome cannot tell
+                        # "a feed failed" from "the listing crawl failed". Miss
+                        # resolution needs them apart: a movie miss may be resolved
+                        # by a cycle where tv_all failed, but never by one whose
+                        # listing was broken -- the listing is the other half of
+                        # the comparison.
+                        # LISTING AUTHORITY from the crawler's OWN verdict, not
+                        # from whether run_scan threw. Peer review found `err` is
+                        # not equivalent to "the listing completed": run_scan
+                        # CATCHES its own exception and still returns
+                        # list(self.items), _crawl_pages swallows per-page errors,
+                        # and a non-200 page simply continues. Worse, this very
+                        # block already distrusts a partial crawl for cache purge
+                        # via _last_crawl_early_stopped while I was writing
+                        # listing_complete=True from `err` alone -- one cycle could
+                        # be "too partial to purge" and "listing complete" at once.
+                        #
+                        # Only the crawler's "complete" state counts, and an
+                        # exception that escaped to here still disqualifies it.
+                        # RAW LISTING MEMBERSHIP. `items` is detail-processed and
+                        # drops anything whose detail scrape failed, which used to
+                        # turn a real miss into apparent acquisition. This set is
+                        # every listing URL the crawl actually saw.
+                        raw_listing_urls=getattr(
+                            scanner, "_last_crawl_seen_urls", None),
+                        # Genuine attribution failures -- scheduled minus completed.
+                        # Round 6: an in-scope listing-only release whose detail
+                        # scrape failed must not vanish from readiness, and this is
+                        # the only signal clean enough to block on (cached skips and
+                        # policy exclusions are excluded by construction).
+                        detail_failed_urls=(
+                            scanner.last_crawl_detail_failed()
+                            if hasattr(scanner, "last_crawl_detail_failed")
+                            else None),
+                        listing_complete=(
+                            not bool(err)
+                            # Keyed on the EXPLICIT termination reason. Round 6's
+                            # counterexample: `if self.stop_scan_flag: break` set no
+                            # boolean at all, so an externally cancelled crawl fell
+                            # through to "complete" and a partial listing certified
+                            # itself. Only a crawl that ran to the end qualifies.
+                            and getattr(scanner, "_last_crawl_termination",
+                                        "not_run") == "complete"
+                        ),
                     ).as_dict()
                     completed_at = datetime.now(timezone.utc).isoformat()
                     restart_recovery = self._qualify_restart_recovery(

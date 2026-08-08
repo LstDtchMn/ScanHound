@@ -135,10 +135,25 @@ def test_expired_cooldown_is_exposed_as_degraded():
 
 
 def test_health_routing_uses_parsed_hostname(monkeypatch):
+    """Path/query text must never decide source health ownership.
+
+    UPDATED 2026-08-07. The route used to classify with its own module-level
+    `_source_page_kind(url)`, which ignored the operator's configured HDEncode host;
+    peer review round 8 found that a configured mirror's health was therefore not
+    attributed to HDEncode. The route now asks the service.
+
+    So `dl` here is a REAL DownloadService with only `scrape_links` stubbed, not a
+    bare MagicMock. A MagicMock's `owns_source_health()` returns a truthy Mock, which
+    made the route record health for EVERY url and broke the negative assertion below
+    -- and had that assertion been positive-only, it would instead have passed
+    vacuously forever. Using the real object keeps this test exercising the same
+    classifier production uses, which is stronger than what it tested before.
+    """
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
     from backend.api.routes import downloads as download_routes
+    from backend.download_service import DownloadService
 
     links = ScrapedLinks(
         diagnostic=ScrapeDiagnostic(
@@ -146,8 +161,9 @@ def test_health_routing_uses_parsed_hostname(monkeypatch):
             affects_source_health=True,
         )
     )
-    dl = MagicMock()
-    dl.scrape_links.return_value = links
+    dl = DownloadService.__new__(DownloadService)
+    dl.config = {"base_url": "https://hdencode.org"}
+    dl.scrape_links = MagicMock(return_value=links)
     db = MagicMock()
     reg = SimpleNamespace(download=dl, db=db)
     recorder = MagicMock()

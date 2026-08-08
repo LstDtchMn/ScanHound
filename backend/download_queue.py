@@ -41,16 +41,40 @@ def _parse(value: Optional[str]) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
-def _source(url: str) -> str:
-    try:
-        host = (urlparse(url).hostname or "").lower().rstrip(".")
-    except Exception:
-        host = ""
-    if host == "ddlbase.com" or host.endswith(".ddlbase.com"):
-        return "ddlbase"
-    if host == "adit-hd.com" or host.endswith(".adit-hd.com"):
-        return "adithd"
-    return "hdencode"
+from backend.source_identity import source_kind as _source_kind
+
+
+#: Queue-row source values, mapped from the shared identity kinds. The queue stores
+#: `filehost` where the shared module says `direct_file`, because that string is
+#: already in `download_queue_items.source` on this branch and the active unique
+#: index `(source, canonical_url, service_type)` is built on it.
+_KIND_TO_QUEUE_SOURCE = {
+    "hdencode": "hdencode",
+    "ddlbase": "ddlbase",
+    "adithd": "adithd",
+    "direct_file": "filehost",
+    "other": "other",
+}
+
+
+def _source(url: str, hdencode_host: str = "hdencode.org") -> str:
+    """The durable queue row's source, from the ONE shared classifier.
+
+    UNIFIED 2026-08-07 on peer review. This function and
+    `download_service._source_page_kind()` were deciding the same question
+    independently, and had already drifted: both originally defaulted everything
+    that was not DDLBase or Adit-HD to "hdencode", round 4 fixed only this one, and
+    their host lists differed as well. Two registries answering one question is how
+    that happened, so both now call `backend.source_identity.source_kind`.
+
+    What the old default cost: Rapidgator, 1fichier, Nitroflare, ddownload and any
+    future host were stored as `source="hdencode"`, so a direct-host row could be
+    grouped under an HDEncode pause and -- once the retry refund worked -- could
+    refund HDEncode's budget. My own mixed-batch test could not catch it because it
+    used DDLBase, one of the only two hosts the old function actually recognised.
+    """
+    return _KIND_TO_QUEUE_SOURCE.get(
+        _source_kind(url, hdencode_host), "other")
 
 
 class DownloadQueueError(RuntimeError):
@@ -329,7 +353,7 @@ class DownloadQueueService:
         seen = set()
         for raw in items:
             item = self._request_dict(dict(raw))
-            source = _source(item["url"])
+            source = _source(item["url"], self._hdencode_host())
             key = (source, item["url"], item["service_type"])
             if not item["url"] or key in seen:
                 continue
@@ -461,7 +485,7 @@ class DownloadQueueService:
             else dict(request)
         )
         item = self._request_dict(data)
-        source = _source(item["url"])
+        source = _source(item["url"], self._hdencode_host())
         reason = str(outcome.get("reason_code") or "")
         direct = reason == "interactive_challenge" or bool(outcome.get("transport_attempted"))
         state = "verification_required" if direct else "waiting_source"
@@ -882,6 +906,24 @@ class DownloadQueueService:
                     item.get("item_uuid"),
                 )
                 return False
+            # REAL SOURCE PROGRESS, recorded separately from 'completed'.
+            # A pre-scrape dedup returns success without contacting the source, so
+            # counting completions would refund retry budget the source never
+            # earned. See is_source_delivery().
+            # SOURCE OWNERSHIP, added 2026-08-07 on peer review. schedule_batch
+            # permits mixed-source batches (it labels them "mixed"), and
+            # _claim_due does not require the parent batch to be scheduled, so a
+            # DDLBase or Adit-HD item can complete while the batch is paused for
+            # HDEncode. A batch-global counter therefore let another source refund
+            # HDEncode's retry budget. Only work from the owning source counts.
+            if (self.is_source_delivery(outcome)
+                    and str(item.get("source") or "") == self.AUTO_RESUME_SOURCE):
+                conn.execute(
+                    "UPDATE download_queue_batches "
+                    "SET source_delivery_count = source_delivery_count + 1 "
+                    "WHERE batch_uuid = ?",
+                    (item["batch_uuid"],),
+                )
             self._refresh_batch_locked(conn, item["batch_uuid"], now)
         self._emit(
             "download:queue_updated",
@@ -1076,6 +1118,131 @@ class DownloadQueueService:
             ),
         )
 
+    def _hdencode_host(self) -> str:
+        """The configured HDEncode host, so identity follows configuration.
+
+        `base_url` is the operator-set source base (default https://hdencode.org),
+        so a mirror or changed domain classifies correctly instead of relying on a
+        hard-coded literal.
+        """
+        return str((self.config or {}).get("base_url") or "https://hdencode.org")
+
+    def _auto_resume_max_attempts(self) -> int:
+        """How many CONSECUTIVE fruitless automatic resumes a batch may make.
+
+        Only fruitless ones count: _resume_batch refunds the budget whenever the
+        previous resume delivered anything, so a batch making progress is never
+        cut off. Clamped to 1..10 -- 1 restores the old single-shot behaviour, and
+        the ceiling exists because an unbounded retry loop against a source that
+        is rate-limiting us is how this incident started.
+        """
+        try:
+            value = int(self.config.get(
+                "download_queue_auto_resume_max_attempts", 3))
+        except (TypeError, ValueError):
+            value = 3
+        return max(1, min(10, value))
+
+    #: The source whose retry budget the auto-resume machinery manages. The
+    #: coordinator, the reveal cooldown and the batch pause are all HDEncode
+    #: concepts, so only HDEncode work may refund an HDEncode retry.
+    AUTO_RESUME_SOURCE = "hdencode"
+
+    @staticmethod
+    def is_source_delivery(outcome: dict) -> bool:
+        """Did this completion actually cross the source boundary?
+
+        Keyed on ONE affirmative signal the producer sets where the delivery
+        happens (`source_progress`), for a reason worth recording.
+
+        THE PREVIOUS VERSION DID NOTHING. It required
+        `transport_attempted` to be truthy on top of a method check, and peer
+        review found that no real success path sets that field --
+        `download_item()` initialises it to None and the jdownloader, clipboard
+        and browser paths never touch it. The only writers are failure
+        diagnostics. So the counter never incremented in production and the
+        refund could never fire, while the tests passed because they fabricated
+        the flag. The extra condition I added as "belt and braces" is precisely
+        what made the whole mechanism inert.
+
+        The lesson applied here: infer nothing. One field, set by the code that
+        performs the delivery, checked by the code that rewards it -- and an
+        integration test that runs the real producer rather than a hand-built
+        dict.
+        """
+        return bool((outcome or {}).get("source_progress"))
+
+    def _source_delivery_count(self, conn, batch_uuid: str) -> int:
+        row = conn.execute(
+            "SELECT source_delivery_count AS n FROM download_queue_batches "
+            "WHERE batch_uuid = ?",
+            (batch_uuid,),
+        ).fetchone()
+        return int((row["n"] if row is not None else 0) or 0)
+
+    def _warn_exhausted_batches(self, now) -> None:
+        """A batch that has spent its automatic budget must SAY so, once.
+
+        THE DEFECT THIS CLOSES, raised by peer review as a combined-set blocker.
+        #47 exists because a due batch could stay parked forever without saying
+        why. #51 then created a NEW terminal automatic state -- paused, resume
+        enabled, budget spent, no fresh source progress -- and that state is
+        filtered out by the eligibility query itself, so it never reaches #47's
+        diagnostic. The tests said the batch should "stop and wait for a human";
+        nothing told the human. That recreates the invisibility #47 removes, just
+        after three attempts instead of one.
+
+        Warned once per batch per process. A persisted marker would survive
+        restarts, but this deliberately avoids another schema column and another
+        write on the polling path; the tradeoff is that a restart can re-warn.
+        """
+        if not hasattr(self, "_exhausted_warned"):
+            self._exhausted_warned = set()
+        maximum = self._auto_resume_max_attempts()
+        for row in self.db._query_dicts(
+            """
+            SELECT batch_uuid, auto_resume_used, cooldown_until,
+                   last_reason_code, source_delivery_count,
+                   auto_resume_progress_mark
+            FROM download_queue_batches
+            WHERE state = 'paused_source'
+              AND auto_resume_after_cooldown = 1
+              AND auto_resume_used >= ?
+              AND source_delivery_count <= auto_resume_progress_mark
+            """,
+            (maximum,), default=[],
+        ):
+            batch_uuid = str(row.get("batch_uuid") or "")
+            # PER EPISODE, not once per process. Peer review noted that keying on
+            # the batch alone means a batch that recovers and later exhausts again
+            # is silent the second time. The attempt count and progress mark both
+            # change when a refund or resume happens, so keying on the triple makes
+            # a genuinely new exhaustion a new key -- without another schema column
+            # or a write on the polling path.
+            episode = (batch_uuid,
+                       int(row.get("auto_resume_used") or 0),
+                       int(row.get("auto_resume_progress_mark") or 0))
+            if episode in self._exhausted_warned:
+                continue
+            until = _parse(row.get("cooldown_until"))
+            if until is not None and until > now:
+                continue  # not yet due; nothing to report
+            deferred = self.db._query(
+                "SELECT COUNT(*) AS n FROM download_queue_items "
+                "WHERE batch_uuid = ? AND state IN "
+                "      ('waiting_source','verification_required')",
+                (batch_uuid,), one=True, default=None)
+            self._exhausted_warned.add(episode)
+            logger.warning(
+                "Batch %s has spent all %d automatic resume attempts without any "
+                "further source delivery and will NOT retry on its own. "
+                "%s item(s) remain deferred; last source reason %r. "
+                "Manual action is required: reason auto_resume_budget_exhausted.",
+                batch_uuid, maximum,
+                int((deferred["n"] if deferred else 0) or 0),
+                row.get("last_reason_code"),
+            )
+
     def _log_unresumable_batch(self, batch: dict) -> None:
         """Say WHY a due batch could not be resumed, instead of failing silently.
 
@@ -1190,17 +1357,63 @@ class DownloadQueueService:
         if snapshot.get("blocked"):
             return
         now = _utcnow()
+        # A RETRY BUDGET, not a single shot. Changed 2026-08-07 after the
+        # single shot was observed to be the binding constraint in production.
+        #
+        # WHAT HAPPENED. At 03:25Z the one automatic resume fired and WORKED: 24
+        # of 69 stranded grabs completed over the next 50 minutes -- the first
+        # fully automatic recovery from a source throttle this system has done.
+        # Then at 04:07Z HDEncode throttled again, four batches re-paused, and
+        # because `auto_resume_used` had reached 1 they could never resume
+        # themselves again. 44 items sat parked behind a spent retry.
+        #
+        # A resume that delivered 24 items is not a failed attempt. So the budget
+        # is REFUNDED whenever a resume made progress -- see _resume_batch, which
+        # resets the counter if the batch completed anything since the last
+        # automatic resume. The budget therefore only runs down on resumes that
+        # achieved NOTHING, which is the case where giving up is correct.
+        #
+        # NOTE ON PACING, corrected 2026-08-07. An earlier version of this comment
+        # claimed the coordinator's 1h -> 2h -> 4h escalation "composes with" this
+        # budget so repeated retries spread out. That composition is NOT proven
+        # here and the claim is withdrawn: no test in this branch exercises the
+        # real coordinator alongside the queue. What IS true is that fruitless
+        # retries are capped and each one waits for whatever cooldown the
+        # coordinator set.
+        #
+        # UPDATED 2026-08-07: the half of that finding about
+        # observe_reveal_success() having no production call site is now FIXED --
+        # download_service calls it when HDEncode actually delivers file-host
+        # links, so the streak does reset on evidence of health. The composition
+        # claim stays withdrawn regardless, because it is still untested here, and
+        # "the mechanism now exists" is not the same as "the behaviour is proven".
         batches = self.db._query_dicts(
             """
             SELECT *
             FROM download_queue_batches
             WHERE state = 'paused_source'
               AND auto_resume_after_cooldown = 1
-              AND auto_resume_used = 0
+              AND (
+                    auto_resume_used < ?
+                 OR source_delivery_count > auto_resume_progress_mark
+              )
             ORDER BY created_at
             """,
+            (self._auto_resume_max_attempts(),),
             default=[],
         )
+        # PROGRESS IS AN INDEPENDENT PATH TO ELIGIBILITY, and it has to be.
+        #
+        # My first version refunded the budget inside _resume_batch and gated
+        # eligibility on `auto_resume_used < max` alone. A test caught that the
+        # refund was then unreachable exactly when it mattered: a batch at its
+        # limit never got selected, so _resume_batch never ran, so the refund it
+        # contained could never fire. The batch stayed stuck despite delivering.
+        #
+        # So the second clause above lets a batch that completed something since
+        # its last automatic resume through regardless of the counter, and
+        # _resume_batch then resets the counter and re-marks the baseline.
+        self._warn_exhausted_batches(now)
         for batch in batches:
             until = _parse(batch.get("cooldown_until"))
             if until is None or until > now:
@@ -1229,11 +1442,9 @@ class DownloadQueueService:
                 default=None,
             )
             if blocked is None:
-                # A batch that is paused, resume-enabled, unspent, and past its
-                # cooldown found NOTHING to resume. Before 2026-08-07 this was a
-                # bare `continue`: the batch stayed parked forever and emitted no
-                # signal of any kind. Five batches holding 69 grabs sat that way,
-                # and the cause was only found by reading this query by hand.
+                # Paused, resume-enabled, past cooldown, still within budget,
+                # and nothing to resume. Before 2026-08-07 this was a bare
+                # `continue`: parked forever with no signal at all.
                 self._log_unresumable_batch(batch)
                 continue
             self._resume_batch(
@@ -1443,17 +1654,67 @@ class DownloadQueueService:
                     ).rowcount
                 if updated == 1:
                     cursor += timedelta(minutes=interval)
+            # REFUND THE BUDGET IF THE LAST AUTOMATIC RESUME ACHIEVED SOMETHING.
+            #
+            # Observed in production on 2026-08-07: one resume delivered 24 items
+            # and then the source throttled again. Counting that as a spent
+            # attempt is wrong -- the retry worked, the source simply shut a
+            # second time. So a batch that completed anything since its previous
+            # automatic resume starts its budget over, and the budget only runs
+            # down on resumes that delivered NOTHING, which is exactly the case
+            # where giving up is the right answer.
+            #
+            # Consequence worth being explicit about: a batch that keeps making
+            # real source progress can retry indefinitely. That is intended -- it is
+            # delivering. Each retry still waits for whatever cooldown the
+            # coordinator has stored, so it is not a tight loop.
+            #
+            # NOT CLAIMED: that those waits GROW. No test here exercises the real
+            # coordinator alongside the queue, so the 1h -> 2h -> 4h composition is
+            # unproven. An earlier version of this comment asserted it; that claim
+            # is withdrawn and stays withdrawn.
+            #
+            # The other half of that finding IS fixed as of 2026-08-07:
+            # observe_reveal_success() now has a production call site (see
+            # download_service, where HDEncode delivers file-host links), so the
+            # streak resets on evidence of health rather than only on a container
+            # restart. That makes the escalation dial behave as designed; it does
+            # not by itself prove the composition above.
+            used_delta = 1 if automated else 0
+            reset_budget = False
+            if automated:
+                delivered_now = self._source_delivery_count(conn, batch_uuid)
+                prior = conn.execute(
+                    "SELECT auto_resume_progress_mark AS mark "
+                    "FROM download_queue_batches WHERE batch_uuid = ?",
+                    (batch_uuid,),
+                ).fetchone()
+                mark = int((prior["mark"] if prior is not None else 0) or 0)
+                if delivered_now > mark:
+                    reset_budget = True
+                    logger.info(
+                        "Batch %s recorded %d real source delivery(ies) since its "
+                        "last automatic resume; restoring its retry budget.",
+                        batch_uuid, delivered_now - mark,
+                    )
             conn.execute(
                 """
                 UPDATE download_queue_batches
                 SET state = 'scheduled', interval_seconds = ?,
                     cooldown_until = NULL,
-                    auto_resume_used = auto_resume_used + ?,
+                    auto_resume_used = CASE WHEN ? THEN ? ELSE
+                        auto_resume_used + ? END,
+                    auto_resume_progress_mark = CASE WHEN ?
+                        THEN source_delivery_count
+                        ELSE auto_resume_progress_mark END,
                     updated_at = ?
                 WHERE batch_uuid = ?
                 """,
                 (
                     interval * 60,
+                    1 if reset_budget else 0,
+                    used_delta,
+                    used_delta,
                     1 if automated else 0,
                     _iso(now),
                     batch_uuid,
