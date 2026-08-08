@@ -254,8 +254,17 @@ class TestCombinedCausesAreAllReported:
         return " ".join(r.getMessage() for r in caplog.records
                         if r.levelno >= logging.WARNING)
 
-    def test_a_timestamp_mismatch_AND_unknown_outcome_reports_both(
+    def test_a_future_cooldown_AND_unknown_outcome_reports_both(
             self, tmp_path, caplog):
+        """RENAMED AND REPOINTED 2026-08-08, round 12.
+
+        The INTENT is unchanged and still valuable: several blocking reasons at once
+        must all be reported, never collapsed to one by precedence. Only the first
+        reason changed -- "the timestamps do not match" is no longer a cause of
+        anything, because item-first recovery deleted the equality requirement. The
+        reviewer noted this test was, once again, preserving the obsolete mechanism.
+        """
+
         db = DatabaseManager(str(tmp_path / "both-causes.db"))
         try:
             service, uuid = _paused_batch(
@@ -269,7 +278,10 @@ class TestCombinedCausesAreAllReported:
             with caplog.at_level(logging.WARNING):
                 service._maybe_auto_resume()
             joined = self._messages(caplog)
-            assert "cooldown timestamp" in joined, joined
+            assert "future" in joined, (
+                f"the not-yet-due rows must be reported: {joined}")
+            assert "NEVER RESUME" not in joined, (
+                f"a future cooldown is transient, not permanent: {joined}")
             assert "unknown execution state" in joined, (
                 "the unknown-outcome rows must be reported EVEN THOUGH the "
                 "cooldown also mismatches -- hiding it is what sends the reader "
@@ -290,8 +302,11 @@ class TestCombinedCausesAreAllReported:
             with caplog.at_level(logging.WARNING):
                 service._maybe_auto_resume()
             joined = self._messages(caplog)
-            for token in ("deferred=", "cooldown_match=", "recognised_reason=",
-                          "unknown_outcome="):
+            # VOCABULARY UPDATED round 12: cooldown_match= is gone with the
+            # equality architecture. The vector now reports temporal state, which is
+            # what an operator can actually act on.
+            for token in ("deferred=", "due=", "future=", "no_retry_time=",
+                          "recognised_reason=", "unknown_outcome="):
                 assert token in joined, (token, joined)
         finally:
             db.close()

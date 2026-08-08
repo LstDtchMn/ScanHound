@@ -157,42 +157,48 @@ else:
             print(f"                automatic retries used: {used} of "
                   f"{_MAX_AUTO_RESUME} (refunded on real source progress)")
 
-# ---- 3b. ORPHANS: deferred items whose batch is no longer paused -------------
+# ---- 3b. can every deferred download still recover? -------------------------
 #
-# ADDED 2026-08-08, because this tool printed "NO batches are paused - everything
-# resumed or completed" while 34 of Jesse's downloads were permanently stuck.
+# REWRITTEN 2026-08-08 on peer review round 12.
 #
-# Both recovery routes key on the BATCH being paused_source:
-#   * the auto-resume sweep selects WHERE state = 'paused_source';
-#   * item selection then joins items on cooldown_until EQUALITY with the batch.
+# This used to call every deferred item whose batch was not `paused_source` an
+# orphan. That was TRUE when recovery could only be reached through a paused batch --
+# and the item-first fix deliberately removed that requirement, so the same check
+# began reporting healthy, recovering downloads as permanently stranded. I fixed a
+# false SUCCESS in round 10 and replaced it with a false FAILURE in round 11.
 #
-# So an item left in waiting_source/verification_required after its batch has moved
-# on -- especially with a stale cooldown the now-NULL batch cooldown cannot match --
-# is invisible to every path. Nothing throttles it and nothing will ever retry it.
-# Reporting only on paused batches meant the one state that needs a human was the
-# one state this tool called healthy.
-print("\n3b. Deferred items whose batch has moved on (orphans)")
-orphans = list(con.execute(
-    "SELECT i.batch_uuid, b.state AS batch_state, b.cooldown_until AS batch_cd, "
-    "       COUNT(*) n, MIN(i.cooldown_until) icd "
-    "FROM download_queue_items i "
-    "LEFT JOIN download_queue_batches b ON b.batch_uuid = i.batch_uuid "
-    "WHERE i.state IN ('waiting_source', 'verification_required') "
-    "  AND COALESCE(b.state, '') != 'paused_source' "
-    "GROUP BY i.batch_uuid ORDER BY n DESC"))
-if not orphans:
-    print(OK + "none - every deferred item sits in a batch that can resume it")
-else:
-    total = sum(o["n"] for o in orphans)
-    print(BAD + f"{total} item(s) in {len(orphans)} batch(es) cannot be reached by "
-                "auto-resume OR by the scheduler")
-    for o in orphans:
-        print(f"        {str(o['batch_uuid'])[:8]}  n={o['n']}  "
-              f"batch_state={o['batch_state']}  "
-              f"item_cooldown={str(o['icd'])[:19]}  "
-              f"batch_cooldown={str(o['batch_cd'])[:19]}")
-    problems.append(f"{total} deferred item(s) are orphaned: their batch is not "
-                    "paused_source, so no resume path can see them")
+# It now asks the shared classifier, which holds the recovery policy ONCE for both
+# this tool and watch_resume.py. Only ORPHANED needs a human; the waiting verdicts are
+# ordinary and clear on their own.
+print("\n3b. Can every deferred download still recover?")
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from queue_recovery_state import (JOINED_DEFERRED_SQL, NEEDS_HUMAN,
+                                      classify_all, max_auto_resume_attempts)
+    rows = [dict(r) for r in con.execute(JOINED_DEFERRED_SQL)]
+    verdicts = classify_all(rows, max_attempts=max_auto_resume_attempts())
+    if not rows:
+        print(OK + "nothing is deferred")
+    else:
+        for verdict in sorted(verdicts):
+            items = verdicts[verdict]
+            marker = BAD if verdict in NEEDS_HUMAN else INFO
+            print(marker + f"{len(items)} item(s): {verdict}")
+            for it in items[:4]:
+                print(f"        {str(it.get('title'))[:42]:42s} "
+                      f"batch={str(it.get('batch_uuid'))[:8]} "
+                      f"own_cooldown={str(it.get('cooldown_until'))[:19]}")
+            if len(items) > 4:
+                print(f"        ... and {len(items) - 4} more")
+        stuck = sum(len(verdicts.get(v, [])) for v in NEEDS_HUMAN)
+        if stuck:
+            problems.append(f"{stuck} deferred item(s) have no automatic recovery "
+                            "path and need an explicit resume")
+        else:
+            print(OK + "every deferred item has a recovery path")
+except Exception as exc:                                   # noqa: BLE001
+    print(BAD + f"recovery classifier unavailable: {type(exc).__name__}: {exc}")
+    problems.append("could not classify deferred items")
 
 failed = list(con.execute(
     "SELECT last_reason_code, COUNT(*) n FROM download_queue_items "

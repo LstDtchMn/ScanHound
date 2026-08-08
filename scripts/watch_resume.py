@@ -26,6 +26,32 @@ GRACE = timedelta(minutes=12)   # scheduler tick slack past the cooldown
 POLL = 120
 
 
+def _orphan_count():
+    """Deferred items with NO automatic recovery path, per the shared classifier.
+
+    Items merely waiting for their own cooldown, or held by the shared source brake,
+    or held for unknown-outcome safety are NOT orphans -- they recover on their own or
+    are held on purpose. Only the classifier's NEEDS_HUMAN verdicts count.
+    """
+    try:
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from queue_recovery_state import (JOINED_DEFERRED_SQL, NEEDS_HUMAN,
+                                          classify_all, max_auto_resume_attempts)
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = [dict(r) for r in con.execute(JOINED_DEFERRED_SQL)]
+        finally:
+            con.close()
+        verdicts = classify_all(rows, max_attempts=max_auto_resume_attempts())
+        return sum(len(verdicts.get(v, [])) for v in NEEDS_HUMAN)
+    except Exception:                                          # noqa: BLE001
+        # Unknown is not the same as zero. Returning 0 here would resurrect the
+        # false-SUCCESS this script was fixed for, so report it as needing a look.
+        return -1
+
+
 def say(msg):
     print(msg, flush=True)
 
@@ -67,8 +93,20 @@ if not paused0:
     # whose success condition is "no paused batches" certifies exactly that state as
     # a win -- and the old message even printed the stranded count next to the word
     # SUCCESS.
-    orphaned = states0.get("waiting_source", 0) + states0.get(
-        "verification_required", 0)
+    # ASK THE SHARED CLASSIFIER, do not re-derive the rule here.
+    #
+    # Round 10 caught this script calling the orphan state SUCCESS. My fix then
+    # called every deferred-item-without-a-paused-batch an ORPHAN -- which round 12
+    # caught as the opposite error, because item-first recovery deliberately made
+    # that state recoverable. Two wrong answers from the same cause: a second copy
+    # of the policy. The copy is gone; queue_recovery_state owns it.
+    orphaned = _orphan_count()
+    if orphaned < 0:
+        say("UNKNOWN: the recovery classifier could not run, so I cannot say "
+            "whether anything is stranded. Treat this as needing a look, not as "
+            "all-clear -- reporting an unknown as zero is the false-SUCCESS this "
+            "script was fixed for.")
+        sys.exit(1)
     if orphaned:
         say(f"ORPHANED: no batch is paused, but {orphaned} item(s) are still "
             "deferred. Nothing owns their recovery. Run "
@@ -102,7 +140,11 @@ while True:
         prev = cur
 
     if not paused:
-        deferred = waiting + states.get("verification_required", 0)
+        deferred = _orphan_count()
+        if deferred < 0:
+            say("UNKNOWN: the recovery classifier could not run; not calling this "
+                "a success.")
+            sys.exit(1)
         if deferred:
             say(f"ORPHANED: no batch is paused, but {deferred} item(s) are STILL "
                 f"deferred (waiting_source={waiting}). The batch moved on without "

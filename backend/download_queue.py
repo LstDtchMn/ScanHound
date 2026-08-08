@@ -1266,8 +1266,21 @@ class DownloadQueueService:
             """
             SELECT
                 COUNT(*) AS deferred,
-                SUM(CASE WHEN cooldown_until = ? THEN 1 ELSE 0 END)
-                    AS cooldown_match,
+                -- TEMPORAL STATE, not timestamp equality. Peer review round 12:
+                -- this used to count how many item cooldowns EQUALLED the batch's
+                -- and, when none did, told the operator the batch "will NEVER
+                -- RESUME until they match". That was true of the architecture the
+                -- item-first rewrite deleted -- equality is no longer a
+                -- prerequisite for anything -- so the diagnostic was reporting a
+                -- cause that can no longer block, and a test was protecting the
+                -- claim. Timestamps are still evidence; DIFFERING from the batch is
+                -- no longer itself a fault.
+                SUM(CASE WHEN cooldown_until IS NOT NULL
+                          AND cooldown_until <= ? THEN 1 ELSE 0 END) AS due_items,
+                SUM(CASE WHEN cooldown_until IS NOT NULL
+                          AND cooldown_until >  ? THEN 1 ELSE 0 END) AS future_items,
+                SUM(CASE WHEN cooldown_until IS NULL THEN 1 ELSE 0 END)
+                    AS no_retry_time_items,
                 SUM(CASE WHEN queue_reason IN (
                         'interactive_challenge', 'source_deferred'
                     ) THEN 1 ELSE 0 END) AS reason_recognised,
@@ -1279,7 +1292,7 @@ class DownloadQueueService:
             WHERE batch_uuid = ?
               AND state IN ('verification_required', 'waiting_source')
             """,
-            (batch.get("cooldown_until"), batch_uuid),
+            (_iso(_utcnow()), _iso(_utcnow()), batch_uuid),
             one=True,
             default=None,
         )
@@ -1301,7 +1314,9 @@ class DownloadQueueService:
             )
             return
 
-        matched = int(counts["cooldown_match"] or 0)
+        due = int(counts["due_items"] or 0)
+        future = int(counts["future_items"] or 0)
+        no_time = int(counts["no_retry_time_items"] or 0)
         recognised = int(counts["reason_recognised"] or 0)
         unknown = int(counts["unknown_outcome"] or 0)
 
@@ -1316,13 +1331,22 @@ class DownloadQueueService:
         # sent the reader to fix the wrong thing, which is the exact failure class
         # this method exists to prevent.
         causes = []
-        if matched == 0:
+        if due == 0 and future:
+            # TRANSIENT and correct, so say so plainly. The old text asserted
+            # "THE BATCH WILL NEVER RESUME ON ITS OWN until they match", which was
+            # about timestamp equality and is now simply false: these items have a
+            # retry time and will recover when it arrives. A permanent-sounding
+            # message invites a needless manual rescue.
             causes.append(
-                "no deferred item carries the batch's cooldown timestamp "
-                f"({batch.get('cooldown_until')!r}), so the eligibility check "
-                "cannot see any of them -- usually because the batch cooldown was "
-                "changed without changing the items. THE BATCH WILL NEVER RESUME "
-                "ON ITS OWN until they match; this is permanent, not transient")
+                f"all {future} deferred item(s) have their OWN retry time still in "
+                "the future, so nothing is due yet. This is transient and will "
+                "clear on its own; no action is needed")
+        if no_time and due == 0 and future == 0:
+            causes.append(
+                f"{no_time} deferred item(s) have no retry time at all, and the "
+                f"batch has no shared cooldown either ({batch.get('cooldown_until')!r}). "
+                "Nothing authorises an automatic retry, so this needs an explicit "
+                "operator resume -- it will NOT clear on its own")
         if recognised == 0:
             causes.append(
                 "no deferred item carries a queue_reason the resume path accepts "
@@ -1343,10 +1367,10 @@ class DownloadQueueService:
                 "satisfies all of them at once")
 
         logger.warning(
-            "Batch %s is due to auto-resume but cannot. Predicates: deferred=%d "
-            "cooldown_match=%d recognised_reason=%d unknown_outcome=%d. "
+            "Batch %s did not auto-resume. Predicates: deferred=%d due=%d "
+            "future=%d no_retry_time=%d recognised_reason=%d unknown_outcome=%d. "
             "Cause(s): %s",
-            batch_uuid, deferred, matched, recognised, unknown,
+            batch_uuid, deferred, due, future, no_time, recognised, unknown,
             "; ".join(causes),
         )
 
@@ -1485,8 +1509,16 @@ class DownloadQueueService:
             # authorises the retry, and the batch cooldown is only a shared brake. If
             # NEITHER side has a time, nothing authorises anything and we leave it
             # alone; the unresumable diagnostic below then explains it.
+            shared_brake_passed = batch_until is not None      # and, checked above,
+                                                               # already in the past
             if batch_until is None and item_until is None:
                 continue
+            # MIN() DECIDES ONLY WHETHER THE GROUP IS WORTH VISITING, never which
+            # rows may run. Round 12 caught it deciding both: the earliest child
+            # authorised every sibling, so a due item dragged along one due in 2030
+            # and one with no retry time at all. `authorised_at` and
+            # `shared_brake_passed` carry the rule down so _resume_batch re-evaluates
+            # it PER ROW, inside its own transaction.
             self._resume_batch(
                 group["batch_uuid"],
                 interval_minutes=max(
@@ -1495,6 +1527,8 @@ class DownloadQueueService:
                 ),
                 automated=True,
                 blocked_source=str(group["source"]),
+                authorised_at=now,
+                shared_brake_passed=shared_brake_passed,
             )
 
         # THE DIAGNOSTIC SURVIVES THE REWRITE, and now means something sharper.
@@ -1641,6 +1675,8 @@ class DownloadQueueService:
         interval_minutes: int,
         automated: bool,
         blocked_source: Optional[str] = None,
+        authorised_at: Optional[datetime] = None,
+        shared_brake_passed: bool = False,
     ) -> dict:
         if not automated:
             self._assert_hdencode_available()
@@ -1668,9 +1704,45 @@ class DownloadQueueService:
                           'operation_timeout_unknown',
                           'interrupted_unknown_outcome'
                       )
+                      -- PER-ITEM AUTHORISATION, added on peer review round 12.
+                      --
+                      -- THE BUG THIS CLOSES, and it was mine, introduced in the very
+                      -- commit that fixed the liveness hole. Discovery grouped by
+                      -- (batch, source) and took MIN(cooldown_until) to decide the
+                      -- group was due -- then this query promoted EVERY deferred
+                      -- child regardless of its own time. So one due item dragged
+                      -- its siblings along:
+                      --
+                      --   A due 2000, B due 2030  -> B went ready five years early
+                      --   A due 2000, B cooldown NULL -> B retried with NO
+                      --                                  authorisation time at all
+                      --
+                      -- The second case defeats the safety rule I had preserved
+                      -- FIFTEEN LINES EARLIER in the same function, with a paragraph
+                      -- explaining why NULL on both sides must decline. Gating one
+                      -- door and leaving the next one open, at the shortest range yet.
+                      --
+                      -- The predicate now lives in the SAME query that selects the
+                      -- rows, so discovery and authorisation cannot drift apart, and
+                      -- it is evaluated INSIDE this transaction rather than trusted
+                      -- from a discovery pass that may already be stale -- an operator
+                      -- can extend a cooldown in between.
+                      -- THE RULE, stated exactly as the group gate states it:
+                      --   own cooldown, and it has passed        -> authorised
+                      --   no own cooldown, shared brake has passed -> authorised
+                      --                                             (the brake IS
+                      --                                              the authorisation)
+                      --   no own cooldown and no shared brake    -> DECLINED
+                      -- The third line is the safety rule preserved in
+                      -- _maybe_auto_resume; it now holds at both gates instead of one.
+                      AND (
+                            (cooldown_until IS NOT NULL AND cooldown_until <= ?)
+                         OR (cooldown_until IS NULL AND ? = 1)
+                      )
                     ORDER BY sequence_number
                     """,
-                    (batch_uuid, blocked_source),
+                    (batch_uuid, blocked_source, _iso(authorised_at or now),
+                     1 if shared_brake_passed else 0),
                 ).fetchall()
             else:
                 rows = conn.execute(

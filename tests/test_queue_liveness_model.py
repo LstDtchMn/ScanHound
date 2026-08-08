@@ -404,3 +404,142 @@ def test_unknown_outcome_items_are_never_auto_retried(tmp_path):
             "duplicate a download that already happened")
     finally:
         db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPORAL SAFETY — the second invariant, added on peer review round 12
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WHY THE MODEL ABOVE COULD NOT SEE THIS CLASS OF BUG.
+#
+# settle() rewrites EVERY non-NULL cooldown to an expired timestamp before running
+# recovery. That is exactly right for the liveness question -- "given every chance,
+# does this item come back?" -- and it destroys the only thing needed to ask the
+# safety question, because after settling no item is ever "not yet due". The model
+# was structurally incapable of expressing "A is due while B is not", which is
+# precisely the state the round-12 defect needed.
+#
+# So liveness-only was not a depth problem or an alphabet problem. It was the wrong
+# question. The invariant here is the missing half:
+#
+#     Automatic recovery must never make an item runnable before the retry
+#     authorisation applying to THAT item is due.
+#
+# THE DEFECT IT CATCHES WAS MINE, introduced in the commit that fixed the liveness
+# hole. Discovery grouped by (batch, source) and used MIN(cooldown_until) to decide
+# the group was due; _resume_batch then promoted every deferred child regardless of
+# its own time. One due item dragged its siblings along -- including one due in 2030,
+# and one with no retry time at all, which defeated the NULL-on-both-sides safety rule
+# preserved fifteen lines earlier in the same function.
+
+PAST = "2000-01-01T00:00:00+00:00"
+FUTURE = "2030-01-01T00:00:00+00:00"
+
+
+def _two_deferred(db, *, batch_cooldown, first, second):
+    """Two deferred siblings with independently chosen cooldowns."""
+    service, batch = _rig(db, count=2)
+    ids = [r["item_uuid"] for r in db._query_dicts(
+        "SELECT item_uuid FROM download_queue_items WHERE batch_uuid=? "
+        "ORDER BY sequence_number", (batch,), default=[])]
+    with db.transaction() as conn:
+        for uid, cooldown in zip(ids, (first, second)):
+            conn.execute(
+                "UPDATE download_queue_items SET state='waiting_source', "
+                "queue_reason='source_deferred', cooldown_until=?, "
+                "last_reason_code='source_temporarily_blocked' WHERE item_uuid=?",
+                (cooldown, uid))
+        conn.execute("UPDATE download_queue_batches SET state='paused_source', "
+                     "cooldown_until=?, auto_resume_used=0 WHERE batch_uuid=?",
+                     (batch_cooldown, batch))
+    return service, batch, ids
+
+
+def _states(db, ids):
+    return [db._query_dicts(
+        "SELECT state FROM download_queue_items WHERE item_uuid=?",
+        (i,), default=[])[0]["state"] for i in ids]
+
+
+def test_a_due_item_does_not_drag_a_future_sibling(tmp_path):
+    """ROUND 12 CASE 1. Verified against the pre-fix code: both went ready."""
+    db = DatabaseManager(str(tmp_path / "drag_future.db"))
+    try:
+        service, _batch, ids = _two_deferred(
+            db, batch_cooldown=None, first=PAST, second=FUTURE)
+        service._maybe_auto_resume()
+        got = _states(db, ids)
+        assert got[0] == "ready", f"the DUE item must resume; got {got}"
+        assert got[1] == "waiting_source", (
+            f"the sibling is due in 2030 and must not be resumed now; got {got}")
+    finally:
+        db.close()
+
+
+def test_a_due_item_does_not_drag_a_sibling_with_no_retry_time(tmp_path):
+    """ROUND 12 CASE 2, and the sharper one.
+
+    MIN() ignores NULLs, so a due sibling made the group look authorised and the
+    NULL-cooldown item came along -- defeating the safety rule that a row with no
+    retry time anywhere must not be retried automatically. That rule is stated in
+    _maybe_auto_resume and was being enforced at one gate only.
+    """
+    db = DatabaseManager(str(tmp_path / "drag_null.db"))
+    try:
+        service, _batch, ids = _two_deferred(
+            db, batch_cooldown=None, first=PAST, second=None)
+        service._maybe_auto_resume()
+        got = _states(db, ids)
+        assert got[0] == "ready", f"the DUE item must resume; got {got}"
+        assert got[1] == "waiting_source", (
+            "no item cooldown and no shared brake means nothing authorises this "
+            f"retry; got {got}")
+    finally:
+        db.close()
+
+
+def test_an_expired_shared_brake_does_not_authorise_a_future_item(tmp_path):
+    """ROUND 12 CASE 3. The brake being off is permission for the SOURCE, not for
+    an item that has asked to wait longer."""
+    db = DatabaseManager(str(tmp_path / "brake_off.db"))
+    try:
+        service, _batch, ids = _two_deferred(
+            db, batch_cooldown=PAST, first=PAST, second=FUTURE)
+        service._maybe_auto_resume()
+        got = _states(db, ids)
+        assert got[0] == "ready", got
+        assert got[1] == "waiting_source", (
+            f"an expired batch brake must not override the item's own time; {got}")
+    finally:
+        db.close()
+
+
+def test_two_due_items_both_resume(tmp_path):
+    """ROUND 12 CASE 4 — the POSITIVE control for this whole section.
+
+    Without it, every test above passes on an implementation that resumes nothing.
+    """
+    db = DatabaseManager(str(tmp_path / "both_due.db"))
+    try:
+        service, _batch, ids = _two_deferred(
+            db, batch_cooldown=None, first=PAST, second=PAST)
+        service._maybe_auto_resume()
+        got = _states(db, ids)
+        assert got == ["ready", "ready"], (
+            f"both items are due and must both resume; got {got}")
+    finally:
+        db.close()
+
+
+def test_a_future_shared_brake_holds_everything(tmp_path):
+    """ROUND 12 CASE 5. The shared brake outranks individual readiness."""
+    db = DatabaseManager(str(tmp_path / "brake_on.db"))
+    try:
+        service, _batch, ids = _two_deferred(
+            db, batch_cooldown=FUTURE, first=PAST, second=PAST)
+        service._maybe_auto_resume()
+        got = _states(db, ids)
+        assert got == ["waiting_source", "waiting_source"], (
+            f"the source is deliberately quiet until 2030; got {got}")
+    finally:
+        db.close()

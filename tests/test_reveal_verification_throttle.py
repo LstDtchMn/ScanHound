@@ -43,7 +43,7 @@ which is retryable=False, carries no cooldown, and never notifies the traffic
 coordinator. So the batch never paused, the queue kept marching at its spacing,
 and every remaining item hit the same closed door and became PERMANENTLY
 terminal. 78 items accumulated that way, with automated_retry_count 0 on every
-one. One throttle event burned the whole queue.
+one. One reveal-stall episode burned the whole queue.
 """
 import pytest
 
