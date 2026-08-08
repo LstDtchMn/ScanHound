@@ -315,10 +315,15 @@ def test_owns_source_health_agrees_with_the_queue():
                                           == "hdencode")
 
 
-def test_the_scrape_route_uses_the_service_for_health_ownership():
-    """Drives the ROUTE, not the service, because the route was the defect.
+def test_the_route_module_no_longer_owns_a_classifier():
+    """Structural guard only, and labelled as such.
 
-    The route module must no longer own a classifier at all.
+    My first version of this was titled "drives the ROUTE, not the service" and did
+    nothing of the kind -- it read the module source with inspect.getsource() and
+    never called a route. A false claim in a docstring, inside a file written to
+    catch false claims. The tests below actually execute the routes; this one keeps
+    the narrow property that a future edit cannot reintroduce a route-local
+    classifier without tripping something.
     """
     import inspect
     from backend.api.routes import downloads as mod
@@ -326,5 +331,107 @@ def test_the_scrape_route_uses_the_service_for_health_ownership():
     assert "_source_page_kind(" not in src.replace(
         "`_source_page_kind(url)`", ""), (
         "the route still classifies independently of the service")
-    assert src.count("owns_source_health(") >= 2, (
-        "both /download/scrape and /download/copy-links must ask the service")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The route-level tests the review actually asked for
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _registry(config):
+    """A ServiceRegistry stand-in whose `download` is a REAL DownloadService.
+
+    A bare MagicMock service is what made `test_health_routing_uses_parsed_hostname`
+    misbehave: `owns_source_health()` returned a truthy Mock, so the route recorded
+    health for every URL. Only `scrape_links` is stubbed here, so identity and
+    ownership are production code.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from backend.download_service import DownloadService
+
+    svc = _scrape_service(config)
+    db = MagicMock()
+    return SimpleNamespace(download=svc, db=db), svc, db
+
+
+def test_scrape_route_returns_a_direct_link_to_its_caller(monkeypatch):
+    """REQUIRED BY THE REVIEW: /download/scrape with a supported direct URL.
+
+    Executes the route. Pre-fix it returned zero links for a Rapidgator URL because
+    the route has no equivalent of download_item()'s passthrough fallback.
+    """
+    from backend.api.routes import downloads as routes
+    reg, svc, _db = _registry({"base_url": "https://hdencode.org",
+                               "hdencode_enabled": True})
+
+    def _tripwire(*a, **k):
+        raise AssertionError("no browser may start for a direct link")
+    svc._navigate_with_diagnostic = _tripwire
+    monkeypatch.setattr(routes, "record_scrape_outcome",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError(
+                            "a direct file host is not HDEncode source health")))
+
+    result = routes.scrape_links(routes.ScrapeRequest(url=RAPIDGATOR), reg)
+    links = result.get("links") if isinstance(result, dict) else list(result)
+    assert list(links) == [RAPIDGATOR], (
+        f"the route must hand its caller the direct link; got {links!r}")
+
+
+def test_copy_links_route_includes_a_direct_link_and_does_not_fail_it(monkeypatch):
+    """REQUIRED BY THE REVIEW: /download/copy-links must not file it as a failure.
+
+    The route's own logic is `if not links and diagnostic is not None: failures.append`,
+    so the old empty+diagnostic contract put a perfectly good direct link into the
+    failure list and contributed nothing to the clipboard.
+    """
+    from backend.api.routes import downloads as routes
+    reg, svc, _db = _registry({"base_url": "https://hdencode.org",
+                               "hdencode_enabled": True})
+
+    def _tripwire(*a, **k):
+        raise AssertionError("no browser may start for a direct link")
+    svc._navigate_with_diagnostic = _tripwire
+
+    copied = {}
+    svc.copy_to_clipboard = lambda links: copied.setdefault("links", list(links)) or True
+    monkeypatch.setattr(routes, "record_scrape_outcome", lambda *a, **k: None)
+    monkeypatch.setattr(routes.ws_manager, "broadcast_sync", lambda *a, **k: None)
+
+    class _Bg:
+        def add_task(self, fn, *a, **k):
+            fn(*a, **k)          # run the background work inline
+
+    item = routes.ScrapeBatchRequest.model_validate(
+        {"items": [{"url": RAPIDGATOR, "service_type": "Rapidgator"}]})
+    routes.copy_links_batch(item, _Bg(), reg)
+
+    assert copied.get("links") == [RAPIDGATOR], (
+        f"the direct link must reach the clipboard payload; got {copied!r}")
+
+
+def test_scrape_route_attributes_a_configured_mirror_to_hdencode_health(monkeypatch):
+    """REQUIRED BY THE REVIEW: mirror health ownership, through the route.
+
+    Pre-fix the route classified with the default host, so a mirror's scrape outcome
+    was never persisted as HDEncode health.
+    """
+    from backend.api.routes import downloads as routes
+    from backend.scrape_outcome import ScrapedLinks
+
+    reg, svc, db = _registry({"base_url": MIRROR, "hdencode_enabled": True})
+    recorded = []
+    monkeypatch.setattr(routes, "record_scrape_outcome",
+                        lambda _db, source, links: recorded.append(source))
+    svc.scrape_links = lambda url, service_type, **k: ScrapedLinks(
+        ["https://rapidgator.net/file/x/y.rar"])
+
+    routes.scrape_links(
+        routes.ScrapeRequest(url="https://hdencode.example.net/a-movie-2160p/"), reg)
+    assert recorded == ["hdencode"], (
+        f"a configured mirror's health must be attributed to HDEncode; got {recorded!r}")
+
+    recorded.clear()
+    routes.scrape_links(
+        routes.ScrapeRequest(url="https://hdencode.org/a-movie-2160p/"), reg)
+    assert recorded == [], (
+        "once a mirror is configured, the old default host is NOT HDEncode")
