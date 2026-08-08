@@ -1387,17 +1387,58 @@ class DownloadQueueService:
         # links, so the streak does reset on evidence of health. The composition
         # claim stays withdrawn regardless, because it is still untested here, and
         # "the mechanism now exists" is not the same as "the behaviour is proven".
-        batches = self.db._query_dicts(
+        # DISCOVERY STARTS FROM THE DEFERRED ITEMS, not from the batch.
+        #
+        # WHAT WAS WRONG. This query used to require `state = 'paused_source'`, and
+        # the per-item lookup below additionally required
+        # `item.cooldown_until = batch.cooldown_until` -- an EQUALITY between two
+        # copies of one recovery fact. Liveness therefore depended on two separate
+        # cross-table synchronisations holding forever, and every mutation path
+        # silently became responsible for maintaining them.
+        #
+        # retry_item() does not maintain them. It sets ONE item ready and then sets
+        # the batch to `scheduled` with `cooldown_until = NULL` regardless of
+        # deferred siblings, and _refresh_batch_locked only ever writes `completed`
+        # -- it never restores `paused_source`. So retrying a single item made every
+        # other deferred item in that batch permanently unreachable: the sweep
+        # would not select the batch, and the scheduler cannot claim
+        # `waiting_source`. That is how 34 of Jesse's downloads sat idle for seven
+        # hours with a healthy source and nothing in their way. A batch is an
+        # aggregate; it can legitimately hold completed, ready, claimed and deferred
+        # children at once, so no single `batch.state` can be the liveness authority
+        # for all of them.
+        #
+        # NOW: find eligible deferred ITEMS, group them by (batch, source), and let
+        # the batch supply only policy -- the retry budget and the shared cooldown.
+        # The safety filters are unchanged and deliberately still here: an unknown
+        # outcome is never auto-retried, because retrying something that may already
+        # have happened is worse than leaving it parked.
+        groups = self.db._query_dicts(
             """
-            SELECT *
-            FROM download_queue_batches
-            WHERE state = 'paused_source'
-              AND auto_resume_after_cooldown = 1
-              AND (
-                    auto_resume_used < ?
-                 OR source_delivery_count > auto_resume_progress_mark
+            SELECT i.batch_uuid            AS batch_uuid,
+                   i.source                AS source,
+                   MIN(i.cooldown_until)   AS earliest_item_cooldown,
+                   b.cooldown_until        AS batch_cooldown,
+                   b.interval_seconds      AS interval_seconds,
+                   b.state                 AS batch_state,
+                   COUNT(*)                AS deferred_items
+            FROM download_queue_items i
+            JOIN download_queue_batches b ON b.batch_uuid = i.batch_uuid
+            WHERE i.state IN ('verification_required', 'waiting_source')
+              AND i.queue_reason IN (
+                  'interactive_challenge', 'source_deferred'
               )
-            ORDER BY created_at
+              AND COALESCE(i.last_reason_code, '') NOT IN (
+                  'operation_timeout_unknown',
+                  'interrupted_unknown_outcome'
+              )
+              AND b.auto_resume_after_cooldown = 1
+              AND (
+                    b.auto_resume_used < ?
+                 OR b.source_delivery_count > b.auto_resume_progress_mark
+              )
+            GROUP BY i.batch_uuid, i.source
+            ORDER BY i.batch_uuid
             """,
             (self._auto_resume_max_attempts(),),
             default=[],
@@ -1414,48 +1455,85 @@ class DownloadQueueService:
         # its last automatic resume through regardless of the counter, and
         # _resume_batch then resets the counter and re-marks the baseline.
         self._warn_exhausted_batches(now)
-        for batch in batches:
-            until = _parse(batch.get("cooldown_until"))
-            if until is None or until > now:
+        for group in groups:
+            # TWO COOLDOWNS, EACH READ ON ITS OWN TERMS -- never compared to each
+            # other. The batch cooldown is the shared breaker: while it is in the
+            # future, this source is deliberately quiet and nothing in the group
+            # runs. The item cooldown is that item's own deferral. Requiring the two
+            # strings to be EQUAL, as this did before, meant a benign one-second
+            # difference between two timestamps that mean the same thing was enough
+            # to strand the work permanently.
+            batch_until = _parse(group.get("batch_cooldown"))
+            if batch_until is not None and batch_until > now:
                 continue
-            blocked = self.db._query(
-                """
-                SELECT source
-                FROM download_queue_items
-                WHERE batch_uuid = ?
-                  AND state IN ('verification_required', 'waiting_source')
-                  AND cooldown_until = ?
-                  AND queue_reason IN (
-                      'interactive_challenge', 'source_deferred'
-                  )
-                  AND COALESCE(last_reason_code, '') NOT IN (
-                      'operation_timeout_unknown',
-                      'interrupted_unknown_outcome'
-                  )
-                ORDER BY updated_at DESC,
-                    CASE WHEN state = 'verification_required' THEN 0 ELSE 1 END,
-                    sequence_number
-                LIMIT 1
-                """,
-                (batch["batch_uuid"], batch.get("cooldown_until")),
-                one=True,
-                default=None,
-            )
-            if blocked is None:
-                # Paused, resume-enabled, past cooldown, still within budget,
-                # and nothing to resume. Before 2026-08-07 this was a bare
-                # `continue`: parked forever with no signal at all.
-                self._log_unresumable_batch(batch)
+            item_until = _parse(group.get("earliest_item_cooldown"))
+            if item_until is not None and item_until > now:
+                continue
+            # SOMETHING MUST SAY WHEN, and the old safety rule is kept.
+            #
+            # `if until is None: continue` used to skip any batch with no cooldown. I
+            # first read that as pure fallout from the equality join and made NULL mean
+            # "no hold" -- which broke test_null_cooldown_batch_does_not_auto_resume,
+            # a rule with no docstring that I nearly "fixed" by rewriting the test.
+            # It is a real rule: a deferred row with NO retry time anywhere has nothing
+            # saying when it is safe to go, and firing immediately would probe a source
+            # that just refused.
+            #
+            # Both properties hold together, because the orphan is not that case. The
+            # orphan has a NULL BATCH cooldown -- retry_item cleared it -- while its
+            # items still carry theirs. So: the item's own deferral time is what
+            # authorises the retry, and the batch cooldown is only a shared brake. If
+            # NEITHER side has a time, nothing authorises anything and we leave it
+            # alone; the unresumable diagnostic below then explains it.
+            if batch_until is None and item_until is None:
                 continue
             self._resume_batch(
-                batch["batch_uuid"],
+                group["batch_uuid"],
                 interval_minutes=max(
                     0,
-                    int(batch.get("interval_seconds") or 0) // 60,
+                    int(group.get("interval_seconds") or 0) // 60,
                 ),
                 automated=True,
-                blocked_source=str(blocked["source"]),
+                blocked_source=str(group["source"]),
             )
+
+        # THE DIAGNOSTIC SURVIVES THE REWRITE, and now means something sharper.
+        #
+        # I removed the `if blocked is None: self._log_unresumable_batch(...)` branch
+        # along with the equality join, which silently deleted the only signal
+        # explaining why a parked batch stays parked -- five tests caught it. Losing
+        # observability while fixing a liveness bug would be a poor trade, and this
+        # whole effort has repeatedly been slowed by absent evidence.
+        #
+        # It also reports a BETTER fact now. Previously it fired for timestamp
+        # artifacts -- two copies of one cooldown drifting apart -- which is no
+        # longer a blocker at all. Now a paused, due, in-budget batch reaches this
+        # only when every one of its deferred items is EXCLUDED ON PURPOSE: an
+        # unknown execution state, or a queue_reason automatic resume does not own.
+        # That is a real operator-facing fact rather than a bookkeeping mismatch.
+        resumable = {str(g["batch_uuid"]) for g in groups}
+        stuck = self.db._query_dicts(
+            """
+            SELECT *
+            FROM download_queue_batches
+            WHERE state = 'paused_source'
+              AND auto_resume_after_cooldown = 1
+              AND (
+                    auto_resume_used < ?
+                 OR source_delivery_count > auto_resume_progress_mark
+              )
+            ORDER BY created_at
+            """,
+            (self._auto_resume_max_attempts(),),
+            default=[],
+        )
+        for batch in stuck:
+            if str(batch.get("batch_uuid")) in resumable:
+                continue
+            until = _parse(batch.get("cooldown_until"))
+            if until is not None and until > now:
+                continue          # still deliberately quiet; nothing to explain yet
+            self._log_unresumable_batch(batch)
 
     def retry_item(self, item_uuid: str) -> dict:
         item = self.get_item(item_uuid)

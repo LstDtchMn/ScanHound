@@ -1,4 +1,23 @@
-"""A stalled reveal control is a source throttle, not a changed layout.
+"""A stalled reveal control is a RETRYABLE reveal-path failure, not a changed layout.
+
+ITS CAUSE IS NOT ESTABLISHED. Corrected 2026-08-08 on peer review round 10.
+
+This module opened by asserting "a source throttle" and closed the evidence section
+with "The source is rate-limiting." I had already renamed the class and stripped the
+claim from the user-facing message in the same PR -- and left the framing here intact,
+which is where the assumption was actually coming from. Every test in the file
+inherited it, and that is how `assert "rate-limit" in message` came to look like a
+reasonable requirement.
+
+WHAT THE OBSERVATIONS BELOW ESTABLISH: the reveal control was present, the page shape
+was unchanged, and the widget had not finished when OUR 60-second window expired. So
+this is not a layout change and it is worth retrying.
+
+WHAT THEY DO NOT ESTABLISH: that the source is rate-limiting us. Every 60s figure is
+RIGHT-CENSORED -- measurement stops at the ceiling, so a widget that would have
+finished at 62s is indistinguishable from one that never finishes. And ScanHound reuses
+a persistent Chromium profile, so source-side limiting is indistinguishable here from
+browser/session state. See docs/reviews/peer-rounds/reveal-stall-root-cause.md.
 
 PRODUCTION EVIDENCE, 2026-08-06. HDEncode gates each link reveal behind a
 client-side countdown. The submit reads "Verifying... Please wait" until it
@@ -16,7 +35,8 @@ clears, then swaps to "View links". Observed sequence from the app log:
 
 Three reveals succeed, then the door shuts and stays shut. The page shape is
 identical throughout -- 6 forms, the same #unlocked action, 92-94 links -- so
-nothing about the layout changed. The source is rate-limiting.
+nothing about the layout changed. Something changed STATE; what owns that state is
+not known from this data.
 
 WHY THIS MATTERED MORE THAN ONE ITEM. The stall was classified LAYOUT_CHANGED,
 which is retryable=False, carries no cooldown, and never notifies the traffic
@@ -131,7 +151,12 @@ class TestStalledVerifyIsRetryableNotALayoutChange:
         assert _diagnose(svc, ds, tier="not-ready").cooldown_until is not None
 
     def test_it_tells_the_traffic_coordinator(self, service):
-        """Without this the backoff system never learns the source is refusing."""
+        """Without this the backoff system never learns the reveal path stalled.
+
+        Said as "the source is refusing" until 2026-08-08 -- the same unproven
+        attribution in miniature. What the coordinator is told is that a reveal did
+        not complete; what that implies about the source is the open question.
+        """
         svc, coordinator, ds = service
         _diagnose(svc, ds, tier="not-ready")
         assert coordinator.observed == ["reveal_verification_stalled"]
