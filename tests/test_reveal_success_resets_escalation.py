@@ -285,5 +285,9 @@ def test_a_direct_file_host_does_not_report_hdencode_health(monkeypatch):
     svc._active_scrapes = 0
 
     result = svc.scrape_links("https://rapidgator.net/file/abc/x.rar", "Rapidgator")
-    assert result.diagnostic.code is ScrapeCode.DIRECT_LINK_NO_SOURCE_PAGE
+    # THE PROPERTY UNDER TEST is `calls == []`. The diagnostic assertion that used to
+    # sit here was incidental and became wrong on round 8, when a supported direct
+    # host started returning itself instead of an empty result -- so it is replaced
+    # with the passthrough, and the escalation assertion is left as the point.
+    assert list(result) == ["https://rapidgator.net/file/abc/x.rar"]
     assert calls == [], "a direct file host must not touch HDEncode's escalation state"

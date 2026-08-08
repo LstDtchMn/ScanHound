@@ -2609,7 +2609,12 @@ class DatabaseManager:
                 failed_urls=set()
             listing=_urlset(details.get("listing_only"),"listing_only",cycle,problems)
             feed=_urlset(details.get("feed_only"),"feed_only",cycle,problems)
-            if listing is None or feed is None:
+            # Cycles written before round 8 have no duplicate_urls; _urlset returns
+            # an empty set for a missing key, which is the conservative reading --
+            # absent evidence clears nothing.
+            duplicates=_urlset(
+                details.get("duplicate_urls"),"duplicate_urls",cycle,problems)
+            if listing is None or feed is None or duplicates is None:
                 continue
             outcomes=self._normal_feed_outcomes(row, cycle, problems)
             # STRICTLY NULL/0/1. The column is an unconstrained INTEGER, and
@@ -2642,12 +2647,32 @@ class DatabaseManager:
             # are governed by the aggregate rule everywhere else.
             for url in failed_urls & listing:
                 candidate_state[url]=True
+            # CLEARING REQUIRES AFFIRMATIVE RSS CARRIAGE. Corrected on peer review
+            # round 8, which found the previous rule fail-open -- and it was worse
+            # than the review described. It cleared on
+            #
+            #     (listing_only | feed_only) - detail_failed
+            #
+            # but `listing_only` MEANS RSS DID NOT CARRY THE URL. That is the
+            # miss-candidate set. So a later cycle where the release was still
+            # missing from RSS -- and merely had a working detail scrape -- deleted
+            # the blocker. I was clearing an RSS-coverage blocker using evidence of
+            # an RSS coverage gap, and if the relevant feed had not been validly
+            # observed that cycle, no graded miss row was created to take over. The
+            # blocker vanished and nothing replaced it.
+            #
+            # The only affirmative evidence that RSS carried a URL is:
+            #   feed_only      -- in RSS, not in the listing
+            #   duplicate_urls -- in RSS AND in the listing  <-- see Finding 2
+            # Their union is exactly "this cycle's RSS set, as far as it concerns
+            # URLs we know about". Nothing else in a persisted cycle establishes it.
+            #
+            # The second legitimate exit is OWNERSHIP TRANSFER to a graded miss row,
+            # applied after the miss loop below, since that is where admission by
+            # feed validity is decided.
+            rss_carried=feed | duplicates
             if listing_ok is not False:
-                # Observed on this cycle AND attributed -- the detail scrape did
-                # not fail for it. Note (listing|feed) is disjoint from
-                # failed_urls here by construction, so no URL is both raised and
-                # cleared by one cycle.
-                for url in (listing | feed) - failed_urls:
+                for url in rss_carried:
                     if url in candidate_state:
                         candidate_state[url]=False
             cycles.append({"at":at,"listing_only":listing,"feed_only":feed,
@@ -2680,6 +2705,27 @@ class DatabaseManager:
                 continue
             misses.append({"url":row.get("url"),"media_type":media_type,
                            "at":_at(row.get("at"))})
+        # OWNERSHIP TRANSFER, the second and only other legitimate way out of
+        # candidate state. Applied HERE and not in the cycles loop because this is
+        # where admission is decided: a miss row only lands in `misses` if its
+        # relevant feed observation was valid (or, for a pre-provenance row, the
+        # conservative cycle rule held).
+        #
+        # The distinction round 8 required: a later detail success must not merely
+        # DELETE the blocker, it must hand the URL over to something that still
+        # blocks. Once an admitted miss row exists, the normal miss-resolution
+        # machinery owns that URL -- it will be graded acquired / never_acquired /
+        # undetermined / not_yet_assessable, and every one of those states except
+        # `acquired` blocks readiness on its own. So dropping it from the
+        # unattributed set is a genuine transfer of responsibility rather than an
+        # erasure.
+        #
+        # Note this deliberately does NOT check whether the miss row's own verdict
+        # is favourable. That is not this function's job, and making candidacy
+        # depend on the outcome would double-count the same URL in two blockers.
+        for url in {str(m.get("url") or "") for m in misses}:
+            if url in candidate_state:
+                candidate_state[url]=False
         summary=summarise_miss_resolutions(misses,cycles)
         summary["evidence_problems"]=problems
         unresolved=sorted(u for u,pending in candidate_state.items() if pending)

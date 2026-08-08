@@ -312,13 +312,21 @@ def test_direct_file_url_never_reaches_the_hdencode_scraper():
 
     result = svc.scrape_links("https://rapidgator.net/file/abc/x.rar", "Rapidgator")
 
-    assert list(result) == [], "nothing to scrape on a direct link"
-    assert result.diagnostic is not None
-    assert result.diagnostic.code is ScrapeCode.DIRECT_LINK_NO_SOURCE_PAGE
-    # It must NOT be attributed to the source's health, and it must not claim a
-    # request was made.
-    assert result.diagnostic.affects_source_health is False
-    assert result.diagnostic.transport_attempted is False
+    # THE PROPERTY UNDER TEST IS THE TRIPWIRE ABOVE: no HDEncode navigation. That is
+    # what round 7 was about, and it still holds.
+    #
+    # THE RETURN VALUE ASSERTION WAS REWRITTEN ON ROUND 8. It used to require
+    # `list(result) == []` plus a diagnostic, because I had designed the branch
+    # around download_item()'s `if not links:` fallback. Round 8 showed that
+    # contract only works for that ONE caller out of five, so a supported direct
+    # host now returns itself. My original assertion had codified the defect --
+    # the same "my own test protected the thing that was wrong" pattern this
+    # effort has hit repeatedly, and it is why the round-8 replacement asserts the
+    # value every caller receives rather than one caller's recovery.
+    assert list(result) == ["https://rapidgator.net/file/abc/x.rar"], (
+        "a supported direct host must be returned to every caller")
+    assert getattr(result, "diagnostic", None) is None, (
+        "a passthrough is not a failure and must carry no diagnostic")
 
 
 def test_unknown_host_is_reported_as_unsupported_not_as_hdencode():
@@ -404,16 +412,29 @@ def test_listing_only_detail_failure_does_block(db):
     assert res["unattributed_candidate_urls"] == [ONLY]
 
 
-def test_a_later_successful_attribution_clears_the_candidate(db):
+def test_a_later_rss_observation_clears_the_candidate(db):
     """THE WRONG ANSWER: one transient scrape failure blocks readiness forever.
 
-    A sum over history cannot subtract, so nothing could ever clear it.
+    A sum over history cannot subtract, so nothing could ever clear it. That part of
+    round 7 stands.
+
+    INVERTED ON ROUND 8, AND THIS TEST WAS THE PROBLEM. My original version had the
+    later cycle keep the URL in `listing_only` with a working detail scrape, and
+    asserted that cleared the candidate. `listing_only` MEANS RSS DID NOT CARRY IT --
+    so I had written a test asserting that an RSS-coverage blocker is resolved by
+    evidence of an RSS coverage gap, and the test then protected exactly the
+    fail-open the reviewer found. Third time a test of mine has guarded the defect it
+    was written to catch.
+
+    The clearing evidence is now affirmative RSS carriage: `feed_only` (in RSS, not
+    in the listing) or `duplicate_urls` (in RSS and in the listing).
     """
     _cycle(db, listing_complete=1, at="2026-08-01T00:00:00+00:00",
            details={"detail_failed": [ONLY], "listing_only": [ONLY],
                     "feed_only": []})
     _cycle(db, listing_complete=1, at="2026-08-02T00:00:00+00:00",
-           details={"detail_failed": [], "listing_only": [ONLY], "feed_only": []})
+           details={"detail_failed": [], "listing_only": [],
+                    "feed_only": [], "duplicate_urls": [ONLY]})
     res = db.get_hdencode_miss_resolution()
     assert res["unattributed_candidates"] == 0, res.get("unattributed_candidate_urls")
 
@@ -435,16 +456,24 @@ def test_a_contradicted_cycle_cannot_clear_a_candidate(db):
         correct                      -> 1
         pre-fix (sums, never clears) -> 2
         clears on contradiction too  -> 0
+
+    REBASED ONTO RSS CARRIAGE ON ROUND 8. The clearing evidence used to be "still
+    listing-only, detail succeeded", which round 8 showed is not evidence of anything
+    -- see test_a_later_rss_observation_clears_the_candidate. The asymmetry being
+    tested is unchanged; only what counts as clearing evidence is.
     """
     _cycle(db, listing_complete=1, at="2026-08-01T00:00:00+00:00",
            details={"detail_failed": [ONLY, OTHER],
                     "listing_only": [ONLY, OTHER], "feed_only": []})
-    # Trusted cycle attributes ONLY -> genuinely resolved.
+    # Trusted cycle: RSS carried ONLY -> genuinely resolved.
     _cycle(db, listing_complete=1, at="2026-08-02T00:00:00+00:00",
-           details={"detail_failed": [], "listing_only": [ONLY], "feed_only": []})
-    # Contradicted cycle "attributes" OTHER -> must NOT resolve it.
+           details={"detail_failed": [], "listing_only": [],
+                    "feed_only": [ONLY]})
+    # Contradicted cycle: RSS appears to carry OTHER -> must NOT resolve it, because
+    # a cycle whose membership contradicts itself cannot certify its own RSS set.
     _cycle(db, listing_complete=0, at="2026-08-03T00:00:00+00:00",
-           details={"detail_failed": [], "listing_only": [OTHER], "feed_only": []})
+           details={"detail_failed": [], "listing_only": [],
+                    "feed_only": [OTHER]})
 
     res = db.get_hdencode_miss_resolution()
     assert res["unattributed_candidate_urls"] == [OTHER], (

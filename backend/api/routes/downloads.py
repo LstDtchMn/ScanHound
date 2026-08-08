@@ -16,7 +16,6 @@ from backend.download_queue import (
     DownloadQueueItemClaimed,
     DownloadQueueUnavailable,
 )
-from backend.download_service import _source_page_kind
 from backend.source_health import record_scrape_outcome
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 from backend.download_outcome import (
@@ -367,7 +366,12 @@ def scrape_links(
         )
         raise HTTPException(status_code=502, detail=public.as_detail())
     diagnostic = getattr(links, "diagnostic", None)
-    if _source_page_kind(req.url) == "hdencode":
+    # OWNERSHIP VIA THE SERVICE, not a route-local classifier. This route used
+    # the module-level `_source_page_kind(url)` with its default host, so with a
+    # configured mirror the service treated the URL as HDEncode (coordinator,
+    # off switch) while this line did not -- the mirror's scrape health was never
+    # persisted as HDEncode, and a stale `hdencode.org` still was.
+    if dl.owns_source_health(req.url, "hdencode"):
         record_scrape_outcome(reg.db, "hdencode", links)
     if links and req.title and reg.db:
         try:
@@ -418,7 +422,8 @@ def copy_links_batch(
             try:
                 links = dl.scrape_links(it.url, it.service_type)
                 diagnostic = getattr(links, "diagnostic", None)
-                if _source_page_kind(it.url) == "hdencode":
+                # Same config-aware ownership test as /download/scrape above.
+                if dl.owns_source_health(it.url, "hdencode"):
                     record_scrape_outcome(reg.db, "hdencode", links)
             except Exception as exc:
                 logger.exception("Batch scrape failed for %s", it.url)

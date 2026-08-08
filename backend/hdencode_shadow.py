@@ -271,6 +271,25 @@ class ShadowComparison:
     #: completed. Unlike detail_dropped this excludes cached skips and policy
     #: exclusions, so it is safe to block on.
     detail_failed:tuple[str,...]=()
+    #: URLs carried by BOTH the RSS feed and the listing, by URL rather than only
+    #: counted. Added 2026-08-07 on peer review round 8.
+    #:
+    #: WHY THE COUNT WAS NOT ENOUGH. `duplicate_count` existed, so the ordinary
+    #: SUCCESS case was invisible: a listing-only URL whose detail scrape failed
+    #: becomes an unresolved candidate, and when RSS later catches up while the
+    #: release is still listed, that URL is a DUPLICATE -- in neither `feed_only`
+    #: nor `listing_only`. The candidate loader could therefore never see the one
+    #: piece of evidence that resolves it, and it blocked forever.
+    #:
+    #: `feed_only | duplicate_urls` is the affirmative "RSS carried this URL" set:
+    #: feed_only is RSS-and-not-listing, duplicates are RSS-and-listing. Nothing
+    #: else in a persisted cycle can establish that, which is why Finding 1's
+    #: ownership rule needs this field too.
+    #:
+    #: DECLARED LAST for the reason spelled out on `listing_complete` above: this
+    #: dataclass is constructed POSITIONALLY and inserting a field mid-list shifted
+    #: every later argument and broke 47 tests.
+    duplicate_urls:tuple[str,...]=()
     def as_dict(self): return asdict(self)
 
 def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss_requests:int, listing_requests:int, normal_feeds_complete:bool, normal_feed_outcomes: Optional[Mapping[str,str]]=None, listing_complete: Optional[bool]=None, raw_listing_urls: Optional[Iterable[str]]=None, detail_failed_urls: Optional[Iterable[str]]=None) -> ShadowComparison:
@@ -429,7 +448,8 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
         detail_dropped=detail_dropped,
         membership_contradiction=membership_contradiction,
         detail_failed=tuple(sorted(
-            {canonical_url(u) for u in (detail_failed_urls or ()) if u} - {''})))
+            {canonical_url(u) for u in (detail_failed_urls or ()) if u} - {''})),
+        duplicate_urls=tuple(sorted(duplicate)))
 
 
 # ---------------------------------------------------------------------------
