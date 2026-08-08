@@ -1136,12 +1136,12 @@ class DownloadQueueService:
         the ceiling exists because an unbounded retry loop against a source that
         is rate-limiting us is how this incident started.
         """
-        try:
-            value = int(self.config.get(
-                "download_queue_auto_resume_max_attempts", 3))
-        except (TypeError, ValueError):
-            value = 3
-        return max(1, min(10, value))
+        # DELEGATED, round 14. This kept its own parse+clamp while
+        # queue_recovery_policy owned the same logic, so round 10's "one parser" item
+        # was not literally closed. They agreed, which is precisely how the earlier
+        # copies survived long enough to drift.
+        from backend.queue_recovery_policy import parse_max_attempts
+        return parse_max_attempts(self.config)
 
     #: The source whose retry budget the auto-resume machinery manages. The
     #: coordinator, the reveal cooldown and the batch pause are all HDEncode

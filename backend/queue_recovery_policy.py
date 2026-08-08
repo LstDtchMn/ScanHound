@@ -63,12 +63,65 @@ UNOWNED_REASON = "reason_not_owned"        # automatic recovery does not own thi
 DISABLED = "auto_resume_disabled"          # the operator turned it off
 BUDGET_SPENT = "retry_budget_spent"        # deliberate policy stop
 
-#: Decisions that will NOT resolve on their own. Everything else either runs now or
-#: clears with time.
-NEEDS_HUMAN = frozenset({NO_AUTHORISATION, UNOWNED_REASON, DISABLED, BUDGET_SPENT})
+#: Decisions that will NOT resolve on their own.
+#:
+#: SAFETY_HOLD BELONGS HERE and was missing, which round 14 caught. Nothing automatic
+#: ever changes an unknown-outcome row, so omitting it made the tools report
+#: "every deferred item has a recovery path" about a row that has none by design, and
+#: made the watcher wait on it forever.
+NEEDS_HUMAN = frozenset({NO_AUTHORISATION, UNOWNED_REASON, DISABLED, BUDGET_SPENT,
+                         SAFETY_HOLD})
 
 #: Transient: no action needed, it will clear.
 WILL_CLEAR = frozenset({WAITING_OWN, WAITING_BRAKE})
+
+# ── WHAT A HUMAN SHOULD ACTUALLY DO ─────────────────────────────────────────
+#
+# "Needs a human" is not one action, and round 14 found the conflation dangerous:
+# watch_resume told every human-required row to "resume explicitly", which for an
+# unknown-outcome row is UNSAFE ADVICE -- a blind retry can duplicate a delivery that
+# already happened. That is the one case where the diagnostics could cause harm rather
+# than merely mislead, so the action is part of the policy rather than left to each
+# tool's phrasing.
+ACTION_ADJUDICATE = "adjudicate"        # check the external state FIRST; never blind
+ACTION_MANUAL_RESUME = "manual_resume"  # safe to resume explicitly
+ACTION_CONFIGURATION = "configuration"  # a setting, not an item, is the problem
+ACTION_WAIT = "wait"                    # will clear on its own
+ACTION_NONE = "none"                    # due; the scheduler will take it
+
+ACTION_FOR = {
+    SAFETY_HOLD: ACTION_ADJUDICATE,
+    NO_AUTHORISATION: ACTION_MANUAL_RESUME,
+    BUDGET_SPENT: ACTION_MANUAL_RESUME,
+    UNOWNED_REASON: ACTION_MANUAL_RESUME,
+    DISABLED: ACTION_CONFIGURATION,
+    WAITING_OWN: ACTION_WAIT,
+    WAITING_BRAKE: ACTION_WAIT,
+    AUTHORISED: ACTION_NONE,
+}
+
+#: Human-readable instruction per action. The adjudicate text deliberately does NOT
+#: say "retry" anywhere.
+ACTION_ADVICE = {
+    ACTION_ADJUDICATE: (
+        "CHECK WHETHER IT ALREADY DOWNLOADED before doing anything. The previous "
+        "attempt's outcome is unknown, so retrying could fetch the same release twice. "
+        "Do not use a plain resume on these."
+    ),
+    ACTION_MANUAL_RESUME: (
+        "Safe to resume explicitly (Downloads page, or the batch resume endpoint)."
+    ),
+    ACTION_CONFIGURATION: (
+        "Turn auto-resume back on for this batch; the items themselves are fine."
+    ),
+    ACTION_WAIT: "Nothing to do; this clears by itself.",
+    ACTION_NONE: "Nothing to do; the scheduler will pick it up.",
+}
+
+
+def action_for(decision: str) -> str:
+    """The action a human should take, given a decision. Never guesses 'retry'."""
+    return ACTION_FOR.get(decision, ACTION_MANUAL_RESUME)
 
 
 @dataclass(frozen=True)
@@ -156,17 +209,24 @@ def decide(item: ItemFacts, shared: SharedFacts,
     if item.cooldown_until is not None:
         return AUTHORISED if item.cooldown_until <= now else WAITING_OWN
 
-    # No own cooldown. The shared brake, having passed, is the authorisation -- and if
-    # there is no brake either then nothing anywhere says when this may run, so it
-    # needs an explicit operator resume rather than an automatic probe at a source
-    # that may have just refused us.
+    # NO OWN COOLDOWN -> NOT AUTHORISED. Strict, changed on round 14.
     #
-    # NOTE the reviewer's caveat, recorded rather than silently accepted: an expired
-    # batch cooldown proves only that SOME source-wide event on this batch had a time,
-    # not that this particular row was deferred by that event -- a batch can be
-    # `source="mixed"`, and a later pause overwrites the scalar. Properly this wants a
-    # recovery-episode identity carrying source, cooldown and budget. Until that
-    # exists this fallback is a documented heuristic, not a proof.
-    if shared.cooldown_until is not None:
-        return AUTHORISED
+    # I previously treated an expired shared brake as the authorisation for a row with
+    # no time of its own, and recorded the reviewer's provenance objection as a caveat
+    # instead of acting on it. The objection is decisive once you check the producer:
+    # _pause_for_source writes `cooldown_until` to the triggering item, to every
+    # same-source sibling it defers, AND to the batch. So a healthy source pause always
+    # gives a row its own time.
+    #
+    # A deferred row with cooldown_until = NULL is therefore NOT a healthy row whose
+    # authorisation merely lives elsewhere. It means the outcome carried no time, or the
+    # row is legacy/manual, or an invariant was broken -- exactly the cases where
+    # inferring permission from an unprovenanced batch scalar is least defensible. The
+    # batch has no `cooldown_source` and no `recovery_episode_id`; a batch can be
+    # source="mixed", and a later pause overwrites the scalar. An expired batch cooldown
+    # proves only that SOME event on that batch had a time, not that THIS row was
+    # deferred by it.
+    #
+    # So it fails closed and asks for a human. When recovery-episode identity exists,
+    # the episode can authorise its own rows without copying the time into each one.
     return NO_AUTHORISATION

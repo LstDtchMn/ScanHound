@@ -36,9 +36,9 @@ from datetime import datetime, timezone
 sys.path.insert(0, "/app")
 
 from backend.queue_recovery_policy import (  # noqa: E402
-    AUTHORISED, BUDGET_SPENT, DISABLED, NEEDS_HUMAN, NO_AUTHORISATION, SAFETY_HOLD,
-    UNOWNED_REASON, WAITING_BRAKE, WAITING_OWN, WILL_CLEAR, ItemFacts, SharedFacts,
-    decide, parse_max_attempts,
+    ACTION_ADVICE, AUTHORISED, BUDGET_SPENT, DISABLED, NEEDS_HUMAN, NO_AUTHORISATION,
+    SAFETY_HOLD, UNOWNED_REASON, WAITING_BRAKE, WAITING_OWN, WILL_CLEAR, ItemFacts,
+    SharedFacts, action_for, decide, parse_max_attempts,
 )
 
 #: Plain-language rendering, because these are read by a person deciding whether to
@@ -133,5 +133,17 @@ def still_deferred(verdicts):
     A watcher must not call these "resolved": the recovery event it is watching for has
     not happened yet. Round 13 caught watch_resume.py exiting success on exactly this.
     """
-    return sum(len(verdicts.get(v, []))
-               for v in tuple(WILL_CLEAR) + (AUTHORISED, SAFETY_HOLD))
+    # SAFETY_HOLD IS NOT WAITING. Round 14: including it here made the tools treat a
+    # row that nothing automatic will ever move as ordinary patience. It is counted by
+    # needs_human() instead.
+    return sum(len(verdicts.get(v, [])) for v in tuple(WILL_CLEAR) + (AUTHORISED,))
+
+
+def advice_for(decision):
+    """What a human should DO about this decision, from the shared policy.
+
+    Never composed locally. Round 14 found watch_resume telling every human-required
+    row to "resume explicitly" -- unsafe for an unknown-outcome row, where a blind
+    retry can duplicate a delivery.
+    """
+    return ACTION_ADVICE[action_for(decision)]

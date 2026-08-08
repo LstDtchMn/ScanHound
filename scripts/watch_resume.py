@@ -26,26 +26,26 @@ GRACE = timedelta(minutes=12)   # scheduler tick slack past the cooldown
 POLL = 120
 
 
-def _recovery_state():
-    """(needs_human, still_deferred) per the SHARED policy, or (-1, -1) if unavailable.
+def _status():
+    """(code, message) for the CURRENT state. One function, both call sites.
 
-    ROUND 13 CAUGHT THE FALSE SUCCESS AGAIN, third variant. This returned only the
-    human-required count, and the caller read "nothing needs a human" as "nothing is
-    deferred" -- so a row merely waiting for its own cooldown made the watcher print
-    RESOLVED and exit 0, while the very recovery event it was watching for had not
-    happened. Round 10 had it calling the orphan state SUCCESS; round 12 caught my fix
-    inverting that to a false FAILURE; this is the third shape of the same mistake.
+    ROUND 14 CAUGHT THE FOURTH SHAPE of this script's false success, and the cause was
+    that I fixed the startup branch and left polling with its own copy of the logic:
 
-    So both numbers are returned and the caller must distinguish:
-        needs_human > 0   -> ACTION REQUIRED
-        still_deferred > 0 -> WAITING, keep polling
-        both zero          -> RESOLVED
+        round 10  called the orphan state SUCCESS
+        round 12  my fix inverted that to a false FAILURE
+        round 13  "nothing needs a human" read as "nothing is deferred"
+        round 14  startup fixed, polling still printed "nothing is deferred" while
+                  computing -- and discarding -- the number that says otherwise
+
+    Four wrong answers from four separate copies of one decision. There is now one.
     """
     try:
         import os
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from queue_recovery_state import (JOINED_DEFERRED_SQL, classify_rows,
-                                          needs_human, still_deferred)
+        from queue_recovery_state import (JOINED_DEFERRED_SQL, advice_for,
+                                          classify_rows, needs_human, still_deferred)
+        from backend.queue_recovery_policy import NEEDS_HUMAN
         con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
         try:
@@ -53,10 +53,22 @@ def _recovery_state():
         finally:
             con.close()
         verdicts = classify_rows(rows)
-        return needs_human(verdicts), still_deferred(verdicts)
-    except Exception:                                          # noqa: BLE001
+    except Exception as exc:                                   # noqa: BLE001
         # Unknown is not zero. Reporting an unknown as all-clear is the original bug.
-        return -1, -1
+        return "UNKNOWN", (f"the recovery classifier could not run "
+                           f"({type(exc).__name__}), so I cannot say whether anything "
+                           "is stranded. Treat this as needing a look.")
+    human = needs_human(verdicts)
+    waiting = still_deferred(verdicts)
+    if human:
+        # ACTION PER DECISION, from the policy -- never one blanket "resume it".
+        lines = [f"{len(verdicts[d])} item(s) {d}: {advice_for(d)}"
+                 for d in sorted(verdicts) if d in NEEDS_HUMAN]
+        return "ACTION REQUIRED", " | ".join(lines)
+    if waiting:
+        return "WAITING", (f"{waiting} item(s) are deferred but all have a recovery "
+                           "path; continuing to watch.")
+    return "RESOLVED", "nothing is paused and nothing is deferred."
 
 
 def say(msg):
@@ -107,27 +119,14 @@ if not paused0:
     # caught as the opposite error, because item-first recovery deliberately made
     # that state recoverable. Two wrong answers from the same cause: a second copy
     # of the policy. The copy is gone; queue_recovery_state owns it.
-    orphaned, waiting = _recovery_state()
-    if orphaned < 0:
-        say("UNKNOWN: the recovery classifier could not run, so I cannot say "
-            "whether anything is stranded. Treat this as needing a look, not as "
-            "all-clear -- reporting an unknown as zero is the false-SUCCESS this "
-            "script was fixed for.")
+    code, message = _status()
+    say(f"{code}: {message}")
+    if code in ("ACTION REQUIRED", "UNKNOWN"):
         sys.exit(1)
-    if orphaned:
-        say(f"ACTION REQUIRED: {orphaned} item(s) have no automatic recovery path. "
-            "Run `python /data/scanhound_check.py` (section 3b) for the verdicts, "
-            "then resume explicitly -- this will not clear on its own.")
-        sys.exit(1)
-    if waiting:
-        # WAITING IS NOT RESOLVED. Round 13: reading "nothing needs a human" as
-        # "nothing is deferred" made this exit 0 while the recovery event being
-        # watched had not happened -- the third shape of this script's false success.
-        say(f"WAITING: {waiting} item(s) are deferred but all have a recovery path; "
-            "continuing to watch.")
-    else:
-        say("RESOLVED: nothing is paused and nothing is deferred.")
+    if code == "RESOLVED":
         sys.exit(0)
+    # WAITING falls through and keeps polling, which is the entire point of a watcher.
+
 
 prev = (len(paused0), states0.get("waiting_source", 0),
         states0.get("failed", 0), sum(b["u"] or 0 for b in paused0))
@@ -153,21 +152,16 @@ while True:
         prev = cur
 
     if not paused:
-        stuck, deferred = _recovery_state()
-        if stuck < 0:
-            say("UNKNOWN: the recovery classifier could not run; not calling this "
-                "a success.")
-            sys.exit(1)
-        if stuck:
-            say(f"ACTION REQUIRED: {stuck} item(s) have no automatic recovery path "
-                f"deferred (waiting_source={waiting}). The batch moved on without "
-                "them, so no automatic path can reach them. This is a FAILURE, not "
-                "a success -- the old version of this script called it SUCCESS "
-                "while printing this very number.")
-            sys.exit(1)
-        say(f"SUCCESS: no batches are paused and nothing is deferred "
-            f"(failed={failed}). The retry fired and the batches resumed.")
-        sys.exit(0)
+        # THE SAME FUNCTION as startup. Round 14 caught this branch keeping its own
+        # copy: it computed the deferred count, DISCARDED it, and printed "nothing is
+        # deferred" -- asserting the very thing it declined to check. Fourth shape of
+        # this script's false success, and the first caused purely by my fixing one
+        # branch of two.
+        code, message = _status()
+        if code != "WAITING":
+            say(f"{code}: {message}")
+            sys.exit(0 if code == "RESOLVED" else 1)
+
 
     if failed:
         say(f"ATTENTION: {failed} item(s) are now FAILED. The retry ran and hit "

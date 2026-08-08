@@ -96,7 +96,11 @@ paused = list(con.execute(
     "       cooldown_until FROM download_queue_batches "
     "WHERE state = 'paused_source' ORDER BY batch_uuid"))
 if not paused:
-    print(OK + "NO batches are paused - everything resumed or completed")
+    # RAW FACT ONLY, round 14. "everything resumed or completed" is a conclusion this
+    # line cannot support: under item-first recovery no paused batch does not imply no
+    # deferred child, and section 3b could contradict it two lines later.
+    print(INFO + "no batch currently has state=paused_source "
+                 "(deferred items are judged in 3b)")
 else:
     print(INFO + f"{len(paused)} batch(es) still paused:")
     for b in paused:
