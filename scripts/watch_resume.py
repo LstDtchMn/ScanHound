@@ -43,9 +43,8 @@ def _status():
     try:
         import os
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from queue_recovery_state import (JOINED_DEFERRED_SQL, advice_for,
-                                          classify_rows, needs_human, still_deferred)
-        from backend.queue_recovery_policy import NEEDS_HUMAN
+        from queue_recovery_state import (JOINED_DEFERRED_SQL, classify_rows,
+                                          watcher_status)
         con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
         try:
@@ -58,17 +57,10 @@ def _status():
         return "UNKNOWN", (f"the recovery classifier could not run "
                            f"({type(exc).__name__}), so I cannot say whether anything "
                            "is stranded. Treat this as needing a look.")
-    human = needs_human(verdicts)
-    waiting = still_deferred(verdicts)
-    if human:
-        # ACTION PER DECISION, from the policy -- never one blanket "resume it".
-        lines = [f"{len(verdicts[d])} item(s) {d}: {advice_for(d)}"
-                 for d in sorted(verdicts) if d in NEEDS_HUMAN]
-        return "ACTION REQUIRED", " | ".join(lines)
-    if waiting:
-        return "WAITING", (f"{waiting} item(s) are deferred but all have a recovery "
-                           "path; continuing to watch.")
-    return "RESOLVED", "nothing is paused and nothing is deferred."
+    # The decision itself is PURE and lives in queue_recovery_state.watcher_status, so
+    # it can be tested without a database. Round 15: this file's logic was untestable,
+    # which is why the test file claimed to pin four states it never touched.
+    return watcher_status(verdicts)
 
 
 def say(msg):

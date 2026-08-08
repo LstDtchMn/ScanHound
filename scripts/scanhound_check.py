@@ -140,13 +140,14 @@ else:
 # false SUCCESS in round 10 and replaced it with a false FAILURE in round 11.
 #
 # It now asks the shared classifier, which holds the recovery policy ONCE for both
-# this tool and watch_resume.py. Only ORPHANED needs a human; the waiting verdicts are
-# ordinary and clear on their own.
+# this tool and watch_resume.py. Human-required decisions are defined by
+# NEEDS_HUMAN, each with its OWN required action; waiting verdicts clear
+# automatically. (There is no longer a single ORPHANED verdict.)
 print("\n3b. Can every deferred download still recover?")
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from queue_recovery_state import (JOINED_DEFERRED_SQL, LABELS, classify_rows,
-                                      needs_human)
+    from queue_recovery_state import (JOINED_DEFERRED_SQL, LABELS, advice_for,
+                                      classify_rows, needs_human)
     from backend.queue_recovery_policy import NEEDS_HUMAN
     rows = [dict(r) for r in con.execute(JOINED_DEFERRED_SQL)]
     verdicts = classify_rows(rows)
@@ -166,8 +167,16 @@ try:
                 print(f"        ... and {len(items) - 4} more")
         stuck = needs_human(verdicts)
         if stuck:
-            problems.append(f"{stuck} deferred item(s) have no automatic recovery "
-                            "path and need an explicit resume")
+            # ACTION-NEUTRAL AGGREGATE, corrected round 15. This used to say all
+            # human-required rows "need an explicit resume", which collapsed the whole
+            # taxonomy back into the one unsafe action round 14 removed -- so an
+            # unknown-outcome row produced BOTH "needs adjudication" and "need an
+            # explicit resume", the second contradicting the first and recommending
+            # precisely the thing that can download something twice.
+            for decision in sorted(v for v in verdicts if v in NEEDS_HUMAN):
+                problems.append(
+                    f"{len(verdicts[decision])} item(s) {LABELS.get(decision, decision)}"
+                    f" -- {advice_for(decision)}")
         else:
             print(OK + "every deferred item has a recovery path")
 except Exception as exc:                                   # noqa: BLE001

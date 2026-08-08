@@ -14,8 +14,13 @@ Pinned here:
   * the round-12 pair -- a due item must not drag a future or NULL sibling;
   * the round-13 mirror -- an ineligible sibling must not veto an eligible one;
   * every policy decision, through the real JOINED_DEFERRED_SQL row shape;
-  * the four watcher states;
-  * the safety taxonomy, including that an unknown-outcome row is never told to retry.
+  * the four watcher states -- ADDED ON ROUND 15. The first version of this docstring
+    claimed to pin them and did not: the decision lived inside watch_resume.py, which
+    opens a database and cannot be imported. Second time I have written a false claim
+    into test documentation; round 8's "drives the ROUTE, not the service" was the same
+    mistake, describing intent rather than code;
+  * the safety taxonomy, including that an unknown-outcome row is never told to retry,
+    and that an UNMAPPED decision raises rather than defaulting to "safe to resume".
 """
 from __future__ import annotations
 
@@ -255,3 +260,78 @@ def test_the_adapter_reads_the_BATCH_cooldown_not_the_item_twice(own, batch_cd, 
         os.path.abspath(__file__))), "scripts"))
     from queue_recovery_state import classify_rows
     assert list(classify_rows([_joined(own, batch_cd)], now=NOW))[0] == expected
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The four watcher states, and the taxonomy's completeness
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _verdicts(**counts):
+    """Build a verdicts dict the way classify_rows returns one."""
+    return {decision: [{"item_uuid": f"{decision}-{n}"} for n in range(count)]
+            for decision, count in counts.items() if count}
+
+
+def _status(verdicts):
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "scripts"))
+    from queue_recovery_state import watcher_status
+    return watcher_status(verdicts)
+
+
+def test_watcher_reports_resolved_only_when_nothing_is_deferred():
+    assert _status({})[0] == "RESOLVED"
+
+
+def test_watcher_reports_waiting_not_resolved_while_rows_still_wait():
+    """The bug that appeared FOUR times in one script.
+
+    r10 called the orphan state SUCCESS; r12 my fix inverted it to false FAILURE; r13
+    "nothing needs a human" was read as "nothing deferred"; r14 startup was fixed and
+    polling was not.
+    """
+    for decision in (WAITING_OWN, WAITING_BRAKE, AUTHORISED):
+        code, _msg = _status(_verdicts(**{decision: 1}))
+        assert code == "WAITING", f"{decision} must keep the watcher polling, got {code}"
+
+
+def test_watcher_reports_action_required_for_every_human_decision():
+    for decision in sorted(NEEDS_HUMAN):
+        code, msg = _status(_verdicts(**{decision: 1}))
+        assert code == "ACTION REQUIRED", f"{decision} -> {code}"
+        assert msg, "the message must say what to do"
+
+
+def test_a_safety_hold_alone_is_never_told_to_resume():
+    """SAFETY. The exact contradiction round 15 found in the check tool's summary.
+
+    A SAFETY_HOLD-only report must not recommend an explicit resume anywhere, because a
+    blind retry can duplicate a delivery that already happened.
+    """
+    code, msg = _status(_verdicts(**{SAFETY_HOLD: 3}))
+    assert code == "ACTION REQUIRED"
+    low = msg.lower()
+    assert "already downloaded" in low
+    assert "safe to resume" not in low, msg
+    assert "resume explicitly" not in low, msg
+
+
+def test_action_required_beats_waiting_when_both_are_present():
+    code, _ = _status(_verdicts(**{WAITING_OWN: 5, SAFETY_HOLD: 1}))
+    assert code == "ACTION REQUIRED", "one held row must not be hidden by five waiting"
+
+
+def test_every_decision_has_an_action_and_unmapped_ones_raise():
+    """ROUND 15: action_for() defaulted to "safe to resume" for unmapped decisions.
+
+    Under a docstring of mine that said it never guesses retry. A new decision reaching
+    an operator tool without a mapping would have been reported as safe to retry, which
+    is the most dangerous possible default.
+    """
+    from backend.queue_recovery_policy import ALL_DECISIONS, ACTION_FOR
+    missing = ALL_DECISIONS - set(ACTION_FOR)
+    assert not missing, f"decisions with no operator action: {sorted(missing)}"
+    with pytest.raises(KeyError):
+        action_for("some_future_decision_nobody_mapped")

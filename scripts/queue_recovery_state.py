@@ -147,3 +147,30 @@ def advice_for(decision):
     retry can duplicate a delivery.
     """
     return ACTION_ADVICE[action_for(decision)]
+
+
+def watcher_status(verdicts):
+    """(code, message) for a watcher, from classified verdicts. PURE.
+
+    EXTRACTED on peer review round 15. It lived inside watch_resume.py, which opens a
+    database connection and cannot be imported in a test -- so the 22-test file's own
+    docstring claimed to pin "the four watcher states" while pinning none of them. That
+    is the second time I have written a false claim into test documentation (round 8's
+    "drives the ROUTE, not the service" did the same), and the mechanism is identical:
+    the prose described the intent, not the code.
+
+    The four branches exist because this decision was got wrong four separate times, so
+    they are now testable without a database.
+    """
+    human = needs_human(verdicts)
+    waiting = still_deferred(verdicts)
+    if human:
+        # PER DECISION, never one blanket action. An unknown-outcome row must be told to
+        # adjudicate, not to resume.
+        lines = [f"{len(verdicts[d])} item(s) {d}: {advice_for(d)}"
+                 for d in sorted(verdicts) if d in NEEDS_HUMAN]
+        return "ACTION REQUIRED", " | ".join(lines)
+    if waiting:
+        return "WAITING", (f"{waiting} item(s) are deferred but all have a recovery "
+                           "path; continuing to watch.")
+    return "RESOLVED", "nothing is paused and nothing is deferred."

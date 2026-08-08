@@ -119,9 +119,37 @@ ACTION_ADVICE = {
 }
 
 
+#: Every decision decide() can return. A new one must be added HERE and to ACTION_FOR,
+#: which test_every_decision_has_an_action enforces -- so a decision cannot reach an
+#: operator tool without someone deciding what a human should do about it.
+ALL_DECISIONS = frozenset({AUTHORISED, WAITING_OWN, WAITING_BRAKE, SAFETY_HOLD,
+                           NO_AUTHORISATION, UNOWNED_REASON, DISABLED, BUDGET_SPENT})
+
+
 def action_for(decision: str) -> str:
-    """The action a human should take, given a decision. Never guesses 'retry'."""
-    return ACTION_FOR.get(decision, ACTION_MANUAL_RESUME)
+    """The action a human should take, given a decision.
+
+    FAILS CLOSED, corrected on peer review round 15. This was:
+
+        return ACTION_FOR.get(decision, ACTION_MANUAL_RESUME)
+
+    under a docstring of mine that said "Never guesses 'retry'" -- while defaulting to
+    exactly that. If a future decision were added to decide() and ACTION_FOR not
+    extended, every operator tool would have silently called it "safe to resume
+    explicitly". For an unmapped state that is the most dangerous possible default, and
+    it contradicted the contract written directly above it.
+
+    An unknown decision now raises, so the tool boundary reports UNKNOWN rather than
+    inventing permission.
+    """
+    try:
+        return ACTION_FOR[decision]
+    except KeyError:
+        raise KeyError(
+            f"no operator action mapped for decision {decision!r}. Add it to "
+            "ACTION_FOR and ALL_DECISIONS; an unmapped safety state must never "
+            "default to 'safe to resume'."
+        ) from None
 
 
 @dataclass(frozen=True)
