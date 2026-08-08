@@ -78,9 +78,26 @@ def _paused_batch(db, *, item_cooldown, batch_cooldown, queue_reason,
 
 
 class TestTheTimestampDivergence:
-    """The exact 2026-08-06 shape: batch cooldown moved, items left behind."""
+    """The exact 2026-08-06 shape: batch cooldown moved, items left behind.
 
-    def test_a_diverged_cooldown_is_reported_not_swallowed(self, tmp_path, caplog):
+    PREMISE DELIBERATELY REVERSED 2026-08-08, on peer review round 10.
+
+    This class was built when item/batch cooldown EQUALITY was a precondition for
+    automatic resume, and its job was to make sure a divergence was at least
+    REPORTED rather than silently swallowed. Round 10's blocking finding was that the
+    equality requirement should not exist at all: liveness must not depend on two
+    copies of one recovery fact staying byte-identical, because ordinary operations
+    (retry_item) break that synchronisation and permanently strand work.
+
+    So divergence is no longer a blocker, and the right assertion is the opposite of
+    the original: the batch RESUMES. Reporting a cause is only interesting for items
+    that are held ON PURPOSE, which the rest of this file still covers.
+
+    The old assertion is preserved below in inverted form rather than deleted,
+    because "we used to require this and stopped" is the part a future reader needs.
+    """
+
+    def test_a_diverged_cooldown_no_longer_blocks_recovery(self, tmp_path, caplog):
         db = DatabaseManager(str(tmp_path / "diverged.db"))
         try:
             service, batch_uuid = _paused_batch(
@@ -99,24 +116,31 @@ class TestTheTimestampDivergence:
             with caplog.at_level(logging.WARNING):
                 service._maybe_auto_resume()
 
-            assert service.get_batch(batch_uuid)["state"] == "paused_source", (
-                "the eligibility rule is deliberate; this test is about the "
-                "diagnostic, not about resuming anyway")
+            # WHAT THIS FIXTURE ACTUALLY MODELS. `DIVERGED` is 2030 -- the FUTURE.
+            # So the item is not merely out of step with its batch, it is genuinely
+            # not due yet. My first rewrite of this test asserted the items must
+            # resume, without checking whether the timestamp was due at all; it
+            # failed against correct code, which is the same fixture mistake I made
+            # twice on round 9.
+            #
+            # Under the new rule each cooldown is read on its own terms, so an item
+            # deferred until 2030 is DELIBERATELY WAITING and has a recovery path --
+            # 2030. Not resuming it is right. What changed is that this is no longer
+            # reported as permanent failure, because it is not one.
+            items = db._query_dicts(
+                "SELECT state FROM download_queue_items WHERE batch_uuid = ?",
+                (batch_uuid,), default=[])
+            assert items, "fixture produced no items"
+            assert all(r["state"] == "waiting_source" for r in items), (
+                "an item whose OWN cooldown is still in the future must stay "
+                f"deferred: {[r['state'] for r in items]}")
 
-            warnings = [r.getMessage() for r in caplog.records
-                        if r.levelno >= logging.WARNING]
-            assert warnings, (
-                "a batch that is paused, resume-enabled, unspent and past its "
-                "cooldown found nothing to resume and said NOTHING. That is the "
-                "silence that hid five stalled batches and 69 grabs.")
-            joined = " ".join(warnings)
-            assert batch_uuid in joined, "the warning must name the batch"
-            assert "cooldown" in joined.lower(), (
-                "the warning must name the CAUSE, not just report a failure -- "
-                "otherwise the next person still has to read the SQL by hand")
-            assert "NEVER RESUME" in joined, (
-                "the warning must say this is permanent, not transient; a "
-                "transient-sounding message invites waiting it out")
+            joined = " ".join(r.getMessage() for r in caplog.records
+                              if r.levelno >= logging.WARNING)
+            assert "NEVER RESUME" not in joined, (
+                "under the old equality rule this was reported as permanently "
+                "unresumable. It is not: the item has a future cooldown and will "
+                f"recover when it passes. Saying NEVER invites a needless rescue: {joined}")
         finally:
             db.close()
 
@@ -230,8 +254,17 @@ class TestCombinedCausesAreAllReported:
         return " ".join(r.getMessage() for r in caplog.records
                         if r.levelno >= logging.WARNING)
 
-    def test_a_timestamp_mismatch_AND_unknown_outcome_reports_both(
+    def test_a_future_cooldown_AND_unknown_outcome_reports_both(
             self, tmp_path, caplog):
+        """RENAMED AND REPOINTED 2026-08-08, round 12.
+
+        The INTENT is unchanged and still valuable: several blocking reasons at once
+        must all be reported, never collapsed to one by precedence. Only the first
+        reason changed -- "the timestamps do not match" is no longer a cause of
+        anything, because item-first recovery deleted the equality requirement. The
+        reviewer noted this test was, once again, preserving the obsolete mechanism.
+        """
+
         db = DatabaseManager(str(tmp_path / "both-causes.db"))
         try:
             service, uuid = _paused_batch(
@@ -245,7 +278,10 @@ class TestCombinedCausesAreAllReported:
             with caplog.at_level(logging.WARNING):
                 service._maybe_auto_resume()
             joined = self._messages(caplog)
-            assert "cooldown timestamp" in joined, joined
+            assert "future" in joined, (
+                f"the not-yet-due rows must be reported: {joined}")
+            assert "NEVER RESUME" not in joined, (
+                f"a future cooldown is transient, not permanent: {joined}")
             assert "unknown execution state" in joined, (
                 "the unknown-outcome rows must be reported EVEN THOUGH the "
                 "cooldown also mismatches -- hiding it is what sends the reader "
@@ -266,8 +302,11 @@ class TestCombinedCausesAreAllReported:
             with caplog.at_level(logging.WARNING):
                 service._maybe_auto_resume()
             joined = self._messages(caplog)
-            for token in ("deferred=", "cooldown_match=", "recognised_reason=",
-                          "unknown_outcome="):
+            # VOCABULARY UPDATED round 12: cooldown_match= is gone with the
+            # equality architecture. The vector now reports temporal state, which is
+            # what an operator can actually act on.
+            for token in ("deferred=", "due=", "future=", "no_retry_time=",
+                          "recognised_reason=", "unknown_outcome="):
                 assert token in joined, (token, joined)
         finally:
             db.close()

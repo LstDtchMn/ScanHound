@@ -1,4 +1,23 @@
-"""A stalled reveal control is a source throttle, not a changed layout.
+"""A stalled reveal control is a RETRYABLE reveal-path failure, not a changed layout.
+
+ITS CAUSE IS NOT ESTABLISHED. Corrected 2026-08-08 on peer review round 10.
+
+This module opened by asserting "a source throttle" and closed the evidence section
+with "The source is rate-limiting." I had already renamed the class and stripped the
+claim from the user-facing message in the same PR -- and left the framing here intact,
+which is where the assumption was actually coming from. Every test in the file
+inherited it, and that is how `assert "rate-limit" in message` came to look like a
+reasonable requirement.
+
+WHAT THE OBSERVATIONS BELOW ESTABLISH: the reveal control was present, the page shape
+was unchanged, and the widget had not finished when OUR 60-second window expired. So
+this is not a layout change and it is worth retrying.
+
+WHAT THEY DO NOT ESTABLISH: that the source is rate-limiting us. Every 60s figure is
+RIGHT-CENSORED -- measurement stops at the ceiling, so a widget that would have
+finished at 62s is indistinguishable from one that never finishes. And ScanHound reuses
+a persistent Chromium profile, so source-side limiting is indistinguishable here from
+browser/session state. See docs/reviews/peer-rounds/reveal-stall-root-cause.md.
 
 PRODUCTION EVIDENCE, 2026-08-06. HDEncode gates each link reveal behind a
 client-side countdown. The submit reads "Verifying... Please wait" until it
@@ -16,14 +35,15 @@ clears, then swaps to "View links". Observed sequence from the app log:
 
 Three reveals succeed, then the door shuts and stays shut. The page shape is
 identical throughout -- 6 forms, the same #unlocked action, 92-94 links -- so
-nothing about the layout changed. The source is rate-limiting.
+nothing about the layout changed. Something changed STATE; what owns that state is
+not known from this data.
 
 WHY THIS MATTERED MORE THAN ONE ITEM. The stall was classified LAYOUT_CHANGED,
 which is retryable=False, carries no cooldown, and never notifies the traffic
 coordinator. So the batch never paused, the queue kept marching at its spacing,
 and every remaining item hit the same closed door and became PERMANENTLY
 terminal. 78 items accumulated that way, with automated_retry_count 0 on every
-one. One throttle event burned the whole queue.
+one. One reveal-stall episode burned the whole queue.
 """
 import pytest
 
@@ -93,7 +113,23 @@ def _diagnose(svc, ds, *, tier, html="<html><body><form></form></body></html>"):
         reveal_tier=tier)
 
 
-class TestStalledVerifyIsAThrottle:
+class TestStalledVerifyIsRetryableNotALayoutChange:
+    """What a stalled reveal IS, stated only as far as the evidence goes.
+
+    RENAMED 2026-08-08 from TestStalledVerifyIsAThrottle. The old name asserted the
+    conclusion in its title, and every test inside inherited that framing -- which is
+    how `assert "rate-limit" in message` came to look like a reasonable thing to
+    require. A stalled reveal is established to be: retryable, not a layout change,
+    cooldown-bearing, and reported to the coordinator. Whether the SOURCE is
+    throttling us is not established; see
+    docs/reviews/peer-rounds/reveal-stall-root-cause.md.
+
+    NOTE the tests below still assert source-wide scope and coordinator notification,
+    because that is the behaviour as built. Round 9 argues the scope is too broad --
+    a per-item reveal failure should trip a reveal circuit breaker, not a global
+    source breaker -- but that is a design change, not a claim correction, so it is
+    left for its own round rather than quietly altered here.
+    """
 
     def test_it_is_not_reported_as_a_layout_change(self, service):
         svc, _, ds = service
@@ -115,7 +151,12 @@ class TestStalledVerifyIsAThrottle:
         assert _diagnose(svc, ds, tier="not-ready").cooldown_until is not None
 
     def test_it_tells_the_traffic_coordinator(self, service):
-        """Without this the backoff system never learns the source is refusing."""
+        """Without this the backoff system never learns the reveal path stalled.
+
+        Said as "the source is refusing" until 2026-08-08 -- the same unproven
+        attribution in miniature. What the coordinator is told is that a reveal did
+        not complete; what that implies about the source is the open question.
+        """
         svc, coordinator, ds = service
         _diagnose(svc, ds, tier="not-ready")
         assert coordinator.observed == ["reveal_verification_stalled"]
@@ -130,10 +171,28 @@ class TestStalledVerifyIsAThrottle:
         assert d.action_code == "wait_for_cooldown"
 
     def test_the_message_does_not_blame_the_release(self, service):
+        """Assert the property this test is NAMED for, not a mechanism.
+
+        CORRECTED 2026-08-08. This asserted `"rate-limit" in message` -- so a test of
+        mine REQUIRED the causal claim that peer review round 9 showed is unmeasured,
+        and it failed the moment I removed it. Fourth time one of my tests has
+        protected the thing it should have caught.
+
+        The proxy was also wrong on its own terms: naming a mechanism is not what
+        makes a message not blame the release. What must hold is that the user is
+        told the release is fine and will be retried, and is not told the page
+        changed. Both of those ARE established.
+        """
         svc, _, ds = service
         message = _diagnose(svc, ds, tier="not-ready").public_message.lower()
-        assert "rate-limit" in message
+        assert "nothing is wrong with this release" in message
+        assert "retry" in message
         assert "layout" not in message
+        # And it must not assert a cause nobody has measured.
+        for unproven in ("rate-limit", "rate limiting", "throttl"):
+            assert unproven not in message, (
+                f"the message asserts {unproven!r}; every 60s stall observation is "
+                "right-censored and cannot establish it")
 
     def test_the_tier_is_recorded_in_the_signals(self, service):
         svc, _, ds = service

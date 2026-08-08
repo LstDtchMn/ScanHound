@@ -1524,9 +1524,11 @@ class DownloadService:
         *,
         stage: str = "page",
         source_kind: str = "hdencode",
-        # The reveal-control tier from _find_reveal_control. "not-ready" means
-        # the control existed but never finished verifying, which is the source
-        # rate-limiting rather than a changed page.
+        # The reveal-control tier from _find_reveal_control. "not-ready" means the
+        # control existed but had not finished verifying when our 60s window
+        # expired. That rules OUT a changed page -- the control was there -- but it
+        # does not establish source rate limiting, which this comment used to
+        # assert. Cause is unresolved; see the note at the emission site.
         reveal_tier: Optional[str] = None,
     ) -> ScrapeDiagnostic:
         """Log page evidence and return a structured operation classification."""
@@ -2208,11 +2210,33 @@ class DownloadService:
                             # "Verifying... Please wait" for the full 60s
                             # ceiling, with the page shape identical throughout
                             # (6 forms, same #unlocked action, 92-94 links).
-                            # That is rate-limiting.
+                            #
+                            # THAT IS A STATE TRANSITION, NOT A PROVEN CAUSE.
+                            # Corrected 2026-08-08 on peer review round 9. This
+                            # comment used to end "That is rate-limiting." and the
+                            # log asserted it as fact. What is actually observed is
+                            # only: a not-ready reveal state was seen, and no usable
+                            # links control appeared before OUR 60-second deadline.
+                            #
+                            # Every 60s observation is RIGHT-CENSORED -- we stop
+                            # measuring at 60s, so the data cannot distinguish a
+                            # widget that would have finished at 62s from one that
+                            # never finishes. And source-side limiting is
+                            # indistinguishable here from browser/session state:
+                            # ScanHound reuses a PERSISTENT Chromium profile
+                            # (--user-data-dir=/data/browser-profiles/hdencode), so
+                            # cookies and site state survive process restarts.
+                            #
+                            # Naming an unproven cause in the log is not harmless:
+                            # it is what a reader (including me, for days) treats as
+                            # the finding, and it justified an expensive source-wide
+                            # cooldown. See docs/reviews/peer-rounds/
+                            # reveal-stall-root-cause.md.
                             self._log(
-                                "[HDEncode] The reveal control never finished "
-                                f"verifying (title: {page_title!r}). The source "
-                                "is rate-limiting; cooling down.",
+                                "[HDEncode] The reveal control did not finish "
+                                "verifying within the 60s observation window "
+                                f"(title: {page_title!r}); cause is not yet "
+                                "established. Cooling down.",
                                 "warning",
                             )
                         else:

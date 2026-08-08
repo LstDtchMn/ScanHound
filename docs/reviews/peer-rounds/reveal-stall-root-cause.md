@@ -161,3 +161,43 @@ observability gap in §4 either way.
 5. Should the durable record keep a stall's own cause instead of overwriting it with
    the pause it caused? I believe this is the most valuable single change here, because
    without it the next occurrence will be just as unanalysable.
+
+---
+
+## CORRECTIONS to this document, 2026-08-08
+
+**1. "The cause is systematically erased" was too broad.** The stall cause survives on
+the BATCH row and is destroyed only on the ITEM rows. Measured on the live database:
+
+```
+download_queue_batches.last_reason_code : reveal_verification_stalled  2
+                                          source_temporarily_blocked   4
+                                          interactive_challenge        1
+download_queue_items.last_reason_code   : source_temporarily_blocked  33
+                                          layout_changed               7   (no stalls)
+```
+
+So the trigger IS recoverable from durable state -- I queried the wrong table and
+generalised. The item-level overwrite is still real and still worth fixing, but the
+finding is "item rows lose their own cause" rather than "the database forgets".
+
+**2. The one-shot auto-resume description was about the DEPLOYED container, not the
+branch** (the round-9 reviewer caught this). The deployed code at the time allowed one
+automatic resume per batch for its lifetime; the branch already allowed 3 with refunds
+on real progress. I conflated what was running with what was written. Deploying main
+released the stranded items immediately, which is the practical proof.
+
+**3. My "fresh process" scrapes do not discriminate hypotheses A and B.** ScanHound
+runs Chromium against a PERSISTENT profile
+(`--user-data-dir=/data/browser-profiles/hdencode`), so cookies and site state survive
+process restarts. Both successful scrapes shared that profile with the stalling app.
+
+**4. A NEW defect found while releasing the stranded items, unrelated to the stall.**
+Recovery keys entirely on the BATCH being `paused_source`: the auto-resume sweep
+selects `WHERE state = 'paused_source'`, and item selection then joins items on
+`cooldown_until` EQUALITY with the batch. Batch `61da35f2` had left paused state
+(`scheduled`, `cooldown_until = NULL`) while 34 items stayed `waiting_source` holding
+`23:07:32`. Neither the sweep nor the scheduler could see them -- nothing throttled
+them and nothing would ever retry them. Freed via the app's own `resume_batch()`, which
+has no such condition. **The orphaning bug itself is unfixed** and will strand items
+again.
