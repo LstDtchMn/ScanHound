@@ -1,136 +1,124 @@
-# DV detection throughput — the current design cannot finish
+# DV detection throughput — RETRACTED: the scan is healthy, my rate was wrong by 12x
 
-**Date:** 2026-08-09
+**Date:** 2026-08-09 (rev 2, same day)
 **Author:** Claude
-**Reviewer:** ChatGPT (design review; no code changed)
-**Status:** Measurement + options. Nothing implemented, nothing deployed.
-
-> **REVIEWER: read this file from the repository, not any chat summary of it.** If you
-> cannot read it directly via the GitHub connector, **stop and say so.**
+**Reviewer:** ChatGPT (rev 1 reviewed at head `7eaeb749`; that review is superseded)
+**Status:** **REV 1 IS WITHDRAWN.** Its central measurement was wrong and every conclusion
+derived from it was wrong. Nothing was implemented. Nothing was deployed.
 
 ---
 
-## 0. The finding
+## 0. RETRACTION — read this before anything else
 
-DV detection reads **every byte of every file**. `backend/rename/dv_detect.py:13`
-documents this in its own comment:
+Rev 1 claimed DV detection could never finish. **That was false.** The scan is working
+correctly and will clear its backlog in about two days.
+
+| Rev 1 claimed | Actually measured |
+|---|---|
+| **6.7 MB/s** | **79 MB/s** |
+| 1,417 hours for one full pass | **~39 hours** for the files that remain |
+| **~59 days** | **~2.2 days** at ~18 scanning hours/day |
+| ~500 hours / 3 weeks of backlog | ~39 hours |
+| "the current design cannot finish" | It is finishing, at **6.0 files/hour** |
+| Most files time out before completing | **31 of 33 succeeded** |
+
+**The single root error.** I observed `dovi_tool.exe` pid 32936 at 12:35 and a *different*
+pid 45220 at 15:10, and concluded one 60.95 GB file had taken 155 minutes. It had not — the
+detector had moved through several files in between. From that one bad inference I derived
+6.7 MB/s, and every figure in rev 1 inherited it: the 32.64 TB framing, the 59 days, the
+"cannot converge" verdict, and the five options offered to fix a problem that does not
+exist. I presented a derived guess as a measurement.
+
+**The measurement that corrects it** — read from `data/dv_host.db` (copied aside with its
+WAL to avoid a lock conflict) after the 2026-08-09 run:
 
 ```
-dovi_tool extract-rpu "<file>" -o <rpu.bin>          # full pass, no decode
+rows written today : 33      first 17:05:54, last 22:33:56  (5.47 h)
+  fel 11   mel 9   profile8 7   profile5 3   none 1   unknown 2
+rate               : 6.0 files/hour  ->  ~79 MB/s at the 45.8 GB mean
+host DB total      : 494 rows
+remaining          : 730 - 494 = 236 files  ->  ~39 h of scanning
+NULL signatures    : only the 2 unknowns (those retry; the 31 successes do not)
 ```
 
-Measured against the four configured roots
-(`Y:/Movie 1 (14TB)/4K DV`, `Y:/Movie 2 (8TB)/4K DV`, `Y:/Movie 3 (2TB)/4K DV`,
-`//TURTLELANDSRV2/4K Magellan/DV`):
+79 MB/s is an ordinary, healthy rate for this SMB path. There is no throughput defect.
+
+## 1. What the library actually looks like
+
+These figures from rev 1 were measured directly and stand:
 
 | | |
 |---|---|
-| Files | **730** |
+| Files in the four configured roots | **730** |
 | Total bytes | **32.64 TB** |
 | Mean file size | **45.8 GB** |
 | Largest | **89.9 GB** |
 | Files over 40 GB | **494 of 730** |
 
-Observed throughput, from the 2026-08-09 12:35 run: `Death Wish 3 (1985).mkv`,
-**60.95 GB**, `dovi_tool extract-rpu` at ~90% of one core for **~155 minutes** wall —
-**6.7 MB/s**.
+`dv_detect.py:13` documents the read as a full pass (`dovi_tool extract-rpu`), which is
+still true — it is simply fast enough not to matter.
 
-**At that rate one full pass over the library is 1,417 hours — about 59 days of
-continuous reading.**
+## 2. ChatGPT's review of rev 1 — what survives
 
-## 1. Why this is not merely slow
+Its blocking finding was sound reasoning on my bad data, so it does not survive as a
+blocker, but two findings do.
 
-**The backlog is the problem, not the steady state.** Change detection
-(`sig_mtime`/`sig_size`, `DV_MTIME_TOL = 2.0`) means an unchanged file is skipped, so once
-the library is fully scanned only new acquisitions cost anything — a few files a week,
-fine. But `dv_scan` currently holds **466** real detections against **730** files in the
-roots, so roughly **264 files have never been detected**. At 45.8 GB mean and 6.7 MB/s
-that backlog alone is **~500 hours ≈ 21 days** of scanning.
+**The 30-minute cap is real but not operationally binding.** `_EXTRACT_TIMEOUT = 1800`
+(`dv_detect.py:43`, used at `:162`) is genuinely enforced: `run_cancellable`
+(`process_control.py:187`) takes the non-cancellable branch when `cancel_requested is
+None` — which is how `dv_host_scan.py` calls it — and goes to
+`subprocess.run(..., timeout=timeout)`. At 79 MB/s, 30 minutes covers ~142 GB, comfortably
+past the 89.9 GB largest file. **Measured: 2 of 33 hit trouble, not "most".** So this is a
+latent risk on the extreme tail plus genuinely slow moments, not the dominant behaviour.
+Worth a size-proportional or work-budget bound eventually; not urgent.
 
-**The scheduler cannot deliver that.** `ScanHound-DVScan` runs every 4 hours with
-`ExecutionTimeLimit = PT6H` and `MultipleInstances = IgnoreNew`. Observed on 2026-08-09:
-the 12:35 run was still on its **first file** at 15:00, so the scheduled 15:00 occurrence
-was refused (`0x800710E0`). Long files therefore displace scheduled runs indefinitely.
-Progress is real and durable — `_upsert()` commits per file
-(`scripts/host-detector/dv_host_scan.py:146`, inside the loop at `:207`), so a timeout
-loses only the file in flight — but the rate is the binding constraint.
+**Retry starvation is real but bounded at this failure rate.** `classify_to_row()` stores an
+`unknown` with NULL `sig_mtime`/`sig_size`, so it retries on every future run — confirmed:
+only the 2 unknowns carry NULL signatures, the 31 successes do not. ChatGPT's "never
+converge" pattern requires files to fail *systematically*; two per session does not crowd
+out 236 never-scanned files. Retry metadata and never-scanned-first ordering remain good
+hygiene.
 
-**6.7 MB/s is the anomaly worth attacking.** `Y:` is SMB to `\\TURTLELANDSRV2`. A gigabit
-path should sustain roughly 100-110 MB/s, so we are achieving **~6%** of the available
-bandwidth. That points at `dovi_tool`'s read pattern — small, unbuffered, latency-bound
-reads — rather than the link. The same class of problem is already recorded for the
-container path in `docker-windows-bindmount-syscall-latency` (dovi_tool's unbuffered
-Matroska path against 9p `msize=65536`); this is the SMB instance of it.
+**`--limit` exists, and the asymmetry is the useful part.** dovi_tool 2.3.2 supports
+`-l/--limit N` including direct MKV input, so "does bounded mode exist" is answered. And
+the semantics are one-sided: a bounded sample containing a FEL frame **proves** the title
+contains FEL, while a sample containing only MEL **proves nothing** — a later frame may be
+FEL. So the only safe bounded use is a FEL-positive accelerator
+(`explicit FEL -> FEL`, `anything else -> NEEDS_FULL_SCAN`). Worth recording; **not worth
+building**, since there is no throughput problem to accelerate.
 
-**Unverified:** I have not measured raw sequential SMB throughput on this host, nor
-`dovi_tool` against a local file. Both are needed before ranking the options below. See §4.
+**A separate real bug, unrelated to throughput.** `_PROFILE_RE` (`dv_detect.py:47`) matches
+`Profile:` only. Upstream dovi_tool emits `Profiles:` when the RPU set contains multiple
+profile values, so a mixed-profile stream would not parse. Track independently.
 
-## 2. What the tool is actually being asked for
+## 3. The conclusion rev 1 argued itself out of
 
-`detect_layer()` runs `extract-rpu` to obtain the RPU stream, then reads its info to
-classify `fel` / `mel` / `profile8` / `profile5`. Distinguishing **FEL from MEL** requires
-RPU content, not container metadata — that is why `ffprobe` cannot substitute (it reports
-that DV is present, not which layer). So the *classification* genuinely needs RPU data.
+**Option E — accept it — is correct.** The steady state is fine: change detection means
+only new acquisitions cost anything. The backlog is ~39 hours of scanning, roughly two
+days, and it makes durable progress (`_upsert()` commits per file,
+`dv_host_scan.py:146`, inside the loop at `:207`), so a timeout loses only the file in
+flight.
 
-The open question is whether it needs **all** of it. Dolby Vision RPUs are interleaved per
-frame throughout the elementary stream, so this is not a header that can be read from the
-first megabyte. But a **layer verdict** may be obtainable from far fewer frames than the
-whole title — and `dovi_tool` may or may not expose a bounded mode.
+Do not build A (copy-locally-first), B (bounded reads), or C (run on the NAS). They exist
+to fix a 12x-overstated rate.
 
-## 3. Options, unranked pending §4
+**Two things still worth doing, neither urgent:**
 
-**A. Copy locally, then process.** Read the file over SMB sequentially at full bandwidth
-into local scratch, run `dovi_tool` against the local copy, delete. Wins only if raw copy
-throughput is much higher than 6.7 MB/s and local `dovi_tool` is faster than
-network-bound `dovi_tool`. Costs ~46 GB of scratch churn per title.
+1. **Progress visibility.** `run-dv-scan.ps1` folds the detector's output into its log only
+   after the process exits, so a multi-hour run shows nothing. That absence is precisely why
+   I could not see what was happening and inferred it wrongly instead. This is the highest-
+   value item in the document.
+2. **Import the results.** The host DB holds 494 rows while `dv_scan` in the container has
+   466 and gained none today, so `POST /rename/dv-import` has not run since the scan
+   started producing. Labels cannot update until it does.
 
-**B. Bound the read.** If `dovi_tool` can be limited to N frames or a byte range while
-still yielding a trustworthy FEL/MEL verdict, cost falls by orders of magnitude.
-**Correctness risk:** `dv_detect.py:96` records that a mixed title with *some* FEL frames
-counts as FEL — a bounded read could see only MEL frames and mislabel it. That is a
-downgrade, and downgrades matter here (a prior audit found a scoring bug that overwrote 4K
-DV with 1080p).
+**One open question I still have not resolved:** the two failures. If they are the 89.9 GB
+titles, the timeout needs a size-proportional bound and the required headroom is knowable
+exactly. If they are ordinary files, something else intermittent is happening.
 
-**C. Run the detector on the NAS.** Eliminate the network from the read path entirely by
-executing where the files live. Biggest architectural change; may not be possible on that
-device.
+## 4. Method note for the next person
 
-**D. Prioritise instead of accelerating.** Scan smallest-first or newest-first so useful
-labels appear sooner, accepting that the tail may take weeks. Cheapest to implement,
-changes nothing about the underlying rate.
-
-**E. Accept it.** Steady state is fine. Only the 264-file backlog is slow, and it does make
-progress. This is the honest do-nothing baseline any option must beat.
-
-## 4. What must be measured before choosing
-
-1. **Raw sequential SMB throughput** from this host to `\\TURTLELANDSRV2` — the ceiling
-   option A is chasing. If it is also ~7 MB/s, option A is dead and the link is the
-   problem.
-2. **`dovi_tool` against a LOCAL file** of comparable size. Isolates tool cost from network
-   cost. If local is also ~7 MB/s, the tool is the bottleneck and only B or C help.
-3. **Whether `dovi_tool` supports a bounded read** at all (frame count, byte range, early
-   exit), and whether a bounded verdict agrees with a full-pass verdict on known FEL, MEL
-   and mixed titles. Without that agreement measurement, option B is unsafe.
-4. **The real backlog count**, not my estimate. 730 minus 466 assumes those sets are
-   comparable, and they are keyed on different path forms — the same vacuous-join hazard
-   recorded elsewhere in these reviews. Normalise before trusting 264.
-
-## 5. Questions
-
-1. **Is option A worth measuring first**, given it is the only one needing no correctness
-   argument? Or is measuring `dovi_tool` locally (§4.2) the better first cut because it
-   partitions tool-versus-network in one test?
-2. **Is option B acceptable in principle?** A bounded read that can downgrade FEL to MEL
-   trades correctness for speed on the one field this feature exists to produce. Is there a
-   bounded strategy that is *conservatively* correct — e.g. bounded scan to prove FEL
-   present, full pass only to prove FEL absent?
-3. **Should the schedule change regardless?** A 4-hour trigger with a 6-hour limit against
-   2.5-hour files means scheduled occurrences are routinely refused. Is one long-running
-   pass more honest than a schedule that mostly cannot fire?
-4. **Is option E defensible?** The steady state genuinely is fine. Am I treating a one-time
-   21-day backlog as an architectural defect when it is really a one-time cost that needs
-   only patience and better progress reporting?
-5. **What have I not considered?** Every prior round found something outside my frame — the
-   commit history that refuted a theory, a policy module of mine that auto-resumed what it
-   should not. I would rather be told what is missing than have these five options ranked.
+Every wrong number here came from inferring a rate from two process snapshots instead of
+reading what the detector recorded. The authoritative source was `dv_host.db` the whole
+time — 33 rows with timestamps, which took one query. Read the artifact, not the process
+list.
