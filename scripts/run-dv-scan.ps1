@@ -119,7 +119,13 @@ if ([string]::IsNullOrWhiteSpace($rootsRaw)) {
     exit 10
 }
 
-$roots = $rootsRaw -split ';' | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() }
+# @(...) IS LOAD-BEARING. A pipeline yielding ONE item returns a scalar string,
+# and under Set-StrictMode `.Count` on a string is a terminating error -- so a
+# config with a single library root crashed the wrapper before it probed
+# anything. Neither the original tests (2 roots) nor production (4 roots) hit it;
+# it took a deliberate one-root fixture to surface. Same reason $unreachable is
+# initialised as @() below.
+$roots = @($rootsRaw -split ';' | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
 Write-Log "configured roots: $($roots.Count)"
 
 $unreachable = @()
@@ -159,15 +165,61 @@ try {
     $env:PATH = "$doviDir;$env:PATH"
     Write-Log "running: $python scripts\host-detector\dv_host_scan.py"
 
-    # Native stderr is NOT redirected into the PowerShell pipeline here: in 5.1
-    # that wraps each line in an ErrorRecord and flips $? to false even on a
-    # clean exit 0, which would make every successful scan look like a failure.
-    & $python 'scripts\host-detector\dv_host_scan.py' 2>&1 | ForEach-Object {
-        $text = "$_"
-        Write-Output $text
-        if ($script:LogFile) { Add-Content -LiteralPath $script:LogFile -Value $text -Encoding utf8 }
+    # DO NOT PIPE NATIVE STDERR THROUGH THE POWERSHELL PIPELINE.
+    #
+    # The previous version's comment said exactly this and the very next line did
+    # `2>&1 | ForEach-Object` anyway. In PS 5.1 that wraps each stderr line in a
+    # NativeCommandError ErrorRecord, and with $ErrorActionPreference='Stop' the
+    # FIRST such line is a terminating error. Measured on the 2026-08-09 11:00
+    # run: the wrapper died immediately after logging "running:", never reached
+    # its own "detector exited" line, reported exit 1, and the detector did
+    # nothing at all -- dv_host.db untouched, zero new dv_scan rows.
+    #
+    # File redirection (`*>>`) writes both streams straight to disk without
+    # ErrorRecord wrapping, so the detector's own diagnostics are preserved and a
+    # chatty-but-successful run is no longer fatal. EAP is relaxed across the
+    # call as belt-and-braces and restored immediately after.
+    # REDIRECT AT THE OS LEVEL, via cmd, so PowerShell never handles the streams.
+    #
+    # Two earlier attempts both failed, each differently, and both are worth
+    # naming because the fix is not obvious:
+    #
+    #   `2>&1 | ForEach-Object`  -- PS 5.1 wraps every native stderr line in a
+    #     NativeCommandError ErrorRecord; with EAP='Stop' the first one is
+    #     TERMINATING. Measured 2026-08-09 11:00: the wrapper died right after
+    #     logging "running:", reported exit 1, and the detector did nothing.
+    #   `*>> $LogFile`           -- stops the crash only because EAP was relaxed,
+    #     NOT because redirection avoids the wrapping: the ErrorRecord decoration
+    #     ("FullyQualifiedErrorId : NativeCommandError") still landed IN the log.
+    #     It also writes UTF-16 while this script's own lines are UTF-8, so the
+    #     detector's output rendered as "p y t h o n . e x e".
+    #
+    # cmd's `>` is plain OS file redirection: no ErrorRecord, no PowerShell
+    # encoding decision, and cmd propagates the child's exit code. The captured
+    # bytes are then appended to the log as UTF-8 like every other line, so the
+    # file has ONE encoding throughout.
+    $detOut = Join-Path $LogDir ("detector-{0}.out" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $savedEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & cmd /c "`"$python`" scripts\host-detector\dv_host_scan.py > `"$detOut`" 2>&1"
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedEAP
     }
-    $code = $LASTEXITCODE
+    if ($null -eq $code) { $code = 0 }
+
+    # Fold the detector's own output into the log. Without this a real detector
+    # failure is undiagnosable -- which is the whole reason this wrapper logs.
+    if (Test-Path -LiteralPath $detOut) {
+        foreach ($line in @(Get-Content -LiteralPath $detOut -ErrorAction SilentlyContinue)) {
+            Write-Output $line
+            if ($script:LogFile) {
+                Add-Content -LiteralPath $script:LogFile -Value "    $line" -Encoding utf8
+            }
+        }
+        Remove-Item -LiteralPath $detOut -Force -ErrorAction SilentlyContinue
+    }
 } finally {
     $env:PATH = $savedPath
     Pop-Location
