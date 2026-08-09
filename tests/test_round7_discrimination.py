@@ -380,6 +380,30 @@ def test_every_scrape_code_has_a_message_and_a_failure_title():
         assert code.value in _FAILURE_TITLES, f"{code.value} has no failure title"
 
 
+def test_no_failure_title_asserts_an_unproven_cause():
+    """Titles must describe what was OBSERVED, never why.
+
+    The existing check above proves a title EXISTS; it never looked at the words.
+    So `reveal_verification_stalled` rendered as "HDEncode is throttling" for two
+    weeks after the reason code had been deliberately made neutral, and it is the
+    title the user actually reads. On 2026-08-09 that attribution was refuted
+    outright -- the exact stalled URL served links to a phone browser with almost
+    no wait, so the source was fine. The sibling test on public_message forbids
+    this wording already; nothing extended the rule to the rendered title.
+
+    Deliberately narrow: it bans CAUSAL vocabulary, not the mention of a source.
+    "HDEncode could not be reached" is an observation and stays legal.
+    """
+    banned = ("throttl", "rate-limit", "rate limit", "rate limiting",
+              "blocking us", "banned", "blacklist")
+    for code_value, title in _FAILURE_TITLES.items():
+        lowered = title.lower()
+        for word in banned:
+            assert word not in lowered, (
+                f"failure title for {code_value!r} asserts a cause we have not "
+                f"proven: {title!r} contains {word!r}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Unresolved listing-only candidates, not every historical detail failure
 # ─────────────────────────────────────────────────────────────────────────────

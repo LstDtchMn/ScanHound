@@ -26,7 +26,14 @@ _FAILURE_TITLES = {
     # release" underneath a title that said the opposite, on the exact code behind
     # the 45 items currently parked in cooldown. The fix I shipped was undone in
     # the UI by the omission.
-    ScrapeCode.REVEAL_VERIFICATION_STALLED.value: "HDEncode is throttling",
+    # NO CAUSAL CLAIM. This said "HDEncode is throttling" until 2026-08-09, when
+    # the throttle attribution was refuted: the user opened the exact stalled URL
+    # on a phone browser and the links appeared with almost no wait, so the source
+    # was serving that page fine. The reason CODE was always neutral; only the
+    # rendered title asserted a cause, and it is the title the user actually reads.
+    # What is observed is that the countdown placeholder never cleared within our
+    # window -- not why. See docs/reviews/peer-rounds/hdencode-reveal-stall-investigation.md.
+    ScrapeCode.REVEAL_VERIFICATION_STALLED.value: "HDEncode links did not unlock in time",
     # Reached only when the link IS a direct file host we identify but cannot hand
     # off; the ordinary direct-host path clears this diagnostic before it is ever
     # rendered. Titled without "HDEncode" on purpose -- these two codes are for
