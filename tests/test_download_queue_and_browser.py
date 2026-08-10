@@ -457,7 +457,21 @@ def test_auto_resume_scopes_source_and_preserves_unknown_outcome(tmp_path):
 
         current = service.get_batch(batch["batch_uuid"])
         by_uuid = {row["item_uuid"]: row for row in current["items"]}
-        assert by_uuid[hdencode_rows[0]["item_uuid"]]["state"] == "ready"
+        # THIS ROW USED TO BE ASSERTED `ready`, AND THAT WAS THE DEFECT.
+        #
+        # It is set up above as state='verification_required',
+        # queue_reason='interactive_challenge', with an EXPIRED cooldown -- a row
+        # parked because a human must verify something. Asserting it resumes
+        # pinned exactly the behaviour the 2026-08-09 review identified as
+        # blocking: a timer releasing a hold that only a person can release.
+        # Nothing about waiting supplies a human, so it stays held.
+        #
+        # The row is kept rather than downgraded to source_deferred, because this
+        # test's actual subject -- that auto-resume scopes to the blocked SOURCE
+        # and leaves the unknown-outcome row alone -- is better served by a
+        # deferred hdencode row that must NOT move sitting beside one that must.
+        assert (by_uuid[hdencode_rows[0]["item_uuid"]]["state"]
+                == "verification_required")
         assert by_uuid[hdencode_rows[1]["item_uuid"]]["state"] == "ready"
         poison = by_uuid[ddlbase_row["item_uuid"]]
         assert poison["state"] == "failed"
