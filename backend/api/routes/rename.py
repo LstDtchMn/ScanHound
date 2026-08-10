@@ -2,7 +2,7 @@
 import logging
 import os
 import threading
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
@@ -14,7 +14,8 @@ from backend.api.ws import ws_manager
 from backend.rename import dv_detect, dv_labeler, fileops, llm_identify
 from backend.rename.conflict_analyzer import analyze_job_conflict, has_active_duplicate
 from backend.rename.conflicts import conflict_annotations, find_library_duplicate
-from backend.rename.dv_import import import_dv_host_db
+from backend.rename.dv_import import (
+    DvHostReadError, import_dv_host_db, import_dv_rows)
 
 
 def _poster_url(poster_path):
@@ -107,6 +108,24 @@ class DvScanRequest(BaseModel):
 
 class DvImportRequest(BaseModel):
     host_db_path: Optional[str] = None
+
+
+class DvHostRow(BaseModel):
+    path: str
+    dv_layer: Optional[str] = None
+    sig_mtime: Optional[float] = None
+    sig_size: Optional[int] = None
+    title: Optional[str] = None
+
+
+class DvHostRowsRequest(BaseModel):
+    """The detector POSTs its dv_host rows here. `source_rows` is the count the
+    detector believes it sent; the server rejects a mismatch so a truncated or
+    duplicated body cannot pass as success."""
+    rows: List[DvHostRow]
+    source_rows: int
+    #: Forward-compat: the producer's row schema version. Bump on a shape change.
+    schema_version: int = 1
 
 
 class DvSyncRequest(BaseModel):
@@ -705,9 +724,59 @@ _DEFAULT_DV_HOST_DB = os.environ.get(
     "SCANHOUND_DV_HOST_DB", "/data/dv_host.db")
 
 
+@router.post("/dv-host-rows")
+def dv_host_rows(
+    req: DvHostRowsRequest, reg: ServiceRegistry = Depends(get_registry)
+):
+    """Ingest DV rows POSTed by the host detector — the durable transport.
+
+    The container never reads the host file, so there is no cross-OS SQLite /
+    WAL / bind-mount handoff to get wrong. The response is mechanically
+    checkable: the detector accepts it only when ``ok`` is true, ``processed``
+    equals ``source_rows``, and ``failed`` is zero (round-4 review). Any
+    shortfall is a NON-2xx so it can never read as success.
+    """
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="DB not initialized")
+    rows = [r.model_dump() for r in req.rows]
+    if req.source_rows != len(rows):
+        # A truncated or duplicated body. Refuse rather than import a partial set.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "error": "source_rows_mismatch",
+                "source_rows": req.source_rows,
+                "received_rows": len(rows),
+            },
+        )
+    result = import_dv_rows(reg.db, rows)
+    body = {
+        "ok": (result["failed"] == 0
+               and result["processed"] + _skipped(result) == result["source_rows"]),
+        **result,
+    }
+    if not body["ok"]:
+        # Partial upsert failure. Surface it as a server error carrying the
+        # counts, so the client fails the import rather than trusting a 200.
+        raise HTTPException(status_code=500, detail=body)
+    return body
+
+
+def _skipped(result: dict) -> int:
+    """Rows that carried no path and were neither processed nor failed."""
+    return int(result["source_rows"]) - int(result["processed"]) - int(result["failed"])
+
+
 @router.post("/dv-import")
 def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)):
-    """Ingest the host detector's dv_host.db into dv_scan (source='scan')."""
+    """Ingest the host detector's dv_host.db into dv_scan (source='scan').
+
+    LEGACY file path (superseded by /dv-host-rows). Retained for compatibility,
+    but a read/open failure is now a 503 rather than a silent zero-row success —
+    an unreadable host DB and a successfully-read empty one are different states
+    (round-4 finding 2).
+    """
     if reg.db is None:
         raise HTTPException(status_code=503, detail="DB not initialized")
     path = (req.host_db_path or _DEFAULT_DV_HOST_DB)
@@ -716,7 +785,10 @@ def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)
     # the host detector is ever configured to drop dv_host.db. Rejects an
     # explicit host_db_path pointed anywhere else (`..` escape, another mount).
     path = _require_within_roots(path, [_dv_host_db_root()], "host_db_path")
-    return import_dv_host_db(reg.db, path)
+    try:
+        return import_dv_host_db(reg.db, path)
+    except DvHostReadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 @router.post("/dv-sync-labels")

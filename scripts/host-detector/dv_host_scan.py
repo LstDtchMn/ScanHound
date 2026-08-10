@@ -4,8 +4,15 @@ Runs on TurtleLandSRVR (.170) where dovi_tool.exe reaches both local drives and
 the .180 SMB media. Reads data/dv_host.json (NOT config.py), keeps its OWN
 standalone dv_host.db (raw sqlite3 — it must NEVER open the container's crawler
 database or construct its ORM layer, which runs DDL), reuses
-dv_detect.detect_layer, optionally tags MKVs with mkvpropedit, then POSTs
-/rename/dv-import so the container ingests it.
+dv_detect.detect_layer, optionally tags MKVs with mkvpropedit, then POSTs its
+rows to /rename/dv-host-rows so the container ingests them.
+
+TRANSPORT (round-4 redesign): the detector reads its OWN dv_host.db and sends the
+rows in the request body — the container never reads the host file. That removes
+the Windows bind-mount / WAL-mmap read that used to fail silently (zero rows
+behind an HTTP 200) while a scan held the file open, and with it the interim
+close/reopen dance. The response is validated (ok + processed==source_rows +
+failed==0), so a partial or failed import can never read as success.
 
 Usage (Task Scheduler action, with dovi_tool.exe's dir on PATH; run from the
 repo root so the --config default resolves — --db and --api already default
@@ -15,6 +22,7 @@ to the shared data/dv_host.db and http://localhost:9721):
 import argparse
 import json
 import logging
+import json
 import os
 import re
 import shutil
@@ -22,6 +30,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -79,7 +88,8 @@ def is_retry_due(next_retry_at, now):
 # The API router mounts at bare /rename (no /api prefix) — see
 # APIRouter(prefix="/rename", ...) in backend/api/routes/rename.py, included
 # with no additional prefix in backend/api/main.py.
-DV_IMPORT_PATH = "/rename/dv-import"
+DV_IMPORT_PATH = "/rename/dv-import"          # legacy file-read endpoint
+DV_ROWS_PATH = "/rename/dv-host-rows"         # durable row-POST endpoint
 
 # The container's import endpoint (backend/api/routes/rename.py's
 # _DEFAULT_DV_HOST_DB) reads /data/dv_host.db, bind-mounted from
@@ -274,18 +284,59 @@ def _tag_file(path, layer):
         return False
 
 
-def _post_import(api_base):
-    url = api_base.rstrip("/") + DV_IMPORT_PATH
-    req = urllib.request.Request(url, data=b"{}",
-                                 headers={"Content-Type": "application/json"},
-                                 method="POST")
+def _read_host_rows(conn):
+    """Every dv_host row as a plain dict, for POSTing to the container.
+
+    THE DETECTOR OWNS dv_host.db, so reading it here is a local same-OS read with
+    no bind mount and no cross-process contention — the exact thing the container
+    could not do. Round-4 review: sending rows in the request body removes the
+    file handoff (and its WAL/mmap/checkpoint failure class) from the protocol.
+    """
+    return [
+        {"path": r["path"], "dv_layer": r["dv_layer"],
+         "sig_mtime": r["sig_mtime"], "sig_size": r["sig_size"],
+         "title": r["title"]}
+        for r in conn.execute(
+            "SELECT path, dv_layer, sig_mtime, sig_size, title FROM dv_host")
+    ]
+
+
+def _post_rows(api_base, rows):
+    """POST the rows and accept the result ONLY if it is mechanically valid.
+
+    A cumulative snapshot: every call sends every row. The upsert is idempotent,
+    so a missed call self-heals on the next one. Success requires HTTP 2xx AND a
+    parseable body with ``ok`` true, ``processed == source_rows == len(rows)``,
+    and ``failed == 0`` (round-4 review). Anything else — non-2xx, unparseable,
+    or a count that does not reconcile — is a FAILURE, never a silent success.
+    """
+    url = api_base.rstrip("/") + DV_ROWS_PATH
+    payload = json.dumps({"rows": rows, "source_rows": len(rows)}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            logger.info("dv-import -> %s", resp.read().decode("utf-8", "replace"))
-        return True
-    except OSError as e:
-        logger.error("dv-import POST failed: %s", e)
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace") if e.fp else ""
+        logger.error("dv-host-rows POST rejected: HTTP %s %s", e.code, detail)
         return False
+    except OSError as e:
+        logger.error("dv-host-rows POST failed: %s", e)
+        return False
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        logger.error("dv-host-rows: unparseable response body: %s", raw[:300])
+        return False
+    if not (body.get("ok") is True
+            and body.get("failed") == 0
+            and body.get("processed") == body.get("source_rows") == len(rows)):
+        logger.error("dv-host-rows: response did not validate: %s", body)
+        return False
+    logger.info("dv-host-rows OK: %s", body)
+    return True
 
 
 def _iter_files(roots):
@@ -397,40 +448,25 @@ def main(argv=None):
                                           error=result.get("error"),
                                           now=time.time()))
         if args.import_every > 0 and scanned % args.import_every == 0:
-            # CLOSE THE DATABASE BEFORE IMPORTING, THEN REOPEN.
-            #
-            # The container reads dv_host.db through a Windows bind mount, and
-            # SQLite's WAL index (-shm) needs mmap semantics that mount cannot
-            # provide. So while THIS process holds the database open, the
-            # container-side read fails with "disk I/O error" -- and
-            # import_dv_host_db() catches sqlite3.Error and returns
-            # {"imported": 0, "updated": 0} behind an HTTP 200. The interim
-            # import would have reported success and delivered nothing, which is
-            # the precise failure this whole effort exists to eliminate.
-            #
-            # Measured 2026-08-10 with a controlled writer: connection held open
-            # -> container read FAILS; writer exits -> container read SUCCEEDS.
-            # Closing checkpoints the WAL and releases -shm, which is what makes
-            # the committed rows visible to the container.
-            #
-            # The final import already escaped this by accident -- it runs after
-            # conn.close() -- but a run killed at the task's time limit never
-            # reaches it, and killed runs are exactly what interim imports are
-            # for.
-            conn.close()
-            _post_import(args.api)
-            conn = _open_db(args.db)
+            # NO close/reopen. The container never reads dv_host.db now — we send
+            # the rows in the request body — so the WAL/bind-mount handoff (and
+            # its whole failure class) is gone. Read our own rows (a local
+            # same-OS read) and POST them; the connection stays open for the
+            # next file. Interim failures stay non-fatal: the host DB is the
+            # durable producer and the snapshot is cumulative, so the next
+            # successful POST carries whatever this one missed.
+            _post_rows(args.api, _read_host_rows(conn))
 
+    # Read the final snapshot BEFORE closing, then hand it off.
+    final_rows = _read_host_rows(conn)
     conn.close()
-    logger.info("scanned %d file(s)%s; posting dv-import", scanned,
-                " (stopped on budget)" if stopped_early else "")
-    # The final import is the run's last chance to complete the handoff, so it
-    # belongs in the exit status. Interim failures stay non-fatal: the host DB is
-    # the durable producer and the import is cumulative, so the next successful
-    # call carries whatever an earlier one missed. (Consolidation blocker 2.)
-    ok = _post_import(args.api)
+    logger.info("scanned %d file(s)%s; posting %d row(s)", scanned,
+                " (stopped on budget)" if stopped_early else "", len(final_rows))
+    # The final POST is the run's last chance to complete the handoff, so it
+    # belongs in the exit status. (Consolidation blocker 2.)
+    ok = _post_rows(args.api, final_rows)
     if not ok:
-        logger.error("final dv-import failed; host rows are durable but "
+        logger.error("final dv-host-rows POST failed; host rows are durable but "
                      "container/Plex are stale")
     return 0 if ok else 1
 

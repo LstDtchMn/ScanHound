@@ -114,15 +114,17 @@ def test_script_never_imports_database_manager():
     assert "crawler.db" not in src
 
 
-def test_post_import_default_url_has_no_api_prefix():
+def test_post_urls_have_no_api_prefix():
     # The router mounts at bare /rename (no /api prefix) — see
     # backend/api/routes/rename.py's APIRouter(prefix="/rename", ...) and its
-    # inclusion in backend/api/main.py. _post_import must target that path,
-    # not /api/rename/dv-import (which 404s).
+    # inclusion in backend/api/main.py. The POST targets must hit that path,
+    # not /api/rename/... (which 404s).
     m = _load()
-    url = "http://localhost:9721".rstrip("/") + m.DV_IMPORT_PATH
-    assert url.endswith("/rename/dv-import")
-    assert "/api/" not in url
+    for path in (m.DV_ROWS_PATH, m.DV_IMPORT_PATH):
+        url = "http://localhost:9721".rstrip("/") + path
+        assert url.startswith("http://localhost:9721/rename/")
+        assert "/api/" not in url
+    assert m.DV_ROWS_PATH.endswith("/rename/dv-host-rows")
 
 
 def test_default_db_path_resolves_to_shared_data_dir():
@@ -307,7 +309,7 @@ def _main_harness(tmp_path, n_files, clock_step, argv_extra,
     m.load_host_config = lambda _p: {"dv_detection": True,
                                      "dv_library_roots": str(root)}
     m._iter_files = lambda roots: iter(paths)
-    m._post_import = lambda api: (posts.append(api) or post_ok)
+    m._post_rows = lambda api, rows: (posts.append(api) or post_ok)
     m.time = _Clock(clock_step)
 
     m.dv_detect.available = lambda: True
@@ -383,27 +385,25 @@ def test_steady_mode_skips_the_retry_sweep(tmp_path):
 
     m.dv_detect.detect_layer = _detect
     m._iter_files = lambda roots: iter([str(wedged), str(fresh)])
-    m._post_import = lambda api: None
+    m._post_rows = lambda api, rows: None
 
     m.main(["--config", "x", "--db", str(db), "--api", "http://x",
             "--mode", "steady", "--max-runtime-minutes", "0"])
     assert seen == [str(fresh)], "steady mode must not re-attempt known failures"
 
 
-# --- ported from fix/dv-import-cadence (reviewed, then retired unmerged) -----
+# --- POST-rows transport (round-4 redesign) ---------------------------------
 
-def test_interim_import_happens_with_the_database_CLOSED(tmp_path, monkeypatch):
-    """The container cannot read dv_host.db while this process holds it open.
+def test_interim_post_does_not_close_the_connection(tmp_path, monkeypatch):
+    """POST-rows redesign: the container never reads dv_host.db now, so the
+    interim POST must NOT close/reopen the connection.
 
-    It reads through a Windows bind mount, where SQLite's WAL index (-shm) needs
-    mmap semantics the mount cannot provide. Measured 2026-08-10 with a
-    controlled writer: held open -> "disk I/O error"; writer exited -> read OK.
-    import_dv_host_db() catches that error and returns zeros behind an HTTP 200,
-    so an interim import with the database open reports success and delivers
-    NOTHING -- the exact false-success this work exists to remove.
-
-    So this asserts the ordering directly: every interim POST must be made while
-    the connection is closed.
+    The old close/reopen dance existed ONLY to release the file for the
+    container's cross-OS read (which failed on the Windows bind mount's WAL
+    mmap). Sending rows in the request body removes that whole failure class —
+    and reintroducing a mid-scan close would be pure cost. This asserts the
+    interim POSTs happen with the connection OPEN, and each carries the rows
+    scanned so far; only the final POST follows the single close.
     """
     m = _load()
     closes = {"n": 0}
@@ -421,8 +421,9 @@ def test_interim_import_happens_with_the_database_CLOSED(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "_open_db", lambda p: _Tracked(real_open(p)))
 
     seen = []
-    monkeypatch.setattr(m, "_post_import",
-                        lambda api: seen.append(closes["n"]) or True)
+    monkeypatch.setattr(
+        m, "_post_rows",
+        lambda api, rows: seen.append((closes["n"], len(rows))) or True)
 
     root = tmp_path / "lib"; root.mkdir()
     paths = []
@@ -439,14 +440,58 @@ def test_interim_import_happens_with_the_database_CLOSED(tmp_path, monkeypatch):
                  "--api", "http://127.0.0.1:9", "--import-every", "2",
                  "--max-runtime-minutes", "0"])
     assert rc == 0
-    # 6 files at every-2 => interim POSTs after 2, 4 and 6, plus the final one.
+    # 6 files at every-2 => interim POSTs after 2, 4, 6, plus the final one.
     assert len(seen) >= 4, seen
-    # EVERY POST must have been preceded by at least one close. If an interim
-    # import fired with the connection open, its recorded count would not have
-    # advanced past the previous one.
-    assert seen[0] >= 1, "the first interim import ran with the database open"
-    assert seen == sorted(seen), seen
-    assert seen[-1] > seen[0], "later imports must follow further closes"
+    interim, final = seen[:-1], seen[-1]
+    assert all(c == 0 for c, _ in interim), (
+        f"interim POSTs must run with the connection OPEN (no close): {seen}")
+    assert final[0] == 1, f"only the final POST follows the single close: {seen}"
+    # Cumulative snapshot: each POST carries the rows accumulated so far.
+    assert [n for _, n in seen] == [2, 4, 6, 6], seen
+
+
+def test_post_rows_rejects_a_count_mismatch(tmp_path, monkeypatch):
+    """_post_rows accepts the result ONLY when the response validates."""
+    m = _load()
+    import urllib.request
+
+    class _Resp:
+        def __init__(self, body):
+            self._b = body.encode("utf-8")
+        def read(self):
+            return self._b
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    # processed != source_rows -> must be rejected even on HTTP 200.
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: _Resp(
+                            '{"ok": true, "source_rows": 2, "processed": 1, '
+                            '"failed": 0}'))
+    assert m._post_rows("http://x", [{"path": "a"}, {"path": "b"}]) is False
+
+    # A fully-valid response is accepted.
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: _Resp(
+                            '{"ok": true, "source_rows": 2, "processed": 2, '
+                            '"failed": 0}'))
+    assert m._post_rows("http://x", [{"path": "a"}, {"path": "b"}]) is True
+
+
+def test_post_rows_rejects_a_non_2xx(tmp_path, monkeypatch):
+    m = _load()
+    import io
+    import urllib.error
+    import urllib.request
+
+    def _raise(*a, **k):
+        raise urllib.error.HTTPError(
+            "http://x", 500, "err", {}, io.BytesIO(b'{"ok": false}'))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _raise)
+    assert m._post_rows("http://x", [{"path": "a"}]) is False
 
 
 def test_a_failed_detection_prints_no_rate(tmp_path, caplog):
