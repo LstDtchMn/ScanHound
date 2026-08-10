@@ -426,6 +426,87 @@ the branch be left in place for the consolidation session to close.
 
 ---
 
+## 8b. WHAT DID NOT WORK — dead ends, in full
+
+Recorded because the next person will otherwise pay for them again. Several of
+these looked correct right up to the point they were measured.
+
+### Detection approaches that failed
+
+* **`.cf-turnstile` container / `data-sitekey`.** Cloudflare's documented markup.
+  **Not present on this site at all** — the widget is rendered programmatically
+  into `#turnstile-container-<hash>`. A detector built from the documentation
+  finds nothing and looks finished.
+* **The challenge `<iframe>` as a signal.** Unreliable. Invisible mode builds a
+  frame, fails, tears it down, and retries about every 11 seconds, so a DOM read
+  usually lands *between* attempts. It is a race, not a signal.
+* **Shadow DOM.** Hypothesised as where the widget was hiding. Walked the whole
+  tree descending into open shadow roots: **zero shadow roots**. Not it.
+* **The dormant `api.js` `<script>` tag.** Ships in `<head>` on *every* release
+  page including ones that reveal links perfectly. Keying on it calls the entire
+  site challenged.
+
+### Causal hypotheses that were refuted
+
+* **`postMessage` on `DOMWindow` as root cause.** Appeared immediately after the
+  first 600010 and looked compelling. **Absent from later captures that still
+  failed identically.** Incidental.
+* **A benign integration defect** (blocked resource, CSP rejection, iframe that
+  fails to load — Cloudflare's 200500/200100 family). Ruled out: all Turnstile
+  requests returned **HTTP 200**, no `Network.loadingFailed`, **no CSP header**
+  on the document. The resources work; the *verdict* fails.
+* **"No captcha or Cloudflare challenge is involved"** — asserted by an earlier
+  session from ScanHound's own diagnostics, and false. The page body loading
+  fully (92,509 bytes, 100 links) is TRUE and PROVES NOTHING, because the
+  challenge is a third-party invisible widget.
+
+### Methods that failed
+
+* **Reloading to reproduce the challenge.** Six consecutive loads, all healthy —
+  reveal control reading "View links", enabled, no widget. **Reloading does not
+  catch it.** A 10-minute polling watcher caught it on cycle 20 (the other
+  session's `scripts/turnstile_watch.py`). Use polling.
+
+### My own mistakes, and what caught each
+
+* **The interstitial partition over-narrowed.** Stripping `iframe:` markers
+  unconditionally also stripped them from genuine Cloudflare interstitials, so a
+  body-only "just a moment" with no `<title>` dropped from
+  `INTERACTIVE_CHALLENGE` to `LAYOUT_CHANGED` — "a challenge blocked us" became
+  "the scraper is broken". **Caught by the full suite, not by review.**
+* **A discrimination test that could not reach the code it discriminated.** My
+  "evidence without a stalled reveal" test used the response field and console;
+  the bypass it was meant to guard lives in the iframe branch. It passed while
+  the bug sat open beside it. **Caught by ChatGPT.** The replacement asserts
+  `iframe:turnstile` is *still produced*, so it cannot pass by the detector
+  having gone silent.
+* **A vacuous control in the migration smoke test.** I passed
+  `cooldown_until=None`, so the "before" state read `NO_AUTHORISATION` rather
+  than `AUTHORISED` — it proved nothing until the real expired cooldown was used.
+  **Caught by reading my own output.**
+* **Order-dependent tests.** The episode rig passed in the full suite and failed
+  when a polluting file was named first, because the HDEncode coordinator is a
+  **process-wide singleton** and `observe_challenge()` leaves a real 1h cooldown.
+  Order-dependent green survives review and breaks later, on someone else's
+  change, in a file they never touched.
+* **Comparing branches by grepping my own naming.** Twice claimed the other
+  branch lacked a capability because I searched for *my* identifier
+  (`challenge_episode`). Both wrong. See §8a.
+* **Closure wired to `_complete` only.** Found by the peer session, not by me and
+  not by either review round. See §8a.
+
+### Things that worked and are worth repeating
+
+* Reproducing **both defects on unmodified `main` first**, using only main's own
+  symbols — a collection error proves a symbol is new, not that behaviour was
+  wrong.
+* Running `origin/main` through the **same** container harness in the **same**
+  session as a baseline.
+* Verifying every review finding **in code before accepting it**, and every peer
+  claim before conceding it.
+
+---
+
 ## 9. What is NOT claimed
 
 * **Not** that `navigator.webdriver` or the automation flags caused the
