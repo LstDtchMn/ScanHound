@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -34,6 +35,46 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("dv_host_scan")
 
 DV_MTIME_TOL = 2.0  # >= FAT/exFAT 2s granularity — below this = endless rescans
+
+# ── retry backoff for failed detections ────────────────────────────────
+#
+# WHY THIS EXISTS. A failed detection stores a NULL signature so the file is
+# retried, which is correct on its own. Combined with a per-file time cap it
+# was not: two titles that wedge dovi_tool were retried at the FRONT of every
+# run (they sit in an otherwise fully-scanned root that os.walk reaches first),
+# burning 1800 s each before the run ever reached the 236 files that had never
+# been scanned at all. Measured 2026-08-09: three such runs in one day, one
+# hour of every six-hour window, and because the run was then hard-killed at
+# its Task Scheduler limit it never reached the dv-import POST either -- so
+# the container's dv_scan gained nothing for two weeks while the host database
+# kept growing.
+#
+# Escalating backoff means a permanently-failing file costs one attempt per
+# week instead of one per run, without ever declaring it unscannable: it stays
+# eligible forever, just not constantly.
+DV_RETRY_BACKOFF_HOURS = (6, 24, 72, 168)
+
+
+def retry_delay_hours(attempts, schedule=DV_RETRY_BACKOFF_HOURS):
+    """Hours to wait before retrying a file that has failed *attempts* times."""
+    if attempts <= 0:
+        return 0
+    return schedule[min(attempts, len(schedule)) - 1]
+
+
+def is_retry_due(next_retry_at, now):
+    """Whether a failed row is eligible again. A NULL due-time is always due.
+
+    NULL is 'due' rather than 'never' on purpose: rows written before this
+    column existed carry NULL, and the safe reading of a missing schedule is
+    "we have no reason to hold this back", not "hold it back forever".
+    """
+    if next_retry_at is None:
+        return True
+    try:
+        return float(next_retry_at) <= float(now)
+    except (TypeError, ValueError):
+        return True
 
 # The API router mounts at bare /rename (no /api prefix) — see
 # APIRouter(prefix="/rename", ...) in backend/api/routes/rename.py, included
@@ -93,15 +134,64 @@ def sig_is_current(stored_mtime, stored_size, st_mtime, st_size,
         return False
 
 
-def classify_to_row(path, layer, st):
-    """Build a dv_host.db row. 'unknown' stores NULL mtime so the next run retries."""
+def classify_to_row(path, layer, st, *, attempts=0, error=None, now=None):
+    """Build a dv_host.db row. 'unknown' stores NULL mtime so the next run retries.
+
+    A failed row additionally carries how many times it has failed and when it
+    next becomes eligible, so "retry it" does not have to mean "retry it on
+    every single run".
+    """
     unknown = layer in ("unknown", None)
-    return {
+    if now is None:
+        now = time.time()
+    row = {
         "path": path,
         "dv_layer": layer,
         "sig_mtime": None if unknown else float(st.st_mtime),
         "sig_size": None if unknown else int(st.st_size),
+        "attempts": 0,
+        "last_error": None,
+        "next_retry_at": None,
     }
+    if unknown:
+        row["attempts"] = int(attempts) + 1
+        row["last_error"] = error
+        row["next_retry_at"] = float(now) + retry_delay_hours(row["attempts"]) * 3600.0
+    return row
+
+
+def partition_work(candidates, now):
+    """Order the run's work: never-scanned, then changed, then due retries.
+
+    *candidates* are ``(path, st, row)`` with ``row`` None when the file has no
+    database entry at all. Returns a single ordered list.
+
+    WHY ORDER MATTERS, AND WHY 'NEWEST FIRST' IS THE LOAD-BEARING PART.
+    os.walk yields directory order, which is roughly alphabetical and entirely
+    unrelated to what deserves attention. A title acquired an hour ago sat
+    behind hundreds of backlog entries purely because its name starts with a
+    late letter. Sorting the unscanned bucket by mtime descending is what makes
+    a fresh acquisition the FIRST thing a run looks at -- ordering the buckets
+    alone would not have done it, because a new acquisition and a two-month-old
+    backlog entry are both simply 'never scanned'.
+    """
+    never, changed, retries = [], [], []
+    for path, st, row in candidates:
+        if row is None:
+            never.append((path, st, row))
+            continue
+        if row["dv_layer"] in ("unknown", None):
+            if is_retry_due(row["next_retry_at"], now):
+                retries.append((path, st, row))
+            continue
+        if not sig_is_current(row["sig_mtime"], row["sig_size"],
+                              st.st_mtime, st.st_size):
+            changed.append((path, st, row))
+    never.sort(key=lambda c: c[1].st_mtime, reverse=True)
+    changed.sort(key=lambda c: c[1].st_mtime, reverse=True)
+    # Longest-waiting failure first, so backoff cannot starve one file forever.
+    retries.sort(key=lambda c: (c[2]["next_retry_at"] or 0.0))
+    return never + changed + retries
 
 
 def tag_name_for(layer):
@@ -110,6 +200,15 @@ def tag_name_for(layer):
 
 
 # ── db (own standalone sqlite — not the container's ORM layer) ──────────
+#: Columns added after the table shipped. ALTER TABLE ADD COLUMN is the only
+#: migration this file may perform — it must never run the container's ORM DDL.
+_ADDED_COLUMNS = (
+    ("attempts", "INTEGER DEFAULT 0"),
+    ("last_error", "TEXT"),
+    ("next_retry_at", "REAL"),
+)
+
+
 def _open_db(db_path):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -123,24 +222,34 @@ def _open_db(db_path):
             title TEXT,
             scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(dv_host)")}
+    for name, decl in _ADDED_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE dv_host ADD COLUMN {name} {decl}")
     conn.commit()
     return conn
 
 
-def _get_sig(conn, path):
-    row = conn.execute(
-        "SELECT sig_mtime, sig_size FROM dv_host WHERE path = ?", (path,)).fetchone()
-    return (row["sig_mtime"], row["sig_size"]) if row else (None, None)
+def _load_rows(conn):
+    """Every row, keyed by path — one query instead of one per walked file."""
+    return {r["path"]: dict(r) for r in conn.execute(
+        "SELECT path, dv_layer, sig_mtime, sig_size, attempts, next_retry_at "
+        "FROM dv_host")}
 
 
 def _upsert(conn, row):
     conn.execute('''
-        INSERT INTO dv_host (path, dv_layer, sig_mtime, sig_size, scanned_at)
-        VALUES (:path, :dv_layer, :sig_mtime, :sig_size, CURRENT_TIMESTAMP)
+        INSERT INTO dv_host (path, dv_layer, sig_mtime, sig_size,
+                             attempts, last_error, next_retry_at, scanned_at)
+        VALUES (:path, :dv_layer, :sig_mtime, :sig_size,
+                :attempts, :last_error, :next_retry_at, CURRENT_TIMESTAMP)
         ON CONFLICT(path) DO UPDATE SET
             dv_layer = excluded.dv_layer,
             sig_mtime = excluded.sig_mtime,
             sig_size = excluded.sig_size,
+            attempts = excluded.attempts,
+            last_error = excluded.last_error,
+            next_retry_at = excluded.next_retry_at,
             scanned_at = CURRENT_TIMESTAMP
     ''', row)
     conn.commit()
@@ -191,6 +300,21 @@ def main(argv=None):
     ap.add_argument("--config", default="data/dv_host.json")
     ap.add_argument("--db", default=DEFAULT_DB_PATH)
     ap.add_argument("--api", default="http://localhost:9721")
+    # 5h30m under a PT6H Task Scheduler limit. A HARD KILL at the limit loses
+    # the file in flight AND skips the dv-import POST at the end of main(),
+    # which is why the container's dv_scan gained nothing while the host
+    # database grew: every run died before reaching the handoff. Stopping
+    # ourselves BETWEEN files, with time to spare, converts that into a normal
+    # exit 0 that always imports what it found.
+    ap.add_argument("--max-runtime-minutes", type=float, default=330.0,
+                    help="stop between files once this much wall clock is used "
+                         "(0 disables the budget)")
+    ap.add_argument("--mode", choices=("backfill", "steady"), default="backfill",
+                    help="backfill: everything, ordered. steady: only "
+                         "never-scanned and changed files, no retry sweep.")
+    ap.add_argument("--import-every", type=int, default=25,
+                    help="POST dv-import after this many files so a long run "
+                         "publishes progress instead of only at the end")
     args = ap.parse_args(argv)
 
     cfg = load_host_config(args.config)
@@ -203,23 +327,64 @@ def main(argv=None):
 
     tagging = bool(cfg.get("dv_file_tagging"))
     conn = _open_db(args.db)
-    scanned = 0
+    started = time.monotonic()
+    budget = float(args.max_runtime_minutes) * 60.0
+
+    rows = _load_rows(conn)
+    candidates = []
     for path in _iter_files(parse_roots(cfg)):
         try:
             st = os.stat(path)
         except OSError:
             continue
-        stored_m, stored_s = _get_sig(conn, path)
-        if sig_is_current(stored_m, stored_s, st.st_mtime, st.st_size):
-            continue
-        layer = dv_detect.detect_layer(path).get("layer")
-        _upsert(conn, classify_to_row(path, layer, st))
+        candidates.append((path, st, rows.get(path)))
+
+    now = time.time()
+    work = partition_work(candidates, now)
+    if args.mode == "steady":
+        work = [c for c in work if c[2] is None
+                or c[2]["dv_layer"] not in ("unknown", None)]
+    logger.info("walked %d file(s); %d need work (mode=%s, budget=%.0f min)",
+                len(candidates), len(work), args.mode, budget / 60.0)
+
+    scanned = 0
+    stopped_early = False
+    for path, st, row in work:
+        if budget > 0 and (time.monotonic() - started) >= budget:
+            logger.info("time budget reached — stopping cleanly with %d file(s) "
+                        "left for the next run", len(work) - scanned)
+            stopped_early = True
+            break
+        # Log BEFORE the work, not after. The detector was silent for hours at a
+        # time, which is what made a wedged run indistinguishable from a busy
+        # one and led to throughput being inferred from process snapshots
+        # instead of read from the database.
+        logger.info("[%d/%d] scanning %.1f GB  %s",
+                    scanned + 1, len(work), st.st_size / 1e9, path)
+        t0 = time.monotonic()
+        result = dv_detect.detect_layer(path)
+        layer = result.get("layer")
+        secs = max(time.monotonic() - t0, 1e-6)
+        logger.info("[%d/%d] -> %s (%s) in %.0fs  %.0f MB/s%s",
+                    scanned + 1, len(work), layer,
+                    result.get("evidence") or result.get("error") or "?",
+                    secs, (st.st_size / 1e6) / secs,
+                    "" if layer != "unknown" else "  FAILED")
+        attempts = (row or {}).get("attempts") or 0
+        _upsert(conn, classify_to_row(path, layer, st, attempts=attempts,
+                                      error=result.get("error"), now=time.time()))
         scanned += 1
         if tagging and _tag_file(path, layer):
             st2 = os.stat(path)  # header rewrite bumped mtime/size
-            _upsert(conn, classify_to_row(path, layer, st2))
+            _upsert(conn, classify_to_row(path, layer, st2, attempts=attempts,
+                                          error=result.get("error"),
+                                          now=time.time()))
+        if args.import_every > 0 and scanned % args.import_every == 0:
+            _post_import(args.api)
+
     conn.close()
-    logger.info("scanned %d file(s); posting dv-import", scanned)
+    logger.info("scanned %d file(s)%s; posting dv-import", scanned,
+                " (stopped on budget)" if stopped_early else "")
     _post_import(args.api)
     return 0
 
