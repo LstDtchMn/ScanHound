@@ -854,8 +854,14 @@ class TestPathConfinement:
         # data-dir path, which must always be in-allowlist by construction.
         import backend.api.routes.rename as rename_routes
         calls = []
-        monkeypatch.setattr(rename_routes, "import_dv_host_db",
-                            lambda db, path: calls.append(path) or {"ok": True})
+        # A confinement test, not an import-contract test: return a full,
+        # valid import result so the route's shared _import_response() validator
+        # (which requires processed == source_rows and failed == 0) is satisfied.
+        monkeypatch.setattr(
+            rename_routes, "import_dv_host_db",
+            lambda db, path: calls.append(path) or {
+                "source_rows": 0, "processed": 0, "imported": 0,
+                "updated": 0, "failed": 0})
         resp = client.post("/rename/dv-import", json={})
         assert resp.status_code == 200
         # The route normalizes the path (os.path.normpath) before passing it
@@ -874,8 +880,11 @@ class TestPathConfinement:
         db_path = str(data_dir / "dv_host.db")
         monkeypatch.setattr(rename_routes, "_DEFAULT_DV_HOST_DB", str(data_dir / "default.db"))
         calls = []
-        monkeypatch.setattr(rename_routes, "import_dv_host_db",
-                            lambda db, path: calls.append(path) or {"ok": True})
+        monkeypatch.setattr(
+            rename_routes, "import_dv_host_db",
+            lambda db, path: calls.append(path) or {
+                "source_rows": 0, "processed": 0, "imported": 0,
+                "updated": 0, "failed": 0})
         resp = client.post("/rename/dv-import", json={"host_db_path": db_path})
         assert resp.status_code == 200
         assert calls == [db_path]

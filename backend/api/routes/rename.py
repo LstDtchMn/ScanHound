@@ -2,10 +2,10 @@
 import logging
 import os
 import threading
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.public_errors import capture_public_exception
@@ -14,7 +14,8 @@ from backend.api.ws import ws_manager
 from backend.rename import dv_detect, dv_labeler, fileops, llm_identify
 from backend.rename.conflict_analyzer import analyze_job_conflict, has_active_duplicate
 from backend.rename.conflicts import conflict_annotations, find_library_duplicate
-from backend.rename.dv_import import import_dv_host_db
+from backend.rename.dv_import import (
+    DvHostReadError, import_dv_host_db, import_dv_rows)
 
 
 def _poster_url(poster_path):
@@ -109,8 +110,71 @@ class DvImportRequest(BaseModel):
     host_db_path: Optional[str] = None
 
 
+class DvHostRow(BaseModel):
+    path: str
+    dv_layer: Optional[str] = None
+    sig_mtime: Optional[float] = None
+    sig_size: Optional[int] = None
+    title: Optional[str] = None
+
+    @field_validator("path")
+    @classmethod
+    def _path_not_blank(cls, v: str) -> str:
+        # A blank/whitespace path is not an importable row. Reject at the request
+        # boundary (422) so the server's success invariant — every accepted row is
+        # processed exactly once — holds without a skipped-row fudge (re-review F2).
+        if not (v or "").strip():
+            raise ValueError("path must not be blank")
+        return v
+
+
+#: The only row schema this container understands. The detector's
+#: DV_ROWS_SCHEMA_VERSION must match; a bump on either side without the other is
+#: rejected at the request boundary rather than silently mis-parsed.
+DV_ROWS_SCHEMA_VERSION = 1
+
+
+class DvHostRowsRequest(BaseModel):
+    """The detector POSTs its dv_host rows here. `source_rows` is the count the
+    detector believes it sent; the server rejects a mismatch so a truncated or
+    duplicated body cannot pass as success."""
+    rows: List[DvHostRow]
+    source_rows: int
+    #: Forward-compat: the producer's row schema version. Bump on a shape change.
+    schema_version: int = 1
+
+    @field_validator("schema_version")
+    @classmethod
+    def _schema_supported(cls, v: int) -> int:
+        # Reject an unrecognised producer version at the boundary (422) so a
+        # future shape change can never be half-applied (re-review cleanup).
+        if v != DV_ROWS_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported schema_version {v}; expected {DV_ROWS_SCHEMA_VERSION}")
+        return v
+
+
 class DvSyncRequest(BaseModel):
     dry_run: bool = False
+    #: Default TRUE, which INVERTS the previous behaviour of this endpoint.
+    #:
+    #: sync_labels' own default is additive_only=False, and this endpoint used
+    #: to accept it by omission — so pressing the manual button ran a full
+    #: reconciliation over every movie in the configured Plex libraries, and
+    #: reconcile_movie grants removal on an unmatched title (`may_remove =
+    #: authoritative or not additive_only`). A title whose row had not yet been
+    #: imported was therefore not merely skipped: its managed DV label was
+    #: REMOVED, and Kometa's overlays key off those labels.
+    #:
+    #: Measured 2026-08-10 against the live library: 444 titles carry a managed
+    #: DV label and all 444 currently match an authoritative dv_scan row, so
+    #: today's exposure is zero. But that is arithmetic that happens to hold,
+    #: not a property anything enforces — it survives only while labels and
+    #: scan rows stay in step, and the whole point of the import backlog work
+    #: is that they had already drifted for two weeks.
+    #:
+    #: Destructive reconciliation is still reachable, by asking for it.
+    additive_only: bool = True
 
 
 class BulkIdsRequest(BaseModel):
@@ -686,9 +750,60 @@ _DEFAULT_DV_HOST_DB = os.environ.get(
     "SCANHOUND_DV_HOST_DB", "/data/dv_host.db")
 
 
+@router.post("/dv-host-rows")
+def dv_host_rows(
+    req: DvHostRowsRequest, reg: ServiceRegistry = Depends(get_registry)
+):
+    """Ingest DV rows POSTed by the host detector — the durable transport.
+
+    The container never reads the host file, so there is no cross-OS SQLite /
+    WAL / bind-mount handoff to get wrong. The response is mechanically
+    checkable: the detector accepts it only when ``ok`` is true, ``processed``
+    equals ``source_rows``, and ``failed`` is zero (round-4 review). Any
+    shortfall is a NON-2xx so it can never read as success.
+    """
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="DB not initialized")
+    rows = [r.model_dump() for r in req.rows]
+    if req.source_rows != len(rows):
+        # A truncated or duplicated body. Refuse rather than import a partial set.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "error": "source_rows_mismatch",
+                "source_rows": req.source_rows,
+                "received_rows": len(rows),
+            },
+        )
+    return _import_response(import_dv_rows(reg.db, rows))
+
+
+def _import_response(result: dict) -> dict:
+    """Validate an import_dv_rows result into a response body, or raise 500.
+
+    ONE invariant, shared by both endpoints (re-review F2/F3): every source row
+    must be processed exactly once with zero failures. `processed == source_rows`
+    (not `processed + skipped`) — blank-path rows are rejected at validation, so a
+    processed shortfall now means a real failure, and a partial or failed import
+    can never read as an HTTP-200 success.
+    """
+    ok = result["failed"] == 0 and result["processed"] == result["source_rows"]
+    body = {"ok": ok, **result}
+    if not ok:
+        raise HTTPException(status_code=500, detail=body)
+    return body
+
+
 @router.post("/dv-import")
 def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)):
-    """Ingest the host detector's dv_host.db into dv_scan (source='scan')."""
+    """Ingest the host detector's dv_host.db into dv_scan (source='scan').
+
+    LEGACY file path (superseded by /dv-host-rows). Retained for compatibility,
+    but a read/open failure is now a 503 rather than a silent zero-row success —
+    an unreadable host DB and a successfully-read empty one are different states
+    (round-4 finding 2).
+    """
     if reg.db is None:
         raise HTTPException(status_code=503, detail="DB not initialized")
     path = (req.host_db_path or _DEFAULT_DV_HOST_DB)
@@ -697,7 +812,13 @@ def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)
     # the host detector is ever configured to drop dv_host.db. Rejects an
     # explicit host_db_path pointed anywhere else (`..` escape, another mount).
     path = _require_within_roots(path, [_dv_host_db_root()], "host_db_path")
-    return import_dv_host_db(reg.db, path)
+    try:
+        result = import_dv_host_db(reg.db, path)
+    except DvHostReadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    # Same validator as /dv-host-rows: a partial destination upsert is a 500, not
+    # a silent 200 (re-review F3).
+    return _import_response(result)
 
 
 @router.post("/dv-sync-labels")
@@ -705,6 +826,7 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
     """Reconcile managed DV labels on every movie against dv_scan (source='scan').
     Runs in the background; streams dv:sync_progress and ALWAYS emits dv:sync_done."""
     dry_run = bool(req.dry_run)
+    additive_only = bool(req.additive_only)
     if reg.db is None:
         raise HTTPException(status_code=503, detail="DB not initialized")
     plex_manager = getattr(reg._plex_service, "plex_manager", None) if reg._plex_service else None
@@ -719,7 +841,8 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
                     "done": done, "total": total}})
             result = dv_labeler.sync_labels(
                 reg.db, plex_manager, reg.config,
-                dry_run=dry_run, progress_cb=_progress)
+                dry_run=dry_run, progress_cb=_progress,
+                additive_only=additive_only)
             ws_manager.broadcast_sync({"type": "notification", "data": {
                 "title": "Dolby Vision label sync",
                 "body": (f"{result['matched']} matched, "

@@ -219,8 +219,13 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     """Reconcile every movie against dv_scan (source='scan'). Returns a summary.
 
     ``additive_only`` never removes labels from an unmatched movie — see
-    reconcile_movie. The scheduled auto-sync passes it; the manual button does
-    not.
+    reconcile_movie. BOTH callers now pass it: the scheduled auto-sync always,
+    and the manual endpoint by default (``DvSyncRequest.additive_only``, which
+    a caller may set False to ask for destructive reconciliation explicitly).
+
+    This function's own default stays False so the parameter keeps meaning
+    "opt IN to protection" at this layer; the safe choice is made at the API
+    boundary, where the request that triggers it is visible.
     """
     vocab = _vocab_from_config(config)
     rows = db.get_dv_scans(source="scan", limit=1000000)

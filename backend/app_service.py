@@ -697,17 +697,39 @@ class AppService:
                     self._last_dv_scan_at = latest  # baseline only
                 elif latest and (self._last_dv_scan_at is None
                                  or latest > self._last_dv_scan_at):
-                    self._last_dv_scan_at = latest
+                    # THE WATERMARK IS ADVANCED ONLY AFTER sync_labels() RETURNS.
+                    #
+                    # It used to be assigned here, before the sync was even
+                    # attempted, which silently consumed the scan generation on
+                    # BOTH failure paths below:
+                    #
+                    #  1. pm is None -- Plex not initialized yet. Entirely
+                    #     plausible when the maintenance pass runs shortly after
+                    #     a container start. The old code logged "skipping this
+                    #     pass" having ALREADY moved the watermark, so those
+                    #     labels were never applied until some LATER scan
+                    #     advanced it again.
+                    #  2. sync_labels() raising -- caught by the outer handler,
+                    #     which logs "non-fatal" and returns. Same outcome.
+                    #
+                    # In both cases the DV data was correct, the labels simply
+                    # never reached Plex, and nothing retried. Leaving the
+                    # watermark where it is makes the next pass see the same
+                    # pending work, so a transient failure self-heals.
                     from backend.api.dependencies import registry
                     from backend.rename import dv_labeler
                     plex_service = getattr(registry, "_plex_service", None)
                     pm = getattr(plex_service, "plex_manager", None) if plex_service else None
                     if pm is None:
                         logger.info("DV auto-sync: new DV data but Plex not "
-                                    "initialized — skipping this pass")
+                                    "initialized — watermark NOT advanced, "
+                                    "will retry next pass")
                     else:
                         result = dv_labeler.sync_labels(
                             self.db, pm, self.config, additive_only=True)
+                        # Success only. A raise here skips this assignment and
+                        # the outer handler logs it, leaving the work pending.
+                        self._last_dv_scan_at = latest
                         logger.info(
                             "DV auto-sync: %d matched, %d label(s) added "
                             "(additive-only)",
