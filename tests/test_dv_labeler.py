@@ -538,3 +538,39 @@ def test_recovery_cannot_invent_labels_for_unscanned_movies():
 
     assert res["added"] == [] and res["removed"] == []
     pm.add_label.assert_not_called()
+
+
+# --- the manual endpoint's default (2026-08-10) -----------------------------
+# The endpoint used to accept sync_labels' additive_only=False by omission, so
+# pressing "sync labels" ran a DESTRUCTIVE full reconciliation over every movie
+# in the configured libraries. Measured at the time: 444 titles carried a
+# managed DV label and all 444 happened to match an authoritative row, so the
+# realised damage was zero -- arithmetic that held, not a property anything
+# enforced. These pin the behaviour rather than the flag: they assert on what
+# reaches Plex, so flipping the default back fails them.
+
+def test_full_reconcile_DOES_strip_an_unmatched_label():
+    """The hazard, stated positively. If this ever stops removing, the
+    contrast the next test draws is meaningless and both are vacuous."""
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+    res = reconcile_movie(mv, {}, VOCAB, pm, dry_run=False, additive_only=False)
+    assert res["removed"] == ["DV FEL"]
+    pm.remove_label.assert_called_once_with(1, "DV FEL")
+
+
+def test_manual_sync_request_defaults_to_additive_only():
+    from backend.api.routes.rename import DvSyncRequest
+    assert DvSyncRequest().additive_only is True
+    assert DvSyncRequest(additive_only=False).additive_only is False
+
+
+def test_manual_sync_default_would_not_strip_that_same_label():
+    """Same movie, same empty index, but through the endpoint's default."""
+    from backend.api.routes.rename import DvSyncRequest
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+    res = reconcile_movie(mv, {}, VOCAB, pm, dry_run=False,
+                          additive_only=DvSyncRequest().additive_only)
+    assert res["removed"] == []
+    pm.remove_label.assert_not_called()

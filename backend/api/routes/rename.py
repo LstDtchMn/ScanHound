@@ -111,6 +111,25 @@ class DvImportRequest(BaseModel):
 
 class DvSyncRequest(BaseModel):
     dry_run: bool = False
+    #: Default TRUE, which INVERTS the previous behaviour of this endpoint.
+    #:
+    #: sync_labels' own default is additive_only=False, and this endpoint used
+    #: to accept it by omission — so pressing the manual button ran a full
+    #: reconciliation over every movie in the configured Plex libraries, and
+    #: reconcile_movie grants removal on an unmatched title (`may_remove =
+    #: authoritative or not additive_only`). A title whose row had not yet been
+    #: imported was therefore not merely skipped: its managed DV label was
+    #: REMOVED, and Kometa's overlays key off those labels.
+    #:
+    #: Measured 2026-08-10 against the live library: 444 titles carry a managed
+    #: DV label and all 444 currently match an authoritative dv_scan row, so
+    #: today's exposure is zero. But that is arithmetic that happens to hold,
+    #: not a property anything enforces — it survives only while labels and
+    #: scan rows stay in step, and the whole point of the import backlog work
+    #: is that they had already drifted for two weeks.
+    #:
+    #: Destructive reconciliation is still reachable, by asking for it.
+    additive_only: bool = True
 
 
 class BulkIdsRequest(BaseModel):
@@ -705,6 +724,7 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
     """Reconcile managed DV labels on every movie against dv_scan (source='scan').
     Runs in the background; streams dv:sync_progress and ALWAYS emits dv:sync_done."""
     dry_run = bool(req.dry_run)
+    additive_only = bool(req.additive_only)
     if reg.db is None:
         raise HTTPException(status_code=503, detail="DB not initialized")
     plex_manager = getattr(reg._plex_service, "plex_manager", None) if reg._plex_service else None
@@ -719,7 +739,8 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
                     "done": done, "total": total}})
             result = dv_labeler.sync_labels(
                 reg.db, plex_manager, reg.config,
-                dry_run=dry_run, progress_cb=_progress)
+                dry_run=dry_run, progress_cb=_progress,
+                additive_only=additive_only)
             ws_manager.broadcast_sync({"type": "notification", "data": {
                 "title": "Dolby Vision label sync",
                 "body": (f"{result['matched']} matched, "

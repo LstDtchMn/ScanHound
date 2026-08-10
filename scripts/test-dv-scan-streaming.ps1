@@ -530,23 +530,27 @@ try {
 }
 $c6text = if (Test-Path -LiteralPath $c6out) { Get-Content -LiteralPath $c6out -Encoding UTF8 -Raw } else { '' }
 
-Assert-That -Name 'detector exits 0' -Condition ($c6code -eq 0) -Detail "got $c6code"
+# --api points at the discard port, so the final dv-import cannot succeed, and
+# a failed FINAL import is now a failed run. Exit 1 is the contract working.
+Assert-That -Name 'detector exits 1 when the final import cannot reach the API' `
+            -Condition ($c6code -eq 1) -Detail "got $c6code"
+Assert-That -Name 'and says why' -Condition ($c6text -match 'final dv-import failed')
 Assert-That -Name 'no UnicodeEncodeError / traceback on the unencodable title' `
             -Condition ($c6text -notmatch 'UnicodeEncodeError' -and $c6text -notmatch 'Traceback') `
             -Detail (($c6text -split "`n" | Select-Object -Last 4) -join ' | ')
 Assert-That -Name 'logs a "scanning <file> (N GB)" line BEFORE reading' `
-            -Condition ((Count-Occurrences -Text $c6text -Pattern 'scanning .*\(\d+\.\d GB\)') -eq 2) `
-            -Detail ("count=" + (Count-Occurrences -Text $c6text -Pattern 'scanning .*\(\d+\.\d GB\)'))
+            -Condition ((Count-Occurrences -Text $c6text -Pattern '\[\d+/\d+\] scanning \d+\.\d GB') -eq 2) `
+            -Detail ("count=" + (Count-Occurrences -Text $c6text -Pattern '\[\d+/\d+\] scanning \d+\.\d GB'))
 Assert-That -Name 'logs a per-file result with elapsed time and an effective scan rate' `
-            -Condition ((Count-Occurrences -Text $c6text -Pattern '-> \w+ in \d+s \(\d+ MB/s effective scan rate\)') -eq 2) `
-            -Detail ("count=" + (Count-Occurrences -Text $c6text -Pattern '-> \w+ in \d+s \(\d+ MB/s effective scan rate\)'))
+            -Condition ((Count-Occurrences -Text $c6text -Pattern '-> \w+ \(.*\) in \d+s\s+\d+ MB/s effective scan rate') -eq 2) `
+            -Detail ("count=" + (Count-Occurrences -Text $c6text -Pattern '-> \w+ \(.*\) in \d+s\s+\d+ MB/s effective scan rate'))
 Assert-That -Name 'the plain title is logged by name' `
             -Condition ($c6text -match [regex]::Escape('Plain Movie (2001).mkv'))
 Assert-That -Name 'the unencodable title is logged intact, not mangled' `
             -Condition ($c6text -match [regex]::Escape($exotic)) `
             -Detail "expected '$exotic' in the detector's captured output"
 Assert-That -Name 'both files were counted and indexed [1]/[2]' `
-            -Condition (($c6text -match '\[1\] scanning') -and ($c6text -match '\[2\] scanning'))
+            -Condition (($c6text -match '\[1/2\] scanning') -and ($c6text -match '\[2/2\] scanning'))
 Assert-That -Name 'reports the final scanned count' `
             -Condition ($c6text -match 'scanned 2 file\(s\)')
 
@@ -646,9 +650,16 @@ Assert-That -Name 'it says the rate is unavailable instead' `
 Assert-That -Name "the detector's error text is preserved in the result line" `
             -Condition ($c8text -match 'simulated extract failure') `
             -Detail 'the error was previously discarded, leaving unknowns undiagnosable at INFO'
-Assert-That -Name 'the layer is recorded as unknown' -Condition ($c8text -match '-> unknown in')
-Assert-That -Name 'the run still exits 0 (a failed file is not a failed run)' `
-            -Condition ($c8code -eq 0) -Detail "got $c8code"
+Assert-That -Name 'the layer is recorded as unknown' -Condition ($c8text -match '-> unknown \(')
+# A failed FILE must not abort the walk -- but that can no longer be read off
+# the exit code, since the discard-port API makes the final import fail. Assert
+# the property directly, and attribute the exit separately.
+Assert-That -Name 'a failed FILE does not abort the walk (it completes and is counted)' `
+            -Condition ($c8text -match 'scanned 1 file\(s\)') `
+            -Detail 'the walk must finish and count the file despite its detection failing'
+Assert-That -Name 'exit 1 here comes from the unreachable API, not the failed file' `
+            -Condition ($c8code -eq 1 -and $c8text -match 'final dv-import failed') `
+            -Detail "code=$c8code"
 
 Remove-Item -LiteralPath $c8 -Recurse -Force -ErrorAction SilentlyContinue
 
