@@ -530,7 +530,16 @@ try {
 }
 $c6text = if (Test-Path -LiteralPath $c6out) { Get-Content -LiteralPath $c6out -Encoding UTF8 -Raw } else { '' }
 
-Assert-That -Name 'detector exits 0' -Condition ($c6code -eq 0) -Detail "got $c6code"
+# --api points at the discard port, so the final dv-import cannot succeed, and
+# since 6526229 a failed FINAL import is a failed run. Exit 1 here is the new
+# contract working, not a regression: the wrapper reports loudly when the
+# container did not receive the scan's results. The walk completing is asserted
+# separately below via "scanned N file(s)".
+Assert-That -Name 'detector exits 1 when the final import cannot reach the API' `
+            -Condition ($c6code -eq 1) -Detail "got $c6code"
+Assert-That -Name 'and says why the run failed' `
+            -Condition ($c6text -match 'final dv-import failed') `
+            -Detail 'expected the explicit "container did not receive this scan'"'"'s results" line'
 Assert-That -Name 'no UnicodeEncodeError / traceback on the unencodable title' `
             -Condition ($c6text -notmatch 'UnicodeEncodeError' -and $c6text -notmatch 'Traceback') `
             -Detail (($c6text -split "`n" | Select-Object -Last 4) -join ' | ')
@@ -647,8 +656,16 @@ Assert-That -Name "the detector's error text is preserved in the result line" `
             -Condition ($c8text -match 'simulated extract failure') `
             -Detail 'the error was previously discarded, leaving unknowns undiagnosable at INFO'
 Assert-That -Name 'the layer is recorded as unknown' -Condition ($c8text -match '-> unknown in')
-Assert-That -Name 'the run still exits 0 (a failed file is not a failed run)' `
-            -Condition ($c8code -eq 0) -Detail "got $c8code"
+# A failed FILE must not abort the walk. That can no longer be read off the exit
+# code -- the discard-port API makes the final import fail, and since 6526229
+# that is exit 1 by design. So assert the property directly: the walk reached
+# its end and counted the file, rather than bailing out on the detection error.
+Assert-That -Name 'a failed FILE does not abort the walk (it completes and is counted)' `
+            -Condition ($c8text -match 'scanned 1 file\(s\)') `
+            -Detail 'the run must finish the walk and count the file despite its detection failing'
+Assert-That -Name 'exit 1 here comes from the unreachable API, not the failed file' `
+            -Condition ($c8code -eq 1 -and $c8text -match 'final dv-import failed') `
+            -Detail "code=$c8code; expected the final-import failure to be the stated cause"
 
 Remove-Item -LiteralPath $c8 -Recurse -Force -ErrorAction SilentlyContinue
 
