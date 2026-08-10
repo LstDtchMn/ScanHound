@@ -128,7 +128,12 @@ the **parser that produced the data**.
 
 **Consequence for the canary:** if the consolidation is deployed before the 711-target write, the
 staged artifact must be **re-derived under the deployed parser, not reused**. Their
-re-verification through the corrected parser stood at 291/716 with **0 disagreements** at handoff.
+re-verification is now **COMPLETE: 716/716 hold, 0 disagreements**, tested through this
+consolidation's own `dv_detect` from a worktree (the parser that will actually deploy, not a
+reimplementation), counted twice. **So the gate figures stand unamended — 711 targets, 5 explained
+non-targets, 0 replacements, 0 removals — and neither the canary nor the write is blocked on
+re-derivation.** The general rule still holds for any future parser change; this particular
+artifact is simply already re-derived.
 
 ## Suites
 
