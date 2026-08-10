@@ -41,7 +41,7 @@ from backend.download_outcome import (
     is_turnstile_console_failure,
     turnstile_challenge_evidence,
 )
-from backend.download_queue import DownloadQueueService
+from backend.download_queue import DownloadQueueError, DownloadQueueService
 from backend.queue_recovery_policy import (
     ACTION_ADVICE, ACTION_ATTENTION_REQUIRED, AUTHORISED, NEEDS_HUMAN,
     SAFETY_HOLD, UNOWNED_REASON, VERIFICATION_HOLD, ItemFacts, SharedFacts,
@@ -453,6 +453,22 @@ def _rig(db, count, interval_minutes=0):
     return svc, download, batch["batch_uuid"]
 
 
+def _drive_to_quiescence(svc, limit=64):
+    """Claim and execute every due item until none remain.
+
+    FOLD, from agent/turnstile-classification's stricter harness: a held sibling
+    that is wrongly promoted is only caught if something actually TRIES to run
+    it. Asserting call_count against a queue nobody drove would pass on an
+    implementation that promotes a held row but is never exercised. This runs
+    the real claim→execute path, so a promotion becomes a transport attempt.
+    """
+    for _ in range(limit):
+        item = svc._claim_due()
+        if item is None:
+            return
+        svc._execute(item)
+
+
 def _state_counts(db, batch_uuid):
     rows = db._query_dicts(
         "SELECT state, COUNT(*) n FROM download_queue_items "
@@ -501,12 +517,60 @@ def test_the_load_bearing_negative_control(tmp_path):
         _expire_every_cooldown(db)
         for _ in range(4):
             svc._maybe_auto_resume()
+        # DRIVE the queue: if any held sibling was wrongly promoted, this runs
+        # it, turning the bug into a real transport attempt rather than a soft
+        # state check that a never-executed queue would pass.
+        _drive_to_quiescence(svc)
         assert svc._claim_due() is None, (
             "an expired timer made a held item claimable")
         assert download.download_item.call_count == 1, (
             "an automatic retry re-entered the failing challenge")
         assert _state_counts(db, batch) == counts, (
             "timer expiry changed the episode's state")
+    finally:
+        db.close()
+
+
+def test_the_rig_can_promote_when_nothing_is_held(tmp_path):
+    """POSITIVE CONTROL for the negative control above.
+
+    FOLD, from agent/turnstile-classification: without this, the 22-item
+    negative control passes on a rig that never promotes ANYTHING. Same shape —
+    22 items, an ordinary source pause (NO verification hold) — must, after the
+    cooldowns expire, promote every deferred row. If this fails, the negative
+    control's "nothing ran" proves nothing.
+    """
+    db = DatabaseManager(str(tmp_path / "positive.db"))
+    try:
+        download = MagicMock()
+        download.download_item.return_value = _success_outcome()
+        svc = DownloadQueueService({}, db, download)
+        svc._coordinator_snapshot = MagicMock(return_value={"blocked": False})
+        batch = svc.schedule_batch(
+            [{"url": f"https://hdencode.org/p-{i}-2160p/", "title": f"P{i}",
+              "media_type": "movie"} for i in range(22)],
+            interval_minutes=0, mode="immediate",
+            auto_resume_after_cooldown=True)["batch_uuid"]
+        # Park as an ORDINARY throttle: source_deferred, NO hold.
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE download_queue_items SET state='waiting_source', "
+                "queue_reason='source_deferred', cooldown_until=?, "
+                "last_reason_code='source_temporarily_blocked' WHERE batch_uuid=?",
+                (PAST_S, batch))
+            conn.execute(
+                "UPDATE download_queue_batches SET state='paused_source', "
+                "cooldown_until=? WHERE batch_uuid=?", (PAST_S, batch))
+        assert _hold(db, batch) is None, "this control must have NO hold"
+        assert _state_counts(db, batch).get("waiting_source") == 22
+
+        _expire_every_cooldown(db)
+        for _ in range(4):
+            svc._maybe_auto_resume()
+        promoted = _state_counts(db, batch)
+        assert promoted.get("ready") == 22, (
+            f"an unheld batch must fully promote — the rig is inert otherwise: "
+            f"{promoted}")
     finally:
         db.close()
 
@@ -713,6 +777,65 @@ def test_a_reveal_success_with_a_failed_delivery_still_releases_the_hold(tmp_pat
             "delivery failed")
         assert _state_counts(db, batch).get("failed") == 1, (
             "the delivery failure is still recorded as a failed item")
+    finally:
+        db.close()
+
+
+def test_resume_batch_is_refused_while_a_hold_is_open(tmp_path):
+    """FOLD (agent/turnstile-classification): the manual resume_batch path must
+    not fan a held batch into the challenge. The base guarded retry_ready but
+    left resume_batch promoting every deferred row without calling decide()."""
+    db = DatabaseManager(str(tmp_path / "resumeguard.db"))
+    try:
+        svc, download, batch = _rig(db, count=3)
+        svc._execute(svc._claim_due())          # → held
+        with pytest.raises(DownloadQueueError) as exc:
+            svc.resume_batch(batch, 0)
+        assert "verification challenge" in str(exc.value).lower()
+        assert not _state_counts(db, batch).get("ready"), (
+            "no held row may have been promoted")
+        assert _hold(db, batch) == "hdencode"
+    finally:
+        db.close()
+
+
+def test_clear_verification_hold_releases_the_siblings(tmp_path):
+    """FOLD: the operator escape hatch. A permanently-challenged source would
+    otherwise deadlock — the only automatic clear is a reveal success the hold
+    blocks. An explicit operator clear releases the source hold; the
+    source_deferred siblings then auto-resume, while the challenge trigger stays
+    held by its own reason and needs a single probe."""
+    db = DatabaseManager(str(tmp_path / "clearhold.db"))
+    try:
+        svc, download, batch = _rig(db, count=4)
+        svc._execute(svc._claim_due())          # → held (1 trigger + 3 siblings)
+        assert _hold(db, batch) == "hdencode"
+
+        result = svc.clear_verification_hold("hdencode")
+        assert result["cleared"] >= 1
+        assert _hold(db, batch) is None, "the operator clear must release the hold"
+
+        _expire_every_cooldown(db)
+        for _ in range(3):
+            svc._maybe_auto_resume()
+        counts = _state_counts(db, batch)
+        assert counts.get("ready") == 3, (
+            f"the source_deferred siblings must recover after the clear: {counts}")
+        assert counts.get("verification_required") == 1, (
+            "the trigger is held by its own reason and still needs a probe")
+    finally:
+        db.close()
+
+
+def test_clear_verification_hold_is_source_matched(tmp_path):
+    """Clearing one source must not release a hold on another."""
+    db = DatabaseManager(str(tmp_path / "clearsrc.db"))
+    try:
+        svc, download, batch = _rig(db, count=2)
+        svc._execute(svc._claim_due())          # → hdencode held
+        svc.clear_verification_hold("ddlbase")  # a different source
+        assert _hold(db, batch) == "hdencode", (
+            "clearing a different source must not touch the hdencode hold")
     finally:
         db.close()
 

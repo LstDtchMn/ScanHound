@@ -74,6 +74,10 @@ class ResumeBatchRequest(BaseModel):
     interval_minutes: int = 10
 
 
+class ClearVerificationHoldRequest(BaseModel):
+    source: str = "hdencode"
+
+
 class ScrapeRequest(BaseModel):
     url: str
     service_type: str = "Rapidgator"
@@ -323,6 +327,23 @@ def resume_download_batch(
     except Exception as exc:
         detail = exc.detail() if hasattr(exc, "detail") else str(exc)
         raise HTTPException(status_code=409, detail=detail)
+
+
+@router.post("/verification-hold/clear")
+def clear_verification_hold(
+    req: ClearVerificationHoldRequest,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    """Operator escape hatch: abandon an open verification hold for a source.
+
+    Wired here because the fold's source branch had the service method but no
+    route, so an operator had no way to reach it. See
+    DownloadQueueService.clear_verification_hold.
+    """
+    queue = reg.download_queue
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Download queue not available")
+    return queue.clear_verification_hold(req.source)
 
 
 @router.delete("/batches/{batch_uuid}")

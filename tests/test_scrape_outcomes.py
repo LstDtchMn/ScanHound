@@ -179,6 +179,64 @@ def test_embedded_challenge_iframe_on_a_working_reveal_is_not_a_challenge(monkey
     coordinator.observe_challenge.assert_not_called()
 
 
+def test_body_only_interstitial_no_title_still_classifies(monkeypatch):
+    # FOLD regression guard (both branches' partitions had this shape): a
+    # Cloudflare interstitial that renders its phrase in the BODY, with no
+    # <title> and a challenge iframe, must still be INTERACTIVE_CHALLENGE — not
+    # demoted to LAYOUT_CHANGED. An embedded iframe alone is gated on a not-ready
+    # reveal; the body interstitial phrase alongside the iframe makes it a
+    # top-level challenge regardless of reveal state. Caught by the full suite,
+    # not review, when this regressed before.
+    service = _service()
+    coordinator = MagicMock()
+    coordinator.observe_challenge.return_value = SimpleNamespace(cooldown_until=None)
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator)
+    driver = MagicMock()
+    driver.title = ""                    # NO <title>
+    # Body carries ONLY the broader title-category phrases ("just a moment",
+    # "attention required") — NOT the standalone visible markers ("checking your
+    # browser" / "verify you are human"), so this exercises the iframe-gated
+    # body-interstitial path specifically, not the pre-existing visible markers.
+    driver.page_source = """
+        <html><body>
+        <h1>Just a moment…</h1>
+        <p>Attention required. Please wait while your request is reviewed.</p>
+        <iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if"></iframe>
+        </body></html>
+    """
+    # No reveal_tier passed — a genuine interstitial has no reveal control.
+    diagnostic = service._log_page_diagnostics(
+        driver, stage="access_control", source_kind="hdencode")
+    assert diagnostic.code is ScrapeCode.INTERACTIVE_CHALLENGE
+    assert diagnostic.affected_scope == "source"
+
+
+def test_body_title_phrase_without_an_iframe_is_not_a_challenge(monkeypatch):
+    # The conjunction guard for the BROADER title phrases: a release page whose
+    # body happens to contain an ambiguous phrase like "just a moment" or
+    # "access denied", with NO rendered challenge iframe, must NOT be treated as
+    # a source-wide interstitial. (The narrow phrases "checking your browser" /
+    # "verify you are human" remain standalone evidence — that is pre-existing
+    # base behaviour these ambiguous ones deliberately do not share.)
+    service = _service()
+    coordinator = MagicMock()
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator)
+    driver = MagicMock()
+    driver.title = "Some.Release.2026.2160p.WEB-DL"
+    driver.page_source = """
+        <html><body>
+        <article>Just a moment of your time — a great 2160p release. No
+        access denied here, just links.</article>
+        </body></html>
+    """
+    diagnostic = service._log_page_diagnostics(
+        driver, stage="access_control", source_kind="hdencode")
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE
+    coordinator.observe_challenge.assert_not_called()
+
+
 def _perf_entry(url, headers, *, rtype="Document"):
     import json
     return {

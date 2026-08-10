@@ -2004,12 +2004,93 @@ class DownloadQueueService:
             self._last_auto_resumed_batches = set()
         self._last_auto_resumed_batches.add(str(batch_uuid))
 
+    @staticmethod
+    def _source_is_held(conn, source: Optional[str]) -> bool:
+        """True while a verification hold is open for this SOURCE (any batch).
+
+        The single source-scoped hold predicate, so `resume_batch`, `retry_ready`
+        and the escape hatch all judge the same fact the same way `decide()` does.
+        """
+        if not source:
+            return False
+        return conn.execute(
+            "SELECT 1 FROM download_queue_batches "
+            "WHERE verification_hold_source = ? LIMIT 1",
+            (source,),
+        ).fetchone() is not None
+
     def resume_batch(self, batch_uuid: str, interval_minutes: int = 10) -> dict:
+        """Operator "resume everything". REFUSED while a verification hold is open.
+
+        FOLD, round-2 review + `agent/turnstile-classification` port. This is the
+        manual counterpart to auto-resume and it releases every deferred row in
+        the batch at once — correct for a merely-throttled source, wrong for one
+        presenting a challenge, because it hands the whole batch to a door
+        measured to be shut and spends every item's attempt to learn one fact.
+        The base guarded the bulk `retry_ready` path but NOT this one: its
+        non-automated branch promotes all deferred rows without calling
+        `decide()`, an unguarded second door. It now refuses, rather than
+        silently downgrading, and points at the single-item probe. (`retry_ready`
+        keeps its exclude-and-report behaviour for the bulk-button UX.)
+        """
+        with self.db.transaction() as conn:
+            if not conn:
+                raise DownloadQueueError("The database is unavailable.")
+            sources = [
+                str(row["source"])
+                for row in conn.execute(
+                    "SELECT DISTINCT source FROM download_queue_items "
+                    "WHERE batch_uuid = ?",
+                    (batch_uuid,),
+                ).fetchall()
+            ]
+            blocked = sorted(s for s in sources if self._source_is_held(conn, s))
+        if blocked:
+            raise DownloadQueueError(
+                "This batch is held behind a verification challenge that "
+                f"ScanHound could not complete ({', '.join(blocked)}). Resuming "
+                "every item would present the same challenge to each of them in "
+                "turn. Retry a single item to test whether it has lifted; the "
+                "rest are released automatically once one succeeds."
+            )
         return self._resume_batch(
             batch_uuid,
             interval_minutes=interval_minutes,
             automated=False,
         )
+
+    def clear_verification_hold(self, source: str = "hdencode") -> dict:
+        """Operator action: abandon an open verification hold for a source.
+
+        FOLD port of `agent/turnstile-classification`'s `clear_challenge_episode`,
+        adapted to this branch's `verification_hold_source` column. THE ESCAPE
+        HATCH THAT MAKES THE STRICT RELEASE RULE SAFE: because the hold clears
+        only on an affirmative source reveal (never a timer), it can otherwise
+        outlive everything it held — a permanently-challenged source would
+        deadlock, its only exit being to cancel the items. This gives the
+        operator a way to say "I have dealt with this" without a successful grab.
+
+        Deliberately NOT wired to any timer and NOT called by
+        `_maybe_auto_resume`: a hold automatic recovery can clear by itself is
+        not a hold. A human passing the same challenge in their own browser is
+        also not a reason to auto-clear — it proves the challenge is passable,
+        not that OUR session can pass it — which is exactly why release stays
+        manual here and affirmative-only in `_release_verification_hold`.
+        """
+        with self.db.transaction() as conn:
+            if not conn:
+                raise DownloadQueueError("The database is unavailable.")
+            cleared = conn.execute(
+                "UPDATE download_queue_batches SET verification_hold_source = NULL "
+                "WHERE verification_hold_source = ?",
+                (source,),
+            ).rowcount
+        logger.info(
+            "Operator cleared the verification hold on %d batch(es) for %s.",
+            cleared, source,
+        )
+        self._wake.set()
+        return {"source": source, "cleared": cleared}
 
     def cancel_item(self, item_uuid: str) -> bool:
         now = _iso()
