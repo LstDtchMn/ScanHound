@@ -71,7 +71,9 @@ both integration cases, while the positive control passes on **both** arms.
 ## Suites
 
 ```
-full pytest                     see head commit / below
+full pytest (at 14d6b24)        4683 passed, 5 skipped, 0 failed  (12m13s)
+full pytest (with watermark)    running at time of writing
+DV suites + watermark           124 passed, 1 skipped
 test_dv_detect                  51 passed
 DV suites (4 files)             119 passed, 1 skipped
 scripts\test-dv-scan-streaming  45 assertions, 9 cases
