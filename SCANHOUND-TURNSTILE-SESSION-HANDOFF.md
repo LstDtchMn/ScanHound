@@ -328,6 +328,104 @@ passed, fixture as the only change.**
 
 ---
 
+## 8a. PEER COORDINATION OUTCOME — read this before using §8
+
+**Three sessions independently built overlapping ScanHound work on 2026-08-10.**
+This branch and `claude/scanhound-turnstile-verification-hold-z43q0x`
+(head `c05186c`) built the *same feature*, both from `main` at `6813260`, with
+**17 conflict markers across 10 files** (measured by a real merge in a throwaway
+worktree; both source branches untouched).
+
+### Joint decision, reached on the merits by both sessions
+
+> **`claude/scanhound-turnstile-verification-hold-z43q0x` is the BASE.
+> `agent/turnstile-classification` folds onto it.**
+> Neither session merged or folded anything. The DV consolidation session is the
+> consolidation point.
+
+**Why the other branch won, decided against this one's author's interest:**
+
+1. **It exposed a real defect here.** This branch's hold closure fires only from
+   `_complete` — **never from `_fail`** (verified: zero references in the `_fail`
+   body). So a *successful reveal* followed by a failed JDownloader handoff
+   leaves the hold open and every sibling parked on stale evidence. Their
+   `source_reveal_succeeded` fires from **both** paths. This branch is simply
+   wrong where theirs is right.
+2. Two review rounds to this branch's one, and a mutation-verified suite.
+3. A **live active-stall capture** — evidence this session tried for and failed
+   to get (six reloads, all healthy). Their 10-minute polling watcher caught it
+   on cycle 20.
+
+### A claim from §5/§6 that is WITHDRAWN
+
+Earlier in this session I described this branch as an "architectural superset"
+with the other having "zero episode semantics". **Both wrong.** I grepped for my
+own naming (`challenge_episode`) instead of reading their code: they hold
+siblings via `verification_hold_source` joined on source, and they have the
+interstitial/embedded partition. The branches converged far more than reported,
+and on the containment representation theirs may be the better shape — a source
+string makes the scope explicit in the data where an opaque episode id derives it
+through a join. **Do not use this document's comparison to justify a base
+choice; it has been superseded by the joint decision above.**
+
+### Port FROM this branch onto theirs (each gap confirmed by that session)
+
+1. **`clear_challenge_episode()`** — explicit operator abandon, ~15 lines. They
+   have **no equivalent**; their only clear is a reveal success, so a
+   permanently-challenged source **deadlocks**: no successful grab is possible
+   because the hold blocks it, and the only exit is cancel.
+2. **`resume_batch` guard.** Theirs is half-done — round 2 made `retry_ready`
+   exclude held rows, but `resume_batch`'s non-automated branch promotes all
+   deferred rows **without calling `decide()`**, so a manual batch resume fans
+   out. Their stated preference: keep `retry_ready`'s exclude-and-report UX and
+   add this branch's `resume_batch` raise. **Reconcile; do not take either
+   wholesale.**
+3. **The 22-item harness that RAISES on any unscripted `download_item`** (theirs
+   asserts `call_count == 1`, which is softer) **plus the paired positive
+   control** proving the rig can promote when nothing is held — they confirmed
+   that control is missing on their side. Without it the whole test passes on a
+   rig that never promotes anything.
+4. Diff `_form_posts_unlock` against their reveal-form logic.
+
+### The highest-risk item for the combined peer round
+
+My first interstitial/embedded partition **over-narrowed** and demoted genuine
+Cloudflare interstitials from `INTERACTIVE_CHALLENGE` to `LAYOUT_CHANGED` — "a
+challenge blocked us" became "the scraper is broken". Caught by the full suite,
+**not by review**, because "just a moment" is matched against `<title>` and a
+body-only interstitial had only iframe evidence. **Both branches' partitions have
+this shape.** If the combination resolves it by taking either side wholesale the
+regression returns silently.
+
+**Required test:** body-only interstitial, **no `<title>`**, iframe present →
+still `INTERACTIVE_CHALLENGE`. The other session confirmed their
+`test_scrape_outcomes` covers title-based interstitials but **not** this case.
+
+### Migrations: keep both
+
+Their inline v9 is a confirmed **no-op on current data** — the live parked rows
+are `reveal_verification_stalled`, predating the classifier, so no
+`verification_required` + `interactive_challenge` trigger exists in production.
+Both sessions verified this independently. Their v9 is correct going forward;
+this branch's `scripts/migrate_challenge_episode.py` with explicitly named IDs is
+the auditable path for a named incident.
+
+### Non-claims neither branch closes
+
+* Cross-batch containment beyond auto-resume leans on the coordinator's
+  **in-memory** cooldown, which resets on container restart.
+* A **non-Turnstile** captcha frame on a not-ready reveal classifies source-wide
+  in **both** branches — a generic frame carries no form association to test.
+
+### Date bomb
+
+`a88d541` is the one to keep. `fix/policy-tests-wall-clock` (`9f28ba4`) is
+confirmed redundant — same autouse mechanism, and `a88d541` adds a load-bearing
+far-side-of-`FUTURE` test plus an empirically measured canary. Jesse asked that
+the branch be left in place for the consolidation session to close.
+
+---
+
 ## 9. What is NOT claimed
 
 * **Not** that `navigator.webdriver` or the automation flags caused the
