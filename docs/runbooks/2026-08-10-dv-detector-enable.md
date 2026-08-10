@@ -1,116 +1,157 @@
 # Runbook — turning the DV host detector ON
 
-**Status:** DRAFT for Jesse. The DV post-rows code is **deployed** on prod (`main` @ `ad54e6a`,
-image `496dfae5`) but the host detector is **not scheduled and cannot authenticate yet**. This
-runbook is the checklist to close the remaining gates and switch it on. Nothing here is
-destructive; the enable step (scheduling) is Jesse's.
+**Status:** DRAFT for Jesse, **revised after peer review** (2026-08-10). The DV post-rows code is
+**deployed** on prod (`main` @ `ad54e6a`, image `496dfae5`) but the host detector is **not
+scheduled and cannot authenticate yet**. This is the checklist to close the remaining gates. The
+enable step (scheduling) is Jesse's. Nothing here is destructive.
+
+> **Peer review folded in.** All five findings were verified against the code before adoption:
+> (1) a login-session token is a **30-day full-API** credential, not detector-scoped — the auth
+> recommendation changed to a scoped ingest key; (2) the fixed-sentinel canary could false-green —
+> now a unique sentinel with response + absence + deletion asserts; (3) the 330-min PT6H budget was
+> too tight — now 300; (4) `dv_file_tagging=true` mutates media — now an explicit off gate; (5)
+> least-privilege task, single-instance, loopback transport.
 
 ## What is already true (deployed, verified 2026-08-10)
 
 - `POST /rename/dv-host-rows` is registered and live. It returns **HTTP 401** — the route works,
   it is just auth-gated.
-- The container migrated `crawler.db` to schema **v9**; `dv_scan` upserts now fail loudly (a
-  failed write can no longer report success — round-4 fix).
-- The detector (`scripts/host-detector/dv_host_scan.py`) reads its own `dv_host.db` on the host
-  and POSTs rows in the request body — no bind-mount read. It sends `schema_version: 1`.
+- The container migrated `crawler.db` to schema **v9**; `dv_scan` upserts now fail loudly.
+- The detector reads its own `dv_host.db` on the host and POSTs rows in the request body (no
+  bind-mount read), sending `schema_version: 1`. With `dv_file_tagging=true` it also runs
+  `mkvpropedit` and **modifies the MKV** — so it is not read-only in that mode.
 
-## Gate 1 — AUTH (this is the real blocker, and it needs your decision)
+## Gate 1 — AUTH (the real blocker; needs your decision)
 
-**Why 401:** the app runs with `--no-auth`, which only disables the *desktop nonce*. It does **not**
-disable the password gate. A password is set on prod (that is why the route 401s), so every
-`/rename` request must carry `Authorization: Bearer <token>`, where the token is a **login-session
-token** minted by `POST /auth/login` with the admin password. The detector currently sends **no**
-auth header, so it is rejected.
+**Why 401:** the app runs `--no-auth`, which disables only the *desktop nonce*. The password gate
+is active, so every `/rename` request needs `Authorization: Bearer <token>`. `token_authorized()`
+accepts a valid **session token** (or the now-empty nonce) — and it applies **no path or method
+scope**: any unexpired session token authorizes the *entire* protected API. `/auth/login` issues
+session tokens with a **30-day TTL** (`SESSION_TTL_DAYS = 30`).
 
-**The detector needs a code change** (small) plus a **credential you supply** (I will not reuse any
-password/token I find on disk). The change: obtain a token and send it on every POST; on a 401,
-re-authenticate once and retry. Where the token comes from is the decision:
+**The blast-radius fact that drives this decision:** `/rename` includes destructive routes —
+`/jobs/{id}/apply`, `/jobs/{id}/undo`, `DELETE /jobs/{id}`, `/jobs/bulk/apply`, `/jobs/bulk/delete`,
+`/trash/delete`, `/trash/empty`, `/process-folder`. A session token stolen from the detector host
+is therefore a 30-day key to **move and delete media files**, not merely to poison DV inventory.
 
-| Option | How it works | Trade-off |
-|---|---|---|
-| **A. Pre-minted token (recommended)** | You log in once (`POST /auth/login`), get a long-lived session token, store it on the host in a file the scheduled task reads into `SCANHOUND_API_TOKEN`. Detector sends it as Bearer; on 401 it logs the token as expired and exits non-zero (no password on the host). | Simplest + no password stored on the host. Token expires eventually (`session_expiry()`) → you re-mint. No new app code beyond the detector. |
-| **B. Password in env** | Store the admin password on the host as `SCANHOUND_API_PASSWORD`; the detector logs in each run to mint a fresh token, then POSTs. | Self-renewing (never expires), but the **admin password sits on the host** in whatever the scheduled task can read. Larger blast radius if the host is compromised. |
-| **C. Dedicated service token (new app feature)** | Add a non-expiring, revocable service API key to the app (new table + `/auth` support), scoped ideally to `/rename` only. | Cleanest long-term and least privilege, but it is **new backend code + its own review round** — more work now. |
-| **D. Open the app** (`SCANHOUND_ALLOW_OPEN=1`) | Removes the gate entirely. | **Not recommended** — the app is reachable via `scanhound.turtleland.us`; this drops auth for everyone. |
+| Option | How it works | Pros | Cons |
+|---|---|---|---|
+| **C-min. Endpoint-scoped ingest key (peer + my recommendation)** | New backend: a 256-bit random secret; server stores `SHA-256(secret)`; middleware allows it **only** for `POST /rename/dv-host-rows` (constant-time compare), zero authority on every other route. Detector sends it as a header. | **Least privilege** — a stolen key can only poison DV inventory, never move/delete files. Non-expiring, individually revocable. Right long-term answer. | New backend code + its own review round before it can ship — slower to first DV run. |
+| **A. Pre-minted session token (temporary bridge)** | You mint one session (separate from the browser), store just the token on the host; detector sends it as Bearer; on 401 it logs "expired" and exits non-zero. | No new app code beyond the detector; fastest to first run. | It is a **30-day FULL-API** credential — a stolen token can move/delete files. Expires in 30 days → renewal procedure needed. Requires hardening (below). |
+| **B. Password in host env** | Detector stores the admin password, logs in each run. | Self-renewing. | **Rejected** — admin password at rest on the host mints fresh full-API sessions indefinitely; largest blast radius. |
+| **Cloudflare Access service token** | Machine token at the edge. | Good *second layer* if the detector must use the public hostname. | Does **not** replace ScanHound auth (origin still needs a credential); unnecessary for a same-host detector. |
+| **Reverse-proxy-injected bearer / mTLS / IP allowlist** | Proxy adds a credential / cert / network gate. | — | Proxy-injection is an auth-bypass risk and is **not recommended**; mTLS is overkill same-host; IP allowlist is defense-in-depth only, not authentication. |
 
-**My recommendation: A** for now (fastest, no password on disk, no new attack surface), with **C**
-as the eventual clean answer if the detector becomes long-lived infrastructure. Once you pick, I
-implement the detector change (add `--api-token`/`SCANHOUND_API_TOKEN`, Bearer header, 401 handling)
-with paired tests and mutation-verify it, same discipline as the rest of this work.
+**Recommendation: the endpoint-scoped ingest key (C-min).** It is a small, focused change (one
+secret, one middleware branch, negative-scope tests) — not a full service-token framework — and it
+is the only option where a compromised detector host cannot reach the destructive routes. **A** is
+an acceptable *temporary* bridge if you want DV running sooner, but only with the hardening below.
 
-## Gate 2 — exact-sentinel canary (prove VALUES land, not just counts)
+**If Option A (bridge) is chosen, required hardening:** mint a *separate* detector session (never
+the browser token); document the 30-day expiry + a renewal/failure procedure; store the token
+**outside the repo**, **not on the Task Scheduler command line**, in an ACL-restricted file
+readable only by the task identity + SYSTEM + Administrators (optionally DPAPI-protected).
 
-Count equality proves cardinality, not correctness. Before scheduling, push **one known sentinel
-row** through the live endpoint and confirm its exact values arrive in prod `crawler.db.dv_scan`.
+**Transport (both options):** point the detector at **`http://127.0.0.1:9721`** (host loopback),
+not `scanhound.turtleland.us`. That keeps the machine credential off the public ingress path and
+avoids coupling a local batch job to Cloudflare/NPM availability. App auth is still required.
 
-Run on the host once auth (Gate 1) is wired, against the prod app:
+Once you pick, I implement it with paired negative-scope tests and mutation-verify, then it gets
+its own peer review round before deploy (per your call).
+
+## Gate 2 — exact-sentinel canary (unique, response-checked)
+
+Count equality proves cardinality, not correctness — and a *fixed* sentinel can false-green: if a
+prior canary row was left behind and the new POST 401s, a values-only check still sees the old row.
+So: **unique per-run sentinel, prove it is absent first, assert the HTTP response, assert the exact
+persisted values, then assert exactly one deletion** (trap/finally so a failed assert never leaves
+a stale row). Use the loopback URL and the Gate-1 credential.
 
 ```bash
-# 1. Push one sentinel row (with the Bearer token from Gate 1).
-curl -s -X POST https://scanhound.turtleland.us/rename/dv-host-rows \
-  -H "Authorization: Bearer $SCANHOUND_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"schema_version":1,"source_rows":1,"rows":[{"path":"__CANARY__/dv-enable-check.mkv","dv_layer":"fel","sig_mtime":1.0,"sig_size":42,"title":"DV enable canary"}]}'
-# Expect: {"ok":true,"source_rows":1,"processed":1,"imported":1,"updated":0,"failed":0}
+# Unique sentinel per run (no Date.now on the host? use a run tag you pass in).
+SENTINEL="__CANARY__/dv-enable-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM.mkv"
+
+# 0. Precondition: prove the sentinel is ABSENT.
+docker exec scanhound python -c "import sqlite3,sys;c=sqlite3.connect('/dbvol/crawler.db');n=c.execute('SELECT count(*) FROM dv_scan WHERE path=?',['$SENTINEL']).fetchone()[0];sys.exit(0 if n==0 else 1)" || { echo 'sentinel already present — abort'; exit 1; }
+
+# 1. POST it (loopback, Gate-1 credential) and REQUIRE the exact JSON + 2xx.
+resp=$(curl -s -w '\n%{http_code}' -X POST http://127.0.0.1:9721/rename/dv-host-rows \
+  -H "<gate-1 auth header>" -H "Content-Type: application/json" \
+  -d "{\"schema_version\":1,\"source_rows\":1,\"rows\":[{\"path\":\"$SENTINEL\",\"dv_layer\":\"fel\",\"sig_mtime\":1.0,\"sig_size\":42,\"title\":\"DV enable canary\"}]}")
+echo "$resp" | tail -1 | grep -qx 200 || { echo "POST not 200: $resp"; exit 1; }
+echo "$resp" | head -1 | grep -q '"ok": *true' && echo "$resp" | head -1 | grep -q '"processed": *1' && echo "$resp" | head -1 | grep -q '"failed": *0' || { echo "response body failed assert: $resp"; exit 1; }
+
+# 2. Prove the EXACT values persisted.
+docker exec scanhound python -c "import sqlite3;c=sqlite3.connect('/dbvol/crawler.db');r=c.execute('SELECT path,dv_layer,sig_mtime,sig_size,title,source FROM dv_scan WHERE path=?',['$SENTINEL']).fetchone();assert r==('$SENTINEL','fel',1.0,42,'DV enable canary','scan'),('MISMATCH',r);print('VALUES OK')"
+
+# 3. Cleanup: delete exactly one row.
+docker exec scanhound python -c "import sqlite3;c=sqlite3.connect('/dbvol/crawler.db');c.execute('DELETE FROM dv_scan WHERE path=?',['$SENTINEL']);c.commit();assert c.total_changes==1,('expected 1 deletion',c.total_changes);print('CANARY OK — cleaned up')"
 ```
 
-```bash
-# 2. Confirm the EXACT values persisted in prod crawler.db (run in the container).
-docker exec scanhound python -c "import sqlite3;c=sqlite3.connect('/dbvol/crawler.db');r=c.execute(\"SELECT path,dv_layer,sig_mtime,sig_size,title,source FROM dv_scan WHERE path='__CANARY__/dv-enable-check.mkv'\").fetchone();print('PERSISTED:',r);assert r==('__CANARY__/dv-enable-check.mkv','fel',1.0,42,'DV enable canary','scan'),'VALUES MISMATCH';print('CANARY OK')"
-```
+This curl canary proves the **endpoint + storage mapping**. It does not exercise the detector's own
+`_post_rows()` sender — that is covered by the auth-implementation tests and the supervised first
+run (Gate 4).
 
-```bash
-# 3. Remove the sentinel so it never pollutes real data.
-docker exec scanhound python -c "import sqlite3;c=sqlite3.connect('/dbvol/crawler.db');c.execute(\"DELETE FROM dv_scan WHERE path='__CANARY__/dv-enable-check.mkv'\");c.commit();print('canary removed, rows deleted=',c.total_changes)"
-```
+## Gate 3 — PT6H runtime guard (use 300, not 330)
 
-Only proceed if step 2 prints `CANARY OK`. A 401 here means Gate 1 is not actually solved.
+`--max-runtime-minutes` is checked **only between files**. Once a file starts, its worst-case tail
+is roughly: DV detect up to **1800 s** + optional `mkvpropedit` up to **300 s** + final POST up to
+**300 s** ≈ **40 min**. So a 330-min budget under a 360-min (PT6H) hard limit leaves only ~30 min —
+*less* than one file's tail. A file starting at minute 329 can blow past PT6H.
 
-## Gate 3 — PT6H runtime guard
-
-The detector self-stops between files once `--max-runtime-minutes` (default **330** = 5h30m) is
-used, which sits under a **PT6H** Windows Task Scheduler limit — the design that stops a hard-kill
-from losing the final row POST. Before scheduling, confirm:
-
-- the scheduled task's *Stop the task if it runs longer than* is **PT6H** (6 hours), and
-- the detector is invoked **without** overriding `--max-runtime-minutes` above ~330 (leave the
-  default, or set it explicitly to `330`).
-
-If the schedule interval is shorter than a full run (e.g. every 6h) and a run legitimately needs
-longer, use `--mode steady` for routine passes (only new/changed files, no retry sweep) so a run
-finishes well inside the budget; reserve `--mode backfill` for occasional full sweeps.
+- Initial deploy: **`--max-runtime-minutes 300`** (≈60-min reserve). 
+- Use `--mode steady` for routine passes (only new/changed files, no retry sweep) so runs finish
+  well inside budget; reserve `--mode backfill` for occasional full sweeps.
+- Mitigation already in place: interim cumulative POSTs every 25 files + the durable `dv_host.db`
+  mean a hard kill is **not** catastrophic (a later cumulative POST self-heals unpublished rows) —
+  but still target a clean final handoff, don't rely on recovery.
+- Future hardening (code round): propagate a hard deadline and refuse to *start* an expensive stage
+  when the shutdown reserve is insufficient.
 
 ## Gate 4 — scheduling (Jesse-only)
 
-Register a Windows Scheduled Task that runs the detector periodically. Claude cannot register a
-`RunLevel=Highest` task, so this step is yours. Key points from prior DV work:
+Register a Windows Scheduled Task; Claude cannot register elevated tasks. Requirements:
 
-- Run it from a **persistent path** — `Y:` has been a *per-session mapped* drive, which a Task
-  Scheduler task will not see. Use a fixed path for both the detector and its `--db`/scan roots.
-- Give the task the privilege it needs to read the library roots (elevation if the roots require
-  it).
-- Invocation shape (fill in real paths + the auth env from Gate 1):
+- **Least privilege, NOT `RunLevel=Highest` by default.** Use a dedicated task identity with only:
+  read/execute on Python + detector code + `dovi_tool`; read on the media roots; read/write on the
+  `dv_host.db` dir, the detector logs, and the credential file. Grant media **write** only if
+  tagging is intentionally enabled.
+- **Single instance: `MultipleInstances=IgnoreNew`.** Overlapping runs duplicate expensive media
+  reads, share one `dv_host.db`, and (if tagging is on) could both edit MKV headers.
+- **`dv_file_tagging=false` for the first enablement** (it defaults false — keep it so). With it
+  true the detector mutates media via `mkvpropedit`; do not combine "first unattended run" with
+  "media writes" unless that is explicitly the plan.
+- **Persistent paths, verified under the TASK identity** (not your interactive shell): local
+  absolute paths for script/config/DB/logs; **UNC** paths for network media (a per-session mapped
+  `Y:` is invisible to Task Scheduler); the task identity needs both SMB-share and NTFS rights.
+- Before unattended operation, prove under the task identity that: `python` resolves, `dovi_tool`
+  resolves, the config exists, the `dv_host.db` dir is writable, all library roots are readable, the
+  API endpoint is reachable, and the credential file is readable.
+- Invocation shape (fill in real paths + Gate-1 auth env):
   ```
   python <repo>\scripts\host-detector\dv_host_scan.py \
     --config <persistent>\dv_host.json --db <persistent>\dv_host.db \
-    --api https://scanhound.turtleland.us --mode steady --max-runtime-minutes 330
+    --api http://127.0.0.1:9721 --mode steady --max-runtime-minutes 300
   ```
-- Set the task's *execution time limit* to PT6H (Gate 3).
-- Do a first **supervised** run and watch the container logs for the row POST + a non-401 result
-  before trusting the schedule.
+- Set the task's *execution time limit* to PT6H.
 
 ## Rollback / safety
 
-- Nothing here changes prod behaviour until Gate 4 (scheduling) runs — the detector is inert until
-  invoked.
-- Pre-deploy DB backup already exists: `/dbvol/crawler.db.pre-deploy-20260810` (schema v8).
-- The canary row is namespaced `__CANARY__/…` and deleted in Gate 2 step 3; it never touches real
-  library paths.
+- Nothing here changes prod behaviour until Gate 4 runs — the detector is inert until invoked.
+- Pre-deploy DB backup exists: `/dbvol/crawler.db.pre-deploy-20260810` (schema v8).
+- The canary row is namespaced `__CANARY__/…`, proven absent before insert and deleted after; it
+  never touches real library paths.
 
-## Order of operations
+## Order of operations (revised)
 
-1. **You pick the auth option (Gate 1).**
-2. I implement + test the detector auth change; push for a quick review.
-3. Run the canary (Gate 2) against prod → must print `CANARY OK`.
-4. Confirm the PT6H guard (Gate 3).
-5. You register the scheduled task (Gate 4) and do one supervised run.
+1. **You pick the auth option (Gate 1)** — endpoint-scoped ingest key (recommended) or the
+   hardened pre-minted-token bridge.
+2. I implement + test it (negative-scope tests for the key; sender/401 tests either way), push for
+   its own peer review round.
+3. Run the unique, response-checked canary (Gate 2) over **loopback** → must print `CANARY OK`.
+4. Confirm the PT6H reserve (Gate 3, `--max-runtime-minutes 300`).
+5. Verify `dv_file_tagging=false` unless media writes are intended.
+6. You register the least-privileged, single-instance task on persistent/UNC paths (Gate 4),
+   verify the environment under the task identity, and do one supervised run watching for: live
+   progress, interim/final `dv-host-rows OK`, no 401, normal detector exit, a successful Task
+   Scheduler result, and container DV rows advancing.
