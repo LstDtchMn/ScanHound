@@ -209,6 +209,44 @@ restoring it returns exit 0. So the gate is the invariant the reviewer asked
 for — **zero unexplained mismatches, not a coverage percentage** — and adding a
 new exception is now a deliberate act rather than an omission.
 
+## FINAL SET — probe complete, all four gates re-run
+
+The bounded probe finished: **2,738 movies, 716 FEL (26%), 0 errors, 109
+minutes**. All four gates re-run against the frozen final artifact, per the
+sign-off condition. The earlier 694/689 figures are left above deliberately so
+the signed-off population stays visible.
+
+```
+GATE 1  staged rows            716      histogram {'fel': 716}
+        not-proven-FEL staged    0      (2,022 negatives, none staged)
+GATE 2  Plex paths indexed   86,041     positive control PASS
+        matched                711
+        unmatched                5      zero UNEXPLAINED -> invariant holds
+GATE 4  snapshotted            711      currently labelled: 0
+        replacements             0      removals: 0
+ACCOUNTING  Plex-effect rows   711  ==  rollback population 711
+SCRIPT EXIT CODE                 0
+```
+
+**The five unmatched are the same five**, still individually explained — no new
+mismatch appeared as the population grew from 694 to 716, which is the outcome
+that would have indicated a systematic rewrite failure. Expected mutation set:
+
+```
++711 DV FEL
+   0 replacements
+   0 removals
+```
+
+Against the reviewer's ten final-run acceptance criteria: 1–6 and 8–9 are
+satisfied by the run above. **7 (apply path additive_only=True) and 10 (nothing
+changes between snapshot and execution) are deployment-time conditions**, not
+staging ones — criterion 7 in particular cannot be satisfied until this branch
+is deployed, because the running container still carries the old destructive
+default. The ordering that resolves this is section 8 of
+`dv-scan-deploy-checklist.md`: deploy, verify the deployed default, re-snapshot,
+dry-run, then apply.
+
 ## What is still outstanding
 
 The probe is not finished: 694 positives from **1,977 of 2,740** titles. The
