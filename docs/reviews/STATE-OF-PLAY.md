@@ -140,3 +140,59 @@ output rather than by reasoning about the code.
 
 The related habit, from the other session, while re-verifying a result it had already correctly
 predicted: **"predicted by the evidence" and "measured" are different claims.**
+
+---
+
+## 6. The DV root cause, and the dead ends — do not re-derive these
+
+The whole DV effort started from "extractions hit the 30-minute timeout, so scale the timeout by
+file size." **That premise was wrong and the obvious fixes are all disproved.** Anyone meeting a
+DV timeout will reach for one of these; each already cost hours.
+
+**Throughput was never the problem.** Healthy files run **57–153 MB/s** end-to-end against a
+storage path that streams **145–221 MB/s** — including 221 MB/s reading straight across the byte
+offset where extraction freezes. At the slowest observed healthy rate the 30-minute cap covers
+103 GB, more than the largest file in the library.
+
+**The actual fault: two Profile 7 FEL titles wedge `dovi_tool`.** Sampled on the live process over
+a 60-second window: **0 bytes read, 0 read operations, 95.7% of one core**, output file still 0
+bytes, after reading 27.37 GB of 74.3 GB. A hang, not slow progress.
+
+| do not try | why it fails |
+|---|---|
+| **Scale the timeout by file size** | The file is frozen, not slow. A bigger cap grants a wedged file *more* time — it would take the loss from ~1 h per run to ~3 h. |
+| **Upgrade dovi_tool** | **2.3.3 does not fix it.** Tested because its changelog reads like the symptom ("extract-rpu now properly exit with errors for invalid inputs"). It hangs 2,465 bytes from where 2.3.2 does. |
+| **Blame SMB / the network** | The whole file was copied to local NTFS. It stalls there too, *faster* (377 s vs 505 s) because the local read reaches the poisoned offset sooner. |
+| **Test with a truncated copy** | `dovi_tool` rejects a truncated MKV in 0 s with `rc=1`, which reads as "completed without stalling" and produces the opposite conclusion. Use the complete file. |
+
+Five stalls inside a **~68 KB window** across two versions × two storage paths. Frame-bracketed by
+bisection: Jurassic World Rebirth completes at `-l 68018` and hangs at `-l 69577`; Death Wish 3 at
+80,487 / 82,046. **Cause still unknown.** Report drafted at
+`docs/reviews/peer-rounds/dovi-tool-extract-rpu-hang-report.md`, not filed.
+
+**The fix that works** is a bounded read: `-l 1000` answers both wedged titles in 3–20 s and both
+are FEL. Validated 22/22 against titles with known full-pass labels. Only FEL may short-circuit —
+a bounded sample containing FEL *proves* FEL, while a sample showing only MEL proves nothing.
+
+### Coverage, measured
+
+Two closed questions, so they are not re-investigated:
+
+- The 197 files in plain `4K` folders beside the scanned `4K DV` folders are **genuinely non-DV** —
+  12-file random sample across all four drives, 0 with any RPU.
+- **`4K HDR Colombo` is 11,547 TV files**, not movies. Correctly out of scope.
+
+Still open: **2,827 unscanned 4K movies (147 TB)** on local volumes, only 87 ever scanned. Plex
+addresses them by junction path (`C:\4K Drives\...`), which ScanHound does **not** resolve — a
+config using drive letters would fail *silently*, the same shape as the 2026-07-11 incident that
+lost all 371 `Y:`-drive files. Proposal in `dv-coverage-widening-proposal.md`.
+
+### Known-unverified, carried forward
+
+1. The mixed `(MEL, FEL)` case is **unvalidated by construction** — no such title appeared in the
+   22 ground-truth samples. That is *why* only FEL short-circuits.
+2. **~8 more wedged files are likely** among the 2,827 unscanned, extrapolating 2-in-730. The
+   bounded probe would not have caught them; it only reads the first 1,000 frames.
+3. The `Profiles:` plural spelling is **latent, not confirmed live**. A binary string search returns
+   zero — but also returns zero for `Profile: `, which the binary demonstrably prints, so that zero
+   proves nothing.
