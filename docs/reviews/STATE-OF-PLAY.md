@@ -131,18 +131,6 @@ nothing. These files existed only in a temp directory until they were committed;
 - `X:\Docker Apps\SCANHOUND-CLOUD-SESSIONS-CATCHUP.md` — the running cross-session log (outside
   the repo)
 
-## 6. The methodological note
-
-Three times during this consolidation a **green test suite was actively concealing a real
-defect**: a test that asserted the unsafe `none`; a suite that passed only because of pytest's
-collection order; and an HTTP 200 that meant zero rows imported. Each was found by looking at live
-output rather than by reasoning about the code.
-
-The related habit, from the other session, while re-verifying a result it had already correctly
-predicted: **"predicted by the evidence" and "measured" are different claims.**
-
----
-
 ## 6. The DV root cause, and the dead ends — do not re-derive these
 
 The whole DV effort started from "extractions hit the 30-minute timeout, so scale the timeout by
@@ -167,8 +155,8 @@ bytes, after reading 27.37 GB of 74.3 GB. A hang, not slow progress.
 
 Five stalls inside a **~68 KB window** across two versions × two storage paths. Frame-bracketed by
 bisection: Jurassic World Rebirth completes at `-l 68018` and hangs at `-l 69577`; Death Wish 3 at
-80,487 / 82,046. **Cause still unknown.** Report drafted at
-`docs/reviews/peer-rounds/dovi-tool-extract-rpu-hang-report.md`, not filed.
+80,487 / 82,046. **Cause still unknown.** Report drafted at `docs/reviews/peer-rounds/dovi-tool-extract-rpu-hang-report.md`
+**on `agent/dv-detector-consolidation`** (not on `main`), not filed.
 
 **The fix that works** is a bounded read: `-l 1000` answers both wedged titles in 3–20 s and both
 are FEL. Validated 22/22 against titles with known full-pass labels. Only FEL may short-circuit —
@@ -196,3 +184,15 @@ lost all 371 `Y:`-drive files. Proposal in `dv-coverage-widening-proposal.md`.
 3. The `Profiles:` plural spelling is **latent, not confirmed live**. A binary string search returns
    zero — but also returns zero for `Profile: `, which the binary demonstrably prints, so that zero
    proves nothing.
+
+## 7. The methodological note
+
+Three times during this consolidation a **green test suite was actively concealing a real
+defect**: a test that asserted the unsafe `none`; a suite that passed only because of pytest's
+collection order; and an HTTP 200 that meant zero rows imported. Each was found by looking at live
+output rather than by reasoning about the code.
+
+The related habit, from the other session, while re-verifying a result it had already correctly
+predicted: **"predicted by the evidence" and "measured" are different claims.**
+
+---
