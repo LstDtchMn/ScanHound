@@ -270,6 +270,26 @@ class TestTheAdviceIsHonest:
         from backend.queue_recovery_policy import ACTION_MANUAL_RESUME
         assert ACTION_ATTENTION_REQUIRED != ACTION_MANUAL_RESUME
 
+    def test_every_decision_has_plain_language_for_the_operator(self):
+        """The gap that adding a decision actually opens, and it is silent.
+
+        scanhound_check renders verdicts with `LABELS.get(verdict, verdict)`,
+        so a missing entry does not raise -- it prints the raw decision string
+        `manual_verification_hold` at the person deciding whether to intervene.
+        ACTION_FOR is guarded by an exhaustiveness test; this map was not, and a
+        grep of the consumers found it rather than a failing test.
+        """
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "scripts"))
+        from queue_recovery_state import LABELS
+
+        assert set(LABELS) == ALL_DECISIONS, (
+            "a decision with no plain-language label reaches an operator as a "
+            f"raw enum string: {sorted(ALL_DECISIONS - set(LABELS))}")
+
 
 # ── the consumer boundary ───────────────────────────────────────────────────
 class TestSourceWideContainmentIsRetained:

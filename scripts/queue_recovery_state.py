@@ -37,8 +37,8 @@ sys.path.insert(0, "/app")
 
 from backend.queue_recovery_policy import (  # noqa: E402
     ACTION_ADVICE, AUTHORISED, BUDGET_SPENT, DISABLED, NEEDS_HUMAN, NO_AUTHORISATION,
-    SAFETY_HOLD, UNOWNED_REASON, WAITING_BRAKE, WAITING_OWN, WILL_CLEAR, ItemFacts,
-    SharedFacts, action_for, decide, parse_max_attempts,
+    SAFETY_HOLD, UNOWNED_REASON, VERIFICATION_HOLD, WAITING_BRAKE, WAITING_OWN,
+    WILL_CLEAR, ItemFacts, SharedFacts, action_for, decide, parse_max_attempts,
 )
 
 #: Plain-language rendering, because these are read by a person deciding whether to
@@ -48,6 +48,15 @@ LABELS = {
     WAITING_OWN: "waiting for its own retry time",
     WAITING_BRAKE: "held by the shared source cooldown",
     SAFETY_HOLD: "held for unknown-outcome safety (needs adjudication)",
+    # FOUND BY GREPPING THE CONSUMERS, not by a failing test. scanhound_check
+    # reads this with `LABELS.get(verdict, verdict)`, so a missing entry does
+    # not crash -- it prints the raw decision string `manual_verification_hold`
+    # at a human who is deciding whether to intervene. That is the failure mode
+    # this map exists to prevent, and it fails quietly enough to survive review.
+    VERIFICATION_HOLD: (
+        "held by a verification challenge ScanHound could not complete "
+        "(needs a person; no timer clears it)"
+    ),
     NO_AUTHORISATION: "NO retry time anywhere - needs an explicit resume",
     UNOWNED_REASON: "automatic recovery does not own this row - needs a resume",
     DISABLED: "auto-resume is switched off for its batch",
