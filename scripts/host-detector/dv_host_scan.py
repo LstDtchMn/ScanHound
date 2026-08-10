@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -212,7 +213,23 @@ def main(argv=None):
         stored_m, stored_s = _get_sig(conn, path)
         if sig_is_current(stored_m, stored_s, st.st_mtime, st.st_size):
             continue
+        # Announce the file BEFORE reading it, not after. detect_layer streams
+        # the whole title over SMB -- 9 minutes for a 57 GB file at the measured
+        # ~100 MB/s, and up to the 30-minute _EXTRACT_TIMEOUT. A line emitted
+        # only on completion would leave exactly the silence this is meant to
+        # remove: on 2026-08-09 a five-hour run showed nothing, and the rate got
+        # inferred from process snapshots instead -- 12x wrong, and the review
+        # built on it had to be retracted.
+        gb = st.st_size / 1e9
+        logger.info("[%d] scanning %s (%.1f GB)",
+                    scanned + 1, os.path.basename(path), gb)
+        t0 = time.monotonic()
         layer = dv_detect.detect_layer(path).get("layer")
+        dt = time.monotonic() - t0
+        # Log the throughput per file. This is the exact number that was guessed
+        # wrongly; it costs one division to record it instead.
+        logger.info("[%d] -> %s in %.0fs (%.0f MB/s)", scanned + 1, layer, dt,
+                    (st.st_size / 1e6 / dt) if dt > 0 else 0.0)
         _upsert(conn, classify_to_row(path, layer, st))
         scanned += 1
         if tagging and _tag_file(path, layer):

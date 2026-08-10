@@ -89,11 +89,17 @@ function Read-DetectorTail {
             $fs = New-Object System.IO.FileStream(
                     $Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
                     ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
-            # Encoding::Default is the ANSI code page -- what Get-Content used
-            # here before, and what python writes to a redirected stream under
-            # this locale. Changing it would be a silent regression, not a fix.
+            # UTF-8, matched to the PYTHONIOENCODING the launch pins below.
+            #
+            # This replaces Get-Content's ANSI default, which was latently wrong:
+            # measured 2026-08-09, python's redirected streams were UTF-8 here
+            # only because an ambient PYTHONIOENCODING=utf-8:surrogateescape
+            # happened to be set, while the locale code page is cp1252. So the
+            # detector's encoding depended on who launched it -- a shell and
+            # Task Scheduler could disagree. It never showed because the detector
+            # emitted pure ASCII; now that it logs filenames, it would.
             $script:DetReader = New-Object System.IO.StreamReader(
-                    $fs, [System.Text.Encoding]::Default, $true)
+                    $fs, (New-Object System.Text.UTF8Encoding($false)), $true)
         } catch {
             return  # not readable yet; the next poll tries again
         }
@@ -126,6 +132,53 @@ function Close-DetectorTail {
     if ($null -ne $script:DetReader) {
         try { $script:DetReader.Dispose() } catch { }
         $script:DetReader = $null
+    }
+}
+
+function Get-DvHostRowCount {
+    # Progress, read from the ARTIFACT rather than inferred from the process
+    # list. dv_host.db held the true rate the whole time on 2026-08-09 while I
+    # was deriving a 12x-wrong one from two `ps` snapshots; one COUNT(*) would
+    # have settled it. So the heartbeat reports it.
+    #
+    # Routed through cmd's `>` for the same reason the detector is: no native
+    # stderr may touch the PowerShell pipeline, or a broken query would become a
+    # terminating error under EAP='Stop' and take the whole run down to log a
+    # number. Returns $null whenever anything at all goes wrong.
+    param([string]$Python, [string]$DbPath)
+
+    if (-not (Test-Path -LiteralPath $DbPath)) { return $null }
+    $tmp = Join-Path $LogDir ("dv-count-{0}.tmp" -f [System.Guid]::NewGuid().ToString('N'))
+    try {
+        # mode=ro: never create, never write, never take a lock that could
+        # disturb the scan this is reporting on. Verified 2026-08-09 against the
+        # live database while a scan held it open in WAL mode.
+        # Single quotes only inside the -c payload -- cmd owns the double ones.
+        $q = 'import sys,sqlite3,pathlib;u=pathlib.Path(sys.argv[1]).as_uri()+' +
+             "'?mode=ro';" +
+             'print(sqlite3.connect(u,uri=True,timeout=2.0).execute(' +
+             "'SELECT COUNT(*) FROM dv_host').fetchone()[0])"
+        $inner = '"{0}" -c "{1}" "{2}" > "{3}" 2>&1' -f $Python, $q, $DbPath, $tmp
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName         = $env:ComSpec
+        $psi.Arguments        = '/c "' + $inner + '"'
+        $psi.UseShellExecute  = $false
+        $psi.CreateNoWindow   = $true
+        $psi.WorkingDirectory = $RepoRoot
+        $p = [System.Diagnostics.Process]::Start($psi)
+        if (-not $p.WaitForExit(15000)) {
+            try { $p.Kill() } catch { }
+            return $null
+        }
+        $first = @(Get-Content -LiteralPath $tmp -ErrorAction SilentlyContinue)
+        if ($first.Count -gt 0 -and $first[0] -match '^\s*(\d+)\s*$') {
+            return [int]$Matches[1]
+        }
+        return $null
+    } catch {
+        return $null
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -319,12 +372,26 @@ try {
     $psi.Arguments       = '/c "' + $inner + '"'
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow  = $true
+    # PIN the child's stream encoding instead of inheriting whatever the caller
+    # happens to have. Measured 2026-08-09: python reported utf-8 streams under
+    # a cp1252 locale purely because an ambient PYTHONIOENCODING was set in the
+    # launching shell -- so the same script could write UTF-8 interactively and
+    # cp1252 under Task Scheduler, and the reader above can only be right about
+    # one of them. UTF-8 also has no unencodable character, so a title in any
+    # script logs cleanly.
+    $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
     # MUST be set explicitly. PowerShell sets a native command's working
     # directory from the current location, so Push-Location above was enough for
     # `& cmd /c`; .NET does not, and would inherit the process-wide current
     # directory instead. The detector's --config/--db defaults are repo-relative,
     # so getting this wrong would point it at the wrong database.
     $psi.WorkingDirectory = $RepoRoot
+
+    # Baseline BEFORE the detector starts, so the heartbeat's "+N this run"
+    # counts only what this run produced rather than the standing total.
+    $dbPath   = Join-Path $RepoRoot 'data\dv_host.db'
+    $baseRows = Get-DvHostRowCount -Python $python -DbPath $dbPath
+    if ($null -ne $baseRows) { Write-Log "dv_host.db at start: $baseRows rows" }
 
     $code = $null
     $proc = $null
@@ -345,10 +412,18 @@ try {
             $now = Get-Date
             if ($now -ge $nextBeat) {
                 $el = New-TimeSpan -Start $started -End $now
+                $rows = Get-DvHostRowCount -Python $python -DbPath $dbPath
+                if ($null -eq $rows) {
+                    $prog = 'dv_host.db unavailable'
+                } elseif ($null -eq $baseRows) {
+                    $prog = "dv_host.db $rows rows"
+                } else {
+                    $prog = "dv_host.db $rows rows (+$($rows - $baseRows) this run)"
+                }
                 # Formatted from TotalHours, not 'hh', so a run past 24 h does
                 # not silently wrap its hour count back to zero.
-                Write-Log ("  ... still running: {0:00}:{1:00}:{2:00} elapsed, {3} detector line(s) so far" -f `
-                           [int]$el.TotalHours, $el.Minutes, $el.Seconds, $script:DetLineCount)
+                Write-Log ("  ... still running: {0:00}:{1:00}:{2:00} elapsed, {3} detector line(s), {4}" -f `
+                           [int]$el.TotalHours, $el.Minutes, $el.Seconds, $script:DetLineCount, $prog)
                 $nextBeat = $now.AddMinutes($HeartbeatMinutes)
             }
         }
@@ -366,7 +441,7 @@ try {
     if ($script:DetLineCount -eq 0 -and (Test-Path -LiteralPath $detOut)) {
         # @(...) is load-bearing, same as for $roots above: a single-line file
         # would otherwise make .Count a terminating error under StrictMode.
-        $residue = @(Get-Content -LiteralPath $detOut -ErrorAction SilentlyContinue)
+        $residue = @(Get-Content -LiteralPath $detOut -Encoding UTF8 -ErrorAction SilentlyContinue)
         if ($residue.Count -gt 0) {
             Write-Log "live tail captured nothing; fell back to a post-exit read." 'WARNING'
             foreach ($line in $residue) { Write-DetectorLine $line }
