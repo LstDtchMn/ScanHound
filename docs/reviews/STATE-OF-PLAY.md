@@ -133,22 +133,37 @@ Nothing is lost by waiting: everything is pushed, the evidence is committed insi
 consolidation, and `consolidation → main` shows **0 conflicts** — one merge lands everything when
 the answer arrives.
 
-## 4d. A THIRD failing title is in the retry loop right now
+## 4d. `.mp4` is declared supported but `dovi_tool` cannot read it — 2 files, non-urgent
 
-Verified against `dv_host.db` on 2026-08-10: **649 rows, exactly one NULL-signature row.**
+**Earlier framing retracted.** `Twisters (2024).mp4` is **not** a third instance of the wedge. It
+was probed directly: `dovi_tool extract-rpu -l 1000` returns in **0.2 s** with `rc=1`, no RPU, and
+`Error: Invalid input file type`. It is a container-support gap, not a parser hang.
 
-```
-unknown   Twisters (2024).mp4   ~23.8 GB
-```
+`_SUPPORTED_EXTS` declares `.mp4` supported, so such a file passes the extension gate, fails
+extraction, and is filed as `unknown` — "detection could not run". Technically true, but the wrong
+category: it is not transient, it is a container the tool structurally cannot demux. The row gets
+a NULL signature and is therefore **retried on every run, forever, never converging**.
 
-A NULL signature means it is **re-scanned on every run** — the starvation pattern, live, until the
-consolidation deploys.
+**Scope: exactly 2 files** across all four roots — `Twisters (2024).mp4` and
+`Billie Eilish The World's a Little Blurry (2021).mp4` — against 647 `.mkv`. At 0.2 s per attempt
+the cost is nil and retry backoff caps it, so this is **not a blocker and not urgent**.
 
-**Do not assume it is a third instance of the Jurassic / Death Wish wedge.** It is **`.mp4`, not
-`.mkv`, and about a third their size**, so it may be a different failure mode entirely. That makes
-it a good first canary subject: the new logging distinguishes `stalled` from `timeout`, and the
-watchdog should cap it near 180 s instead of 1800 s. **If it still burns 1800 s, the watchdog does
-not cover this mode and that is a finding.**
+**If it is fixed, two details matter** (verified against the consolidation, not assumed):
+
+- Dropping `.mp4` from `_SUPPORTED_EXTS` works, but via `_iter_files`, which gates the walk on that
+  same constant — the file is then **never yielded at all**, so there is no row rather than a
+  better-labelled one.
+- The `unsupported container` branch in `detect_layer` is therefore **not** what a scan would
+  reach, and it returns `LAYER_UNKNOWN` anyway — so it would not have fixed the classification.
+  It matters only for callers that do not pre-filter.
+- The two existing NULL-signature rows would **remain** in `dv_host.db` unless separately settled.
+  Harmless (an `unknown` row is non-authoritative and can never remove a label) but stale.
+
+**Good news for the canary:** the walk finds 649 files across the four roots and `dv_host.db` has
+**649 rows** — every file has a row, and the 236-file backlog is gone. So the canary runs against
+**converged roots**, and any new NULL signature that appears is genuinely new rather than backlog
+noise. The two real wedges (`Death Wish 3`, `Jurassic World Rebirth`) remain the only known
+instances of the hang.
 
 ## 5. Detail lives here
 
