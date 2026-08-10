@@ -2,6 +2,30 @@ import importlib.util
 import os
 import types
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_shared_dv_detect():
+    """Undo any stubbing of the SHARED backend.rename.dv_detect module.
+
+    _load() hands back a fresh dv_host_scan each time, but `m.dv_detect` is the
+    real shared module -- so a test assigning to it leaks stub lambdas into
+    every LATER test file. This suite passed only because pytest's alphabetical
+    order happens to run test_dv_detect.py before this file; running them the
+    other way round failed 27 of its tests against stubs left behind here.
+
+    A suite whose result depends on collection order is a suite that can lie,
+    which is the one thing these tests exist not to do. Autouse so a new test
+    cannot reintroduce the leak by forgetting to clean up.
+    """
+    from backend.rename import dv_detect as _shared
+    saved = (_shared.available, _shared.detect_layer)
+    try:
+        yield
+    finally:
+        _shared.available, _shared.detect_layer = saved
+
 HERE = os.path.dirname(__file__)
 SCRIPT = os.path.abspath(os.path.join(
     HERE, "..", "scripts", "host-detector", "dv_host_scan.py"))
@@ -282,12 +306,13 @@ def _main_harness(tmp_path, n_files, clock_step, argv_extra,
     posts = []
     m.load_host_config = lambda _p: {"dv_detection": True,
                                      "dv_library_roots": str(root)}
-    m.dv_detect.available = lambda: True
-    m.dv_detect.detect_layer = detect or (
-        lambda p, **kw: {"layer": "fel", "error": None, "evidence": "bounded"})
     m._iter_files = lambda roots: iter(paths)
     m._post_import = lambda api: (posts.append(api) or post_ok)
     m.time = _Clock(clock_step)
+
+    m.dv_detect.available = lambda: True
+    m.dv_detect.detect_layer = detect or (
+        lambda p, **kw: {"layer": "fel", "error": None, "evidence": "bounded"})
 
     db = tmp_path / "dv_host.db"
     rc = m.main(["--config", "ignored", "--db", str(db),
@@ -366,6 +391,63 @@ def test_steady_mode_skips_the_retry_sweep(tmp_path):
 
 
 # --- ported from fix/dv-import-cadence (reviewed, then retired unmerged) -----
+
+def test_interim_import_happens_with_the_database_CLOSED(tmp_path, monkeypatch):
+    """The container cannot read dv_host.db while this process holds it open.
+
+    It reads through a Windows bind mount, where SQLite's WAL index (-shm) needs
+    mmap semantics the mount cannot provide. Measured 2026-08-10 with a
+    controlled writer: held open -> "disk I/O error"; writer exited -> read OK.
+    import_dv_host_db() catches that error and returns zeros behind an HTTP 200,
+    so an interim import with the database open reports success and delivers
+    NOTHING -- the exact false-success this work exists to remove.
+
+    So this asserts the ordering directly: every interim POST must be made while
+    the connection is closed.
+    """
+    m = _load()
+    closes = {"n": 0}
+    real_open = m._open_db
+
+    class _Tracked:
+        def __init__(self, inner):
+            self._inner = inner
+        def close(self):
+            closes["n"] += 1
+            return self._inner.close()
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(m, "_open_db", lambda p: _Tracked(real_open(p)))
+
+    seen = []
+    monkeypatch.setattr(m, "_post_import",
+                        lambda api: seen.append(closes["n"]) or True)
+
+    root = tmp_path / "lib"; root.mkdir()
+    paths = []
+    for i in range(6):
+        f = root / ("m%d.mkv" % i); f.write_bytes(b"x" * 32); paths.append(str(f))
+    monkeypatch.setattr(m, "load_host_config",
+                        lambda _p: {"dv_detection": True, "dv_library_roots": str(root)})
+    monkeypatch.setattr(m, "_iter_files", lambda roots: iter(paths))
+    monkeypatch.setattr(m.dv_detect, "available", lambda: True)
+    monkeypatch.setattr(m.dv_detect, "detect_layer",
+                        lambda p, **kw: {"layer": "fel", "error": None, "evidence": "b"})
+
+    rc = m.main(["--config", "x", "--db", str(tmp_path / "h.db"),
+                 "--api", "http://127.0.0.1:9", "--import-every", "2",
+                 "--max-runtime-minutes", "0"])
+    assert rc == 0
+    # 6 files at every-2 => interim POSTs after 2, 4 and 6, plus the final one.
+    assert len(seen) >= 4, seen
+    # EVERY POST must have been preceded by at least one close. If an interim
+    # import fired with the connection open, its recorded count would not have
+    # advanced past the previous one.
+    assert seen[0] >= 1, "the first interim import ran with the database open"
+    assert seen == sorted(seen), seen
+    assert seen[-1] > seen[0], "later imports must follow further closes"
+
 
 def test_a_failed_detection_prints_no_rate(tmp_path, caplog):
     """No throughput number may appear for a detection that failed.

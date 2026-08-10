@@ -397,7 +397,29 @@ def main(argv=None):
                                           error=result.get("error"),
                                           now=time.time()))
         if args.import_every > 0 and scanned % args.import_every == 0:
+            # CLOSE THE DATABASE BEFORE IMPORTING, THEN REOPEN.
+            #
+            # The container reads dv_host.db through a Windows bind mount, and
+            # SQLite's WAL index (-shm) needs mmap semantics that mount cannot
+            # provide. So while THIS process holds the database open, the
+            # container-side read fails with "disk I/O error" -- and
+            # import_dv_host_db() catches sqlite3.Error and returns
+            # {"imported": 0, "updated": 0} behind an HTTP 200. The interim
+            # import would have reported success and delivered nothing, which is
+            # the precise failure this whole effort exists to eliminate.
+            #
+            # Measured 2026-08-10 with a controlled writer: connection held open
+            # -> container read FAILS; writer exits -> container read SUCCEEDS.
+            # Closing checkpoints the WAL and releases -shm, which is what makes
+            # the committed rows visible to the container.
+            #
+            # The final import already escaped this by accident -- it runs after
+            # conn.close() -- but a run killed at the task's time limit never
+            # reaches it, and killed runs are exactly what interim imports are
+            # for.
+            conn.close()
             _post_import(args.api)
+            conn = _open_db(args.db)
 
     conn.close()
     logger.info("scanned %d file(s)%s; posting dv-import", scanned,
