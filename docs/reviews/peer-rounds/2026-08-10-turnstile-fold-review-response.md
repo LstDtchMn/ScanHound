@@ -103,3 +103,33 @@ not copied literally; these exercise `main()` in-process, which covers the same 
 - Full suite: result in the relay message (expected green).
 - Fold-review mutations discriminate: resume race, host_links guard, solved-token skip,
   form-ownership gate, migration hold-batch membership — each FAILS on the restored defect.
+
+---
+
+## Re-review round (ChatGPT @ `dc1cb31`) — two new medium seams. Both closed.
+
+The re-review confirmed **F1, F3, F5 resolved** and **F2/F4 cores fixed**, and raised two
+new mediums.
+
+### New M1 — non-submit buttons treated as form submissions. FIXED.
+
+`_form_posts_unlock` accepted every `<button>` as a submitting control, including
+`type="button"` and `type="reset"`. So a non-submit button's `formaction` could make a
+non-unlock form look like it posts the reveal endpoint (false positive → a durable hold on a
+working page), or replace a genuine unlock form's `action` fallback (false negative). Now only
+`input[type="submit"]`, `button[type="submit"]`, and a `<button>` with no/empty type count.
+Paired tests: a non-submit `formaction` neither creates evidence nor suppresses the fallback.
+
+### New M2 — `--hold-batch` validated outside the write transaction. FIXED.
+
+The trigger write was already atomic, but the `--hold-batch` source-membership check ran before
+`BEGIN IMMEDIATE` and the batch stamps were an unchecked `executemany`. A live queue removing a
+batch's only deferred source row (or the batch) between precheck and write could create a phantom
+hold, or miss a vanished batch while still reporting `len(batches)` applied. The apply is now one
+function, `_apply_hold`: a single transaction that re-validates each batch's membership and
+rowcount-checks each stamp immediately before it, rolling the WHOLE invocation back on any
+failure. A deterministic race test drives `_apply_hold` with a hold-batch whose row was removed →
+raises, stamps nothing, trigger not flipped.
+
+**Evidence:** affected suites 91 passed; both new mutations discriminate (`_is_submit` filter,
+`_apply_hold` membership re-check). Full suite green (recorded in the relay message).
