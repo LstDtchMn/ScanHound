@@ -34,7 +34,7 @@ run time                            : 33.3 min
 ```
 
 Counted twice: once by the run itself, once by re-reading
-`scratchpad/reverify_716.jsonl` independently. **The staged set is unchanged**,
+`docs/reviews/peer-rounds/dv-evidence-2026-08-10/reverify_716.jsonl` independently. **The staged set is unchanged**,
 so the gate figures signed off at `7260499` — 711 Plex targets, 0 replacements,
 0 removals — stand without amendment.
 

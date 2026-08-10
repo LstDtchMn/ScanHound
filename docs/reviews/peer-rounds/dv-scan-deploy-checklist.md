@@ -180,8 +180,8 @@ Everything is additive and reversible.
 - **Tonight's data writes:** the two hand-written FEL rows and any rows the
   bounded sweep added are all proven-FEL with real signatures. To undo a
   specific one, set `dv_layer='unknown'` and both signature columns to NULL.
-  Prior values for the first two are in `scratchpad/dv_host_rows_before.json`,
-  and every sweep write is recorded in `scratchpad/sweep_results.jsonl`.
+  Prior values for the first two are in `docs/reviews/peer-rounds/dv-evidence-2026-08-10/dv_host_rows_before.json`,
+  and every sweep write is recorded in `docs/reviews/peer-rounds/dv-evidence-2026-08-10/sweep_results.jsonl`.
 
 ## Not in this deploy
 

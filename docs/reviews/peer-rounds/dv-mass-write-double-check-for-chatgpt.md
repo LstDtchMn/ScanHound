@@ -1,7 +1,7 @@
 # Double-check request: a ~1,260-row bounded-FEL write into the live label path
 
 **Status:** NOTHING HAS BEEN WRITTEN. Jesse has held this pending your review.
-Results are sitting read-only in `scratchpad/local_quickcheck.jsonl`.
+Results are sitting read-only in `docs/reviews/peer-rounds/dv-evidence-2026-08-10/local_quickcheck.jsonl`.
 
 ## What is proposed
 
