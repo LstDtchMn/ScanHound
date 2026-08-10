@@ -122,6 +122,58 @@ title and current label state.
 
 ---
 
+---
+
+## Round 2: reviewer verdict and the two follow-ups it asked for
+
+Reviewed at head `c8360b3`. Verdict: **GO for the current 694-positive set** —
+689 matched targets, 5 explained non-targets, 0 expected removals, 0 expected
+replacements, 689 pure additions. Approval is explicitly for the **gate design
+and the current staged population**, not carried forward to the final set by
+assumption.
+
+Two follow-ups were requested and both are now closed.
+
+**1. The five residuals must never dissolve into an undifferentiated
+"unmatched" count** (reviewer's preferred option: exclude them from the
+Plex-application set while retaining them in a separate report). Implemented —
+staging now emits two artifacts, so the accounting reconciles by construction:
+
+```
+rows intended for Plex effect : 689
+rollback snapshot population  : 689
+reconciles                    : True
+explained no-Plex-target rows : 5   (enumerated, not counted)
+    Hamilton.2020.2160p.UHD.Blu-ray.Remux.DV.HDR.HEVC.TrueHD.Atmos.7.1-CiNEPHiLES.mkv
+    Notting Hill (1999).mkv
+    The Return of the Pink Panther (1975).mkv
+    Day.of.the.Dead.1985.2160p.UHD.Blu-ray.Remux.DV.HDR.HEVC.FLAC.1.0-CiNEPHiLES.mkv
+    Bowfinger.1999.2160p.UHD.Blu-ray.Remux.DV.HDR.HEVC.DTS-HD.MA.5.1-CiNEPHiLES.mkv
+```
+
+An unmatched row cannot add or remove a Plex badge, so these are a coverage
+observation rather than a destructive-write risk — but they are named, not
+summarised.
+
+**2. Confirm the live apply path does not explicitly send
+`additive_only: false`**, which would override the new API default. Checked in
+the client rather than assumed:
+
+```
+frontend/src/lib/api/client.ts:635
+  dvSyncLabels: (dryRun = false) =>
+    request('/rename/dv-sync-labels', {
+      method: 'POST',
+      body: JSON.stringify({ dry_run: dryRun })   <- additive_only never sent
+    })
+```
+
+A repo-wide search for `additive_only` across `.ts/.tsx/.js/.svelte/.html`
+returns nothing outside the backend, and the function's only caller
+(`frontend/src/routes/renames/+page.svelte:145`) passes `dryRun` alone. So the
+UI button inherits the safe default. The final dry-run response remains the
+authoritative proof of the live path.
+
 ## What is still outstanding
 
 The probe is not finished: 694 positives from **1,977 of 2,740** titles. The

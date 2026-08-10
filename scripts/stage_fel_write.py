@@ -146,9 +146,27 @@ would_replace = sum(n for k, n in pre.items() if k not in ("(none)", "DV FEL"))
 print(f"\n  titles where DV FEL would REPLACE a different managed label : {would_replace}")
 print("  (authoritative replacement happens even in additive-only mode)")
 
-json.dump(staged, open(os.path.join(HERE, "staged_fel.jsonl"), "w", encoding="utf-8"),
-          indent=1)
+# ── outputs ────────────────────────────────────────────────────────────
+# Split per the reviewer's option 1: rows intended to produce a Plex label are
+# kept separate from rows with no Plex target, so
+#     rows intended for Plex effect == matched rollback snapshot population
+# and the five residuals stay individually enumerated instead of dissolving
+# into an undifferentiated "unmatched" count.
+json.dump(matched, open(os.path.join(HERE, "staged_fel_apply.jsonl"), "w",
+                        encoding="utf-8"), indent=1)
+json.dump(unmatched, open(os.path.join(HERE, "staged_fel_no_plex_target.jsonl"), "w",
+                          encoding="utf-8"), indent=1)
 json.dump(snapshot, open(os.path.join(HERE, "label_snapshot.json"), "w",
                          encoding="utf-8"), indent=1)
-print(f"\nwrote staged_fel.jsonl ({len(staged)}) and label_snapshot.json "
-      f"({len(snapshot)}). NOTHING written to dv_host.db or Plex.")
+
+print("\n--- accounting ---")
+print(f"  rows intended for Plex effect : {len(matched)}")
+print(f"  rollback snapshot population  : {len(snapshot)}")
+print(f"  reconciles                    : {len(matched) == len(snapshot)}")
+print(f"  explained no-Plex-target rows : {len(unmatched)} (enumerated below)")
+for s in unmatched:
+    print(f"      {os.path.basename(s['path'])}")
+print(f"\nwrote staged_fel_apply.jsonl ({len(matched)}), "
+      f"staged_fel_no_plex_target.jsonl ({len(unmatched)}), "
+      f"label_snapshot.json ({len(snapshot)}).")
+print("NOTHING written to dv_host.db or Plex.")
