@@ -55,13 +55,22 @@ written against the other model).
 **Body-only interstitial regression.** Both branches' interstitial/embedded partitions shared a
 defect: a genuine Cloudflare interstitial that renders its phrase in the BODY (no `<title>`, no
 captured `cf-mitigated` header) with a challenge iframe was demoted from `INTERACTIVE_CHALLENGE`
-to `LAYOUT_CHANGED` — "a challenge blocked us" became "the scraper is broken". Fix in
-`strong_challenge_markers` (`backend/download_outcome.py`): the broader interstitial title phrases
-("just a moment", "attention required", "access denied") are now matched in visible body text,
-but **only alongside a rendered challenge iframe** — the conjunction keeps it off normal release
-pages, which render no challenge iframe (measured on the live healthy page). The narrower phrases
-("checking your browser", "verify you are human") remain standalone evidence, unchanged.
-Regression test + its negative control added in `tests/test_scrape_outcomes.py`.
+to `LAYOUT_CHANGED`.
+
+**This section was ALREADY through one peer round** (`agent/turnstile-classification`'s author).
+My first fix keyed on the challenge iframe + a body phrase; they showed it false-positives,
+because invisible Turnstile renders a TRANSIENT iframe (~11s build/teardown) on otherwise-working
+pages and release pages carry "access denied"/"just a moment" as related-release NAMES — so a
+working page could be held on a source-wide challenge. **Fixed** to their recommendation: guard on
+the STRUCTURAL property a page-replacing interstitial has and a working page never does —
+**no reveal control found** (`reveal_tier` None/"none") **AND no access/download/link controls**
+(`candidates` empty), with a rendered challenge iframe (`backend/download_service.py`, the
+`interstitial_shape` term; the body-phrase logic was removed from
+`backend/download_outcome.strong_challenge_markers`). Phrase- and lifecycle-independent. Tests:
+the positive case (bare interstitial → still a challenge) and their counterexample (working page,
+ready reveal, transient iframe, "Access Denied" related title, controls present → NOT a challenge)
+are both in `tests/test_scrape_outcomes.py`, and both are mutation-checked. Please sanity-check the
+structural guard for any remaining gap.
 
 `_form_posts_unlock`: the fold instructions listed it as a possible port; the base already
 implements that rule (`_resolves_to_unlock_target` + the `formaction`-overrides-`form.action`
@@ -99,9 +108,11 @@ logic in `_reveal_candidate`), so nothing was ported.
    escape hatch also release the trigger?
 2. **The `resume_batch` guard.** Is refusing (409) correct, versus silently downgrading? Any
    remaining path that promotes a held row without `_source_is_held`/`decide()`?
-3. **The interstitial conjunction.** Is "broader title phrase in visible body AND a rendered
-   challenge iframe" the right guard, given the hold now makes a false-positive costly? Any release
-   page that would trip it, or any real interstitial it would still miss?
+3. **The interstitial structural guard** (already through one peer round — see above). Is
+   "rendered challenge iframe AND no reveal control found AND no access/download/link controls" the
+   right signal for a page-replacing interstitial? Any real interstitial it would still miss (e.g.
+   one that renders some link-like control), or any working page that could present as control-less
+   with a challenge iframe?
 4. **The stricter harness.** Is the positive control meaningful — does it actually prove the rig
    promotes, so the negative control is not vacuous?
 5. **Did the fold drop anything** from either branch that mattered?
