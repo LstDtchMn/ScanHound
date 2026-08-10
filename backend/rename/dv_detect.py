@@ -178,12 +178,29 @@ def _classify(profile: str, subtoken: str) -> str:
         return LAYER_P5
     if major == 8:
         return LAYER_P8
-    return LAYER_NONE
+    # A profile we do not know (9, 10, ...) is a profile we cannot classify --
+    # not evidence that Dolby Vision is absent.
+    return LAYER_UNKNOWN
 
 
 def _parse_info(summary: str) -> str:
     """Extract a layer constant from ``dovi_tool info -s`` output."""
-    best = LAYER_NONE
+    # THIS FUNCTION MAY NEVER RETURN LAYER_NONE.
+    #
+    # By the time detect_layer() calls it, extract-rpu has SUCCEEDED and the RPU
+    # file is non-empty -- the source is already proven to contain Dolby Vision
+    # data. So a summary this parser cannot read means "DV exists, cannot
+    # classify it", which is `unknown`. It cannot mean "no Dolby Vision".
+    #
+    # The distinction is not academic: `none` is authoritative in the label
+    # pipeline and can REMOVE a managed DV badge, while `unknown` can never
+    # remove anything. A future dovi_tool output change would otherwise turn a
+    # proven-DV file into an authoritative "no DV" and strip its label. Absence
+    # is established earlier, in detect_layer(), where extract-rpu itself says
+    # there is no RPU or produces zero bytes -- that is the only place it can
+    # honestly be decided.
+    best = LAYER_UNKNOWN
+    seen = False
     for m in _PROFILE_RE.finditer(summary or ""):
         # "Profiles: 7, 8" carries several values on one line; classify each and
         # let the same precedence apply as if they had been separate lines.
@@ -191,11 +208,15 @@ def _parse_info(summary: str) -> str:
             if not profile:
                 continue
             layer = _classify(profile, m.group(2))
-            # FEL wins over everything; otherwise take the first concrete signal.
+            # FEL wins over everything; otherwise the FIRST classification
+            # stands -- including an `unknown` one, so a list whose leading
+            # profile is unclassifiable ("Profiles: 7, 8") stays unknown rather
+            # than being resolved by a later, more convenient entry.
             if layer == LAYER_FEL:
                 return LAYER_FEL
-            if best in (LAYER_NONE,) and layer != LAYER_NONE:
+            if not seen:
                 best = layer
+                seen = True
     return best
 
 
@@ -360,7 +381,16 @@ def detect_layer(path: str, *, cancel_requested=None, bounded_first: bool = True
                     "error": f"info failed: {ierr[:180]}" if ierr else "info failed",
                     "evidence": None}
         out = (info.stdout or b"").decode("utf-8", "ignore")
-        return {"layer": _parse_info(out), "tool": True, "error": None,
+        layer = _parse_info(out)
+        if layer == LAYER_UNKNOWN:
+            # The RPU extracted fine, so DV is present; we just could not read
+            # the summary. Carry the reason so it is diagnosable at INFO rather
+            # than silently becoming a retry with no explanation.
+            snippet = " ".join(out.split())[:120] or "<empty>"
+            return {"layer": LAYER_UNKNOWN, "tool": True,
+                    "error": f"unrecognised info summary: {snippet}",
+                    "evidence": "full"}
+        return {"layer": layer, "tool": True, "error": None,
                 "evidence": "full"}
     except ProcessCancelled:
         return {"layer": LAYER_UNKNOWN, "tool": True, "error": "cancelled",

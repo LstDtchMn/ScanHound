@@ -56,8 +56,31 @@ class TestParseInfo:
         assert dv_detect._classify("08.1", "") == dv_detect.LAYER_P8
         assert dv_detect._classify("05", "") == dv_detect.LAYER_P5
 
-    def test_no_profile_line_is_none(self):
-        assert dv_detect._parse_info("garbage output") == dv_detect.LAYER_NONE
+    def test_unreadable_summary_is_unknown_not_none(self):
+        # Was LAYER_NONE, and that was the unsafe assertion that kept a green
+        # suite from catching this: _parse_info is only ever reached AFTER
+        # extract-rpu succeeded with a non-empty RPU, so DV is already proven to
+        # exist. An unreadable summary means "cannot classify", never "absent".
+        # `none` is authoritative and can strip a managed DV badge; `unknown`
+        # cannot remove anything.
+        assert dv_detect._parse_info("garbage output") == dv_detect.LAYER_UNKNOWN
+
+    def test_empty_summary_is_unknown(self):
+        assert dv_detect._parse_info("") == dv_detect.LAYER_UNKNOWN
+
+    def test_unsupported_profile_is_unknown_not_none(self):
+        # A profile we do not know is a profile we cannot classify -- not
+        # evidence that Dolby Vision is absent.
+        assert dv_detect._parse_info("Profile: 9") == dv_detect.LAYER_UNKNOWN
+        assert dv_detect._parse_info("Profiles: 9, 10") == dv_detect.LAYER_UNKNOWN
+
+    def test_parse_info_can_never_report_absence(self):
+        # The invariant, stated directly: nothing this parser returns may be
+        # LAYER_NONE. Absence is decided in detect_layer(), from extract-rpu.
+        for summary in ("garbage output", "", "Profile: 9", "Profiles: 9, 10",
+                        "Profile: 7", "Profiles: 7, 8", "Profile: 7 (NOT FEL)",
+                        "Profile: 5", "Profile: 8.1", "Profile: 7 (MEL, FEL)"):
+            assert dv_detect._parse_info(summary) != dv_detect.LAYER_NONE, summary
 
 
 # ── detect_layer integration (mocked subprocess) ──────────────────────
@@ -102,6 +125,36 @@ class TestDetectLayer:
         with patch("shutil.which", return_value="/usr/local/bin/dovi_tool"), \
              patch("backend.rename.dv_detect.run_cancellable", side_effect=fake_run):
             return dv_detect.detect_layer(str(f), bounded_first=False)
+
+    def test_nonempty_rpu_plus_unreadable_summary_is_unknown(self, tmp_path):
+        """The safety invariant, pinned where it is actually authoritative.
+
+        extract-rpu rc=0 and a NON-EMPTY RPU prove this file carries Dolby
+        Vision. If `info -s` then succeeds but says something we cannot parse,
+        the only honest answer is `unknown`. Returning `none` here would let a
+        future dovi_tool output change strip the DV badge off a proven-DV file.
+        """
+        r = self._run_with_stages(
+            tmp_path, _proc(returncode=0), info_stdout=b"garbage output")
+        assert r["layer"] == dv_detect.LAYER_UNKNOWN
+        assert r["layer"] != dv_detect.LAYER_NONE
+        assert r["error"], "an unclassifiable summary must carry a reason"
+        assert "garbage output" in r["error"]
+
+    def test_nonempty_rpu_plus_empty_summary_is_unknown(self, tmp_path):
+        r = self._run_with_stages(
+            tmp_path, _proc(returncode=0), info_stdout=b"")
+        assert r["layer"] == dv_detect.LAYER_UNKNOWN
+        assert r["error"]
+
+    def test_an_empty_rpu_is_still_an_authoritative_none(self, tmp_path):
+        """The positive control. Absence IS decidable -- but only here, from
+        extract-rpu producing no RPU, not from an unreadable summary. Without
+        this, the tests above could pass with `none` removed entirely."""
+        r = self._run_with_stages(
+            tmp_path, _proc(returncode=0), info_stdout=b"", rpu_size=0)
+        assert r["layer"] == dv_detect.LAYER_NONE
+        assert r["error"] is None
 
     def test_fel_detected(self, tmp_path):
         r = self._run_with_stages(
