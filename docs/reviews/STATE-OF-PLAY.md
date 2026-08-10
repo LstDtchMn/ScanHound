@@ -35,6 +35,7 @@ All of this is fixed on `agent/dv-detector-consolidation`. **Do not build on `ma
 | Branch | Head | What it is |
 |---|---|---|
 | `agent/dv-detector-consolidation` | `e196de4` | DV detector + wrapper + imports, consolidated from two parallel sessions. **4 review rounds, round 4 outstanding.** Suite 4689 passed / 5 skipped |
+| `agent/dv-gate-evidence-for-consolidation` | `9c63de1` | The gate evidence and rollback pre-image, branched off the consolidation. Docs/data only, 0 conflicts — **merge it alongside so the evidence travels with the code it justifies** |
 | `agent/turnstile-consolidation` | `49625ff` | The Turnstile / download-link fold — **instructions only, nothing folded yet** |
 | `agent/hdr10plus-design-review` | `8fbac87` | The live-progress wrapper, approved over 3 rounds and verified on a real scheduled run. **This is what the `ScanHound-DVScan` task currently executes** |
 
@@ -74,6 +75,24 @@ been frozen at 466 rows since 2026-07-26 while the host store kept growing.
 4. **The Turnstile fold** — fully specified in
    `docs/reviews/peer-rounds/turnstile-fold-instructions.md`. One branch author offered to peer
    review the result rather than author it.
+
+## 4a. A reviewed mass write is STAGED AND APPROVED, not executed
+
+**Do not discover this by finding the artifacts.** 716 titles were proved FEL from a 1000-frame
+bounded sample across the local 4K drives; 711 match a live Plex part, and 5 are individually
+enumerated no-Plex-target rows. **Expected mutation: +711 `DV FEL`, 0 replacements, 0 removals.**
+
+Four safety gates were signed off by peer review, and all 716 were re-verified through the
+consolidation's **corrected** parser (716/716, 0 disagreements), so the staged set survives the
+`_classify` tightening described in §1.
+
+Artifacts: `docs/reviews/peer-rounds/dv-evidence-2026-08-10/` on
+`agent/dv-gate-evidence-for-consolidation` — including **`label_snapshot.json`, the rollback
+pre-image without which the write is not reversible**, and `staged_fel_apply.jsonl`, the rows
+themselves. Procedure is §8 of `dv-scan-deploy-checklist.md`; §8c now requires confirming no scan
+holds `dv_host.db` open and **verifying the import by a row count, never by the HTTP status**.
+
+**Order matters: deploy → canary → write → widen roots, separately.**
 
 ## 4b. The 711-target FEL write is the local-drive WIDENING, not the canary
 

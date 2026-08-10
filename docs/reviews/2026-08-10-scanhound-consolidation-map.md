@@ -37,7 +37,8 @@ are 0 behind and touched in the last three days:
 | `agent/dv-detector-consolidation` | 38 | this one | **round 3 out** |
 | `agent/hdr10plus-design-review` | 21 | this one | **subsumed** ↓ |
 | `fix/dv-scan-live-progress` | 21 | this one | **subsumed** ↓ |
-| `agent/dv-scan-hang-and-starvation` | 14 | `46af8201` (running) | **subsumed** ↓ |
+| `agent/dv-scan-hang-and-starvation` | 14 | `46af8201` | **subsumed** ↓ — but note this SHA predates the gate work; the evidence is on the branch below |
+| `agent/dv-gate-evidence-for-consolidation` | — | `46af8201` | gate evidence + **rollback pre-image**, off the consolidation, docs/data only |
 | `agent/policy-migration-audit` | 1 | — | **subsumed** ↓ |
 | `fix/dv-import-cadence` | 24 | this one | **retire unmerged** (properties ported) |
 | `fix/queue-policy-test-time-bomb` | 1 | `b295ea14` | content in via cherry-pick `cd1195b` |
