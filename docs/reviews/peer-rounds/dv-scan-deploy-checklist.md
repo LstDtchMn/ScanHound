@@ -134,11 +134,27 @@ rollback snapshot population.
 
 ### 8c. Write, import, and dry-run BEFORE applying
 
+**FIRST: no detector process may hold `dv_host.db` open.** The container reads
+it through a Windows bind mount, and SQLite's WAL index needs mmap semantics
+that mount cannot provide — so while a writer holds the connection, the
+container-side read fails with `disk I/O error`, and `import_dv_host_db()`
+catches that and returns `{"imported": 0, "updated": 0}` **behind an HTTP 200**.
+An import run at the wrong moment reports success and delivers nothing. Confirm
+the scheduled task is not running before step 2.
+
 ```bash
+# 0. confirm no scan is holding the database open
+powershell -c "(Get-ScheduledTask -TaskName 'ScanHound-DVScan').State"   # must NOT be Running
+
 # 1. write the staged rows into data/dv_host.db   (rows only; no labels move)
 # 2. import them into the container
 curl -X POST http://localhost:9721/rename/dv-import
-# 3. DRY RUN the label sync and read the summary
+
+# 3. VERIFY THE IMPORT BY A ROW, NEVER BY THE HTTP STATUS
+docker exec scanhound python -c "import sqlite3; c=sqlite3.connect('file:/dbvol/crawler.db?mode=ro',uri=True); print(c.execute(\"select count(*) from dv_scan where source='scan'\").fetchone())"
+# must have risen from 466 by roughly the number of rows written
+
+# 4. DRY RUN the label sync and read the summary
 curl -X POST http://localhost:9721/rename/dv-sync-labels -H 'Content-Type: application/json' -d '{"dry_run": true}'
 ```
 
