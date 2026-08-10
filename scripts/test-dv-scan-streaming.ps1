@@ -652,6 +652,39 @@ Assert-That -Name 'the run still exits 0 (a failed file is not a failed run)' `
 
 Remove-Item -LiteralPath $c8 -Recurse -Force -ErrorAction SilentlyContinue
 
+
+# ===========================================================================
+Write-Output ''
+Write-Output '=== 9. elapsed formatting (the live 03:00 run found this one) ==='
+#
+# The first heartbeat format used [int]$span.TotalHours. PowerShell's [int] cast
+# ROUNDS rather than truncates, so 3 h 35 m (TotalHours 3.59) printed as
+# "04:35:19" -- an hour ahead of its own minute field, wrong for every span with
+# minutes >= 30. No integration test would have caught it without waiting hours,
+# so the function is extracted and tested directly against the SHIPPED source
+# rather than a copy of the logic.
+
+$src = Get-Content -LiteralPath $wrapper -Raw
+if ($src -match '(?ms)^function Format-Elapsed \{.*?^\}') {
+    . ([scriptblock]::Create($Matches[0]))
+    $bad = @()
+    foreach ($c in @(
+        @{ S = (New-TimeSpan -Hours 3 -Minutes 35 -Seconds 20); W = '03:35:20' },  # the live bug
+        @{ S = (New-TimeSpan -Hours 4 -Minutes 0  -Seconds 22); W = '04:00:22' },
+        @{ S = (New-TimeSpan -Hours 0 -Minutes 59 -Seconds 59); W = '00:59:59' },
+        @{ S = (New-TimeSpan -Hours 25 -Minutes 10 -Seconds 5); W = '25:10:05' },  # past 24 h
+        @{ S = (New-TimeSpan -Seconds 5);                       W = '00:00:05' }
+    )) {
+        $got = Format-Elapsed $c.S
+        if ($got -ne $c.W) { $bad += ("got {0} want {1}" -f $got, $c.W) }
+    }
+    Assert-That -Name 'elapsed renders correctly, including minutes >= 30 and past 24h' `
+                -Condition ($bad.Count -eq 0) -Detail ($bad -join '; ')
+} else {
+    Assert-That -Name 'Format-Elapsed is present in the wrapper' -Condition $false `
+                -Detail 'could not extract the function from the wrapper source'
+}
+
 # ===========================================================================
 $env:DV_STUB_NONL = ''
 Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue

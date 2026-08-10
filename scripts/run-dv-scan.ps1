@@ -135,6 +135,19 @@ function Close-DetectorTail {
     }
 }
 
+function Format-Elapsed {
+    # [math]::Floor, NOT [int]. PowerShell's [int] cast ROUNDS, so a 3 h 35 m span
+    # (TotalHours 3.59) rendered as "04:35:19" -- an hour ahead of its own minute
+    # field, and wrong for every span with minutes >= 30. Caught by reading the
+    # live 2026-08-10 03:00 run rather than by any test, which is precisely the
+    # argument for having made the log readable.
+    #
+    # Formatted from TotalHours rather than the 'hh' format specifier so a run
+    # past 24 h keeps counting instead of silently wrapping to zero.
+    param([TimeSpan]$Span)
+    return '{0:00}:{1:00}:{2:00}' -f [math]::Floor($Span.TotalHours), $Span.Minutes, $Span.Seconds
+}
+
 function Get-DvHostRowCount {
     # Progress, read from the ARTIFACT rather than inferred from the process
     # list. dv_host.db held the true rate the whole time on 2026-08-09 while I
@@ -437,10 +450,8 @@ try {
                 } else {
                     $prog = "dv_host.db $rows rows"
                 }
-                # Formatted from TotalHours, not 'hh', so a run past 24 h does
-                # not silently wrap its hour count back to zero.
-                Write-Log ("  ... still running: {0:00}:{1:00}:{2:00} elapsed, {3} detector line(s), {4}" -f `
-                           [int]$el.TotalHours, $el.Minutes, $el.Seconds, $script:DetLineCount, $prog)
+                Write-Log ("  ... still running: {0} elapsed, {1} detector line(s), {2}" -f `
+                           (Format-Elapsed $el), $script:DetLineCount, $prog)
                 $nextBeat = $now.AddMinutes($HeartbeatMinutes)
             }
         }
