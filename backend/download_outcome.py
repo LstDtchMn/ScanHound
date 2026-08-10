@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
 
@@ -226,6 +226,128 @@ def challenge_iframe_srcs(html: str) -> tuple[str, ...]:
     return tuple(hits)
 
 
+# The mechanism recorded in cause_code when active Turnstile evidence, not a
+# generic challenge marker, is what proved the challenge. 600* is Cloudflare's
+# generic challenge-failure FAMILY, so detection matches the family — 600010 is
+# what production logged on 2026-08-09 but it is an observation, not a contract.
+TURNSTILE_CAUSE_CODE = "turnstile_challenge_failed"
+
+_TURNSTILE_CONSOLE_HOST = "challenges.cloudflare.com/turnstile"
+_TURNSTILE_CONSOLE_ERROR = re.compile(r"error:?\s*['\"]?600\d+", re.IGNORECASE)
+
+
+def is_turnstile_console_failure(line: str) -> bool:
+    """Does one browser-console line record a Turnstile 600*-family failure?
+
+    Requires BOTH the Turnstile script origin and a 600-family error number in
+    the same entry, so an unrelated site error mentioning "600123" or a dormant
+    reference to the script URL alone is never evidence. The CALLER owns the
+    navigation scoping: console entries must be drained at navigation start so
+    an old page's error cannot classify the next page.
+    """
+    low = (line or "").lower()
+    return (_TURNSTILE_CONSOLE_HOST in low
+            and bool(_TURNSTILE_CONSOLE_ERROR.search(low)))
+
+
+def _form_posts_unlock(form, unlock_target: Callable[[str], bool]) -> bool:
+    """True when a form's EFFECTIVE destination is this page's unlock endpoint.
+
+    Mirrors the reveal-control rule: a submit may override its form's
+    destination via ``formaction``, so the effective target is the submit's
+    ``formaction`` when present, else the form's ``action``. Ported from
+    agent/turnstile-classification — checking ``form.action`` alone is wrong in
+    both directions (a form whose action looks safe while its submit posts the
+    unlock endpoint, and the reverse).
+    """
+    action = form.get("action") or ""
+
+    def _is_submit(el) -> bool:
+        # Only a SUBMITTING control's formaction is the effective destination.
+        # A <button> defaults to type=submit, so a missing/empty type counts;
+        # but button[type=button] and button[type=reset] cannot submit and must
+        # not be read as (or suppress) the form's post target — re-review round.
+        t = str(el.get("type") or "").lower()
+        if el.name == "button":
+            return t in ("", "submit")
+        return t == "submit"
+
+    submits = [el for el in form.find_all(["input", "button"]) if _is_submit(el)]
+    targets = [(el.get("formaction") or action) for el in submits] or [action]
+    return any(unlock_target(target) for target in targets)
+
+
+def turnstile_challenge_evidence(
+    html: str,
+    console_lines: Sequence[str] = (),
+    *,
+    unlock_target: Optional[Callable[[str], bool]] = None,
+) -> tuple[str, ...]:
+    """Active, UNSOLVED Turnstile evidence markers, or ``()`` for none.
+
+    HDEncode embeds Turnstile INSIDE the reveal widget rather than replacing
+    the page, so the interstitial-shaped checks (challenge page title, visible
+    challenge text, cf-mitigated header) all miss it — that is how a failing
+    challenge was classified as a source throttle for two weeks. Accepted
+    evidence, in order of preference:
+
+    1. a rendered ``input[name="cf-turnstile-response"]`` that is UNSOLVED (empty
+       value) and — when ``unlock_target`` is supplied — belongs to a form that
+       posts THIS page's unlock endpoint;
+    2. a rendered ``.cf-turnstile`` container element;
+    3. a rendered iframe whose ``src`` names ``challenges.cloudflare.com``;
+    4. a NAVIGATION-SCOPED console error in the 600* family from the Turnstile
+       script (see is_turnstile_console_failure for what the caller must
+       guarantee about scoping).
+
+    THE RESPONSE-FIELD DISCRIMINATION (ported from agent/turnstile-classification
+    on peer + ChatGPT review): a POPULATED token is a challenge that SUCCEEDED,
+    not failure evidence; and a response field belonging to the page's COMMENT or
+    report form is not evidence about the reveal. Without ``unlock_target`` the
+    field is accepted on presence alone (back-compat for callers that cannot
+    resolve the endpoint), but the production caller always supplies it.
+
+    Deliberately NOT evidence: the word "cloudflare" anywhere in raw HTML, a
+    dormant ``<script src=...turnstile...>`` reference alone, the English
+    "Verifying… Please wait" label (localizable, and the site also uses it for
+    its own states), or generic access/show/download/link control text — the
+    existing detector once matched "show" inside a "TV Shows" navigation link.
+    """
+    markers: list[str] = []
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html or "", "html.parser")
+        for field in soup.find_all(
+            "input", attrs={"name": "cf-turnstile-response"}
+        ):
+            if (field.get("value") or "").strip():
+                continue  # solved — not failure evidence
+            if unlock_target is not None:
+                # Form ownership by nesting OR a ``form="<id>"`` attribute
+                # pointing elsewhere in the document. Checking only the parent
+                # would let a cosmetic markup change silently disable detection.
+                owner = field.get("form")
+                form = soup.find("form", id=owner) if owner else None
+                if form is None:
+                    form = field.find_parent("form")
+                if form is None or not _form_posts_unlock(form, unlock_target):
+                    continue
+            markers.append("turnstile:response-field")
+            break
+        if soup.find(class_="cf-turnstile") is not None:
+            markers.append("turnstile:container")
+        for frame in soup.find_all("iframe"):
+            if "challenges.cloudflare.com" in (frame.get("src") or "").lower():
+                markers.append("turnstile:iframe")
+                break
+    except Exception:
+        pass
+    if any(is_turnstile_console_failure(line) for line in console_lines or ()):
+        markers.append("turnstile:console-600")
+    return tuple(dict.fromkeys(markers))
+
+
 def strong_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:
     """Return active interactive-challenge evidence markers, or ``()`` for none.
 
@@ -290,6 +412,15 @@ def strong_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:
     markers.extend(
         marker for marker in _CHALLENGE_VISIBLE_MARKERS if marker in visible
     )
+    # NOTE: a body-only page-replacing interstitial (its phrase in the BODY, no
+    # <title>, no captured cf-mitigated header) is NOT recognised here — keying
+    # on the body phrase is unsafe, because release pages carry those phrases as
+    # related-release names and the invisible-Turnstile widget renders a
+    # transient iframe on otherwise-working pages (~11s build/teardown). That
+    # case is handled STRUCTURALLY in _log_page_diagnostics instead: a rendered
+    # challenge iframe on a page with NO access/download/link controls is the
+    # interstitial shape, phrase- and lifecycle-independent. See the fold's
+    # round-1 finding from agent/turnstile-classification.
     return tuple(dict.fromkeys(markers))
 
 
@@ -359,6 +490,9 @@ def public_download_result(
         # pre-scrape duplicate. Dropping it here would make the producer's signal
         # invisible to its only consumer.
         "source_progress": bool(source.get("source_progress")),
+        # Carried through so the queue can release a verification hold the moment
+        # the source served its reveal, even if downstream delivery then failed.
+        "source_reveal_succeeded": bool(source.get("source_reveal_succeeded")),
         "affected_scope": source.get("affected_scope") or "item",
         "action_code": source.get("action_code"),
         "signals": signals,

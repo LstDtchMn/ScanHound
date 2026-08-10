@@ -276,20 +276,24 @@ def _status(
 
 
 def _enable_performance_log(options: Any) -> bool:
-    """Ask Chrome for network performance logs; failure to SET it is ignored.
+    """Ask Chrome for network performance and console logs; failure to SET is ignored.
 
-    The logs carry the main document's response headers, which is how a
-    Cloudflare Challenge Page is recognised regardless of its language or
-    template. Purely additive: if the adapter rejects the capability here, the
-    browser still launches and challenge detection falls back to page
-    evidence.
+    The performance log carries the main document's response headers, which is
+    how a Cloudflare Challenge Page is recognised regardless of its language or
+    template. The browser (console) log carries Turnstile's 600*-family
+    failures — the only signal the widget emits when it is embedded in a page
+    rather than replacing it, which is how HDEncode serves it. Purely additive:
+    if the adapter rejects the capability here, the browser still launches and
+    challenge detection falls back to page evidence.
 
     Scope note: this only swallows failures raised while *setting* the
     capability. A driver that accepts the option and then rejects it during
     construction still fails the launch — that is outside this helper.
     """
     try:
-        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+        options.set_capability(
+            "goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"}
+        )
         return True
     except Exception:
         return False

@@ -303,9 +303,11 @@ def _joined(own, batch_cd, **over):
     row = {"item_uuid": "i", "batch_uuid": "b", "title": "T",
            "state": "waiting_source", "cooldown_until": own,
            "queue_reason": "source_deferred", "last_reason_code": "",
+           "item_source": "hdencode",
            "batch_state": "paused_source", "batch_cooldown": batch_cd,
            "auto_resume_after_cooldown": 1, "auto_resume_used": 0,
-           "source_delivery_count": 0, "auto_resume_progress_mark": 0}
+           "source_delivery_count": 0, "auto_resume_progress_mark": 0,
+           "source_held": 0}
     row.update(over)
     return row
 
