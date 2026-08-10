@@ -544,6 +544,49 @@ def test_post_rows_sends_schema_version(tmp_path, monkeypatch):
     assert captured["body"]["source_rows"] == 2
 
 
+def _capture_req(monkeypatch, m):
+    """Capture the urllib Request _post_rows builds, returning a 2-row OK reply."""
+    import urllib.request
+    box = {}
+
+    class _Resp:
+        def read(self):
+            return (b'{"ok": true, "source_rows": 2, "processed": 2, '
+                    b'"failed": 0}')
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def _cap(req, *a, **k):
+        box["req"] = req
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _cap)
+    return box
+
+
+def test_post_rows_sends_ingest_key_header_when_configured(tmp_path, monkeypatch):
+    """The scoped machine credential rides on X-DV-Ingest-Key when the host has
+    SCANHOUND_DV_INGEST_KEY set (peer review: least-privilege ingest key)."""
+    m = _load()
+    monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY", "  the-secret  ")  # trimmed
+    box = _capture_req(monkeypatch, m)
+    assert m._post_rows("http://x", [{"path": "a"}, {"path": "b"}]) is True
+    # urllib capitalizes header keys; get_header uses that normalized form.
+    assert box["req"].get_header("X-dv-ingest-key") == "the-secret"
+
+
+def test_post_rows_omits_ingest_key_header_when_unset(tmp_path, monkeypatch):
+    """Unset => no header => the server 401s and the POST fails loudly, which is
+    the correct 'not configured' outcome (not a silent open call)."""
+    m = _load()
+    monkeypatch.delenv("SCANHOUND_DV_INGEST_KEY", raising=False)
+    box = _capture_req(monkeypatch, m)
+    assert m._post_rows("http://x", [{"path": "a"}, {"path": "b"}]) is True
+    assert box["req"].get_header("X-dv-ingest-key") is None
+
+
 def test_a_failed_detection_prints_no_rate(tmp_path, caplog):
     """No throughput number may appear for a detection that failed.
 

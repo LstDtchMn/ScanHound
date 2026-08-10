@@ -317,9 +317,16 @@ def _post_rows(api_base, rows):
     payload = json.dumps(
         {"schema_version": DV_ROWS_SCHEMA_VERSION,
          "rows": rows, "source_rows": len(rows)}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    # Scoped machine credential for exactly this endpoint. The server compares
+    # its SHA-256, so the raw secret only ever lives here on the host (env
+    # SCANHOUND_DV_INGEST_KEY). Unset => no header => the server 401s and the
+    # POST fails loudly, which is the correct "not configured" outcome.
+    ingest_key = os.environ.get("SCANHOUND_DV_INGEST_KEY", "").strip()
+    if ingest_key:
+        headers["X-DV-Ingest-Key"] = ingest_key
     req = urllib.request.Request(
-        url, data=payload,
-        headers={"Content-Type": "application/json"}, method="POST")
+        url, data=payload, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             raw = resp.read().decode("utf-8", "replace")

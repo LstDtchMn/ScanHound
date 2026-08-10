@@ -275,3 +275,31 @@ def token_authorized(token: str) -> bool:
         if expires_at and not auth_service.is_expired(expires_at):
             return True
     return False
+
+
+def dv_ingest_key_hash() -> str:
+    """The configured SHA-256 (hex) of the DV ingest secret, or "" if unset.
+
+    A SCOPED machine credential for exactly ``POST /rename/dv-host-rows`` (the DV
+    host detector's row upload). The RAW secret never reaches the server — only
+    its hash is configured, via env ``SCANHOUND_DV_INGEST_KEY_SHA256`` — so a DB
+    dump or a config leak on the server side does not yield a usable key. Empty
+    means the scoped key is disabled and only a normal session admits the route.
+    """
+    return os.environ.get("SCANHOUND_DV_INGEST_KEY_SHA256", "").strip().lower()
+
+
+def dv_ingest_key_authorized(presented: str) -> bool:
+    """Whether *presented* (the raw secret) matches the configured ingest key.
+
+    Constant-time on the HASH so neither the secret nor its stored hash leaks by
+    timing. Returns False when no key is configured (feature off) or nothing was
+    presented. This function grants NOTHING by itself — the caller
+    (``main._dv_ingest_authorized``) restricts it to the one method+path.
+    """
+    import hashlib
+    configured = dv_ingest_key_hash()
+    if not configured or not presented:
+        return False
+    presented_hash = hashlib.sha256(presented.encode("utf-8")).hexdigest()
+    return secrets.compare_digest(presented_hash, configured)
