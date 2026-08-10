@@ -121,16 +121,50 @@ solve, or evade the challenge.**
   radius is one transport attempt, matching `f96c08b6`'s production measurement. The
   advice text now tells the operator to probe one item instead.
 
-## 4. What I could not verify here
+## 4. The live diagnostic — run this session, and what it showed
 
-* The live diagnostic the review listed as "do first" (non-evasive capture of Turnstile
-  resource loads, CSP headers, iframe attributes, and the exact console sequence on the
-  current navigation) has NOT been run in this session — it needs the production
-  container. The classification work above is cause-agnostic (it keys on the challenge
-  being present and failing, not on WHY it fails), but if that diagnostic shows a benign
-  integration defect (e.g. a blocked subresource), the right remedy may make the
-  challenge pass again — at which point held items release through the normal probe path.
-* Chrome's `goog:loggingPrefs {"browser": "ALL"}` is exercised through a driver double
-  here; whether the production chromedriver actually surfaces the Turnstile console
-  entries under Xvfb needs one live observation before the console leg of detection is
-  trusted (the DOM legs do not depend on it).
+The review's "do first" diagnostic WAS run in the production container (ScanHound's own
+Chromium, chromedriver `151`, Xvfb `:99`, a throwaway profile; read-only, no click, no
+solve, no queue or live-profile change) against the still-parked stalled URL
+`.../being-erica-s02-1080p-nf-web-dl-dd5-1-x264-ntb-18-3-gb/`. Two passes, one with the
+reveal form scrolled into view and 18 s of settle. Findings, at the precision they
+support:
+
+* **The reveal was NOT stalled at probe time.** The reveal control read **"View links"**
+  — the ready state, not "Verifying… Please wait". Page load 0.54 s, document 200. So the
+  active challenge is intermittent and was **not occurring** during this probe; the 600*
+  console error could not be re-captured because there was no active challenge to emit it.
+* **Turnstile infrastructure IS embedded, dormant, on the HEALTHY page.**
+  `"turnstile" in page_source` is **true** even though the reveal works — while
+  `input[name=cf-turnstile-response]` is **absent**, `.cf-turnstile` is **absent**, no
+  `challenges.cloudflare.com` iframe rendered, and **no** request to
+  challenges.cloudflare.com was made. The two iframes present have empty `src` (ad slots),
+  not Turnstile.
+* **This is direct live validation of the conjunction (change 8).** A dormant Turnstile
+  script tag is present on every normal reveal page, so keying on it — or on raw
+  "turnstile"/"cloudflare" in HTML — would false-positive on the healthy path. Requiring
+  `reveal_tier == not-ready` AND *rendered/active* evidence is exactly what stops that,
+  and the probe shows the guard is load-bearing rather than theoretical.
+* **One observation against "navigator.webdriver caused the rejection" as a sole/permanent
+  cause:** `navigator.webdriver` was **true** during this probe and the reveal still
+  reached the ready "View links" state. Consistent with the finding doc's discipline that
+  the 600* trigger was never isolated; an automation flag that categorically blocked us
+  would have blocked this load too. Not proof of anything on its own — just a data point
+  the "permanent bot block" reading has to explain.
+
+What this does and does not change for the code: the classification work is cause-agnostic
+(it keys on the challenge being present and failing, not why), so nothing above alters it.
+It does mean a future capture of the ACTIVE stall is still owed before the *cause* is
+called settled — the stall simply was not happening at probe time.
+
+## 5. Still owed
+
+* A capture of the diagnostic above **during an active stall** (the widget-embedded 600*
+  console error, the rendered Turnstile iframe/response-field, and any
+  `Network.loadingFailed` on Turnstile resources). This session caught only the healthy
+  state. The console leg of detection (`turnstile:console-600`) is therefore still
+  unproven against a live failure, though the DOM legs are now shown to behave correctly
+  on the healthy page and do not depend on the console.
+* `goog:loggingPrefs {"browser": "ALL"}` was accepted by the production chromedriver (the
+  probe read the console log without error), so the capability is live; what remains is
+  seeing it carry a real Turnstile 600* line during a stall.
