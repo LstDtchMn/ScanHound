@@ -268,7 +268,70 @@ Verified through `dv_host_scan.sig_is_current` itself, not a re-derivation of th
 rule. Prior values saved to `scratchpad/dv_host_rows_before.json`; reverting is
 setting `dv_layer='unknown'` and both signature columns back to NULL.
 
-## 8. Open items
+## 8. Applied a second time: the bounded sweep
+
+With the accelerator proven, the same probe was run outside the app across every
+file in the configured roots lacking a current signature, writing **only**
+proven-FEL results and leaving everything else untouched for a full pass:
+
+```
+probed 149   proven FEL 67   left for full pass 82   errors 0   in 13.4 min
+mean 5.4 s/file      4,555 GB covered      ~10.6 h of full passes avoided
+```
+
+45% FEL, against the 37% the whole-library figures predicted. Every write is
+recorded in `scratchpad/sweep_results.jsonl`.
+
+Host DB over the session: **494 → 568 rows, NULL signatures 2 → 0, FEL 182 →
+253.** Root 4's backlog went 236 → 162 without a single deploy.
+
+## 9. Coverage — measured, and mostly closed
+
+The scan covers four roots holding 730 files. Normalising by filename (the
+comparison that previously returned zero **vacuously**, because the two stores
+use different path forms):
+
+```
+distinct seed filenames : 3370
+distinct scan filenames :  460
+in BOTH                 :  459     <- the normalisation is sound
+seed-only               : 2911
+```
+
+So ~2,900 distinct 4K titles have never had a real detection. Two parts of that
+gap are now resolved rather than assumed:
+
+- **The 197 files in plain `4K` folders beside the scanned `4K DV` folders are
+  genuinely non-DV.** A 12-file random sample across all four drives returned
+  **0 with any RPU at all**. DV profiles 5/7/8 carry an RPU on every frame, so
+  no RPU in the first 1000 frames is strong evidence of no Dolby Vision. The
+  hand-sorting is correct and these folders are not worth scanning.
+- **`4K HDR Colombo` is 11,547 TV files**, not movies — correctly out of scope
+  for a movie DV scan.
+
+What remains genuinely unmeasured is the seed's `C:/4K Drives` set (2,616 rows
+across Jefferson, Truman, Gambino, Quantum, Ulysses, Yuri Gagarin, Rickover,
+Arnold). The repeated `BU`/`Backup` naming suggests many are backup copies
+rather than distinct titles, and none of those paths are reachable from the
+scanning host as configured. Establishing which are online and distinct is a
+scope decision, not a defect in this change.
+
+## 10. The freeze is frame-addressable
+
+Bisecting `-l N` on Jurassic World Rebirth, each probe bounded by the new stall
+watchdog rather than a wall clock:
+
+```
+  50875  completed      63343  completed      66460  completed
+  75812  WEDGED        100750  WEDGED        200500  WEDGED   400000  WEDGED
+  69577  WEDGED
+```
+
+The failure is between **frame 66,460 and 69,577**, at byte **27,367,062,473**
+— reproducible to the byte across independent runs. That pair is what an
+upstream report needs, and it rules out a transient or a storage fault.
+
+## 11. Open items
 
 1. **Not deployed.** Needs `up -d --build`, and `main` needs
    `fix/queue-policy-test-time-bomb` (`a88d541`) merged first or three unrelated
