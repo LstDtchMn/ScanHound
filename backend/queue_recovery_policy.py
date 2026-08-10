@@ -62,6 +62,7 @@ NO_AUTHORISATION = "no_authorisation_time"  # needs an explicit operator resume
 UNOWNED_REASON = "reason_not_owned"        # automatic recovery does not own this row
 DISABLED = "auto_resume_disabled"          # the operator turned it off
 BUDGET_SPENT = "retry_budget_spent"        # deliberate policy stop
+VERIFICATION_HOLD = "verification_hold"    # deliberate; a timer must NEVER release it
 
 #: Decisions that will NOT resolve on their own.
 #:
@@ -69,8 +70,11 @@ BUDGET_SPENT = "retry_budget_spent"        # deliberate policy stop
 #: ever changes an unknown-outcome row, so omitting it made the tools report
 #: "every deferred item has a recovery path" about a row that has none by design, and
 #: made the watcher wait on it forever.
+#:
+#: VERIFICATION_HOLD belongs here for the same reason: the whole point of the
+#: decision is that nothing automatic ever clears it.
 NEEDS_HUMAN = frozenset({NO_AUTHORISATION, UNOWNED_REASON, DISABLED, BUDGET_SPENT,
-                         SAFETY_HOLD})
+                         SAFETY_HOLD, VERIFICATION_HOLD})
 
 #: Transient: no action needed, it will clear.
 WILL_CLEAR = frozenset({WAITING_OWN, WAITING_BRAKE})
@@ -88,6 +92,11 @@ ACTION_MANUAL_RESUME = "manual_resume"  # safe to resume explicitly
 ACTION_CONFIGURATION = "configuration"  # a setting, not an item, is the problem
 ACTION_WAIT = "wait"                    # will clear on its own
 ACTION_NONE = "none"                    # due; the scheduler will take it
+#: DISTINCT from ACTION_MANUAL_RESUME on purpose. "Safe to resume explicitly"
+#: promises the resume fixes the problem; for a verification hold it does not —
+#: the source is presenting a challenge our automated browser cannot complete,
+#: so a resume is only a PROBE that re-checks whether the challenge has lifted.
+ACTION_ATTENTION_REQUIRED = "attention_required"
 
 ACTION_FOR = {
     SAFETY_HOLD: ACTION_ADJUDICATE,
@@ -95,6 +104,7 @@ ACTION_FOR = {
     BUDGET_SPENT: ACTION_MANUAL_RESUME,
     UNOWNED_REASON: ACTION_MANUAL_RESUME,
     DISABLED: ACTION_CONFIGURATION,
+    VERIFICATION_HOLD: ACTION_ATTENTION_REQUIRED,
     WAITING_OWN: ACTION_WAIT,
     WAITING_BRAKE: ACTION_WAIT,
     AUTHORISED: ACTION_NONE,
@@ -114,6 +124,16 @@ ACTION_ADVICE = {
     ACTION_CONFIGURATION: (
         "Turn auto-resume back on for this batch; the items themselves are fine."
     ),
+    # DELIBERATELY does not promise that retrying completes the verification.
+    # It cannot: the challenge runs inside ScanHound's own automated browser
+    # session, which the UI offers no way to interact with. "Retry now" is a
+    # probe of whether the challenge has lifted, nothing more.
+    ACTION_ATTENTION_REQUIRED: (
+        "Manual attention required: automated verification did not complete, and "
+        "waiting will not clear it. 'Retry now' on ONE item sends a single probe "
+        "to check whether the source still presents the challenge; it cannot "
+        "complete the verification itself. Do not retry all items at once."
+    ),
     ACTION_WAIT: "Nothing to do; this clears by itself.",
     ACTION_NONE: "Nothing to do; the scheduler will pick it up.",
 }
@@ -123,7 +143,8 @@ ACTION_ADVICE = {
 #: which test_every_decision_has_an_action enforces -- so a decision cannot reach an
 #: operator tool without someone deciding what a human should do about it.
 ALL_DECISIONS = frozenset({AUTHORISED, WAITING_OWN, WAITING_BRAKE, SAFETY_HOLD,
-                           NO_AUTHORISATION, UNOWNED_REASON, DISABLED, BUDGET_SPENT})
+                           NO_AUTHORISATION, UNOWNED_REASON, DISABLED, BUDGET_SPENT,
+                           VERIFICATION_HOLD})
 
 
 def action_for(decision: str) -> str:
@@ -178,6 +199,11 @@ class SharedFacts:
     source_delivery_count: int = 0
     progress_mark: int = 0
     max_attempts: int = 3
+    #: True when this group is under an ACTIVE human-verification hold for the
+    #: item's source (the batch's `verification_hold_source` matches it). The
+    #: caller resolves the source match; this type carries only the verdict, so
+    #: the policy cannot mis-compare two different spellings of one source.
+    verification_hold: bool = False
 
 
 def parse_max_attempts(config, default: int = 3) -> int:
@@ -218,6 +244,34 @@ def decide(item: ItemFacts, shared: SharedFacts,
 
     if (item.queue_reason or "") not in RECOGNISED_REASONS:
         return UNOWNED_REASON
+
+    # A HUMAN-VERIFICATION HOLD IS NOT A COOLDOWN. Added 2026-08-09, after the
+    # Turnstile root cause: this function returned AUTHORISED for
+    # (state="verification_required", queue_reason="interactive_challenge",
+    # cooldown_until=<expired>) — so a timer alone released a hold whose entire
+    # meaning is "an interactive challenge our automated browser cannot complete
+    # is in the way". Reclassifying Turnstile correctly would then have fed every
+    # item straight back into the same failing challenge on a schedule.
+    #
+    # Two facts can put a row under the hold, and each covers the other's gap:
+    #   * its OWN queue_reason is interactive_challenge (the triggering item);
+    #   * its group carries an active hold (shared.verification_hold) — the
+    #     siblings parked as source_deferred by the same challenge, which would
+    #     otherwise auto-resume one by one into the challenge.
+    #
+    # Placed BEFORE the configuration/budget/time checks because every later
+    # decision's advice is wrong for this row: DISABLED says "turn auto-resume
+    # on; the items are fine", BUDGET_SPENT and NO_AUTHORISATION say "safe to
+    # resume explicitly" — and none of those actions completes a verification.
+    # SAFETY and OWNERSHIP still outrank it: an unknown outcome must be
+    # adjudicated first, and an unowned reason must keep saying it is unowned.
+    #
+    # Release is NOT time-based by design. The hold clears only when a probe the
+    # operator explicitly promoted actually succeeds against the source
+    # (download_queue._complete clears the batch's verification_hold_source on a
+    # real source delivery).
+    if item.queue_reason == "interactive_challenge" or shared.verification_hold:
+        return VERIFICATION_HOLD
 
     if not shared.auto_resume_enabled:
         return DISABLED

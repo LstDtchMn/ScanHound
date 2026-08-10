@@ -21,7 +21,11 @@
 
   function stateLabel(state: string): string {
     return ({
-      verification_required: 'Verification required',
+      // Not "verification required" — that read as something the user could go
+      // and complete. The challenge runs inside ScanHound's own automated
+      // browser, which this UI has no way to interact with; retrying only
+      // probes whether the source still presents it.
+      verification_required: 'Manual attention required',
       waiting_source: 'Waiting for HDEncode',
       ready: 'Ready to retry',
       scheduled: 'Scheduled',
@@ -126,6 +130,8 @@
       <h2 class="text-sm font-semibold">Verification Retries</h2>
       <p class="text-xs text-[var(--text-secondary)]">
         Challenged and source-deferred link grabs are retained across restarts.
+        When automated verification did not complete, retrying sends a single
+        probe — the verification itself cannot be completed inside ScanHound.
       </p>
     </div>
     {#if browser}
@@ -189,7 +195,9 @@
             <button
               class="px-2.5 py-1 rounded bg-[var(--accent)] text-white text-xs disabled:opacity-40"
               disabled={!item.retry_available || busy !== ''}
-              title={item.retry_available ? 'Retry this item' : 'HDEncode is still paused'}
+              title={item.retry_available
+                ? 'Send one probe retry for this item'
+                : 'HDEncode is still paused'}
               onclick={() => retry(item)}
             >
               {busy === item.item_uuid ? 'Working…' : 'Retry now'}

@@ -35,10 +35,12 @@ from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 from backend.download_outcome import (
     CF_MITIGATED_CHALLENGE,
     CHALLENGE_IFRAME_MARKERS,
+    TURNSTILE_CAUSE_CODE,
     cf_mitigated_from_perf_log,
     challenge_iframe_srcs,
     diagnostic_from_traffic_denial,
     strong_challenge_markers,
+    turnstile_challenge_evidence,
 )
 from backend.browser_adapter import (
     browser_plan,
@@ -1629,6 +1631,24 @@ class DownloadService:
                     "warning",
                 )
 
+            # Widget-embedded Turnstile evidence: the response field, the
+            # .cf-turnstile container, a challenges.cloudflare.com iframe, or a
+            # navigation-scoped 600*-family console error. Every check above is
+            # shaped for an interstitial that REPLACES the page; HDEncode embeds
+            # the challenge inside the reveal widget, which is how a failing
+            # challenge was read as a source throttle for two weeks.
+            turnstile_markers = list(turnstile_challenge_evidence(
+                html, self._browser_console_lines(driver)
+            ))
+            if turnstile_markers:
+                signals.extend(
+                    m for m in turnstile_markers if m not in signals
+                )
+                self._log(
+                    f"[HDEncode][diag] Turnstile evidence: {turnstile_markers}",
+                    "warning",
+                )
+
             if keyword:
                 keyword_present = keyword.lower() in low
                 signals.append(f"requested_host_present:{str(keyword_present).lower()}")
@@ -1651,17 +1671,37 @@ class DownloadService:
                     affects_source_health=False,
                     signals=tuple(signals),
                 )
-            if header_challenge or captcha_frames or challenge_markers:
+            if (header_challenge or captcha_frames or challenge_markers
+                    or (stage == "access_control"
+                        and reveal_tier == "not-ready" and turnstile_markers)):
+                # THE CONJUNCTION, 2026-08-09. A not-ready reveal control plus
+                # ACTIVE Turnstile evidence is an interactive challenge, not a
+                # source throttle — measured on the live stall: Turnstile logged
+                # `Error: 600010.` while the reveal sat at "Verifying…" and the
+                # user's own browser passed the same challenge in under a
+                # second. Turnstile evidence alone deliberately does NOT
+                # classify outside the not-ready reveal state: a dormant widget
+                # on a page whose reveal works fine proves nothing.
                 decision = None
                 if source_kind == "hdencode":
                     decision = get_hdencode_coordinator().observe_challenge()
+                if stage == "access_control" and reveal_tier == "not-ready":
+                    signals.append("reveal-tier:not-ready")
                 return ScrapeDiagnostic(
                     ScrapeCode.INTERACTIVE_CHALLENGE,
                     retryable=False,
                     affects_source_health=True,
                     signals=tuple(signals),
                     stage="verification",
-                    cause_code="interactive_challenge",
+                    # The MECHANISM, when proven; the generic label otherwise.
+                    # last_cause_code is one of only three fields the queue
+                    # persists, so this is where "it was Turnstile" survives
+                    # log rotation.
+                    cause_code=(
+                        TURNSTILE_CAUSE_CODE
+                        if turnstile_markers
+                        else "interactive_challenge"
+                    ),
                     cooldown_until=(
                         decision.cooldown_until if decision is not None else None
                     ),
@@ -1929,6 +1969,33 @@ class DownloadService:
             )
         return value
 
+    def _drain_browser_console(self, driver) -> None:
+        """Mark a navigation boundary in the browser (console) log.
+
+        ``get_log`` DRAINS, so whatever this call discards belonged to the
+        previous page. Called at the top of ``_wait_past_cloudflare``, which
+        runs once per navigation (including the post-click one), so a Turnstile
+        error the OLD page logged can never classify the next page — the
+        navigation scoping ``is_turnstile_console_failure`` requires of its
+        caller lives here.
+        """
+        try:
+            driver.get_log("browser")
+        except Exception:
+            pass
+
+    def _browser_console_lines(self, driver) -> list:
+        """Console messages logged since the last navigation boundary.
+
+        Empty on any failure — an adapter without console logging means "no
+        signal", never "no challenge", so page evidence still decides.
+        """
+        try:
+            entries = driver.get_log("browser")
+        except Exception:
+            return []
+        return [str(entry.get("message") or "") for entry in entries or ()]
+
     def _wait_past_cloudflare(
         self,
         driver,
@@ -1937,6 +2004,8 @@ class DownloadService:
         source_kind: str = "other",
     ) -> Optional[ScrapeDiagnostic]:
         """Passively wait for a transient browser check without solving it."""
+        # A new navigation starts a new console scope — see _drain_browser_console.
+        self._drain_browser_console(driver)
         # Read the navigation's response headers once, before polling the page.
         # cf-mitigated is authoritative and language-independent, so a custom or
         # localized Challenge Page is recognised even with no English phrase and

@@ -37,8 +37,8 @@ sys.path.insert(0, "/app")
 
 from backend.queue_recovery_policy import (  # noqa: E402
     ACTION_ADVICE, AUTHORISED, BUDGET_SPENT, DISABLED, NEEDS_HUMAN, NO_AUTHORISATION,
-    SAFETY_HOLD, UNOWNED_REASON, WAITING_BRAKE, WAITING_OWN, WILL_CLEAR, ItemFacts,
-    SharedFacts, action_for, decide, parse_max_attempts,
+    SAFETY_HOLD, UNOWNED_REASON, VERIFICATION_HOLD, WAITING_BRAKE, WAITING_OWN,
+    WILL_CLEAR, ItemFacts, SharedFacts, action_for, decide, parse_max_attempts,
 )
 
 #: Plain-language rendering, because these are read by a person deciding whether to
@@ -52,18 +52,22 @@ LABELS = {
     UNOWNED_REASON: "automatic recovery does not own this row - needs a resume",
     DISABLED: "auto-resume is switched off for its batch",
     BUDGET_SPENT: "retry budget spent with no progress - needs a resume",
+    VERIFICATION_HOLD: (
+        "held for manual verification - a timer will NOT release it"),
 }
 
 #: The SQL both tools use, so they cannot even select different populations.
 JOINED_DEFERRED_SQL = """
     SELECT i.item_uuid, i.batch_uuid, i.title, i.state, i.cooldown_until,
            i.queue_reason, COALESCE(i.last_reason_code, '') AS last_reason_code,
+           i.source                      AS item_source,
            b.state                       AS batch_state,
            b.cooldown_until              AS batch_cooldown,
            b.auto_resume_after_cooldown  AS auto_resume_after_cooldown,
            b.auto_resume_used            AS auto_resume_used,
            b.source_delivery_count       AS source_delivery_count,
-           b.auto_resume_progress_mark   AS auto_resume_progress_mark
+           b.auto_resume_progress_mark   AS auto_resume_progress_mark,
+           b.verification_hold_source    AS verification_hold_source
     FROM download_queue_items i
     LEFT JOIN download_queue_batches b ON b.batch_uuid = i.batch_uuid
     WHERE i.state IN ('waiting_source', 'verification_required')
@@ -102,6 +106,10 @@ def facts_from_row(row):
         queue_reason=str(row["queue_reason"] or ""),
         last_reason_code=str(row["last_reason_code"] or ""),
     )
+    # The hold applies to this row only when the batch's held source IS this
+    # row's source — resolved here, exactly as _resume_batch resolves it, so
+    # the tools and production judge the same fact the same way.
+    hold_source = str(row["verification_hold_source"] or "")
     shared = SharedFacts(
         cooldown_until=_dt(row["batch_cooldown"]),          # <- the batch's, not the item's
         auto_resume_enabled=bool(row["auto_resume_after_cooldown"]),
@@ -109,6 +117,9 @@ def facts_from_row(row):
         source_delivery_count=int(row["source_delivery_count"] or 0),
         progress_mark=int(row["auto_resume_progress_mark"] or 0),
         max_attempts=load_max_attempts(),
+        verification_hold=bool(
+            hold_source and hold_source == str(row["item_source"] or "")
+        ),
     )
     return item, shared
 

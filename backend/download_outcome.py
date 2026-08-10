@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
 
@@ -217,6 +217,75 @@ def challenge_iframe_srcs(html: str) -> tuple[str, ...]:
         if any(marker in src.lower() for marker in CHALLENGE_IFRAME_MARKERS):
             hits.append(src)
     return tuple(hits)
+
+
+# The mechanism recorded in cause_code when active Turnstile evidence, not a
+# generic challenge marker, is what proved the challenge. 600* is Cloudflare's
+# generic challenge-failure FAMILY, so detection matches the family — 600010 is
+# what production logged on 2026-08-09 but it is an observation, not a contract.
+TURNSTILE_CAUSE_CODE = "turnstile_challenge_failed"
+
+_TURNSTILE_CONSOLE_HOST = "challenges.cloudflare.com/turnstile"
+_TURNSTILE_CONSOLE_ERROR = re.compile(r"error:?\s*['\"]?600\d+", re.IGNORECASE)
+
+
+def is_turnstile_console_failure(line: str) -> bool:
+    """Does one browser-console line record a Turnstile 600*-family failure?
+
+    Requires BOTH the Turnstile script origin and a 600-family error number in
+    the same entry, so an unrelated site error mentioning "600123" or a dormant
+    reference to the script URL alone is never evidence. The CALLER owns the
+    navigation scoping: console entries must be drained at navigation start so
+    an old page's error cannot classify the next page.
+    """
+    low = (line or "").lower()
+    return (_TURNSTILE_CONSOLE_HOST in low
+            and bool(_TURNSTILE_CONSOLE_ERROR.search(low)))
+
+
+def turnstile_challenge_evidence(
+    html: str, console_lines: Sequence[str] = ()
+) -> tuple[str, ...]:
+    """Active Turnstile evidence markers, or ``()`` for none.
+
+    HDEncode embeds Turnstile INSIDE the reveal widget rather than replacing
+    the page, so the interstitial-shaped checks (challenge page title, visible
+    challenge text, cf-mitigated header) all miss it — that is how a failing
+    challenge was classified as a source throttle for two weeks. Accepted
+    evidence, in order of preference:
+
+    1. a rendered ``input[name="cf-turnstile-response"]`` — the field the
+       widget posts its verdict through;
+    2. a rendered ``.cf-turnstile`` container element;
+    3. a rendered iframe whose ``src`` names ``challenges.cloudflare.com``;
+    4. a NAVIGATION-SCOPED console error in the 600* family from the Turnstile
+       script (see is_turnstile_console_failure for what the caller must
+       guarantee about scoping).
+
+    Deliberately NOT evidence: the word "cloudflare" anywhere in raw HTML, a
+    dormant ``<script src=...turnstile...>`` reference alone, the English
+    "Verifying… Please wait" label (localizable, and the site also uses it for
+    its own states), or generic access/show/download/link control text — the
+    existing detector once matched "show" inside a "TV Shows" navigation link.
+    """
+    markers: list[str] = []
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html or "", "html.parser")
+        if soup.find("input", attrs={"name": "cf-turnstile-response"}) is not None:
+            markers.append("turnstile:response-field")
+        if soup.find(class_="cf-turnstile") is not None:
+            markers.append("turnstile:container")
+        for frame in soup.find_all("iframe"):
+            if "challenges.cloudflare.com" in (frame.get("src") or "").lower():
+                markers.append("turnstile:iframe")
+                break
+    except Exception:
+        pass
+    if any(is_turnstile_console_failure(line) for line in console_lines or ()):
+        markers.append("turnstile:console-600")
+    return tuple(dict.fromkeys(markers))
 
 
 def strong_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:

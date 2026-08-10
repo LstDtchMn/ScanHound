@@ -265,7 +265,52 @@ class DatabaseManager:
     # ── Schema initialization ────────────────────────────────────────
 
     # Schema version — increment when migrations are added.
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 9
+
+    @staticmethod
+    def _mark_existing_challenge_pauses_held(cursor):
+        """v9: put pre-existing challenge pauses under the verification hold.
+
+        The 2026-08-09 root cause: batches paused by what is actually a
+        Cloudflare Turnstile challenge sit recorded as `interactive_challenge`
+        or `reveal_verification_stalled`, cycling on expired cooldowns. Moving
+        them under the hold must be ATOMIC AT THE EPISODE — rewriting item
+        reason codes alone would leave the old cooldowns and auto-resume flags
+        able to reschedule them, so the hold is written at the batch, which is
+        the level the resume machinery consults. One UPDATE, one transaction.
+
+        The hold's source comes from the batch's own deferred items (a batch
+        can be labelled source="mixed"); a paused batch with no deferred item
+        left is skipped — there is nothing an automatic resume could replay.
+        Runs once, gated by user_version < 9: a reveal stall that happens AFTER
+        this deploy classifies at grab time instead, where actual Turnstile
+        evidence decides — inferring a challenge from these reason codes is
+        only justified for the episode that was measured.
+        """
+        cursor.execute(
+            """
+            UPDATE download_queue_batches
+            SET verification_hold_source = (
+                SELECT i.source FROM download_queue_items i
+                WHERE i.batch_uuid = download_queue_batches.batch_uuid
+                  AND i.state IN ('verification_required', 'waiting_source')
+                ORDER BY i.sequence_number LIMIT 1
+            )
+            WHERE state = 'paused_source'
+              AND verification_hold_source IS NULL
+              AND (
+                    COALESCE(last_reason_code, '') IN (
+                        'interactive_challenge', 'reveal_verification_stalled')
+                 OR COALESCE(last_cause_code, '') IN (
+                        'interactive_challenge', 'reveal_verification_stalled')
+              )
+              AND EXISTS (
+                SELECT 1 FROM download_queue_items i
+                WHERE i.batch_uuid = download_queue_batches.batch_uuid
+                  AND i.state IN ('verification_required', 'waiting_source')
+              )
+            """
+        )
 
     def init_db(self):
         """Initialize database tables and run schema migrations.
@@ -1201,7 +1246,13 @@ class DatabaseManager:
                         paused_at TEXT,
                         cooldown_until TEXT,
                         last_reason_code TEXT,
-                        last_cause_code TEXT
+                        last_cause_code TEXT,
+                        -- Non-NULL = this batch is under a human-verification
+                        -- hold for that source: an interactive challenge our
+                        -- automated browser could not complete. A timer never
+                        -- clears it; only a probe that genuinely delivers from
+                        -- this source does (DownloadQueueService._complete).
+                        verification_hold_source TEXT
                     )
                 """)
                 # Additive migration for the table above, placed HERE and not in
@@ -1225,12 +1276,20 @@ class DatabaseManager:
                     "ALTER TABLE download_queue_batches "
                     "ADD COLUMN source_delivery_count INTEGER "
                     "NOT NULL DEFAULT 0",
+                    # See the column comment in the CREATE above (v9).
+                    "ALTER TABLE download_queue_batches "
+                    "ADD COLUMN verification_hold_source TEXT",
                 ):
                     try:
                         cursor.execute(_batch_alter)
                     except sqlite3.OperationalError as exc:
                         if "duplicate column" not in str(exc).lower():
                             raise
+
+                if current_version < 9:
+                    # v9 ONE-TIME DATA MIGRATION: place the challenge episode
+                    # that predates the verification-hold column under the hold.
+                    self._mark_existing_challenge_pauses_held(cursor)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS download_queue_items (
                         item_uuid TEXT PRIMARY KEY,
