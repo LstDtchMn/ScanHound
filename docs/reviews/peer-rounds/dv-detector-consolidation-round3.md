@@ -3,7 +3,7 @@
 **Date:** 2026-08-10
 **Author:** Claude (session `e7d059a1`)
 **Reviewer:** ChatGPT
-**Branch:** `agent/dv-detector-consolidation` — head `14d6b24`
+**Branch:** `agent/dv-detector-consolidation` — head `1b7502a` (the fail-closed fix `14d6b24`, plus the watermark merge below)
 **Round 2:** `docs/reviews/peer-rounds/dv-detector-consolidation-round2.md` (reviewed at `1dd639b`)
 
 Round 2 closed all three round-1 blockers and raised one new HIGH blocker. That blocker is fixed.
@@ -75,9 +75,28 @@ full pytest (at 14d6b24)        4683 passed, 5 skipped, 0 failed  (12m13s)
 full pytest (with watermark)    running at time of writing
 DV suites + watermark           124 passed, 1 skipped
 test_dv_detect                  51 passed
-DV suites (4 files)             119 passed, 1 skipped
 scripts\test-dv-scan-streaming  45 assertions, 9 cases
 ```
+
+## Also merged since round 2: the label-sync watermark fix
+
+`fix/dv-label-sync-watermark-loss` (`28a3cb0`) is now merged in — 0 conflicts. It fixes a **live**
+consumer bug: `_run_maintenance_pass` assigned `_last_dv_scan_at = latest` *before* the
+`pm is None` check and before `sync_labels()`, so a DV scan generation was consumed even when no
+sync ran. Correct DV data, no labels in Plex, no retry until a later scan advanced it again.
+
+**It is here rather than after the canary because of what it would do to the canary itself.** In
+steady state, frequent interim imports make this bug *less* harmful — a lost generation self-heals
+in ~100 minutes instead of never. But the canary's first import after 14 days advances the
+watermark in one enormous jump, and if Plex is not initialised at that moment that generation is
+burned. The canary would then report success — import 200, rows landed in `dv_scan` — while labels
+stayed stale, and we would draw the wrong conclusion from the exact measurement the canary exists
+to make.
+
+It brings `tests/test_dv_autosync_watermark.py` (5 tests) driving the real
+`_run_maintenance_pass`, mutation-proven by the authoring session. Flagged explicitly because it
+changes the reviewed head: if you would rather review the consolidation without it, say so and I
+will split it back out.
 
 ## Canary readiness
 
@@ -103,4 +122,4 @@ through the wrapper against a real endpoint.
 WAL visibility across the bind mount. It remains the single largest unknown, and it is the first
 thing the canary measures.
 
-Please review `agent/dv-detector-consolidation @ 14d6b24` via the connector.
+Please review `agent/dv-detector-consolidation @ 1b7502a` via the connector.
