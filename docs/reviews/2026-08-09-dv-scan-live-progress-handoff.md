@@ -233,9 +233,35 @@ review's "2 unknowns with NULL sigs". Those two were resolved to `fel` by anothe
   was in the test harness's own launch path, since replaced. No root cause is claimed.
 
 **Carried over from the retracted throughput review, still open:**
-- **`POST /rename/dv-import` has not run since the scan started producing.** The host DB holds 499
-  rows; the container's `dv_scan` held 466 and gained none. **Plex DV labels cannot update until
-  it does.** This was follow-up #2 of the throughput review and is untouched by this work.
+- **`POST /rename/dv-import` has NEVER run — now root-caused, and it is structural.**
+  This was follow-up #2 of the throughput review, recorded there as "has not run". It is worse
+  than that: **no scheduled run has ever reached the import step at all,** and it cannot under
+  the present design. Verified end to end, read-only:
+
+  | evidence | value |
+  |---|---|
+  | Host `dv_host.db` | **499** rows |
+  | Container `dv_scan` `source='scan'` | **466** rows |
+  | Container `MAX(last_seen_at)` | **2026-07-26 02:29:47** (14 days stale) |
+  | Every detector capture file today | exactly **218 bytes** — the two timeout warnings and nothing else |
+  | `scanned N file(s)` in any capture | **none** |
+  | `dv-import ->` in any capture | **none** |
+
+  The chain:
+  1. `_post_import()` is called only **after** the `for path in _iter_files(...)` loop finishes
+     (`dv_host_scan.py:223`) — it is the last statement of `main()`.
+  2. The loop cannot finish: ~231 files remain at roughly 6 files/hour, ~38 hours of work,
+     against the task's `ExecutionTimeLimit = PT6H`.
+  3. So every run is killed mid-loop and the POST never fires.
+  4. The container's `dv_scan` therefore stays at 466 and `last_seen_at` stays frozen.
+  5. The label sync fires only when `MAX(last_seen_at)` **rises**, so **Plex DV labels have not
+     updated since 2026-07-26** and will not, no matter how well detection performs.
+
+  **Detection working and results being visible are two different things, and only the first is
+  fixed by this branch.** The shape of a fix is to import incrementally — POST every N files, or
+  in a `finally` so a killed run still hands off what it completed — rather than once at the very
+  end of a scan that never ends. Not attempted here; it is a behaviour change to the detector's
+  contract with the container and wants its own review.
 - The 30-minute `_EXTRACT_TIMEOUT` remains a latent risk on the extreme tail — being addressed by
   the other session's stall watchdog, not here.
 
