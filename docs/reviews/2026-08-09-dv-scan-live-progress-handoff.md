@@ -218,8 +218,20 @@ review's "2 unknowns with NULL sigs". Those two were resolved to `fel` by anothe
 ## 7. What remains
 
 **Blocking:**
-- **ChatGPT peer review** of `fix/dv-scan-live-progress` — requested, not yet returned. Six
-  questions in `docs/reviews/peer-rounds/dv-scan-live-progress.md` §4.
+- **ChatGPT round 1 came back REQUEST CHANGES and all six findings are fixed** (`8434627`).
+  Response table in `docs/reviews/peer-rounds/dv-scan-live-progress.md`. **Round 2 not yet run.**
+  Two were merge blockers, and both were the same error this branch exists to prevent — a proxy
+  promoted into a claim:
+  - the heartbeat's `(+N this run)` counted every writer's rows and under-counted UPSERTs, so it
+    could not mean "this run". Removed; absolute count only.
+  - the per-file `MB/s` printed on **failed and timed-out** detections too, dividing a whole file
+    size by a timeout during which `dovi_tool` may have read any fraction of it. That would have
+    fabricated an authoritative-looking rate for the two nightly timeout titles, in the very log
+    built to stop that. Now `<error>; rate unavailable`, with the error text preserved.
+  Also: fail closed when `Process.Start()` yields neither process nor code; the 12-second test
+  deadline replaced by a blocked-child handshake (no timing assumption); a corrected `mode=ro`
+  comment; and two new cases — a line split inside a multi-byte UTF-8 character across polls,
+  and a failed detection printing no rate. **41 assertions across 8 cases; pytest 9/9.**
 - **Merge is Jesse's call.** So is any deploy beyond the working-tree checkout already made.
 
 **Known gaps, stated so they are not assumed covered:**
@@ -261,7 +273,13 @@ review's "2 unknowns with NULL sigs". Those two were resolved to `fel` by anothe
   fixed by this branch.** The shape of a fix is to import incrementally — POST every N files, or
   in a `finally` so a killed run still hands off what it completed — rather than once at the very
   end of a scan that never ends. Not attempted here; it is a behaviour change to the detector's
-  contract with the container and wants its own review.
+  contract with the container and wants its own review. ChatGPT independently reached the same
+  conclusion and added **a second half I had missed: `_post_import()` logs an HTTP/OSError but
+  does not return failure to `main()`, so even a scan that DOES complete can exit 0 with its
+  import having failed.** The import is therefore both unreachable and, if reached, silently
+  fallible. A repeated import is designed as an upsert of the host store into `dv_scan`, so
+  decoupling it from full-scan completion is technically plausible; cadence and the label-sync
+  trigger want reviewing together.
 - The 30-minute `_EXTRACT_TIMEOUT` remains a latent risk on the extreme tail — being addressed by
   the other session's stall watchdog, not here.
 

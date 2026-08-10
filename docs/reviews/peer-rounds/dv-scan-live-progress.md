@@ -173,3 +173,45 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-dv-scan-streami
 
 Please review the branch itself via the connector rather than this summary — the summary is
 where my blind spots would be preserved rather than caught.
+
+---
+
+# ROUND 1 RESPONSE — all six findings accepted and fixed (`8434627`)
+
+ChatGPT reviewed at `f32ca8e` and returned **REQUEST CHANGES**, with two merge blockers. Both
+were correct, and both were the same failure this branch exists to prevent: **a convenient
+proxy promoted into a stronger claim.** I had done it twice while fixing it once.
+
+| # | Finding | Verdict | Fix |
+|---|---|---|---|
+| 1 | `(+N this run)` is not attributable | **Accepted** | Delta removed; absolute count only. A new assertion fails if any `this run` claim reappears. |
+| 2 | MB/s printed for failed/timed-out detections | **Accepted** | Rate printed only when detection completed; otherwise `<error>; rate unavailable`. Error text preserved. Renamed *effective scan rate*. |
+| 3 | 12 s deadline stakes correctness on host speed | **Accepted** | Replaced with a blocked-child/release handshake. No deadline remains. |
+| 4 | `Process.Start()` → `$null` became success | **Accepted** | Fails closed with a logged reason. |
+| 5 | `mode=ro` is non-writing, not lock-free | **Accepted** | Comment corrected; design unchanged. |
+| Q1 | Missing split-line-across-polls test | **Accepted** | Case 7, split inside a multi-byte UTF-8 character. |
+
+**On finding 1** — the third counterexample is the one I would not have found myself: the
+primary key is the raw path string, so the same physical file can occupy two rows under two
+spellings, and the second writer uses a different spelling. Even single-writer, an UPSERT does
+real work while leaving `COUNT(*)` unchanged, so the delta under-counts. There is no cheap
+correct version of that number; it is gone rather than relabelled.
+
+**On finding 2** — this is the one that would have done real damage. The 03:00 run hits two
+titles that time out at 1800 s every night. The old code would have written a confident
+`(40 MB/s)` for each, derived from dividing a whole file size by a timeout during which
+`dovi_tool` may have read any fraction of it. A future reader would have found exactly the kind
+of authoritative-looking fabricated rate that caused the retraction — generated automatically,
+in the log built to prevent it. Case 8 now asserts no `MB/s` appears anywhere on a failed
+detection.
+
+**Tests are now 41 assertions across 8 cases.** The negative control was re-verified against the
+pre-streaming wrapper: it fails the blocked-window assertion and both split-line assertions.
+`tests/test_dv_host_scan.py` remains 9/9.
+
+**Not adopted:** nothing. **Deferred, with agreement:** `dv-import` cadence and failure
+semantics, which the review also identified as a separate task. Its second half —
+`_post_import()` logs an error but does not return failure, so a completed scan with a failed
+import still exits 0 — is recorded in the handoff and not fixed here.
+
+Ready for round 2 at head `8434627`.
