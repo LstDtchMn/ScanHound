@@ -2090,7 +2090,22 @@ class DownloadQueueService:
             cleared, source,
         )
         self._wake.set()
-        return {"source": source, "cleared": cleared}
+        # SAY that the clear is self-correcting. Peer review of the fold: if the
+        # challenge is still active, the first released sibling re-arms the hold
+        # within a cycle. That is fail-safe, but an operator who clicks "clear"
+        # and watches it re-arm 40 seconds later will read it as broken and
+        # remove the re-arm. Surfacing it here (and wherever the UI wires this)
+        # keeps that from happening.
+        return {
+            "source": source,
+            "cleared": cleared,
+            "message": (
+                f"Released the verification hold on {cleared} batch(es) for "
+                f"{source}. If the challenge is still active, the first released "
+                "item will re-arm the hold within a cycle — that is fail-safe, "
+                "not a fault."
+            ),
+        }
 
     def cancel_item(self, item_uuid: str) -> bool:
         now = _iso()

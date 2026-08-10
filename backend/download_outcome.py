@@ -352,23 +352,15 @@ def strong_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:
     markers.extend(
         marker for marker in _CHALLENGE_VISIBLE_MARKERS if marker in visible
     )
-    # BODY-ONLY INTERSTITIAL (fold, round-2 regression guard). Some Cloudflare
-    # interstitials render the phrase in the BODY, not the <title>, and may
-    # carry no cf-mitigated header we captured. Without this, such a page has
-    # only its iframe as evidence — and because an embedded iframe is gated on a
-    # not-ready reveal, a genuine page-replacing interstitial (which has no
-    # reveal control at all) was demoted to LAYOUT_CHANGED: "a challenge blocked
-    # us" became "the scraper is broken". Both authors' first partitions had
-    # this shape. The full interstitial title phrases are matched in the visible
-    # body, but ONLY alongside a rendered challenge iframe — the conjunction
-    # keeps it from firing on a normal release page, which renders no challenge
-    # iframe (measured on the live healthy page). Emitted as `visible:` markers
-    # so the classifier treats them as top-level interstitial evidence.
-    has_iframe_marker = any(m.startswith("iframe:") for m in markers)
-    if has_iframe_marker:
-        for phrase in _CHALLENGE_TITLE_MARKERS:
-            if phrase in visible:
-                markers.append(f"visible:{phrase}")
+    # NOTE: a body-only page-replacing interstitial (its phrase in the BODY, no
+    # <title>, no captured cf-mitigated header) is NOT recognised here — keying
+    # on the body phrase is unsafe, because release pages carry those phrases as
+    # related-release names and the invisible-Turnstile widget renders a
+    # transient iframe on otherwise-working pages (~11s build/teardown). That
+    # case is handled STRUCTURALLY in _log_page_diagnostics instead: a rendered
+    # challenge iframe on a page with NO access/download/link controls is the
+    # interstitial shape, phrase- and lifecycle-independent. See the fold's
+    # round-1 finding from agent/turnstile-classification.
     return tuple(dict.fromkeys(markers))
 
 

@@ -1696,10 +1696,37 @@ class DownloadService:
                 )
             reveal_not_ready = (
                 stage == "access_control" and reveal_tier == "not-ready")
-            # TOP-LEVEL interstitial: the page IS the challenge (cf-mitigated on
-            # the displayed document, or a Cloudflare interstitial title/body).
-            # Reveal state is irrelevant — there is no working reveal to be in.
-            top_level_challenge = header_challenge or bool(interstitial_markers)
+            # A PAGE-REPLACING INTERSTITIAL has NO access/download/link controls —
+            # `candidates` is empty. That STRUCTURAL property is what a genuine
+            # Cloudflare interstitial has and a working release page never does,
+            # and it is immune to two things the body-phrase approach was not
+            # (peer review of the fold, agent/turnstile-classification):
+            #   * release pages carry "access denied"/"just a moment" as
+            #     related-release NAMES, so keying on the phrase false-positives;
+            #   * invisible Turnstile renders a TRANSIENT iframe (~11s build/
+            #     teardown) on otherwise-working pages, so keying on the iframe
+            #     alone would arm a source-wide hold on a healthy source.
+            # So a rendered challenge iframe on a control-less page is the
+            # interstitial; the same iframe on a page WITH controls is the
+            # embedded case, gated on a not-ready reveal below.
+            #
+            # AND no reveal control was found. reveal_tier tells us directly: a
+            # working page yields "links-control" and an active reveal challenge
+            # yields "not-ready" — in both a control WAS found, so it is not a
+            # page-replacing interstitial. Only None/"none" (no reveal control at
+            # all) qualifies. This resolves the artificial-but-instructive case
+            # of a bare iframe reported as a ready reveal: the reveal tier, not
+            # just the absence of other controls, decides.
+            interstitial_shape = (
+                bool(captcha_frames or iframe_markers)
+                and not candidates
+                and reveal_tier in (None, "none"))
+            # TOP-LEVEL interstitial: the page IS the challenge — a cf-mitigated
+            # header, an interstitial <title>, or the control-less iframe shape.
+            # Reveal state is irrelevant; there is no working reveal to be in.
+            top_level_challenge = (
+                header_challenge or bool(interstitial_markers)
+                or interstitial_shape)
             # EMBEDDED challenge widget on an otherwise-normal release page:
             # Turnstile in the reveal, or a captcha iframe. This is a source-wide
             # challenge ONLY when the reveal itself is stuck — the conjunction.

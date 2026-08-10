@@ -180,13 +180,14 @@ def test_embedded_challenge_iframe_on_a_working_reveal_is_not_a_challenge(monkey
 
 
 def test_body_only_interstitial_no_title_still_classifies(monkeypatch):
-    # FOLD regression guard (both branches' partitions had this shape): a
-    # Cloudflare interstitial that renders its phrase in the BODY, with no
-    # <title> and a challenge iframe, must still be INTERACTIVE_CHALLENGE — not
-    # demoted to LAYOUT_CHANGED. An embedded iframe alone is gated on a not-ready
-    # reveal; the body interstitial phrase alongside the iframe makes it a
-    # top-level challenge regardless of reveal state. Caught by the full suite,
-    # not review, when this regressed before.
+    # FOLD regression guard (both branches' partitions had this shape): a genuine
+    # page-replacing Cloudflare interstitial — no <title>, no captured
+    # cf-mitigated header, a challenge iframe, and NO access/download/link
+    # controls — must still be INTERACTIVE_CHALLENGE, not demoted to
+    # LAYOUT_CHANGED. Recognised STRUCTURALLY (iframe + no controls = the
+    # interstitial shape), not by the body phrase — see the peer-review finding
+    # that keying on the phrase or the iframe alone false-positives on working
+    # release pages.
     service = _service()
     coordinator = MagicMock()
     coordinator.observe_challenge.return_value = SimpleNamespace(cooldown_until=None)
@@ -194,14 +195,12 @@ def test_body_only_interstitial_no_title_still_classifies(monkeypatch):
         "backend.download_service.get_hdencode_coordinator", lambda: coordinator)
     driver = MagicMock()
     driver.title = ""                    # NO <title>
-    # Body carries ONLY the broader title-category phrases ("just a moment",
-    # "attention required") — NOT the standalone visible markers ("checking your
-    # browser" / "verify you are human"), so this exercises the iframe-gated
-    # body-interstitial path specifically, not the pre-existing visible markers.
+    # A bare interstitial: a spinner, its copy, the challenge iframe — and NO
+    # download/access/link controls (that absence is the structural signal).
     driver.page_source = """
         <html><body>
         <h1>Just a moment…</h1>
-        <p>Attention required. Please wait while your request is reviewed.</p>
+        <p>Please wait while your request is reviewed.</p>
         <iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if"></iframe>
         </body></html>
     """
@@ -212,13 +211,45 @@ def test_body_only_interstitial_no_title_still_classifies(monkeypatch):
     assert diagnostic.affected_scope == "source"
 
 
+def test_challenge_iframe_on_a_working_page_with_controls_is_not_a_challenge(monkeypatch):
+    # PEER-REVIEW COUNTEREXAMPLE (agent/turnstile-classification). The invisible
+    # Turnstile widget renders a TRANSIENT iframe (~11s build/teardown) on
+    # otherwise-working pages, and a release page carries phrases like "Access
+    # Denied" as related-release NAMES. A working release page — reveal control
+    # READY, access/download/link controls present, an "Access Denied (2021)"
+    # related title in the body, and a transient challenge iframe — must NOT be
+    # a source-wide interstitial. The structural guard (controls present) is what
+    # prevents arming a hold on a healthy source; keying on the iframe or the
+    # body phrase would not.
+    service = _service()
+    coordinator = MagicMock()
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator)
+    driver = MagicMock()
+    driver.title = "Some.Release.2026.2160p.WEB-DL"
+    driver.page_source = """
+        <html><body>
+        <form action="/some-release/#unlocked">
+          <input type="submit" value="View links">
+        </form>
+        <a href="https://rapidgator.net/file/abc">Rapidgator download</a>
+        <aside>Related: <a href="/access-denied-2021/">Access Denied (2021)</a></aside>
+        <iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if"></iframe>
+        </body></html>
+    """
+    diagnostic = service._log_page_diagnostics(
+        driver, stage="access_control", source_kind="hdencode",
+        reveal_tier="links-control")
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE, (
+        "a working page with controls must not be held on a transient iframe")
+    coordinator.observe_challenge.assert_not_called()
+
+
 def test_body_title_phrase_without_an_iframe_is_not_a_challenge(monkeypatch):
-    # The conjunction guard for the BROADER title phrases: a release page whose
-    # body happens to contain an ambiguous phrase like "just a moment" or
-    # "access denied", with NO rendered challenge iframe, must NOT be treated as
-    # a source-wide interstitial. (The narrow phrases "checking your browser" /
-    # "verify you are human" remain standalone evidence — that is pre-existing
-    # base behaviour these ambiguous ones deliberately do not share.)
+    # The broader ambiguous title phrases ("just a moment", "access denied") in
+    # a release body, with NO challenge iframe, must NOT classify — they are not
+    # standalone evidence. (The narrow phrases "checking your browser" / "verify
+    # you are human" remain standalone, pre-existing base behaviour.)
     service = _service()
     coordinator = MagicMock()
     monkeypatch.setattr(
