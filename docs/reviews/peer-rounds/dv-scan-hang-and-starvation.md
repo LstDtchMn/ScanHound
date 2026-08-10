@@ -49,16 +49,21 @@ So `6.7 MB/s` never existed, and at the *slowest* observed healthy rate the
 Rebirth, sampled over a 60-second window while the scan was live:
 
 ```
-read_bytes_delta : 0          <- zero read operations, not "slow"
+read_bytes_delta : 0            <- zero read operations, not "slow"
 read_ops_delta   : 0
-cpu_percent      : 95.7       <- one thread, pegged
-total_read       : 25.49 GB   of a 74.3 GB file
+cpu_percent      : 95.7         <- one thread, pegged
+total_read       : 27.37 GB     of a 74.3 GB file  (36.8%)
 rpu output       : 0 bytes, not growing
 ```
 
-It had read 34% of the file and then stopped reading entirely while holding a
+It had read 37% of the file and then stopped reading entirely while holding a
 core. A plain sequential read streams straight through that same offset at
 221 MB/s, so neither the file nor the link is at fault.
+
+**The freeze offset is exact and reproducible.** An independent run hours later,
+under different load, stalled at **byte 27,367,062,473** — the same position to
+the byte. That rules out a transient and points at a specific position in the
+stream, which is the single most useful fact for an upstream report.
 
 **It is deterministic and it recurs.** From `data/dv-scan-logs/`:
 
@@ -183,17 +188,57 @@ publishes progress during a long backfill instead of only at the end.
 changed files, skipping the retry sweep; `--mode backfill` (default) does
 everything, ordered.
 
-**Separate bug fixed.** `_PROFILE_RE` matched `Profile:` only. Its real severity
-is worse than "would not parse": an unmatched summary fell through to
-`LAYER_NONE` with `error=None` — an *authoritative* "no Dolby Vision", which
-`dv_labeler` acts on by **removing** the managed label. A mixed-profile title
-could therefore lose its DV badge. Now matches `Profiles: 7, 8` and classifies
-each value.
+**Separate bug fixed — with the severity stated precisely.** Two claims here, and
+only one of them is verified.
+
+*Verified, and the reason it matters:* **any** summary line `_PROFILE_RE` fails to
+match falls through to `LAYER_NONE` with `error=None` — an *authoritative* "no
+Dolby Vision", not an "unknown". `dv_labeler.is_authoritative()` accepts that
+value and `desired_label()` maps it to no label, so an unparsed summary does not
+merely fail to classify: it **authorises removing the DV badge**. That fail-open
+direction is real today, independent of any particular trigger, and it is the
+part worth fixing.
+
+*NOT verified:* that `dovi_tool 2.3.2` ever emits a plural `Profiles:`. It was
+asserted upstream, and I could not confirm it against the pinned binary. A
+string search finds zero occurrences of `Profiles` — but that zero is **not
+trustworthy**, because the same search also finds zero occurrences of
+`Profile: `, which this binary demonstrably printed 24 times during the bounded
+experiment. The profile line is assembled from fragments rather than stored as
+one literal, so absence proves nothing about exactly that line. (The control
+holds for every other summary label: `Scene/shot count`, `DM version`,
+`RPU mastering display`, `L5 offsets` and `Parsing RPU file` are all present as
+literals, so the method works everywhere except the one line in question.)
+
+So the regex now accepts both spellings and a comma-separated value list, which
+is correct whether the plural is emitted by 2.3.2, by a later version, or never.
+**Treat the mixed-profile trigger as latent rather than live** until someone
+produces a real multi-profile summary from this binary.
 
 ## 6. Verification
 
-- Full suite run on this branch and on `origin/main` in the same session, from
-  complete worktrees, so failures are attributed by baseline rather than by eye.
+**Suite, both arms, same session, from complete worktrees** — so failures are
+attributed by baseline rather than by eye:
+
+```
+main   6813260 : 3 failed, 4626 passed, 5 skipped   (711.20 s)
+branch 48cbd53 : 3 failed, 4656 passed, 5 skipped   (739.28 s)
+```
+
+The same three `test_queue_recovery_policy.py` tests fail on both — the
+`a88d541` date bomb, pre-existing. **Zero regressions; +30 passing tests.**
+
+**End-to-end against the real library and real dovi_tool** (not mocks):
+
+```
+bounded  Jurassic World Rebirth   13.4 s   fel        evidence=bounded
+bounded  Death Wish 3             19.5 s   fel        evidence=bounded
+full     If These Walls Could Sing 95.9 s  profile5   evidence=full     <- non-FEL still takes the full path
+full     Jurassic (forced)        504.6 s  unknown    error=stalled     <- watchdog fired, vs 1800 s before
+```
+
+The third line is the one that proves the accelerator is not over-applied: a
+non-FEL title is *not* short-circuited and still returns its true layer.
 - **Mutation-checked.** Reverting the regex to singular fails 3 of the 4
   multi-profile tests; changing the bounded probe to finalise any non-`none`
   sample fails 2 of the 6 accelerator tests. Baseline restored and re-verified
@@ -231,9 +276,10 @@ setting `dv_layer='unknown'` and both signature columns back to NULL.
 2. **The container has never imported this backlog.** Once deployed, the first
    completed run posts `/rename/dv-import` and 494 rows land at once.
 3. **Why those two files wedge dovi_tool is still unknown.** Both are Profile 7
-   FEL, both stop reading partway. Worth a `-l` sweep at increasing limits to
-   find the offending frame, and worth reporting upstream — but it no longer
-   blocks anything.
+   FEL, both stop reading partway, and Jurassic World Rebirth does so at exactly
+   byte 27,367,062,473 on repeated independent runs. A `-l` bisection to convert
+   that offset into a frame number is in progress; that plus the byte offset is
+   what an upstream report needs. It no longer blocks anything.
 4. **`--mode steady` is not yet wired into the scheduled task.** The task still
    runs one 4-hourly job doing both jobs; splitting it is a task-definition
    change and therefore Jesse's.
