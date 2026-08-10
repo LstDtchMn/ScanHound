@@ -23,13 +23,26 @@ disagreement is a FALSE POSITIVE that would have become a wrong Plex badge.
 `backend.rename.dv_detect` from a worktree of the consolidation itself — the
 parser that will actually be deployed, not a reimplementation of it.
 
-**Result at handoff: 291 of 716 re-verified, 0 disagreements.** The run was
-still in flight when this session wound down; its output is
-`scratchpad/reverify_716.jsonl` (one JSON line per title, `still_fel`
-true/false) and the console log is the `bu2msb982` task file. Consistent with
-the prior evidence: 24 real `dovi_tool` summaries only ever produced
-`Profile: 7 (FEL|MEL)`, `Profile: 8` and `Profile: 5`, none of which the
-tightening rejects.
+## RESULT — COMPLETE, 0 disagreements
+
+```
+total re-tested                     : 716
+  still FEL under corrected parser  : 716
+  DISAGREE (would have been wrong)  :   0
+  file no longer present            :   0
+run time                            : 33.3 min
+```
+
+Counted twice: once by the run itself, once by re-reading
+`scratchpad/reverify_716.jsonl` independently. **The staged set is unchanged**,
+so the gate figures signed off at `7260499` — 711 Plex targets, 0 replacements,
+0 removals — stand without amendment.
+
+This is the outcome the prior evidence predicted: 24 real `dovi_tool` summaries
+only ever produced `Profile: 7 (FEL|MEL)`, `Profile: 8` and `Profile: 5`, none
+of which the tightening rejects. The point of running it was that "predicted by
+the evidence" and "measured" are different claims, and the gates exist to make
+the second one available.
 
 **What to do with it.** If the completed run shows 0 disagreements, the signed-off
 gate figures stand unchanged. If any title disagrees, drop it from
