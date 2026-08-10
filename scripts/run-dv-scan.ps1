@@ -392,8 +392,9 @@ try {
     # so getting this wrong would point it at the wrong database.
     $psi.WorkingDirectory = $RepoRoot
 
-    # Baseline BEFORE the detector starts, so the heartbeat's "+N this run"
-    # counts only what this run produced rather than the standing total.
+    # The pre-launch row count, logged once as a starting reference. It is NOT
+    # subtracted from later readings -- see the heartbeat below for why that
+    # delta was not attributable to this run and was removed.
     $dbPath   = Join-Path $RepoRoot 'data\dv_host.db'
     $baseRows = Get-DvHostRowCount -Python $python -DbPath $dbPath
     if ($null -ne $baseRows) { Write-Log "dv_host.db at start: $baseRows rows" }
