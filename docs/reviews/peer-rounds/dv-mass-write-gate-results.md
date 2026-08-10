@@ -174,6 +174,41 @@ returns nothing outside the backend, and the function's only caller
 UI button inherits the safe default. The final dry-run response remains the
 authoritative proof of the live path.
 
+## Round 3: sign-off, and the caveat it left
+
+Head `7260499` reviewed. **All four gates PASS.** Execution remains HOLD for one
+reason only: the probe is incomplete, so the final population will differ from
+the reviewed one.
+
+The reviewer left one caveat, and it was a fair hit. The script printed
+
+```
+staged rows UNMATCHED: N  <- stop condition if unexplained
+```
+
+and then **did not stop**. The explained/unexplained distinction lived in human
+review, not in code — so a genuinely new mismatch (a systematic rewrite failure
+of the 2026-07-11 Y:-drive kind) would have printed among the examples and been
+waved past by exactly the reader most likely to skim it.
+
+Now encoded. `EXPLAINED_NO_PLEX_TARGET` maps each known non-target to a reason,
+every unmatched row is printed **with its reason**, and any row without one
+exits 1:
+
+```
+Hamilton.2020…-CiNEPHiLES.mkv          raw release name; Plex never matched it
+Day.of.the.Dead.1985…-CiNEPHiLES.mkv   raw release name; Plex never matched it
+Bowfinger.1999…-CiNEPHiLES.mkv         raw release name; Plex never matched it
+Notting Hill (1999).mkv                on disk, absent from the Plex library
+The Return of the Pink Panther (1975)  on disk, absent from the Plex library
+zero UNEXPLAINED mismatches -> gate 2 invariant holds
+```
+
+Mutation-checked: removing one entry from the allowlist makes the run exit 1;
+restoring it returns exit 0. So the gate is the invariant the reviewer asked
+for — **zero unexplained mismatches, not a coverage percentage** — and adding a
+new exception is now a deliberate act rather than an omission.
+
 ## What is still outstanding
 
 The probe is not finished: 694 positives from **1,977 of 2,740** titles. The

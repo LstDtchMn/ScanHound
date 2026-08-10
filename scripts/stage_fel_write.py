@@ -113,11 +113,41 @@ for s in staged:
     else:
         unmatched.append(s)
 print(f"  staged rows MATCHED     : {len(matched)}")
-print(f"  staged rows UNMATCHED   : {len(unmatched)}   <- stop condition if unexplained")
-if unmatched:
-    print("  unmatched examples (these titles are simply not in Plex):")
-    for s in unmatched[:6]:
-        print(f"    {os.path.basename(s['path'])[:62]}")
+print(f"  staged rows UNMATCHED   : {len(unmatched)}")
+
+# The gate is ZERO UNEXPLAINED MISMATCHES, not a coverage percentage -- 99.3%
+# is not what makes this pass. Reviewer's caveat on the previous revision was
+# that the script announced a stop condition and then did not stop: the
+# explained/unexplained distinction lived in human review rather than in code,
+# so a NEW mismatch (say, a systematic rewrite failure like the 2026-07-11
+# Y:-drive incident) would have printed among the examples and been waved past.
+#
+# Each entry must carry a reason. Adding one is a deliberate act; forgetting to
+# is now a hard stop.
+EXPLAINED_NO_PLEX_TARGET = {
+    "Hamilton.2020.2160p.UHD.Blu-ray.Remux.DV.HDR.HEVC.TrueHD.Atmos.7.1-CiNEPHiLES.mkv":
+        "raw release name; Plex never matched it to a library item",
+    "Day.of.the.Dead.1985.2160p.UHD.Blu-ray.Remux.DV.HDR.HEVC.FLAC.1.0-CiNEPHiLES.mkv":
+        "raw release name; Plex never matched it to a library item",
+    "Bowfinger.1999.2160p.UHD.Blu-ray.Remux.DV.HDR.HEVC.DTS-HD.MA.5.1-CiNEPHiLES.mkv":
+        "raw release name; Plex never matched it to a library item",
+    "Notting Hill (1999).mkv": "file present on disk, absent from the Plex library",
+    "The Return of the Pink Panther (1975).mkv":
+        "file present on disk, absent from the Plex library",
+}
+
+unexplained = [s for s in unmatched
+               if os.path.basename(s["path"]) not in EXPLAINED_NO_PLEX_TARGET]
+for s in unmatched:
+    base = os.path.basename(s["path"])
+    why = EXPLAINED_NO_PLEX_TARGET.get(base, "*** UNEXPLAINED ***")
+    print(f"    {base[:58]:<60} {why}")
+if unexplained:
+    print(f"\n  GATE 2 FAILED: {len(unexplained)} unmatched row(s) with no recorded")
+    print("  explanation. Each must be investigated and added to")
+    print("  EXPLAINED_NO_PLEX_TARGET with a reason, or the rewrite table is wrong.")
+    sys.exit(1)
+print("  zero UNEXPLAINED mismatches -> gate 2 invariant holds")
 
 # ── GATE 4 ─────────────────────────────────────────────────────────────
 ids = [s["plex_id"] for s in matched]
