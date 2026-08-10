@@ -457,7 +457,16 @@ def test_auto_resume_scopes_source_and_preserves_unknown_outcome(tmp_path):
 
         current = service.get_batch(batch["batch_uuid"])
         by_uuid = {row["item_uuid"]: row for row in current["items"]}
-        assert by_uuid[hdencode_rows[0]["item_uuid"]]["state"] == "ready"
+        # CHANGED 2026-08-09 with the verification hold. This asserted the
+        # challenge row promotes to 'ready' — which is precisely the defect the
+        # hold closes: an expired timer releasing a human-verification hold fed
+        # the item straight back into the failing challenge. It now stays put;
+        # only an explicit operator probe may move it. The sibling still
+        # resumes (this hand-built scenario sets no batch-level hold), so the
+        # test's original point — source scoping plus unknown-outcome
+        # preservation — is unchanged.
+        assert (by_uuid[hdencode_rows[0]["item_uuid"]]["state"]
+                == "verification_required")
         assert by_uuid[hdencode_rows[1]["item_uuid"]]["state"] == "ready"
         poison = by_uuid[ddlbase_row["item_uuid"]]
         assert poison["state"] == "failed"

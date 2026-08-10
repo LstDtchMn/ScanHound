@@ -1286,10 +1286,6 @@ class DatabaseManager:
                         if "duplicate column" not in str(exc).lower():
                             raise
 
-                if current_version < 9:
-                    # v9 ONE-TIME DATA MIGRATION: place the challenge episode
-                    # that predates the verification-hold column under the hold.
-                    self._mark_existing_challenge_pauses_held(cursor)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS download_queue_items (
                         item_uuid TEXT PRIMARY KEY,
@@ -1348,6 +1344,16 @@ class DatabaseManager:
                         'verification_required'
                     )
                 """)
+
+                if current_version < 9:
+                    # v9 ONE-TIME DATA MIGRATION: place the challenge episode
+                    # that predates the verification-hold column under the
+                    # hold. AFTER both queue tables exist — the UPDATE's
+                    # subqueries read download_queue_items, and on a fresh
+                    # database (current_version=0) that table is only created
+                    # a few statements above; running earlier broke every
+                    # fresh init with "no such table".
+                    self._mark_existing_challenge_pauses_held(cursor)
 
                 # ── Stamp current version ────────────────────────────────
                 cursor.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
