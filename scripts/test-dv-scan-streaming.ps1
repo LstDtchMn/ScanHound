@@ -79,6 +79,17 @@ function Read-LogSafe {
     } catch { return '' }
 }
 
+function Reset-StubEnv {
+    # Clear every stub knob between cases. Without this a blocking handshake set
+    # in one case leaks into the next and hangs it -- the same class of
+    # cross-case contamination that makes a suite lie about which case failed.
+    foreach ($n in @('DV_STUB_LINES','DV_STUB_DELAY','DV_STUB_RC','DV_STUB_NONL',
+                     'DV_STUB_MARKER','DV_STUB_BLOCK_MARKER','DV_STUB_RELEASE',
+                     'DV_STUB_SPLIT')) {
+        Set-Item -Path ("env:" + $n) -Value '' -ErrorAction SilentlyContinue
+    }
+}
+
 function Assert-That {
     param([string]$Name, [bool]$Condition, [string]$Detail = '')
     if ($Condition) {
@@ -142,6 +153,33 @@ rc    = int(os.environ.get("DV_STUB_RC", "0"))
 for i in range(count):
     log.info("stub progress line %d", i)
     time.sleep(delay)
+
+if os.environ.get("DV_STUB_SPLIT"):
+    # ONE logical line delivered in TWO writes, cut INSIDE a multi-byte UTF-8
+    # character, separated by longer than the wrapper's poll interval. Proves the
+    # tail never emits a half line, never splits one line into two, and that its
+    # decoder survives a byte-boundary split mid-character.
+    b = "stub split \u6771\u4eac tail\n".encode("utf-8")
+    cut = 12  # "stub split " is 11 bytes, so this lands inside the first CJK char
+    sys.stdout.buffer.write(b[:cut])
+    sys.stdout.buffer.flush()
+    time.sleep(2.5)
+    sys.stdout.buffer.write(b[cut:])
+    sys.stdout.buffer.flush()
+
+# HANDSHAKE. Announce "alive and blocked", then refuse to exit until released.
+# This is what lets the test prove streaming STRUCTURALLY -- lines visible in the
+# log while the child provably cannot have exited -- instead of racing a
+# wall-clock deadline that a loaded host could lose while still being correct.
+block = os.environ.get("DV_STUB_BLOCK_MARKER")
+if block:
+    with open(block, "w") as fh:
+        fh.write("blocked")
+    rel = os.environ.get("DV_STUB_RELEASE")
+    waited = 0.0
+    while rel and not os.path.exists(rel) and waited < 180:
+        time.sleep(0.2)
+        waited += 0.2
 
 # A title outside the cp1252 code page. The wrapper pins PYTHONIOENCODING=utf-8
 # and reads the capture as UTF-8; if those two ever disagree this line arrives
@@ -219,51 +257,75 @@ function Count-Occurrences {
 Write-Output ''
 Write-Output '=== 1. streaming: detector lines reach the log DURING the run ==='
 
+Reset-StubEnv
 $logDir = New-Fixture
-$env:DV_STUB_LINES  = '8'
-$env:DV_STUB_DELAY  = '3'      # 8 x 3 s = ~24 s of running
-$env:DV_STUB_RC     = '0'
-$env:DV_STUB_NONL   = ''
-$env:DV_STUB_MARKER = Join-Path $root 'invoked.txt'
+$env:DV_STUB_LINES        = '8'
+$env:DV_STUB_DELAY        = '1'
+$env:DV_STUB_RC           = '0'
+$env:DV_STUB_MARKER       = Join-Path $root 'invoked.txt'
+$env:DV_STUB_BLOCK_MARKER = Join-Path $root 'child-is-blocked.txt'
+$env:DV_STUB_RELEASE      = Join-Path $root 'release-child.txt'
 
-$proc = Start-Wrapper -LogDir $logDir -Heartbeat 0.15   # ~9 s between heartbeats
+$proc = Start-Wrapper -LogDir $logDir -Heartbeat 0.1   # ~6 s between heartbeats
 $logFile = Wait-ForLog -LogDir $logDir
 
-# THE MID-RUN ASSERTION, and the DEADLINE is what gives it teeth.
+# THE MID-RUN ASSERTION -- a SYNCHRONIZATION HANDSHAKE, not a stopwatch.
 #
-# "Lines appeared before the process exited" is NOT enough, and assuming it was
-# nearly shipped a vacuous test. The old wrapper folds its whole capture in
-# after the detector exits and then quits ~100 ms later; a 400 ms poll can land
-# inside that window, so the control passed by luck on one run and failed on
-# another. Timing is the honest discriminator: the stub emits for ~24 s, so the
-# old wrapper cannot put a single line in the log before ~24 s, while streaming
-# puts one there at ~1 s. Requiring 2 lines within MID_RUN_DEADLINE seconds is
-# unreachable for the former and has ~3x margin for the latter.
-$MID_RUN_DEADLINE = 12.0
-$sawMidRun   = $false
-$midRunCount = 0
-$midRunAt    = $null
+# Two earlier versions of this were weaker. The first required only that lines
+# appear "before the process exited", which the old wrapper's ~100 ms post-exit
+# fold can satisfy by luck -- it passed on one run and failed on another. The
+# second required them within 12 s of a 24 s run, which does discriminate, but
+# stakes a correctness property on host speed: a loaded box, an antivirus sweep
+# or a cold python start could false-fail a perfectly correct implementation.
+# (ChatGPT, 2026-08-09.)
+#
+# So the stub now emits its lines, drops a "child-is-blocked" marker and REFUSES
+# TO EXIT until released. The proof becomes structural and speed-independent:
+#     the child demonstrably cannot have exited
+#     AND its lines are already in the wrapper's log
+# The old wrapper cannot satisfy that at any CPU speed, because it has not read
+# its capture file yet. There is no deadline left to defend.
+$blocked   = $false
+$sawWhileBlocked = 0
+$sawHeartbeat    = $false
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-while (-not $proc.HasExited) {
-    $now = Read-LogSafe -Path $logFile
-    $c = Count-Occurrences -Text $now -Pattern 'stub progress line \d+'
-    if ($c -ge 2) { $sawMidRun = $true; $midRunCount = $c; $midRunAt = $sw.Elapsed.TotalSeconds; break }
-    Start-Sleep -Milliseconds 250
+while ($sw.Elapsed.TotalSeconds -lt 120 -and -not $proc.HasExited) {
+    if (Test-Path -LiteralPath $env:DV_STUB_BLOCK_MARKER) { $blocked = $true; break }
+    Start-Sleep -Milliseconds 200
 }
-$stillRunningWhenSeen = (-not $proc.HasExited)
-$inTime = ($null -ne $midRunAt -and $midRunAt -lt $MID_RUN_DEADLINE)
+$blockedAt = $sw.Elapsed.TotalSeconds
+# Still blocked, so anything in the log now got there DURING the run.
+$aliveWhileBlocked = (-not $proc.HasExited)
+if ($blocked) {
+    # Give the heartbeat one cadence to fire while the child is pinned, so that
+    # assertion is structural too rather than hoping the run lasted long enough.
+    $hb = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($hb.Elapsed.TotalSeconds -lt 30 -and -not $proc.HasExited) {
+        $snap = Read-LogSafe -Path $logFile
+        $sawWhileBlocked = Count-Occurrences -Text $snap -Pattern 'stub progress line \d+'
+        if ((Count-Occurrences -Text $snap -Pattern 'still running:') -ge 1) { $sawHeartbeat = $true; break }
+        Start-Sleep -Milliseconds 400
+    }
+    $snap = Read-LogSafe -Path $logFile
+    $sawWhileBlocked = Count-Occurrences -Text $snap -Pattern 'stub progress line \d+'
+}
+$stillAliveAtRelease = (-not $proc.HasExited)
+# Release the child and let it finish normally.
+Set-Content -LiteralPath $env:DV_STUB_RELEASE -Value 'go' -Encoding ascii
 
 $proc.WaitForExit()
 $exit = $proc.ExitCode
 $final = Read-LogSafe -Path $logFile
 
-Assert-That -Name "detector lines in the log within ${MID_RUN_DEADLINE}s, process still alive" `
-            -Condition ($sawMidRun -and $stillRunningWhenSeen -and $inTime) `
-            -Detail ("sawMidRun=$sawMidRun stillRunning=$stillRunningWhenSeen inTime=$inTime count=$midRunCount at={0:N1}s (deadline ${MID_RUN_DEADLINE}s; a post-exit fold cannot beat ~24s)" -f `
-                     $(if ($null -ne $midRunAt) { $midRunAt } else { 0 }))
-if ($sawMidRun) {
-    Write-Output ("           (saw $midRunCount line(s) at {0:N1}s, run is ~24s)" -f $midRunAt)
-}
+Assert-That -Name 'child reached the blocked handshake while the wrapper was alive' `
+            -Condition ($blocked -and $aliveWhileBlocked) `
+            -Detail ("blocked=$blocked aliveWhenSeen=$aliveWhileBlocked at={0:N1}s" -f $blockedAt)
+Assert-That -Name 'ALL 8 detector lines were in the log while the child COULD NOT have exited' `
+            -Condition ($sawWhileBlocked -eq 8 -and $stillAliveAtRelease) `
+            -Detail "sawWhileBlocked=$sawWhileBlocked (want 8) stillAlive=$stillAliveAtRelease -- a post-exit fold cannot reach this at any CPU speed"
+Assert-That -Name 'heartbeat fired while the child was pinned' `
+            -Condition $sawHeartbeat `
+            -Detail 'no "still running:" line appeared during the blocked window'
 
 # Every line exactly once: not merely 8 total, but each index present once.
 $dupes = @()
@@ -299,9 +361,14 @@ Assert-That -Name 'heartbeat lines present while detector was silent' `
 # that number is the one whose absence caused the 12x error.
 Assert-That -Name 'baseline row count logged before the detector starts' `
             -Condition ($final -match 'dv_host\.db at start: 3 rows')
-Assert-That -Name 'heartbeat reports the dv_host.db row count and delta' `
-            -Condition ($final -match 'dv_host\.db 3 rows \(\+0 this run\)') `
-            -Detail 'expected "dv_host.db 3 rows (+0 this run)" in a heartbeat line'
+Assert-That -Name 'heartbeat reports the ABSOLUTE dv_host.db row count' `
+            -Condition ($final -match 'dv_host\.db 3 rows') `
+            -Detail 'expected "dv_host.db 3 rows" in a heartbeat line'
+# The delta was removed because it counted every writer's rows and under-counted
+# UPSERTs, so it could not mean "this run". Assert it never comes back.
+Assert-That -Name 'heartbeat makes NO per-run attribution claim' `
+            -Condition ($final -notmatch 'this run') `
+            -Detail 'a "+N this run" delta is not attributable -- see peer review finding 1'
 
 # .NET does not inherit PowerShell's location the way `& cmd` did, so the
 # wrapper must set WorkingDirectory itself or the detector reads the wrong DB.
@@ -319,6 +386,7 @@ if ($script:Failures -gt 0 -and (Test-Path -LiteralPath $script:WrapperConsole))
 Write-Output ''
 Write-Output '=== 2. nonzero detector exit -> wrapper exit 1, code logged ==='
 
+Reset-StubEnv
 $logDir = New-Fixture
 $env:DV_STUB_LINES  = '3'
 $env:DV_STUB_DELAY  = '1'
@@ -341,6 +409,7 @@ Assert-That -Name 'the 3 detector lines survived the failure path' `
 Write-Output ''
 Write-Output '=== 3. control: unreachable root -> exit 11, detector NEVER invoked ==='
 
+Reset-StubEnv
 $logDir = New-Fixture -RootCount 1 -WithBadRoot
 $env:DV_STUB_LINES  = '2'
 $env:DV_STUB_DELAY  = '1'
@@ -362,6 +431,7 @@ Assert-That -Name 'detector was never invoked (no marker file)' `
 Write-Output ''
 Write-Output '=== 4. control: single-root config (the scalar .Count case) ==='
 
+Reset-StubEnv
 $logDir = New-Fixture -RootCount 1
 $env:DV_STUB_LINES  = '2'
 $env:DV_STUB_DELAY  = '1'
@@ -383,6 +453,7 @@ Assert-That -Name 'detector lines still streamed' `
 Write-Output ''
 Write-Output '=== 5. edge: final line with no trailing newline is not dropped ==='
 
+Reset-StubEnv
 $logDir = New-Fixture
 $env:DV_STUB_LINES  = '2'
 $env:DV_STUB_DELAY  = '1'
@@ -416,6 +487,7 @@ Write-Output '=== 6. the REAL detector: per-file logging, incl. an unencodable t
 # real 45 GB title. --api points at the discard port so the run cannot POST a
 # dv-import at the live container.
 
+Reset-StubEnv
 $c6      = Join-Path $env:TEMP 'dv-detector-logtest'
 $c6media = Join-Path $c6 'media'
 $c6stub  = Join-Path $c6 'stubbin'
@@ -465,9 +537,9 @@ Assert-That -Name 'no UnicodeEncodeError / traceback on the unencodable title' `
 Assert-That -Name 'logs a "scanning <file> (N GB)" line BEFORE reading' `
             -Condition ((Count-Occurrences -Text $c6text -Pattern 'scanning .*\(\d+\.\d GB\)') -eq 2) `
             -Detail ("count=" + (Count-Occurrences -Text $c6text -Pattern 'scanning .*\(\d+\.\d GB\)'))
-Assert-That -Name 'logs a per-file result with elapsed time and MB/s' `
-            -Condition ((Count-Occurrences -Text $c6text -Pattern '-> \w+ in \d+s \(\d+ MB/s\)') -eq 2) `
-            -Detail ("count=" + (Count-Occurrences -Text $c6text -Pattern '-> \w+ in \d+s \(\d+ MB/s\)'))
+Assert-That -Name 'logs a per-file result with elapsed time and an effective scan rate' `
+            -Condition ((Count-Occurrences -Text $c6text -Pattern '-> \w+ in \d+s \(\d+ MB/s effective scan rate\)') -eq 2) `
+            -Detail ("count=" + (Count-Occurrences -Text $c6text -Pattern '-> \w+ in \d+s \(\d+ MB/s effective scan rate\)'))
 Assert-That -Name 'the plain title is logged by name' `
             -Condition ($c6text -match [regex]::Escape('Plain Movie (2001).mkv'))
 Assert-That -Name 'the unencodable title is logged intact, not mangled' `
@@ -479,6 +551,106 @@ Assert-That -Name 'reports the final scanned count' `
             -Condition ($c6text -match 'scanned 2 file\(s\)')
 
 Remove-Item -LiteralPath $c6 -Recurse -Force -ErrorAction SilentlyContinue
+
+# ===========================================================================
+Write-Output ''
+Write-Output '=== 7. a line SPLIT across two polls stays exactly one line ==='
+#
+# Case 5 proves an unterminated FINAL line survives. It does not prove that a
+# line arriving in TWO writes, separated by more than one poll interval, stays
+# one line rather than being emitted as two -- or as a truncated half. Peer
+# review flagged the gap. The split is placed INSIDE a multi-byte UTF-8
+# character so the decoder's byte-boundary handling is exercised at the same time.
+
+Reset-StubEnv
+$logDir = New-Fixture
+$env:DV_STUB_LINES  = '1'
+$env:DV_STUB_DELAY  = '0'
+$env:DV_STUB_RC     = '0'
+$env:DV_STUB_SPLIT  = '1'
+$env:DV_STUB_MARKER = Join-Path $root 'invoked.txt'
+
+$proc = Start-Wrapper -LogDir $logDir
+$logFile = Wait-ForLog -LogDir $logDir
+$proc.WaitForExit()
+$exit  = $proc.ExitCode
+$final = Read-LogSafe -Path $logFile
+
+$splitLine = 'stub split ' + (-join @([char]0x6771, [char]0x4EAC)) + ' tail'
+Assert-That -Name 'the split line appears exactly once, fully reassembled' `
+            -Condition ((Count-Occurrences -Text $final -Pattern ([regex]::Escape($splitLine))) -eq 1) `
+            -Detail ("count=" + (Count-Occurrences -Text $final -Pattern ([regex]::Escape($splitLine))))
+# The decisive half: 'stub split ' must never appear on a line of its own, which
+# is exactly what a tail emitting whatever it found mid-write would produce.
+$halfAlone = @($final -split "`n" | Where-Object { $_ -match 'stub split ' -and $_ -notmatch [regex]::Escape($splitLine) })
+Assert-That -Name 'no truncated half-line was emitted' `
+            -Condition ($halfAlone.Count -eq 0) `
+            -Detail ("stray fragments: " + (($halfAlone | ForEach-Object { $_.Trim() }) -join ' | '))
+Assert-That -Name 'exit code is 0' -Condition ($exit -eq 0) -Detail "got $exit"
+
+
+
+# ===========================================================================
+Write-Output ''
+Write-Output '=== 8. a FAILED detection must NOT print a fabricated MB/s ==='
+#
+# THE POINT OF THIS BRANCH, tested directly. detect_layer() returns
+# layer="unknown" with an error string instead of raising -- timeout, read
+# failure, demux error. The first version of the per-file logging divided the
+# WHOLE file size by elapsed time regardless, so a 30-minute timeout that may
+# have read any fraction of the file would have printed a confident MB/s figure
+# in the log. On the two titles that already time out nightly, that is the exact
+# 12x-error shape this work exists to eliminate, automated. (Peer review
+# finding 2, ChatGPT 2026-08-09.)
+
+Reset-StubEnv
+$c8      = Join-Path $env:TEMP 'dv-detector-failtest'
+$c8media = Join-Path $c8 'media'
+$c8stub  = Join-Path $c8 'stubbin'
+Remove-Item -LiteralPath $c8 -Recurse -Force -ErrorAction SilentlyContinue
+foreach ($d in @($c8, $c8media, $c8stub)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+
+# dovi_tool that FAILS with a diagnostic on stderr. The message must not look
+# like a "no RPU" report, or dv_detect would read it as an authoritative 'none'.
+Set-Content -LiteralPath (Join-Path $c8stub 'dovi_tool.bat') `
+            -Value "@echo off`r`necho simulated extract failure 1>&2`r`nexit /b 3" -Encoding ascii
+[System.IO.File]::WriteAllBytes((Join-Path $c8media 'Failing Movie (1999).mkv'), (New-Object byte[] 4096))
+
+$c8cfg = Join-Path $c8 'cfg.json'
+@{ dv_library_roots = ($c8media -replace '\\', '/'); dv_detection = $true } |
+    ConvertTo-Json | Set-Content -LiteralPath $c8cfg -Encoding ascii
+$c8out = Join-Path $c8 'detector.out'
+
+$savedPath = $env:PATH
+$savedEnc  = $env:PYTHONIOENCODING
+$env:PATH = "$c8stub;$env:PATH"
+$env:PYTHONIOENCODING = 'utf-8'
+Push-Location -LiteralPath $repo
+try {
+    $a = '--config "{0}" --db "{1}" --api http://127.0.0.1:9' -f $c8cfg, (Join-Path $c8 'test.db')
+    & cmd /c "`"$py`" -u scripts\host-detector\dv_host_scan.py $a > `"$c8out`" 2>&1"
+    $c8code = $LASTEXITCODE
+} finally {
+    Pop-Location
+    $env:PATH = $savedPath
+    $env:PYTHONIOENCODING = $savedEnc
+}
+$c8text = if (Test-Path -LiteralPath $c8out) { Get-Content -LiteralPath $c8out -Encoding UTF8 -Raw } else { '' }
+
+Assert-That -Name 'a failed detection prints NO MB/s figure at all' `
+            -Condition ($c8text -notmatch 'MB/s') `
+            -Detail (($c8text -split "`n" | Where-Object { $_ -match '->' }) -join ' | ')
+Assert-That -Name 'it says the rate is unavailable instead' `
+            -Condition ((Count-Occurrences -Text $c8text -Pattern 'rate unavailable') -eq 1) `
+            -Detail ("count=" + (Count-Occurrences -Text $c8text -Pattern 'rate unavailable'))
+Assert-That -Name "the detector's error text is preserved in the result line" `
+            -Condition ($c8text -match 'simulated extract failure') `
+            -Detail 'the error was previously discarded, leaving unknowns undiagnosable at INFO'
+Assert-That -Name 'the layer is recorded as unknown' -Condition ($c8text -match '-> unknown in')
+Assert-That -Name 'the run still exits 0 (a failed file is not a failed run)' `
+            -Condition ($c8code -eq 0) -Detail "got $c8code"
+
+Remove-Item -LiteralPath $c8 -Recurse -Force -ErrorAction SilentlyContinue
 
 # ===========================================================================
 $env:DV_STUB_NONL = ''

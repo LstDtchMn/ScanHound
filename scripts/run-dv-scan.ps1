@@ -150,9 +150,14 @@ function Get-DvHostRowCount {
     if (-not (Test-Path -LiteralPath $DbPath)) { return $null }
     $tmp = Join-Path $LogDir ("dv-count-{0}.tmp" -f [System.Guid]::NewGuid().ToString('N'))
     try {
-        # mode=ro: never create, never write, never take a lock that could
-        # disturb the scan this is reporting on. Verified 2026-08-09 against the
-        # live database while a scan held it open in WAL mode.
+        # mode=ro: this connection cannot create or modify the database. It is
+        # NOT lock-free -- a WAL reader still participates in normal read
+        # locking, and a long-lived one can delay checkpoint progress. What makes
+        # it safe here is that it is bounded: one COUNT(*) in a short-lived child
+        # process that then exits, which normally coexists with the writer.
+        # Verified 2026-08-09 against the live database while a scan held it open
+        # in WAL mode. (Claim corrected after peer review; the design was fine,
+        # the comment overstated it.)
         # Single quotes only inside the -c payload -- cmd owns the double ones.
         $q = 'import sys,sqlite3,pathlib;u=pathlib.Path(sys.argv[1]).as_uri()+' +
              "'?mode=ro';" +
@@ -413,12 +418,23 @@ try {
             if ($now -ge $nextBeat) {
                 $el = New-TimeSpan -Start $started -End $now
                 $rows = Get-DvHostRowCount -Python $python -DbPath $dbPath
+                # ABSOLUTE COUNT ONLY -- deliberately no "+N this run".
+                #
+                # An earlier version reported the delta against a pre-launch
+                # baseline and called it this run's work. It is not, in three
+                # separate ways: another host process writes this same database;
+                # an UPSERT of an existing path does real scanning work while
+                # leaving COUNT(*) unchanged, so the delta UNDER-counts; and the
+                # primary key is the raw path string, so the same file counts
+                # twice under two spellings. Peer review (ChatGPT, 2026-08-09)
+                # called it correctly: this branch exists because a proxy got
+                # promoted into a stronger claim, and that is what the delta was.
+                # Per-run progress comes from the detector's own [N] lines, which
+                # actually know what they scanned.
                 if ($null -eq $rows) {
                     $prog = 'dv_host.db unavailable'
-                } elseif ($null -eq $baseRows) {
-                    $prog = "dv_host.db $rows rows"
                 } else {
-                    $prog = "dv_host.db $rows rows (+$($rows - $baseRows) this run)"
+                    $prog = "dv_host.db $rows rows"
                 }
                 # Formatted from TotalHours, not 'hh', so a run past 24 h does
                 # not silently wrap its hour count back to zero.
@@ -431,7 +447,17 @@ try {
         $code = $proc.ExitCode
         $proc.Dispose()
     }
-    if ($null -eq $code) { $code = 0 }
+    # FAIL CLOSED. There are exactly two legitimate outcomes: the start threw and
+    # $code is already 1, or a process exists and gave us its ExitCode. The old
+    # `if ($null -eq $code) { $code = 0 }` turned every other state into SUCCESS
+    # -- including .NET's documented case where Process::Start returns $null
+    # without throwing because no process resource was started. A wrapper whose
+    # entire purpose is to make "the detector did nothing" loud must never
+    # report 0 for "we never observed a result". (ChatGPT, 2026-08-09.)
+    if ($null -eq $code) {
+        Write-Log "detector produced neither a process nor an exit code -- treating as failure." 'ERROR'
+        $code = 1
+    }
     Close-DetectorTail
 
     # SAFETY NET, not redundancy. If the live tail never read a single line the

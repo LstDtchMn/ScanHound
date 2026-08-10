@@ -224,12 +224,30 @@ def main(argv=None):
         logger.info("[%d] scanning %s (%.1f GB)",
                     scanned + 1, os.path.basename(path), gb)
         t0 = time.monotonic()
-        layer = dv_detect.detect_layer(path).get("layer")
+        result = dv_detect.detect_layer(path)
         dt = time.monotonic() - t0
-        # Log the throughput per file. This is the exact number that was guessed
-        # wrongly; it costs one division to record it instead.
-        logger.info("[%d] -> %s in %.0fs (%.0f MB/s)", scanned + 1, layer, dt,
-                    (st.st_size / 1e6 / dt) if dt > 0 else 0.0)
+        layer = result.get("layer")
+        error = result.get("error")
+        # A RATE IS ONLY PRINTED WHEN THE DETECTION ACTUALLY COMPLETED.
+        #
+        # detect_layer() returns layer="unknown" with an error string rather than
+        # raising -- timeout, read failure, demux error, info failure. On a
+        # timeout dovi_tool may have read any fraction of the file, so
+        # size/elapsed is not a measurement of anything; it is a guess wearing a
+        # unit. It would also be fabricated on precisely the two titles whose
+        # guessed throughput caused the retraction this logging exists to
+        # prevent. Caught in peer review (ChatGPT, 2026-08-09).
+        #
+        # "effective scan rate" is deliberate too: elapsed time covers dovi_tool's
+        # own work, which is what matters operationally, but it is not a
+        # byte-counter reading off the network stack.
+        if error:
+            logger.info("[%d] -> %s in %.0fs (%s; rate unavailable)",
+                        scanned + 1, layer, dt, error)
+        else:
+            logger.info("[%d] -> %s in %.0fs (%.0f MB/s effective scan rate)",
+                        scanned + 1, layer, dt,
+                        (st.st_size / 1e6 / dt) if dt > 0 else 0.0)
         _upsert(conn, classify_to_row(path, layer, st))
         scanned += 1
         if tagging and _tag_file(path, layer):
