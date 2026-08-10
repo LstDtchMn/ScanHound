@@ -42,6 +42,59 @@ DEFAULT_DB = "/dbvol/crawler.db"
 DEFERRED = ("verification_required", "waiting_source")
 
 
+def _apply_hold(conn, triggers, batches, source):
+    """Atomically set the triggers and stamp the held batches, or raise.
+
+    ONE transaction. Every precondition is (re-)checked INSIDE it, immediately
+    before the write it guards, and every write is rowcount-checked — so a live
+    queue mutating a row between the earlier dry-run read and here rolls the
+    WHOLE invocation back rather than writing a partial or phantom hold. Raises
+    sqlite3.Error on any failure (which `with conn` turns into a rollback).
+    """
+    placeholders = ",".join("?" for _ in DEFERRED)
+    with conn:                           # commits on success, rolls back on error
+        conn.execute("BEGIN IMMEDIATE")
+        for row in triggers:
+            updated = conn.execute(
+                f"""
+                UPDATE download_queue_items
+                SET state = 'verification_required',
+                    queue_reason = 'interactive_challenge',
+                    last_reason_code = 'interactive_challenge',
+                    last_cause_code = 'operator_identified_challenge'
+                WHERE item_uuid = ? AND source = ?
+                  AND state IN ({placeholders})
+                """,
+                (row["item_uuid"], source, *DEFERRED),
+            ).rowcount
+            if updated != 1:
+                raise sqlite3.Error(
+                    f"trigger {row['item_uuid']} is no longer a parked {source} "
+                    "row (it moved before the write); nothing applied")
+        # The trigger UPDATE above just moved every trigger into a deferred
+        # state, so trigger batches satisfy the membership check; a --hold-batch
+        # that no longer holds a deferred source row (removed by a live queue
+        # between the dry-run read and here) rolls the whole invocation back.
+        for b in batches:
+            member = conn.execute(
+                f"SELECT 1 FROM download_queue_items WHERE batch_uuid = ? "
+                f"AND source = ? AND state IN ({placeholders}) LIMIT 1",
+                (b, source, *DEFERRED),
+            ).fetchone()
+            if member is None:
+                raise sqlite3.Error(
+                    f"batch {b} no longer holds a deferred {source} row; "
+                    "nothing applied")
+            stamped = conn.execute(
+                "UPDATE download_queue_batches "
+                "SET verification_hold_source = ? WHERE batch_uuid = ?",
+                (source, b),
+            ).rowcount
+            if stamped != 1:
+                raise sqlite3.Error(
+                    f"batch {b} vanished before the write; nothing applied")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=DEFAULT_DB)
@@ -136,38 +189,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     try:
-        with conn:                       # one transaction; rolls back on error
-            conn.execute("BEGIN IMMEDIATE")
-            for row in triggers:
-                # RE-CHECK the predicate INSIDE the write, and require exactly one
-                # row. Fold review: validation ran before BEGIN IMMEDIATE, so a
-                # live queue could move a validated row (resume, cancel, claim)
-                # before this write — and the bare `WHERE item_uuid = ?` would
-                # then force an already-progressed row back to
-                # verification_required. Repeating state+source and asserting the
-                # rowcount makes the apply atomic with its own validation.
-                updated = conn.execute(
-                    f"""
-                    UPDATE download_queue_items
-                    SET state = 'verification_required',
-                        queue_reason = 'interactive_challenge',
-                        last_reason_code = 'interactive_challenge',
-                        last_cause_code = 'operator_identified_challenge'
-                    WHERE item_uuid = ? AND source = ?
-                      AND state IN ({placeholders})
-                    """,
-                    (row["item_uuid"], args.source, *DEFERRED),
-                ).rowcount
-                if updated != 1:
-                    raise sqlite3.Error(
-                        f"trigger {row['item_uuid']} is no longer a parked "
-                        f"{args.source} row (it moved before the write); nothing "
-                        "applied")
-            conn.executemany(
-                "UPDATE download_queue_batches "
-                "SET verification_hold_source = ? WHERE batch_uuid = ?",
-                [(args.source, b) for b in batches],
-            )
+        _apply_hold(conn, triggers, batches, args.source)
     except sqlite3.Error as exc:
         print(f"ERROR: migration rolled back: {exc}", file=sys.stderr)
         return 3

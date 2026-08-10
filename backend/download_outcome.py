@@ -254,11 +254,18 @@ def _form_posts_unlock(form, unlock_target: Callable[[str], bool]) -> bool:
     unlock endpoint, and the reverse).
     """
     action = form.get("action") or ""
-    submits = [
-        el for el in form.find_all(["input", "button"])
-        if (el.name == "button"
-            or str(el.get("type") or "").lower() == "submit")
-    ]
+
+    def _is_submit(el) -> bool:
+        # Only a SUBMITTING control's formaction is the effective destination.
+        # A <button> defaults to type=submit, so a missing/empty type counts;
+        # but button[type=button] and button[type=reset] cannot submit and must
+        # not be read as (or suppress) the form's post target — re-review round.
+        t = str(el.get("type") or "").lower()
+        if el.name == "button":
+            return t in ("", "submit")
+        return t == "submit"
+
+    submits = [el for el in form.find_all(["input", "button"]) if _is_submit(el)]
     targets = [(el.get("formaction") or action) for el in submits] or [action]
     return any(unlock_target(target) for target in targets)
 

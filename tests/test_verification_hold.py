@@ -279,6 +279,27 @@ def test_formaction_override_decides_ownership():
     assert turnstile_challenge_evidence(html, unlock_target=_unlock_only) == ()
 
 
+def test_a_non_submit_button_formaction_is_not_a_post_target():
+    # Re-review: a button[type=button] CANNOT submit, so its formaction must not
+    # make a non-unlock form look like it posts the unlock endpoint (false pos).
+    html = """<html><body><form action="/comment">
+        <button type="button" formaction="#unlocked">Preview</button>
+        <input type="hidden" name="cf-turnstile-response" value="">
+        </form></body></html>"""
+    assert turnstile_challenge_evidence(html, unlock_target=_unlock_only) == ()
+
+
+def test_a_non_submit_button_does_not_suppress_the_action_fallback():
+    # And the mirror: a non-submit button's formaction must not REPLACE the
+    # form's own action, or a genuine unlock form would be missed (false neg).
+    html = """<html><body><form action="#unlocked">
+        <button type="button" formaction="/report">Report</button>
+        <input type="hidden" name="cf-turnstile-response" value="">
+        </form></body></html>"""
+    assert "turnstile:response-field" in turnstile_challenge_evidence(
+        html, unlock_target=_unlock_only)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The classification boundary: not-ready reveal + evidence -> challenge
 # (harness pattern shared with test_reveal_verification_throttle)
@@ -1131,10 +1152,14 @@ def test_clear_verification_hold_route():
     q.clear_verification_hold.assert_called_once_with("hdencode")
 
 
-def _migrate(argv):
+def _migrate_mod():
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "scripts"))
-    return importlib.import_module("migrate_challenge_episode").main(argv)
+    return importlib.import_module("migrate_challenge_episode")
+
+
+def _migrate(argv):
+    return _migrate_mod().main(argv)
 
 
 def _one_deferred_hdencode(db):
@@ -1210,3 +1235,50 @@ def test_migration_refuses_a_hold_batch_without_a_source_row(tmp_path):
                    "--hold-batch", ddl_batch, "--apply"])
     assert rc == 1, "a DDLBase-only hold-batch must be refused"
     assert _hold_of(path, batch) is None, "nothing may be written on refusal"
+
+
+def test_apply_hold_rolls_back_a_hold_batch_that_lost_its_row(tmp_path):
+    """Re-review M2: if a --hold-batch's only deferred source row is removed
+    AFTER the dry-run precheck but before the write, the in-transaction
+    re-validation rolls the WHOLE invocation back — no trigger set, no batch
+    stamped. Exercised directly against _apply_hold, which is the atomic unit."""
+    import sqlite3 as _sqlite
+    path = str(tmp_path / "m.db")
+    db = DatabaseManager(path)
+    batch, item = _one_deferred_hdencode(db)          # the trigger's batch
+    svc = DownloadQueueService({}, db, MagicMock())
+    hb = svc.schedule_batch(
+        [{"url": "https://hdencode.org/z-2160p/", "title": "Z",
+          "media_type": "movie"}],
+        interval_minutes=0, mode="immediate",
+        auto_resume_after_cooldown=True)["batch_uuid"]
+    hb_item = db._query_dicts(
+        "SELECT item_uuid FROM download_queue_items WHERE batch_uuid=?",
+        (hb,), default=[])[0]["item_uuid"]
+    with db.transaction() as conn:
+        conn.execute("UPDATE download_queue_items SET state='waiting_source', "
+                     "queue_reason='source_deferred' WHERE batch_uuid=?", (hb,))
+        # THE RACE: the hold-batch's only deferred row moves on before the write.
+        conn.execute("UPDATE download_queue_items SET state='completed' "
+                     "WHERE item_uuid=?", (hb_item,))
+    db.close()
+
+    m = _migrate_mod()
+    conn = _sqlite.connect(path)
+    conn.row_factory = _sqlite.Row
+    try:
+        with pytest.raises(_sqlite.Error):
+            m._apply_hold(conn, [{"item_uuid": item}], [batch, hb], "hdencode")
+    finally:
+        conn.close()
+    assert _hold_of(path, batch) is None and _hold_of(path, hb) is None, (
+        "a rolled-back invocation must stamp NOTHING")
+    # And the trigger must not have been left flipped either.
+    db2 = DatabaseManager(path)
+    try:
+        row = db2._query_dicts(
+            "SELECT state FROM download_queue_items WHERE item_uuid=?",
+            (item,), default=[])[0]
+        assert row["state"] == "waiting_source", "the trigger update rolled back"
+    finally:
+        db2.close()
