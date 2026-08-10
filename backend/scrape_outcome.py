@@ -88,11 +88,19 @@ _MESSAGES = {
 
 # The codes whose cause is genuinely ambiguous, so the collected signals are
 # worth persisting alongside the message. Every other code names its own cause.
+#
+# INTERACTIVE_CHALLENGE was added 2026-08-09: which challenge fired and which
+# evidence proved it (an iframe, the cf-turnstile-response field, a console
+# 600* error) is exactly what the next investigation needs, and the Turnstile
+# root cause could be named only because the app log happened not to have
+# rotated yet. The mechanism also travels in cause_code, but the evidence list
+# has no other durable home.
 _SIGNAL_BEARING_CODES = frozenset({
     ScrapeCode.LAYOUT_CHANGED,
     ScrapeCode.REVEAL_VERIFICATION_STALLED,
     ScrapeCode.NO_FILE_HOST_LINKS,
     ScrapeCode.REQUESTED_HOST_MISSING,
+    ScrapeCode.INTERACTIVE_CHALLENGE,
 })
 
 

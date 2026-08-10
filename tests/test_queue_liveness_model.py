@@ -24,8 +24,11 @@ THE RULE (round 10's wording, tightened into something checkable):
 
     Every nonterminal item is either runnable, or deliberately deferred with a
     recovery path that the AUTOMATIC machinery can take, or held because retrying an
-    unknown outcome would be unsafe. There is no ordinary "nonterminal but
-    unreachable" fourth state.
+    unknown outcome would be unsafe, or held because a human-verification challenge
+    means automatic retry is pointless BY DESIGN (2026-08-09: the verification
+    hold — a timer must not release it, so "no automatic transition" is the
+    specified behaviour, exactly as it is for unknown outcomes). There is no
+    ordinary "nonterminal but unreachable" fifth state.
 
     Corollary the orphan violates: batch aggregate metadata must not be able to
     revoke a child's future transition.
@@ -154,8 +157,47 @@ def op_cancel_one(db, service, batch_uuid):
             pass
 
 
+def op_challenge_pause(db, service, batch_uuid):
+    """Park the batch the way an interactive challenge parks one (2026-08-09).
+
+    Mirrors _pause_for_source's direct branch: the first still-pending item is
+    the trigger (verification_required / interactive_challenge), the rest defer
+    as ordinary source_deferred rows, and the batch carries the hold.
+    """
+    with db.transaction() as conn:
+        trigger = conn.execute(
+            "SELECT item_uuid FROM download_queue_items WHERE batch_uuid=? "
+            "AND state IN ('scheduled','ready','waiting_source',"
+            "'verification_required') ORDER BY sequence_number LIMIT 1",
+            (batch_uuid,)).fetchone()
+        if trigger is None:
+            return
+        conn.execute(
+            "UPDATE download_queue_items "
+            "SET state='verification_required', "
+            "    queue_reason='interactive_challenge', cooldown_until=?, "
+            "    last_reason_code='interactive_challenge', updated_at=? "
+            "WHERE item_uuid=?",
+            (EXPIRED, STAMP, trigger["item_uuid"]))
+        conn.execute(
+            "UPDATE download_queue_items "
+            "SET state='waiting_source', queue_reason='source_deferred', "
+            "    cooldown_until=?, last_reason_code='source_temporarily_blocked', "
+            "    updated_at=? WHERE batch_uuid=? AND state IN "
+            "    ('scheduled','ready')",
+            (EXPIRED, STAMP, batch_uuid))
+        conn.execute(
+            "UPDATE download_queue_batches SET state='paused_source', "
+            "  paused_at=?, cooldown_until=?, "
+            "  last_reason_code='interactive_challenge', "
+            "  verification_hold_source='hdencode' WHERE batch_uuid=?",
+            (STAMP, EXPIRED, batch_uuid))
+        service._refresh_batch_locked(conn, batch_uuid, STAMP)
+
+
 OPERATIONS = {
     "pause": op_pause_source,
+    "challenge": op_challenge_pause,
     "retry1": op_retry_one,
     "resume": op_resume_batch,
     "done1": op_complete_one,
@@ -198,8 +240,12 @@ def _liveness_violations(db, batch_uuid):
     copying the defect into the oracle.
     """
     rows = db._query_dicts(
-        "SELECT item_uuid, state, last_reason_code, queue_reason "
-        "FROM download_queue_items WHERE batch_uuid=?", (batch_uuid,), default=[])
+        "SELECT i.item_uuid, i.state, i.last_reason_code, i.queue_reason, "
+        "       i.source AS item_source, "
+        "       b.verification_hold_source AS hold_source "
+        "FROM download_queue_items i "
+        "LEFT JOIN download_queue_batches b ON b.batch_uuid = i.batch_uuid "
+        "WHERE i.batch_uuid=?", (batch_uuid,), default=[])
     bad = []
     for r in rows:
         state = str(r["state"] or "")
@@ -211,6 +257,16 @@ def _liveness_violations(db, batch_uuid):
         # Unknown-outcome safety is a LEGITIMATE reason to stay put; retrying could
         # duplicate a download that actually happened. Safety outranks liveness.
         if str(r["last_reason_code"] or "") in UNKNOWN_OUTCOME:
+            continue
+        # A verification hold is a LEGITIMATE reason to stay put (2026-08-09):
+        # the challenge fails identically on every automatic retry, so the only
+        # useful transition is an explicit operator probe. Stated the same two
+        # ways production states it — the row's own reason, or its group's hold
+        # matching the row's source.
+        if str(r["queue_reason"] or "") == "interactive_challenge":
+            continue
+        hold = str(r["hold_source"] or "")
+        if hold and hold == str(r["item_source"] or ""):
             continue
         bad.append((r["item_uuid"], state, str(r["last_reason_code"] or "")))
     return bad
@@ -402,6 +458,29 @@ def test_unknown_outcome_items_are_never_auto_retried(tmp_path):
         assert all(r["state"] in DEFERRED for r in rows), (
             "an unknown-outcome item was made runnable again; retrying it could "
             "duplicate a download that already happened")
+    finally:
+        db.close()
+
+
+def test_verification_held_items_are_never_auto_retried(tmp_path):
+    """The 2026-08-09 mirror of the unknown-outcome invariant, and equally
+    discriminating: settle() expires every cooldown in the world and runs the
+    automatic machinery to quiescence — and a verification-held episode must
+    STILL not move, because the challenge fails identically on every automatic
+    retry. The pre-hold code fails exactly this: the expired timer promoted the
+    whole episode back into the failing challenge.
+    """
+    db = DatabaseManager(str(tmp_path / "vhold.db"))
+    try:
+        service, batch = _rig(db, count=3)
+        op_challenge_pause(db, service, batch)
+        settle(db, service, batch)
+        rows = db._query_dicts(
+            "SELECT state FROM download_queue_items WHERE batch_uuid=?",
+            (batch,), default=[])
+        assert all(r["state"] in DEFERRED for r in rows), (
+            "a verification-held item was made runnable by time alone; the "
+            "hold exists precisely so a timer cannot do that")
     finally:
         db.close()
 

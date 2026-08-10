@@ -25,7 +25,7 @@ Pinned here:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -42,6 +42,46 @@ PAST = NOW - timedelta(days=1)
 FUTURE = NOW + timedelta(days=1)
 PAST_S = PAST.isoformat()
 FUTURE_S = FUTURE.isoformat()
+
+
+@pytest.fixture(autouse=True)
+def _pin_production_clock():
+    """Pin the PRODUCTION clock to NOW for every test in this module.
+
+    THESE TESTS WERE A TIME BOMB AND IT DETONATED. `FUTURE` is
+    ``2026-08-09 12:00 UTC``, but the production path reads the real clock via
+    `download_queue._utcnow()` -- it has never known about `NOW`. So from that
+    instant onwards the "future sibling that must not be resumed" became
+    genuinely due, promoting it was correct behaviour, and three assertions
+    started failing on every run, forever:
+
+        test_round12_a_due_item_does_not_drag_a_future_sibling
+        test_round13_an_ineligible_sibling_does_not_veto_an_eligible_one
+        test_a_visit_authorising_nothing_does_not_spend_budget
+
+    CI's own history proves the mechanism: run 31294003483 on commit 6813260d
+    passed at 04:17 UTC, and run 31331167519 on the SAME tests failed at 19:22
+    UTC -- 7h22m past the cutoff. Nothing about the code changed in between.
+
+    Chasing this cost a day: it was misread as a possible live safety defect,
+    then as test pollution, a timezone difference, a dependency mismatch, and an
+    SQLite version difference -- all wrong, because the failing comparison was
+    against wall time.
+
+    AUTOUSE ON PURPOSE. Patching per-test invites the next author to add a
+    wall-clock-sensitive test and reintroduce the bomb.
+
+    WHAT DETECTS A BROKEN FIXTURE: the three tests named above. Measured by
+    flipping this to ``autouse=False`` in a container -- exactly those three fail
+    and the rest pass. `test_the_clock_pin_is_load_bearing` does NOT serve that
+    role; it patches its own clock, so it passes either way. Its value is
+    different and still worth having: it proves patching `_utcnow` genuinely
+    governs the production decision, and it pins the far side of `FUTURE`, which
+    nothing asserted before -- which is why the bomb went unnoticed until wall
+    time crossed it.
+    """
+    with patch("backend.download_queue._utcnow", return_value=NOW):
+        yield
 
 
 def _shared(cooldown=None, *, enabled=True, used=0, delivered=0, mark=0, cap=3):
@@ -210,6 +250,36 @@ def test_a_visit_authorising_nothing_does_not_spend_budget(tmp_path):
         db.close()
 
 
+def test_the_clock_pin_is_load_bearing(tmp_path):
+    """Proves `_pin_production_clock` actually governs the outcome.
+
+    Same rig as the round-12 test, but the clock is forced one second PAST
+    `FUTURE`, so the sibling really is due and BOTH children must be promoted.
+
+    Note what this does and does not prove. It patches `_utcnow` ITSELF, so it
+    passes whether or not the autouse fixture is active -- it is not the canary
+    for a broken fixture (those are the three tests named in that fixture's
+    docstring, verified by flipping it to autouse=False). What it does prove is
+    that patching `_utcnow` genuinely reaches the production decision, so the
+    fixture's mechanism is sound rather than merely present.
+
+    It is also the assertion the original suite lacked entirely: nothing ever
+    checked the far side of `FUTURE`, which is exactly why the bomb sat
+    undetected until wall time crossed it.
+    """
+    db = DatabaseManager(str(tmp_path / "pin.db"))
+    try:
+        svc, _b, ids = _rig(db, [PAST_S, FUTURE_S], batch_cooldown=None)
+        with patch("backend.download_queue._utcnow",
+                   return_value=FUTURE + timedelta(seconds=1)):
+            svc._maybe_auto_resume()
+        assert _states(db, ids) == ["ready", "ready"], (
+            "past FUTURE both children are due; if this says waiting_source the "
+            "clock pin is not reaching production")
+    finally:
+        db.close()
+
+
 def test_unknown_outcome_rows_are_never_resumed_by_production(tmp_path):
     """The discriminating control: a fix that relaxed filters would fail only this."""
     db = DatabaseManager(str(tmp_path / "unknown.db"))
@@ -233,9 +303,11 @@ def _joined(own, batch_cd, **over):
     row = {"item_uuid": "i", "batch_uuid": "b", "title": "T",
            "state": "waiting_source", "cooldown_until": own,
            "queue_reason": "source_deferred", "last_reason_code": "",
+           "item_source": "hdencode",
            "batch_state": "paused_source", "batch_cooldown": batch_cd,
            "auto_resume_after_cooldown": 1, "auto_resume_used": 0,
-           "source_delivery_count": 0, "auto_resume_progress_mark": 0}
+           "source_delivery_count": 0, "auto_resume_progress_mark": 0,
+           "source_held": 0}
     row.update(over)
     return row
 

@@ -265,7 +265,55 @@ class DatabaseManager:
     # ── Schema initialization ────────────────────────────────────────
 
     # Schema version — increment when migrations are added.
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 9
+
+    @staticmethod
+    def _mark_existing_challenge_pauses_held(cursor):
+        """v9: put pre-existing INTERACTIVE-CHALLENGE pauses under the hold.
+
+        NARROWED on round-2 review (finding 3). The first version also swept
+        `reveal_verification_stalled` batches and took the held source from the
+        first deferred child by sequence. Both were wrong:
+
+          * `reveal_verification_stalled` is explicitly NOT Turnstile evidence —
+            it is the runtime classifier's fallback for a not-ready reveal with
+            NO active challenge — so retro-labelling it a human challenge
+            contradicts the very rule this change adds. A `user_version` gate
+            bounds how OFTEN the inference runs, not WHICH rows it is valid for.
+          * the first deferred child can be a different source than the one that
+            hit the challenge (a mixed batch: seq0 DDLBase, seq1 HDEncode), so
+            the wrong source could be held.
+
+        So this migrates ONLY a batch that carries a genuine challenge TRIGGER
+        row — an item in `verification_required` with
+        `queue_reason='interactive_challenge'` — and takes the held source from
+        THAT row, which is by construction the source that hit the challenge.
+        A batch without such a row is left alone; if its reveal later stalls on
+        a live Turnstile, the runtime classifier holds it then, on real
+        evidence. This is the schema migration doing only what the schema can
+        prove. It is written at the batch (the level the resume machinery reads)
+        so old item cooldowns and auto-resume flags cannot reschedule the rows.
+        """
+        cursor.execute(
+            """
+            UPDATE download_queue_batches
+            SET verification_hold_source = (
+                SELECT i.source FROM download_queue_items i
+                WHERE i.batch_uuid = download_queue_batches.batch_uuid
+                  AND i.state = 'verification_required'
+                  AND i.queue_reason = 'interactive_challenge'
+                ORDER BY i.sequence_number LIMIT 1
+            )
+            WHERE state = 'paused_source'
+              AND verification_hold_source IS NULL
+              AND EXISTS (
+                SELECT 1 FROM download_queue_items i
+                WHERE i.batch_uuid = download_queue_batches.batch_uuid
+                  AND i.state = 'verification_required'
+                  AND i.queue_reason = 'interactive_challenge'
+              )
+            """
+        )
 
     def init_db(self):
         """Initialize database tables and run schema migrations.
@@ -1201,7 +1249,13 @@ class DatabaseManager:
                         paused_at TEXT,
                         cooldown_until TEXT,
                         last_reason_code TEXT,
-                        last_cause_code TEXT
+                        last_cause_code TEXT,
+                        -- Non-NULL = this batch is under a human-verification
+                        -- hold for that source: an interactive challenge our
+                        -- automated browser could not complete. A timer never
+                        -- clears it; only a probe that genuinely delivers from
+                        -- this source does (DownloadQueueService._complete).
+                        verification_hold_source TEXT
                     )
                 """)
                 # Additive migration for the table above, placed HERE and not in
@@ -1225,12 +1279,16 @@ class DatabaseManager:
                     "ALTER TABLE download_queue_batches "
                     "ADD COLUMN source_delivery_count INTEGER "
                     "NOT NULL DEFAULT 0",
+                    # See the column comment in the CREATE above (v9).
+                    "ALTER TABLE download_queue_batches "
+                    "ADD COLUMN verification_hold_source TEXT",
                 ):
                     try:
                         cursor.execute(_batch_alter)
                     except sqlite3.OperationalError as exc:
                         if "duplicate column" not in str(exc).lower():
                             raise
+
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS download_queue_items (
                         item_uuid TEXT PRIMARY KEY,
@@ -1289,6 +1347,16 @@ class DatabaseManager:
                         'verification_required'
                     )
                 """)
+
+                if current_version < 9:
+                    # v9 ONE-TIME DATA MIGRATION: place the challenge episode
+                    # that predates the verification-hold column under the
+                    # hold. AFTER both queue tables exist — the UPDATE's
+                    # subqueries read download_queue_items, and on a fresh
+                    # database (current_version=0) that table is only created
+                    # a few statements above; running earlier broke every
+                    # fresh init with "no such table".
+                    self._mark_existing_challenge_pauses_held(cursor)
 
                 # ── Stamp current version ────────────────────────────────
                 cursor.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")

@@ -540,10 +540,25 @@ def test_post_reveal_click_challenge_is_captured_not_reported_as_missing_links()
     svc.cached_driver = driver
 
     # First drain: clean initial navigation. Second: the challenged unlock POST.
-    driver.get_log.side_effect = [
+    #
+    # KEYED BY LOG TYPE, not call order (2026-08-09): get_log also serves the
+    # browser console log now — _drain_browser_console marks each navigation
+    # boundary and the Turnstile detector reads it — so a positional
+    # side_effect list would feed the challenge header to whichever consumer
+    # happened to call first.
+    perf_batches = [
         [_perf(page, {"content-type": "text/html"})],
         [_perf(page, {"cf-mitigated": "challenge"})],
     ]
+    perf_drains = []
+
+    def _get_log(kind):
+        if kind == "performance":
+            perf_drains.append(kind)
+            return perf_batches.pop(0) if perf_batches else []
+        return []          # console log: drained at each boundary, nothing queued
+
+    driver.get_log.side_effect = _get_log
 
     reveal = MagicMock()
     reveal.get_attribute.return_value = "View links"
@@ -559,4 +574,4 @@ def test_post_reveal_click_challenge_is_captured_not_reported_as_missing_links()
     assert result.diagnostic.code == ScrapeCode.INTERACTIVE_CHALLENGE
     assert svc._last_cf_mitigated == "challenge"
     # Both navigations were drained: the initial one and the post-click one.
-    assert driver.get_log.call_count == 2
+    assert len(perf_drains) == 2
