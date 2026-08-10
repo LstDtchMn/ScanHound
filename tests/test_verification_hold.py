@@ -29,7 +29,11 @@ Three layers are covered, because each has its own way to regress:
 """
 from __future__ import annotations
 
+import importlib
+import os
+import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -151,7 +155,7 @@ _RELEASE_PAGE = """
 <html><head><title>Some.Release.2026.2160p.WEB-DL – 9.0 GB</title></head>
 <body>
   <a href="/tv-shows/">TV Shows</a>
-  <form action="/some-release/#unlocked">
+  <form action="#unlocked">
     <input type="submit" value="Verifying… Please wait">{extra}
   </form>
 </body></html>
@@ -212,6 +216,67 @@ def test_navigation_text_and_raw_cloudflare_words_are_not_evidence():
     html = _RELEASE_PAGE.format(
         extra='<p>Mirrors are behind cloudflare. Click show to reveal.</p>')
     assert turnstile_challenge_evidence(html) == ()
+
+
+# ── response-field discrimination (fold review: ChatGPT + b087aa20) ──────────
+# A cf-turnstile-response field is reveal evidence ONLY when it is UNSOLVED and
+# belongs to a form that posts the reveal's unlock endpoint.
+
+def _unlock_only(target):
+    """Test unlock_target: only a destination ending in #unlocked is the reveal."""
+    return (target or "").endswith("#unlocked")
+
+
+def test_a_solved_response_token_is_not_evidence():
+    html = """<html><body><form action="#unlocked">
+        <input type="submit" value="View links">
+        <input type="hidden" name="cf-turnstile-response" value="SOLVED-TOKEN">
+        </form></body></html>"""
+    assert turnstile_challenge_evidence(html, unlock_target=_unlock_only) == (), (
+        "a populated token is a challenge that SUCCEEDED, not failure evidence")
+
+
+def test_a_response_field_on_the_comment_form_is_not_reveal_evidence():
+    html = """<html><body>
+        <form action="#unlocked"><input type="submit" value="View links"></form>
+        <form action="/comment/post">
+          <input type="hidden" name="cf-turnstile-response" value="">
+          <input type="submit" value="Post Comment">
+        </form>
+        </body></html>"""
+    assert turnstile_challenge_evidence(html, unlock_target=_unlock_only) == (), (
+        "a Turnstile widget on the comment form is not evidence about the reveal")
+
+
+def test_an_unsolved_response_field_on_the_unlock_form_is_evidence():
+    html = """<html><body><form action="#unlocked">
+        <input type="submit" value="Verifying… Please wait">
+        <input type="hidden" name="cf-turnstile-response" value="">
+        </form></body></html>"""
+    assert "turnstile:response-field" in turnstile_challenge_evidence(
+        html, unlock_target=_unlock_only)
+
+
+def test_form_id_ownership_is_honoured():
+    # Associated to the unlock form by form="id", not by nesting.
+    html = """<html><body>
+        <form id="unlock" action="#unlocked">
+          <input type="submit" value="Verifying… Please wait">
+        </form>
+        <input type="hidden" name="cf-turnstile-response" value="" form="unlock">
+        </body></html>"""
+    assert "turnstile:response-field" in turnstile_challenge_evidence(
+        html, unlock_target=_unlock_only)
+
+
+def test_formaction_override_decides_ownership():
+    # The form action posts #unlocked, but the submit's formaction posts /report,
+    # so the field's effective form does NOT post the reveal endpoint.
+    html = """<html><body><form action="#unlocked">
+        <input type="submit" formaction="/report" value="Report">
+        <input type="hidden" name="cf-turnstile-response" value="">
+        </form></body></html>"""
+    assert turnstile_challenge_evidence(html, unlock_target=_unlock_only) == ()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -799,6 +864,24 @@ def test_resume_batch_is_refused_while_a_hold_is_open(tmp_path):
         db.close()
 
 
+def test_resume_batch_is_hold_safe_against_a_check_use_race(tmp_path):
+    """FOLD review (ChatGPT + b087aa20): the AUTHORITATIVE hold check lives inside
+    _resume_batch's promotion transaction, not only in resume_batch's outer fast
+    check. Calling _resume_batch directly simulates a worker arming the hold
+    AFTER the outer check committed — it must still refuse and promote nothing."""
+    db = DatabaseManager(str(tmp_path / "race.db"))
+    try:
+        svc, download, batch = _rig(db, count=3)
+        svc._execute(svc._claim_due())          # → held
+        with pytest.raises(DownloadQueueError):
+            svc._resume_batch(batch, interval_minutes=0, automated=False)
+        assert not _state_counts(db, batch).get("ready"), (
+            "the in-transaction check must promote nothing")
+        assert _hold(db, batch) == "hdencode"
+    finally:
+        db.close()
+
+
 def test_clear_verification_hold_releases_the_siblings(tmp_path):
     """FOLD: the operator escape hatch. A permanently-challenged source would
     otherwise deadlock — the only automatic clear is a reveal success the hold
@@ -1020,3 +1103,110 @@ def test_the_hold_is_source_matched_not_batch_global(tmp_path):
             "a DDLBase sibling must not be held by an HDEncode challenge")
     finally:
         db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The clear-hold route + the standalone migration script (fold review)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_clear_verification_hold_route():
+    """FOLD review (finding 5): the escape-hatch route has a boundary test."""
+    from fastapi import HTTPException
+    from backend.api.routes.downloads import (
+        ClearVerificationHoldRequest, clear_verification_hold as route)
+
+    # queue unavailable -> 503
+    with pytest.raises(HTTPException) as exc:
+        route(ClearVerificationHoldRequest(source="hdencode"),
+              reg=SimpleNamespace(download_queue=None))
+    assert exc.value.status_code == 503
+
+    # queue present -> delegates to the service and returns its result
+    q = MagicMock()
+    q.clear_verification_hold.return_value = {
+        "source": "hdencode", "cleared": 2, "remaining_triggers": 1}
+    result = route(ClearVerificationHoldRequest(source="hdencode"),
+                   reg=SimpleNamespace(download_queue=q))
+    assert result["cleared"] == 2
+    q.clear_verification_hold.assert_called_once_with("hdencode")
+
+
+def _migrate(argv):
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "scripts"))
+    return importlib.import_module("migrate_challenge_episode").main(argv)
+
+
+def _one_deferred_hdencode(db):
+    svc = DownloadQueueService({}, db, MagicMock())
+    b = svc.schedule_batch(
+        [{"url": "https://hdencode.org/x-2160p/", "title": "X",
+          "media_type": "movie"}],
+        interval_minutes=0, mode="immediate", auto_resume_after_cooldown=True)
+    item_uuid = b["items"][0]["item_uuid"]
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE download_queue_items SET state='waiting_source', "
+            "queue_reason='source_deferred', cooldown_until=? WHERE item_uuid=?",
+            (PAST_S, item_uuid))
+        conn.execute("UPDATE download_queue_batches SET state='paused_source' "
+                     "WHERE batch_uuid=?", (b["batch_uuid"],))
+    return b["batch_uuid"], item_uuid
+
+
+def _hold_of(path, batch):
+    db = DatabaseManager(path)
+    try:
+        rows = db._query_dicts(
+            "SELECT verification_hold_source h FROM download_queue_batches "
+            "WHERE batch_uuid=?", (batch,), default=[])
+        return rows[0]["h"] if rows else None
+    finally:
+        db.close()
+
+
+def test_migration_requires_a_named_trigger(tmp_path):
+    path = str(tmp_path / "m.db")
+    DatabaseManager(path).close()
+    assert _migrate(["--db", path]) == 2, "no --trigger must refuse (exit 2)"
+
+
+def test_migration_dry_run_writes_nothing_then_apply_holds(tmp_path):
+    path = str(tmp_path / "m.db")
+    db = DatabaseManager(path)
+    batch, item = _one_deferred_hdencode(db)
+    db.close()
+    assert _migrate(["--db", path, "--trigger", item]) == 0
+    assert _hold_of(path, batch) is None, "dry run must not write"
+    assert _migrate(["--db", path, "--trigger", item, "--apply"]) == 0
+    assert _hold_of(path, batch) == "hdencode", "apply must hold the source"
+
+
+def test_migration_refuses_a_typo_trigger(tmp_path):
+    path = str(tmp_path / "m.db")
+    db = DatabaseManager(path)
+    batch, _item = _one_deferred_hdencode(db)
+    db.close()
+    assert _migrate(["--db", path, "--trigger", "not-a-real-id", "--apply"]) == 1
+    assert _hold_of(path, batch) is None, "a typo'd trigger must write nothing"
+
+
+def test_migration_refuses_a_hold_batch_without_a_source_row(tmp_path):
+    path = str(tmp_path / "m.db")
+    db = DatabaseManager(path)
+    batch, item = _one_deferred_hdencode(db)
+    # A second batch with only a DDLBase deferred row.
+    svc = DownloadQueueService({}, db, MagicMock())
+    ddl = svc.schedule_batch(
+        [{"url": "https://ddlbase.com/y/", "title": "Y", "media_type": "movie"}],
+        interval_minutes=0, mode="immediate", auto_resume_after_cooldown=True)
+    ddl_batch = ddl["batch_uuid"]
+    with db.transaction() as conn:
+        conn.execute("UPDATE download_queue_items SET state='waiting_source', "
+                     "queue_reason='source_deferred' WHERE batch_uuid=?",
+                     (ddl_batch,))
+    db.close()
+    rc = _migrate(["--db", path, "--trigger", item,
+                   "--hold-batch", ddl_batch, "--apply"])
+    assert rc == 1, "a DDLBase-only hold-batch must be refused"
+    assert _hold_of(path, batch) is None, "nothing may be written on refusal"

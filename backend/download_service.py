@@ -1660,8 +1660,22 @@ class DownloadService:
             # shaped for an interstitial that REPLACES the page; HDEncode embeds
             # the challenge inside the reveal widget, which is how a failing
             # challenge was read as a source throttle for two weeks.
+            # Supply the unlock-endpoint predicate so a cf-turnstile-response
+            # field only counts as reveal evidence when it belongs to a form
+            # that posts THIS page's unlock endpoint — a Turnstile widget on the
+            # page's comment/report form is not evidence about the reveal (fold
+            # review, ChatGPT + b087aa20). One copy of "does this post the unlock
+            # endpoint?" — _resolves_to_unlock_target — injected, not reimplemented.
+            try:
+                _page_url = driver.current_url or ""
+            except Exception:
+                _page_url = ""
+            _unlock_target = (
+                (lambda target: _resolves_to_unlock_target(target, _page_url))
+                if _page_url else None)
             turnstile_markers = list(turnstile_challenge_evidence(
-                html, self._browser_console_lines(driver)
+                html, self._browser_console_lines(driver),
+                unlock_target=_unlock_target,
             ))
             if turnstile_markers:
                 signals.extend(
@@ -1717,9 +1731,19 @@ class DownloadService:
             # all) qualifies. This resolves the artificial-but-instructive case
             # of a bare iframe reported as a ready reveal: the reveal tier, not
             # just the absence of other controls, decides.
+            # ...and NO positive working-page evidence of any kind. `candidates`
+            # (lexical access/download/link labels) is necessary but NOT
+            # sufficient: a post-click page can expose a real file-host link
+            # whose visible label is just "Rapidgator" — no lexical keyword — so
+            # `candidates` is empty while the page is plainly working. `host_links`
+            # (actual Rapidgator/Nitroflare/1fichier/DDownload URLs) is the
+            # stronger signal, and the transient invisible-Turnstile iframe on a
+            # different-host post-click page is exactly the reviewers' reachable
+            # false positive. Require the absence of BOTH.
             interstitial_shape = (
                 bool(captcha_frames or iframe_markers)
                 and not candidates
+                and not host_links
                 and reveal_tier in (None, "none"))
             # TOP-LEVEL interstitial: the page IS the challenge — a cf-mitigated
             # header, an interstitial <title>, or the control-less iframe shape.

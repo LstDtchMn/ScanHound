@@ -1862,6 +1862,33 @@ class DownloadQueueService:
                 # resumed something" from "this batch merely held a candidate row".
                 self._note_auto_resumed(batch_uuid)
             else:
+                # AUTHORITATIVE HOLD CHECK, inside the promotion transaction
+                # (ChatGPT + b087aa20 round). resume_batch()'s outer check is only
+                # a fast message: a worker can arm verification_hold_source
+                # between that check's commit and this one, and the manual branch
+                # below promotes every deferred row without decide(). Re-checking
+                # HERE, in the same transaction that flips the rows, is what
+                # actually closes the bulk-fan-out door. Raising rolls the
+                # transaction back, so nothing is promoted.
+                held_sources = [
+                    str(r["source"])
+                    for r in conn.execute(
+                        "SELECT DISTINCT i.source FROM download_queue_items i "
+                        "WHERE i.batch_uuid = ? AND EXISTS ("
+                        "  SELECT 1 FROM download_queue_batches b "
+                        "  WHERE b.verification_hold_source = i.source)",
+                        (batch_uuid,),
+                    ).fetchall()
+                ]
+                if held_sources:
+                    raise DownloadQueueError(
+                        "This batch is held behind a verification challenge that "
+                        "ScanHound could not complete "
+                        f"({', '.join(sorted(held_sources))}). Resuming every "
+                        "item would present the same challenge to each in turn. "
+                        "Retry a single item to test whether it has lifted; the "
+                        "rest are released automatically once one succeeds."
+                    )
                 rows = conn.execute(
                     """
                     SELECT item_uuid
@@ -2008,8 +2035,13 @@ class DownloadQueueService:
     def _source_is_held(conn, source: Optional[str]) -> bool:
         """True while a verification hold is open for this SOURCE (any batch).
 
-        The single source-scoped hold predicate, so `resume_batch`, `retry_ready`
-        and the escape hatch all judge the same fact the same way `decide()` does.
+        The source-scoped hold predicate used by `resume_batch`'s fast pre-check
+        and `_resume_batch`'s authoritative in-transaction check. NOTE: this is
+        not literally the ONLY expression of the rule — `retry_ready` and the
+        automated `decide()` path each phrase the equivalent membership test in
+        their own single-transaction SQL (safe there, since the check and the
+        write commit together). They agree by construction on the same column;
+        do not let a future edit drift them.
         """
         if not source:
             return False
@@ -2085,9 +2117,18 @@ class DownloadQueueService:
                 "WHERE verification_hold_source = ?",
                 (source,),
             ).rowcount
+            # Trigger rows stay held by their OWN reason; they need a probe. Say
+            # how many remain so the operator is not surprised (fold review).
+            remaining_triggers = int((conn.execute(
+                "SELECT COUNT(*) AS n FROM download_queue_items "
+                "WHERE source = ? AND state = 'verification_required' "
+                "AND queue_reason = 'interactive_challenge'",
+                (source,),
+            ).fetchone()["n"]) or 0)
         logger.info(
-            "Operator cleared the verification hold on %d batch(es) for %s.",
-            cleared, source,
+            "Operator cleared the verification hold on %d batch(es) for %s "
+            "(%d trigger(s) still need a probe).",
+            cleared, source, remaining_triggers,
         )
         self._wake.set()
         # SAY that the clear is self-correcting. Peer review of the fold: if the
@@ -2099,6 +2140,11 @@ class DownloadQueueService:
         return {
             "source": source,
             "cleared": cleared,
+            "remaining_triggers": remaining_triggers,
+            "next_action": (
+                "Retry one verification-required item as a probe."
+                if remaining_triggers else "No trigger left to probe."
+            ),
             "message": (
                 f"Released the verification hold on {cleared} batch(es) for "
                 f"{source}. If the challenge is still active, the first released "

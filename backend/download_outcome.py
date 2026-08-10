@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
 
@@ -243,10 +243,33 @@ def is_turnstile_console_failure(line: str) -> bool:
             and bool(_TURNSTILE_CONSOLE_ERROR.search(low)))
 
 
+def _form_posts_unlock(form, unlock_target: Callable[[str], bool]) -> bool:
+    """True when a form's EFFECTIVE destination is this page's unlock endpoint.
+
+    Mirrors the reveal-control rule: a submit may override its form's
+    destination via ``formaction``, so the effective target is the submit's
+    ``formaction`` when present, else the form's ``action``. Ported from
+    agent/turnstile-classification — checking ``form.action`` alone is wrong in
+    both directions (a form whose action looks safe while its submit posts the
+    unlock endpoint, and the reverse).
+    """
+    action = form.get("action") or ""
+    submits = [
+        el for el in form.find_all(["input", "button"])
+        if (el.name == "button"
+            or str(el.get("type") or "").lower() == "submit")
+    ]
+    targets = [(el.get("formaction") or action) for el in submits] or [action]
+    return any(unlock_target(target) for target in targets)
+
+
 def turnstile_challenge_evidence(
-    html: str, console_lines: Sequence[str] = ()
+    html: str,
+    console_lines: Sequence[str] = (),
+    *,
+    unlock_target: Optional[Callable[[str], bool]] = None,
 ) -> tuple[str, ...]:
-    """Active Turnstile evidence markers, or ``()`` for none.
+    """Active, UNSOLVED Turnstile evidence markers, or ``()`` for none.
 
     HDEncode embeds Turnstile INSIDE the reveal widget rather than replacing
     the page, so the interstitial-shaped checks (challenge page title, visible
@@ -254,13 +277,21 @@ def turnstile_challenge_evidence(
     challenge was classified as a source throttle for two weeks. Accepted
     evidence, in order of preference:
 
-    1. a rendered ``input[name="cf-turnstile-response"]`` — the field the
-       widget posts its verdict through;
+    1. a rendered ``input[name="cf-turnstile-response"]`` that is UNSOLVED (empty
+       value) and — when ``unlock_target`` is supplied — belongs to a form that
+       posts THIS page's unlock endpoint;
     2. a rendered ``.cf-turnstile`` container element;
     3. a rendered iframe whose ``src`` names ``challenges.cloudflare.com``;
     4. a NAVIGATION-SCOPED console error in the 600* family from the Turnstile
        script (see is_turnstile_console_failure for what the caller must
        guarantee about scoping).
+
+    THE RESPONSE-FIELD DISCRIMINATION (ported from agent/turnstile-classification
+    on peer + ChatGPT review): a POPULATED token is a challenge that SUCCEEDED,
+    not failure evidence; and a response field belonging to the page's COMMENT or
+    report form is not evidence about the reveal. Without ``unlock_target`` the
+    field is accepted on presence alone (back-compat for callers that cannot
+    resolve the endpoint), but the production caller always supplies it.
 
     Deliberately NOT evidence: the word "cloudflare" anywhere in raw HTML, a
     dormant ``<script src=...turnstile...>`` reference alone, the English
@@ -273,8 +304,23 @@ def turnstile_challenge_evidence(
         from bs4 import BeautifulSoup
 
         soup = BeautifulSoup(html or "", "html.parser")
-        if soup.find("input", attrs={"name": "cf-turnstile-response"}) is not None:
+        for field in soup.find_all(
+            "input", attrs={"name": "cf-turnstile-response"}
+        ):
+            if (field.get("value") or "").strip():
+                continue  # solved — not failure evidence
+            if unlock_target is not None:
+                # Form ownership by nesting OR a ``form="<id>"`` attribute
+                # pointing elsewhere in the document. Checking only the parent
+                # would let a cosmetic markup change silently disable detection.
+                owner = field.get("form")
+                form = soup.find("form", id=owner) if owner else None
+                if form is None:
+                    form = field.find_parent("form")
+                if form is None or not _form_posts_unlock(form, unlock_target):
+                    continue
             markers.append("turnstile:response-field")
+            break
         if soup.find(class_="cf-turnstile") is not None:
             markers.append("turnstile:container")
         for frame in soup.find_all("iframe"):

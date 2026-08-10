@@ -245,6 +245,34 @@ def test_challenge_iframe_on_a_working_page_with_controls_is_not_a_challenge(mon
     coordinator.observe_challenge.assert_not_called()
 
 
+def test_a_control_less_page_with_a_host_link_is_not_an_interstitial(monkeypatch):
+    # FOLD review counterexample (ChatGPT): a post-click page for a DIFFERENT
+    # requested host exposes a real file-host link whose visible label is just
+    # "Rapidgator" — no lexical access/download/link keyword, so `candidates` is
+    # empty — while the invisible-Turnstile iframe is transiently present and the
+    # reveal tier is None. `host_links` (the actual host URL) is the stronger
+    # signal that the page is working; without requiring its absence, the
+    # structural guard would arm a source-wide hold on a healthy page.
+    service = _service()
+    coordinator = MagicMock()
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator)
+    driver = MagicMock()
+    driver.title = "Some.Release.2026.2160p.WEB-DL"
+    driver.page_source = """
+        <html><body>
+        <a href="https://rapidgator.net/file/abc">Rapidgator</a>
+        <iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if"></iframe>
+        </body></html>
+    """
+    diagnostic = service._log_page_diagnostics(
+        driver, keyword="nitroflare", stage="requested_host",
+        source_kind="hdencode")
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE, (
+        "a page exposing a real host link must not be held on a transient iframe")
+    coordinator.observe_challenge.assert_not_called()
+
+
 def test_body_title_phrase_without_an_iframe_is_not_a_challenge(monkeypatch):
     # The broader ambiguous title phrases ("just a moment", "access denied") in
     # a release body, with NO challenge iframe, must NOT classify — they are not

@@ -99,10 +99,18 @@ def main(argv: list[str]) -> int:
 
     batches = sorted({row["batch_uuid"] for row in triggers}
                      | set(args.hold_batch))
+    # A --hold-batch must actually contain a deferred row for this source. Fold
+    # review: stamping verification_hold_source='hdencode' on a DDLBase-only
+    # batch would create a durable HDEncode hold with no HDEncode row behind it.
+    # (This also subsumes the existence check — a missing batch has no rows.)
     for batch_uuid in args.hold_batch:
-        if conn.execute("SELECT 1 FROM download_queue_batches WHERE "
-                        "batch_uuid = ?", (batch_uuid,)).fetchone() is None:
-            print(f"ERROR: batch {batch_uuid} does not exist. Nothing was "
+        if conn.execute(
+            f"SELECT 1 FROM download_queue_items WHERE batch_uuid = ? "
+            f"AND source = ? AND state IN ({placeholders}) LIMIT 1",
+            (batch_uuid, args.source, *DEFERRED),
+        ).fetchone() is None:
+            print(f"ERROR: batch {batch_uuid} has no deferred {args.source} row; "
+                  f"refusing to stamp a {args.source} hold on it. Nothing was "
                   "written.", file=sys.stderr)
             return 1
 
@@ -131,17 +139,30 @@ def main(argv: list[str]) -> int:
         with conn:                       # one transaction; rolls back on error
             conn.execute("BEGIN IMMEDIATE")
             for row in triggers:
-                conn.execute(
-                    """
+                # RE-CHECK the predicate INSIDE the write, and require exactly one
+                # row. Fold review: validation ran before BEGIN IMMEDIATE, so a
+                # live queue could move a validated row (resume, cancel, claim)
+                # before this write — and the bare `WHERE item_uuid = ?` would
+                # then force an already-progressed row back to
+                # verification_required. Repeating state+source and asserting the
+                # rowcount makes the apply atomic with its own validation.
+                updated = conn.execute(
+                    f"""
                     UPDATE download_queue_items
                     SET state = 'verification_required',
                         queue_reason = 'interactive_challenge',
                         last_reason_code = 'interactive_challenge',
                         last_cause_code = 'operator_identified_challenge'
-                    WHERE item_uuid = ?
+                    WHERE item_uuid = ? AND source = ?
+                      AND state IN ({placeholders})
                     """,
-                    (row["item_uuid"],),
-                )
+                    (row["item_uuid"], args.source, *DEFERRED),
+                ).rowcount
+                if updated != 1:
+                    raise sqlite3.Error(
+                        f"trigger {row['item_uuid']} is no longer a parked "
+                        f"{args.source} row (it moved before the write); nothing "
+                        "applied")
             conn.executemany(
                 "UPDATE download_queue_batches "
                 "SET verification_hold_source = ? WHERE batch_uuid = ?",
@@ -151,12 +172,11 @@ def main(argv: list[str]) -> int:
         print(f"ERROR: migration rolled back: {exc}", file=sys.stderr)
         return 3
 
-    applied = conn.execute(
-        "SELECT COUNT(*) AS n FROM download_queue_batches "
-        "WHERE verification_hold_source = ?", (args.source,)
-    ).fetchone()["n"]
-    print(f"\nApplied. {len(triggers)} trigger(s); source {args.source} now "
-          f"held on {applied} batch(es).")
+    # Report only what THIS invocation held, not every batch already carrying the
+    # source hold. Fold review: the global count conflated pre-existing holds
+    # with this run's effect.
+    print(f"\nApplied. {len(triggers)} trigger(s); {args.source} held on "
+          f"{len(batches)} batch(es) this run.")
     return 0
 
 
