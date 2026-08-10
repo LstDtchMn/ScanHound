@@ -1,4 +1,4 @@
-# dovi_tool 2.3.2 — `extract-rpu` hangs at a fixed stream offset (100% CPU, zero read syscalls)
+# dovi_tool 2.3.2 and 2.3.3 — `extract-rpu` hangs at a fixed stream offset (100% CPU, zero read syscalls)
 
 Upstream report for https://github.com/quietvoid/dovi_tool. Everything below is
 measured. Both variables that could have explained it away -- the SMB transport
