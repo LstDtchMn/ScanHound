@@ -48,8 +48,15 @@ def test_download_item_surfaces_structured_failure_message():
 def test_page_diagnostics_classifies_interactive_challenge():
     service = _service()
     driver = MagicMock()
+    # A real Cloudflare interstitial REPLACES the page: the challenge phrase is
+    # in the <title>, which is authoritative regardless of reveal state. (Before
+    # the round-2 review this test relied on a bare iframe classifying on its
+    # own; that path is now gated on a not-ready reveal, so the test uses the
+    # interstitial evidence a genuine challenge page actually carries.)
+    driver.title = "Just a moment..."
     driver.page_source = """
-        <html><body><h1>Just a moment</h1>
+        <html><head><title>Just a moment...</title></head>
+        <body><h1>Just a moment</h1>
         <iframe src="https://challenges.cloudflare.com/turnstile"></iframe>
         </body></html>
     """
@@ -114,9 +121,11 @@ def test_dormant_cloudflare_assets_stay_item_level(monkeypatch):
     coordinator.observe_challenge.assert_not_called()
 
 
-def test_real_interactive_challenge_still_creates_source_wide_outcome(monkeypatch):
-    # 8. A rendered challenge iframe still produces the typed source-wide
-    #    interactive-challenge outcome and invokes the coordinator.
+def test_embedded_challenge_iframe_on_a_stuck_reveal_is_source_wide(monkeypatch):
+    # 8. An embedded challenge iframe on a NOT-READY reveal produces the typed
+    #    source-wide interactive-challenge outcome and invokes the coordinator.
+    #    (Round-2 review, finding 4: the iframe no longer classifies on its own;
+    #    it is the reveal-stuck conjunction that makes it a source-wide event.)
     service = _service()
     coordinator = MagicMock()
     coordinator.observe_challenge.return_value = SimpleNamespace(
@@ -133,7 +142,8 @@ def test_real_interactive_challenge_still_creates_source_wide_outcome(monkeypatc
     """
 
     diagnostic = service._log_page_diagnostics(
-        driver, stage="access_control", source_kind="hdencode"
+        driver, stage="access_control", source_kind="hdencode",
+        reveal_tier="not-ready",
     )
 
     assert diagnostic.code is ScrapeCode.INTERACTIVE_CHALLENGE
@@ -141,6 +151,32 @@ def test_real_interactive_challenge_still_creates_source_wide_outcome(monkeypatc
     assert diagnostic.affected_scope == "source"
     assert diagnostic.cooldown_until == "2099-01-01T00:00:00+00:00"
     coordinator.observe_challenge.assert_called_once()
+
+
+def test_embedded_challenge_iframe_on_a_working_reveal_is_not_a_challenge(monkeypatch):
+    # Round-2 review, finding 4: the negative control. A rendered Turnstile
+    # iframe on a page whose reveal is READY (or not evaluated) must NOT classify
+    # as a source-wide challenge — otherwise a dormant/unrelated widget would
+    # strand the source under a verification hold a timer cannot release.
+    service = _service()
+    coordinator = MagicMock()
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator
+    )
+    driver = MagicMock()
+    driver.page_source = """
+        <html><body>
+        <iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if"></iframe>
+        </body></html>
+    """
+
+    diagnostic = service._log_page_diagnostics(
+        driver, stage="access_control", source_kind="hdencode",
+        reveal_tier="links-control",
+    )
+
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE
+    coordinator.observe_challenge.assert_not_called()
 
 
 def _perf_entry(url, headers, *, rtype="Document"):

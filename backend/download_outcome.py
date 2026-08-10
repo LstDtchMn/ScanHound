@@ -421,6 +421,9 @@ def public_download_result(
         # pre-scrape duplicate. Dropping it here would make the producer's signal
         # invisible to its only consumer.
         "source_progress": bool(source.get("source_progress")),
+        # Carried through so the queue can release a verification hold the moment
+        # the source served its reveal, even if downstream delivery then failed.
+        "source_reveal_succeeded": bool(source.get("source_reveal_succeeded")),
         "affected_scope": source.get("affected_scope") or "item",
         "action_code": source.get("action_code"),
         "signals": signals,

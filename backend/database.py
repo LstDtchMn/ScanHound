@@ -269,23 +269,30 @@ class DatabaseManager:
 
     @staticmethod
     def _mark_existing_challenge_pauses_held(cursor):
-        """v9: put pre-existing challenge pauses under the verification hold.
+        """v9: put pre-existing INTERACTIVE-CHALLENGE pauses under the hold.
 
-        The 2026-08-09 root cause: batches paused by what is actually a
-        Cloudflare Turnstile challenge sit recorded as `interactive_challenge`
-        or `reveal_verification_stalled`, cycling on expired cooldowns. Moving
-        them under the hold must be ATOMIC AT THE EPISODE — rewriting item
-        reason codes alone would leave the old cooldowns and auto-resume flags
-        able to reschedule them, so the hold is written at the batch, which is
-        the level the resume machinery consults. One UPDATE, one transaction.
+        NARROWED on round-2 review (finding 3). The first version also swept
+        `reveal_verification_stalled` batches and took the held source from the
+        first deferred child by sequence. Both were wrong:
 
-        The hold's source comes from the batch's own deferred items (a batch
-        can be labelled source="mixed"); a paused batch with no deferred item
-        left is skipped — there is nothing an automatic resume could replay.
-        Runs once, gated by user_version < 9: a reveal stall that happens AFTER
-        this deploy classifies at grab time instead, where actual Turnstile
-        evidence decides — inferring a challenge from these reason codes is
-        only justified for the episode that was measured.
+          * `reveal_verification_stalled` is explicitly NOT Turnstile evidence —
+            it is the runtime classifier's fallback for a not-ready reveal with
+            NO active challenge — so retro-labelling it a human challenge
+            contradicts the very rule this change adds. A `user_version` gate
+            bounds how OFTEN the inference runs, not WHICH rows it is valid for.
+          * the first deferred child can be a different source than the one that
+            hit the challenge (a mixed batch: seq0 DDLBase, seq1 HDEncode), so
+            the wrong source could be held.
+
+        So this migrates ONLY a batch that carries a genuine challenge TRIGGER
+        row — an item in `verification_required` with
+        `queue_reason='interactive_challenge'` — and takes the held source from
+        THAT row, which is by construction the source that hit the challenge.
+        A batch without such a row is left alone; if its reveal later stalls on
+        a live Turnstile, the runtime classifier holds it then, on real
+        evidence. This is the schema migration doing only what the schema can
+        prove. It is written at the batch (the level the resume machinery reads)
+        so old item cooldowns and auto-resume flags cannot reschedule the rows.
         """
         cursor.execute(
             """
@@ -293,21 +300,17 @@ class DatabaseManager:
             SET verification_hold_source = (
                 SELECT i.source FROM download_queue_items i
                 WHERE i.batch_uuid = download_queue_batches.batch_uuid
-                  AND i.state IN ('verification_required', 'waiting_source')
+                  AND i.state = 'verification_required'
+                  AND i.queue_reason = 'interactive_challenge'
                 ORDER BY i.sequence_number LIMIT 1
             )
             WHERE state = 'paused_source'
               AND verification_hold_source IS NULL
-              AND (
-                    COALESCE(last_reason_code, '') IN (
-                        'interactive_challenge', 'reveal_verification_stalled')
-                 OR COALESCE(last_cause_code, '') IN (
-                        'interactive_challenge', 'reveal_verification_stalled')
-              )
               AND EXISTS (
                 SELECT 1 FROM download_queue_items i
                 WHERE i.batch_uuid = download_queue_batches.batch_uuid
-                  AND i.state IN ('verification_required', 'waiting_source')
+                  AND i.state = 'verification_required'
+                  AND i.queue_reason = 'interactive_challenge'
               )
             """
         )

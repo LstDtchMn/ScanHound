@@ -1462,6 +1462,15 @@ class DownloadService:
                         return None, diag
 
                     try:
+                        # NAVIGATION BOUNDARY for the console scope. Drain the
+                        # OLD page's console lines BEFORE this navigation begins,
+                        # so everything the console carries afterwards belongs to
+                        # THIS page. Draining after driver.get (the previous
+                        # placement, inside _wait_past_cloudflare) discarded the
+                        # current navigation's own Turnstile 600* error — the
+                        # exact evidence the detector needs. Each retry attempt
+                        # re-drains here.
+                        self._drain_browser_console(driver)
                         driver.get(url)
                     except Exception as exc:
                         if hdencode_request:
@@ -1630,6 +1639,20 @@ class DownloadService:
                     f"{challenge_markers}",
                     "warning",
                 )
+            # SPLIT the challenge evidence by whether it REPLACES the page.
+            # Round-2 review, finding 4: a rendered challenge iframe used to
+            # classify a source-wide challenge on its own, which bypassed the
+            # not-ready conjunction — and misclassifying a WORKING reveal page
+            # now arms a verification hold a timer cannot release, so the stakes
+            # of that false positive are higher than before. Title/visible-body
+            # markers only appear when the page itself is a Cloudflare
+            # interstitial, so they stay authoritative; iframe markers can sit
+            # on a normal release page, so they are treated as embedded evidence
+            # and gated on the reveal being stuck (below).
+            interstitial_markers = [
+                m for m in challenge_markers if not m.startswith("iframe:")]
+            iframe_markers = [
+                m for m in challenge_markers if m.startswith("iframe:")]
 
             # Widget-embedded Turnstile evidence: the response field, the
             # .cf-turnstile container, a challenges.cloudflare.com iframe, or a
@@ -1671,21 +1694,32 @@ class DownloadService:
                     affects_source_health=False,
                     signals=tuple(signals),
                 )
-            if (header_challenge or captcha_frames or challenge_markers
-                    or (stage == "access_control"
-                        and reveal_tier == "not-ready" and turnstile_markers)):
-                # THE CONJUNCTION, 2026-08-09. A not-ready reveal control plus
-                # ACTIVE Turnstile evidence is an interactive challenge, not a
-                # source throttle — measured on the live stall: Turnstile logged
-                # `Error: 600010.` while the reveal sat at "Verifying…" and the
-                # user's own browser passed the same challenge in under a
-                # second. Turnstile evidence alone deliberately does NOT
-                # classify outside the not-ready reveal state: a dormant widget
-                # on a page whose reveal works fine proves nothing.
+            reveal_not_ready = (
+                stage == "access_control" and reveal_tier == "not-ready")
+            # TOP-LEVEL interstitial: the page IS the challenge (cf-mitigated on
+            # the displayed document, or a Cloudflare interstitial title/body).
+            # Reveal state is irrelevant — there is no working reveal to be in.
+            top_level_challenge = header_challenge or bool(interstitial_markers)
+            # EMBEDDED challenge widget on an otherwise-normal release page:
+            # Turnstile in the reveal, or a captcha iframe. This is a source-wide
+            # challenge ONLY when the reveal itself is stuck — the conjunction.
+            # captcha_frames and iframe_markers are the same rendered-iframe
+            # evidence surfaced two ways; turnstile_markers adds the response
+            # field / container / navigation-scoped 600* console line.
+            embedded_challenge = bool(
+                captcha_frames or iframe_markers or turnstile_markers)
+            if top_level_challenge or (embedded_challenge and reveal_not_ready):
+                # Measured on the live stall: Turnstile logged `Error: 600010.`
+                # while the reveal sat at "Verifying…" and the user's own
+                # browser passed the same challenge in under a second. Embedded
+                # evidence deliberately does NOT classify outside the not-ready
+                # reveal state — a dormant/unrelated widget on a working reveal
+                # page proves nothing, and (round-2 review) must not strand the
+                # source under a hold a timer cannot release.
                 decision = None
                 if source_kind == "hdencode":
                     decision = get_hdencode_coordinator().observe_challenge()
-                if stage == "access_control" and reveal_tier == "not-ready":
+                if reveal_not_ready:
                     signals.append("reveal-tier:not-ready")
                 return ScrapeDiagnostic(
                     ScrapeCode.INTERACTIVE_CHALLENGE,
@@ -2003,9 +2037,14 @@ class DownloadService:
         *,
         source_kind: str = "other",
     ) -> Optional[ScrapeDiagnostic]:
-        """Passively wait for a transient browser check without solving it."""
-        # A new navigation starts a new console scope — see _drain_browser_console.
-        self._drain_browser_console(driver)
+        """Passively wait for a transient browser check without solving it.
+
+        Does NOT drain the browser console: draining here would run AFTER the
+        navigation that produced the challenge (this method is called after
+        driver.get and after the reveal click), discarding the current page's
+        own 600* error. The drain is a PRE-navigation boundary instead — see
+        _navigate_with_diagnostic and the reveal-click path.
+        """
         # Read the navigation's response headers once, before polling the page.
         # cf-mitigated is authoritative and language-independent, so a custom or
         # localized Challenge Page is recognised even with no English phrase and
@@ -2325,6 +2364,11 @@ class DownloadService:
                         btn_desc = "?"
                     self._log(f"[HDEncode] Access control found ({btn_desc!r}) — clicking")
                     driver.execute_script("arguments[0].scrollIntoView();", access_btn)
+                    # NAVIGATION BOUNDARY: the click submits the unlock form, a new
+                    # top-level navigation that can present its own Turnstile. Drain
+                    # BEFORE it so the post-click _wait_past_cloudflare/diagnostics
+                    # read only this navigation's console (incl. its 600* error).
+                    self._drain_browser_console(driver)
                     try:
                         access_btn.click()
                     except Exception as click_exc:
@@ -2946,6 +2990,14 @@ class DownloadService:
             # Only an explicit signal, set where the delivery actually happens,
             # is trustworthy.
             "source_progress": False,
+            # AFFIRMATIVE SOURCE-REVEAL signal, added on round-2 review
+            # (finding 6). True once the SOURCE served its file-host links — the
+            # reveal/challenge demonstrably cleared for our session — regardless
+            # of whether the downstream JDownloader hand-off then succeeded. The
+            # verification hold owns source accessibility, not delivery, so this
+            # (not source_progress) is what releases it. A pre-scrape dedup and a
+            # pasted direct-link URL both leave it False: neither read the source.
+            "source_reveal_succeeded": False,
             "affected_scope": "item",
             "action_code": None,
             "deferred": False,
@@ -3025,6 +3077,11 @@ class DownloadService:
                 _cb=_cb,
             )
 
+        # The source served its file-host links: the reveal/challenge cleared
+        # for our session. Captured BEFORE the direct-link fallback below, which
+        # sets links=[url] without ever reading a source page.
+        reveal_served = bool(links)
+
         if not links:
             # Only fall back to the URL itself if it is *already* a file-host
             # link (e.g. user pasted a rapidgator URL). Sending a source page
@@ -3058,6 +3115,7 @@ class DownloadService:
 
         self._progress("download:links_found", {"title": title, "link_count": len(links)}, _cb=_cb)
         result["link_count"] = len(links)
+        result["source_reveal_succeeded"] = reveal_served
         # Remember which movie/show these links belong to (for broken-link tracing)
         if self.db and title:
             try:

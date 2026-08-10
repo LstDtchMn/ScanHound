@@ -338,6 +338,53 @@ def test_a_previous_pages_console_error_does_not_classify_this_one(service):
         "a drained (previous-navigation) console error still classified")
 
 
+def test_the_console_is_drained_before_navigation_not_after(monkeypatch):
+    """Round-2 review, finding 5: the drain must be a PRE-navigation boundary.
+
+    Draining at the top of _wait_past_cloudflare (the old placement) ran AFTER
+    driver.get, discarding the current page's own 600* error. Model the console
+    as a queue that get_log drains and that navigation appends to: after
+    _navigate_with_diagnostic, the PREVIOUS page's error must be gone and the
+    CURRENT navigation's error must survive to be read.
+    """
+    from backend import download_service as ds
+    svc = object.__new__(ds.DownloadService)
+    svc._log = lambda *a, **k: None
+    svc._source_kind_of = lambda u: "ddlbase"      # avoid the HDEncode coordinator
+    console = {"lines": [
+        "OLD https://challenges.cloudflare.com/turnstile Error: 600010."]}
+
+    driver = MagicMock()
+
+    def _get_log(kind):
+        if kind == "browser":
+            out, console["lines"] = console["lines"], []
+            return [{"message": m} for m in out]
+        return []
+
+    def _get(url):
+        # The navigation itself emits THIS page's Turnstile failure.
+        console["lines"].append(
+            "NEW https://challenges.cloudflare.com/turnstile Error: 600321.")
+
+    driver.get_log.side_effect = _get_log
+    driver.get.side_effect = _get
+    monkeypatch.setattr(svc, "get_driver", lambda **k: driver, raising=False)
+    monkeypatch.setattr(svc, "_browser_error_code",
+                        lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(svc, "_recycle_driver",
+                        lambda *a, **k: None, raising=False)
+
+    got, diag = svc._navigate_with_diagnostic(
+        "https://ddlbase.com/x/", tag="DDL", attempts=1)
+    assert got is driver and diag is None
+    lines = svc._browser_console_lines(driver)
+    assert any("600321" in line for line in lines), (
+        "the current navigation's 600 error was drained away")
+    assert not any("600010" in line for line in lines), (
+        "a previous page's 600 error survived into this navigation")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The consumer: the queue engine, end to end
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,6 +419,24 @@ def _success_outcome():
         "message": "Sent to JDownloader",
         "link_count": 2,
         "source_progress": True,
+        "source_reveal_succeeded": True,
+    }
+
+
+def _reveal_ok_delivery_failed_outcome():
+    """HDEncode served the links; the JDownloader hand-off then failed."""
+    return {
+        "success": False,
+        "method": "",
+        "message": "Links found but the JDownloader hand-off failed.",
+        "link_count": 2,
+        "reason_code": "download_failed",
+        "stage": "download",
+        "retryable": True,
+        "transport_attempted": True,
+        "affected_scope": "item",
+        "source_progress": False,
+        "source_reveal_succeeded": True,
     }
 
 
@@ -552,72 +617,200 @@ def test_a_duplicate_dedup_success_does_not_release_the_hold(tmp_path):
         db.close()
 
 
+def test_a_held_source_holds_a_second_batch_until_a_probe_succeeds(tmp_path):
+    """Round-2 review, finding 1: the hold is SOURCE-scoped, not batch-scoped.
+
+    A second HDEncode batch, parked as an ordinary source pause while the
+    coordinator was blocked, must NOT auto-probe the challenge once its own
+    cooldown expires — and one successful probe releases BOTH batches.
+    """
+    db = DatabaseManager(str(tmp_path / "crossbatch.db"))
+    try:
+        svc, download, batch_a = _rig(db, count=3)
+        svc._execute(svc._claim_due())          # batch A hits Turnstile → held
+        assert _hold(db, batch_a) == "hdencode"
+
+        # Batch B: a SEPARATE HDEncode batch parked as an ordinary throttle
+        # (source_deferred, no hold of its own), cooldown already expired.
+        batch_b = svc.schedule_batch(
+            [{"url": f"https://hdencode.org/b-{i}-2160p/", "title": f"B{i}",
+              "media_type": "movie"} for i in range(2)],
+            interval_minutes=0, mode="immediate",
+            auto_resume_after_cooldown=True)
+        b_uuid = batch_b["batch_uuid"]
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE download_queue_items SET state='waiting_source', "
+                "queue_reason='source_deferred', cooldown_until=?, "
+                "last_reason_code='source_temporarily_blocked' "
+                "WHERE batch_uuid=?", (PAST_S, b_uuid))
+            conn.execute(
+                "UPDATE download_queue_batches SET state='paused_source', "
+                "cooldown_until=? WHERE batch_uuid=?", (PAST_S, b_uuid))
+        assert _hold(db, b_uuid) is None, "batch B records no hold of its own"
+
+        _expire_every_cooldown(db)
+        for _ in range(3):
+            svc._maybe_auto_resume()
+        assert _state_counts(db, b_uuid).get("waiting_source") == 2, (
+            "a second batch auto-probed a source under a verification hold")
+
+        # One successful probe on A releases the source; B becomes eligible.
+        a_trigger = db._query_dicts(
+            "SELECT item_uuid FROM download_queue_items WHERE batch_uuid=? "
+            "AND state='verification_required'",
+            (batch_a,), default=[])[0]["item_uuid"]
+        svc.retry_item(a_trigger)
+        download.download_item.return_value = _success_outcome()
+        svc._execute(svc._claim_due())          # the probe delivers
+        assert _hold(db, batch_a) is None and _hold(db, b_uuid) is None, (
+            "an affirmative probe must clear the hold for EVERY batch of the source")
+
+        _expire_every_cooldown(db)
+        for _ in range(3):
+            svc._maybe_auto_resume()
+        assert _state_counts(db, b_uuid).get("ready") == 2, (
+            "released siblings in the second batch must become eligible")
+    finally:
+        db.close()
+
+
+def test_retry_ready_excludes_verification_held_rows(tmp_path):
+    """Round-2 review, finding 2: the bulk 'Retry all ready' path must not
+    schedule verification-held rows — that would fan the source into the
+    challenge, one transport per batch, while the UI says 'a single probe'."""
+    db = DatabaseManager(str(tmp_path / "retryready.db"))
+    try:
+        svc, download, batch = _rig(db, count=4)
+        svc._execute(svc._claim_due())          # → held
+        result = svc.retry_ready(interval_minutes=0)
+        assert result["scheduled"] == 0, "held rows must not be bulk-scheduled"
+        assert result["held"] >= 1, "the skipped held rows must be reported"
+        assert not _state_counts(db, batch).get("ready"), (
+            "no held row may have been promoted to ready")
+    finally:
+        db.close()
+
+
+def test_a_reveal_success_with_a_failed_delivery_still_releases_the_hold(tmp_path):
+    """Round-2 review, finding 6: the hold owns SOURCE accessibility, not the
+    downstream hand-off. If HDEncode serves the reveal links but JDownloader
+    then fails, the challenge has cleared for our session and the hold releases;
+    the delivery failure is recorded separately as a failed item."""
+    db = DatabaseManager(str(tmp_path / "revealok.db"))
+    try:
+        svc, download, batch = _rig(db, count=3)
+        svc._execute(svc._claim_due())          # → held
+        trigger = db._query_dicts(
+            "SELECT item_uuid FROM download_queue_items WHERE batch_uuid=? "
+            "AND state='verification_required'",
+            (batch,), default=[])[0]["item_uuid"]
+        svc.retry_item(trigger)
+        download.download_item.return_value = _reveal_ok_delivery_failed_outcome()
+        svc._execute(svc._claim_due())          # reveal ok, JDownloader fails
+        assert _hold(db, batch) is None, (
+            "the reveal served links, so the hold must release even though "
+            "delivery failed")
+        assert _state_counts(db, batch).get("failed") == 1, (
+            "the delivery failure is still recorded as a failed item")
+    finally:
+        db.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The migration: the episode that predates the column
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _insert_batch(conn, batch_uuid, *, state, reason, items, source="hdencode",
-                  item_state="waiting_source"):
+def _insert_batch(conn, batch_uuid, *, state, batch_reason, items):
+    """items: list of (source, item_state, queue_reason) triples, in sequence."""
     conn.execute(
         "INSERT INTO download_queue_batches (batch_uuid, mode, "
         " interval_seconds, state, source, total_items, created_at, "
         " updated_at, cooldown_until, last_reason_code, "
         " auto_resume_after_cooldown) "
-        "VALUES (?, 'staggered', 0, ?, ?, ?, ?, ?, ?, ?, 1)",
-        (batch_uuid, state, source, items, PAST_S, PAST_S, PAST_S, reason))
-    for i in range(items):
+        "VALUES (?, 'staggered', 0, ?, 'hdencode', ?, ?, ?, ?, ?, 1)",
+        (batch_uuid, state, len(items), PAST_S, PAST_S, PAST_S, batch_reason))
+    for i, (src, istate, qreason) in enumerate(items):
         conn.execute(
             "INSERT INTO download_queue_items (item_uuid, batch_uuid, "
             " sequence_number, source, canonical_url, title, service_type, "
             " queue_reason, state, cooldown_until, attempt_count, "
             " last_reason_code, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'Rapidgator', 'source_deferred', ?, "
-            " ?, 1, ?, ?, ?)",
-            (f"{batch_uuid}-i{i}", batch_uuid, i, source,
-             f"https://hdencode.org/{batch_uuid}-{i}/", f"T{i}", item_state,
-             PAST_S, reason, PAST_S, PAST_S))
+            "VALUES (?, ?, ?, ?, ?, ?, 'Rapidgator', ?, ?, ?, 1, ?, ?, ?)",
+            (f"{batch_uuid}-i{i}", batch_uuid, i, src,
+             f"https://hdencode.org/{batch_uuid}-{i}/", f"T{i}", qreason, istate,
+             PAST_S, batch_reason, PAST_S, PAST_S))
 
 
-def test_the_migration_holds_only_the_challenge_episode(tmp_path):
+_TRIGGER = ("hdencode", "verification_required", "interactive_challenge")
+_SIBLING = ("hdencode", "waiting_source", "source_deferred")
+
+
+def test_the_migration_holds_only_a_real_challenge_trigger(tmp_path):
+    """Round-2 review, finding 3: the migration must key on a genuine challenge
+    TRIGGER row, not a batch reason code — and must NOT retro-label a
+    reveal_verification_stalled batch (which the runtime classifier defines as
+    NOT-a-challenge) as a human challenge."""
     db = DatabaseManager(str(tmp_path / "migrate.db"))
     try:
         with db.transaction() as conn:
-            _insert_batch(conn, "stalled", state="paused_source",
-                          reason="reveal_verification_stalled", items=2)
             _insert_batch(conn, "challenged", state="paused_source",
-                          reason="interactive_challenge", items=2)
+                          batch_reason="interactive_challenge",
+                          items=[_TRIGGER, _SIBLING])
+            _insert_batch(conn, "stalled", state="paused_source",
+                          batch_reason="reveal_verification_stalled",
+                          items=[_SIBLING, _SIBLING])
             _insert_batch(conn, "throttled", state="paused_source",
-                          reason="source_temporarily_blocked", items=2)
-            _insert_batch(conn, "drained", state="paused_source",
-                          reason="reveal_verification_stalled", items=1,
-                          item_state="completed")
+                          batch_reason="source_temporarily_blocked",
+                          items=[_SIBLING])
             DatabaseManager._mark_existing_challenge_pauses_held(conn)
             holds = {r["batch_uuid"]: r["verification_hold_source"]
                      for r in conn.execute(
                          "SELECT batch_uuid, verification_hold_source "
                          "FROM download_queue_batches")}
-        assert holds["stalled"] == "hdencode", (
-            "the measured episode is recorded as reveal_verification_stalled "
-            "and must come under the hold")
         assert holds["challenged"] == "hdencode"
+        assert holds["stalled"] is None, (
+            "reveal_verification_stalled is NOT Turnstile evidence and must not "
+            "be retro-labelled a human challenge")
         assert holds["throttled"] is None, (
             "an ordinary throttle pause must keep auto-resuming")
-        assert holds["drained"] is None, (
-            "a batch with nothing deferred has nothing to hold")
+    finally:
+        db.close()
+
+
+def test_the_migration_source_is_the_trigger_not_the_first_child(tmp_path):
+    """Round-2 review, finding 3, Problem B: a mixed-source batch must hold the
+    source that produced the challenge, not whichever source is first in
+    sequence."""
+    db = DatabaseManager(str(tmp_path / "migrate_mixed.db"))
+    try:
+        with db.transaction() as conn:
+            _insert_batch(
+                conn, "mixed", state="paused_source",
+                batch_reason="interactive_challenge",
+                items=[("ddlbase", "waiting_source", "source_deferred"),
+                       _TRIGGER])          # HDEncode is the challenge trigger
+            DatabaseManager._mark_existing_challenge_pauses_held(conn)
+            hold = conn.execute(
+                "SELECT verification_hold_source FROM download_queue_batches "
+                "WHERE batch_uuid='mixed'").fetchone()[0]
+        assert hold == "hdencode", (
+            "the held source must be the challenge trigger's (hdencode), not "
+            "the first deferred child's (ddlbase)")
     finally:
         db.close()
 
 
 def test_migrated_rows_are_held_without_touching_item_history(tmp_path):
-    """The chip's warning made concrete: the migration moves the EPISODE (the
-    batch-level hold) and leaves last_reason_code as the true record of what
-    each attempt observed at the time — yet the old cooldowns can no longer
-    reschedule anything."""
+    """The migration moves the EPISODE (the batch-level hold) and leaves
+    last_reason_code as the true record of each attempt — yet the old cooldowns
+    can no longer reschedule anything."""
     db = DatabaseManager(str(tmp_path / "migrate2.db"))
     try:
         with db.transaction() as conn:
             _insert_batch(conn, "ep", state="paused_source",
-                          reason="reveal_verification_stalled", items=3)
+                          batch_reason="interactive_challenge",
+                          items=[_TRIGGER, _SIBLING, _SIBLING])
             DatabaseManager._mark_existing_challenge_pauses_held(conn)
 
         svc = DownloadQueueService({}, db, MagicMock())
@@ -629,8 +822,9 @@ def test_migrated_rows_are_held_without_touching_item_history(tmp_path):
         rows = db._query_dicts(
             "SELECT state, last_reason_code FROM download_queue_items "
             "WHERE batch_uuid='ep'", default=[])
-        assert all(r["state"] == "waiting_source" for r in rows), rows
-        assert all(r["last_reason_code"] == "reveal_verification_stalled"
+        assert all(r["state"] in ("waiting_source", "verification_required")
+                   for r in rows), rows
+        assert all(r["last_reason_code"] == "interactive_challenge"
                    for r in rows), "history must not be rewritten"
     finally:
         db.close()
@@ -641,6 +835,8 @@ def test_migrated_rows_are_held_without_touching_item_history(tmp_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _joined_row(**over):
+    # source_held is the precomputed SOURCE-scoped flag the SQL supplies (1 =
+    # some batch holds this row's source). Defaults to held for these rows.
     row = {"item_uuid": "i", "batch_uuid": "b", "title": "T",
            "state": "verification_required", "cooldown_until": PAST_S,
            "queue_reason": "interactive_challenge", "last_reason_code": "",
@@ -648,7 +844,7 @@ def _joined_row(**over):
            "batch_state": "paused_source", "batch_cooldown": PAST_S,
            "auto_resume_after_cooldown": 1, "auto_resume_used": 0,
            "source_delivery_count": 0, "auto_resume_progress_mark": 0,
-           "verification_hold_source": "hdencode"}
+           "source_held": 1}
     row.update(over)
     return row
 
@@ -671,9 +867,33 @@ def test_the_tools_classify_a_held_sibling_as_held():
     assert _classify(row) == VERIFICATION_HOLD
 
 
-def test_the_hold_is_source_matched_not_batch_global():
-    """A DDLBase row in a batch whose hold names hdencode is NOT held — the
-    same source-ownership rule the budget refund follows."""
-    row = _joined_row(state="waiting_source", queue_reason="source_deferred",
-                      item_source="ddlbase")
-    assert _classify(row) == AUTHORISED
+def test_the_hold_is_source_matched_not_batch_global(tmp_path):
+    """Round-2 review, finding 1: the operator tools' SQL holds a row only when
+    ITS source is held. A DDLBase sibling in a batch alongside a held HDEncode
+    trigger must NOT be held — exercised through the REAL JOINED_DEFERRED_SQL
+    source_held subquery, not a hand-built flag."""
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "scripts"))
+    from queue_recovery_state import JOINED_DEFERRED_SQL, facts_from_row
+    from backend.queue_recovery_policy import decide
+
+    db = DatabaseManager(str(tmp_path / "toolsql.db"))
+    try:
+        with db.transaction() as conn:
+            _insert_batch(
+                conn, "held", state="paused_source",
+                batch_reason="interactive_challenge",
+                items=[_TRIGGER,
+                       ("ddlbase", "waiting_source", "source_deferred")])
+            DatabaseManager._mark_existing_challenge_pauses_held(conn)
+        verdict = {}
+        for r in db._query_dicts(JOINED_DEFERRED_SQL, default=[]):
+            item, shared = facts_from_row(r)
+            verdict[r["item_source"]] = decide(item, shared, NOW)
+        assert verdict["hdencode"] == VERIFICATION_HOLD
+        assert verdict["ddlbase"] == AUTHORISED, (
+            "a DDLBase sibling must not be held by an HDEncode challenge")
+    finally:
+        db.close()

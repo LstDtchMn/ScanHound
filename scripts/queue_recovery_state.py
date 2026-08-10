@@ -57,6 +57,11 @@ LABELS = {
 }
 
 #: The SQL both tools use, so they cannot even select different populations.
+#:
+#: source_held is SOURCE-SCOPED (round-2 review, finding 1): a row is held if
+#: ANY batch holds its source, not only if the row's own batch recorded it —
+#: the same rule production applies in _resume_batch. Reading only the row's own
+#: batch column would report a transitively-held sibling batch as recoverable.
 JOINED_DEFERRED_SQL = """
     SELECT i.item_uuid, i.batch_uuid, i.title, i.state, i.cooldown_until,
            i.queue_reason, COALESCE(i.last_reason_code, '') AS last_reason_code,
@@ -67,7 +72,8 @@ JOINED_DEFERRED_SQL = """
            b.auto_resume_used            AS auto_resume_used,
            b.source_delivery_count       AS source_delivery_count,
            b.auto_resume_progress_mark   AS auto_resume_progress_mark,
-           b.verification_hold_source    AS verification_hold_source
+           (SELECT COUNT(*) FROM download_queue_batches h
+            WHERE h.verification_hold_source = i.source) AS source_held
     FROM download_queue_items i
     LEFT JOIN download_queue_batches b ON b.batch_uuid = i.batch_uuid
     WHERE i.state IN ('waiting_source', 'verification_required')
@@ -106,10 +112,9 @@ def facts_from_row(row):
         queue_reason=str(row["queue_reason"] or ""),
         last_reason_code=str(row["last_reason_code"] or ""),
     )
-    # The hold applies to this row only when the batch's held source IS this
-    # row's source — resolved here, exactly as _resume_batch resolves it, so
-    # the tools and production judge the same fact the same way.
-    hold_source = str(row["verification_hold_source"] or "")
+    # The hold is source-scoped: this row is held if any batch holds its
+    # source (source_held from the SQL), exactly as _resume_batch resolves it,
+    # so the tools and production judge the same fact the same way.
     shared = SharedFacts(
         cooldown_until=_dt(row["batch_cooldown"]),          # <- the batch's, not the item's
         auto_resume_enabled=bool(row["auto_resume_after_cooldown"]),
@@ -117,9 +122,7 @@ def facts_from_row(row):
         source_delivery_count=int(row["source_delivery_count"] or 0),
         progress_mark=int(row["auto_resume_progress_mark"] or 0),
         max_attempts=load_max_attempts(),
-        verification_hold=bool(
-            hold_source and hold_source == str(row["item_source"] or "")
-        ),
+        verification_hold=bool(row["source_held"]),
     )
     return item, shared
 

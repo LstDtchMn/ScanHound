@@ -102,7 +102,16 @@
     busy = 'all';
     try {
       const result = await api.retryReadyDownloads(intervalMinutes);
-      addToast('Retries scheduled', `${result.scheduled} item(s), ${intervalMinutes}-minute spacing`);
+      const held = (result as { held?: number }).held ?? 0;
+      const base = `${result.scheduled} item(s), ${intervalMinutes}-minute spacing`;
+      // Verification-held items are skipped by the backend on purpose: a bulk
+      // retry cannot probe a challenge for you. They need 'Retry now' one at a time.
+      addToast(
+        'Retries scheduled',
+        held > 0
+          ? `${base}. ${held} held for manual attention — use 'Retry now' one at a time.`
+          : base
+      );
       await load();
     } catch (e) {
       addToast('Retry unavailable', e instanceof Error ? e.message : 'The source is still paused.', 'warning');

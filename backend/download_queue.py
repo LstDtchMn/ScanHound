@@ -913,22 +913,7 @@ class DownloadQueueService:
             # A pre-scrape dedup returns success without contacting the source, so
             # counting completions would refund retry budget the source never
             # earned. See is_source_delivery().
-            if self.is_source_delivery(outcome):
-                # THE ONLY RELEASE OF A VERIFICATION HOLD. A real delivery from
-                # the held source is affirmative ScanHound-side proof that the
-                # challenge no longer blocks OUR browser session — the human
-                # passing it in a different browser proves nothing about ours,
-                # which is why nothing else (no timer, no reclassification, no
-                # config change) clears this column. Guarded by the source
-                # match in SQL: a DDLBase item completing must not release an
-                # HDEncode hold. The now-eligible siblings are then promoted
-                # with spacing by the ordinary auto-resume pass.
-                conn.execute(
-                    "UPDATE download_queue_batches "
-                    "SET verification_hold_source = NULL "
-                    "WHERE batch_uuid = ? AND verification_hold_source = ?",
-                    (item["batch_uuid"], str(item.get("source") or "")),
-                )
+            self._release_verification_hold(conn, item, outcome)
             # SOURCE OWNERSHIP, added 2026-08-07 on peer review. schedule_batch
             # permits mixed-source batches (it labels them "mixed"), and
             # _claim_due does not require the parent batch to be scheduled, so a
@@ -950,6 +935,31 @@ class DownloadQueueService:
         )
         self._emit_batch_progress(item["batch_uuid"])
         return True
+
+    def _release_verification_hold(self, conn, item: dict, outcome: dict) -> None:
+        """Clear the verification hold for a source that just served its reveal.
+
+        THE ONLY RELEASE OF A VERIFICATION HOLD. Keyed on
+        `source_reveal_succeeded` (round-2 review, finding 6): the hold owns
+        SOURCE accessibility, not downstream delivery. Once HDEncode serves the
+        file-host links, its verification has demonstrably cleared for OUR
+        session — a human passing it in a different browser proves nothing, and
+        a later JDownloader failure is an item/delivery problem recorded
+        separately. So this fires from BOTH _complete (delivery also succeeded)
+        and _fail (reveal succeeded, delivery did not). A pre-scrape dedup and a
+        pasted direct link both leave the flag False, so neither can release it.
+
+        SOURCE-WIDE and source-matched in SQL: one affirmative reveal clears the
+        hold for every batch of that source, and a DDLBase reveal never releases
+        an HDEncode hold.
+        """
+        if outcome.get("source_reveal_succeeded"):
+            conn.execute(
+                "UPDATE download_queue_batches "
+                "SET verification_hold_source = NULL "
+                "WHERE verification_hold_source = ?",
+                (str(item.get("source") or ""),),
+            )
 
     def _fail(self, item: dict, outcome: dict) -> bool:
         now = _iso()
@@ -987,6 +997,9 @@ class DownloadQueueService:
                     item.get("item_uuid"),
                 )
                 return False
+            # A JDownloader hand-off can fail AFTER the reveal served links; that
+            # reveal success still clears the source's verification hold.
+            self._release_verification_hold(conn, item, outcome)
             self._refresh_batch_locked(conn, item["batch_uuid"], now)
         self._emit(
             "download:queue_updated",
@@ -1572,13 +1585,36 @@ class DownloadQueueService:
             (self._auto_resume_max_attempts(),),
             default=[],
         )
+        # Sources currently under a verification hold, read once. A batch is
+        # held if it recorded the hold itself OR (source-scoped, round-2 review)
+        # any of its deferred items belongs to a held source — the transitively
+        # held sibling batch, which must not be re-diagnosed as stuck.
+        held_sources = {
+            str(r.get("verification_hold_source"))
+            for r in self.db._query_dicts(
+                "SELECT DISTINCT verification_hold_source "
+                "FROM download_queue_batches "
+                "WHERE verification_hold_source IS NOT NULL", default=[])
+        }
         for batch in stuck:
             if str(batch.get("batch_uuid")) in resumable:
                 continue
             until = _parse(batch.get("cooldown_until"))
             if until is not None and until > now:
                 continue          # still deliberately quiet; nothing to explain yet
-            if str(batch.get("verification_hold_source") or ""):
+            hold_source = str(batch.get("verification_hold_source") or "")
+            if not hold_source and held_sources:
+                match = self.db._query(
+                    "SELECT source FROM download_queue_items "
+                    "WHERE batch_uuid = ? AND state IN "
+                    "('verification_required', 'waiting_source') "
+                    "AND source IN (%s) LIMIT 1" % ",".join(
+                        "?" * len(held_sources)),
+                    (str(batch.get("batch_uuid")), *sorted(held_sources)),
+                    one=True, default=None)
+                if match is not None:
+                    hold_source = str(match["source"])
+            if hold_source:
                 # DELIBERATELY held, not stuck. This is the steady state of a
                 # verification hold — the cooldowns are long expired and nothing
                 # automatic will ever promote it, BY DESIGN — so it must not be
@@ -1594,8 +1630,7 @@ class DownloadQueueService:
                         "will not release it. Use 'Retry now' on ONE item as a "
                         "probe; the hold clears only when a probe actually "
                         "delivers.",
-                        batch.get("batch_uuid"),
-                        batch.get("verification_hold_source"),
+                        batch.get("batch_uuid"), hold_source,
                     )
                 continue
             self._log_unresumable_batch(batch)
@@ -1652,15 +1687,40 @@ class DownloadQueueService:
         with self.db.transaction() as conn:
             if not conn:
                 raise DownloadQueueError("The database is unavailable.")
-            rows = conn.execute(
+            # EXCLUDE verification-held rows (round-2 review, finding 2). This
+            # bulk path is an operator convenience, but the UI describes a retry
+            # as a single probe; scheduling every held row at once would fan the
+            # source out into the failing challenge — one transport attempt per
+            # batch — while the operator believes they sent one probe. A held
+            # source must be probed one item at a time via retry_item. Held rows
+            # are counted and returned so the caller/UI can say what was skipped.
+            held = int((conn.execute(
                 """
-                SELECT item_uuid, batch_uuid
-                FROM download_queue_items
-                WHERE source = 'hdencode'
-                  AND state IN (
+                SELECT COUNT(*) AS n
+                FROM download_queue_items i
+                WHERE i.source = 'hdencode'
+                  AND i.state IN (
                       'verification_required', 'waiting_source', 'failed'
                   )
-                ORDER BY created_at, sequence_number
+                  AND EXISTS (
+                      SELECT 1 FROM download_queue_batches h
+                      WHERE h.verification_hold_source = i.source
+                  )
+                """
+            ).fetchone()["n"]) or 0)
+            rows = conn.execute(
+                """
+                SELECT i.item_uuid AS item_uuid, i.batch_uuid AS batch_uuid
+                FROM download_queue_items i
+                WHERE i.source = 'hdencode'
+                  AND i.state IN (
+                      'verification_required', 'waiting_source', 'failed'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM download_queue_batches h
+                      WHERE h.verification_hold_source = i.source
+                  )
+                ORDER BY i.created_at, i.sequence_number
                 """
             ).fetchall()
             cursor = now
@@ -1697,7 +1757,8 @@ class DownloadQueueService:
                 )
                 self._refresh_batch_locked(conn, batch_uuid, _iso(now))
         self._wake.set()
-        return {"scheduled": len(rows), "interval_minutes": interval}
+        return {"scheduled": len(rows), "interval_minutes": interval,
+                "held": held}
 
     def _resume_batch(
         self,
@@ -1740,7 +1801,20 @@ class DownloadQueueService:
                 ).fetchone()
                 if brow is None:
                     raise DownloadQueueError("The batch no longer exists.")
-                hold_source = str(brow["verification_hold_source"] or "")
+                # SOURCE-SCOPED HOLD (round-2 review, finding 1). The challenge
+                # is source-wide (affected_scope="source", and the coordinator
+                # sets a source-level cooldown), so the hold must be too: a row
+                # is held if ANY batch holds its source, not only if THIS batch
+                # recorded it. Otherwise a second HDEncode batch — parked as an
+                # ordinary source_deferred pause while the coordinator was
+                # blocked — would auto-probe the challenge once the shared
+                # cooldown expired. The candidates below are already filtered to
+                # blocked_source, so this one verdict governs exactly them.
+                held = conn.execute(
+                    "SELECT 1 FROM download_queue_batches "
+                    "WHERE verification_hold_source = ? LIMIT 1",
+                    (blocked_source,),
+                ).fetchone()
                 shared = SharedFacts(
                     cooldown_until=_parse(brow["cooldown_until"]),
                     auto_resume_enabled=bool(brow["auto_resume_after_cooldown"]),
@@ -1748,13 +1822,7 @@ class DownloadQueueService:
                     source_delivery_count=int(brow["source_delivery_count"] or 0),
                     progress_mark=int(brow["auto_resume_progress_mark"] or 0),
                     max_attempts=parse_max_attempts(self.config),
-                    # The source match is resolved HERE, where both spellings
-                    # come from the same database, and the candidates below are
-                    # already filtered to blocked_source — so the hold verdict
-                    # and the rows it governs cannot diverge.
-                    verification_hold=bool(
-                        hold_source and hold_source == str(blocked_source)
-                    ),
+                    verification_hold=held is not None,
                 )
                 candidates = conn.execute(
                     """

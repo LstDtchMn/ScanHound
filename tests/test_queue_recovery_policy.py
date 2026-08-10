@@ -307,7 +307,7 @@ def _joined(own, batch_cd, **over):
            "batch_state": "paused_source", "batch_cooldown": batch_cd,
            "auto_resume_after_cooldown": 1, "auto_resume_used": 0,
            "source_delivery_count": 0, "auto_resume_progress_mark": 0,
-           "verification_hold_source": None}
+           "source_held": 0}
     row.update(over)
     return row
 
