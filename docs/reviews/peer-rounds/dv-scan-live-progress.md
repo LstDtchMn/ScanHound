@@ -215,3 +215,36 @@ semantics, which the review also identified as a separate task. Its second half 
 import still exits 0 — is recorded in the handoff and not fixed here.
 
 Ready for round 2 at head `8434627`.
+
+---
+
+# ROUNDS 2 AND 3 — APPROVED
+
+**Round 2** (head `e074840`): **APPROVE.** All six round-1 findings verified fixed, zero new
+merge blockers. It confirmed the layering the exactly-once behaviour depends on — persistent
+`FileStream` → persistent UTF-8 `StreamReader` (byte→character boundaries, decoder state
+retained across polls) → `$script:DetPending` (character→line boundaries) → `Write-DetectorLine`
+— and singled out the fallback gate on `DetLineCount == 0` as the thing preventing a re-read
+from duplicating already-streamed lines. It also endorsed keeping the two-line-per-file model:
+collapsing start and completion would reintroduce the silence gap during a long single file.
+
+**Round 3** (head `03194ad`): **APPROVE / MERGE.** Reviewed the elapsed-hour fix and case 9,
+confirming `[math]::Floor(TotalHours)` satisfies both requirements at once — truncate the
+fractional hour, and keep counting past 24 h rather than wrapping. It rated case 9 a genuine
+regression test rather than a reimplementation of the production expression, because it extracts
+`Format-Elapsed` from the shipped wrapper rather than restating the logic.
+
+Round 3 also treated the 03:00 production run as the material evidence: 127 log lines, per-file
+progress observable during real long media reads, heartbeat DB observations advancing 590 → 622,
+and — its words — the readable heartbeat is what exposed the elapsed-format defect that was then
+fixed. That is the branch's own thesis demonstrating itself: the log became inspectable, and the
+first thing it surfaced was a bug in the code that made it inspectable.
+
+**Live postscript.** The defect reproduced again at 07:30 on the still-running 03:00 scan
+(`05:30:24 elapsed` for a 4 h 30 m run, TotalHours 4.507 rounding to 5), exactly at the
+predicted minutes ≥ 30 boundary. The running process holds the 03:00 copy of the script, so the
+fix takes effect on the next occurrence, not this one.
+
+**Status: approved for merge at `03194ad` for the live-progress scope. Merge itself is Jesse's
+call and has not been performed.** Deferred by agreement across all three rounds: `dv-import`
+cadence and failure propagation.

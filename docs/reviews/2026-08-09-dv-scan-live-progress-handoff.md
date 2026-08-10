@@ -217,7 +217,27 @@ review's "2 unknowns with NULL sigs". Those two were resolved to `fel` by anothe
 
 ## 7. What remains
 
-**Blocking:**
+**STATUS: peer review COMPLETE — approved for merge at `03194ad`. The merge itself is Jesse's
+call and has NOT been performed.** Round 2 (`e074840`) APPROVE, round 3 (`03194ad`)
+APPROVE / MERGE, zero remaining blockers. Response table and both verdicts are in
+`docs/reviews/peer-rounds/dv-scan-live-progress.md`.
+
+**LIVE-VERIFIED on the 2026-08-10 03:00 run.** 127 log lines where the old wrapper wrote six and
+then nothing: `[1] scanning Rocky Balboa (2006).mkv (43.3 GB)` four seconds in, per-file results
+at 93 / 46 / 75 / 111 / 149 MB/s, heartbeats every five minutes with `dv_host.db` climbing
+590 → 622, 32 files in 4 h 20 m and zero `rate unavailable` (the two formerly-wedged titles now
+carry valid signatures and are skipped). `MultipleInstances=IgnoreNew` also confirmed
+empirically: the 07:00 occurrence returned LastTaskResult **2147946720 = 0x80070420**, "an
+instance is already running" — that code means SKIPPED, not failed.
+
+**One bug of mine that the live log found, and nothing else would have.** The heartbeat's
+elapsed hours used `[int]$span.TotalHours`; PowerShell's `[int]` cast ROUNDS rather than
+truncating, so 3 h 35 m rendered as `04:35` — an hour ahead of its own minute field, wrong for
+every span with minutes ≥ 30. Fixed in `03194ad` with `[math]::Floor` and a direct regression
+test (case 9) that extracts the shipped `Format-Elapsed` rather than restating it. No synthetic
+test would have caught it without waiting hours.
+
+**Historical (round 1):**
 - **ChatGPT round 1 came back REQUEST CHANGES and all six findings are fixed** (`8434627`).
   Response table in `docs/reviews/peer-rounds/dv-scan-live-progress.md`. **Round 2 not yet run.**
   Two were merge blockers, and both were the same error this branch exists to prevent — a proxy
