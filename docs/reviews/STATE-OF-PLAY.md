@@ -121,6 +121,35 @@ Independently checked here: **711 staged rows ↔ 711 snapshot keys, exact 1:1 w
 nothing. These files existed only in a temp directory until they were committed; without
 `label_snapshot.json` the write would not have been reversible.
 
+## 4c. Do NOT merge the consolidation before round 4 answers
+
+Round 4 is an **open question, not a verdict**. It asks whether close/reopen is the right layer
+for the WAL problem, or whether `dv_host.db` should leave WAL entirely (a ~6 rows/hour workload),
+or whether the detector should POST its rows in the request body so the container never reads the
+file at all. **Merging now would commit `main` to close/reopen before the reviewer has answered**,
+and two of those three answers change the shape.
+
+Nothing is lost by waiting: everything is pushed, the evidence is committed inside the
+consolidation, and `consolidation → main` shows **0 conflicts** — one merge lands everything when
+the answer arrives.
+
+## 4d. A THIRD failing title is in the retry loop right now
+
+Verified against `dv_host.db` on 2026-08-10: **649 rows, exactly one NULL-signature row.**
+
+```
+unknown   Twisters (2024).mp4   ~23.8 GB
+```
+
+A NULL signature means it is **re-scanned on every run** — the starvation pattern, live, until the
+consolidation deploys.
+
+**Do not assume it is a third instance of the Jurassic / Death Wish wedge.** It is **`.mp4`, not
+`.mkv`, and about a third their size**, so it may be a different failure mode entirely. That makes
+it a good first canary subject: the new logging distinguishes `stalled` from `timeout`, and the
+watchdog should cap it near 180 s instead of 1800 s. **If it still burns 1800 s, the watchdog does
+not cover this mode and that is a finding.**
+
 ## 5. Detail lives here
 
 - `docs/reviews/2026-08-10-scanhound-consolidation-map.md` — every current branch, attributed to
