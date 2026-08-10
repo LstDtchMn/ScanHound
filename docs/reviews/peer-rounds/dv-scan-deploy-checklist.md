@@ -30,8 +30,9 @@ gh pr create --base main --head agent/dv-scan-hang-and-starvation --fill
 
 ## 3. Deploy the container
 
-Only the container half needs deploying (`backend/rename/dv_detect.py`,
-`process_control.py`). Run in the BACKGROUND — this build has exceeded 10
+The container half is `backend/rename/dv_detect.py`, `process_control.py` AND
+`backend/api/routes/rename.py` -- that last one carries the additive-only
+label-sync default, which everything in section 8 depends on. Run in the BACKGROUND — this build has exceeded 10
 minutes before:
 
 ```bash
@@ -89,6 +90,78 @@ A wedged file should now produce `error=stalled` after ~180 s, not a 1800 s
 ```
 [n/m] -> unknown (stalled) in 300s ...
 ```
+
+---
+
+## 8. THEN the bounded-FEL write — in this order, and not before
+
+The order is a real dependency, not a preference. **The safe-by-default label
+sync exists only after step 3.** Until this branch is deployed, the running
+container still has `/dv-sync-labels` defaulting to a destructive full
+reconciliation, so the sync step must not be reached on the old code.
+
+Writing rows changes no labels by itself, and importing them changes no labels
+by itself — only the sync does. That is what makes this ordering safe rather
+than merely tidy.
+
+### 8a. Confirm the deployed code actually has the safe default
+
+Not "we merged it" — check the running container:
+
+```bash
+docker exec scanhound python -c "from backend.api.routes.rename import DvSyncRequest; print('additive_only default =', DvSyncRequest().additive_only)"
+```
+
+Must print `True`. If it prints `False`, the deploy did not take and **stop
+here** — everything below assumes it.
+
+### 8b. Re-run all four gates on the FINAL frozen set
+
+The sign-off covers the gate *design* and the 694-positive population, not
+whatever the completed probe produces. Re-run immediately before writing:
+
+```bash
+python scripts/stage_fel_write.py
+```
+
+Exit 0 is the gate. It exits 1 on any unmatched row lacking a recorded reason —
+the invariant is **zero unexplained mismatches**, not a coverage percentage.
+Check the printed accounting reconciles: rows intended for Plex effect ==
+rollback snapshot population.
+
+### 8c. Write, import, and dry-run BEFORE applying
+
+```bash
+# 1. write the staged rows into data/dv_host.db   (rows only; no labels move)
+# 2. import them into the container
+curl -X POST http://localhost:9721/rename/dv-import
+# 3. DRY RUN the label sync and read the summary
+curl -X POST http://localhost:9721/rename/dv-sync-labels -H 'Content-Type: application/json' -d '{"dry_run": true}'
+```
+
+The dry-run response is the authoritative proof of the live path. Expect
+roughly `added ≈ the staged count`, and **`removed: 0`**. Any nonzero
+`removed` is a stop condition — investigate before applying, because the whole
+premise of the gate work is that this batch is pure additions.
+
+### 8d. Apply
+
+Only once the dry run reads as expected. Re-run the same call with
+`{"dry_run": false}`.
+
+### 8e. Post-write reconciliation (the completion criterion)
+
+Keep `label_snapshot.json` until this passes. Compare expected additions
+against actual Plex labels and require:
+
+```
+unexpected removals            = 0
+unexpected managed-label changes = 0
+unexplained missing additions  = 0
+```
+
+The explained no-Plex-target rows must remain non-targets, not be counted as
+failed label writes.
 
 ---
 
