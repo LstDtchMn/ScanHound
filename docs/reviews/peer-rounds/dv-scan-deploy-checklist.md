@@ -1,9 +1,12 @@
 # DV scan fix — deploy checklist (Jesse runs this; nothing here has been run)
 
-Branch `agent/dv-scan-hang-and-starvation`, head `1c2a64c`, base `main` `6813260`.
+Branch `agent/dv-scan-hang-and-starvation`, base `main` `6813260`. Re-check the
+head SHA with `git rev-parse HEAD` rather than trusting a number written here.
 
-Steps are ordered because step 1 is what stops CI failing on three unrelated
-tests, and step 5 is the only one that proves the whole point of the change.
+The order is load-bearing throughout. Step 1 stops CI failing on three
+unrelated tests; step 5 is the only step that proves the defect is actually
+fixed; and section 8 must not begin before step 3, because the safe label-sync
+default does not exist until the container is rebuilt.
 
 ---
 
@@ -185,7 +188,13 @@ Everything is additive and reversible.
 - **`--mode steady` is not wired into the scheduled task.** The task still runs
   one 4-hourly job doing both backfill and steady-state. Splitting it is a task
   definition change and needs your call.
-- **Coverage.** The detector is configured for four roots holding 730 files,
-  while ~3,370 distinct 4K movie filenames are known to the seed and only 460
-  have ever had a real detection. That is a scope decision, not a bug in this
-  change.
+- **Coverage.** The detector is configured for four roots holding 730 files.
+  Measured 2026-08-10 against the LOCAL 4K drives on the scanning host
+  (`C:K Drives\...`, junctions to A:/E:/G:/I:/J:/Q:/R:/U:): **2,827 distinct
+  movies >= 15 GB, of which only 87 had ever been DV-scanned**. Those drives are
+  almost entirely disjoint from the configured roots, and Plex addresses them by
+  the junction path. Widening the config to cover them is a scope decision, not
+  a bug in this change.
+- **Already closed, so do not re-litigate:** the 197 files in the plain `4K`
+  folders beside the scanned `4K DV` folders are genuinely non-DV (12-file
+  random sample, 0 with any RPU), and `4K HDR Colombo` is 11,547 TV files.
