@@ -102,6 +102,34 @@ now a pass that depended on collection order.
 4. **The `PT6H` limit may not be enforced** — the 03:00 run was still active at 7h23m. Not
    investigated; flagged because your canary plan assumes runs end at six hours.
 
+## A cross-branch consequence of blocker 3, raised by the authoring session
+
+Merged at `f17e0b0` from `agent/dv-gate-evidence-for-consolidation` (docs + one script, no
+production code).
+
+Session `46af8201` verified all four of my resolutions against its own code before agreeing, and
+**corroborated blocker 3 independently**: it had traced `reconcile_movie` and confirmed
+`may_remove = authoritative or not additive_only`, with `is_authoritative('mel')` True. So an
+ambiguous parse resolving to MEL really could have **replaced** a managed Plex badge. That is
+confirmation from the code's author, not deference.
+
+It then raised a consequence I had not considered, and it is the sharper point:
+
+> Its **716 staged FEL positives were produced by the OLD `_classify`.** `probe_fel_bounded()`
+> returns `_parse_info(...) == LAYER_FEL`, so the staged set is a *product of that parser*, and
+> the gate evidence signed off earlier (711 targets, 0 replacements, 0 removals) rests on it.
+
+The new rule is strictly narrower — new-FEL ⊆ old-FEL — so no old negative can flip positive, but
+some of the 716 could **stop** being FEL, and those would have become wrong Plex badges.
+
+**Their framing of it is the part worth keeping:** gate criterion 10 ("nothing changes between
+snapshot and execution") is normally read as the *data* changing. Here the thing that changed is
+the **parser that produced the data**.
+
+**Consequence for the canary:** if the consolidation is deployed before the 711-target write, the
+staged artifact must be **re-derived under the deployed parser, not reused**. Their
+re-verification through the corrected parser stood at 291/716 with **0 disagreements** at handoff.
+
 ## Suites
 
 ```
