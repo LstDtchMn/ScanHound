@@ -75,6 +75,33 @@ been frozen at 466 rows since 2026-07-26 while the host store kept growing.
    `docs/reviews/peer-rounds/turnstile-fold-instructions.md`. One branch author offered to peer
    review the result rather than author it.
 
+## 4b. The 711-target FEL write is the local-drive WIDENING, not the canary
+
+Verified on the committed evidence: all 711 staged rows have `source_path` on **local drives**
+(`G:` `U:` `I:` `R:` `E:` `A:` `Q:` `J:`) — **none** are from the `Y:`/Magellan roots the
+scheduled scan actually covers. So the write and the canary touch different libraries, and the
+write is effectively the coverage expansion.
+
+ChatGPT's canary instruction was to keep the existing roots and **not** combine detector
+consolidation with the local-drive expansion. That separation is therefore not merely advisable —
+these are two distinct operations on two distinct sets.
+
+**The evidence is committed and the write is reversible**, which was a hard condition of the
+sign-off. On `agent/dv-detector-consolidation` under
+`docs/reviews/peer-rounds/dv-evidence-2026-08-10/`:
+
+| file | what it is |
+|---|---|
+| `label_snapshot.json` | **Gate 4's rollback pre-image**, 711 entries |
+| `staged_fel_apply.jsonl` | the 711 rows to write (a pretty-printed JSON **array**, not line-delimited) |
+| `dv_host_rows_before.json` | rollback for the two rows already written live |
+| `reverify_716.jsonl` | the 716/716 revalidation the sign-off rests on |
+
+Independently checked here: **711 staged rows ↔ 711 snapshot keys, exact 1:1 with no extras**, and
+**0 targets already carry a managed label** — so the write is purely additive and overwrites
+nothing. These files existed only in a temp directory until they were committed; without
+`label_snapshot.json` the write would not have been reversible.
+
 ## 5. Detail lives here
 
 - `docs/reviews/2026-08-10-scanhound-consolidation-map.md` — every current branch, attributed to
