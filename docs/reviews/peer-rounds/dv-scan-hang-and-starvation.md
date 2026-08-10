@@ -265,7 +265,7 @@ rows carrying a NULL signature: 2 -> 0
 ```
 
 Verified through `dv_host_scan.sig_is_current` itself, not a re-derivation of the
-rule. Prior values saved to `scratchpad/dv_host_rows_before.json`; reverting is
+rule. Prior values saved to `docs/reviews/peer-rounds/dv-evidence-2026-08-10/dv_host_rows_before.json`; reverting is
 setting `dv_layer='unknown'` and both signature columns back to NULL.
 
 ## 8. Applied a second time: the bounded sweep
@@ -280,7 +280,7 @@ mean 5.4 s/file      4,555 GB covered      ~10.6 h of full passes avoided
 ```
 
 45% FEL, against the 37% the whole-library figures predicted. Every write is
-recorded in `scratchpad/sweep_results.jsonl`.
+recorded in `docs/reviews/peer-rounds/dv-evidence-2026-08-10/sweep_results.jsonl`.
 
 Host DB over the session: **494 → 568 rows, NULL signatures 2 → 0, FEL 182 →
 253.** Root 4's backlog went 236 → 162 without a single deploy.

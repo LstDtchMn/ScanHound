@@ -117,7 +117,7 @@ titles where DV FEL would REPLACE a different managed label : 0
 Every affected title is currently **unlabelled**, so your "removal path 1"
 (authoritative replacement of a stale `DV MEL`) cannot fire on this batch. The
 operation is **689 pure additions, 0 replacements, 0 removals** — measured, not
-argued. Snapshot kept in `scratchpad/label_snapshot.json` with ratingKey,
+argued. Snapshot kept in `docs/reviews/peer-rounds/dv-evidence-2026-08-10/label_snapshot.json` with ratingKey,
 title and current label state.
 
 ---
