@@ -31,7 +31,12 @@
 param(
     [string]$RepoRoot = 'X:\Docker Apps\ScanHound',
     [string]$LogDir   = 'X:\Docker Apps\ScanHound\data\dv-scan-logs',
-    [int]$KeepLogs    = 30
+    [int]$KeepLogs    = 30,
+    # How often to log a "still running" line while the detector is silent. The
+    # detector can legitimately say nothing for ~20 minutes (one 90 GB file at
+    # the measured 79 MB/s), so streaming alone still leaves long gaps; this is
+    # what separates "working" from "hung" in the log. Test fixtures set it low.
+    [double]$HeartbeatMinutes = 5
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,6 +47,86 @@ function Write-Log {
     $line = "{0} {1} {2}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Message
     Write-Output $line
     if ($script:LogFile) { Add-Content -LiteralPath $script:LogFile -Value $line -Encoding utf8 }
+}
+
+# --- live tail of the detector's captured output ----------------------------
+#
+# State is script-scoped because Read-DetectorTail is called repeatedly from the
+# poll loop and has to remember where it left off.
+$script:DetReader    = $null
+$script:DetPending   = ''
+$script:DetLineCount = 0
+
+function Write-DetectorLine {
+    # Detector lines carry python's own timestamp, so they are indented rather
+    # than re-stamped -- and written as utf8 like every other line this script
+    # emits, so the log has ONE encoding throughout.
+    param([string]$Line)
+    $script:DetLineCount++
+    Write-Output $Line
+    if ($script:LogFile) {
+        Add-Content -LiteralPath $script:LogFile -Value "    $Line" -Encoding utf8
+    }
+}
+
+function Read-DetectorTail {
+    # Emit every COMPLETE line appended to the capture file since the last call.
+    #
+    # COMPLETE is the load-bearing word. A poll can land in the middle of a
+    # write, and emitting a half-written line would split one detector line into
+    # two -- breaking "every line appears exactly once" just as surely as
+    # dropping one would. So a partial tail is held in $script:DetPending until
+    # its newline arrives. -Final flushes whatever is left once the process has
+    # exited, which is how an unterminated last line still reaches the log.
+    param([Parameter(Mandatory = $true)][string]$Path, [switch]$Final)
+
+    if ($null -eq $script:DetReader) {
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        try {
+            # FileShare::ReadWrite is required -- cmd still holds this file open
+            # for writing. Verified 2026-08-09 that cmd's `>` permits a
+            # concurrent reader; without that share flag the open throws.
+            $fs = New-Object System.IO.FileStream(
+                    $Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+                    ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+            # Encoding::Default is the ANSI code page -- what Get-Content used
+            # here before, and what python writes to a redirected stream under
+            # this locale. Changing it would be a silent regression, not a fix.
+            $script:DetReader = New-Object System.IO.StreamReader(
+                    $fs, [System.Text.Encoding]::Default, $true)
+        } catch {
+            return  # not readable yet; the next poll tries again
+        }
+    }
+
+    try {
+        $chunk = $script:DetReader.ReadToEnd()
+    } catch {
+        return
+    }
+    if ($chunk) { $script:DetPending += $chunk }
+
+    $nl = $script:DetPending.LastIndexOf("`n")
+    if ($nl -ge 0) {
+        $complete          = $script:DetPending.Substring(0, $nl)
+        $script:DetPending = $script:DetPending.Substring($nl + 1)
+        # Split on "`n" and trim the CR, rather than splitting on "`r`n": the
+        # last element of a CRLF split would otherwise keep a trailing CR.
+        foreach ($line in ($complete -split "`n")) {
+            Write-DetectorLine ($line.TrimEnd([char]13))
+        }
+    }
+    if ($Final -and $script:DetPending.Length -gt 0) {
+        Write-DetectorLine ($script:DetPending.TrimEnd([char]13))
+        $script:DetPending = ''
+    }
+}
+
+function Close-DetectorTail {
+    if ($null -ne $script:DetReader) {
+        try { $script:DetReader.Dispose() } catch { }
+        $script:DetReader = $null
+    }
 }
 
 # --- log file first, so even an early failure is recorded -------------------
@@ -163,7 +248,7 @@ Push-Location -LiteralPath $RepoRoot
 $savedPath = $env:PATH
 try {
     $env:PATH = "$doviDir;$env:PATH"
-    Write-Log "running: $python scripts\host-detector\dv_host_scan.py"
+    Write-Log "running: $python -u scripts\host-detector\dv_host_scan.py"
 
     # DO NOT PIPE NATIVE STDERR THROUGH THE POWERSHELL PIPELINE.
     #
@@ -175,11 +260,10 @@ try {
     # its own "detector exited" line, reported exit 1, and the detector did
     # nothing at all -- dv_host.db untouched, zero new dv_scan rows.
     #
-    # File redirection (`*>>`) writes both streams straight to disk without
-    # ErrorRecord wrapping, so the detector's own diagnostics are preserved and a
-    # chatty-but-successful run is no longer fatal. EAP is relaxed across the
-    # call as belt-and-braces and restored immediately after.
     # REDIRECT AT THE OS LEVEL, via cmd, so PowerShell never handles the streams.
+    # Nothing below relaxes $ErrorActionPreference any more: the detector is no
+    # longer invoked as a native command by PowerShell, so there is no pipeline
+    # left to decorate an ErrorRecord onto and nothing to guard against.
     #
     # Two earlier attempts both failed, each differently, and both are worth
     # naming because the fix is not obvious:
@@ -198,29 +282,99 @@ try {
     # encoding decision, and cmd propagates the child's exit code. The captured
     # bytes are then appended to the log as UTF-8 like every other line, so the
     # file has ONE encoding throughout.
+    #
+    # WHY THE OUTPUT IS NOW TAILED LIVE INSTEAD OF FOLDED IN AFTER EXIT.
+    #
+    # The previous version read $detOut only once the process had exited, so a
+    # five-hour run wrote a log containing nothing but the preflight lines above
+    # -- indistinguishable from a hung one. On 2026-08-09 that absence is what
+    # made me infer throughput from two `ps` snapshots and get 6.7 MB/s when the
+    # real figure, sitting in data/dv_host.db the whole time, was 79 MB/s. The
+    # 12x error produced a review claiming the design "cannot finish" that then
+    # had to be retracted in full. Live output is the cheapest defence against
+    # inferring what you could have read.
+    #
+    # The launch is System.Diagnostics.Process rather than `& cmd /c` ONLY so
+    # there is a handle to poll; the command line handed to cmd is byte-for-byte
+    # what `& cmd /c "..."` produced, so every property above still holds. Note
+    # what does NOT work here:
+    #
+    #   Start-Process -ArgumentList '/c', $inner  -- the redirection does not
+    #     survive being split across an argument ARRAY. Measured against a stub
+    #     printing for 24 s: the wrapper reported "finished OK" in 14 s having
+    #     captured nothing, because the child exited immediately. ProcessStartInfo
+    #     takes the raw command line as ONE string, which is why it works.
+    #
+    # `-u` is deliberate. Probed 2026-08-09: python's stderr (where `logging`
+    # writes, and the detector logs nothing else) is line-buffered and streams
+    # on its own, but stdout redirected to a file is BLOCK-buffered -- a stub's
+    # print() lines all appeared at exit, not live. The detector uses no print()
+    # today, so -u changes nothing now; it is here so that adding one later
+    # cannot silently un-fix this.
     $detOut = Join-Path $LogDir ("detector-{0}.out" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-    $savedEAP = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        & cmd /c "`"$python`" scripts\host-detector\dv_host_scan.py > `"$detOut`" 2>&1"
-        $code = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $savedEAP
-    }
-    if ($null -eq $code) { $code = 0 }
 
-    # Fold the detector's own output into the log. Without this a real detector
-    # failure is undiagnosable -- which is the whole reason this wrapper logs.
-    if (Test-Path -LiteralPath $detOut) {
-        foreach ($line in @(Get-Content -LiteralPath $detOut -ErrorAction SilentlyContinue)) {
-            Write-Output $line
-            if ($script:LogFile) {
-                Add-Content -LiteralPath $script:LogFile -Value "    $line" -Encoding utf8
+    $inner = '"{0}" -u scripts\host-detector\dv_host_scan.py > "{1}" 2>&1' -f $python, $detOut
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName        = $env:ComSpec
+    $psi.Arguments       = '/c "' + $inner + '"'
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow  = $true
+    # MUST be set explicitly. PowerShell sets a native command's working
+    # directory from the current location, so Push-Location above was enough for
+    # `& cmd /c`; .NET does not, and would inherit the process-wide current
+    # directory instead. The detector's --config/--db defaults are repo-relative,
+    # so getting this wrong would point it at the wrong database.
+    $psi.WorkingDirectory = $RepoRoot
+
+    $code = $null
+    $proc = $null
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        Write-Log "could not start the detector: $($_.Exception.Message)" 'ERROR'
+        $code = 1
+    }
+
+    if ($null -ne $proc) {
+        $started  = Get-Date
+        $nextBeat = $started.AddMinutes($HeartbeatMinutes)
+        # WaitForExit(ms) returns $true the moment the process ends, so this
+        # neither busy-waits nor delays the finish by a full poll interval.
+        while (-not $proc.WaitForExit(1000)) {
+            Read-DetectorTail -Path $detOut
+            $now = Get-Date
+            if ($now -ge $nextBeat) {
+                $el = New-TimeSpan -Start $started -End $now
+                # Formatted from TotalHours, not 'hh', so a run past 24 h does
+                # not silently wrap its hour count back to zero.
+                Write-Log ("  ... still running: {0:00}:{1:00}:{2:00} elapsed, {3} detector line(s) so far" -f `
+                           [int]$el.TotalHours, $el.Minutes, $el.Seconds, $script:DetLineCount)
+                $nextBeat = $now.AddMinutes($HeartbeatMinutes)
             }
         }
-        Remove-Item -LiteralPath $detOut -Force -ErrorAction SilentlyContinue
+        Read-DetectorTail -Path $detOut -Final
+        $code = $proc.ExitCode
+        $proc.Dispose()
     }
+    if ($null -eq $code) { $code = 0 }
+    Close-DetectorTail
+
+    # SAFETY NET, not redundancy. If the live tail never read a single line the
+    # run must not be LESS diagnosable than it was before this change, so fall
+    # back to the old post-exit read. Gated on a zero count precisely because
+    # zero is the only state in which a re-read cannot duplicate anything.
+    if ($script:DetLineCount -eq 0 -and (Test-Path -LiteralPath $detOut)) {
+        # @(...) is load-bearing, same as for $roots above: a single-line file
+        # would otherwise make .Count a terminating error under StrictMode.
+        $residue = @(Get-Content -LiteralPath $detOut -ErrorAction SilentlyContinue)
+        if ($residue.Count -gt 0) {
+            Write-Log "live tail captured nothing; fell back to a post-exit read." 'WARNING'
+            foreach ($line in $residue) { Write-DetectorLine $line }
+        }
+    }
+    Remove-Item -LiteralPath $detOut -Force -ErrorAction SilentlyContinue
 } finally {
+    Close-DetectorTail
     $env:PATH = $savedPath
     Pop-Location
 }
