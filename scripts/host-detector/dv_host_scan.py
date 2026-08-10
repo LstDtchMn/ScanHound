@@ -22,7 +22,6 @@ to the shared data/dv_host.db and http://localhost:9721):
 import argparse
 import json
 import logging
-import json
 import os
 import re
 import shutil
@@ -90,6 +89,10 @@ def is_retry_due(next_retry_at, now):
 # with no additional prefix in backend/api/main.py.
 DV_IMPORT_PATH = "/rename/dv-import"          # legacy file-read endpoint
 DV_ROWS_PATH = "/rename/dv-host-rows"         # durable row-POST endpoint
+# Sent in every row-POST body and enforced server-side. Bump in lockstep with
+# any change to the row shape so an old detector can never feed a new container
+# (or vice-versa) a body it will silently mis-parse (round-4 cleanup).
+DV_ROWS_SCHEMA_VERSION = 1
 
 # The container's import endpoint (backend/api/routes/rename.py's
 # _DEFAULT_DV_HOST_DB) reads /data/dv_host.db, bind-mounted from
@@ -311,7 +314,9 @@ def _post_rows(api_base, rows):
     or a count that does not reconcile — is a FAILURE, never a silent success.
     """
     url = api_base.rstrip("/") + DV_ROWS_PATH
-    payload = json.dumps({"rows": rows, "source_rows": len(rows)}).encode("utf-8")
+    payload = json.dumps(
+        {"schema_version": DV_ROWS_SCHEMA_VERSION,
+         "rows": rows, "source_rows": len(rows)}).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload,
         headers={"Content-Type": "application/json"}, method="POST")
@@ -329,6 +334,11 @@ def _post_rows(api_base, rows):
         body = json.loads(raw)
     except ValueError:
         logger.error("dv-host-rows: unparseable response body: %s", raw[:300])
+        return False
+    # Guard the contract exactly: a valid-JSON non-object (null, list) must fail
+    # the same way an unparseable body does, not raise on .get (round-4 cleanup).
+    if not isinstance(body, dict):
+        logger.error("dv-host-rows: response was not a JSON object: %s", raw[:300])
         return False
     if not (body.get("ok") is True
             and body.get("failed") == 0
@@ -354,7 +364,7 @@ def main(argv=None):
     ap.add_argument("--db", default=DEFAULT_DB_PATH)
     ap.add_argument("--api", default="http://localhost:9721")
     # 5h30m under a PT6H Task Scheduler limit. A HARD KILL at the limit loses
-    # the file in flight AND skips the dv-import POST at the end of main(),
+    # the file in flight AND skips the final row POST at the end of main(),
     # which is why the container's dv_scan gained nothing while the host
     # database grew: every run died before reaching the handoff. Stopping
     # ourselves BETWEEN files, with time to spare, converts that into a normal
@@ -366,8 +376,8 @@ def main(argv=None):
                     help="backfill: everything, ordered. steady: only "
                          "never-scanned and changed files, no retry sweep.")
     ap.add_argument("--import-every", type=int, default=25,
-                    help="POST dv-import after this many files so a long run "
-                         "publishes progress instead of only at the end")
+                    help="POST the accumulated rows after this many files so a "
+                         "long run publishes progress instead of only at the end")
     args = ap.parse_args(argv)
 
     cfg = load_host_config(args.config)

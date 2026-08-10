@@ -494,6 +494,56 @@ def test_post_rows_rejects_a_non_2xx(tmp_path, monkeypatch):
     assert m._post_rows("http://x", [{"path": "a"}]) is False
 
 
+def test_post_rows_rejects_a_non_object_body(tmp_path, monkeypatch):
+    """Valid JSON that is not an object (null, list) must fail, not raise on
+    .get (round-4 cleanup: isinstance(body, dict) guard)."""
+    m = _load()
+    import urllib.request
+
+    class _Resp:
+        def __init__(self, body):
+            self._b = body.encode("utf-8")
+        def read(self):
+            return self._b
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    for payload in ("null", "[]", "42"):
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda *a, _p=payload, **k: _Resp(_p))
+        assert m._post_rows("http://x", [{"path": "a"}]) is False, payload
+
+
+def test_post_rows_sends_schema_version(tmp_path, monkeypatch):
+    """The producer stamps schema_version and source_rows into the body so the
+    container can reject an unrecognised version (round-4 cleanup)."""
+    m = _load()
+    import json
+    import urllib.request
+
+    captured = {}
+
+    class _Resp:
+        def read(self):
+            return (b'{"ok": true, "source_rows": 2, "processed": 2, '
+                    b'"failed": 0}')
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def _capture(req, *a, **k):
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _capture)
+    assert m._post_rows("http://x", [{"path": "a"}, {"path": "b"}]) is True
+    assert captured["body"]["schema_version"] == m.DV_ROWS_SCHEMA_VERSION == 1
+    assert captured["body"]["source_rows"] == 2
+
+
 def test_a_failed_detection_prints_no_rate(tmp_path, caplog):
     """No throughput number may appear for a detection that failed.
 

@@ -4858,7 +4858,7 @@ class DatabaseManager:
             item.get("dv_layer"), item.get("dv_profile"), scan_state,
             item.get("sig_mtime"), item.get("sig_size"), item.get("scan_run_uuid"),
             item.get("probe_json"), scan_state,
-        ), label="upsert_media_inventory") is not None
+        ), label="upsert_media_inventory")
 
     _MEDIA_INVENTORY_EVIDENCE_CTE = '''
         WITH cached_unscanned_4k AS (
@@ -5083,7 +5083,7 @@ class DatabaseManager:
                 imdb_id = COALESCE(excluded.imdb_id, dv_scan.imdb_id),
                 last_seen_at = CURRENT_TIMESTAMP
         ''', (path, title, dv_layer, sig_mtime, sig_size, source,
-              rating_key, imdb_id), label="upsert_dv_scan") is not None
+              rating_key, imdb_id), label="upsert_dv_scan")
 
     def get_latest_dv_scan_at(self, source="scan"):
         """Newest ``last_seen_at`` among dv_scan rows for *source*, else None.
@@ -5206,7 +5206,7 @@ class DatabaseManager:
                 sig_size = excluded.sig_size,
                 probe_json = excluded.probe_json,
                 probed_at = CURRENT_TIMESTAMP
-        ''', (path, sig_mtime, sig_size, probe_json), label="upsert_media_probe") is not None
+        ''', (path, sig_mtime, sig_size, probe_json), label="upsert_media_probe")
 
     def get_media_probe(self, path):
         """Return the cached probe row for ``path`` (dict, probe_json still a raw

@@ -58,11 +58,35 @@ def test_import_dv_rows_counts(tmp_path):
 
 
 def test_import_dv_rows_counts_failures(tmp_path, monkeypatch):
+    """A real write failure must count as failed, not success.
+
+    Force the REAL low-level ``_mutate`` to return False and leave the REAL
+    ``upsert_dv_scan`` in the call chain (re-review F1). This exercises the
+    adapter's ``return self._mutate(...)`` line — the exact spot where the old
+    ``... is not None`` bug turned a False into a True. Mocking upsert_dv_scan
+    itself (the previous test) skipped that line and could not catch it.
+    """
     dm = DatabaseManager(db_path=str(tmp_path / "c.db"))
     try:
-        monkeypatch.setattr(dm, "upsert_dv_scan", lambda *a, **k: False)
+        monkeypatch.setattr(dm, "_mutate", lambda *a, **k: False)
         res = import_dv_rows(dm, [{"path": "Y:/a.mkv", "dv_layer": "fel"}])
         assert res["failed"] == 1 and res["processed"] == 0
+        # And nothing was persisted.
+        monkeypatch.undo()
+        assert dm.get_dv_scan("Y:/a.mkv") is None
+    finally:
+        dm.close()
+
+
+def test_import_dv_rows_real_success_persists(tmp_path):
+    """Positive control for the failure test above: with the REAL ``_mutate``,
+    a good single-row import reports one processed row AND persists it. If this
+    passed while the failure test was vacuous, the pair would not discriminate."""
+    dm = DatabaseManager(db_path=str(tmp_path / "c.db"))
+    try:
+        res = import_dv_rows(dm, [{"path": "Y:/a.mkv", "dv_layer": "fel"}])
+        assert res["processed"] == 1 and res["imported"] == 1 and res["failed"] == 0
+        assert dm.get_dv_scan("Y:/a.mkv")["dv_layer"] == "fel"
     finally:
         dm.close()
 
@@ -178,13 +202,63 @@ def test_dv_host_rows_source_rows_mismatch_is_422(client):
 
 
 def test_dv_host_rows_partial_failure_is_500(client, monkeypatch):
+    """A real write failure at the endpoint must be a 500, not an ok:true 200.
+
+    Force the REAL ``_mutate`` False (re-review F1) so the whole adapter →
+    import_dv_rows → _import_response chain runs for real."""
     from backend.api.dependencies import registry
     dm = DatabaseManager(); dm.clear_dv_scans()
-    monkeypatch.setattr(dm, "upsert_dv_scan", lambda *a, **k: False)
+    monkeypatch.setattr(dm, "_mutate", lambda *a, **k: False)
     registry.db = dm
     r = client.post("/rename/dv-host-rows", json={
         "rows": [{"path": "Y:/M/a.mkv", "dv_layer": "fel"}], "source_rows": 1})
     assert r.status_code == 500
     assert r.json()["detail"]["ok"] is False
     assert r.json()["detail"]["failed"] == 1
+    assert r.json()["detail"]["processed"] == 0
+    monkeypatch.undo()
+    assert dm.get_dv_scan("Y:/M/a.mkv") is None
+    dm.clear_dv_scans()
+
+
+def test_dv_host_rows_blank_path_is_422(client):
+    """A blank/whitespace path is rejected at validation, not silently skipped
+    into an ok:true 200 (re-review F2)."""
+    from backend.api.dependencies import registry
+    registry.db = DatabaseManager()
+    r = client.post("/rename/dv-host-rows", json={
+        "rows": [{"path": "   ", "dv_layer": "fel"}], "source_rows": 1})
+    assert r.status_code == 422
+
+
+def test_dv_host_rows_bad_schema_version_is_422(client):
+    """An unrecognised producer schema_version is rejected at the boundary
+    rather than half-applied (re-review cleanup)."""
+    from backend.api.dependencies import registry
+    registry.db = DatabaseManager()
+    r = client.post("/rename/dv-host-rows", json={
+        "rows": [{"path": "Y:/M/a.mkv", "dv_layer": "fel"}],
+        "source_rows": 1, "schema_version": 2})
+    assert r.status_code == 422
+
+
+def test_dv_import_endpoint_partial_failure_is_500(client, tmp_path, monkeypatch):
+    """The retained legacy endpoint must also convert a partial destination
+    upsert into a 500, using the real upsert over a forced _mutate failure
+    (re-review F3)."""
+    from backend.api.dependencies import registry
+    from backend.api.routes import rename as rename_routes
+    host = tmp_path / "dv_host.db"
+    _make_host_db(host, [("Y:/M/a.mkv", "fel", 1.0, 10, "A")])
+    monkeypatch.setattr(
+        rename_routes, "_DEFAULT_DV_HOST_DB", str(tmp_path / "dv_host.db"))
+    dm = DatabaseManager(); dm.clear_dv_scans()
+    registry.db = dm
+    # Read of the host DB succeeds; the destination write fails.
+    monkeypatch.setattr(dm, "_mutate", lambda *a, **k: False)
+    r = client.post("/rename/dv-import", json={"host_db_path": str(host)})
+    assert r.status_code == 500
+    assert r.json()["detail"]["ok"] is False
+    assert r.json()["detail"]["failed"] == 1
+    monkeypatch.undo()
     dm.clear_dv_scans()

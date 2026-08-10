@@ -5,7 +5,7 @@ import threading
 from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.public_errors import capture_public_exception
@@ -117,6 +117,22 @@ class DvHostRow(BaseModel):
     sig_size: Optional[int] = None
     title: Optional[str] = None
 
+    @field_validator("path")
+    @classmethod
+    def _path_not_blank(cls, v: str) -> str:
+        # A blank/whitespace path is not an importable row. Reject at the request
+        # boundary (422) so the server's success invariant — every accepted row is
+        # processed exactly once — holds without a skipped-row fudge (re-review F2).
+        if not (v or "").strip():
+            raise ValueError("path must not be blank")
+        return v
+
+
+#: The only row schema this container understands. The detector's
+#: DV_ROWS_SCHEMA_VERSION must match; a bump on either side without the other is
+#: rejected at the request boundary rather than silently mis-parsed.
+DV_ROWS_SCHEMA_VERSION = 1
+
 
 class DvHostRowsRequest(BaseModel):
     """The detector POSTs its dv_host rows here. `source_rows` is the count the
@@ -126,6 +142,16 @@ class DvHostRowsRequest(BaseModel):
     source_rows: int
     #: Forward-compat: the producer's row schema version. Bump on a shape change.
     schema_version: int = 1
+
+    @field_validator("schema_version")
+    @classmethod
+    def _schema_supported(cls, v: int) -> int:
+        # Reject an unrecognised producer version at the boundary (422) so a
+        # future shape change can never be half-applied (re-review cleanup).
+        if v != DV_ROWS_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported schema_version {v}; expected {DV_ROWS_SCHEMA_VERSION}")
+        return v
 
 
 class DvSyncRequest(BaseModel):
@@ -750,22 +776,23 @@ def dv_host_rows(
                 "received_rows": len(rows),
             },
         )
-    result = import_dv_rows(reg.db, rows)
-    body = {
-        "ok": (result["failed"] == 0
-               and result["processed"] + _skipped(result) == result["source_rows"]),
-        **result,
-    }
-    if not body["ok"]:
-        # Partial upsert failure. Surface it as a server error carrying the
-        # counts, so the client fails the import rather than trusting a 200.
+    return _import_response(import_dv_rows(reg.db, rows))
+
+
+def _import_response(result: dict) -> dict:
+    """Validate an import_dv_rows result into a response body, or raise 500.
+
+    ONE invariant, shared by both endpoints (re-review F2/F3): every source row
+    must be processed exactly once with zero failures. `processed == source_rows`
+    (not `processed + skipped`) — blank-path rows are rejected at validation, so a
+    processed shortfall now means a real failure, and a partial or failed import
+    can never read as an HTTP-200 success.
+    """
+    ok = result["failed"] == 0 and result["processed"] == result["source_rows"]
+    body = {"ok": ok, **result}
+    if not ok:
         raise HTTPException(status_code=500, detail=body)
     return body
-
-
-def _skipped(result: dict) -> int:
-    """Rows that carried no path and were neither processed nor failed."""
-    return int(result["source_rows"]) - int(result["processed"]) - int(result["failed"])
 
 
 @router.post("/dv-import")
@@ -786,9 +813,12 @@ def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)
     # explicit host_db_path pointed anywhere else (`..` escape, another mount).
     path = _require_within_roots(path, [_dv_host_db_root()], "host_db_path")
     try:
-        return import_dv_host_db(reg.db, path)
+        result = import_dv_host_db(reg.db, path)
     except DvHostReadError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+    # Same validator as /dv-host-rows: a partial destination upsert is a 500, not
+    # a silent 200 (re-review F3).
+    return _import_response(result)
 
 
 @router.post("/dv-sync-labels")
