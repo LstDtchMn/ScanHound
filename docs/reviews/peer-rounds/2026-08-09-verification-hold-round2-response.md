@@ -153,10 +153,25 @@ itself is captured on the right navigation).
 - Mutation checks for all six: each fix's regression test FAILS on the restored defect and
   PASSES on the fix (F1 1/1, F2 1/1, F3 1/1, F4 1/1, F5 1/1, F6 2/2).
 
-## Still owed (unchanged from round 1, and honest)
+## Owed item — now CAPTURED (2026-08-10 04:19 UTC)
 
-- A capture of the diagnostic during an ACTIVE stall. A read-only, non-evasive watcher
-  (`scripts/turnstile_watch.py`) is armed in the production container and will record the
-  live 600* evidence the next time a reveal stalls, then exit. The reveal was healthy at
-  diagnostic time, so this is not yet captured; the DOM legs of detection are validated on
-  the healthy page and do not depend on the console leg.
+The active-stall capture the previous rounds owed has landed. The watcher
+(`scripts/turnstile_watch.py`) caught the reveal actively stalled and recorded it (raw:
+`turnstile-active-stall-capture-2026-08-10.json`; writeup:
+`turnstile-active-stall-capture-2026-08-10.md`). During the stall:
+
+- reveal not-ready (`verifying… please wait`);
+- `cf-turnstile-response` field **present with no value** (absent when healthy — the DOM leg
+  discriminates);
+- two `[Cloudflare Turnstile] Error: 600010.` console lines from `turnstile/v0/api.js`;
+- every `challenges.cloudflare.com` request returned **HTTP 200** (api.js + two invisible
+  `challenge-platform` requests), no `loadingFailed`, no `blockedReason`.
+
+So the detector's conjunction fires correctly on a real stall (the **console-600 leg is now
+proven against a live failure**, not just modelled), and a benign integration defect (blocked
+resource / CSP / failed frame) is ruled out for this capture — the resources load, the
+challenge *verdict* fails, leaving automation rejection as the dominant explanation
+(consistent with, not proven by, `navigator.webdriver`). The stall is intermittent, which is
+why the same URL read healthy at the earlier probe. Nothing here changes the code — the
+classification is cause-agnostic — but the evidence it keys on is now confirmed present in
+production.
