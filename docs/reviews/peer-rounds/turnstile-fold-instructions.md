@@ -15,7 +15,7 @@ this document. Where they disagreed with each other, they settled it on the meri
 
 **Base:** `claude/scanhound-turnstile-verification-hold-z43q0x` @ `c05186c` (8 commits from
 `main`, first is `a88d541`).
-**Fold in:** `agent/turnstile-classification` @ `2bac41c`.
+**Fold in:** `agent/turnstile-classification` @ **`6b0b1a5`** (was `2bac41c` when first handed off; two documentation commits landed after. Conflict count is unchanged at 17, so the fold shape is identical).
 
 **Why, in their words** — `b087aa20` found the deciding fact against itself: its hold closure
 fires only from `_complete`, never `_fail` (verified, zero references in the `_fail` body), so a
@@ -51,6 +51,24 @@ the other **raises `DownloadQueueError`** with an operator message.
 exclude-and-report UX **and** add the `resume_batch` raise. The base's `resume_batch`
 non-automated branch promotes all deferred rows **without calling `decide()`** — an unguarded
 second door that fans a held batch into the challenge.
+
+## REQUIRED READING BEFORE STARTING
+
+`SCANHOUND-TURNSTILE-SESSION-HANDOFF.md` on `agent/turnstile-classification` @ `6b0b1a5`:
+
+- **§8a — the peer-coordination outcome.** The joint decision and why, the `_fail` closure defect
+  that decided it, the withdrawn "architectural superset" claim, the port list with each gap
+  confirmed by the other session, and the migration split. Written specifically so a reader
+  arriving at that document does not use its *earlier* comparison to conclude the opposite.
+- **§8b — every dead end, consolidated.** Detection approaches that failed (Cloudflare's
+  documented markup is absent from this site; the challenge iframe is a race, not a signal; no
+  shadow roots; the dormant `api.js` ships on healthy pages), refuted hypotheses (`postMessage`,
+  a benign integration defect, and "no captcha or Cloudflare is involved" — false, and
+  expensively so), methods that failed (reloading, six times; 10-minute polling is what worked),
+  and its author's own six mistakes with what caught each.
+
+**If the fold is about to re-run any diagnostic ground, read §8b first.** It exists because that
+session's full dead-end list was otherwise only in a chat that has now been archived.
 
 ## Port these four from `agent/turnstile-classification`
 
