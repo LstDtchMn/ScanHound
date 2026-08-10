@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
 
@@ -10,7 +10,11 @@ from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
 _FAILURE_TITLES = {
     ScrapeCode.SOURCE_DISABLED.value: "HDEncode is disabled",
     ScrapeCode.SOURCE_TEMPORARILY_BLOCKED.value: "Download deferred",
-    ScrapeCode.INTERACTIVE_CHALLENGE.value: "HDEncode verification required",
+    # "HDEncode verification required" until 2026-08-09. It read as an
+    # instruction -- go and verify something -- and there is nothing the reader
+    # can go and verify. The title now names the state, and the message says
+    # what did not happen.
+    ScrapeCode.INTERACTIVE_CHALLENGE.value: "Manual attention required",
     ScrapeCode.BROWSER_LAUNCH_FAILED.value: "Browser could not start",
     ScrapeCode.BROWSER_NETWORK_ERROR.value: "HDEncode could not be reached",
     ScrapeCode.BROWSER_NAVIGATION_FAILED.value: "Page navigation failed",
@@ -26,7 +30,17 @@ _FAILURE_TITLES = {
     # release" underneath a title that said the opposite, on the exact code behind
     # the 45 items currently parked in cooldown. The fix I shipped was undone in
     # the UI by the omission.
-    ScrapeCode.REVEAL_VERIFICATION_STALLED.value: "HDEncode is throttling",
+    # NO CAUSAL CLAIM. This said "HDEncode is throttling" until 2026-08-09,
+    # when the throttle attribution was refuted twice over: the user opened the
+    # exact stalled URL on a phone browser and the links appeared with almost no
+    # wait, and six later loads from ScanHound's own browser found the reveal
+    # control ready and enabled. The reason CODE was always neutral; only the
+    # rendered title asserted a cause, and it is the title the reader believes.
+    # What is observed is that the control did not clear inside our window --
+    # not why.
+    ScrapeCode.REVEAL_VERIFICATION_STALLED.value: (
+        "HDEncode links did not unlock in time"
+    ),
     # Reached only when the link IS a direct file host we identify but cannot hand
     # off; the ordinary direct-host path clears this diagnostic before it is ever
     # rendered. Titled without "HDEncode" on purpose -- these two codes are for
@@ -283,6 +297,133 @@ def strong_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:
     markers.extend(
         marker for marker in _CHALLENGE_VISIBLE_MARKERS if marker in visible
     )
+    return tuple(dict.fromkeys(markers))
+
+
+# ── ACTIVE TURNSTILE EVIDENCE ───────────────────────────────────────────────
+#
+# MEASURED ON THE LIVE STALLED PAGE, 2026-08-09, before any of this was written.
+# The measurements are what the rules below are for; without them this would be
+# a list of plausible selectors, and two of the plausible ones are wrong.
+#
+#   * `input[name="cf-turnstile-response"]` EXISTS in the reveal form and its
+#     value is empty. It is rendered by turnstile.render(), so it is present
+#     only once a widget really exists -- unlike the api.js <script> tag.
+#   * There is NO `.cf-turnstile` container and NO `data-sitekey` attribute:
+#     hdencode renders the widget programmatically into `#turnstile-container-
+#     <hash>`. A detector keyed on the documented Cloudflare markup finds
+#     nothing here.
+#   * There is NO reachable challenge <iframe> either. The widget runs in
+#     INVISIBLE mode: it creates a frame, fails, and tears it down, retrying
+#     about every 11 seconds. A DOM read lands between attempts more often than
+#     not, so iframe presence is a race, not a signal.
+#   * The console carries `[Cloudflare Turnstile] Error: 600010.` repeatedly.
+#
+# So the response field and the console error are the two signals that actually
+# fire on the page this exists for. The container and iframe checks are kept
+# because they are correct where they DO apply and cost nothing -- not because
+# they were observed working here.
+_TURNSTILE_RESPONSE_FIELD = "cf-turnstile-response"
+
+# The 600 family is Cloudflare's GENERIC client-side challenge-execution
+# failure. Matching the family rather than 600010 is deliberate: the specific
+# code is an observation from one page on one day, not a contract, and pinning
+# it would make the detector silently stop working when Cloudflare emits a
+# sibling code for the same condition.
+_TURNSTILE_CONSOLE_CODE = re.compile(r"\b(600\d{3})\b")
+
+
+def turnstile_challenge_evidence(
+    html: str,
+    *,
+    console_entries: Sequence[Mapping[str, Any]] = (),
+    unlock_target: Optional[Callable[[str], bool]] = None,
+) -> tuple[str, ...]:
+    """Return markers proving an ACTIVE, UNSOLVED Turnstile challenge, or ``()``.
+
+    ``console_entries`` MUST already be scoped to the current navigation. This
+    function cannot tell a fresh error from one a previous page left in a
+    persistent browser session, so the caller drains the log at navigation start
+    and passes only what arrived afterwards. Getting that wrong would let one
+    stalled page classify the next several.
+
+    ``unlock_target`` is the caller's own "does this destination resolve to
+    THIS page's unlock endpoint?" predicate, injected rather than reimplemented
+    so there is exactly one copy of that rule. When supplied, the response field
+    only counts if it sits in a form that posts the reveal endpoint -- a captcha
+    belonging to the page's comment form is not evidence about the reveal.
+
+    NOT evidence, each for a reason:
+
+    ``<script src=".../turnstile/v0/api.js">``
+        Dormant. hdencode ships it in ``<head>`` on every release page,
+        including the ones that reveal links perfectly.
+    the word "cloudflare" anywhere in the HTML
+        The whole site is behind Cloudflare. It is true on every page.
+    "Verifying… Please wait"
+        The placeholder label. It is the SYMPTOM this code is trying to
+        explain, and it is one site re-wording away from meaning nothing.
+    a populated ``cf-turnstile-response`` value
+        That is a challenge that SUCCEEDED. Treating it as failure evidence
+        would misclassify the healthy case.
+    """
+    markers: list[str] = []
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html or "", "html.parser")
+    except Exception:
+        soup = None
+
+    if soup is not None:
+        for field in soup.find_all(
+            "input", attrs={"name": _TURNSTILE_RESPONSE_FIELD}
+        ):
+            if (field.get("value") or "").strip():
+                # Solved. Not evidence of a failure, and deliberately not
+                # recorded as a marker at all.
+                continue
+            if unlock_target is not None:
+                # BOTH association forms. HTML lets an input belong to a form by
+                # nesting OR by a `form="<id>"` attribute pointing at one
+                # elsewhere in the document. The measured page nests it, but
+                # checking only the parent would make a purely cosmetic markup
+                # change silently disable the detector -- and the failure would
+                # look like "no challenge", the most misleading of all the
+                # possible wrong answers here.
+                owner = field.get("form")
+                form = None
+                if owner:
+                    form = soup.find("form", id=owner)
+                if form is None:
+                    form = field.find_parent("form")
+                action = (form.get("action") or "") if form is not None else ""
+                if not unlock_target(action):
+                    continue
+            markers.append("turnstile:unsolved-response-field")
+            break
+
+        if soup.select(".cf-turnstile"):
+            markers.append("turnstile:widget-container")
+
+        for frame in soup.find_all("iframe"):
+            src = (frame.get("src") or "").lower()
+            if "challenges.cloudflare.com" in src and "turnstile" in src:
+                markers.append("turnstile:challenge-iframe")
+                break
+
+    for entry in console_entries or ():
+        try:
+            message = str(entry.get("message") or "")
+        except Exception:
+            continue
+        if "turnstile" not in message.lower():
+            continue
+        found = _TURNSTILE_CONSOLE_CODE.search(message)
+        if found:
+            markers.append(f"turnstile:console-{found.group(1)}")
+            break
+
     return tuple(dict.fromkeys(markers))
 
 

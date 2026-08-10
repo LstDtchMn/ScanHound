@@ -44,8 +44,21 @@ from typing import Optional
 #: Deliberately not runnable, and therefore requiring a recovery path.
 DEFERRED_STATES = frozenset({"waiting_source", "verification_required"})
 
-#: queue_reason values automatic recovery owns. Anything else it will not touch.
+#: queue_reason values automatic recovery RECOGNISES. Anything else it will not
+#: touch.
+#:
+#: "interactive_challenge" is recognised but is NEVER authorised: decide()
+#: intercepts it above the ownership test and returns VERIFICATION_HOLD. It stays
+#: in the set because the queue's discovery SQL uses the same vocabulary, and
+#: because removing it would turn a challenge row into UNOWNED_REASON, whose
+#: action is "safe to resume explicitly" -- the exact advice that must not be
+#: given for a challenge.
 RECOGNISED_REASONS = frozenset({"interactive_challenge", "source_deferred"})
+
+#: The queue_reason that means "a human-verification challenge stopped this row".
+#: A timer NEVER clears it. Named once, here, because the string is the join
+#: between the producer (_pause_for_source), the discovery SQL, and this policy.
+CHALLENGE_REASON = "interactive_challenge"
 
 #: Outcomes never auto-retried: we do not know whether the previous attempt took
 #: effect, so a retry could duplicate a delivery that already happened. Safety
@@ -58,6 +71,7 @@ AUTHORISED = "authorised"                  # may be made runnable now
 WAITING_OWN = "waiting_own_cooldown"       # transient; its own time has not come
 WAITING_BRAKE = "waiting_shared_cooldown"  # transient; the source is quiet on purpose
 SAFETY_HOLD = "unknown_outcome_hold"       # deliberate; needs adjudication
+VERIFICATION_HOLD = "manual_verification_hold"  # a human challenge blocks it
 NO_AUTHORISATION = "no_authorisation_time"  # needs an explicit operator resume
 UNOWNED_REASON = "reason_not_owned"        # automatic recovery does not own this row
 DISABLED = "auto_resume_disabled"          # the operator turned it off
@@ -69,8 +83,11 @@ BUDGET_SPENT = "retry_budget_spent"        # deliberate policy stop
 #: ever changes an unknown-outcome row, so omitting it made the tools report
 #: "every deferred item has a recovery path" about a row that has none by design, and
 #: made the watcher wait on it forever.
+#:
+#: VERIFICATION_HOLD belongs here for the same reason and for a sharper one: the
+#: thing it waits on is a human, and no amount of elapsed time supplies one.
 NEEDS_HUMAN = frozenset({NO_AUTHORISATION, UNOWNED_REASON, DISABLED, BUDGET_SPENT,
-                         SAFETY_HOLD})
+                         SAFETY_HOLD, VERIFICATION_HOLD})
 
 #: Transient: no action needed, it will clear.
 WILL_CLEAR = frozenset({WAITING_OWN, WAITING_BRAKE})
@@ -88,9 +105,18 @@ ACTION_MANUAL_RESUME = "manual_resume"  # safe to resume explicitly
 ACTION_CONFIGURATION = "configuration"  # a setting, not an item, is the problem
 ACTION_WAIT = "wait"                    # will clear on its own
 ACTION_NONE = "none"                    # due; the scheduler will take it
+# DISTINCT FROM ACTION_MANUAL_RESUME on purpose. "Safe to resume explicitly"
+# promises that resuming finishes the job. For a row stopped by a verification
+# challenge that ScanHound's browser cannot complete, resuming is a PROBE -- it
+# re-presents the same challenge to the same browser, which is measured to fail
+# the same way. Telling an operator to resume would be telling them to do the
+# thing that does not work, which is how "retry" became the answer to a stall
+# that no retry has ever cleared.
+ACTION_ATTENTION_REQUIRED = "attention_required"
 
 ACTION_FOR = {
     SAFETY_HOLD: ACTION_ADJUDICATE,
+    VERIFICATION_HOLD: ACTION_ATTENTION_REQUIRED,
     NO_AUTHORISATION: ACTION_MANUAL_RESUME,
     BUDGET_SPENT: ACTION_MANUAL_RESUME,
     UNOWNED_REASON: ACTION_MANUAL_RESUME,
@@ -116,6 +142,15 @@ ACTION_ADVICE = {
     ),
     ACTION_WAIT: "Nothing to do; this clears by itself.",
     ACTION_NONE: "Nothing to do; the scheduler will pick it up.",
+    # DELIBERATELY PROMISES NOTHING. It does not say the wait will end, does not
+    # say a retry will work, and does not say the operator can complete the
+    # verification inside ScanHound -- there is no way to interact with the
+    # browser session that is being challenged.
+    ACTION_ATTENTION_REQUIRED: (
+        "Manual attention required. Automated verification did not complete, and "
+        "waiting will not change that. Retrying re-presents the same challenge to "
+        "the same browser; treat it as a probe, not a fix."
+    ),
 }
 
 
@@ -123,7 +158,8 @@ ACTION_ADVICE = {
 #: which test_every_decision_has_an_action enforces -- so a decision cannot reach an
 #: operator tool without someone deciding what a human should do about it.
 ALL_DECISIONS = frozenset({AUTHORISED, WAITING_OWN, WAITING_BRAKE, SAFETY_HOLD,
-                           NO_AUTHORISATION, UNOWNED_REASON, DISABLED, BUDGET_SPENT})
+                           VERIFICATION_HOLD, NO_AUTHORISATION, UNOWNED_REASON,
+                           DISABLED, BUDGET_SPENT})
 
 
 def action_for(decision: str) -> str:
@@ -178,6 +214,13 @@ class SharedFacts:
     source_delivery_count: int = 0
     progress_mark: int = 0
     max_attempts: int = 3
+    #: True while an interactive-challenge EPISODE is open for this group's
+    #: source. One episode covers the triggering row AND every sibling parked
+    #: behind it, so a challenge is answered once rather than re-presented to
+    #: each of 22 items in turn. Only an affirmative ScanHound-side success
+    #: closes it -- not a timer, and not a human succeeding in some other
+    #: browser, which proves nothing about this browser's session.
+    challenge_open: bool = False
 
 
 def parse_max_attempts(config, default: int = 3) -> int:
@@ -201,9 +244,11 @@ def decide(item: ItemFacts, shared: SharedFacts,
 
     1. SAFETY first. An unknown execution outcome is never automatic, whatever else
        is true.
-    2. Ownership and configuration next -- automatic recovery only touches rows it
+    2. HUMAN VERIFICATION next, for the same reason and by the same rule: what it
+       waits on is a person, and no amount of elapsed time supplies one.
+    3. Ownership and configuration next -- automatic recovery only touches rows it
        owns, in batches where it is enabled, within budget.
-    3. TIME last, and per item. The shared brake is a veto for the whole group; the
+    4. TIME last, and per item. The shared brake is a veto for the whole group; the
        item's own cooldown is a veto for itself. NEITHER is allowed to authorise a row
        that the other would decline, and -- the round-13 lesson -- one row's veto is
        never applied to a different row.
@@ -215,6 +260,32 @@ def decide(item: ItemFacts, shared: SharedFacts,
 
     if (item.last_reason_code or "") in UNKNOWN_OUTCOMES:
         return SAFETY_HOLD
+
+    # A HUMAN-VERIFICATION HOLD IS NOT A TIMER, and this branch is the whole
+    # point of the change that introduced it.
+    #
+    # WHAT WAS WRONG. DEFERRED_STATES contains "verification_required" and
+    # RECOGNISED_REASONS contains "interactive_challenge", so a row that had been
+    # parked *because a human must verify something* fell straight through to the
+    # time checks below -- and an expired cooldown returned AUTHORISED. Since
+    # action_for(AUTHORISED) is ACTION_NONE, the tools then reported "nothing to
+    # do; the scheduler will pick it up" about a row whose entire meaning is that
+    # the scheduler cannot. The clock released a hold that only a person can
+    # release.
+    #
+    # That was survivable only while nothing produced these rows in volume. The
+    # moment a real challenge is classified correctly, the same expiry would feed
+    # every item straight back into the challenge that just failed -- so this
+    # branch has to exist BEFORE the classification change is worth making.
+    #
+    # BOTH clauses matter:
+    #   * the row's own reason, for the item that met the challenge; and
+    #   * the group's open EPISODE, for its siblings, which were parked with an
+    #     ordinary source_deferred reason and would otherwise be authorised the
+    #     moment their cooldown expired -- 21 further presentations of a
+    #     challenge that has already been answered "no" once.
+    if (item.queue_reason or "") == CHALLENGE_REASON or shared.challenge_open:
+        return VERIFICATION_HOLD
 
     if (item.queue_reason or "") not in RECOGNISED_REASONS:
         return UNOWNED_REASON

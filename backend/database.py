@@ -1225,6 +1225,22 @@ class DatabaseManager:
                     "ALTER TABLE download_queue_batches "
                     "ADD COLUMN source_delivery_count INTEGER "
                     "NOT NULL DEFAULT 0",
+                    # NON-NULL while an interactive-challenge EPISODE is open.
+                    #
+                    # An episode is the unit a human answers. One challenge
+                    # presented to one item is not 22 separate problems, and
+                    # replaying 22 items through it produces 22 identical
+                    # failures and 22 identical notifications. The id groups the
+                    # triggering row and every sibling parked behind it, so the
+                    # queue can hold them all on ONE fact and release them on ONE
+                    # affirmative success.
+                    #
+                    # Kept on the batch rather than in memory on purpose: the
+                    # coordinator's equivalent state resets when the container
+                    # restarts, which would silently reopen the queue on a
+                    # challenge nobody had answered.
+                    "ALTER TABLE download_queue_batches "
+                    "ADD COLUMN challenge_episode_id TEXT",
                 ):
                     try:
                         cursor.execute(_batch_alter)

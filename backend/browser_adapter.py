@@ -276,20 +276,29 @@ def _status(
 
 
 def _enable_performance_log(options: Any) -> bool:
-    """Ask Chrome for network performance logs; failure to SET it is ignored.
+    """Ask Chrome for network + console logs; failure to SET it is ignored.
 
-    The logs carry the main document's response headers, which is how a
-    Cloudflare Challenge Page is recognised regardless of its language or
+    The performance log carries the main document's response headers, which is
+    how a Cloudflare Challenge Page is recognised regardless of its language or
     template. Purely additive: if the adapter rejects the capability here, the
     browser still launches and challenge detection falls back to page
     evidence.
+
+    The BROWSER log was added 2026-08-09. An invisible Turnstile widget reports
+    its own failure to the console and nowhere else -- no header, no rendered
+    interstitial, and (measured) no iframe that survives long enough to be
+    queried. Without this capability that failure is invisible to the process
+    that has to classify it, which is how a bot challenge came to be recorded as
+    a source throttle for weeks.
 
     Scope note: this only swallows failures raised while *setting* the
     capability. A driver that accepts the option and then rejects it during
     construction still fails the launch — that is outside this helper.
     """
     try:
-        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+        options.set_capability(
+            "goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"}
+        )
         return True
     except Exception:
         return False

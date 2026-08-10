@@ -19,9 +19,13 @@
     return Number.isNaN(parsed) ? value : new Date(parsed).toLocaleString();
   }
 
+  // "Verification required" until 2026-08-09. It read as an instruction, and
+  // there is no way to act on it here: the challenge is presented to the
+  // container's headless browser, and this panel offers only Retry / Remove.
+  // Naming the state instead of demanding an impossible action.
   function stateLabel(state: string): string {
     return ({
-      verification_required: 'Verification required',
+      verification_required: 'Manual attention required',
       waiting_source: 'Waiting for HDEncode',
       ready: 'Ready to retry',
       scheduled: 'Scheduled',
@@ -101,7 +105,11 @@
       addToast('Retries scheduled', `${result.scheduled} item(s), ${intervalMinutes}-minute spacing`);
       await load();
     } catch (e) {
-      addToast('Retry unavailable', e instanceof Error ? e.message : 'The source is still paused.', 'warning');
+      // The backend refuses "retry all" while a challenge episode is open, and
+      // its message explains why and what to do instead. Surface it verbatim
+      // rather than flattening it to "still paused" — that is a different
+      // condition with a different remedy (wait, vs. probe a single item).
+      addToast('Retry all unavailable', e instanceof Error ? e.message : 'The source is still paused.', 'warning');
     } finally {
       busy = '';
     }
@@ -126,6 +134,8 @@
       <h2 class="text-sm font-semibold">Verification Retries</h2>
       <p class="text-xs text-[var(--text-secondary)]">
         Challenged and source-deferred link grabs are retained across restarts.
+        When automated verification did not complete, retrying is a probe rather
+        than a fix — it presents the same challenge to the same browser.
       </p>
     </div>
     {#if browser}
@@ -189,7 +199,11 @@
             <button
               class="px-2.5 py-1 rounded bg-[var(--accent)] text-white text-xs disabled:opacity-40"
               disabled={!item.retry_available || busy !== ''}
-              title={item.retry_available ? 'Retry this item' : 'HDEncode is still paused'}
+              title={item.retry_available
+                ? (item.state === 'verification_required'
+                  ? 'Probe this one item to test whether the challenge has lifted. It is not a fix — the same challenge is presented again.'
+                  : 'Retry this item')
+                : 'HDEncode is still paused'}
               onclick={() => retry(item)}
             >
               {busy === item.item_uuid ? 'Working…' : 'Retry now'}

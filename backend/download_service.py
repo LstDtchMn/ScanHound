@@ -37,6 +37,7 @@ from backend.download_outcome import (
     CHALLENGE_IFRAME_MARKERS,
     cf_mitigated_from_perf_log,
     challenge_iframe_srcs,
+    turnstile_challenge_evidence,
     diagnostic_from_traffic_denial,
     strong_challenge_markers,
 )
@@ -439,6 +440,12 @@ class DownloadService:
         self.cached_driver = None
         # Latest navigation's Cloudflare cf-mitigated value (None = no signal).
         self._last_cf_mitigated: Optional[str] = None
+        # Console entries belonging to the CURRENT navigation only. Reset the
+        # instant before each `driver.get`, appended to on every drain, so an
+        # error left by the previous page can never classify this one. The
+        # browser session is persistent and shared, so without the reset one
+        # stalled release would go on explaining every release after it.
+        self._navigation_console: List[dict] = []
         self._browser_status: Dict[str, Any] = safe_status_without_driver(
             self.config,
             chrome_bin=os.environ.get("CHROME_BIN"),
@@ -1459,6 +1466,10 @@ class DownloadService:
                         )
                         return None, diag
 
+                    # NAVIGATION SCOPING, and it has to be here rather than at
+                    # the point of use: this is the only place that knows a new
+                    # page is about to load.
+                    self._reset_console_log(driver)
                     try:
                         driver.get(url)
                     except Exception as exc:
@@ -1676,6 +1687,84 @@ class DownloadService:
                     ),
                 )
             if stage == "access_control" and reveal_tier == "not-ready":
+                # THE CONJUNCTION. Not-ready ALONE is not challenge evidence and
+                # never becomes it: the reveal control sits in that state on
+                # perfectly healthy loads that simply had not finished. Active
+                # Turnstile evidence ALONE is not enough either -- an unsolved
+                # widget on a page that went on to hand over links is not a
+                # failure. It takes both, and only both, to say the reveal was
+                # stopped by a verification ScanHound could not complete.
+                #
+                # MEASURED 2026-08-09, and the measurement is why this is a
+                # conjunction rather than either half. Six consecutive loads of
+                # the very release that had been parked for a day presented NO
+                # widget at all, with the control reading "View links" and
+                # enabled. The gate is intermittent. A detector keyed on the
+                # not-ready label alone would call that release challenged; one
+                # keyed on Turnstile's mere presence would call a healthy load
+                # challenged the moment hdencode turns the gate back on.
+                try:
+                    page_base = driver.current_url or ""
+                except Exception:
+                    page_base = ""
+                turnstile_evidence = turnstile_challenge_evidence(
+                    html,
+                    console_entries=self._drain_console_log(driver),
+                    unlock_target=(
+                        (lambda action: _resolves_to_unlock_target(
+                            action, page_base))
+                        if page_base
+                        else None
+                    ),
+                )
+                if turnstile_evidence:
+                    signals.append("reveal-tier:not-ready")
+                    signals.extend(turnstile_evidence)
+                    decision = None
+                    if source_kind == "hdencode":
+                        decision = get_hdencode_coordinator().observe_challenge()
+                    self._log(
+                        "[HDEncode] the link reveal is gated by a Cloudflare "
+                        "Turnstile challenge that did not complete in this "
+                        f"browser session: {list(turnstile_evidence)}. This "
+                        "needs a person; it will not be retried automatically.",
+                        "warning",
+                    )
+                    return ScrapeDiagnostic(
+                        ScrapeCode.INTERACTIVE_CHALLENGE,
+                        # NOT RETRYABLE. Retrying re-presents the same challenge
+                        # to the same browser. Measured three times on 08-09:
+                        # three loads, three failures, zero links.
+                        retryable=False,
+                        affects_source_health=True,
+                        signals=tuple(signals),
+                        stage="verification",
+                        # The MECHANISM lives here, because the reason code says
+                        # only "a challenge". cause_code is persisted on the
+                        # item, so an operator reading the row a week later can
+                        # still tell a Turnstile that failed to execute from a
+                        # Cloudflare interstitial or a captcha on some other
+                        # form.
+                        cause_code="turnstile_challenge_failed",
+                        cooldown_until=(
+                            decision.cooldown_until
+                            if decision is not None
+                            else None
+                        ),
+                        transport_attempted=True,
+                        # SOURCE, deliberately unchanged. This is the membership
+                        # that routes the outcome to _pause_for_source instead of
+                        # _fail. Narrowing it to "item" is what once let 78 items
+                        # march into the same closed door and become permanent
+                        # failures, one at a time.
+                        affected_scope="source",
+                        retry_mode="manual_verification",
+                        action_code="verification_required",
+                        health_owner=(
+                            "coordinator" if source_kind == "hdencode"
+                            else "outcome_recorder"
+                        ),
+                    )
                 # A STALLED VERIFY IS A THROTTLE, NOT A BROKEN PAGE.
                 #
                 # This previously fell through to LAYOUT_CHANGED: retryable=False,
@@ -1878,6 +1967,40 @@ class DownloadService:
         if matches:
             state["ambiguous"] = True
         return None
+
+    def _reset_console_log(self, driver) -> None:
+        """Start a fresh console buffer for the navigation about to happen.
+
+        Draining and DISCARDING is the point. Chrome's browser log is a queue
+        on a long-lived session, so whatever the previous page logged is still
+        sitting there; reading it after the next navigation would attribute one
+        page's failure to another. Failures are swallowed because console
+        capture is an evidence source, never a precondition for grabbing.
+        """
+        self._navigation_console = []
+        try:
+            driver.get_log("browser")
+        except Exception:
+            return
+
+    def _drain_console_log(self, driver) -> List[dict]:
+        """Append newly logged console entries and return the navigation's set.
+
+        APPEND, not replace: a single navigation is diagnosed more than once
+        (the pre-click challenge wait, then the post-click page), each drain
+        empties Chrome's queue, and a replace would throw away the earlier
+        window -- including the first Turnstile error, which arrives about two
+        seconds after load and well before the reveal window closes.
+        """
+        try:
+            entries = driver.get_log("browser") or []
+        except Exception:
+            entries = []
+        buffer = getattr(self, "_navigation_console", None)
+        if buffer is None:
+            buffer = self._navigation_console = []
+        buffer.extend(entries)
+        return list(buffer)
 
     def _capture_cf_mitigated(self, driver) -> Optional[str]:
         """Drain the navigation's performance log and record its cf-mitigated value.

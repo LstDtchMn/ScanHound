@@ -46,7 +46,19 @@ _MESSAGES = {
     ScrapeCode.BROWSER_LAUNCH_FAILED: "The browser could not start. Check the Chromium/Xvfb service and profile locks.",
     ScrapeCode.BROWSER_NETWORK_ERROR: "Chromium could not reach the source because of a browser network or DNS error.",
     ScrapeCode.BROWSER_NAVIGATION_FAILED: "The browser failed while navigating to the source page.",
-    ScrapeCode.INTERACTIVE_CHALLENGE: "The source presented an interactive verification challenge that did not clear.",
+    # PROMISES NOTHING, and specifically not that the user can finish the
+    # verification. They cannot: the challenge is presented to a headless
+    # Chromium running under Xvfb inside the container, and the only controls
+    # the UI offers are Retry now / Retry all / Remove. There is no path from a
+    # click in ScanHound to that browser session. Saying "verification required"
+    # implied there was one, and sent the reader looking for a button that has
+    # never existed.
+    ScrapeCode.INTERACTIVE_CHALLENGE: (
+        "Automated verification did not complete. The source presented a "
+        "verification challenge that ScanHound's browser could not finish, so "
+        "the links were never shown. Waiting will not clear this and a retry "
+        "presents the same challenge again."
+    ),
     # Asserting "the layout changed" overstates what this code knows. It fires
     # only after the challenge branch above has already ruled out a cf-mitigated
     # header, captcha frames and challenge markers -- so what remains is "the
@@ -93,6 +105,17 @@ _SIGNAL_BEARING_CODES = frozenset({
     ScrapeCode.REVEAL_VERIFICATION_STALLED,
     ScrapeCode.NO_FILE_HOST_LINKS,
     ScrapeCode.REQUESTED_HOST_MISSING,
+    # ADDED 2026-08-09. This code does name its own cause at the level of "a
+    # challenge", which is why it was excluded -- but "a challenge" turned out
+    # not to be specific enough to act on. Which challenge, presented by what,
+    # and proven by which marker are the facts that decide whether an operator
+    # is looking at a Turnstile that failed to execute, a Cloudflare
+    # interstitial, or a captcha on some unrelated form. Without them the
+    # signals live only in the app log, and the 2026-07-31 burst of 64
+    # layout_changed failures is the standing proof of what that costs: by the
+    # time anyone looked, the log had rotated and the cause became permanently
+    # unknowable.
+    ScrapeCode.INTERACTIVE_CHALLENGE,
 })
 
 

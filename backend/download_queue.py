@@ -924,6 +924,26 @@ class DownloadQueueService:
                     "WHERE batch_uuid = ?",
                     (item["batch_uuid"],),
                 )
+                # THE ONE THING THAT CLOSES A CHALLENGE EPISODE, and it is
+                # deliberately the same predicate that earns retry budget: a
+                # completion that genuinely crossed the source boundary. This
+                # browser session asked this source for links and got them,
+                # which is the only evidence that the challenge which stopped it
+                # is no longer stopping it.
+                #
+                # Not a timer, and not a human reporting success elsewhere. Both
+                # were available and both are wrong: the first releases 22 items
+                # into an unanswered challenge, and the second releases them on
+                # evidence about a different browser.
+                closed = self._close_challenge_episodes(
+                    conn, str(item.get("source") or "")
+                )
+                if closed:
+                    logger.info(
+                        "Closing %d challenge episode(s) for %s: item %s "
+                        "completed a real source delivery.",
+                        closed, item.get("source"), item.get("item_uuid"),
+                    )
             self._refresh_batch_locked(conn, item["batch_uuid"], now)
         self._emit(
             "download:queue_updated",
@@ -981,6 +1001,12 @@ class DownloadQueueService:
         direct = outcome.get("reason_code") == "interactive_challenge"
         item_state = "verification_required" if direct else "waiting_source"
         item_reason = "interactive_challenge" if direct else "source_deferred"
+        # ONE EPISODE PER CHALLENGE, opened here because this is the only place
+        # that knows a challenge just stopped a real attempt. The siblings this
+        # method is about to park keep their ordinary source_deferred reason --
+        # they did not meet the challenge, they were merely behind it -- so the
+        # episode on the batch is what holds them once their cooldowns expire.
+        episode_id = str(uuid.uuid4()) if direct else None
         with self.db.transaction() as conn:
             if not conn:
                 return False
@@ -1047,6 +1073,7 @@ class DownloadQueueService:
                     cooldown_until = ?,
                     last_reason_code = ?,
                     last_cause_code = ?,
+                    challenge_episode_id = COALESCE(?, challenge_episode_id),
                     updated_at = ?
                 WHERE batch_uuid = ?
                 """,
@@ -1055,6 +1082,11 @@ class DownloadQueueService:
                     outcome.get("cooldown_until"),
                     outcome.get("reason_code"),
                     outcome.get("cause_code"),
+                    # COALESCE, so a non-challenge pause landing on a batch that
+                    # already has an open episode does not quietly erase it. A
+                    # source throttle arriving after a challenge is not an answer
+                    # to the challenge.
+                    episode_id,
                     now,
                     item["batch_uuid"],
                 ),
@@ -1581,12 +1613,26 @@ class DownloadQueueService:
         return updated
 
     def retry_ready(self, interval_minutes: int = 10) -> dict:
+        """"Retry all" across every deferred HDEncode row. Same refusal as
+        resume_batch, and for the same reason -- this one is broader still,
+        since it spans batches. Guarded here rather than only at the route,
+        because a rule enforced at one entrance is a rule with an unguarded
+        second door.
+        """
         self._assert_hdencode_available()
         interval = max(0, min(120, int(interval_minutes)))
         now = _utcnow()
         with self.db.transaction() as conn:
             if not conn:
                 raise DownloadQueueError("The database is unavailable.")
+            if self._challenge_episode_open(conn, "hdencode"):
+                raise DownloadQueueError(
+                    "HDEncode is held behind a verification challenge that "
+                    "ScanHound could not complete. Retrying everything would "
+                    "present the same challenge to every item in turn. Retry a "
+                    "single item to test whether it has lifted; the rest are "
+                    "released automatically once one succeeds."
+                )
             rows = conn.execute(
                 """
                 SELECT item_uuid, batch_uuid
@@ -1682,6 +1728,9 @@ class DownloadQueueService:
                     source_delivery_count=int(brow["source_delivery_count"] or 0),
                     progress_mark=int(brow["auto_resume_progress_mark"] or 0),
                     max_attempts=parse_max_attempts(self.config),
+                    challenge_open=self._challenge_episode_open(
+                        conn, blocked_source
+                    ),
                 )
                 candidates = conn.execute(
                     """
@@ -1852,6 +1901,65 @@ class DownloadQueueService:
         self._emit("download:batch_schedule", batch)
         return batch
 
+    @staticmethod
+    def _challenge_episode_open(conn, source: Optional[str]) -> bool:
+        """True while an unanswered challenge episode still holds this SOURCE.
+
+        SOURCE-SCOPED, not batch-scoped, and the difference is the whole
+        containment story. A challenge is presented by the site, so it applies
+        to every batch holding items from that site. Scoping the hold to the
+        batch that happened to meet it would let a second batch march its own
+        items into the identical challenge -- which is the shape of the original
+        defect (78 items, one closed door, one item at a time), just with a
+        different mechanism.
+
+        The episode is treated as closed once nothing deferred is left behind
+        it, so a batch whose items were cancelled or manually cleared cannot
+        hold the source hostage on a stale flag.
+        """
+        if not source:
+            return False
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM download_queue_batches b
+            JOIN download_queue_items i ON i.batch_uuid = b.batch_uuid
+            WHERE b.challenge_episode_id IS NOT NULL
+              AND i.source = ?
+              AND i.state IN ('verification_required', 'waiting_source')
+            LIMIT 1
+            """,
+            (source,),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _close_challenge_episodes(conn, source: Optional[str]) -> int:
+        """Close every open episode for a source. Returns how many were closed.
+
+        THE ONLY THING THAT MAY CALL THIS is an affirmative ScanHound-side
+        success -- this browser session completing a real reveal on this source.
+        A human passing the same challenge in their own browser is NOT that: it
+        proves the challenge is passable, not that the session which failed it
+        can now pass it, and acting on it would release every sibling straight
+        back into the failure.
+        """
+        if not source:
+            return 0
+        return conn.execute(
+            """
+            UPDATE download_queue_batches
+            SET challenge_episode_id = NULL
+            WHERE challenge_episode_id IS NOT NULL
+              AND batch_uuid IN (
+                  SELECT DISTINCT batch_uuid
+                  FROM download_queue_items
+                  WHERE source = ?
+              )
+            """,
+            (source,),
+        ).rowcount
+
     def _note_auto_resumed(self, batch_uuid: str) -> None:
         """Remember that THIS batch really resumed something automatically.
 
@@ -1864,6 +1972,39 @@ class DownloadQueueService:
         self._last_auto_resumed_batches.add(str(batch_uuid))
 
     def resume_batch(self, batch_uuid: str, interval_minutes: int = 10) -> dict:
+        """Operator "resume everything". REFUSED while a challenge is open.
+
+        This is the manual counterpart to auto-resume, and it releases every
+        deferred row in the batch at once. That is the right behaviour for a
+        source that was merely throttled and the wrong behaviour for a source
+        presenting a challenge: it hands the whole batch to a door that is
+        measured to be shut, spending every item's attempt to learn one fact.
+
+        Refusing rather than silently downgrading, because the operator asked
+        for something specific and deserves to be told why they are not getting
+        it. The single-item probe (retry_item) stays available and is the
+        supported way to test whether the challenge has lifted.
+        """
+        with self.db.transaction() as conn:
+            if not conn:
+                raise DownloadQueueError("The database is unavailable.")
+            sources = [
+                str(row["source"])
+                for row in conn.execute(
+                    "SELECT DISTINCT source FROM download_queue_items "
+                    "WHERE batch_uuid = ?",
+                    (batch_uuid,),
+                ).fetchall()
+            ]
+            blocked = [s for s in sources if self._challenge_episode_open(conn, s)]
+        if blocked:
+            raise DownloadQueueError(
+                "This batch is held behind a verification challenge that "
+                f"ScanHound could not complete ({', '.join(sorted(blocked))}). "
+                "Resuming every item would present the same challenge to each "
+                "of them in turn. Retry a single item to test whether it has "
+                "lifted; the rest are released automatically once one succeeds."
+            )
         return self._resume_batch(
             batch_uuid,
             interval_minutes=interval_minutes,
