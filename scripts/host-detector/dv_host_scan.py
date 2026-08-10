@@ -166,16 +166,29 @@ def _tag_file(path, layer):
         return False
 
 
-def _post_import(api_base):
+def _post_import(api_base, label="dv-import"):
+    """POST the import trigger. Returns True on success, False on failure.
+
+    Returning a status matters: this used to swallow the outcome, so a scan
+    could finish, report success, and leave the container with none of its
+    results -- the failure mode being fixed here, one layer up.
+
+    A missed import is self-healing and never loses data: the endpoint re-reads
+    the WHOLE host store and upserts every row, so the next successful call
+    carries anything an earlier one missed.
+    """
     url = api_base.rstrip("/") + DV_IMPORT_PATH
     req = urllib.request.Request(url, data=b"{}",
                                  headers={"Content-Type": "application/json"},
                                  method="POST")
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
-            logger.info("dv-import -> %s", resp.read().decode("utf-8", "replace"))
+            logger.info("%s -> %s", label,
+                        resp.read().decode("utf-8", "replace"))
+        return True
     except OSError as e:
-        logger.error("dv-import POST failed: %s", e)
+        logger.error("%s POST failed: %s", label, e)
+        return False
 
 
 def _iter_files(roots):
@@ -192,6 +205,10 @@ def main(argv=None):
     ap.add_argument("--config", default="data/dv_host.json")
     ap.add_argument("--db", default=DEFAULT_DB_PATH)
     ap.add_argument("--api", default="http://localhost:9721")
+    # Hand results off DURING the walk, not only at the end. 0 disables.
+    ap.add_argument("--import-every", type=int, default=10, metavar="N",
+                    help="POST dv-import after every N newly scanned files "
+                         "(0 = only at the end)")
     args = ap.parse_args(argv)
 
     cfg = load_host_config(args.config)
@@ -205,6 +222,7 @@ def main(argv=None):
     tagging = bool(cfg.get("dv_file_tagging"))
     conn = _open_db(args.db)
     scanned = 0
+    imported_at = 0   # value of `scanned` when the last interim import fired
     for path in _iter_files(parse_roots(cfg)):
         try:
             st = os.stat(path)
@@ -253,10 +271,41 @@ def main(argv=None):
         if tagging and _tag_file(path, layer):
             st2 = os.stat(path)  # header rewrite bumped mtime/size
             _upsert(conn, classify_to_row(path, layer, st2))
+
+        # HAND OFF DURING THE WALK.
+        #
+        # _post_import() used to be the last statement of main(), reached only
+        # after the entire root walk finished -- and the walk does not finish.
+        # ~230 files at ~6/hour is ~38 hours against the scheduled task's PT6H
+        # limit, so every run was killed mid-loop and the import never ran at
+        # all. Measured 2026-08-10: host dv_host.db 622 rows, container dv_scan
+        # 466, MAX(last_seen_at) frozen at 2026-07-26 -- Plex DV labels 14 days
+        # stale while detection was working perfectly the whole time.
+        #
+        # Gated on NEW files rather than a timer on purpose. Each import
+        # re-upserts every row, and upsert_dv_scan refreshes last_seen_at, which
+        # is what the label sync watches -- so an import with nothing new behind
+        # it would trigger a full every-movie-library Plex pass for no reason
+        # (app_service.py's own comment calls that "pure waste"). Tying the
+        # cadence to real detections keeps every sync earned.
+        if args.import_every > 0 and (scanned - imported_at) >= args.import_every:
+            _post_import(args.api, label="interim dv-import")
+            # Advance regardless of outcome: the import is cumulative, so a
+            # failure loses nothing and retrying every single file would only
+            # hammer a container that is down.
+            imported_at = scanned
+
     conn.close()
     logger.info("scanned %d file(s); posting dv-import", scanned)
-    _post_import(args.api)
-    return 0
+    # ALWAYS run the final import, even when this run scanned nothing. Rows
+    # committed by earlier killed runs are still sitting in the host store
+    # unexported -- that backlog is exactly how the 622/466 gap accumulated, and
+    # gating this on scanned>0 would strand it forever.
+    ok = _post_import(args.api, label="final dv-import")
+    if not ok:
+        logger.error("final dv-import failed -- the container did not receive "
+                     "this scan's results; Plex labels will not update")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
