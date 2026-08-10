@@ -1,7 +1,8 @@
 # dovi_tool 2.3.2 — `extract-rpu` hangs at a fixed stream offset (100% CPU, zero read syscalls)
 
-Draft upstream report for https://github.com/quietvoid/dovi_tool.
-Everything below is measured; the one unresolved variable is called out in §6.
+Upstream report for https://github.com/quietvoid/dovi_tool. Everything below is
+measured. Both variables that could have explained it away -- the SMB transport
+and the tool version -- have been eliminated by direct test (§6).
 
 ---
 
@@ -20,10 +21,11 @@ hours apart under different system load, and it is **frame-addressable**:
 
 | | |
 |---|---|
-| dovi_tool | 2.3.2 (Windows x86_64) |
+| dovi_tool | **2.3.2 and 2.3.3** (Windows x86_64) — both affected |
 | OS | Windows 11 Pro 10.0.26200 |
 | Command | `dovi_tool extract-rpu "<file>" -o <out>.rpu.bin` |
 | Input | Matroska (.mkv), Dolby Vision Profile 7 FEL, UHD remux |
+| Storage | reproduced on both SMB and local NTFS |
 
 ## 3. Observed behaviour
 
@@ -97,14 +99,33 @@ fully readable end to end.
 **Not transient.** Independent runs hours apart stalled at the identical byte
 offset.
 
-## 6. The one variable not yet eliminated
+## 6. Reproduces on the latest release, and on local disk
 
-Both files live on an SMB share (a mapped drive to a NAS). The zero-read-syscall
-signature argues strongly against an SMB interaction — a stalled network read
-would not burn CPU — but a local-disk reproduction has not yet been completed.
-**A retest against a local copy is in progress and this report should not be
-filed until that result is in.** If the hang does not reproduce locally, the
-whole framing changes and this becomes an SMB-interaction report instead.
+Both variables that could have explained this away are now eliminated by
+measurement rather than by argument.
+
+| version | storage | stalled at byte | time to stall |
+|---|---|---|---|
+| 2.3.2 | SMB (mapped drive) | 27,367,062,473 | — |
+| 2.3.2 | SMB, independent rerun | 27,367,062,473 | 505 s |
+| **2.3.2** | **local NTFS disk** | **27,367,130,713** | 377 s |
+| **2.3.3** | SMB (mapped drive) | **27,367,064,938** | 794 s |
+
+All four stalls fall within a **~68 KB window** of one another — the spread is
+consistent with read-buffer granularity, not with different causes.
+
+**Not the transport.** The file was copied whole to a local NTFS volume
+(74,277,195,186 bytes at 142.4 MB/s) and 2.3.2 stalls there too, faster
+(377 s vs 505 s) because the local read is quicker — it simply reaches the same
+poisoned position sooner.
+
+**Not fixed in 2.3.3.** 2.3.3 was tested because its changelog looked directly
+relevant ("`extract-rpu` … now properly exit with errors for invalid inputs";
+"improved dovi/level11 byte parsing for broader sample file compatibility").
+It hangs identically, 2,465 bytes from where 2.3.2 does.
+
+So: a deterministic, content-triggered hang, present in the current release,
+independent of storage.
 
 ## 7. Workaround
 
