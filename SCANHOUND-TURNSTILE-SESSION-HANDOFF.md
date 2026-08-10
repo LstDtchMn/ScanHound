@@ -217,6 +217,37 @@ row that must *not* move sitting beside one that must.
 
 ---
 
+## 5a. ChatGPT's review, and round 2
+
+ChatGPT returned **REQUEST CHANGES** with four MEDIUM blocking findings and two
+LOW. Each was verified in code before being accepted. **All six were real.**
+
+Its closing sentence is the one worth keeping:
+
+> The authority is correct. The remaining failures are at boundaries where
+> consumers reconstruct, infer, or silently drop one of its facts.
+
+| # | Finding | Verdict |
+|---|---|---|
+| 1 | `scripts/queue_recovery_state.py` builds `SharedFacts` without `challenge_open`, so the diagnostics disagreed with production about every **sibling** row | Confirmed. Fixed with a correlated subquery in the adapter SQL |
+| 2 | Episode closure was inferred from child-state emptiness, so probing or cancelling a single-item episode batch closed it before any success | Confirmed. `challenge_episode_id` is now sole authority; added `clear_challenge_episode()` as the explicit operator escape hatch |
+| 3 | The migration treated `reveal_verification_stalled` as challenge evidence — the code that specifically means *no* challenge evidence — and gave one episode to every parked batch | Confirmed. Now requires explicitly named trigger item IDs and refuses to guess |
+| 4 | The older `captcha_frames or challenge_markers` branch classified before the new conjunction, so a **ready** reveal plus any turnstile iframe became a source-wide hold | Confirmed. Interstitial and embedded-frame evidence are now partitioned |
+| 5 | The doc claimed the one-item probe "stays available"; it is disabled during the coordinator's one-hour quiet period | Confirmed. Documentation corrected |
+| 6 | Response-field association read `form.action` only, ignoring a submit's `formaction` override | Confirmed. Now shares one effective-target helper with the reveal rule |
+
+Two things worth carrying forward as lessons rather than as fixes:
+
+* **I found the `LABELS` instance of finding 1 myself and then stopped.** Both
+  bugs are the same shape — a consumer dropping a fact — in the same file. Having
+  found one, the right move was to grep every construction site. There are
+  exactly two `SharedFacts(` calls in the codebase.
+* **My own discrimination test for finding 4 could not reach the code it was
+  discriminating.** It used the response field and the console; the bypass is in
+  the iframe branch. It passed while the bug sat open beside it. The replacement
+  includes a control asserting `iframe:turnstile` is *still produced*, so the
+  test cannot pass by the detector having gone silent.
+
 ## 6. Test evidence
 
 Method: `git archive HEAD` of the **whole tree** into a fresh container off
@@ -237,7 +268,19 @@ Method: `git archive HEAD` of the **whole tree** into a fresh container off
   Verified through `decide()`, i.e. the consumer, not by checking columns.
 * `test_queue_liveness_model.py` — the independent oracle that deliberately does
   not import the policy — is unaffected and still passes.
-* Full suite: **4654 passed** on the branch vs **4620** on main.
+* **Round 2:** `tests/test_challenge_episode_migration.py` added; the other two
+  extended. **14 of the new tests fail on the pre-review head `fcc5a40` and pass
+  now** — a control for every one of ChatGPT's six findings.
+* Full suite (round 1): **4654 passed** on the branch vs **4620** on main, with
+  the only failures the known date bug that also fails on main.
+
+**Note on CI.** ChatGPT observed no GitHub Actions run associated with the
+reviewed head and correctly treated the suite counts as author/local evidence,
+not independent confirmation. That is accurate. Every run reported here was done
+locally by `git archive` of the whole tree into a fresh container off
+`scanhound:latest`, with `origin/main` run the same way in the same session as a
+baseline. Worth checking whether Actions minutes are the reason before reading
+anything into the absence.
 
 ---
 
@@ -263,11 +306,17 @@ passed, fixture as the only change.**
 
 1. **Review.** `agent/turnstile-classification` is pushed for the ChatGPT round.
 2. **Merge and deploy are Jesse's calls.** Neither has been done.
-3. **The migration has not been run.** It cannot run yet — the live DB lacks
-   `challenge_episode_id` until the app is rebuilt, and the script refuses
-   without it. Jesse's decision was to **leave the 22 parked items alone**: their
-   cooldowns lift around 01:54 and the source is currently serving the reveal
-   control ready, so they will most likely grab normally.
+3. **The migration has not been run, and now needs an argument it did not
+   before.** It cannot run until the app is rebuilt (the live DB lacks
+   `challenge_episode_id` and the script refuses without it), and it now requires
+   `--trigger <item_uuid>` naming a row someone has actually verified met a
+   challenge. For the live incident that is
+   `9e888af4-2f72-4ff3-8ad0-0d6277ea5b98` (the Being Erica S02 row, the one whose
+   console produced 600010) — but **only if the challenge is still what is
+   holding it.** Jesse's decision was to **leave the 22 parked items alone**:
+   their cooldowns lift around 01:54 and the source was serving the reveal
+   control ready, so they will most likely grab normally and no episode is
+   needed for this incident at all.
 4. **`fix/policy-tests-wall-clock` is pushed** and independent; it can merge on
    its own.
 5. **Unrelated, worth someone's attention:** the main working tree at

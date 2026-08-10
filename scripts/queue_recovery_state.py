@@ -72,7 +72,26 @@ JOINED_DEFERRED_SQL = """
            b.auto_resume_after_cooldown  AS auto_resume_after_cooldown,
            b.auto_resume_used            AS auto_resume_used,
            b.source_delivery_count       AS source_delivery_count,
-           b.auto_resume_progress_mark   AS auto_resume_progress_mark
+           b.auto_resume_progress_mark   AS auto_resume_progress_mark,
+           -- SOURCE-SCOPED, matching DownloadQueueService._challenge_episode_open
+           -- exactly. Peer review found this fact missing: production passed
+           -- challenge_open into SharedFacts and this adapter did not, so the
+           -- dataclass default False applied and the two disagreed about every
+           -- SIBLING row -- production said VERIFICATION_HOLD, the diagnostics
+           -- said "due now, waiting for the next scheduler pass". The trigger
+           -- row hid the disagreement, because its own queue_reason is enough
+           -- on its own.
+           --
+           -- This is the same failure class as rounds 12, 13 and 14: the
+           -- authority was right and a consumer dropped one of its facts before
+           -- calling it. A correlated subquery keeps it in ONE statement, so
+           -- there is no second read to fall out of step.
+           (SELECT COUNT(*) FROM download_queue_batches eb
+             WHERE eb.challenge_episode_id IS NOT NULL
+               AND EXISTS (SELECT 1 FROM download_queue_items ei
+                            WHERE ei.batch_uuid = eb.batch_uuid
+                              AND ei.source = i.source)
+           )                             AS challenge_open
     FROM download_queue_items i
     LEFT JOIN download_queue_batches b ON b.batch_uuid = i.batch_uuid
     WHERE i.state IN ('waiting_source', 'verification_required')
@@ -118,8 +137,26 @@ def facts_from_row(row):
         source_delivery_count=int(row["source_delivery_count"] or 0),
         progress_mark=int(row["auto_resume_progress_mark"] or 0),
         max_attempts=load_max_attempts(),
+        # Keyed off the row's own source, so a deferred row in ANY batch is held
+        # while that source has an open episode -- which is what production does.
+        challenge_open=bool(_optional(row, "challenge_open")),
     )
     return item, shared
+
+
+def _optional(row, key, default=None):
+    """Read a column that may be absent from an older/partial row mapping.
+
+    The adapter is also fed hand-built rows by tests and by scanhound_check's
+    own fixtures. Failing closed here would be wrong in both directions, so a
+    missing column means "no episode fact available" and the row is judged on
+    the remaining facts -- exactly as it was before this column existed.
+    """
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
 
 
 def classify_rows(rows, now=None):

@@ -268,6 +268,126 @@ class TestTheConjunctionHoldsBothWays:
             html, unlock_target=_unlock_target) == ("turnstile:unsolved-response-field",)
 
 
+class TestTheOlderIframePathDoesNotBypassTheConjunction:
+    """PEER REVIEW 2026-08-09, and my own test failed to catch it.
+
+    `_log_page_diagnostics` classifies on `header_challenge or captcha_frames or
+    challenge_markers` BEFORE reaching the reveal conjunction, and
+    `strong_challenge_markers` returns `iframe:turnstile` for any turnstile
+    frame anywhere on the page. So a page whose reveal control reads "View
+    links" and which happens to carry a Turnstile frame became a source-wide
+    manual hold.
+
+    My "evidence without a stalled reveal" test used the response field and the
+    console -- neither of which reaches that branch -- so it passed while the
+    bypass sat open beside it. A discrimination test that cannot reach the code
+    it is discriminating is not a control.
+    """
+
+    def test_a_ready_reveal_with_a_turnstile_iframe_is_not_a_challenge(
+            self, service):
+        svc, _ = service
+        html = _page(body=(
+            '<form action="' + UNLOCK_ACTION + '">'
+            '<input type="submit" value="View links"></form>'
+            + CHALLENGE_IFRAME))
+        d = _diagnose(svc, html=html, tier="links-control")
+        assert d.code is not ScrapeCode.INTERACTIVE_CHALLENGE
+
+    def test_the_marker_that_used_to_classify_is_still_produced(self):
+        """The control for the test above: if the iframe stopped being detected
+        at all, that test would pass for the wrong reason."""
+        from backend.download_outcome import strong_challenge_markers
+        html = _page(body=CHALLENGE_IFRAME)
+        assert "iframe:turnstile" in strong_challenge_markers(html, "")
+
+    def test_a_not_ready_reveal_with_a_challenge_iframe_is_a_challenge(
+            self, service):
+        """The other half: embedded frames still classify, but only in
+        conjunction with a reveal that did not complete."""
+        svc, _ = service
+        d = _diagnose(svc, html=_page(body=_reveal_form() + CHALLENGE_IFRAME))
+        assert d.code is ScrapeCode.INTERACTIVE_CHALLENGE
+
+    def test_a_genuine_interstitial_still_classifies_on_its_own(self, service):
+        """A Cloudflare challenge PAGE replaces the release page, so it is
+        source-wide regardless of any reveal control. Narrowing the iframe rule
+        must not narrow this one."""
+        svc, _ = service
+        html = ("<html><head><title>Just a moment…</title></head><body>"
+                "<p>Checking your browser before accessing.</p></body></html>")
+        d = _diagnose(svc, html=html, tier="none")
+        assert d.code is ScrapeCode.INTERACTIVE_CHALLENGE
+
+    def test_an_interstitial_without_a_title_is_still_a_challenge(self, service):
+        """THE REGRESSION MY OWN FIX CAUSED, caught by the full suite.
+
+        Stripping iframe markers unconditionally also stripped them from real
+        Cloudflare interstitials. "just a moment" is matched against the
+        <title>, so a challenge page carrying the phrase in its BODY and serving
+        no title was left with the iframe as its only evidence -- and dropped
+        from INTERACTIVE_CHALLENGE to LAYOUT_CHANGED, i.e. from "a challenge
+        blocked us" to "the scraper is broken".
+
+        The discriminator is whether the page is a release page at all: an
+        interstitial replaces it and carries no access/download/link control.
+        """
+        svc, _ = service
+        html = ("<html><body><h1>Just a moment</h1>"
+                '<iframe src="https://challenges.cloudflare.com/turnstile">'
+                "</iframe></body></html>")
+        d = _diagnose(svc, html=html, tier=None)
+        assert d.code is ScrapeCode.INTERACTIVE_CHALLENGE
+
+    def test_the_release_page_control_is_what_tells_them_apart(self, service):
+        """The paired control: identical challenge frame, but the page still
+        has a working reveal control, so it is a widget on a release page and
+        not an interstitial."""
+        svc, _ = service
+        html = ("<html><body><h1>Just a moment</h1>"
+                '<form action="' + UNLOCK_ACTION + '">'
+                '<input type="submit" value="View links"></form>'
+                '<iframe src="https://challenges.cloudflare.com/turnstile">'
+                "</iframe></body></html>")
+        d = _diagnose(svc, html=html, tier="links-control")
+        assert d.code is not ScrapeCode.INTERACTIVE_CHALLENGE
+
+    def test_a_non_turnstile_captcha_frame_keeps_its_coverage(self, service):
+        """The partition must not quietly drop reCAPTCHA/hCaptcha detection on
+        a stalled reveal, which is coverage that existed before it."""
+        svc, _ = service
+        frame = ('<iframe src="https://www.google.com/recaptcha/api2/anchor">'
+                 "</iframe>")
+        d = _diagnose(svc, html=_page(body=_reveal_form() + frame))
+        assert d.code is ScrapeCode.INTERACTIVE_CHALLENGE
+
+
+class TestTheEffectiveTargetRuleIsMirrored:
+    """`formaction` overrides a form's action, and the reveal-control rule has
+    honoured that since 2026-07-24. The response-field check reused the URL
+    predicate but not this rule, so the two disagreed about where a form posts.
+    """
+
+    def test_a_submit_formaction_elsewhere_is_not_reveal_evidence(self):
+        html = _page(body=(
+            f'<form action="{UNLOCK_ACTION}">'
+            '<input type="submit" value="Report content" '
+            'formaction="/some-release-2026-2160p-9-0-gb/?report=x#uwee">'
+            + RESPONSE_FIELD + "</form>"))
+        assert turnstile_challenge_evidence(
+            html, unlock_target=_unlock_target) == ()
+
+    def test_a_submit_formaction_to_unlock_is_reveal_evidence(self):
+        html = _page(body=(
+            '<form action="/wp-comments-post.php">'
+            '<input type="submit" value="Verifying… Please wait" '
+            f'formaction="{UNLOCK_ACTION}">'
+            + RESPONSE_FIELD + "</form>"))
+        assert turnstile_challenge_evidence(
+            html, unlock_target=_unlock_target) == (
+                "turnstile:unsolved-response-field",)
+
+
 class TestNavigationScoping:
 
     def test_a_previous_pages_error_must_not_classify_this_one(self, service):

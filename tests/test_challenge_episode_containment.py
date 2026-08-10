@@ -139,6 +139,26 @@ def rig(tmp_path, monkeypatch):
     db = DatabaseManager(str(tmp_path / "episode.db"))
     downloads = ScriptedDownloads()
     service = DownloadQueueService({}, db, downloads, poll_seconds=0.01)
+    # THE COORDINATOR IS A PROCESS-WIDE SINGLETON WITH IN-MEMORY STATE, and
+    # `observe_challenge()` sets a one-hour cooldown on it. Any earlier test in
+    # the same pytest process that exercises a real challenge therefore leaves
+    # `_assert_hdencode_available()` raising for every test after it, and
+    # retry_item/retry_ready/resume_batch stop working here for reasons that
+    # have nothing to do with this file.
+    #
+    # Observed exactly that: these tests pass in the full suite, where
+    # alphabetical ordering puts them before test_scrape_outcomes.py, and fail
+    # when that file is named first on an ad-hoc command line. Order-dependent
+    # green is worse than red -- it survives review and breaks later, on
+    # somebody else's change, in a file they did not touch.
+    #
+    # Pinned unblocked, because this file's subject is the QUEUE's holds. The
+    # coordinator's separate quiet period is real behaviour and is documented in
+    # the review, but letting it leak in here would test process ordering.
+    monkeypatch.setattr(
+        DownloadQueueService, "_coordinator_snapshot",
+        lambda self: {"blocked": False},
+    )
     yield clock, db, downloads, service
     db.close()
 
@@ -402,6 +422,135 @@ class TestTheProbeIsOneItem:
                  for row in service.get_batch(batch["batch_uuid"])["items"]]
         assert ready.count("ready") == 1, "the probe is one item, not 22"
         assert ready.count("waiting_source") == 21
+
+
+class TestTheOperatorAdapterSeesWhatProductionSees:
+    """PEER REVIEW 2026-08-09. Production passed challenge_open into SharedFacts
+    and scripts/queue_recovery_state.py did not, so the dataclass default False
+    applied and the two disagreed about every SIBLING row: production held it,
+    the diagnostics called it due. The trigger row hid the disagreement, because
+    its own queue_reason is enough on its own.
+
+    Same failure class as rounds 12, 13 and 14 -- the authority is right and a
+    consumer drops one of its facts before calling it -- so it is pinned end to
+    end, through the real SQL, rather than by asserting the column exists.
+    """
+
+    def _classify(self, db):
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "scripts"))
+        from queue_recovery_state import JOINED_DEFERRED_SQL, facts_from_row
+
+        out = {}
+        for row in db._query_dicts(JOINED_DEFERRED_SQL, (), default=[]):
+            item, shared = facts_from_row(row)
+            out[row["item_uuid"]] = decide(item, shared, START + timedelta(days=2))
+        return out
+
+    def test_a_sibling_is_held_for_the_adapter_too(self, rig):
+        clock, db, downloads, service = rig
+        batch = _schedule(service, 5)
+        downloads.queue(challenge_outcome(clock))
+        _tick(service)
+
+        verdicts = self._classify(db)
+        assert set(verdicts.values()) == {VERIFICATION_HOLD}, (
+            "the diagnostics disagree with production about these rows: "
+            f"{verdicts}")
+
+    def test_the_same_rows_are_authorised_once_the_episode_closes(self, rig):
+        """THE NEGATIVE CONTROL. Without it the test above would pass on an
+        adapter that holds everything for some unrelated reason."""
+        clock, db, downloads, service = rig
+        batch = _schedule(service, 5)
+        downloads.queue(challenge_outcome(clock))
+        _tick(service)
+        service.clear_challenge_episode("hdencode")
+
+        verdicts = self._classify(db)
+        assert AUTHORISED in verdicts.values(), (
+            f"nothing was released after the episode closed: {verdicts}")
+
+
+class TestEpisodeClosureHasOneAuthority:
+    """PEER REVIEW 2026-08-09. Closure used to be inferred from child state: an
+    episode counted as open only while its batch still held a deferred row.
+
+    That evaporated during the probe window -- the exact interval the episode
+    exists to cover -- because probing the single trigger row moved it out of
+    the deferred states.
+    """
+
+    def _second_batch_of_siblings(self, service, clock, downloads):
+        """Batch A: one item, meets the challenge. Batch B: siblings."""
+        batch_a = _schedule(service, 1)
+        downloads.queue(challenge_outcome(clock))
+        _tick(service)
+        batch_b = service.schedule_batch(
+            [{"url": "https://hdencode.org/sibling-b/", "title": "Sibling B",
+              "media_type": "movie"}],
+            interval_minutes=0, mode="immediate",
+            auto_resume_after_cooldown=True)
+        with service.db.transaction() as conn:
+            conn.execute(
+                "UPDATE download_queue_items SET state='waiting_source', "
+                "queue_reason='source_deferred', cooldown_until=?, "
+                "last_reason_code='source_temporarily_blocked' "
+                "WHERE batch_uuid=?",
+                ((clock.now - timedelta(hours=1)).isoformat(),
+                 batch_b["batch_uuid"]))
+        return batch_a, batch_b
+
+    def test_probing_the_only_trigger_does_not_free_another_batch(self, rig):
+        clock, _db, downloads, service = rig
+        batch_a, batch_b = self._second_batch_of_siblings(
+            service, clock, downloads)
+
+        trigger = next(row["item_uuid"]
+                       for row in service.get_batch(batch_a["batch_uuid"])["items"]
+                       if row["state"] == "verification_required")
+        service.retry_item(trigger)      # batch A now holds no deferred row
+
+        clock.advance(days=2)
+        service._maybe_auto_resume()
+        states = _states(service, batch_b["batch_uuid"])
+        assert list(states.values()) == ["waiting_source"], (
+            "the episode closed itself during the probe window, before any "
+            "success proved the challenge had lifted")
+
+    def test_cancelling_the_trigger_does_not_free_another_batch(self, rig):
+        clock, _db, downloads, service = rig
+        batch_a, batch_b = self._second_batch_of_siblings(
+            service, clock, downloads)
+
+        trigger = next(row["item_uuid"]
+                       for row in service.get_batch(batch_a["batch_uuid"])["items"]
+                       if row["state"] == "verification_required")
+        service.cancel_item(trigger)
+
+        clock.advance(days=2)
+        service._maybe_auto_resume()
+        states = _states(service, batch_b["batch_uuid"])
+        assert list(states.values()) == ["waiting_source"]
+
+    def test_an_operator_can_abandon_the_episode_explicitly(self, rig):
+        """The escape hatch that makes the stricter rule safe -- otherwise an
+        episode outliving everything it held would strand the source with no
+        way back except a successful grab it is itself blocking."""
+        clock, _db, downloads, service = rig
+        batch_a, batch_b = self._second_batch_of_siblings(
+            service, clock, downloads)
+
+        assert service.clear_challenge_episode("hdencode")["cleared"] >= 1
+        clock.advance(days=2)
+        for _ in range(2):
+            downloads.queue(success_outcome())
+        service._maybe_auto_resume()
+        states = _states(service, batch_b["batch_uuid"])
+        assert list(states.values()) == ["ready"]
 
 
 class TestReleaseTakesAnAffirmativeSuccess:

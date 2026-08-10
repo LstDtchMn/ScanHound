@@ -1913,9 +1913,33 @@ class DownloadQueueService:
         defect (78 items, one closed door, one item at a time), just with a
         different mechanism.
 
-        The episode is treated as closed once nothing deferred is left behind
-        it, so a batch whose items were cancelled or manually cleared cannot
-        hold the source hostage on a stale flag.
+        ONE AUTHORITY: the stored `challenge_episode_id`. Nothing is inferred
+        from what state the child rows happen to be in.
+
+        WHAT THAT REPLACED, and why it was wrong. This used to additionally
+        require that some row in the episode's batch was still deferred, on the
+        reasoning that a cancelled batch should not hold the source hostage.
+        Peer review supplied the counterexample: an episode whose batch holds a
+        SINGLE challenge row closes itself the moment an operator probes it.
+
+            batch A   one challenge trigger, episode E
+            batch B   source-deferred siblings
+
+            retry_item(A1)  ->  A1 becomes 'ready'
+                            ->  A has no deferred row
+                            ->  episode reads CLOSED
+                            ->  B's siblings are released
+
+        The episode evaporated during the probe window -- the exact interval it
+        exists to cover -- before any success proved anything. Cancelling the
+        trigger did the same thing more directly.
+
+        So closure now has exactly two causes, both explicit: an affirmative
+        source delivery (_close_challenge_episodes) or an operator abandoning it
+        (clear_challenge_episode). An episode with no deferred rows left holds
+        nothing and costs nothing; if new work arrives for that source while it
+        is still open, holding that work is correct, and the probe path is
+        always available to resolve it.
         """
         if not source:
             return False
@@ -1923,15 +1947,37 @@ class DownloadQueueService:
             """
             SELECT 1
             FROM download_queue_batches b
-            JOIN download_queue_items i ON i.batch_uuid = b.batch_uuid
             WHERE b.challenge_episode_id IS NOT NULL
-              AND i.source = ?
-              AND i.state IN ('verification_required', 'waiting_source')
+              AND EXISTS (
+                  SELECT 1 FROM download_queue_items i
+                  WHERE i.batch_uuid = b.batch_uuid AND i.source = ?
+              )
             LIMIT 1
             """,
             (source,),
         ).fetchone()
         return row is not None
+
+    def clear_challenge_episode(self, source: str = "hdencode") -> dict:
+        """Operator action: abandon an open challenge episode for a source.
+
+        THE ESCAPE HATCH THAT MAKES THE STRICTER RULE SAFE. Because closure is
+        no longer inferred from child state, an episode can outlive everything
+        it was holding -- so there has to be a way to say "I have dealt with
+        this" that does not require a successful grab.
+
+        Deliberately NOT wired to any timer, and deliberately not called by
+        _maybe_auto_resume. A hold that automatic recovery can clear by itself
+        is not a hold.
+        """
+        with self.db.transaction() as conn:
+            if not conn:
+                raise DownloadQueueError("The database is unavailable.")
+            cleared = self._close_challenge_episodes(conn, source)
+        logger.info(
+            "Operator cleared %d challenge episode(s) for %s.", cleared, source
+        )
+        return {"source": source, "cleared": cleared}
 
     @staticmethod
     def _close_challenge_episodes(conn, source: Optional[str]) -> int:

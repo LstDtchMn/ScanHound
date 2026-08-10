@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
-"""Move already-parked rows onto challenge-episode semantics, atomically.
+"""Open a challenge episode over an EXPLICITLY IDENTIFIED set of parked rows.
 
-WHY A MIGRATION AT ALL. The rows parked before this change carry
-``last_reason_code = 'reveal_verification_stalled'`` (the item that met the
-challenge) and ``'source_temporarily_blocked'`` (its siblings). Nothing about
-them says "a human challenge stopped this", so the new hold in
-``queue_recovery_policy.decide()`` does not see them and they resume on their
-old timers exactly as before.
+WHY THIS TAKES ITEM IDS INSTEAD OF FINDING THEM, corrected on peer review
+2026-08-09. The first version searched for rows whose `last_reason_code` was
+`reveal_verification_stalled` with `transport_attempted = 1` and called those
+challenge triggers.
 
-WHY IT IS ONE TRANSACTION. Relabelling ``last_reason_code`` on its own is the
-trap this script exists to avoid. The label is not what authorises a retry --
-``queue_reason``, the batch's ``challenge_episode_id``, the item cooldown and
-the auto-resume budget are. Rewriting one of those and not the others produces a
-row that LOOKS held and is not, which is worse than one that plainly is not
-held, because it stops anyone looking further. So every fact that decides
-whether these rows may run moves together or not at all.
+That is backwards. `reveal_verification_stalled` is precisely the code the
+runtime classifier emits when a reveal stalled and there was NO active Turnstile
+evidence. Treating it as proof of Turnstile invents the very evidence the
+classifier was rewritten to require, and then writes that invention into the row
+as `cause_code = turnstile_challenge_failed` -- a confident claim about a page
+nobody looked at. It also assigned one episode to EVERY parked batch for the
+source, so an unrelated parked batch joined an incident it had nothing to do
+with.
 
-WHAT IT DELIBERATELY DOES NOT TOUCH: the cooldowns. It is tempting to null them
-"for safety", and it would be a mistake -- a deferred row with no cooldown of
-its own is NO_AUTHORISATION forever (see the round-14 note in the policy), so
-clearing them would also block the legitimate release after a probe succeeds.
-The episode is the hold; the cooldowns are what let the siblings restart
-politely, with spacing, once it is answered.
+Historical rows cannot be re-classified, because the evidence that would decide
+it (the page, its console) is gone. So the operator names the incident and this
+script does exactly what it is told, refusing anything it cannot verify.
+
+WHAT IT DELIBERATELY DOES NOT TOUCH: the cooldowns. Nulling them "for safety"
+would make the siblings NO_AUTHORISATION forever (see the round-14 note in the
+policy) and block the legitimate release after a probe succeeds. The episode is
+the hold; the cooldowns are what let the siblings restart politely afterwards.
 
 DRY RUN BY DEFAULT. Pass --apply to write.
+
+    migrate_challenge_episode.py --trigger <item_uuid> [--trigger <item_uuid>]
+                                [--hold-batch <batch_uuid>] [--apply]
 """
 from __future__ import annotations
 
@@ -35,19 +39,30 @@ import uuid
 DEFAULT_DB = "/dbvol/crawler.db"
 DEFERRED = ("verification_required", "waiting_source")
 
-# The item that actually met the challenge, as opposed to the siblings parked
-# behind it. transport_attempted is the discriminator the queue already uses:
-# the trigger opened the page, the siblings never left the gate.
-TRIGGER_CODES = ("reveal_verification_stalled", "interactive_challenge")
-
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=DEFAULT_DB)
     parser.add_argument("--source", default="hdencode")
+    parser.add_argument(
+        "--trigger", action="append", default=[], metavar="ITEM_UUID",
+        help="an item VERIFIED to have met the challenge; repeatable. "
+             "Required -- this script does not guess which rows those are.")
+    parser.add_argument(
+        "--hold-batch", action="append", default=[], metavar="BATCH_UUID",
+        help="an additional batch to hold behind the same episode. Default is "
+             "only the batches containing the named triggers.")
     parser.add_argument("--apply", action="store_true",
                         help="write the change (default is a dry run)")
     args = parser.parse_args(argv)
+
+    if not args.trigger:
+        print("ERROR: --trigger is required. Historical rows carry no evidence "
+              "of which challenge they met, and inferring it from "
+              "reveal_verification_stalled would fabricate exactly the evidence "
+              "the classifier requires. Name the item(s) you have verified.",
+              file=sys.stderr)
+        return 2
 
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
@@ -61,45 +76,50 @@ def main(argv: list[str]) -> int:
         return 2
 
     placeholders = ",".join("?" for _ in DEFERRED)
-    parked = conn.execute(
+    triggers = []
+    for item_uuid in args.trigger:
+        row = conn.execute(
+            f"""
+            SELECT item_uuid, batch_uuid, state, source, title
+            FROM download_queue_items
+            WHERE item_uuid = ? AND source = ? AND state IN ({placeholders})
+            """,
+            (item_uuid, args.source, *DEFERRED),
+        ).fetchone()
+        if row is None:
+            # REFUSING rather than skipping. A typo'd or already-resumed id
+            # would otherwise silently shrink the incident, and the run would
+            # still report success.
+            print(f"ERROR: {item_uuid} is not a parked {args.source} row. "
+                  "Nothing was written.", file=sys.stderr)
+            return 1
+        triggers.append(row)
+
+    batches = sorted({row["batch_uuid"] for row in triggers}
+                     | set(args.hold_batch))
+    for batch_uuid in args.hold_batch:
+        if conn.execute("SELECT 1 FROM download_queue_batches WHERE "
+                        "batch_uuid = ?", (batch_uuid,)).fetchone() is None:
+            print(f"ERROR: batch {batch_uuid} does not exist. Nothing was "
+                  "written.", file=sys.stderr)
+            return 1
+
+    held = conn.execute(
         f"""
-        SELECT item_uuid, batch_uuid, state, queue_reason, cooldown_until,
-               COALESCE(last_reason_code, '') AS last_reason_code,
-               COALESCE(transport_attempted, 0) AS transport_attempted,
-               title
-        FROM download_queue_items
+        SELECT COUNT(*) AS n FROM download_queue_items
         WHERE source = ? AND state IN ({placeholders})
-        ORDER BY batch_uuid, sequence_number
+          AND batch_uuid IN ({",".join("?" for _ in batches)})
         """,
-        (args.source, *DEFERRED),
-    ).fetchall()
+        (args.source, *DEFERRED, *batches),
+    ).fetchone()["n"]
 
-    if not parked:
-        print(f"No parked {args.source} rows. Nothing to migrate.")
-        return 0
-
-    triggers = [r for r in parked
-                if r["last_reason_code"] in TRIGGER_CODES
-                and int(r["transport_attempted"] or 0) == 1]
-    batches = sorted({r["batch_uuid"] for r in parked})
-
-    print(f"parked rows          : {len(parked)}")
-    print(f"batches to hold      : {len(batches)}")
+    print(f"source               : {args.source}")
     print(f"challenge triggers   : {len(triggers)}")
     for row in triggers:
-        print(f"   trigger {row['item_uuid']}  {row['title'][:60]}")
-    print(f"siblings held        : {len(parked) - len(triggers)}")
-
-    if not triggers:
-        # Refusing rather than inventing one. Opening an episode with no
-        # triggering row would hold every sibling behind a challenge nobody can
-        # point at, and the probe -- which targets the trigger -- would have no
-        # target. A parked set with no trigger means something other than a
-        # challenge parked it.
-        print("\nNo row carries challenge-trigger evidence; refusing to open an "
-              "episode. These rows were not parked by a challenge.",
-              file=sys.stderr)
-        return 1
+        print(f"   trigger {row['item_uuid']}  {str(row['title'])[:60]}")
+    print(f"batches to hold      : {len(batches)}")
+    print(f"deferred rows held   : {held} "
+          f"({held - len(triggers)} sibling(s))")
 
     if not args.apply:
         print("\nDRY RUN. Re-run with --apply to write.")
@@ -116,7 +136,7 @@ def main(argv: list[str]) -> int:
                     SET state = 'verification_required',
                         queue_reason = 'interactive_challenge',
                         last_reason_code = 'interactive_challenge',
-                        last_cause_code = 'turnstile_challenge_failed'
+                        last_cause_code = 'operator_identified_challenge'
                     WHERE item_uuid = ?
                     """,
                     (row["item_uuid"],),
@@ -130,12 +150,12 @@ def main(argv: list[str]) -> int:
         print(f"ERROR: migration rolled back: {exc}", file=sys.stderr)
         return 3
 
-    held = conn.execute(
+    applied = conn.execute(
         "SELECT COUNT(*) AS n FROM download_queue_batches "
         "WHERE challenge_episode_id = ?", (episode_id,)
     ).fetchone()["n"]
     print(f"\nApplied. episode {episode_id}: {len(triggers)} trigger(s), "
-          f"{held} batch(es) held.")
+          f"{applied} batch(es) held.")
     return 0
 
 

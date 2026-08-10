@@ -134,11 +134,23 @@ door. Only an **affirmative ScanHound-side source delivery** closes it — the s
 `is_source_delivery()` predicate that earns retry budget, so a pre-scrape
 duplicate does not qualify, and neither does a human succeeding in another
 browser. "Retry all" (`resume_batch`, `retry_ready`) is **refused** while an
-episode is open, with a message saying what to do instead; the single-item probe
-(`retry_item`) stays available. `scripts/migrate_challenge_episode.py` moves
-existing rows in **one transaction** (dry-run by default) and deliberately leaves
-cooldowns intact — nulling them would make the siblings `NO_AUTHORISATION`
-forever and block the legitimate release after a probe succeeds.
+episode is open, with a message saying what to do instead.
+
+**The single-item probe is the only route through, and it is not available
+immediately.** `retry_item()` calls `_assert_hdencode_available()`, and
+`observe_challenge()` sets a one-hour source cooldown, during which
+`list_retries()` reports `retry_available=False` and the UI disables "Retry now".
+So the accurate statement is: **the one-item probe becomes available once the
+coordinator's quiet period ends.** That is deliberate containment — probing a
+source that just presented a challenge, immediately and repeatedly, is the
+behaviour this whole change exists to stop — but the earlier wording said the
+probe "stays available", which was wrong, and this document said it.
+
+`scripts/migrate_challenge_episode.py` takes **explicitly named trigger item
+IDs** and moves them in **one transaction** (dry-run by default). It deliberately
+leaves cooldowns intact — nulling them would make the siblings
+`NO_AUTHORISATION` forever and block the legitimate release after a probe
+succeeds.
 
 **7. Wording.** Title → *"Manual attention required"*. Message → *"Automated
 verification did not complete…"*. The advice text promises nothing: not that the
@@ -201,9 +213,104 @@ evidence about the reveal, and the same field inside the reveal form is);
 navigation scoping in both directions; probe-is-one-item; and a duplicate
 completion **not** closing an episode.
 
+Round 2 added `tests/test_challenge_episode_migration.py` and extended the other
+two. **14 of the new tests fail on the pre-review head `fcc5a40` and pass now**,
+which is the control for every one of ChatGPT's six findings — including the two
+that only a discrimination test could distinguish (`iframe:turnstile` is still
+produced, so "ready reveal is not a challenge" cannot pass by the detector
+having gone silent).
+
 ---
 
-## 4. What is NOT claimed
+## 4. Round 2 — ChatGPT's REQUEST CHANGES, and what each fix was
+
+All six findings were verified in code before being accepted. All six were real.
+Fourteen new tests fail on the pre-review head `fcc5a40` and pass now, so every
+fix is pinned by a control rather than by assertion.
+
+**F1 — the operator adapter dropped `challenge_open` (MEDIUM).** Production
+passed it into `SharedFacts`; `scripts/queue_recovery_state.py` did not, so the
+dataclass default `False` applied and the two disagreed about every **sibling**
+row — production held it, the diagnostics said "due now". The trigger row hid
+the disagreement because its own `queue_reason` is enough on its own.
+
+This is the fourth appearance of one failure class: **the authority is right and
+a consumer drops one of its facts before calling it.** I had already found and
+fixed the `LABELS` instance of it in the same file — and stopped there instead of
+grepping every `SharedFacts(` construction. There are exactly two.
+
+Fixed with a correlated subquery in `JOINED_DEFERRED_SQL`, so the fact is
+computed in the same statement the adapter already runs, with a matching source
+scope. Pinned end to end through the real SQL, plus the negative control that the
+same rows become `AUTHORISED` once the episode closes.
+
+**F2 — episode closure had two authorities (MEDIUM).** `_challenge_episode_open`
+also required that the episode's batch still held a deferred row. ChatGPT's
+counterexample is exact: an episode whose batch holds a **single** trigger closes
+itself the moment an operator probes it, because the probe moves that row to
+`ready`. The episode evaporated during the probe window — the one interval it
+exists to cover. Cancelling the trigger did it more directly.
+
+`challenge_episode_id` is now the sole authority. Closure has exactly two
+explicit causes: an affirmative source delivery, or `clear_challenge_episode()`,
+a new operator action. That escape hatch is what makes the stricter rule safe —
+without it an episode could outlive everything it held and strand the source.
+
+**F3 — the migration invented evidence (MEDIUM).** It treated
+`reveal_verification_stalled` as a challenge trigger. That code means precisely
+*the classifier found no active challenge evidence*, so promoting it fabricated
+the fact the whole change exists to demand — and then wrote the fabrication into
+the row as `cause_code = turnstile_challenge_failed`, a confident claim about a
+page nobody looked at. It also assigned one episode to **every** parked batch for
+the source.
+
+Historical rows cannot be reclassified, because the evidence is gone. The script
+now **requires explicitly named trigger item IDs**, refuses to run without them,
+refuses an id that is not a parked row for the source rather than skipping it,
+and holds only the batches containing the named triggers plus any explicitly
+named with `--hold-batch`. `cause_code` is now
+`operator_identified_challenge` — what actually happened. Seven automated tests
+replace the manual smoke run.
+
+**F4 — the conjunction had an older bypass (MEDIUM).** `_log_page_diagnostics`
+classified on `header_challenge or captcha_frames or challenge_markers` *before*
+reaching the new branch, and `strong_challenge_markers` returns
+`iframe:turnstile` for any turnstile frame anywhere. So a page whose reveal read
+"View links" and which carried a Turnstile frame became a source-wide manual
+hold. **My own "evidence without a stalled reveal" test used the response field
+and console — neither of which reaches that branch — so it passed while the
+bypass sat open beside it.** A discrimination test that cannot reach the code it
+discriminates is not a control.
+
+Evidence is now partitioned. An **interstitial** (a `cf-mitigated` header, a
+challenge title, visible challenge text) replaces the page and still classifies
+on its own. An **embedded frame** rejoins at the reveal conjunction, where it
+must coincide with a not-ready control. Kept generic rather than Turnstile-only,
+so reCAPTCHA and hCaptcha frames retain the coverage they had — tested.
+
+**F5 — the probe availability claim was wrong (LOW).** This document said the
+one-item probe "stays available". It is disabled during the coordinator's
+one-hour quiet period. The containment is deliberate; the sentence was not
+accurate. Corrected in §2.
+
+**F6 — the response field ignored `formaction` (LOW).** The reveal-control rule
+has honoured a submit's `formaction` override since 2026-07-24; the field check
+reused the URL predicate but not the effective-target rule. Both directions were
+wrong: a form whose action looked safe while its submit posted `#unlocked` was
+missed, and the reverse counted. Now shares one `_form_posts_unlock` helper, with
+mirror tests.
+
+### Residual, stated rather than fixed
+
+An embedded **non-Turnstile** captcha frame belonging to some other page feature
+will still classify on a not-ready reveal, because a generic frame carries no
+form association to test. The Turnstile path additionally requires the form tie.
+The not-ready conjunct bounds the blast radius, and this is strictly narrower
+than the pre-review behaviour, but it is not zero.
+
+---
+
+## 5. What is NOT claimed
 
 * **Not** that `navigator.webdriver` or the automation flags caused the
   rejection. 600\* is a generic family and the trigger is not isolated.

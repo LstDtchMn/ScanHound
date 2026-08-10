@@ -333,6 +333,34 @@ _TURNSTILE_RESPONSE_FIELD = "cf-turnstile-response"
 _TURNSTILE_CONSOLE_CODE = re.compile(r"\b(600\d{3})\b")
 
 
+def _form_posts_unlock(form, unlock_target: Callable[[str], bool]) -> bool:
+    """True when a form's EFFECTIVE destination is this page's unlock endpoint.
+
+    Mirrors the reveal-control rule exactly: a submit may override its form's
+    destination via ``formaction``, so the effective target is the submit's
+    ``formaction`` when present and the form's ``action`` otherwise.
+
+    Peer review caught the response-field check reusing the URL predicate but
+    NOT this rule -- it read ``form.action`` alone. Both halves of that gap are
+    wrong in a direction that matters: a form whose action looks safe while its
+    submit posts the unlock endpoint would have been missed, and a form whose
+    action is the unlock endpoint while its submit posts elsewhere would have
+    counted. Two copies of "where does this actually post" is precisely the
+    drift this codebase keeps paying for.
+    """
+    action = form.get("action") or ""
+    submits = form.find_all(["input", "button"])
+    targets = [
+        (element.get("formaction") or action)
+        for element in submits
+        if (element.name == "button"
+            or str(element.get("type") or "").lower() == "submit")
+    ]
+    if not targets:
+        targets = [action]
+    return any(unlock_target(target) for target in targets)
+
+
 def turnstile_challenge_evidence(
     html: str,
     *,
@@ -397,8 +425,7 @@ def turnstile_challenge_evidence(
                     form = soup.find("form", id=owner)
                 if form is None:
                     form = field.find_parent("form")
-                action = (form.get("action") or "") if form is not None else ""
-                if not unlock_target(action):
+                if form is None or not _form_posts_unlock(form, unlock_target):
                     continue
             markers.append("turnstile:unsolved-response-field")
             break
@@ -425,6 +452,37 @@ def turnstile_challenge_evidence(
             break
 
     return tuple(dict.fromkeys(markers))
+
+
+def interstitial_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:
+    """Markers proving the page ITSELF was replaced by a challenge interstitial.
+
+    THE PARTITION THIS EXISTS FOR, found on peer review 2026-08-09.
+
+    ``strong_challenge_markers`` returns two kinds of evidence that were being
+    treated as one:
+
+    * a challenge **page** -- a Cloudflare interstitial that REPLACED the
+      release page. Nothing else is on it, so it is source-wide on its own.
+    * a challenge **iframe** -- an embedded widget on a page that is otherwise
+      perfectly normal. hdencode renders exactly that on release pages which go
+      on to hand over links.
+
+    Because the iframe kind classified by itself, a **ready** reveal control on
+    a page carrying any turnstile/captcha frame anywhere -- the comments widget
+    included -- became a source-wide manual hold. Verified: a page whose submit
+    reads "View links" and which contains one Turnstile frame returns
+    ``('iframe:turnstile',)`` and was classified INTERACTIVE_CHALLENGE.
+
+    So only the interstitial kind is returned here. Embedded frames are handed
+    to the reveal conjunction instead, where they must coincide with a
+    not-ready control before they mean anything.
+    """
+    return tuple(
+        marker
+        for marker in strong_challenge_markers(html, title)
+        if not marker.startswith("iframe:")
+    )
 
 
 def diagnostic_from_traffic_denial(exc: BaseException) -> ScrapeDiagnostic:

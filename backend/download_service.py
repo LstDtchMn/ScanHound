@@ -1662,7 +1662,39 @@ class DownloadService:
                     affects_source_health=False,
                     signals=tuple(signals),
                 )
-            if header_challenge or captcha_frames or challenge_markers:
+            # INTERSTITIAL ONLY. An embedded challenge <iframe> no longer
+            # classifies on its own -- see interstitial_challenge_markers for
+            # why, and the reveal conjunction below for where frames go instead.
+            interstitial_markers = [
+                marker for marker in challenge_markers
+                if not marker.startswith("iframe:")
+            ]
+            # ...EXCEPT ON A PAGE THAT IS NOT A RELEASE PAGE AT ALL.
+            #
+            # THE REGRESSION THAT PUT THIS HERE, caught by the full suite rather
+            # than by review. Stripping iframe markers unconditionally also
+            # stripped them from genuine Cloudflare interstitials, and
+            # test_page_diagnostics_classifies_interactive_challenge dropped from
+            # INTERACTIVE_CHALLENGE to LAYOUT_CHANGED on:
+            #
+            #     <h1>Just a moment</h1>
+            #     <iframe src=".../turnstile"></iframe>
+            #
+            # "just a moment" is matched against the <title> only, and an
+            # interstitial that carries the phrase in its BODY -- or serves no
+            # title at all -- was left with the iframe as its sole evidence. So
+            # the narrowing was too broad in exactly the direction that matters:
+            # it demoted a real challenge page to "the scraper is broken".
+            #
+            # The discriminator is whether the page is a release page at all. An
+            # interstitial REPLACES it, so it carries no access/download/link
+            # control; an embedded widget sits on a page that still has one. That
+            # test uses the candidate scan already computed above, so no new
+            # signal is invented -- and it is the same fact the log has been
+            # printing as access_control_present/absent all along.
+            if not candidates:
+                interstitial_markers = list(challenge_markers)
+            if header_challenge or interstitial_markers:
                 decision = None
                 if source_kind == "hdencode":
                     decision = get_hdencode_coordinator().observe_challenge()
@@ -1717,16 +1749,26 @@ class DownloadService:
                         else None
                     ),
                 )
-                if turnstile_evidence:
+                # EMBEDDED FRAMES REJOIN HERE, and only here. A captcha or
+                # Turnstile frame is real evidence about the reveal exactly when
+                # the reveal did not complete -- which is the conjunction. Kept
+                # generic rather than Turnstile-only so reCAPTCHA and hCaptcha
+                # frames keep the coverage they had before the partition; the
+                # Turnstile path additionally requires the form tie, which a
+                # generic frame cannot supply.
+                reveal_evidence = list(turnstile_evidence) + [
+                    _challenge_iframe_signal(src) for src in captcha_frames[:5]
+                ]
+                if reveal_evidence:
                     signals.append("reveal-tier:not-ready")
-                    signals.extend(turnstile_evidence)
+                    signals.extend(reveal_evidence)
                     decision = None
                     if source_kind == "hdencode":
                         decision = get_hdencode_coordinator().observe_challenge()
                     self._log(
                         "[HDEncode] the link reveal is gated by a Cloudflare "
                         "Turnstile challenge that did not complete in this "
-                        f"browser session: {list(turnstile_evidence)}. This "
+                        f"browser session: {reveal_evidence}. This "
                         "needs a person; it will not be retried automatically.",
                         "warning",
                     )
