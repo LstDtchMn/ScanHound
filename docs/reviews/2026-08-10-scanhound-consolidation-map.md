@@ -110,10 +110,24 @@ deliberately, then a single peer round over the result.
   actually starts running, because generations will arrive far more often. **Merge before or with
   the canary.**
 
+## 2b. STATUS as of 2026-08-10 midday
+
+**Track A is approved but NOT canary-ready.** Round 3 approved an existing-roots canary; the
+WAL check it prescribed then found that **the container cannot read `dv_host.db` at all while
+the detector holds it open** (`disk I/O error`, reproducible, isolated with a controlled writer).
+`import_dv_host_db()` returns `{"imported": 0, "updated": 0}` behind an HTTP 200, so every
+interim import would have reported success and delivered nothing. Fixed in `1c02930`; **round 4
+is out**. See `docs/reviews/peer-rounds/dv-detector-consolidation-round4.md`.
+
+Full suite on the consolidation: **4689 passed, 5 skipped, 0 failed**.
+
+**All three active sessions have been asked to wind down**, push everything, and hand off — the
+two turnstile sessions were running and responding at the time of writing.
+
 ## 3. Suggested order
 
-1. **`fix/dv-label-sync-watermark-loss`** — smallest, live bug, no conflicts.
-2. **`agent/dv-detector-consolidation`** once round 3 passes — lands four branches with it.
+1. ~~`fix/dv-label-sync-watermark-loss`~~ — **DONE**, merged into the consolidation.
+2. **`agent/dv-detector-consolidation`** once round 4 passes — lands five branches with it.
 3. **Canary** on existing roots; prove WAL visibility first; no root widening.
 4. **Retire** `fix/dv-import-cadence`, `fix/dv-scan-live-progress`, `agent/hdr10plus-design-review`,
    `agent/dv-scan-hang-and-starvation` — all subsumed or superseded.
