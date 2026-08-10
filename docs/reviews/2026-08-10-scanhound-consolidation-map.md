@@ -40,8 +40,8 @@ are 0 behind and touched in the last three days:
 | `agent/dv-scan-hang-and-starvation` | 14 | `46af8201` (running) | **subsumed** ↓ |
 | `agent/policy-migration-audit` | 1 | — | **subsumed** ↓ |
 | `fix/dv-import-cadence` | 24 | this one | **retire unmerged** (properties ported) |
-| `fix/queue-policy-test-time-bomb` | 1 | — | content in via cherry-pick `cd1195b` |
-| `fix/policy-tests-wall-clock` | 1 | — | **conflicts with the above — pick one** |
+| `fix/queue-policy-test-time-bomb` | 1 | `b295ea14` | content in via cherry-pick `cd1195b` |
+| `fix/policy-tests-wall-clock` | 1 | `b087aa20` | **conflicts with the above — pick one** |
 | `fix/dv-label-sync-watermark-loss` | 1 | — | **outstanding, live consumer bug** |
 | `claude/scanhound-turnstile-verification-hold-z43q0x` | 8 | `54093368` | **outstanding** |
 | `agent/turnstile-classification` | 5 | `b087aa20` | **conflicts with the above** |
@@ -50,6 +50,21 @@ are 0 behind and touched in the last three days:
 `git merge-base --is-ancestor`, not assumed). Merging it lands the approved live-progress wrapper,
 the HDR10+ design work, the DV scheduling commits, the other session's detector architecture, and
 the policy-migration audit — in one move.
+
+## 1b. Session → branch attribution (every current branch is owned)
+
+| Session | Title | Owns | Covered by |
+|---|---|---|---|
+| `e7d059a1` | this one | the consolidation + 3 subsumed/retired | Track A |
+| `46af8201` | DV scan cannot converge… | `agent/dv-scan-hang-and-starvation` | Track A (subsumed) |
+| `54093368` | Turnstile verification hold timer | `claude/scanhound-turnstile-verification-hold-z43q0x` | Track B |
+| `b087aa20` | Add a verification hold a timer cannot release | `agent/turnstile-classification`, `fix/policy-tests-wall-clock` | Tracks B and C |
+| `b295ea14` | ScanHound completion drive | `fix/queue-policy-test-time-bomb` (`a88d541`) | Track C — content already in Track A |
+| `3c040c7c` | Docker setup and app container updates | none current | nothing to consolidate |
+
+**Every current branch is attributed**, so a session owning none of them has no outstanding code
+to fold in. Note the date-bomb duplication crosses tracks: `b087aa20` is a turnstile session that
+also fixed the policy tests, unaware `b295ea14` had already done it.
 
 ## 2. Three independent tracks
 
