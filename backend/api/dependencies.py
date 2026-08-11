@@ -275,3 +275,52 @@ def token_authorized(token: str) -> bool:
         if expires_at and not auth_service.is_expired(expires_at):
             return True
     return False
+
+
+_dv_ingest_bad_hash_warned = False
+
+
+def dv_ingest_key_hash() -> str:
+    """The configured SHA-256 (hex) of the DV ingest secret, or "" if unset.
+
+    A SCOPED machine credential for exactly ``POST /rename/dv-host-rows`` (the DV
+    host detector's row upload). The raw secret is never STORED or CONFIGURED
+    server-side — only its SHA-256 is configured, via env
+    ``SCANHOUND_DV_INGEST_KEY_SHA256`` — so a DB dump or a server-side config leak
+    does not yield a usable key. (The raw secret does travel in the request
+    header on each authenticated call; it just never rests on the server.) Empty
+    means the scoped key is disabled and only a normal session admits the route.
+
+    A configured value that is not a 64-char hex digest is malformed: it is
+    treated as **disabled** (fail closed) and a one-time warning is logged
+    without the value, so an operator typo is diagnosable instead of a silent
+    perpetual 401.
+    """
+    global _dv_ingest_bad_hash_warned
+    raw = os.environ.get("SCANHOUND_DV_INGEST_KEY_SHA256", "").strip().lower()
+    if not raw:
+        return ""
+    if len(raw) != 64 or any(c not in "0123456789abcdef" for c in raw):
+        if not _dv_ingest_bad_hash_warned:
+            logger.warning(
+                "SCANHOUND_DV_INGEST_KEY_SHA256 is set but is not a 64-char hex "
+                "SHA-256 digest — the DV ingest key is DISABLED (value not logged).")
+            _dv_ingest_bad_hash_warned = True
+        return ""
+    return raw
+
+
+def dv_ingest_key_authorized(presented: str) -> bool:
+    """Whether *presented* (the raw secret) matches the configured ingest key.
+
+    Constant-time on the HASH so neither the secret nor its stored hash leaks by
+    timing. Returns False when no key is configured (feature off) or nothing was
+    presented. This function grants NOTHING by itself — the caller
+    (``main._dv_ingest_authorized``) restricts it to the one method+path.
+    """
+    import hashlib
+    configured = dv_ingest_key_hash()
+    if not configured or not presented:
+        return False
+    presented_hash = hashlib.sha256(presented.encode("utf-8")).hexdigest()
+    return secrets.compare_digest(presented_hash, configured)

@@ -18,6 +18,7 @@ from backend.api.dependencies import (
     token_authorized as _token_authorized,
     has_any_credential as _has_any_credential,
     allow_open as _allow_open,
+    dv_ingest_key_authorized as _dv_ingest_key_authorized,
 )
 
 logger = logging.getLogger(__name__)
@@ -455,6 +456,26 @@ def _bearer_token(request: Request) -> str:
     return header[7:] if header.startswith("Bearer ") else ""
 
 
+#: The single route the scoped DV ingest key may authorize — nothing else.
+_DV_INGEST_PATH = "/rename/dv-host-rows"
+
+
+def _dv_ingest_authorized(request: Request) -> bool:
+    """Scoped machine credential: authorizes ONLY ``POST /rename/dv-host-rows``.
+
+    The DV host detector presents its ingest secret in the ``X-DV-Ingest-Key``
+    header. The method+path gate here is the whole point of the design: the key
+    has ZERO authority on any other request, so a key stolen from the detector
+    host can at worst write DV rows — it can never reach the destructive
+    ``/rename`` job routes (apply/undo/delete/trash/process-folder) that a full
+    session token would. This is why the detector uses a scoped key and not a
+    login session (peer review, 2026-08-10).
+    """
+    if request.method != "POST" or request.url.path != _DV_INGEST_PATH:
+        return False
+    return _dv_ingest_key_authorized(request.headers.get("x-dv-ingest-key", ""))
+
+
 # _auth_enabled / _token_authorized are imported from dependencies (top of file)
 # so the WebSocket handshake in backend.api.ws shares the exact same gate.
 
@@ -660,7 +681,12 @@ def create_app(
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
         if _request_requires_auth(request):
-            if not _token_authorized(_bearer_token(request)):
+            # A normal session token admits any protected route; the scoped DV
+            # ingest key admits ONLY POST /rename/dv-host-rows (see
+            # _dv_ingest_authorized — it returns False for every other request,
+            # so this OR cannot widen access anywhere else).
+            if not (_token_authorized(_bearer_token(request))
+                    or _dv_ingest_authorized(request)):
                 return JSONResponse(
                     status_code=401,
                     content={"detail": "Unauthorized"},
