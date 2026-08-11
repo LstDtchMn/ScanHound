@@ -100,3 +100,37 @@ confirmed on the first run after the password switch.
 5. **Anything else** in this deployment that's a security or correctness gap.
 
 Merge/deploy/enable/prod-settings are Jesse's.
+
+---
+
+## Remediation (2026-08-11, Claude)
+
+- **F1 (blocking) — CLOSED.** Wrapper now captures the detector output to
+  `C:\DockerData\scanhound\dv-scan.log` and ends with `exit $LASTEXITCODE`.
+  Proven: `python -c "sys.exit(7)"` through `powershell -File` yields outer exit 7,
+  so a failed final POST now propagates to Task Scheduler `LastTaskResult`. The
+  mapping-failure exits (3/4) are preserved. Full task-level forced-failure proof
+  is deferred to the first logged-off verification run.
+- **F4 — CLOSED.** Wrapper verifies `Y:` maps EXACTLY to
+  `\TURTLELANDSRV2\4K HDR Geronimo` (via `Get-SmbMapping`, confirmed target) and
+  aborts (exit 4) on a wrong target; establishes + re-verifies on a missing one.
+- **F8 — MITIGATED.** The raw key is now set only after the net-use fallback, so no
+  mapping subprocess inherits it. Detector children (dovi_tool) still inherit it;
+  fully closing that is tied to F2 (trusted tool chain).
+- **F5 — NON-ISSUE.** `X:` is a Fixed local volume (Storage Spaces), not a session
+  mapping; no logged-off dependency.
+- **F3 — RESOLVED.** Docker Engine server = 29.6.2 (>= 28.0.0), so the pre-28
+  localhost-publish defect does not apply. App auth remains mandatory. Residual: a
+  LAN negative-connection test (needs a second host) + the pre-existing proxy-net
+  east-west path (any proxy container can reach scanhound:9721, auth still required).
+- **F6 — TRACKED.** A spawned task covers committing the port line + moving the hash
+  to an untracked `.env`; the hash is integrity-sensitive (protect it).
+- **F7 — VERIFIED.** `dv_file_tagging=false` in the live config; the detector does not
+  mutate media. A read-only media identity aligns with this (see F2).
+- **F2 — OPEN, Jesse's decision.** Highest + a user-writable wrapper/tool chain is the
+  remaining P0 before the stored-password/logged-off switch. Options: (a) dedicated
+  non-admin batch account (RunLevel=Limited) + directory-ACL protection of the
+  wrapper/C:\Tools/Python/compose; (b) interim: lock those directories to admins-only
+  write so a medium-integrity process can't plant code, keeping the NLSur/Highest task;
+  (c) accept the risk on a single-user box. Recommend (a) as the durable fix, done as
+  part of the password-switch work.
