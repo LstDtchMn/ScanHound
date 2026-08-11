@@ -1,127 +1,108 @@
-# Design proposal — unblocking RSS promotion from permanent "undetermined" misses
+# Decision record + design — RSS promotion via a coverage-canary hybrid
 
 **Repository:** `LstDtchMn/ScanHound`
-**Status:** DESIGN for review (no code yet). Author: Claude. Date: 2026-08-11.
-**Subsystem:** HDEncode RSS shadow readiness gate (`backend/hdencode_shadow.py`,
-`backend/database.py` `get_hdencode_rss_readiness` / `get_hdencode_miss_resolution`,
-`backend/api/routes/rss.py`).
+**Status:** DECISION + design outline (no build yet). Date: 2026-08-11.
+**Supersedes:** the per-URL-acknowledgement proposal previously in this file (see "Rejected"),
+which BOTH peer reviews rejected.
 
-## The problem
+## Decision
 
-`get_hdencode_rss_readiness()` is a hard gate: `POST /rss/mode` refuses to switch
-`hdencode_discovery_mode` to `rss_primary` unless `readiness["ready"]` is true
-(`api/routes/rss.py:282`). One of its blocking conditions is `misses_undetermined > 0`.
+RSS is fully built and running as a shadow evaluator (mode `rss_shadow`). It performs well
+(287 cycles / 17 days, `never_acquired = 0`, worst lag 4.06h, ~84% fewer discovery requests if
+promoted), but the promotion path is blocked and the safe way to promote is NOT the original
+per-URL-ack design.
 
-Live state (2026-08-11, read-only copy of prod `crawler.db`):
+**Chosen direction — a coverage-canary hybrid ("D"), agreed by both peer reviews:**
 
-- `successful_cycles: 287` (bar: 20), `observed_days: 17.1` (bar: 7), `normal_feeds_healthy: true`
-- `misses_never_acquired: 0`, `worst_acquisition_lag_hours: 4.06`, `request_reduction_pct: 83.9`
-- **blocking:** `misses_undetermined: 8`, `misses_not_yet_assessable: 9`, `unattributed_listing_candidates`
+> Promote RSS to acquisition-primary under an explicit *provisional* state, while retaining a
+> reduced-frequency listing scrape purely as an independent **coverage canary**, with **automatic
+> reversion** to `rss_shadow` on any demonstrated `never_acquired` or a systematic-gap guard firing.
 
-All 8 undetermined are one show — **Gun Stories** S04/S06/S07/S08/S10/S11/S12/S14, `web-dl`
-"archived" back-catalog uploads. They appeared on the HDEncode *listing* as `missing_season`,
-then left the listing before RSS was ever observed carrying them.
+The hybrid's whole point: **you never have to prove RSS is complete.** RSS drives the fast path; the
+canary catches whatever RSS misses and preserves the miss-detection evidence that pure `rss_primary`
+would destroy. This makes the 8 "undetermined" blockers, the acknowledgement mechanism, and the
+frozen-cohort-as-gate all unnecessary.
 
-## Root cause — why "undetermined" is permanent
+**Timing / go-no-go:**
+- **NO-GO today.** The ~9 `not_yet_assessable` rows are genuine fresh uncertainty; let them resolve.
+- **GO** on the hybrid once the only remaining blockers are the 8 Gun Stories historical unknowns —
+  AND only after the hybrid is built and reviewed.
+- **NO-GO** on today's blind `rss_primary` (option B) — it throws away the coverage alarm for the last
+  slice of the saving.
+- **Not** indefinite shadow (option A alone) — that gives unknowable historical cases more weight than
+  17 days of clean evidence warrant.
 
-`classify_miss_resolution()` (hdencode_shadow.py) resolves a listing-only miss by scanning valid
-later cycles for the URL:
+This is a build for a *convenience* payoff (request reduction + faster pickups), not a capability gap
+— listing mode acquires everything today with zero misses. Build it when it is actionable (pending
+rows cleared) and the efficiency is wanted.
 
-- URL later in `feed_only` or `duplicate_urls` → **acquired** (RSS carried it).
-- URL later in `listing_only` (still listed) but never in the feed → **never_acquired** — a REAL,
-  demonstrable RSS coverage gap.
-- URL never seen again on either side → **undetermined** — "left the listing without ever appearing
-  in the feed, so neither acquisition nor loss can be proven."
+## Why the original per-URL-ack design was rejected (both peers)
 
-`undetermined` is **terminal**: once a URL has paged off the listing, no future cycle produces a
-`listing_only`/`feed_only`/`duplicate` observation of it, so it can never reclassify. Bulk archive
-re-posts (old seasons dumped on the listing and quickly paged away, never in the feed, that the
-operator never wanted) land here and **block promotion forever**, regardless of how well RSS
-performs on real releases.
+1. **`undetermined` is not structurally terminal.** `classify_miss_resolution` recomputes each row
+   against later cycles, so a re-listed URL can reclassify. Acknowledgement must never outrank the
+   live classifier; current state is authority.
+2. **Per-URL ack can hide a systematic category gap.** If RSS silently drops an entire population,
+   every member pages off as `undetermined` and NONE becomes `never_acquired` (that needs a later
+   `listing_only` sighting they never get). Acknowledging them all yields `ready=true` while RSS
+   carries 0% of that category — a new fail-open at the population level.
+3. **It conflates operator risk-acceptance with empirical readiness.** `ready=true, reasons=[]` must
+   not mean the same thing for "all evidence resolved" and "operator waived unresolved evidence."
 
-## Design constraints (the gate's hard-won invariants — do NOT regress these)
+The hybrid sidesteps all three: it does not try to declare empirical completeness at all.
 
-The readiness gate has a documented history of fail-open bugs (comments cite "two HIGH findings").
-Any fix must preserve:
+## The design
 
-1. **`never_acquired` blocks unconditionally, no deadline** (2026-08-07 decision). A release still on
-   the listing that RSS never carried is a real gap; time must not forgive it.
-2. **`not_yet_assessable` blocks** (2026-08-07 reversal). Because shadow comparison is only recorded
-   while `discovery_mode == rss_shadow`, promoting stops producing the observations a pending row
-   needs — the gate must not open on evidence its own promoted mode destroys.
-3. **No auto-vanish.** "The honest way to pass is a frozen cohort … not to make a live unresolved
-   row vanish." (summarise_miss_resolutions docstring.)
-4. **No string-matching on release names / JSON** to classify (an explicitly-removed anti-pattern).
+### 1. Provisional primary mode (`rss_primary` + canary)
+- RSS is the acquisition source (the fast path), as today's `rss_primary`.
+- A **scheduled** limited listing scrape runs independently of RSS health (unlike the existing
+  `fallback_qualified` fallback, which fires ONLY on `coverage_uncertain` and requires
+  `readiness["ready"]` — a transient-error fallback, not a canary). This scrape:
+  - runs `compare_shadow` and writes the SAME shadow evidence while RSS is primary (today that only
+    happens in `rss_shadow` — this is the core change that keeps the instrument alive after promotion);
+  - acts as a fallback acquisition path for anything the canary finds that RSS missed.
 
-So the fix targets ONLY the `undetermined` bucket, and must be an explicit, auditable, reversible
-operator decision — not an automatic or heuristic reclassification.
+### 2. Canary interval — the load-bearing parameter (ChatGPT's key refinement)
+A canary only protects you if a release stays visible on the listing **longer than the canary
+interval**. Gun Stories proves items page off fast; if a category appears and vanishes between two
+sweeps, RSS misses it and the canary never sees it.
 
-## Proposed fix — operator acknowledgement of undetermined misses
+> **Invariant: canary interval < credible listing-visibility window.**
 
-Follow the existing `dismissed_items` precedent (database.py:448 — the app already lets an operator
-permanently hide releases from future scans, with a `dismissed_at` audit column and a cache kept in
-sync by mutators).
+The visibility window is **measurable from existing shadow data** — how many consecutive valid cycles
+a URL persists in `listing_only` before disappearing. Derive the window empirically (e.g. the low
+percentile of observed residence), set the canary interval safely below it, start faster (every few
+hours) and relax after measuring. If no such window can be established, a fixed cadence is only
+occasional sampling, not a safety net — and that must be surfaced, not assumed.
 
-1. **New state:** an `hdencode_shadow_miss_ack` table keyed by `canonical_url`, with
-   `acknowledged_at`, `reason`, and the `state_at_ack` (must be `undetermined` at ack time — the ack
-   is rejected if the row is anything else, so a `never_acquired` gap can never be acknowledged away).
-2. **Readiness change, surgical:** in the readiness computation, an `undetermined` row whose URL is
-   acknowledged is counted into a new `misses_undetermined_acknowledged` field and EXCLUDED from the
-   `misses_undetermined` that feeds `reasons`. `never_acquired` and `not_yet_assessable` are
-   untouched. The `reasons` list gains nothing new; it only stops listing `miss_resolution_undetermined`
-   when every undetermined row is acknowledged.
-3. **Transparency:** `readiness` exposes both `misses_undetermined` (active/blocking) and
-   `misses_undetermined_acknowledged`, and `GET /rss/status` surfaces the acknowledged URLs so the
-   operator can always see exactly what was set aside and re-open it.
-4. **Routes:** `POST /rss/misses/acknowledge` (body: url + reason) and
-   `POST /rss/misses/unacknowledge` (url). Acknowledge validates the URL is currently `undetermined`.
-5. **Reversibility:** un-acknowledge restores the block immediately; the audit row is retained
-   (soft, not deleted) so history is preserved.
+### 3. The 8 Gun Stories = a documented, operator-accepted historical cohort
+Freeze them as explicitly accepted historical uncertainty. They are **not** relabeled `acquired` and
+**not** "proven safe" — empirical readiness keeps telling the truth. The risk acceptance covers the
+frozen historical unknowns only, not future blindness (the canary handles the future).
 
-### Why this is safe against the fail-open history
+### 4. Automatic reversion
+Demote `rss_primary` → `rss_shadow` on:
+- a *proven* `never_acquired` (a real gap), or
+- a systematic-gap guard firing (a stratum with listing evidence > 0, RSS acquisitions = 0),
+but **not** merely because one listing sighting beat RSS (RSS may legitimately lag hours).
 
-- It cannot forgive a `never_acquired` (the ack is refused unless the row is `undetermined` at ack
-  time — a real gap is never dismissible).
-- It is not automatic and not time-based — a human explicitly decides per URL, logged with a reason.
-  This is the "frozen cohort resolved by an operator" shape, not "a live row vanishes."
-- It does not touch the classifier or use name/JSON heuristics; classification is unchanged. Only the
-  *gate's treatment of an already-terminal `undetermined`* changes.
-- It is fully visible in `readiness` output, so promoting on an acknowledged set is an informed,
-  auditable operator choice, not a hidden bypass.
+### 5. Canary health is part of the safety claim
+A stale/broken canary = degraded protection. Do not run for long labeled "canary-protected" if the
+canary has not successfully observed the listing recently; surface it and treat it as a demotion
+signal.
 
-## Alternatives considered (and why not)
+## Open implementation questions (for the build round)
+- Where the scheduled canary lives (background_scanner) and how its cadence is configured/derived.
+- The exact `compare_shadow`-in-`rss_primary` wiring (today gated on `discovery_mode == rss_shadow`).
+- The systematic-gap guard's stratum definition — using ONLY source-owned structured provenance
+  (category / media_type / feed attribution), never title/name/URL/JSON heuristics; and what to do
+  when the provenance is too coarse to make a category claim (conservative: cannot claim coverage).
+- The provisional-state surfacing in `GET /rss/status` so promotion is visibly a provisional,
+  canary-protected, operator-accepted state — not "empirically ready".
 
-- **Bounded age-out of undetermined (e.g., >90 days).** Rejected as the primary mechanism: it is
-  exactly the automatic-time-heals shape the subsystem rejected for `never_acquired`, and a
-  *systematic* RSS gap (a whole category RSS never carries) would age out silently. Could be revisited
-  later as a secondary hygiene valve ONLY if paired with a clustering guard, but it should not gate
-  promotion on its own.
-- **Relevance re-check (is the release still wanted?).** Rejected: "want-ness" for an arbitrary paged
-  release is fuzzy and would re-introduce heuristic classification; and the miss was already recorded
-  because it matched a relevant state, so re-deriving relevance later is guesswork.
-- **Pattern/prefix dismiss ("ignore all Gun Stories").** Rejected as the default granularity:
-  over-dismisses future real gaps under the same title. Per-URL ack is explicit; a pattern helper
-  could sit on top later if the operator burden proves high.
-
-## Open questions for the reviewer
-
-1. Is per-URL operator acknowledgement the right shape, or is a frozen-cohort admission-cutoff (only
-   count undetermined admitted before cutoff X; require the cohort to be all-acknowledged) safer?
-2. Should acknowledgement require the row to still be `undetermined` at ack time (proposed), and what
-   should happen if a later cycle somehow reclassifies an acknowledged URL (can it, given terminal-ness)?
-3. Does exposing acknowledged URLs in `GET /rss/status` plus the `reasons` change give enough
-   transparency that promoting on an acknowledged set is clearly an operator decision, not a bypass?
-4. Is there any path by which an acknowledged `undetermined` could mask a `never_acquired` (e.g., a URL
-   that was undetermined at ack time but represents content RSS systematically drops)? If so, how to
-   detect the systematic case.
-
-## Scope / testing plan (for the implementation round)
-
-- DB: new `hdencode_shadow_miss_ack` table + `acknowledge/unacknowledge/get_acknowledged` methods;
-  readiness excludes acknowledged undetermined and reports the split.
-- Routes: acknowledge/unacknowledge with validation (reject non-undetermined URLs).
-- Tests: ack of an undetermined URL clears exactly that block and nothing else; ack of a
-  `never_acquired` URL is REFUSED; unack restores the block; readiness `ready` flips only when all
-  undetermined are acknowledged AND every other gate already passes; the acknowledged split is
-  reported. Mutation-verify each (e.g., removing the "must be undetermined" guard must let a
-  never_acquired ack succeed and fail the refusal test).
+## Peer trail
+- Claude design (per-URL ack) → ChatGPT review: request-changes (systematic-gap fail-open).
+- Claude go/no-go: A now / hybrid if efficiency matters, grounded in the code (existing fallback is
+  transient-error-only, readiness-gated).
+- ChatGPT go/no-go: "D" (the hybrid), NO-GO today, canary-interval-< -visibility-window, auto-demote,
+  document (not relabel) the 8; redirect PR #61 off per-URL-ack toward retained observability.
+- Both peers converged on the hybrid; this record is that convergence.
