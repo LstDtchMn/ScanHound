@@ -1,16 +1,58 @@
 # Runbook — turning the DV host detector ON
 
-**Status:** DRAFT for Jesse, **revised after peer review** (2026-08-10). The DV post-rows code is
-**deployed** on prod (`main` @ `ad54e6a`, image `496dfae5`) but the host detector is **not
-scheduled and cannot authenticate yet**. This is the checklist to close the remaining gates. The
-enable step (scheduling) is Jesse's. Nothing here is destructive.
+**Status (2026-08-11):** **Gate 1 (auth) is DONE and MERGED to `main` (`9227578`, PR #60)** — a
+least-privilege ingest key scoped to exactly `POST /rename/dv-host-rows`, through two security-review
+rounds (redirect leak + ambient-proxy leak both closed, mutation-verified). What remains is
+operational: **the running container predates the merge (it is still `ad54e6a`)**, so activating the
+key needs a redeploy, then the canary and the scheduled task. The enable step (scheduling) is Jesse's.
+Nothing here is destructive.
 
-> **Peer review folded in.** All five findings were verified against the code before adoption:
-> (1) a login-session token is a **30-day full-API** credential, not detector-scoped — the auth
-> recommendation changed to a scoped ingest key; (2) the fixed-sentinel canary could false-green —
-> now a unique sentinel with response + absence + deletion asserts; (3) the 330-min PT6H budget was
-> too tight — now 300; (4) `dv_file_tagging=true` mutates media — now an explicit off gate; (5)
-> least-privilege task, single-instance, loopback transport.
+## DEPLOY CHECKLIST — execution order (copy-paste)
+
+Do these in order. Steps 1-3 activate the key; 4 is the safety canary; 5-6 turn the detector on.
+
+**1. Generate the secret + its hash** (keep the SECRET private; only the HASH goes on the server):
+```bash
+python -c "import secrets,hashlib; s=secrets.token_urlsafe(32); print('SECRET (host):',s); print('HASH   (server):',hashlib.sha256(s.encode()).hexdigest())"
+```
+
+**2. Configure the server hash.** In `X:\Docker Apps\ScanHound\docker-compose.yml`, under the
+`scanhound` service's `environment:` block, add (best kept in an untracked `.env` beside the compose
+file, since even the hash is better off out of git):
+```yaml
+      - SCANHOUND_DV_INGEST_KEY_SHA256=<HASH from step 1>
+```
+
+**3. Redeploy to main so the ingest-key code goes live** (from `X:\Docker Apps\ScanHound`, on `main`
+`9227578`). This is behavior-neutral for the running app — no schema change, no DV detector yet:
+```bash
+git checkout main && git pull --ff-only && docker compose up -d --build
+```
+Then confirm the key is accepted (expect `ok:true`, not 401) — this IS Gate 2 step 1 below.
+
+**4. Run the exact-sentinel canary (Gate 2)** over loopback with the real header — prove one row's
+VALUES land in `crawler.db`. See Gate 2 for the full prove-absent / assert-response / assert-values /
+assert-deletion sequence. The auth header is:
+```
+X-DV-Ingest-Key: <SECRET from step 1>
+```
+
+**5. Configure the detector** on the host: put the SECRET in the scheduled task's environment as
+`SCANHOUND_DV_INGEST_KEY` (an ACL-restricted `.env`/file the task identity reads — NOT the command
+line), point `--api http://127.0.0.1:9721`, and set `dv_file_tagging=false` in `data/dv_host.json`
+for the first run.
+
+**6. Register the least-privilege scheduled task (Gate 4)** with `--max-runtime-minutes 300`,
+`MultipleInstances=IgnoreNew`, UNC (not mapped `Y:`) media paths, and do one **supervised** run.
+
+Details and rationale for each gate follow.
+
+> **Peer review folded in.** Findings verified against the code before adoption: (1) a login-session
+> token is a **30-day full-API** credential, not detector-scoped — auth uses a scoped ingest key
+> (shipped); (2) the fixed-sentinel canary could false-green — now a unique sentinel with response +
+> absence + deletion asserts; (3) the 330-min PT6H budget was too tight — now 300; (4)
+> `dv_file_tagging=true` mutates media — explicit off gate; (5) least-privilege task, single-instance,
+> loopback transport; (6, round-2) the credential cannot be carried by a redirect or an ambient proxy.
 
 ## What is already true (deployed, verified 2026-08-10)
 
@@ -21,7 +63,14 @@ enable step (scheduling) is Jesse's. Nothing here is destructive.
   bind-mount read), sending `schema_version: 1`. With `dv_file_tagging=true` it also runs
   `mkvpropedit` and **modifies the MKV** — so it is not read-only in that mode.
 
-## Gate 1 — AUTH (the real blocker; needs your decision)
+## Gate 1 — AUTH — ✅ DONE (merged `9227578`, PR #60)
+
+**Shipped:** the endpoint-scoped ingest key below (option C-min) was built and merged after two
+security-review rounds. Server: `SCANHOUND_DV_INGEST_KEY_SHA256` (hash only); detector:
+`SCANHOUND_DV_INGEST_KEY` → `X-DV-Ingest-Key`, sent via an unredirected header through an opener that
+refuses redirects and ambient proxies, so the credential reaches only the configured origin. It
+authorizes exactly `POST /rename/dv-host-rows` and nothing else. The rest of this section is the
+decision record for why a scoped key rather than a session token.
 
 **Why 401:** the app runs `--no-auth`, which disables only the *desktop nonce*. The password gate
 is active, so every `/rename` request needs `Authorization: Bearer <token>`. `token_authorized()`
@@ -76,7 +125,7 @@ docker exec scanhound python -c "import sqlite3,sys;c=sqlite3.connect('/dbvol/cr
 
 # 1. POST it (loopback, Gate-1 credential) and REQUIRE the exact JSON + 2xx.
 resp=$(curl -s -w '\n%{http_code}' -X POST http://127.0.0.1:9721/rename/dv-host-rows \
-  -H "<gate-1 auth header>" -H "Content-Type: application/json" \
+  -H "X-DV-Ingest-Key: $SCANHOUND_DV_INGEST_KEY" -H "Content-Type: application/json" \
   -d "{\"schema_version\":1,\"source_rows\":1,\"rows\":[{\"path\":\"$SENTINEL\",\"dv_layer\":\"fel\",\"sig_mtime\":1.0,\"sig_size\":42,\"title\":\"DV enable canary\"}]}")
 echo "$resp" | tail -1 | grep -qx 200 || { echo "POST not 200: $resp"; exit 1; }
 echo "$resp" | head -1 | grep -q '"ok": *true' && echo "$resp" | head -1 | grep -q '"processed": *1' && echo "$resp" | head -1 | grep -q '"failed": *0' || { echo "response body failed assert: $resp"; exit 1; }
