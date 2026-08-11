@@ -64,3 +64,29 @@ empty/missing cases are unchanged. Key generation is documented as high-entropy 
 Please re-verify `agent/dv-ingest-key` at its new head: that the redirect is refused and the
 key cannot reach a second origin (test + mutation), and that the four fixes hold. Merge/deploy
 remain Jesse's.
+
+---
+
+## Round-2 re-review addendum — ambient proxy blocker — CLOSED
+
+The re-review confirmed F1–F4 closed and found a NEW MEDIUM: `build_opener()` installs a
+default `ProxyHandler` that honours `http_proxy` / system proxy settings, so the credentialed
+POST could be routed through an ambient proxy that reads `X-DV-Ingest-Key`
+(`add_unredirected_header` does not help — a proxy is the transport, not a redirect). Verified
+against the code: the opener as built carried `proxies={'http': <env value>}`.
+
+Fixed: `_INGEST_OPENER = build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())`.
+`ProxyHandler({})` disables auto-discovered proxies, so the credentialed request now reaches
+only the configured origin — no redirects, no ambient proxies.
+
+Test (`test_post_rows_ignores_ambient_proxy`): a real proxy sink + a direct endpoint; with
+`http_proxy` pointed at the sink and `no_proxy` cleared, `_post_rows` reaches the endpoint
+directly, the sink is never contacted, and the key arrives at the endpoint. `http_proxy` is set
+before the module loads so the mutation's default `ProxyHandler` picks it up.
+**Mutation-verified:** removing `ProxyHandler({})` routes the request through the sink and fails
+the test.
+
+Also added the re-review's minor F4 suggestion: a `caplog` test proving the malformed-hash
+warning fires exactly once and never logs the value.
+
+Head now advances past `ddeac96`; full suite re-run to green.

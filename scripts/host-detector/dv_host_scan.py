@@ -110,8 +110,16 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
             % (code, newurl), headers, fp)
 
 
-#: Opener that refuses redirects (built once; the handler is stateless).
-_INGEST_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+#: Opener for the credentialed ingest POST (built once; handlers are stateless).
+#: ProxyHandler({}) disables ambient/system proxy discovery: build_opener()
+#: otherwise installs a default ProxyHandler that honours http_proxy / system
+#: proxy settings, which would route the request — and its X-DV-Ingest-Key
+#: header — through a proxy that can read it (a proxy is the transport, not a
+#: redirect, so add_unredirected_header does not help). The detector's endpoint
+#: is fixed, so the credential must reach ONLY the configured origin: no
+#: redirects, no ambient proxies (peer review round-2, 2026-08-10).
+_INGEST_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirectHandler())
 
 # The container's import endpoint (backend/api/routes/rename.py's
 # _DEFAULT_DV_HOST_DB) reads /data/dv_host.db, bind-mounted from

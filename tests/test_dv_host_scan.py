@@ -635,6 +635,50 @@ def test_post_rows_refuses_redirect_and_never_leaks_key(tmp_path, monkeypatch):
     assert sink["saw_key"] is None, "the ingest key leaked to the redirect target"
 
 
+def test_post_rows_ignores_ambient_proxy(tmp_path, monkeypatch):
+    """The credential must reach ONLY the configured origin — never an ambient
+    HTTP proxy. build_opener installs a default ProxyHandler that honours
+    http_proxy; the detector clears it with ProxyHandler({}) (peer review
+    round-2 blocker, 2026-08-10)."""
+    import http.server
+
+    proxy = {"hit": False}
+
+    class Proxy(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            proxy["hit"] = True
+            self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+        def log_message(self, *a): pass
+
+    got = {"key": None}
+
+    class Direct(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            got["key"] = self.headers.get("X-DV-Ingest-Key")
+            body = (b'{"ok": true, "source_rows": 1, "processed": 1, '
+                    b'"failed": 0}')
+            self.send_response(200); self.end_headers(); self.wfile.write(body)
+        def log_message(self, *a): pass
+
+    proxy_srv, proxy_base = _serve(Proxy)
+    direct_srv, direct_base = _serve(Direct)
+    # Set the ambient proxy BEFORE loading the module, so the opener is built
+    # with it in the environment (the mutation's default ProxyHandler reads env
+    # at construction; our ProxyHandler({}) ignores it regardless).
+    monkeypatch.setenv("http_proxy", proxy_base)
+    monkeypatch.setenv("HTTP_PROXY", proxy_base)
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY", "TOP-SECRET")
+    m = _load()
+    try:
+        assert m._post_rows(direct_base, [{"path": "a"}]) is True
+    finally:
+        proxy_srv.shutdown(); direct_srv.shutdown()
+    assert proxy["hit"] is False, "the credential was routed through an ambient proxy"
+    assert got["key"] == "TOP-SECRET", "the request must reach the configured origin directly"
+
+
 def test_post_rows_direct_success_delivers_key(tmp_path, monkeypatch):
     """Positive control: with NO redirect, the key reaches the configured host
     and the post succeeds — so the redirect test above isn't vacuously green."""

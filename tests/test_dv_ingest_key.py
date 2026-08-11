@@ -186,3 +186,18 @@ def test_malformed_configured_hash_disables_key(monkeypatch):
     monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY_SHA256", SECRET_HASH.upper())
     assert deps.dv_ingest_key_hash() == SECRET_HASH
     assert deps.dv_ingest_key_authorized(SECRET) is True
+
+
+def test_malformed_hash_warns_once_without_value(monkeypatch, caplog):
+    import logging
+    from backend.api import dependencies as deps
+    monkeypatch.setattr(deps, "_dv_ingest_bad_hash_warned", False)
+    monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY_SHA256", "SEKRET-typo-not-64-hex")
+    with caplog.at_level(logging.WARNING, logger="backend.api.dependencies"):
+        deps.dv_ingest_key_hash()
+        deps.dv_ingest_key_hash()  # second call must NOT warn again
+    warns = [r for r in caplog.records
+             if "SCANHOUND_DV_INGEST_KEY_SHA256" in r.getMessage()]
+    assert len(warns) == 1, "the malformed-hash warning must fire exactly once"
+    assert "SEKRET-typo-not-64-hex" not in warns[0].getMessage(), \
+        "the malformed value must never be logged"
