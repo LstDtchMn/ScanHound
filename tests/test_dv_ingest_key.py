@@ -140,3 +140,49 @@ def test_key_ignored_when_not_configured(client, monkeypatch):
     _set_password(client)
     assert client.post("/rename/dv-host-rows", headers=_key(),
                        json=_valid_body()).status_code == 401
+
+
+# ── path-canonicalization edges (the exact match IS the boundary) ─────────────
+
+def test_key_rejected_on_trailing_slash(client, monkeypatch):
+    # "…/dv-host-rows/" != the authorized path; auth runs before any router
+    # trailing-slash redirect, so the key is refused (401), fail closed.
+    monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY_SHA256", SECRET_HASH)
+    _set_password(client)
+    assert client.post("/rename/dv-host-rows/", headers=_key(),
+                       json=_valid_body()).status_code == 401
+
+
+def test_key_rejected_on_double_slash(client, monkeypatch):
+    monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY_SHA256", SECRET_HASH)
+    _set_password(client)
+    assert client.post("/rename//dv-host-rows", headers=_key(),
+                       json=_valid_body()).status_code == 401
+
+
+def test_uppercase_path_does_not_reach_ingest_handler(client, monkeypatch):
+    # Case-sensitive routing: "/RENAME/…" is not a protected segment and does not
+    # match the (lowercase) ingest route, so the POST never reaches the DV
+    # handler — the key grants nothing. The exact code is 404 (no route) or 405
+    # (matched only the SPA GET catch-all); either proves no ingest happened.
+    # Pinned so a later routing/proxy change can't silently move the boundary.
+    monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY_SHA256", SECRET_HASH)
+    _set_password(client)
+    r = client.post("/RENAME/dv-host-rows", headers=_key(), json=_valid_body())
+    assert r.status_code in (404, 405), r.status_code
+
+
+# ── malformed configured hash fails closed (Finding 4) ───────────────────────
+
+def test_malformed_configured_hash_disables_key(monkeypatch):
+    from backend.api import dependencies as deps
+    monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY_SHA256", "not-64-hex-chars")
+    assert deps.dv_ingest_key_hash() == ""                      # disabled
+    assert deps.dv_ingest_key_authorized(SECRET) is False       # nothing authorizes
+    # A too-short (63-char) value is also malformed → disabled.
+    monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY_SHA256", SECRET_HASH[:-1])
+    assert deps.dv_ingest_key_hash() == ""
+    # A valid 64-hex digest passes through, normalized to lowercase.
+    monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY_SHA256", SECRET_HASH.upper())
+    assert deps.dv_ingest_key_hash() == SECRET_HASH
+    assert deps.dv_ingest_key_authorized(SECRET) is True

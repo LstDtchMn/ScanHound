@@ -466,14 +466,14 @@ def test_post_rows_rejects_a_count_mismatch(tmp_path, monkeypatch):
             return False
 
     # processed != source_rows -> must be rejected even on HTTP 200.
-    monkeypatch.setattr(urllib.request, "urlopen",
+    monkeypatch.setattr(m._INGEST_OPENER, "open",
                         lambda *a, **k: _Resp(
                             '{"ok": true, "source_rows": 2, "processed": 1, '
                             '"failed": 0}'))
     assert m._post_rows("http://x", [{"path": "a"}, {"path": "b"}]) is False
 
     # A fully-valid response is accepted.
-    monkeypatch.setattr(urllib.request, "urlopen",
+    monkeypatch.setattr(m._INGEST_OPENER, "open",
                         lambda *a, **k: _Resp(
                             '{"ok": true, "source_rows": 2, "processed": 2, '
                             '"failed": 0}'))
@@ -490,7 +490,7 @@ def test_post_rows_rejects_a_non_2xx(tmp_path, monkeypatch):
         raise urllib.error.HTTPError(
             "http://x", 500, "err", {}, io.BytesIO(b'{"ok": false}'))
 
-    monkeypatch.setattr(urllib.request, "urlopen", _raise)
+    monkeypatch.setattr(m._INGEST_OPENER, "open", _raise)
     assert m._post_rows("http://x", [{"path": "a"}]) is False
 
 
@@ -511,7 +511,7 @@ def test_post_rows_rejects_a_non_object_body(tmp_path, monkeypatch):
             return False
 
     for payload in ("null", "[]", "42"):
-        monkeypatch.setattr(urllib.request, "urlopen",
+        monkeypatch.setattr(m._INGEST_OPENER, "open",
                             lambda *a, _p=payload, **k: _Resp(_p))
         assert m._post_rows("http://x", [{"path": "a"}]) is False, payload
 
@@ -538,7 +538,7 @@ def test_post_rows_sends_schema_version(tmp_path, monkeypatch):
         captured["body"] = json.loads(req.data.decode("utf-8"))
         return _Resp()
 
-    monkeypatch.setattr(urllib.request, "urlopen", _capture)
+    monkeypatch.setattr(m._INGEST_OPENER, "open", _capture)
     assert m._post_rows("http://x", [{"path": "a"}, {"path": "b"}]) is True
     assert captured["body"]["schema_version"] == m.DV_ROWS_SCHEMA_VERSION == 1
     assert captured["body"]["source_rows"] == 2
@@ -562,7 +562,7 @@ def _capture_req(monkeypatch, m):
         box["req"] = req
         return _Resp()
 
-    monkeypatch.setattr(urllib.request, "urlopen", _cap)
+    monkeypatch.setattr(m._INGEST_OPENER, "open", _cap)
     return box
 
 
@@ -585,6 +585,79 @@ def test_post_rows_omits_ingest_key_header_when_unset(tmp_path, monkeypatch):
     box = _capture_req(monkeypatch, m)
     assert m._post_rows("http://x", [{"path": "a"}, {"path": "b"}]) is True
     assert box["req"].get_header("X-dv-ingest-key") is None
+
+
+def _serve(handler_cls):
+    """Start a throwaway localhost HTTP server on a free port; returns (srv, base)."""
+    import http.server
+    import threading
+    srv = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d" % srv.server_address[1]
+
+
+def test_post_rows_refuses_redirect_and_never_leaks_key(tmp_path, monkeypatch):
+    """A 302 from the endpoint must FAIL the post, and the raw ingest key must
+    never reach the redirect target (peer review MEDIUM blocker, 2026-08-10)."""
+    import http.server
+    m = _load()
+    monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY", "TOP-SECRET")
+
+    sink = {"hit": False, "saw_key": None}
+
+    class Sink(http.server.BaseHTTPRequestHandler):
+        def _h(self):
+            sink["hit"] = True
+            sink["saw_key"] = self.headers.get("X-DV-Ingest-Key")
+            self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+        do_GET = do_POST = _h
+        def log_message(self, *a): pass
+
+    sink_srv, sink_base = _serve(Sink)
+    try:
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", sink_base + "/anything")
+                self.end_headers()
+            def log_message(self, *a): pass
+
+        red_srv, red_base = _serve(Redirector)
+        try:
+            # The endpoint 302s to the sink; the detector must refuse it.
+            assert m._post_rows(red_base, [{"path": "a"}]) is False
+        finally:
+            red_srv.shutdown()
+    finally:
+        sink_srv.shutdown()
+
+    assert sink["hit"] is False, "the redirect was followed — request reached the sink"
+    assert sink["saw_key"] is None, "the ingest key leaked to the redirect target"
+
+
+def test_post_rows_direct_success_delivers_key(tmp_path, monkeypatch):
+    """Positive control: with NO redirect, the key reaches the configured host
+    and the post succeeds — so the redirect test above isn't vacuously green."""
+    import http.server
+    m = _load()
+    monkeypatch.setenv("SCANHOUND_DV_INGEST_KEY", "TOP-SECRET")
+
+    got = {"key": None}
+
+    class Direct(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            got["key"] = self.headers.get("X-DV-Ingest-Key")
+            body = (b'{"ok": true, "source_rows": 1, "processed": 1, '
+                    b'"failed": 0}')
+            self.send_response(200); self.end_headers(); self.wfile.write(body)
+        def log_message(self, *a): pass
+
+    srv, base = _serve(Direct)
+    try:
+        assert m._post_rows(base, [{"path": "a"}]) is True
+    finally:
+        srv.shutdown()
+    assert got["key"] == "TOP-SECRET", "the key must reach the configured endpoint"
 
 
 def test_a_failed_detection_prints_no_rate(tmp_path, caplog):

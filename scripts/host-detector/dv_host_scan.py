@@ -94,6 +94,25 @@ DV_ROWS_PATH = "/rename/dv-host-rows"         # durable row-POST endpoint
 # (or vice-versa) a body it will silently mis-parse (round-4 cleanup).
 DV_ROWS_SCHEMA_VERSION = 1
 
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect on the DV ingest POST.
+
+    The detector calls one fixed endpoint; a 3xx there is configuration drift,
+    and following it would send the credentialed request to an unintended origin.
+    Raising here turns any redirect into an HTTPError, which ``_post_rows``
+    already treats as a failure (peer review 2026-08-10)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            "refused redirect on the DV ingest endpoint (%s -> %s)"
+            % (code, newurl), headers, fp)
+
+
+#: Opener that refuses redirects (built once; the handler is stateless).
+_INGEST_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
 # The container's import endpoint (backend/api/routes/rename.py's
 # _DEFAULT_DV_HOST_DB) reads /data/dv_host.db, bind-mounted from
 # <repo-root>/data on the host (./data:/data in docker-compose.yml). Resolve
@@ -317,18 +336,24 @@ def _post_rows(api_base, rows):
     payload = json.dumps(
         {"schema_version": DV_ROWS_SCHEMA_VERSION,
          "rows": rows, "source_rows": len(rows)}).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    # Scoped machine credential for exactly this endpoint. The server compares
-    # its SHA-256, so the raw secret only ever lives here on the host (env
-    # SCANHOUND_DV_INGEST_KEY). Unset => no header => the server 401s and the
-    # POST fails loudly, which is the correct "not configured" outcome.
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    # Scoped machine credential for exactly this endpoint (env
+    # SCANHOUND_DV_INGEST_KEY). The server configures only its SHA-256, so the
+    # raw secret is never STORED server-side. Two protections keep it from
+    # escaping the configured origin (peer review 2026-08-10):
+    #  * add_unredirected_header — urllib copies ordinary headers onto a
+    #    redirected request, but NOT unredirected ones, so a 3xx can never carry
+    #    the secret to another host;
+    #  * the no-redirect opener below refuses any redirect outright, since the
+    #    detector's endpoint is fixed and a redirect is configuration drift.
+    # Unset key => no header => the server 401s and the POST fails loudly.
     ingest_key = os.environ.get("SCANHOUND_DV_INGEST_KEY", "").strip()
     if ingest_key:
-        headers["X-DV-Ingest-Key"] = ingest_key
-    req = urllib.request.Request(
-        url, data=payload, headers=headers, method="POST")
+        req.add_unredirected_header("X-DV-Ingest-Key", ingest_key)
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with _INGEST_OPENER.open(req, timeout=300) as resp:
             raw = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace") if e.fp else ""
