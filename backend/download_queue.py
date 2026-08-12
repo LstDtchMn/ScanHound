@@ -1635,6 +1635,98 @@ class DownloadQueueService:
                 continue
             self._log_unresumable_batch(batch)
 
+        self._warn_manual_recovery_batches(now, held_sources)
+
+    #: Grace after a cooldown lapses before a manual-only batch is reported.
+    #: Exists ONLY to avoid churn around the worker poll; it authorises no retry.
+    _MANUAL_RECOVERY_GRACE_SECONDS = 60
+
+    def _warn_manual_recovery_batches(self, now, held_sources) -> None:
+        """Report a batch that will NEVER auto-resume, because nothing else does.
+
+        THE SILENT FOURTH STATE (peer review 2026-08-12). Three separate queries
+        gate recovery observability on ``auto_resume_after_cooldown = 1``: the
+        resume eligibility query, ``_warn_exhausted_batches``, and the ``stuck``
+        query feeding ``_log_unresumable_batch``. So the dispositions are:
+
+            enabled + budget available -> automatic recovery
+            enabled + budget spent     -> exhaustion warning
+            enabled + due but blocked  -> unresumable diagnostic
+            verification hold          -> explicit hold diagnostic
+            DISABLED + cooldown due    -> no path, no warning, no diagnostic
+
+        That last row is a STRICTLY WORSE parked state than the one already
+        warned about: automatic recovery was never permitted, so there is no
+        budget to spend and nothing will ever promote it. Observed in production
+        2026-08-10..12 -- a batch sat with an expired cooldown and one deferred
+        item for two days, its retry budget UNTOUCHED, reported by nothing, until
+        a manual retry completed it immediately.
+
+        The invariant this restores: every nonterminal ``paused_source`` batch is
+        automatically recoverable, deliberately safety-held, or durably reported
+        as needing a human. Configuration may choose WHICH branch applies; it may
+        not create a silent fourth state.
+
+        This ONLY reports. It changes no state and authorises no retry -- the
+        flag is a deliberate retry-policy choice, unknown outcomes still require
+        adjudication, and a held source still gets the one-probe rule. It is also
+        deliberately NOT labelled ``auto_resume_budget_exhausted``: "never
+        permitted" and "permitted and spent" are different causes needing
+        different operator responses.
+        """
+        if not hasattr(self, "_manual_recovery_warned"):
+            self._manual_recovery_warned = set()
+        for row in self.db._query_dicts(
+            """
+            SELECT batch_uuid, cooldown_until, last_reason_code,
+                   verification_hold_source
+            FROM download_queue_batches
+            WHERE state = 'paused_source'
+              AND auto_resume_after_cooldown = 0
+            """,
+            default=[],
+        ):
+            batch_uuid = str(row.get("batch_uuid") or "")
+            until = _parse(row.get("cooldown_until"))
+            if until is not None and (
+                until + timedelta(
+                    seconds=self._MANUAL_RECOVERY_GRACE_SECONDS) > now
+            ):
+                continue  # not yet due (plus grace); nothing to report
+            # A deliberate verification hold already has its own diagnostic and
+            # its own release rule. Do not re-report it as manual recovery.
+            if row.get("verification_hold_source"):
+                continue
+            deferred = self.db._query_dicts(
+                "SELECT source, COUNT(*) AS n FROM download_queue_items "
+                "WHERE batch_uuid = ? AND state IN "
+                "      ('waiting_source','verification_required') "
+                "GROUP BY source",
+                (batch_uuid,), default=[])
+            total = sum(int(r.get("n") or 0) for r in deferred)
+            if total == 0:
+                continue  # nothing deferred; not parked
+            if held_sources and any(
+                str(r.get("source")) in held_sources for r in deferred
+            ):
+                continue  # transitively held sibling; the hold diagnostic owns it
+            # Keyed on the parking episode, not the batch alone, so a batch that
+            # is recovered and later parks again is reported again.
+            episode = (batch_uuid, str(row.get("cooldown_until") or ""), total)
+            if episode in self._manual_recovery_warned:
+                continue
+            self._manual_recovery_warned.add(episode)
+            logger.warning(
+                "Batch %s is parked with automatic resume DISABLED "
+                "(auto_resume_after_cooldown=0), so its cooldown expiring will "
+                "never promote anything. %s item(s) remain deferred; last source "
+                "reason %r. A human must decide: reason manual_recovery_required. "
+                "This is NOT budget exhaustion -- no automatic attempt was ever "
+                "permitted. Unknown outcomes still need adjudication, and a held "
+                "source is still probed one item at a time.",
+                batch_uuid, total, row.get("last_reason_code"),
+            )
+
     def retry_item(self, item_uuid: str) -> dict:
         item = self.get_item(item_uuid)
         if item is None:

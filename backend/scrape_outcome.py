@@ -19,7 +19,20 @@ class ScrapeCode(str, Enum):
     BROWSER_NETWORK_ERROR = "browser_network_error"
     BROWSER_NAVIGATION_FAILED = "browser_navigation_failed"
     INTERACTIVE_CHALLENGE = "interactive_challenge"
+    # POSITIVE structural evidence that the reveal contract differs from what
+    # ScanHound expects: a links-labelled submit whose destination no longer
+    # matches the unlock endpoint ("destination-rejected"), or several otherwise
+    # valid reveal controls ("ambiguous"). Both are things we DID observe.
     LAYOUT_CHANGED = "layout_changed"
+    # No qualifying reveal control was proven, and no challenge was recognised.
+    # DELIBERATELY NEUTRAL (peer review 2026-08-12): this used to be reported as
+    # LAYOUT_CHANGED, which picks one hypothesis without evidence. Absence is
+    # equally consistent with a page-specific restriction, a login/session or
+    # region gate, a pulled release, an error page, an unrecognised block, an
+    # alternate release template -- or a real layout change. Splitting it from
+    # LAYOUT_CHANGED is what makes a genuine source-wide regression detectable by
+    # aggregation, since one page can no longer impersonate it.
+    REVEAL_CONTROL_ABSENT = "reveal_control_absent"
     # The reveal control existed but never left its "Verifying... Please wait"
     # state. Distinct from SOURCE_TEMPORARILY_BLOCKED, whose message says no
     # request was made -- here the page was fetched and the control was found.
@@ -63,6 +76,14 @@ _MESSAGES = {
         "recognised verification challenge. The page may be a login or region "
         "gate, an unrecognised block, an error page, or a changed layout."
     ),
+    # Says only what was observed: the control was not found. It deliberately
+    # does NOT name a cause, because absence does not identify one.
+    ScrapeCode.REVEAL_CONTROL_ABSENT: (
+        "The link-reveal control was not found on this page, and no verification "
+        "challenge was recognised. This page alone does not show why -- it may be "
+        "a login or region gate, a pulled release, an error page, an unrecognised "
+        "block, or a different page template."
+    ),
     ScrapeCode.REQUESTED_HOST_MISSING: "The page loaded, but it does not contain links for the requested file host.",
     ScrapeCode.NO_FILE_HOST_LINKS: "The page loaded, but no supported file-host links were found.",
     # NO CAUSAL CLAIM. This used to say the stall is what the source "does when it
@@ -97,6 +118,9 @@ _MESSAGES = {
 # has no other durable home.
 _SIGNAL_BEARING_CODES = frozenset({
     ScrapeCode.LAYOUT_CHANGED,
+    # The reveal tier IS the evidence here, and absence has no other cause to
+    # name, so the signals are the whole diagnostic.
+    ScrapeCode.REVEAL_CONTROL_ABSENT,
     ScrapeCode.REVEAL_VERIFICATION_STALLED,
     ScrapeCode.NO_FILE_HOST_LINKS,
     ScrapeCode.REQUESTED_HOST_MISSING,
