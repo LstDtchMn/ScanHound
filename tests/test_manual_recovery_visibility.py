@@ -32,16 +32,23 @@ FUTURE = "2999-01-01T00:00:00+00:00"
 STAMP = "2026-08-12T04:00:00+00:00"
 
 
-def _items(n):
-    return [{"url": "https://hdencode.org/release-%d-2160p/" % i,
-             "title": "Release %d" % i, "media_type": "movie"} for i in range(n)]
+def _items(n, prefix="release"):
+    # DISTINCT URLs PER BATCH. schedule_batch raises DownloadQueueConflict when
+    # every selected item is already active, keyed on (source, url,
+    # service_type). A test that builds a second batch must therefore not reuse
+    # the first batch's URLs — reusing them made the mixed-source test FLAKY
+    # rather than merely order-dependent: whether the second batch collided
+    # depended on which random item_uuid sorted first in _set_sources.
+    return [{"url": "https://hdencode.org/%s-%d-2160p/" % (prefix, i),
+             "title": "%s %d" % (prefix.title(), i), "media_type": "movie"}
+            for i in range(n)]
 
 
-def _rig(db, *, auto_resume, count=2):
+def _rig(db, *, auto_resume, count=2, prefix="release"):
     fake = MagicMock()
     service = DownloadQueueService({}, db, fake)
     service._coordinator_snapshot = MagicMock(return_value={"blocked": False})
-    batch = service.schedule_batch(_items(count), interval_minutes=0,
+    batch = service.schedule_batch(_items(count, prefix), interval_minutes=0,
                                    mode="immediate",
                                    auto_resume_after_cooldown=auto_resume)
     return service, batch["batch_uuid"]
@@ -160,10 +167,16 @@ def test_reported_once_per_parking_episode(tmp_path, caplog):
 
 
 def _set_sources(db, batch_uuid, mapping):
-    """Give the batch's deferred rows distinct sources (mixed-source batch)."""
+    """Give the batch's deferred rows distinct sources (mixed-source batch).
+
+    Ordered by URL, NOT by item_uuid: uuids are random, so ordering by them made
+    which row became which source a coin flip — and with it whether a later
+    batch's URL collided with an active (source, url) key. Deterministic input
+    is the difference between a test and a lottery.
+    """
     rows = db._query_dicts(
         "SELECT item_uuid FROM download_queue_items WHERE batch_uuid = ? "
-        "ORDER BY item_uuid", (batch_uuid,), default=[])
+        "ORDER BY canonical_url", (batch_uuid,), default=[])
     with db.transaction() as conn:
         for row, source in zip(rows, mapping):
             conn.execute("UPDATE download_queue_items SET source = ? "
@@ -185,8 +198,9 @@ def test_a_held_source_does_not_mask_an_unrelated_source_in_the_same_batch(
     _set_sources(db, batch_uuid, ["hdencode", "othersite"])
     _park(db, service, batch_uuid)
     # A DIFFERENT batch puts 'hdencode' under a verification hold, so hdencode
-    # is in held_sources while 'othersite' is not.
-    _, held_batch = _rig(db, auto_resume=False, count=1)
+    # is in held_sources while 'othersite' is not. Distinct URLs so this batch
+    # cannot collide with the first one's still-active rows.
+    _, held_batch = _rig(db, auto_resume=False, count=1, prefix="held")
     _park(db, service, held_batch, hold="hdencode")
 
     with caplog.at_level(logging.WARNING):
