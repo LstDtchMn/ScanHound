@@ -4841,11 +4841,16 @@ class DatabaseManager:
             return 0
 
     def prepare_metadata_scan_resume(self, run_uuid, *, retry_failed=False):
-        """Reset only resumable manifest rows and queue an existing run.
+        """Reset repairable manifest rows and queue an existing run.
 
         Successfully scanned items are immutable for the resumed attempt. A
         normal resume retries interrupted/cancelled work; ``retry_failed`` also
         includes terminal probe failures selected by the operator.
+
+        Returns the count of PENDING work the resumed run has to do — which
+        includes rows a pause left pending and never needed repairing, not just
+        the rows this call reset. The caller treats <= 0 as "nothing to resume",
+        so counting only repaired rows made a paused run unresumable.
         """
         if not run_uuid:
             return 0
@@ -4862,14 +4867,34 @@ class DatabaseManager:
                 ).fetchone()
                 if not run or run[0] == "running":
                     return 0
-                cursor = conn.execute(f'''
+                conn.execute(f'''
                     UPDATE metadata_scan_items
                     SET status = 'pending', failure_stage = NULL, error_code = NULL,
                         error_message = NULL, completed_at = NULL, updated_at = CURRENT_TIMESTAMP
                     WHERE run_uuid = ? AND status IN ({placeholders})
                 ''', (run_uuid, *statuses))
-                reset_count = max(cursor.rowcount, 0)
-                if reset_count == 0:
+                # RESUMABILITY IS "IS THERE PENDING WORK", NOT "DID THIS UPDATE
+                # CHANGE ROWS". Gating on the UPDATE's rowcount was the bug: a
+                # user PAUSE leaves every unprocessed row in 'pending' (the
+                # worker writes that state deliberately — see
+                # plex_metadata_scan._run_durable), and 'pending' is not in the
+                # reset set because such a row needs no repair. So a paused run
+                # reset 0 rows, returned 0 here, and the caller raised "metadata
+                # scan has no retryable items" — the Resume button was dead for
+                # exactly the state it exists to serve, and the only way forward
+                # was discarding a multi-hour manifest and rescanning from
+                # scratch with no cached reuse.
+                #
+                # Count the pending work instead: it covers both the rows just
+                # reset and the ones a pause left already pending, so the run is
+                # requeued whenever real work remains and left alone when it
+                # genuinely has none (e.g. a fully completed run).
+                pending_row = conn.execute('''
+                    SELECT COUNT(*) FROM metadata_scan_items
+                    WHERE run_uuid = ? AND status = 'pending'
+                ''', (run_uuid,)).fetchone()
+                pending_count = int(pending_row[0]) if pending_row else 0
+                if pending_count == 0:
                     return 0
                 conn.execute('''
                     UPDATE metadata_scan_runs
@@ -4877,7 +4902,7 @@ class DatabaseManager:
                         error_code = NULL, error_message = NULL
                     WHERE run_uuid = ?
                 ''', (run_uuid,))
-                return reset_count
+                return pending_count
         except Exception as exc:
             logger.error("DB Error (prepare_metadata_scan_resume): %s", exc)
             return 0
