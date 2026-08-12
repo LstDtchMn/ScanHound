@@ -1705,10 +1705,22 @@ class DownloadQueueService:
                     seconds=self._MANUAL_RECOVERY_GRACE_SECONDS) > now
             ):
                 continue  # not yet due (plus grace); nothing to report
-            # A batch that recorded the hold itself is owned by the hold
-            # diagnostic and its one-probe release rule.
-            if row.get("verification_hold_source"):
-                continue
+            # THE BATCH'S OWN HOLD MARKER NAMES ONE SOURCE, NOT THE BATCH
+            # (peer review round 3 — the same batch-vs-source confusion, one
+            # layer earlier than round 2 fixed). This used to `continue` on any
+            # non-null verification_hold_source, which is a batch-wide veto over
+            # a source-scoped fact. _pause_for_source says so itself: "decide()
+            # holds every row of this (batch, source) group while it is set" and
+            # "a non-challenge pause deliberately leaves an existing hold in
+            # place". So a mixed batch where hdencode is held and othersite
+            # later pauses normally keeps the hdencode marker — and the whole
+            # batch went silent, including the unrelated overdue othersite group.
+            # Fold the marker into the held set instead; the per-source loop
+            # below already has the right authority.
+            held_here = set(held_sources)
+            batch_hold = str(row.get("verification_hold_source") or "")
+            if batch_hold:
+                held_here.add(batch_hold)
             # PER SOURCE, NOT PER BATCH (peer review round 2). The first version
             # skipped the WHOLE batch when ANY deferred source was held:
             #     if held_sources and any(r.source in held_sources ...): continue
@@ -1734,7 +1746,7 @@ class DownloadQueueService:
                 count = int(group.get("n") or 0)
                 if count == 0:
                     continue
-                if source in held_sources:
+                if source in held_here:
                     continue  # this group is held; the hold diagnostic owns it
                 unknown_n = int(group.get("unknown_n") or 0)
                 # Keyed on the parking episode so a group that recovers and later

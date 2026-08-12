@@ -214,6 +214,39 @@ def test_a_held_source_does_not_mask_an_unrelated_source_in_the_same_batch(
         "the held group must stay with the hold diagnostic"
 
 
+def test_a_hold_on_THIS_batch_does_not_mask_its_other_sources(tmp_path, caplog):
+    """PEER REVIEW ROUND 3 — the same batch-vs-source confusion, one layer earlier.
+
+    Round 2 fixed the INHERITED case (a hold recorded on a different batch). This
+    is the batch's OWN marker, which round 2 still treated as a batch-wide veto:
+
+        if row.get("verification_hold_source"): continue
+
+    That is reachable, and _pause_for_source documents why: the marker names one
+    (batch, source) group — "decide() holds every row of this (batch, source)
+    group while it is set" — and "a non-challenge pause deliberately leaves an
+    existing hold in place". So hdencode hits a challenge and arms the marker,
+    othersite later pauses normally on the SAME batch, and the whole batch went
+    silent including the unrelated overdue group.
+    """
+    db = DatabaseManager(str(tmp_path / "q.sqlite"))
+    service, batch_uuid = _rig(db, auto_resume=False, count=2)
+    _set_sources(db, batch_uuid, ["hdencode", "othersite"])
+    # The hold is recorded on THIS batch (as a real challenge would arm it).
+    _park(db, service, batch_uuid, hold="hdencode")
+
+    with caplog.at_level(logging.WARNING):
+        service._maybe_auto_resume()
+
+    msgs = [m for m in _warnings(caplog)
+            if batch_uuid in m and "manual_recovery_required" in m]
+    assert any("othersite" in m for m in msgs), (
+        "the batch's own hold marker masked an unrelated source group; it names "
+        "one (batch, source) group, not the whole batch")
+    assert not any("source hdencode" in m for m in msgs), \
+        "the held group must stay with the hold diagnostic"
+
+
 def test_an_unknown_outcome_child_is_affirmatively_surfaced(tmp_path, caplog):
     """PEER REVIEW ROUND 2 — generic boilerplate is not enough.
 
