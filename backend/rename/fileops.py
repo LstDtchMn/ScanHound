@@ -1753,9 +1753,61 @@ def undo_place(src: str, dst: str, method: str) -> None:
     """Reverse a :func:`place_file`: restore ``src``, remove ``dst`` as needed."""
     require_writer_lock()
     if method in ("hardlink", "symlink", "copy"):
-        # The original src still exists — just drop the link/copy.
+        # NOTHING HERE MAY ASSUME THE SOURCE SURVIVED.
+        #
+        # This branch used to read "The original src still exists — just drop the
+        # link/copy" and act on that unchecked, which was a data-loss bug:
+        #   * hardlink (the DEFAULT for a same-volume apply, and what an
+        #     unattended 'move' is forced down to — see Guard 1 in the module
+        #     docstring): src and dst are two directory entries for ONE inode.
+        #     If src is gone, dst is the LAST link and unlinking it destroys the
+        #     file data itself.
+        #   * copy (the cross-device fallback): dst is an independent copy, so
+        #     once src is gone it is the only remaining copy.
+        # Either way the user loses a file that cannot be re-created, and the old
+        # code reported success while doing it.
+        #
+        # So: fail closed when the source is missing (the module mandate above is
+        # "no accidental file deletion; deletions must go through a user's input
+        # first"), and route the removal through the trash so an undo is
+        # recoverable like every other destructive path in this module. _trash
+        # itself fails closed — on any preparation failure it raises with the
+        # source kept — so a trash-less environment errors instead of deleting.
+        #
+        # symlink is exempt: dst is only a pointer at src, so removing it cannot
+        # destroy data even when the target is already gone (a dangling link).
         if os.path.lexists(dst):
-            _unlink_durable(dst)
+            if method == "symlink":
+                _unlink_durable(dst)
+            else:
+                if not os.path.lexists(src):
+                    raise FileNotFoundError(
+                        "refusing to undo %s placement: the original %r no longer "
+                        "exists, so removing %r would destroy the last copy"
+                        % (method, src, dst)
+                    )
+                # REDUNDANCY MUST BE PROVEN, NOT INFERRED FROM "src exists"
+                # (peer review 2026-08-12, Q2). A surviving src is not by itself
+                # evidence that dst's bytes are duplicated:
+                #   * copy: src may have been REPLACED or re-downloaded since the
+                #     apply, so dst can be the only copy of the version that was
+                #     placed, even though a file exists at src.
+                #   * hardlink: src may since have been replaced by a different
+                #     file, breaking the shared-inode relationship.
+                # samefile proves the hardlink case (one inode, two names), and
+                # only then is dropping a directory entry provably lossless.
+                # Everything else cannot be shown equivalent cheaply, so the
+                # removal goes to the trash and stays recoverable.
+                proven_redundant = False
+                if method == "hardlink":
+                    try:
+                        proven_redundant = os.path.samefile(src, dst)
+                    except OSError:
+                        proven_redundant = False
+                if proven_redundant:
+                    _unlink_durable(dst)
+                else:
+                    _trash(dst)
     elif method == "move":
         if os.path.isfile(dst):
             os.makedirs(os.path.dirname(src) or ".", exist_ok=True)
