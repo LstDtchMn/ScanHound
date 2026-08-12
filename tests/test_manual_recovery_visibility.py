@@ -159,6 +159,91 @@ def test_reported_once_per_parking_episode(tmp_path, caplog):
     assert len(hits) == 1, "the diagnostic must not repeat on every poll"
 
 
+def _set_sources(db, batch_uuid, mapping):
+    """Give the batch's deferred rows distinct sources (mixed-source batch)."""
+    rows = db._query_dicts(
+        "SELECT item_uuid FROM download_queue_items WHERE batch_uuid = ? "
+        "ORDER BY item_uuid", (batch_uuid,), default=[])
+    with db.transaction() as conn:
+        for row, source in zip(rows, mapping):
+            conn.execute("UPDATE download_queue_items SET source = ? "
+                         "WHERE item_uuid = ?", (source, row["item_uuid"]))
+
+
+def test_a_held_source_does_not_mask_an_unrelated_source_in_the_same_batch(
+        tmp_path, caplog):
+    """PEER REVIEW ROUND 2, MEDIUM BLOCKER — and the same bug class this
+    diagnostic exists to remove.
+
+    The first version skipped the WHOLE batch when ANY deferred source was held.
+    A verification hold is SOURCE-scoped, so in a mixed batch one held source
+    erased an unrelated, unheld, overdue group's disposition — an adjacent
+    aggregate condition creating a silent branch over actionable work.
+    """
+    db = DatabaseManager(str(tmp_path / "q.sqlite"))
+    service, batch_uuid = _rig(db, auto_resume=False, count=2)
+    _set_sources(db, batch_uuid, ["hdencode", "othersite"])
+    _park(db, service, batch_uuid)
+    # A DIFFERENT batch puts 'hdencode' under a verification hold, so hdencode
+    # is in held_sources while 'othersite' is not.
+    _, held_batch = _rig(db, auto_resume=False, count=1)
+    _park(db, service, held_batch, hold="hdencode")
+
+    with caplog.at_level(logging.WARNING):
+        service._maybe_auto_resume()
+
+    msgs = [m for m in _warnings(caplog)
+            if batch_uuid in m and "manual_recovery_required" in m]
+    assert any("othersite" in m for m in msgs), \
+        "a held source masked an unrelated source group's disposition"
+    assert not any("source hdencode" in m for m in msgs), \
+        "the held group must stay with the hold diagnostic"
+
+
+def test_an_unknown_outcome_child_is_affirmatively_surfaced(tmp_path, caplog):
+    """PEER REVIEW ROUND 2 — generic boilerplate is not enough.
+
+    The manual `_resume_batch(automated=False)` path selects deferred rows
+    WITHOUT decide(), clears exactly these reason codes and makes the rows ready.
+    So the natural operator sequence (see this warning -> press Resume batch) can
+    retry a row whose delivery outcome is unknown. The diagnostic must say so
+    when a child actually carries one.
+    """
+    db = DatabaseManager(str(tmp_path / "q.sqlite"))
+    service, batch_uuid = _rig(db, auto_resume=False, count=2)
+    _park(db, service, batch_uuid)
+    rows = db._query_dicts(
+        "SELECT item_uuid FROM download_queue_items WHERE batch_uuid = ? "
+        "ORDER BY item_uuid", (batch_uuid,), default=[])
+    with db.transaction() as conn:
+        conn.execute("UPDATE download_queue_items "
+                     "SET last_reason_code = 'operation_timeout_unknown' "
+                     "WHERE item_uuid = ?", (rows[0]["item_uuid"],))
+
+    with caplog.at_level(logging.WARNING):
+        service._maybe_auto_resume()
+
+    msgs = [m for m in _warnings(caplog) if batch_uuid in m]
+    assert any("adjudicate_before_retry" in m for m in msgs), \
+        "an unknown-outcome child must be named, not collapsed into generic text"
+    assert any("do NOT use plain batch resume" in m for m in msgs)
+
+
+def test_no_adjudication_text_when_no_unknown_outcome_exists(tmp_path, caplog):
+    """Control for the test above: the safety sentence must appear only when the
+    condition is real, or it becomes boilerplate operators learn to ignore."""
+    db = DatabaseManager(str(tmp_path / "q.sqlite"))
+    service, batch_uuid = _rig(db, auto_resume=False, count=2)
+    _park(db, service, batch_uuid)
+
+    with caplog.at_level(logging.WARNING):
+        service._maybe_auto_resume()
+
+    msgs = [m for m in _warnings(caplog) if batch_uuid in m]
+    assert msgs and any("manual_recovery_required" in m for m in msgs)
+    assert not any("adjudicate_before_retry" in m for m in msgs)
+
+
 def test_auto_resume_enabled_batches_are_left_to_the_existing_diagnostics(
         tmp_path, caplog):
     """Positive control / no double-reporting: an auto-resume-ENABLED batch is
