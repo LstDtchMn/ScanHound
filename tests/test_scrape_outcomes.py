@@ -461,14 +461,22 @@ def test_page_diagnostics_distinguishes_requested_host_missing():
     assert diagnostic.affects_source_health is False
 
 
-def test_page_diagnostics_distinguishes_layout_change():
+def test_page_diagnostics_classifies_an_access_control_failure():
+    """An access-control failure is classified and counts toward source health.
+
+    The expected CODE changed on 2026-08-12: with no reveal tier supplied the
+    tier is unknown, which proves nothing about the layout, so this reports the
+    neutral REVEAL_CONTROL_ABSENT rather than asserting LAYOUT_CHANGED. What this
+    test protects — that the stage is classified at all, and that it still
+    affects source health — is unchanged.
+    """
     service = _service()
     driver = MagicMock()
     driver.page_source = "<html><body><article>Release text only</article></body></html>"
 
     diagnostic = service._log_page_diagnostics(driver, stage="access_control")
 
-    assert diagnostic.code is ScrapeCode.LAYOUT_CHANGED
+    assert diagnostic.code is ScrapeCode.REVEAL_CONTROL_ABSENT
     assert diagnostic.affects_source_health is True
 
 
@@ -561,7 +569,14 @@ def test_release_text_named_captcha_is_not_a_challenge():
         stage="access_control",
     )
 
-    assert diagnostic.code is ScrapeCode.LAYOUT_CHANGED
+    # THE POINT OF THIS TEST is the negative: a release whose TITLE contains
+    # "Captcha" must not be mistaken for an interactive challenge. Assert that
+    # directly rather than only implying it via the fallback code.
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE
+    # The fallback code changed on 2026-08-12: with no reveal tier supplied the
+    # tier is unknown, so this is the neutral REVEAL_CONTROL_ABSENT rather than
+    # an unproven LAYOUT_CHANGED claim.
+    assert diagnostic.code is ScrapeCode.REVEAL_CONTROL_ABSENT
     assert diagnostic.affects_source_health is True
 
 

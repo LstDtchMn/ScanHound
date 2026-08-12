@@ -203,12 +203,24 @@ class TestARealLayoutChangeIsUnaffected:
     """The discrimination. If these regress, the fix has become a blanket
     excuse that would hide an actual site change."""
 
-    @pytest.mark.parametrize("tier", [None, "none", "ambiguous",
-                                      "destination-rejected"])
-    def test_other_tiers_remain_terminal_layout_changes(self, service, tier):
+    # The tier is CONSERVED rather than collapsed (peer review 2026-08-12): only
+    # ambiguous / destination-rejected are positive evidence that the reveal
+    # contract changed. `none` (and an unknown tier) prove nothing about the
+    # layout, so they report the neutral REVEAL_CONTROL_ABSENT instead of
+    # asserting a cause. The discrimination THIS CLASS protects is unchanged and
+    # is still asserted below: every one of these tiers stays TERMINAL and none
+    # of them triggers a source cooldown. Expectations are explicit data, not a
+    # re-implementation of the production branch.
+    @pytest.mark.parametrize("tier,expected", [
+        (None, ScrapeCode.REVEAL_CONTROL_ABSENT),
+        ("none", ScrapeCode.REVEAL_CONTROL_ABSENT),
+        ("ambiguous", ScrapeCode.LAYOUT_CHANGED),
+        ("destination-rejected", ScrapeCode.LAYOUT_CHANGED),
+    ])
+    def test_other_tiers_remain_terminal(self, service, tier, expected):
         svc, coordinator, ds = service
         d = _diagnose(svc, ds, tier=tier)
-        assert d.code == ScrapeCode.LAYOUT_CHANGED
+        assert d.code == expected
         assert d.retryable is False
         assert d.cooldown_until is None
         assert coordinator.observed == [], (
