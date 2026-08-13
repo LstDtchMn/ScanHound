@@ -337,12 +337,27 @@ if ($unreachable.Count -gt 0) {
 # up in dv_host.db unnoticed. The environment wins over the file so a caller or
 # a test can inject one without touching disk.
 #
-# The value is NEVER logged and NEVER set process-wide. It is handed to the
-# detector alone, through its ProcessStartInfo below. A process-wide $env: would
-# be inherited by every other child this script starts -- the row-count probes
-# and the cmd used for stream redirection -- which is a wider blast radius than
-# this secret needs. Only a SHA-256 fingerprint is logged, which is also what
-# the server stores, so the two can be compared without either side printing it.
+# The value is NEVER logged and NEVER set process-wide by this script. It is
+# scoped to the launch TREE started below, which is:
+#
+#     powershell -> cmd.exe -> python (detector) -> dovi_tool / mkvpropedit
+#
+# Every one of those inherits it, because the detector is launched through cmd
+# for OS-level stream redirection and does not scrub the environment of its own
+# tool subprocesses. So this is NARROWER than a process-wide $env: -- the
+# row-count probes and any other sibling this script starts never see it -- but
+# it is NOT "the detector alone" (peer review 2026-08-13 corrected an earlier
+# comment here that claimed exactly that). The remaining exposure is descendants
+# of the process that legitimately needs the key, which is defence-in-depth
+# rather than containment.
+#
+# NOTE the asymmetry: when the key arrives via the ambient environment instead
+# of the file, the CALLER has already made it process-wide, so this script's
+# other children do inherit it. That is the caller's scope decision, not one
+# this script can narrow.
+#
+# Only a SHA-256 fingerprint is logged, which is also what the server stores, so
+# the two can be compared without either side printing the secret.
 $ingestKey = ''
 if ($env:SCANHOUND_DV_INGEST_KEY) {
     $ingestKey = ([string]$env:SCANHOUND_DV_INGEST_KEY).Trim()
@@ -461,16 +476,22 @@ try {
     # one of them. UTF-8 also has no unencodable character, so a title in any
     # script logs cleanly.
     $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
-    # THE CREDENTIAL, HANDED TO THE DETECTOR AND NOTHING ELSE.
+    # THE CREDENTIAL, SCOPED TO THIS LAUNCH RATHER THAN THE WHOLE PROCESS.
     #
-    # It must be set HERE rather than as a process-wide $env: earlier, and the
-    # reason is easy to get wrong: ProcessStartInfo.EnvironmentVariables is
-    # populated from the parent's environment WHEN THE OBJECT IS CONSTRUCTED
-    # (line above). Setting $env:SCANHOUND_DV_INGEST_KEY after that point would
-    # not reach this child at all -- the detector would still send no header and
-    # still be rejected 401, with the wrapper now claiming it had supplied a key.
-    # Assigning it on $psi is both correct and narrower: no sibling process this
-    # script starts ever sees the secret.
+    # Set HERE, on $psi, rather than as a process-wide $env: earlier. The timing
+    # rule is easy to state wrongly (an earlier version of this comment did):
+    # under .NET Framework, ProcessStartInfo.EnvironmentVariables is materialised
+    # from the parent environment on FIRST ACCESS of the property -- not when the
+    # object is constructed -- and is frozen from then on. Verified empirically:
+    # a variable created after construction IS visible on first access, and one
+    # created after that first access is NOT.
+    #
+    # The PYTHONIOENCODING line immediately above is therefore load-bearing for
+    # more than encoding: it is the first access, so this dictionary is already
+    # materialised by the time we get here. A later $env:SCANHOUND_DV_INGEST_KEY
+    # would not reach this child -- the detector would send no header and still
+    # be rejected 401, with the wrapper now claiming it had supplied a key.
+    # Assigning explicitly on $psi does not depend on any of that ordering.
     $psi.EnvironmentVariables['SCANHOUND_DV_INGEST_KEY'] = $ingestKey
     # MUST be set explicitly. PowerShell sets a native command's working
     # directory from the current location, so Push-Location above was enough for
