@@ -530,11 +530,21 @@ try {
 }
 $c6text = if (Test-Path -LiteralPath $c6out) { Get-Content -LiteralPath $c6out -Encoding UTF8 -Raw } else { '' }
 
-# --api points at the discard port, so the final dv-import cannot succeed, and
-# a failed FINAL import is now a failed run. Exit 1 is the contract working.
+# --api points at the discard port, so the final POST cannot succeed, and a
+# failed FINAL handoff is now a failed run. Exit 1 is the contract working.
+#
+# THE MESSAGE MOVED. These two assertions matched 'final dv-import failed', which
+# the detector stopped emitting when the handoff switched from the legacy
+# /rename/dv-import endpoint to the durable /rename/dv-host-rows row POST. It now
+# says 'final dv-host-rows POST failed'. The behaviour was always correct; the
+# expected string was left behind, so this suite has been failing these two
+# assertions ever since -- and a suite that is permanently red is one nobody
+# reads, which is how it stayed unnoticed.
 Assert-That -Name 'detector exits 1 when the final import cannot reach the API' `
             -Condition ($c6code -eq 1) -Detail "got $c6code"
-Assert-That -Name 'and says why' -Condition ($c6text -match 'final dv-import failed')
+Assert-That -Name 'and says why' `
+            -Condition ($c6text -match 'final dv-host-rows POST failed') `
+            -Detail 'expected the detector to name the failed handoff'
 Assert-That -Name 'no UnicodeEncodeError / traceback on the unencodable title' `
             -Condition ($c6text -notmatch 'UnicodeEncodeError' -and $c6text -notmatch 'Traceback') `
             -Detail (($c6text -split "`n" | Select-Object -Last 4) -join ' | ')
@@ -658,7 +668,7 @@ Assert-That -Name 'a failed FILE does not abort the walk (it completes and is co
             -Condition ($c8text -match 'scanned 1 file\(s\)') `
             -Detail 'the walk must finish and count the file despite its detection failing'
 Assert-That -Name 'exit 1 here comes from the unreachable API, not the failed file' `
-            -Condition ($c8code -eq 1 -and $c8text -match 'final dv-import failed') `
+            -Condition ($c8code -eq 1 -and $c8text -match 'final dv-host-rows POST failed') `
             -Detail "code=$c8code"
 
 Remove-Item -LiteralPath $c8 -Recurse -Force -ErrorAction SilentlyContinue
