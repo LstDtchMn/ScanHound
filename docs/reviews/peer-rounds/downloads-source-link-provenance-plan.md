@@ -12,6 +12,13 @@ Jesse's decision, 2026-08-12.
   reviewer rejected. Recording a fact does not change a decision; the wrong-link
   path is open until the consumer switches over.
 
+**Remaining work, exactly:** add `download_results.provenance_url` (guarded ALTER);
+resolve in `poll_results()` from the `child_links` it already holds; persist via
+`upsert_download_result()` with COALESCE so a proven association sticks; select it
+in `get_download_results()`; rewrite `annotate_source_links()` to read that column
+and take `first_grabbed_at` from the proven release, retiring name matching for
+live rows entirely. Then the peer's tests 1–3, and a whole-tree run.
+
 ## Why
 
 Peer review Finding 1 (MEDIUM, confirmed against production code). The resolver's
@@ -84,9 +91,10 @@ coincidence can produce a false positive, and both send paths know them.
    A test driving `download_item()` must pin that, rather than trusting a read of
    the call site.
 5. A FAILED send records nothing — recording is inside the success branch.
-6. **`hdencode_action_service.py:278` also calls `send_to_jdownloader()` and is NOT
-   wired.** Its packages resolve to nothing: safe (no wrong link) but no link at
-   all. Wire it in part 2, with a test, or state the gap explicitly at merge.
+6. `hdencode_action_service.py` also calls `send_to_jdownloader()`. NOW WIRED
+   (`d8ab9df`) — it records against the action's `canonical_url` on a successful
+   submit. Both send paths and both callers therefore record; a test driving each
+   caller is still owed.
 
 ## Already closed on this branch
 
