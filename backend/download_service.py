@@ -1872,10 +1872,43 @@ class DownloadService:
                     ),
                 )
             if stage == "access_control":
-                # Genuinely absent or wrong-destination: tier "none",
-                # "ambiguous", "destination-rejected". A real layout change.
+                # CONSERVE THE TIER (peer review 2026-08-12). _find_reveal_control
+                # already distinguishes three materially different observations,
+                # and this collapsed all of them into LAYOUT_CHANGED — whose own
+                # comment asserted "A real layout change":
+                #   destination-rejected -> a links-labelled submit EXISTS but its
+                #       effective destination no longer matches the expected unlock
+                #       endpoint. Positive evidence the reveal contract changed.
+                #   ambiguous            -> several otherwise-valid reveal controls.
+                #       Also positive unexpected-structure evidence.
+                #   none                 -> nothing qualifying was proven. Equally
+                #       consistent with a page-specific restriction, a login or
+                #       region gate, a pulled release, an error page, an
+                #       unrecognised block, or an alternate template.
+                # Calling "none" a layout change picks one hypothesis without
+                # evidence — and because both feed source health, one unclassified
+                # page could read as a source regression. Splitting them is what
+                # makes a REAL source-wide change detectable: it can no longer be
+                # impersonated by a single gated page. Both still affect source
+                # health exactly as before; deciding health by aggregation rather
+                # than by one item is a follow-up that needs the aggregate first.
+                tier_signal = "reveal-tier:%s" % (reveal_tier or "unknown")
+                if tier_signal not in signals:
+                    signals.append(tier_signal)
+                # TWO LITERAL CALL SITES, not one conditional code. A ternary here
+                # made the reason code non-literal, which
+                # test_scrape_reason_policy_invariant flags because a static audit
+                # of reason codes can no longer see it. The invariant is worth more
+                # than the brevity.
+                if reveal_tier in ("ambiguous", "destination-rejected"):
+                    return ScrapeDiagnostic(
+                        ScrapeCode.LAYOUT_CHANGED,
+                        retryable=False,
+                        affects_source_health=True,
+                        signals=tuple(signals),
+                    )
                 return ScrapeDiagnostic(
-                    ScrapeCode.LAYOUT_CHANGED,
+                    ScrapeCode.REVEAL_CONTROL_ABSENT,
                     retryable=False,
                     affects_source_health=True,
                     signals=tuple(signals),

@@ -1635,6 +1635,188 @@ class DownloadQueueService:
                 continue
             self._log_unresumable_batch(batch)
 
+        self._warn_manual_recovery_batches(now, held_sources)
+
+    #: Grace after a cooldown lapses before a manual-only batch is reported.
+    #: Exists ONLY to avoid churn around the worker poll; it authorises no retry.
+    _MANUAL_RECOVERY_GRACE_SECONDS = 60
+
+    def manual_recovery_groups(self, now=None, held_sources=None) -> list[dict]:
+        """Every (batch, source) group that will NEVER auto-resume.
+
+        THE SILENT FOURTH STATE (peer review 2026-08-12). Three separate queries
+        gate recovery observability on ``auto_resume_after_cooldown = 1``: the
+        resume eligibility query, ``_warn_exhausted_batches``, and the ``stuck``
+        query feeding ``_log_unresumable_batch``. So the dispositions are:
+
+            enabled + budget available -> automatic recovery
+            enabled + budget spent     -> exhaustion warning
+            enabled + due but blocked  -> unresumable diagnostic
+            verification hold          -> explicit hold diagnostic
+            DISABLED + cooldown due    -> no path, no warning, no diagnostic
+
+        That last row is a STRICTLY WORSE parked state than the one already
+        warned about: automatic recovery was never permitted, so there is no
+        budget to spend and nothing will ever promote it. Observed in production
+        2026-08-10..12 -- a batch sat with an expired cooldown and one deferred
+        item for two days, its retry budget UNTOUCHED, reported by nothing, until
+        a manual retry completed it immediately.
+
+        The invariant this restores: every nonterminal ``paused_source`` group is
+        automatically recoverable, deliberately safety-held, or REPORTED as
+        needing a human. Configuration may choose WHICH branch applies; it may
+        not create a silent fourth state.
+
+        Evaluated PER (batch, source): a verification hold is source-scoped, so a
+        held source must not erase an unrelated source group's disposition.
+
+        THIS IS THE ONE RULE. The operator log warning and the API/UI disposition
+        both read it, so a badge on screen and a line in the log can never
+        disagree about which downloads need a human -- two implementations of
+        "needs you" would drift, and the operator would have no way to tell which
+        was lying. Pure by construction: no warn-once state, no logging, no
+        mutation, no retry authorised. Callers own all of that.
+
+        `held_sources` is accepted so the worker pass can reuse the set it has
+        already read; omit it and it is read here.
+        """
+        from backend.queue_recovery_policy import UNKNOWN_OUTCOMES
+
+        now = now if now is not None else _utcnow()
+        if held_sources is None:
+            # Same read as the worker pass: a batch is held if it recorded the
+            # hold itself OR any of its deferred items belongs to a held source.
+            held_sources = {
+                str(r.get("verification_hold_source"))
+                for r in self.db._query_dicts(
+                    "SELECT DISTINCT verification_hold_source "
+                    "FROM download_queue_batches "
+                    "WHERE verification_hold_source IS NOT NULL", default=[])
+            }
+        groups: list[dict] = []
+        for row in self.db._query_dicts(
+            """
+            SELECT batch_uuid, cooldown_until, verification_hold_source
+            FROM download_queue_batches
+            WHERE state = 'paused_source'
+              AND auto_resume_after_cooldown = 0
+            """,
+            default=[],
+        ):
+            batch_uuid = str(row.get("batch_uuid") or "")
+            until = _parse(row.get("cooldown_until"))
+            if until is not None and (
+                until + timedelta(
+                    seconds=self._MANUAL_RECOVERY_GRACE_SECONDS) > now
+            ):
+                continue  # not yet due (plus grace); nothing to report
+            # THE BATCH'S OWN HOLD MARKER NAMES ONE SOURCE, NOT THE BATCH
+            # (peer review round 3 — the same batch-vs-source confusion, one
+            # layer earlier than round 2 fixed). This used to `continue` on any
+            # non-null verification_hold_source, which is a batch-wide veto over
+            # a source-scoped fact. _pause_for_source says so itself: "decide()
+            # holds every row of this (batch, source) group while it is set" and
+            # "a non-challenge pause deliberately leaves an existing hold in
+            # place". So a mixed batch where hdencode is held and othersite
+            # later pauses normally keeps the hdencode marker — and the whole
+            # batch went silent, including the unrelated overdue othersite group.
+            # Fold the marker into the held set instead; the per-source loop
+            # below already has the right authority.
+            held_here = set(held_sources)
+            batch_hold = str(row.get("verification_hold_source") or "")
+            if batch_hold:
+                held_here.add(batch_hold)
+            # PER SOURCE, NOT PER BATCH (peer review round 2). The first version
+            # skipped the WHOLE batch when ANY deferred source was held:
+            #     if held_sources and any(r.source in held_sources ...): continue
+            # A verification hold is SOURCE-scoped, so in a mixed batch one held
+            # source erased an unrelated, unheld, overdue source group's
+            # disposition — recreating the very silent branch this diagnostic
+            # exists to remove. Exclude only the held groups; report the rest.
+            for group in self.db._query_dicts(
+                """
+                SELECT source,
+                       COUNT(*) AS n,
+                       SUM(CASE WHEN last_reason_code IN (%s)
+                                THEN 1 ELSE 0 END) AS unknown_n,
+                       MAX(last_reason_code) AS a_reason
+                FROM download_queue_items
+                WHERE batch_uuid = ?
+                  AND state IN ('waiting_source','verification_required')
+                GROUP BY source
+                """ % ",".join("?" * len(UNKNOWN_OUTCOMES)),
+                (*sorted(UNKNOWN_OUTCOMES), batch_uuid), default=[],
+            ):
+                source = str(group.get("source") or "")
+                count = int(group.get("n") or 0)
+                if count == 0:
+                    continue
+                if source in held_here:
+                    continue  # this group is held; the hold diagnostic owns it
+                groups.append({
+                    "batch_uuid": batch_uuid,
+                    "source": source,
+                    "count": count,
+                    "unknown_n": int(group.get("unknown_n") or 0),
+                    "a_reason": group.get("a_reason"),
+                    "cooldown_until": str(row.get("cooldown_until") or ""),
+                })
+        return groups
+
+    def _warn_manual_recovery_batches(self, now, held_sources) -> None:
+        """Log the groups manual_recovery_groups() identifies, once each.
+
+        "Reported through operator diagnostics" is deliberately weaker than
+        "durably reported" (peer review round 2): this is a log warning with a
+        per-process warn-once set, exactly like the exhausted-budget and
+        verification-hold diagnostics beside it. Nothing is persisted on the
+        batch, so a restart re-warns rather than suppressing forever. The API
+        disposition (list_retries -> manual_recovery_required) reads the same
+        rule rather than recomputing it.
+
+        This ONLY reports. It changes no state and authorises no retry -- the
+        flag is a deliberate retry-policy choice, unknown outcomes still require
+        adjudication, and a held source still gets the one-probe rule. It is also
+        deliberately NOT labelled ``auto_resume_budget_exhausted``: "never
+        permitted" and "permitted and spent" are different causes needing
+        different operator responses.
+        """
+        if not hasattr(self, "_manual_recovery_warned"):
+            self._manual_recovery_warned = set()
+        for group in self.manual_recovery_groups(now, held_sources):
+            # Keyed on the parking episode so a group that recovers and later
+            # parks again is reported again.
+            episode = (group["batch_uuid"], group["source"],
+                       group["cooldown_until"], group["count"])
+            if episode in self._manual_recovery_warned:
+                continue
+            self._manual_recovery_warned.add(episode)
+            # AFFIRM THE SAFETY CONDITION when it is really present (peer
+            # review round 2). Generic "unknown outcomes need adjudication"
+            # boilerplate is not enough: the manual _resume_batch path selects
+            # deferred rows WITHOUT decide(), clears exactly these reason
+            # codes and makes the rows ready — so the natural operator
+            # sequence (see this warning -> press Resume batch) can retry a
+            # row whose delivery outcome is unknown. Say so only when a child
+            # actually carries one.
+            adjudicate = (
+                " %d of these have an UNKNOWN delivery outcome "
+                "(reason adjudicate_before_retry): check whether the release "
+                "already downloaded before retrying, and do NOT use plain "
+                "batch resume, which clears that state without adjudicating."
+                % group["unknown_n"]
+            ) if group["unknown_n"] else ""
+            logger.warning(
+                "Batch %s source %s is parked with automatic resume DISABLED "
+                "(auto_resume_after_cooldown=0), so its cooldown expiring will "
+                "never promote anything. %d item(s) remain deferred; a last "
+                "reason is %r. A human must decide: reason "
+                "manual_recovery_required. This is NOT budget exhaustion — no "
+                "automatic attempt was ever permitted.%s",
+                group["batch_uuid"], group["source"], group["count"],
+                group["a_reason"], adjudicate,
+            )
+
     def retry_item(self, item_uuid: str) -> dict:
         item = self.get_item(item_uuid)
         if item is None:
@@ -2310,8 +2492,24 @@ class DownloadQueueService:
         )
         snapshot = self._coordinator_snapshot()
         now = _utcnow()
+        # The same rule the operator log warning reports, read once per call.
+        # Read from manual_recovery_groups() rather than recomputed here, so a
+        # badge on screen and a line in the log can never disagree about which
+        # downloads need a human. Never fatal: this list's job is showing the
+        # retry queue, and a disposition lookup failing must not empty it.
+        try:
+            manual_recovery = {
+                (g["batch_uuid"], g["source"])
+                for g in self.manual_recovery_groups(now)
+            }
+        except Exception:
+            logger.exception("manual-recovery disposition lookup failed")
+            manual_recovery = set()
         for row in rows:
             scheduled = _parse(row.get("scheduled_for"))
+            row["manual_recovery_required"] = (
+                str(row.get("batch_uuid") or ""), str(row.get("source") or "")
+            ) in manual_recovery
             row["retry_available"] = (
                 row.get("source") != "hdencode" or not snapshot.get("blocked")
             )
