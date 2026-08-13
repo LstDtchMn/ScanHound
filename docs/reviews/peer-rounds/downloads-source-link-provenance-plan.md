@@ -1,8 +1,16 @@
 # Live source links: link-based package provenance (plan)
 
 **Branch:** `feat/download-first-grabbed-and-link`
-**Status:** DESIGN AGREED, NOT BUILT. The branch must not merge until this lands —
+**Status:** PART 1 OF 2 BUILT. The branch must not merge until part 2 lands —
 Jesse's decision, 2026-08-12.
+
+- **Done:** provenance is RECORDED (`download_package_links`, written on a
+  successful send) and RESOLVABLE (`resolve_release_by_links`, fails closed on
+  unknown or ambiguous links). 10 tests, ambiguity guard mutation-verified.
+- **NOT done, so Finding 1 is NOT yet fixed:** nothing consumes it. Live rows are
+  still annotated by `get_download_source_links()` — the name-based resolver the
+  reviewer rejected. Recording a fact does not change a decision; the wrong-link
+  path is open until the consumer switches over.
 
 ## Why
 
@@ -46,9 +54,13 @@ coincidence can produce a false positive, and both send paths know them.
    file-host link (normalised). Written in `send_to_jdownloader()` for BOTH the
    `api` and folder/`.crawljob` branches — the folder path is exactly where a
    uuid-based scheme would have failed, so it must not be skipped here.
-2. **Resolve a live package by its links.** Ask JD for the package's links and
-   match against the stored set. First successful match pins `package_uuid` to the
-   release durably, so the expensive lookup happens once per package, not per poll.
+2. **Resolve a live package by its links.** NO EXTRA JD CALL IS NEEDED:
+   `poll_results()` already issues `device.downloads.query_links([...])` with
+   `"url": True` and builds `by_pkg` (packageUUID -> child links) at
+   `backend/download_service.py:1033`. Feed those urls to
+   `resolve_release_by_links()` and persist the answer on the result row, so the
+   REST path (which reads the DB, not the live poll) sees the same proven
+   association as the WebSocket push.
 3. **Fail closed.** No proven association -> `source_url` and `first_grabbed_at`
    stay `None`. Unproven is the default, not the exception.
 4. **Evidence order** once provenance exists (peer's Finding 3): proven package

@@ -3194,6 +3194,14 @@ class DownloadService:
 
         if self.config.get("jd_enabled", False) and (jd_folder or jd_method == "api"):
             if self.send_to_jdownloader(links, package_name, destination=destination, progress_callback=_cb):
+                # Provenance for the live downloads view (peer review Finding 1):
+                # remember which links belong to this release, so a package can
+                # later be proven ours instead of matched by display name. After
+                # the send succeeded, so a failed send records nothing. Never
+                # raises — an unrecorded link only costs a missing source link,
+                # and must not fail a grab that actually went out.
+                if self.db is not None:
+                    self.db.record_submitted_links(url, links)
                 result["success"] = True
                 result["method"] = "jdownloader"
                 result["source_progress"] = True

@@ -938,6 +938,28 @@ class DatabaseManager:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_jd_confirmed_name '
                                'ON downloads(jd_confirmed_name) WHERE jd_confirmed_name IS NOT NULL')
 
+                # PACKAGE PROVENANCE (peer review Finding 1, 2026-08-12).
+                # The file-host links ScanHound actually submitted for a release.
+                # poll_results() enumerates JDownloader's ENTIRE package list, so
+                # a package added by hand is in scope; matching it to a release by
+                # display name is a coincidence, not evidence, and produced a
+                # confident link to the wrong release page. A link IS the release,
+                # so this is provenance by construction — and both send paths (API
+                # and .crawljob) know the links, which a package-uuid scheme could
+                # not say (JD assigns uuids asynchronously, and the folder path has
+                # nothing to ask).
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS download_package_links (
+                        url TEXT NOT NULL,
+                        link TEXT NOT NULL,
+                        recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (url, link)
+                    )
+                ''')
+                # Resolution goes link -> release, so `link` is the lookup key.
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_package_links_link '
+                               'ON download_package_links(link)')
+
                 # HDEncode RSS evidence tables (v3, additive-only).
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS hdencode_feed_state (
@@ -3932,6 +3954,63 @@ class DatabaseManager:
             "FROM download_results ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         )
+
+    def record_submitted_links(self, url, links):
+        """Remember the file-host links submitted to JDownloader for `url`.
+
+        Called for BOTH send paths. The folder/.crawljob path is the one that
+        matters most here: it has no API to read a package back from, so any
+        scheme that depended on asking JDownloader what it created would leave
+        that path with no provenance at all.
+
+        Idempotent (INSERT OR IGNORE on the natural key), so a regrab of the
+        same release re-affirms the same rows rather than duplicating them, and
+        a partial failure can be retried. Never raises: failing to record
+        provenance must not fail the grab itself -- the cost is a link that
+        stays unresolved, which is the safe direction.
+        """
+        rows = [(str(url), str(link)) for link in (links or []) if link]
+        if not url or not rows:
+            return 0
+        try:
+            with self.transaction() as conn:
+                if conn is None:
+                    return 0
+                conn.executemany(
+                    "INSERT OR IGNORE INTO download_package_links (url, link) "
+                    "VALUES (?, ?)", rows)
+            return len(rows)
+        except Exception:
+            logger.exception("failed to record submitted links for %s", url)
+            return 0
+
+    def resolve_release_by_links(self, link_urls):
+        """The release these live JDownloader links provably belong to, or None.
+
+        Provenance, not inference: a link resolves only because ScanHound
+        recorded submitting it. A package JDownloader shows that ScanHound never
+        sent contributes no rows and therefore resolves to nothing, which is the
+        whole point of Finding 1.
+
+        Returns None when the links map to more than one release, too. That is a
+        real possibility -- a hand-built package can mix links from two releases,
+        and a regrab at a different URL can reuse a host link -- and there is no
+        honest answer to "which release is this?" in that case.
+        """
+        wanted = [str(u) for u in dict.fromkeys(link_urls or []) if u]
+        if not wanted:
+            return None
+        found = set()
+        for start in range(0, len(wanted), 300):
+            chunk = wanted[start:start + 300]
+            rows = self._query_dicts(
+                "SELECT DISTINCT url FROM download_package_links WHERE link IN (%s)"
+                % ",".join("?" * len(chunk)),
+                tuple(chunk), default=[]) or []
+            found.update(r["url"] for r in rows)
+            if len(found) > 1:
+                return None   # ambiguous; no honest answer
+        return next(iter(found)) if len(found) == 1 else None
 
     def get_download_source_links(self, names):
         """Map JD package name -> {"source_url", "first_grabbed_at"}.
