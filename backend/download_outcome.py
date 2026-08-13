@@ -15,6 +15,14 @@ _FAILURE_TITLES = {
     ScrapeCode.BROWSER_NETWORK_ERROR.value: "HDEncode could not be reached",
     ScrapeCode.BROWSER_NAVIGATION_FAILED.value: "Page navigation failed",
     ScrapeCode.LAYOUT_CHANGED.value: "HDEncode page changed",
+    # CAUGHT BY THE EXHAUSTIVENESS TEST, exactly as its docstring predicted -- I
+    # added the code with a message and forgot this map, so it would have
+    # rendered as the generic "Download Failed".
+    # Observation only, per the sibling neutrality test: the control was not
+    # found. NOT "page changed" -- that is the claim this code exists to stop
+    # making, since absence is equally consistent with a gate, a pulled release,
+    # an error page or a different template.
+    ScrapeCode.REVEAL_CONTROL_ABSENT.value: "Download links not found on the page",
     ScrapeCode.REQUESTED_HOST_MISSING.value: "Requested host unavailable",
     ScrapeCode.NO_FILE_HOST_LINKS.value: "No supported links found",
     ScrapeCode.SCRAPE_EXCEPTION.value: "Link retrieval failed",
