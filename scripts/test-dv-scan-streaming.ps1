@@ -42,24 +42,6 @@ $py = @(
 if (-not $py) { $py = (Get-Command python -ErrorAction SilentlyContinue).Source }
 if (-not $py) { Write-Output 'FATAL: no python found; this suite needs the real interpreter.'; exit 1 }
 
-# Ask the detector what it says when its final handoff fails, instead of
-# repeating the literal. Importing is safe: dv_host_scan guards its entry point
-# with `if __name__ == "__main__"`, so nothing runs on import.
-$detectorDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\host-detector'
-$expectedFailMsg = (& $py -c @"
-import sys
-sys.path.insert(0, r'$detectorDir')
-import dv_host_scan
-print(dv_host_scan.FINAL_POST_FAILED_MSG)
-"@) -join ''
-if (-not $expectedFailMsg) {
-    Write-Output 'FATAL: could not read FINAL_POST_FAILED_MSG from the detector.'
-    exit 1
-}
-# Regex-escaped, because the message contains characters -match would treat as
-# metacharacters and a silent partial match would make this assertion vacuous.
-$expectedFailPattern = [regex]::Escape($expectedFailMsg)
-Write-Output "expected failure message: $expectedFailMsg"
 
 
 function Invoke-PyFile {
@@ -553,20 +535,27 @@ $c6text = if (Test-Path -LiteralPath $c6out) { Get-Content -LiteralPath $c6out -
 # --api points at the discard port, so the final POST cannot succeed, and a
 # failed FINAL handoff is now a failed run. Exit 1 is the contract working.
 #
-# THE MESSAGE IS NO LONGER DUPLICATED HERE. These assertions used to hardcode
+# THE LITERAL HERE IS DELIBERATE. These assertions used to expect
 # 'final dv-import failed', which the detector stopped emitting when the handoff
-# moved from /rename/dv-import to the durable /rename/dv-host-rows row POST. The
-# behaviour was always correct; the expected string was simply left behind, and
-# these two assertions then failed on main for weeks unnoticed -- this suite is
-# not in CI, and a permanently red suite is one nobody reads.
+# moved from /rename/dv-import to the durable /rename/dv-host-rows row POST, and
+# they then failed on main for weeks unnoticed.
 #
-# So the expectation is now READ FROM THE DETECTOR ITSELF ($expectedFailMsg,
-# resolved above from dv_host_scan.FINAL_POST_FAILED_MSG). The two cannot drift
-# apart again, whatever CI does or does not run.
+# An earlier revision of this branch "fixed" that by importing the string from
+# the detector. Peer review rejected it, correctly: a test that asks production
+# what production currently says can only detect a MISSING message, never a WRONG
+# one. It asserts 'did we emit whatever we now define' instead of 'did the
+# failure produce the diagnostic contract we intended' -- which is the assertion
+# worth having.
+#
+# So the expectation stays independent. Drift is caught by the path-scoped
+# windows-latest job instead, where a wording change is a one-line maintenance
+# edit on a red build rather than a permanently red suite nobody runs. If this
+# wording churns often, the fix is a stable machine token (e.g.
+# DV_FINAL_HANDOFF_FAILED) logged beside the prose -- not deriving the prose.
 Assert-That -Name 'detector exits 1 when the final import cannot reach the API' `
             -Condition ($c6code -eq 1) -Detail "got $c6code"
 Assert-That -Name 'and says why' `
-            -Condition ($c6text -match $expectedFailPattern) `
+            -Condition ($c6text -match 'final dv-host-rows POST failed') `
             -Detail 'expected the detector to name the failed handoff'
 Assert-That -Name 'no UnicodeEncodeError / traceback on the unencodable title' `
             -Condition ($c6text -notmatch 'UnicodeEncodeError' -and $c6text -notmatch 'Traceback') `
@@ -691,7 +680,7 @@ Assert-That -Name 'a failed FILE does not abort the walk (it completes and is co
             -Condition ($c8text -match 'scanned 1 file\(s\)') `
             -Detail 'the walk must finish and count the file despite its detection failing'
 Assert-That -Name 'exit 1 here comes from the unreachable API, not the failed file' `
-            -Condition ($c8code -eq 1 -and $c8text -match $expectedFailPattern) `
+            -Condition ($c8code -eq 1 -and $c8text -match 'final dv-host-rows POST failed') `
             -Detail "code=$c8code"
 
 Remove-Item -LiteralPath $c8 -Recurse -Force -ErrorAction SilentlyContinue
