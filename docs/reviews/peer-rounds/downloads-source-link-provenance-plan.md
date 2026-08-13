@@ -79,7 +79,14 @@ coincidence can produce a false positive, and both send paths know them.
 3. Precedence: exact `jd_confirmed_name` on A colliding with computed
    `package_name` on B -> pinned, not mutually suppressed.
 4. Folder/`.crawljob` send path records links too — the branch a uuid scheme
-   would have missed.
+   would have missed. Recording sits at the `download_item()` call site, which is
+   ABOVE the api/folder split inside `send_to_jdownloader()`, so both are covered.
+   A test driving `download_item()` must pin that, rather than trusting a read of
+   the call site.
+5. A FAILED send records nothing — recording is inside the success branch.
+6. **`hdencode_action_service.py:278` also calls `send_to_jdownloader()` and is NOT
+   wired.** Its packages resolve to nothing: safe (no wrong link) but no link at
+   all. Wire it in part 2, with a test, or state the gap explicitly at merge.
 
 ## Already closed on this branch
 
