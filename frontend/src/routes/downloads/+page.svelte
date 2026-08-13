@@ -19,18 +19,23 @@
   import { checkedAgo, exactTime } from '$lib/time';
   import { safeHttpUrl } from '$lib/url';
 
-  /** History rows carry `date_added` (as `downloaded_at`) — the FIRST grab.
-   *  save_to_history()'s ON CONFLICT bumps `last_grabbed_at` and deliberately
-   *  leaves date_added alone, so a regrab does not move this date. Labelled
-   *  explicitly because the bare timestamp read as "downloaded at". */
-  function firstGrabbedFrom(ts: string | null | undefined): string {
+  /** History rows carry `date_added` (as `downloaded_at`): when this url was
+   *  FIRST SEEN in history, not when it first succeeded. add_to_history()'s
+   *  ON CONFLICT bumps `last_grabbed_at` and deliberately leaves date_added
+   *  alone, so a regrab does not move it — but download_item() also writes a
+   *  row with status="failed", so the first write can be a failed attempt
+   *  (peer review). Hence "first seen", NOT "first grabbed": a failed Monday
+   *  attempt followed by a successful Wednesday retry would otherwise claim a
+   *  grab happened on Monday. Labelled explicitly because the bare timestamp
+   *  read as "downloaded at". */
+  function firstSeenFrom(ts: string | null | undefined): string {
     const ago = checkedAgo(ts ?? '');
-    return ago ? `first grabbed ${ago}` : '';
+    return ago ? `first seen ${ago}` : '';
   }
-  function firstGrabbedLabel(entry: DownloadHistoryEntry): string {
-    return firstGrabbedFrom(entry.downloaded_at ?? entry.timestamp);
+  function firstSeenLabel(entry: DownloadHistoryEntry): string {
+    return firstSeenFrom(entry.downloaded_at ?? entry.timestamp);
   }
-  function firstGrabbedExact(entry: DownloadHistoryEntry): string {
+  function firstSeenExact(entry: DownloadHistoryEntry): string {
     return exactTime(entry.downloaded_at ?? entry.timestamp ?? '');
   }
 
@@ -654,9 +659,9 @@
               {/if}
             {/if}
           </div>
-          {#if firstGrabbedFrom(r.first_grabbed_at)}
+          {#if firstSeenFrom(r.first_grabbed_at)}
             <span class="text-[10px] text-[var(--text-secondary)] whitespace-nowrap"
-                  title={exactTime(r.first_grabbed_at ?? '')}>{firstGrabbedFrom(r.first_grabbed_at)}</span>
+                  title={exactTime(r.first_grabbed_at ?? '')}>{firstSeenFrom(r.first_grabbed_at)}</span>
           {/if}
           {#if r.host}<span class="text-[var(--text-secondary)] whitespace-nowrap">{r.host}</span>{/if}
           <span class="text-[10px] text-[var(--text-secondary)] uppercase whitespace-nowrap w-20 text-right">{r.state === 'extracted' && r.extraction === 'na' ? 'Complete' : stateLabel(r.state)}</span>
@@ -814,7 +819,7 @@
                       <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap">{entry.size}</span>
                     {/if}
                     <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap"
-                          title={firstGrabbedExact(entry)}>{firstGrabbedLabel(entry)}</span>
+                          title={firstSeenExact(entry)}>{firstSeenLabel(entry)}</span>
                     <Badge
                       label={historyStatusLabel(entry.status)}
                       variant={historyStatusVariant(entry.status)}
@@ -856,7 +861,7 @@
               <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap">{entry.size}</span>
             {/if}
             <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap"
-                  title={firstGrabbedExact(entry)}>{firstGrabbedLabel(entry)}</span>
+                  title={firstSeenExact(entry)}>{firstSeenLabel(entry)}</span>
             <Badge
               label={historyStatusLabel(entry.status)}
               variant={historyStatusVariant(entry.status)}

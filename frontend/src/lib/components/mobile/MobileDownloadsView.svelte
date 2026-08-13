@@ -29,9 +29,9 @@
   /** '' whenever the package name did not map to exactly one release — the row
    *  then shows progress only, rather than a date borrowed from the wrong
    *  release. See database.get_download_source_links(). */
-  function firstGrabbed(r: DownloadResult): string {
+  function firstSeen(r: DownloadResult): string {
     const ago = checkedAgo(r.first_grabbed_at ?? '');
-    return ago ? `first grabbed ${ago}` : '';
+    return ago ? `first seen ${ago}` : '';
   }
   function stateLabel(s: string): string {
     return ({ queued: 'Queued', downloading: 'Downloading', downloaded: 'Downloaded',
@@ -155,10 +155,10 @@
             <div class="mt-0.5 text-[11px] text-[var(--text-secondary)]">
               {gb(r.bytes_loaded)} / {gb(r.bytes_total)} GB · {r.host}{#if r.error} · <span class="text-red-400">{r.error}</span>{/if}
             </div>
-            {#if firstGrabbed(r) || safeHttpUrl(r.source_url)}
+            {#if firstSeen(r) || safeHttpUrl(r.source_url)}
               <div class="mt-0.5 text-[11px] text-[var(--text-secondary)] flex items-center gap-2">
-                {#if firstGrabbed(r)}
-                  <span title={exactTime(r.first_grabbed_at ?? '')}>{firstGrabbed(r)}</span>
+                {#if firstSeen(r)}
+                  <span title={exactTime(r.first_grabbed_at ?? '')}>{firstSeen(r)}</span>
                 {/if}
                 {#if safeHttpUrl(r.source_url)}
                   <a href={safeHttpUrl(r.source_url)} target="_blank" rel="noopener noreferrer"
