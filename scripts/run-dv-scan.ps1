@@ -25,13 +25,33 @@
 #   11 a configured library root is unreachable (the mapped-drive case)
 #   12 python not found
 #   13 dovi_tool.exe not found
+#   14 the ingest key is unavailable, so nothing could be delivered
 #   1  the detector itself failed; see the log
+#
+# WHY 14 EXISTS (added 2026-08-13 after a live outage).
+#
+# The detector authenticates its POST with the SCANHOUND_DV_INGEST_KEY
+# environment variable (dv_host_scan.py sends it as the X-DV-Ingest-Key header;
+# the server stores only its SHA-256). This wrapper never set it. So every run
+# walked all four roots correctly, spent an hour scanning, and then had every
+# single upload rejected 401 -- 670 rows accumulated in dv_host.db that the
+# container never saw, while LastTaskResult showed a generic 1 that looked like
+# any other detector failure.
+#
+# That is precisely the shape this wrapper exists to prevent, in its own words
+# above: work that cannot land, reported indistinguishably from work that did.
+# So a missing key is now checked BEFORE the scan and fails loudly with its own
+# code, rather than after an hour of unusable work.
 
 [CmdletBinding()]
 param(
     [string]$RepoRoot = 'X:\Docker Apps\ScanHound',
     [string]$LogDir   = 'X:\Docker Apps\ScanHound\data\dv-scan-logs',
     [int]$KeepLogs    = 30,
+    # Read at launch and handed ONLY to the detector process. An already-set
+    # SCANHOUND_DV_INGEST_KEY in the environment wins, so a caller or test can
+    # inject one without a file on disk.
+    [string]$IngestKeyFile = 'C:\DockerData\scanhound\dv_ingest_key.secret',
     # How often to log a "still running" line while the detector is silent. The
     # detector can legitimately say nothing for ~20 minutes (one 90 GB file at
     # the measured 79 MB/s), so streaming alone still leaves long gaps; this is
@@ -310,6 +330,64 @@ if ($unreachable.Count -gt 0) {
     exit 11
 }
 
+# --- ingest credential -----------------------------------------------------
+#
+# Resolved BEFORE the detector starts. A missing key makes every POST a 401, and
+# finding that out only after an hour of scanning is exactly how 670 rows piled
+# up in dv_host.db unnoticed. The environment wins over the file so a caller or
+# a test can inject one without touching disk.
+#
+# The value is NEVER logged and NEVER set process-wide by this script. It is
+# scoped to the launch TREE started below, which is:
+#
+#     powershell -> cmd.exe -> python (detector) -> dovi_tool / mkvpropedit
+#
+# Every one of those inherits it, because the detector is launched through cmd
+# for OS-level stream redirection and does not scrub the environment of its own
+# tool subprocesses. So this is NARROWER than a process-wide $env: -- the
+# row-count probes and any other sibling this script starts never see it -- but
+# it is NOT "the detector alone" (peer review 2026-08-13 corrected an earlier
+# comment here that claimed exactly that). The remaining exposure is descendants
+# of the process that legitimately needs the key, which is defence-in-depth
+# rather than containment.
+#
+# NOTE the asymmetry: when the key arrives via the ambient environment instead
+# of the file, the CALLER has already made it process-wide, so this script's
+# other children do inherit it. That is the caller's scope decision, not one
+# this script can narrow.
+#
+# Only a SHA-256 fingerprint is logged, which is also what the server stores, so
+# the two can be compared without either side printing the secret.
+$ingestKey = ''
+if ($env:SCANHOUND_DV_INGEST_KEY) {
+    $ingestKey = ([string]$env:SCANHOUND_DV_INGEST_KEY).Trim()
+    Write-Log 'ingest key: supplied by the environment'
+} elseif (Test-Path -LiteralPath $IngestKeyFile) {
+    try {
+        $ingestKey = (Get-Content -LiteralPath $IngestKeyFile -Raw -ErrorAction Stop).Trim()
+    } catch {
+        Write-Log "cannot read the ingest key file '$IngestKeyFile': $($_.Exception.Message)" 'ERROR'
+        Write-Log 'Without it every upload is rejected 401 and the scan is wasted work.' 'ERROR'
+        exit 14
+    }
+    Write-Log "ingest key: read from $IngestKeyFile"
+} else {
+    Write-Log "ingest key file not found: $IngestKeyFile" 'ERROR'
+    Write-Log 'Without it every upload is rejected 401 and the scan is wasted work.' 'ERROR'
+    exit 14
+}
+if (-not $ingestKey) {
+    Write-Log 'the ingest key is empty; every upload would be rejected 401.' 'ERROR'
+    exit 14
+}
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $fp = [System.BitConverter]::ToString(
+            $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($ingestKey))
+          ).Replace('-', '').ToLowerInvariant()
+} finally { $sha.Dispose() }
+Write-Log ("ingest key sha256 (first 12): {0}" -f $fp.Substring(0, 12))
+
 # --- run the detector ------------------------------------------------------
 #
 # From the repo root, because the detector's --config/--db defaults are
@@ -398,6 +476,23 @@ try {
     # one of them. UTF-8 also has no unencodable character, so a title in any
     # script logs cleanly.
     $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
+    # THE CREDENTIAL, SCOPED TO THIS LAUNCH RATHER THAN THE WHOLE PROCESS.
+    #
+    # Set HERE, on $psi, rather than as a process-wide $env: earlier. The timing
+    # rule is easy to state wrongly (an earlier version of this comment did):
+    # under .NET Framework, ProcessStartInfo.EnvironmentVariables is materialised
+    # from the parent environment on FIRST ACCESS of the property -- not when the
+    # object is constructed -- and is frozen from then on. Verified empirically:
+    # a variable created after construction IS visible on first access, and one
+    # created after that first access is NOT.
+    #
+    # The PYTHONIOENCODING line immediately above is therefore load-bearing for
+    # more than encoding: it is the first access, so this dictionary is already
+    # materialised by the time we get here. A later $env:SCANHOUND_DV_INGEST_KEY
+    # would not reach this child -- the detector would send no header and still
+    # be rejected 401, with the wrapper now claiming it had supplied a key.
+    # Assigning explicitly on $psi does not depend on any of that ordering.
+    $psi.EnvironmentVariables['SCANHOUND_DV_INGEST_KEY'] = $ingestKey
     # MUST be set explicitly. PowerShell sets a native command's working
     # directory from the current location, so Push-Location above was enough for
     # `& cmd /c`; .NET does not, and would inherit the process-wide current
