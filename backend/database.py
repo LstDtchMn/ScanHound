@@ -3961,14 +3961,23 @@ class DatabaseManager:
                         "host = ?, bytes_total = ?, bytes_loaded = ?, downloaded = ?, "
                         "extraction = ?, state = ?, error = ?, "
                         # Observed -> take the value as given (NULL retracts).
-                        # Unobserved -> keep what is already proven.
+                        # Unobserved -> keep what is stored, MECHANICALLY.
+                        #
+                        # The unobserved branch ignores the passed value entirely
+                        # rather than COALESCEing it (peer review follow-up 2).
+                        # With COALESCE, a caller passing observed=False WITH a
+                        # url would still overwrite the stored one -- so the
+                        # docstring's promise ("the previous proof stands") held
+                        # only because the production caller never emits that
+                        # combination. An invariant that depends on callers
+                        # behaving is not an invariant; this makes it structural.
                         "provenance_url = CASE WHEN ? = 1 THEN ? "
-                        "                      ELSE COALESCE(?, provenance_url) END, "
+                        "                      ELSE provenance_url END, "
                         "updated_at = CURRENT_TIMESTAMP "
                         "WHERE id = ?",
                         (package_uuid, name, title, host, bytes_total, bytes_loaded,
                          downloaded, extraction, state, error,
-                         1 if provenance_observed else 0, provenance_url, provenance_url,
+                         1 if provenance_observed else 0, provenance_url,
                          rid))
                     conn.commit()
                     return rid

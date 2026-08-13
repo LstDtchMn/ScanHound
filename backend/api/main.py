@@ -378,9 +378,22 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                     # overwrite the list -- the two transports disagreeing for a
                     # window, which is the class of bug the shared annotator
                     # exists to prevent.
+                    # BOTH provenance fields, for the same reason change_key
+                    # carries both: url=None/observed=False (could not look) and
+                    # url=None/observed=True (looked, now ambiguous) are different
+                    # events, and a signature that cannot tell them apart cannot
+                    # push the second one.
+                    #
+                    # KNOWN AND ACCEPTED: an UNOBSERVED row carries url=None here
+                    # while the database still holds the previous proof, so a push
+                    # during an unobserved poll briefly hides a link the DB has
+                    # not retracted. The next REST poll restores it within 5s.
+                    # Fixing it properly means reading the persisted value back
+                    # per row, which costs a query on the poll path to remove a
+                    # 5-second cosmetic gap -- deliberately not done.
                     sig = tuple(
                         (r["name"], r["state"], r["bytes_loaded"], r["extraction"],
-                         r.get("provenance_url"))
+                         r.get("provenance_url"), r.get("provenance_observed"))
                         for r in results
                     )
                     if sig != last_sig:

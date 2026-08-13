@@ -138,6 +138,24 @@ class TestRetraction:
 
         assert self._stored(db, "u1") == B
 
+    def test_an_unobserved_write_cannot_overwrite_even_WITH_a_url(self, db):
+        """The invariant must be structural, not a convention.
+
+        The unobserved branch ignores the passed value entirely rather than
+        COALESCEing it. With COALESCE, a caller passing observed=False together
+        with a url would still replace the stored proof -- so "unobserved
+        preserves" held only because the one production caller never emits that
+        combination. Found by mutation: restoring COALESCE broke nothing, because
+        no test passed the contradictory pair. An invariant nothing tests is a
+        convention, and conventions are what the next caller breaks.
+        """
+        self._prove(db)
+
+        db.upsert_download_result("Pkg", package_uuid="u1",
+                                  provenance_url=B, provenance_observed=False)
+
+        assert self._stored(db, "u1") == A, "an unobserved write overwrote a stored proof"
+
     def test_an_insert_records_provenance_without_needing_observation(self, db):
         """A brand-new row has nothing to preserve, so the value stands as given
         regardless of the flag -- the COALESCE branch only matters on UPDATE."""
