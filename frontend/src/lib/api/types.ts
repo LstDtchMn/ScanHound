@@ -660,6 +660,11 @@ export interface DownloadResult {
   // it IS on the wire; UI code should read `source_url`, which is the annotated
   // answer and the only one guaranteed present on every row.
   provenance_url?: string | null;
+  // WS only, and a SERVER-SIDE write decision, not a display value: whether this
+  // poll actually managed to observe the package's links. It distinguishes "no
+  // longer provable" from "could not look", which is what decides whether a
+  // stored association may be retracted. The UI has no use for it.
+  provenance_observed?: boolean;
 }
 
 export interface TmdbSearchResult {

@@ -1874,12 +1874,41 @@ class TestPollResults:
         with patch.object(svc, "_connect_jd_device", return_value=device):
             results = svc.poll_results(record=False)
         assert results == [{
-            "id": None, "provenance_url": None,
+            "id": None, "provenance_url": None, "provenance_observed": True,
             "name": "Pkg.Queued", "title": "Pkg.Queued", "host": "",
             "bytes_total": 1000, "bytes_loaded": 0, "downloaded": 0,
             "extraction": "na", "state": "queued", "error": None,
             "package_uuid": "1", "save_to": "",
         }]
+
+    def test_a_failed_link_query_does_not_claim_to_have_observed_provenance(self):
+        """The producer half of the retraction fix.
+
+        A failed query_links yields links=[], which is byte-identical to a
+        package that genuinely has none. Only this flag separates them, and the
+        write uses it to decide whether a None may retract a stored proof. If it
+        were True here, one transient JDownloader hiccup would erase every
+        package's source link.
+        """
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.NoLinks", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000,
+               "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[], raise_on_links=True)
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["provenance_observed"] is False
+        assert results[0]["provenance_url"] is None
+
+    def test_a_successful_link_query_DOES_claim_observation(self):
+        """Positive control. Without it the assertion above would also pass if
+        the flag were hardcoded False and no retraction could ever happen."""
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.Links", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000,
+               "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["provenance_observed"] is True
 
     def test_downloading_state(self):
         svc, _db = self._svc()

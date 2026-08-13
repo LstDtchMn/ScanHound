@@ -3911,16 +3911,27 @@ class DatabaseManager:
     def upsert_download_result(self, name, package_uuid=None, title=None, host=None,
                                bytes_total=0, bytes_loaded=0, downloaded=0,
                                extraction="na", state="queued", error=None,
-                               provenance_url=None):
+                               provenance_url=None, provenance_observed=False):
         """Insert/update a JD package's download outcome; returns the row id (int)
         or None on failure. Identity is package_uuid when present, else the row is
         adopted-by-name (a legacy NULL-uuid row) or inserted. Runs the whole
         lookup-then-write under one lock hold to avoid poller-vs-remove races.
 
-        ``provenance_url`` is COALESCEd, never overwritten with NULL: a package's
-        links are only visible while JDownloader still lists them, so a later poll
-        that cannot re-derive the association must not erase one already proven.
-        Passing a value re-affirms it; passing None leaves what is there."""
+        ``provenance_url`` is written under ``provenance_observed``, which is the
+        difference between an absence of observation and an observation of
+        absence (peer review 2026-08-13):
+
+            observed=True   write the value AS GIVEN, including NULL. The caller
+                            looked, and either proved one release or proved there
+                            is no honest unique answer. The second RETRACTS.
+            observed=False  COALESCE. The caller could not look -- JDownloader's
+                            link query failed, or the lookup threw -- so whatever
+                            was proven earlier stands.
+
+        Unconditional COALESCE was the earlier behaviour and it let a stale proof
+        outlive its evidence: once a second release recorded the same host link,
+        the resolver correctly said "ambiguous", and that None was read as
+        "nothing to say" rather than "this is no longer authorised"."""
         try:
             with self._lock:
                 conn = self.get_connection()
@@ -3949,11 +3960,16 @@ class DatabaseManager:
                         "package_uuid = COALESCE(?, package_uuid), name = ?, title = ?, "
                         "host = ?, bytes_total = ?, bytes_loaded = ?, downloaded = ?, "
                         "extraction = ?, state = ?, error = ?, "
-                        "provenance_url = COALESCE(?, provenance_url), "
+                        # Observed -> take the value as given (NULL retracts).
+                        # Unobserved -> keep what is already proven.
+                        "provenance_url = CASE WHEN ? = 1 THEN ? "
+                        "                      ELSE COALESCE(?, provenance_url) END, "
                         "updated_at = CURRENT_TIMESTAMP "
                         "WHERE id = ?",
                         (package_uuid, name, title, host, bytes_total, bytes_loaded,
-                         downloaded, extraction, state, error, provenance_url, rid))
+                         downloaded, extraction, state, error,
+                         1 if provenance_observed else 0, provenance_url, provenance_url,
+                         rid))
                     conn.commit()
                     return rid
                 cur.execute(

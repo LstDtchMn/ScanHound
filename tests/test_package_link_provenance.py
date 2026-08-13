@@ -80,6 +80,73 @@ class TestAmbiguity:
             ["https://host.example/a1"] + filler + ["https://host.example/b1"]) is None
 
 
+class TestRetraction:
+    """Absence of observation is not an observation of absence.
+
+    Both cases below hand `provenance_url=None` to the same write. They must do
+    OPPOSITE things, and which one happens is decided solely by whether the
+    caller actually managed to look. Collapsing them was the blocker: a proof
+    outlived the evidence for it, and the UI kept pointing at a release the
+    resolver had already stopped authorising.
+    """
+
+    L = "https://host.example/shared-link"
+
+    def _stored(self, db, uuid):
+        rows = db._query_dicts(
+            "SELECT provenance_url FROM download_results WHERE package_uuid = ?", (uuid,))
+        return rows[0]["provenance_url"] if rows else "<no row>"
+
+    def _prove(self, db, uuid="u1"):
+        db.record_submitted_links(A, [self.L])
+        resolved = db.resolve_release_by_links([self.L])
+        assert resolved == A, "setup failed: the link should resolve to A"
+        db.upsert_download_result("Pkg", package_uuid=uuid,
+                                  provenance_url=resolved, provenance_observed=True)
+        assert self._stored(db, uuid) == A, "setup failed: the proof was not stored"
+
+    def test_an_OBSERVED_ambiguous_result_retracts_the_proof(self, db):
+        """The blocker. Release B later records the same host link, so the
+        resolver stops having an honest answer -- and the stored one must go."""
+        self._prove(db)
+        db.record_submitted_links(B, [self.L])
+        assert db.resolve_release_by_links([self.L]) is None, "should now be ambiguous"
+
+        db.upsert_download_result("Pkg", package_uuid="u1",
+                                  provenance_url=None, provenance_observed=True)
+
+        assert self._stored(db, "u1") is None, "a stale proof outlived its evidence"
+
+    def test_an_UNOBSERVED_poll_preserves_the_proof(self, db):
+        """The other half. JDownloader's link query failed, so this poll knows
+        nothing -- it must not be read as 'there is no longer an answer'."""
+        self._prove(db)
+
+        db.upsert_download_result("Pkg", package_uuid="u1",
+                                  provenance_url=None, provenance_observed=False)
+
+        assert self._stored(db, "u1") == A, "an unobserved poll erased a valid proof"
+
+    def test_an_observed_proof_replaces_an_earlier_different_one(self, db):
+        """Not only retraction: a package whose links genuinely now prove a
+        different release must follow the evidence."""
+        self._prove(db)
+        db.record_submitted_links(B, ["https://host.example/only-b"])
+
+        db.upsert_download_result("Pkg", package_uuid="u1",
+                                  provenance_url=B, provenance_observed=True)
+
+        assert self._stored(db, "u1") == B
+
+    def test_an_insert_records_provenance_without_needing_observation(self, db):
+        """A brand-new row has nothing to preserve, so the value stands as given
+        regardless of the flag -- the COALESCE branch only matters on UPDATE."""
+        db.upsert_download_result("Fresh", package_uuid="u2",
+                                  provenance_url=A, provenance_observed=True)
+
+        assert self._stored(db, "u2") == A
+
+
 class TestRecording:
     def test_a_regrab_re_affirms_rather_than_duplicating(self, db):
         db.record_submitted_links(A, ["https://host.example/a1"])

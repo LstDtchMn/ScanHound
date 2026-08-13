@@ -371,8 +371,16 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                 dl = reg.download
                 if dl and cfg.get("jd_enabled") and cfg.get("jd_method") == "api":
                     results = dl.poll_results(record=True)
+                    # provenance_url participates so a provenance-ONLY change
+                    # (a link resolving, or being retracted, while nothing else
+                    # moves) still pushes. Without it the WebSocket would sit on
+                    # a stale link until the next 5s REST poll happened to
+                    # overwrite the list -- the two transports disagreeing for a
+                    # window, which is the class of bug the shared annotator
+                    # exists to prevent.
                     sig = tuple(
-                        (r["name"], r["state"], r["bytes_loaded"], r["extraction"])
+                        (r["name"], r["state"], r["bytes_loaded"], r["extraction"],
+                         r.get("provenance_url"))
                         for r in results
                     )
                     if sig != last_sig:

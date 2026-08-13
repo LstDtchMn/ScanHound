@@ -1035,9 +1035,16 @@ class DownloadService:
                 "finished": True, "status": True, "extractionStatus": True,
                 "bytesTotal": True, "bytesLoaded": True,
             }]) or []
+            links_observed = True
         except Exception as e:
             logger.warning("JD link poll failed: %s", e)
             links = []
+            # NOT the same as "this package has no links" (peer review 2026-08-13).
+            # An empty list from a FAILED query is an absence of observation; an
+            # empty list from a successful one is an observation of absence. Only
+            # the second may retract a provenance already proven, so the
+            # distinction has to survive from here down to the write.
+            links_observed = False
 
         by_pkg: Dict[Any, List[dict]] = {}
         for link in links:
@@ -1120,17 +1127,33 @@ class DownloadService:
             # no recorded links and resolves to None, which is the whole point --
             # matching it by display name is what produced confident links to
             # unrelated releases.
+            # THREE states, not two (peer review 2026-08-13):
+            #
+            #   PROVEN     observation succeeded and names exactly one release
+            #   UNPROVEN   observation succeeded, names zero or several -> RETRACT
+            #   UNOBSERVED could not look -> preserve whatever was already proven
+            #
+            # Collapsing the last two to None let a stale proof outlive the
+            # evidence for it: once release B also records link L, the resolver
+            # correctly answers "no honest answer", but a COALESCE that reads that
+            # None as "nothing to say" kept showing release A indefinitely.
             provenance_url = None
-            if self.db is not None:
+            provenance_observed = False
+            if self.db is not None and links_observed:
                 try:
                     provenance_url = self.db.resolve_release_by_links(
                         [link.get("url") for link in child_links])
+                    provenance_observed = True
                 except Exception:
+                    # A lookup that threw observed nothing either -- preserve.
                     logger.debug("provenance lookup failed for %r", name, exc_info=True)
+                    provenance_url = None
+                    provenance_observed = False
 
             row = {
                 "id": None,
                 "provenance_url": provenance_url,
+                "provenance_observed": provenance_observed,
                 "name": name, "title": title, "host": host,
                 "bytes_total": bytes_total, "bytes_loaded": bytes_loaded,
                 "downloaded": 1 if downloaded else 0,
@@ -1147,14 +1170,21 @@ class DownloadService:
                 # 'id' is derived, not stored — passing either would TypeError
                 # and the whole row would (silently) never persist.
                 db_fields = {k: v for k, v in row.items() if k not in ("save_to", "id")}
-                # provenance_url is PART of the change key. Without it, a package
-                # whose links only become resolvable on a later poll (JD had not
-                # yet listed them, or the grab was recorded after the package
-                # appeared) would find every other field unchanged, skip the
-                # write, and never persist the association it just proved --
-                # a link permanently missing for no visible reason.
+                # BOTH provenance fields are part of the change key.
+                #
+                # provenance_url, because a package whose links only become
+                # resolvable on a later poll would otherwise find every other
+                # field unchanged, skip the write, and never persist what it just
+                # proved -- a link permanently missing for no visible reason.
+                #
+                # provenance_observed, because without it the two states that
+                # both carry url=None are indistinguishable here: "could not
+                # look" and "looked, and the answer is now ambiguous". A batch
+                # sitting unobserved and then becoming ambiguous would produce
+                # the same key twice, skip the write, and the retraction would
+                # never reach the database however correct the SQL was.
                 change_key = (state, bytes_loaded, extraction, row["downloaded"], error,
-                              title, provenance_url)
+                              title, provenance_url, provenance_observed)
                 if self._results_cache.get(cache_key) != change_key:
                     try:
                         rid = self.db.upsert_download_result(**db_fields)
