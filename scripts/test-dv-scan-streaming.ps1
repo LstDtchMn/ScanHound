@@ -235,6 +235,20 @@ function Start-Wrapper {
     $psi.Arguments       = '/c "' + $cmd + '"'
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow  = $true
+    # A DUMMY INGEST KEY, so this suite is hermetic.
+    #
+    # The wrapper now refuses to scan without one (exit 14) rather than spending
+    # an hour on work every upload would reject 401. Supplying it by ENVIRONMENT
+    # -- which wins over the key file -- keeps these cases about streaming and
+    # exit codes, and needs no file on disk.
+    #
+    # Without this the suite passed on a developer machine ONLY because the
+    # production key happened to exist at C:\DockerData\scanhound, and failed
+    # immediately with exit 14 on a clean GitHub Windows runner. That dependency
+    # on a host file was invisible until CI ran it, which is the argument for
+    # having CI run it. The value is never used: every case here stubs the
+    # detector or points --api at a discard port.
+    $psi.EnvironmentVariables['SCANHOUND_DV_INGEST_KEY'] = 'test-suite-dummy-key'
     return [System.Diagnostics.Process]::Start($psi)
 }
 
