@@ -5,6 +5,8 @@
   import { groupDownloads, type DownloadGroup } from '$lib/downloads/dupes';
   import type { DownloadResult } from '$lib/api/types';
   import VerificationRetries from '$lib/components/VerificationRetries.svelte';
+  import { checkedAgo, exactTime } from '$lib/time';
+  import { safeHttpUrl } from '$lib/url';
 
   let results = $state<DownloadResult[]>([]);
   let loaded = $state(false);
@@ -23,6 +25,13 @@
   }
   function gb(bytes: number): string {
     return (bytes / 1e9).toFixed(1);
+  }
+  /** '' whenever the package name did not map to exactly one release — the row
+   *  then shows progress only, rather than a date borrowed from the wrong
+   *  release. See database.get_download_source_links(). */
+  function firstGrabbed(r: DownloadResult): string {
+    const ago = checkedAgo(r.first_grabbed_at ?? '');
+    return ago ? `first grabbed ${ago}` : '';
   }
   function stateLabel(s: string): string {
     return ({ queued: 'Queued', downloading: 'Downloading', downloaded: 'Downloaded',
@@ -146,6 +155,17 @@
             <div class="mt-0.5 text-[11px] text-[var(--text-secondary)]">
               {gb(r.bytes_loaded)} / {gb(r.bytes_total)} GB · {r.host}{#if r.error} · <span class="text-red-400">{r.error}</span>{/if}
             </div>
+            {#if firstGrabbed(r) || safeHttpUrl(r.source_url)}
+              <div class="mt-0.5 text-[11px] text-[var(--text-secondary)] flex items-center gap-2">
+                {#if firstGrabbed(r)}
+                  <span title={exactTime(r.first_grabbed_at ?? '')}>{firstGrabbed(r)}</span>
+                {/if}
+                {#if safeHttpUrl(r.source_url)}
+                  <a href={safeHttpUrl(r.source_url)} target="_blank" rel="noopener noreferrer"
+                     class="underline py-1">Source page</a>
+                {/if}
+              </div>
+            {/if}
           </div>
         {/each}
       </div>

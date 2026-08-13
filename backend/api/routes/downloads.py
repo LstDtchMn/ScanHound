@@ -611,10 +611,18 @@ def jd_control(req: JdControlRequest, reg: ServiceRegistry = Depends(get_registr
 
 @router.get("/results")
 def download_results(limit: int = 200, reg: ServiceRegistry = Depends(get_registry)):
-    """Persisted per-item download + extraction outcomes (polled from JDownloader)."""
-    if reg.db:
-        return reg.db.get_download_results(limit=limit)
-    return []
+    """Persisted per-item download + extraction outcomes (polled from JDownloader).
+
+    Rows are annotated with `source_url` / `first_grabbed_at` where the package
+    name maps unambiguously to one release (see get_download_source_links).
+    Both stay None when the name is unknown or ambiguous, so the UI simply
+    renders no link rather than a wrong one. Enrichment failure must never
+    take down the live download list, which is this view's actual job.
+    """
+    if not reg.db:
+        return []
+    from backend.download_links import annotate_source_links
+    return annotate_source_links(reg.db, reg.db.get_download_results(limit=limit))
 
 
 @router.delete("/results")

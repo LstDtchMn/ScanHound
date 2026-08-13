@@ -926,6 +926,18 @@ class DatabaseManager:
                     if "duplicate column" not in str(e).lower():
                         raise
 
+                # Must come AFTER the package_name / jd_confirmed_name column
+                # migrations above — on a fresh database `downloads` is created
+                # with only (url, title, date_added), so indexing these columns
+                # any earlier fails with "no such column" and takes startup with
+                # it. get_download_source_links() probes both on every changed
+                # results broadcast; unindexed that is two full scans of a
+                # monotonically growing table.
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_package_name '
+                               'ON downloads(package_name) WHERE package_name IS NOT NULL')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_jd_confirmed_name '
+                               'ON downloads(jd_confirmed_name) WHERE jd_confirmed_name IS NOT NULL')
+
                 # HDEncode RSS evidence tables (v3, additive-only).
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS hdencode_feed_state (
@@ -3920,6 +3932,60 @@ class DatabaseManager:
             "FROM download_results ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         )
+
+    def get_download_source_links(self, names):
+        """Map JD package name -> {"source_url", "first_grabbed_at"}.
+
+        The live download list only knows a JDownloader *package name*; the
+        source page and the first-grab date live on `downloads`. This is the
+        reverse of pipeline_service._match_download_results(), which walks
+        downloads -> download_results. It deliberately does NOT reuse that
+        matcher: that one resolves *which attempt* a grab became (and so needs
+        last_grabbed_at windows, uuid pinning and excluded-uuid lists), while
+        this one only needs *which release page* a name came from, which is
+        stable across regrabs.
+
+        A name is mapped only when it resolves to exactly one url. Regrabs of
+        the same release reuse the name and share a url, so they still map. Two
+        genuinely different releases that produce the same package name are
+        left unmapped: a missing link is recoverable, a wrong link sends the
+        operator to the wrong release page and looks authoritative doing it.
+
+        `date_added` is the first-grab time -- save_to_history()'s ON CONFLICT
+        updates last_grabbed_at and never date_added.
+        """
+        wanted = [n for n in dict.fromkeys(names or []) if n]
+        if not wanted:
+            return {}
+        links = {}
+        # Bound the bind-variable count (each name binds twice per chunk).
+        for start in range(0, len(wanted), 300):
+            chunk = wanted[start:start + 300]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self._query_dicts(
+                f"""
+                SELECT nm,
+                       COUNT(DISTINCT url) AS url_count,
+                       MIN(url) AS url,
+                       MIN(date_added) AS first_grabbed_at
+                FROM (
+                    SELECT jd_confirmed_name AS nm, url, date_added FROM downloads
+                    WHERE jd_confirmed_name IN ({placeholders})
+                    UNION ALL
+                    SELECT package_name AS nm, url, date_added FROM downloads
+                    WHERE package_name IN ({placeholders})
+                )
+                GROUP BY nm
+                """,
+                tuple(chunk) * 2,
+            ) or []
+            for row in rows:
+                if row.get("url_count") == 1:
+                    links[row["nm"]] = {
+                        "source_url": row.get("url"),
+                        "first_grabbed_at": row.get("first_grabbed_at"),
+                    }
+        return links
 
     def get_download_result_id(self, package_uuid, name):
         """Resolve a download_results row id for a package: by ``package_uuid``

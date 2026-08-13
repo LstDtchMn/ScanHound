@@ -644,6 +644,11 @@ export interface DownloadResult {
   error: string | null;
   updated_at?: string; // REST only
   save_to?: string; // WS only
+  // REST only. Null when the package name is unknown to the history table or
+  // maps to more than one release — the UI then shows no link/date rather than
+  // a wrong one. Never sent over the WS push.
+  source_url?: string | null;
+  first_grabbed_at?: string | null;
 }
 
 export interface TmdbSearchResult {

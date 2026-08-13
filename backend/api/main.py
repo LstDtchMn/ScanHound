@@ -377,9 +377,19 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                     )
                     if sig != last_sig:
                         last_sig = sig
+                        # Same annotation the REST /results endpoint applies —
+                        # the page replaces its whole list from this push, so
+                        # skipping it here would blank the source link on every
+                        # progress change. Applied after `sig` is computed so
+                        # it can never affect change detection. Annotating in
+                        # place is safe for the code below: every downstream
+                        # reader takes named keys (name / state / save_to /
+                        # package_uuid), none enumerates the dict, so the two
+                        # added keys cannot shift a dedup key or a payload.
+                        from backend.download_links import annotate_source_links
                         ws_manager.broadcast_sync({
                             "type": "download:results",
-                            "data": {"results": results},
+                            "data": {"results": annotate_source_links(reg.db, results)},
                         })
                     # Empirical package-name capture: persist JD's own reported
                     # name for any grab still awaiting confirmation, so pipeline
