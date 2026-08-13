@@ -207,6 +207,11 @@ export interface DownloadQueueItem {
   last_cause_code?: string | null;
   last_message?: string | null;
   transport_attempted?: number | null;
+  created_at?: string | null;
+  // True when automatic recovery is disabled AND the cooldown is due, i.e.
+  // nothing will ever promote this group. Read from the same rule that writes
+  // the operator log warning, so the badge and the log cannot disagree.
+  manual_recovery_required?: boolean;
   retry_available: boolean;
   due: boolean;
   source_state?: string | null;
