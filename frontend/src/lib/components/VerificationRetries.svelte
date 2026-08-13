@@ -4,6 +4,16 @@
   import { connection } from '$lib/stores/connection';
   import { addToast } from '$lib/stores/notifications';
   import type { BrowserStatus, DownloadQueueItem } from '$lib/api/types';
+  import { checkedAgo } from '$lib/components/pipeline/pipelineDisplay';
+
+  /** How long this item has been queued, e.g. "3d". '' when the timestamp is
+   *  missing or unparsable, so the row simply omits it rather than rendering
+   *  "NaNd". checkedAgo handles both timestamp shapes the API emits — sqlite's
+   *  naive UTC and Python's offset-carrying isoformat — which is why it is
+   *  reused here instead of a local Date.parse. */
+  function waitingFor(item: DownloadQueueItem): string {
+    return checkedAgo(item.created_at ?? '').replace(/ ago$/, '');
+  }
 
   let items = $state<DownloadQueueItem[]>([]);
   let browser = $state<BrowserStatus | null>(null);
@@ -184,8 +194,13 @@
               <div class="text-[11px] text-[var(--text-secondary)]">
                 {item.service_type} · attempt {item.attempt_count}
                 {#if item.transport_attempted === 0} · no page opened{/if}
+                {#if waitingFor(item)} · <span title={localTime(item.created_at)}>waiting {waitingFor(item)}</span>{/if}
               </div>
             </div>
+            {#if item.manual_recovery_required}
+              <span class="text-[10px] px-2 py-0.5 rounded text-red-300 bg-red-500/15 whitespace-nowrap"
+                    title="Automatic retry is switched off for this batch and its cooldown has passed, so nothing will promote it on its own.">Needs you</span>
+            {/if}
             <span class="text-[10px] px-2 py-0.5 rounded {stateClass(item.state)}">{stateLabel(item.state)}</span>
           </div>
 
