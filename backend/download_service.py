@@ -1110,8 +1110,27 @@ class DownloadService:
             else:
                 state = "queued"
 
+            # PROVENANCE (peer review Finding 1). The release these links PROVE
+            # this package belongs to, or None. Resolved here because this is the
+            # only place the child links exist: the REST endpoint reads the
+            # database, not JDownloader, so the association has to be persisted
+            # from the poll or the two transports could never agree.
+            #
+            # A package JDownloader shows that ScanHound never sent contributes
+            # no recorded links and resolves to None, which is the whole point --
+            # matching it by display name is what produced confident links to
+            # unrelated releases.
+            provenance_url = None
+            if self.db is not None:
+                try:
+                    provenance_url = self.db.resolve_release_by_links(
+                        [link.get("url") for link in child_links])
+                except Exception:
+                    logger.debug("provenance lookup failed for %r", name, exc_info=True)
+
             row = {
                 "id": None,
+                "provenance_url": provenance_url,
                 "name": name, "title": title, "host": host,
                 "bytes_total": bytes_total, "bytes_loaded": bytes_loaded,
                 "downloaded": 1 if downloaded else 0,
@@ -1128,7 +1147,14 @@ class DownloadService:
                 # 'id' is derived, not stored — passing either would TypeError
                 # and the whole row would (silently) never persist.
                 db_fields = {k: v for k, v in row.items() if k not in ("save_to", "id")}
-                change_key = (state, bytes_loaded, extraction, row["downloaded"], error, title)
+                # provenance_url is PART of the change key. Without it, a package
+                # whose links only become resolvable on a later poll (JD had not
+                # yet listed them, or the grab was recorded after the package
+                # appeared) would find every other field unchanged, skip the
+                # write, and never persist the association it just proved --
+                # a link permanently missing for no visible reason.
+                change_key = (state, bytes_loaded, extraction, row["downloaded"], error,
+                              title, provenance_url)
                 if self._results_cache.get(cache_key) != change_key:
                     try:
                         rid = self.db.upsert_download_result(**db_fields)

@@ -1,16 +1,26 @@
 # Live source links: link-based package provenance (plan)
 
 **Branch:** `feat/download-first-grabbed-and-link`
-**Status:** PART 1 OF 2 BUILT. The branch must not merge until part 2 lands —
-Jesse's decision, 2026-08-12.
+**Status:** BOTH PARTS BUILT (2026-08-13). Finding 1 is closed: live rows are
+authorised by recorded provenance, and name matching is deleted from this path.
 
-- **Done:** provenance is RECORDED (`download_package_links`, written on a
-  successful send) and RESOLVABLE (`resolve_release_by_links`, fails closed on
-  unknown or ambiguous links). 10 tests, ambiguity guard mutation-verified.
-- **NOT done, so Finding 1 is NOT yet fixed:** nothing consumes it. Live rows are
-  still annotated by `get_download_source_links()` — the name-based resolver the
-  reviewer rejected. Recording a fact does not change a decision; the wrong-link
-  path is open until the consumer switches over.
+- **Part 1** — provenance RECORDED (`download_package_links`, on a successful
+  send from BOTH callers) and RESOLVABLE (`resolve_release_by_links`, fails
+  closed on unknown or ambiguous links). Ambiguity guard mutation-verified.
+- **Part 2** — CONSUMED. `poll_results()` resolves from the child links it
+  already holds (no extra JD call), persists to `download_results.provenance_url`
+  (COALESCEd, so a later poll that cannot re-derive it does not erase it), and
+  `annotate_source_links()` reads only that. `get_download_source_links()` is
+  DELETED rather than left unused.
+- **Known gap, accepted:** packages submitted BEFORE part 1 shipped have no
+  recorded links, so they show no source link until re-sent. Self-healing as new
+  grabs accumulate; failing closed is the correct direction.
+- **Test hole found by mutation, then fixed:** a name-matching fallback
+  reintroduced into `annotate_source_links` was NOT caught, because the function
+  returns early when no row carries provenance — so a list of only-unproven rows
+  never reaches the per-row guard. A MIXED list (proven beside unproven, which is
+  what a live JD list looks like) now covers it, and the mutation fails exactly
+  that test.
 
 **Remaining work, exactly:** add `download_results.provenance_url` (guarded ALTER);
 resolve in `poll_results()` from the `child_links` it already holds; persist via

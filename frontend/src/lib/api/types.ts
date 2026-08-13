@@ -644,11 +644,17 @@ export interface DownloadResult {
   error: string | null;
   updated_at?: string; // REST only
   save_to?: string; // WS only
-  // REST only. Null when the package name is unknown to the history table or
-  // maps to more than one release — the UI then shows no link/date rather than
-  // a wrong one. Never sent over the WS push.
+  // Null unless the package has RECORDED PROVENANCE: its file-host links match
+  // links ScanHound recorded submitting. A package added to JDownloader by hand
+  // resolves to nothing, so the UI shows no link rather than a confident wrong
+  // one. `first_seen_at` is when the release first entered history — which can
+  // be a FAILED attempt, hence "seen", not "grabbed".
   source_url?: string | null;
-  first_grabbed_at?: string | null;
+  first_seen_at?: string | null;
+  // The raw persisted association, carried on both transports. Declared because
+  // it IS on the wire; UI code should read `source_url`, which is the annotated
+  // answer and the only one guaranteed present on every row.
+  provenance_url?: string | null;
 }
 
 export interface TmdbSearchResult {

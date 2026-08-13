@@ -283,10 +283,24 @@ class HDEncodeActionService:
             # The SECOND caller of send_to_jdownloader. Record provenance here
             # too, or every RSS-acquired package resolves to no source link --
             # safe, but silently link-less for the source most releases arrive
-            # through. Only on a successful submit, and never fatal: provenance
-            # is decoration, and this action's outcome must not turn on it.
+            # through.
+            #
+            # ITS OWN try/except, INSIDE the submission try. The first version
+            # was a bare call here, which meant a failure to record provenance
+            # raised into the enclosing handler and marked an action that HAD
+            # SUBMITTED SUCCESSFULLY as needs_review -- a cosmetic side-channel
+            # deciding the outcome of the real work. Caught by
+            # test_explicit_grab_retrieves_maps_submits_and_records_history,
+            # whose stub db lacks the method; in production any exception would
+            # have done it. Decoration must never be a hard dependency.
             if submitted and self.db is not None:
-                self.db.record_submitted_links(action.get("canonical_url"), links)
+                try:
+                    self.db.record_submitted_links(action.get("canonical_url"), links)
+                except Exception:
+                    logger.warning(
+                        "could not record link provenance for %s; the submission "
+                        "itself succeeded and stands",
+                        action.get("canonical_url"), exc_info=True)
         except Exception as exc:
             # Submission may have crossed the process boundary before raising.
             # Never make that automatically retryable.

@@ -124,6 +124,30 @@ def test_explicit_grab_retrieves_maps_submits_and_records_history():
     assert download.history
 
 
+def test_a_provenance_recording_failure_cannot_undo_a_successful_submit():
+    """Link provenance is decoration on a submission that already happened.
+
+    The first version of that call was bare, inside the try that catches
+    submission failures, so an exception while RECORDING marked an action whose
+    JDownloader submit had SUCCEEDED as needs_review -- ScanHound would then
+    believe it had not sent something it had, and a human would be asked to
+    review a non-problem. Caught only incidentally, because the stub db in this
+    file happens not to define the method; in production any exception from it
+    would have done the same. Assert the property directly so it stays true.
+    """
+    action, db, download = service()
+    db.record_submitted_links = MagicMock(side_effect=RuntimeError("disk gone"))
+    queued = action.queue_action(
+        db.candidate["canonical_url"], action_kind="grab",
+        requested_by="explicit", idempotency_key="grab-prov",
+    )
+
+    result = action.run_action(queued["action_uuid"], owns_lifespan=lambda: True)
+
+    assert result["state"] == "submitted", "a recording failure changed the outcome"
+    assert download.submits == 1, "the submission itself must be unaffected"
+
+
 def test_default_config_cannot_auto_grab():
     action, db, _download = service({"hdencode_enabled": True})
     with pytest.raises(HDEncodeActionError, match="disabled"):

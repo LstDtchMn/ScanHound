@@ -782,6 +782,19 @@ class DatabaseManager:
                                'ON download_results(package_uuid) WHERE package_uuid IS NOT NULL')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_download_results_name '
                                'ON download_results(name)')
+                # PACKAGE PROVENANCE, PERSISTED (peer review Finding 1, part 2).
+                # The release a live package was PROVEN to belong to, by matching
+                # the file-host links ScanHound recorded submitting. Persisted
+                # rather than recomputed per request because the REST endpoint
+                # reads this table, not the live JD poll -- only the poller holds
+                # the child links, so without a column the two transports could
+                # not agree. NULL means unproven, which renders as no link.
+                try:
+                    cursor.execute('ALTER TABLE download_results '
+                                   'ADD COLUMN provenance_url TEXT')
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp DESC)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_bg_cache_last_seen ON background_scan_cache(last_seen_at)')
@@ -930,9 +943,10 @@ class DatabaseManager:
                 # migrations above — on a fresh database `downloads` is created
                 # with only (url, title, date_added), so indexing these columns
                 # any earlier fails with "no such column" and takes startup with
-                # it. get_download_source_links() probes both on every changed
-                # results broadcast; unindexed that is two full scans of a
-                # monotonically growing table.
+                # it. The live source-link resolver that first needed these was
+                # retired in favour of recorded link provenance; they stay for
+                # the remaining name queries, chiefly the jd_confirmed_name
+                # backfill, which scans package_name on every startup.
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_package_name '
                                'ON downloads(package_name) WHERE package_name IS NOT NULL')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_jd_confirmed_name '
@@ -3896,11 +3910,17 @@ class DatabaseManager:
 
     def upsert_download_result(self, name, package_uuid=None, title=None, host=None,
                                bytes_total=0, bytes_loaded=0, downloaded=0,
-                               extraction="na", state="queued", error=None):
+                               extraction="na", state="queued", error=None,
+                               provenance_url=None):
         """Insert/update a JD package's download outcome; returns the row id (int)
         or None on failure. Identity is package_uuid when present, else the row is
         adopted-by-name (a legacy NULL-uuid row) or inserted. Runs the whole
-        lookup-then-write under one lock hold to avoid poller-vs-remove races."""
+        lookup-then-write under one lock hold to avoid poller-vs-remove races.
+
+        ``provenance_url`` is COALESCEd, never overwritten with NULL: a package's
+        links are only visible while JDownloader still lists them, so a later poll
+        that cannot re-derive the association must not erase one already proven.
+        Passing a value re-affirms it; passing None leaves what is there."""
         try:
             with self._lock:
                 conn = self.get_connection()
@@ -3928,18 +3948,21 @@ class DatabaseManager:
                         "UPDATE download_results SET "
                         "package_uuid = COALESCE(?, package_uuid), name = ?, title = ?, "
                         "host = ?, bytes_total = ?, bytes_loaded = ?, downloaded = ?, "
-                        "extraction = ?, state = ?, error = ?, updated_at = CURRENT_TIMESTAMP "
+                        "extraction = ?, state = ?, error = ?, "
+                        "provenance_url = COALESCE(?, provenance_url), "
+                        "updated_at = CURRENT_TIMESTAMP "
                         "WHERE id = ?",
                         (package_uuid, name, title, host, bytes_total, bytes_loaded,
-                         downloaded, extraction, state, error, rid))
+                         downloaded, extraction, state, error, provenance_url, rid))
                     conn.commit()
                     return rid
                 cur.execute(
                     "INSERT INTO download_results (package_uuid, name, title, host, "
-                    "bytes_total, bytes_loaded, downloaded, extraction, state, error, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    "bytes_total, bytes_loaded, downloaded, extraction, state, error, "
+                    "provenance_url, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     (package_uuid, name, title, host, bytes_total, bytes_loaded,
-                     downloaded, extraction, state, error))
+                     downloaded, extraction, state, error, provenance_url))
                 conn.commit()
                 return cur.lastrowid
         except Exception as e:
@@ -3950,7 +3973,7 @@ class DatabaseManager:
         """Return tracked download/extraction outcomes, most recent first."""
         return self._query_dicts(
             "SELECT id, package_uuid, name, title, host, bytes_total, bytes_loaded, "
-            "downloaded, extraction, state, error, updated_at "
+            "downloaded, extraction, state, error, updated_at, provenance_url "
             "FROM download_results ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         )
@@ -4012,59 +4035,28 @@ class DatabaseManager:
                 return None   # ambiguous; no honest answer
         return next(iter(found)) if len(found) == 1 else None
 
-    def get_download_source_links(self, names):
-        """Map JD package name -> {"source_url", "first_grabbed_at"}.
+    def get_release_first_seen(self, urls):
+        """Map release url -> `date_added`, the first time that url entered
+        history.
 
-        The live download list only knows a JDownloader *package name*; the
-        source page and the first-grab date live on `downloads`. This is the
-        reverse of pipeline_service._match_download_results(), which walks
-        downloads -> download_results. It deliberately does NOT reuse that
-        matcher: that one resolves *which attempt* a grab became (and so needs
-        last_grabbed_at windows, uuid pinning and excluded-uuid lists), while
-        this one only needs *which release page* a name came from, which is
-        stable across regrabs.
-
-        A name is mapped only when it resolves to exactly one url. Regrabs of
-        the same release reuse the name and share a url, so they still map. Two
-        genuinely different releases that produce the same package name are
-        left unmapped: a missing link is recoverable, a wrong link sends the
-        operator to the wrong release page and looks authoritative doing it.
-
-        `date_added` is the first-grab time -- save_to_history()'s ON CONFLICT
-        updates last_grabbed_at and never date_added.
+        NOT "first grabbed": download_item() writes a history row for FAILED
+        attempts too, so this can be the moment a grab was first tried rather
+        than the moment one succeeded. The UI labels it "first seen" for exactly
+        that reason (peer review Finding 2).
         """
-        wanted = [n for n in dict.fromkeys(names or []) if n]
+        wanted = [str(u) for u in dict.fromkeys(urls or []) if u]
         if not wanted:
             return {}
-        links = {}
-        # Bound the bind-variable count (each name binds twice per chunk).
+        out = {}
         for start in range(0, len(wanted), 300):
             chunk = wanted[start:start + 300]
-            placeholders = ",".join("?" * len(chunk))
             rows = self._query_dicts(
-                f"""
-                SELECT nm,
-                       COUNT(DISTINCT url) AS url_count,
-                       MIN(url) AS url,
-                       MIN(date_added) AS first_grabbed_at
-                FROM (
-                    SELECT jd_confirmed_name AS nm, url, date_added FROM downloads
-                    WHERE jd_confirmed_name IN ({placeholders})
-                    UNION ALL
-                    SELECT package_name AS nm, url, date_added FROM downloads
-                    WHERE package_name IN ({placeholders})
-                )
-                GROUP BY nm
-                """,
-                tuple(chunk) * 2,
-            ) or []
+                "SELECT url, date_added FROM downloads WHERE url IN (%s)"
+                % ",".join("?" * len(chunk)),
+                tuple(chunk), default=[]) or []
             for row in rows:
-                if row.get("url_count") == 1:
-                    links[row["nm"]] = {
-                        "source_url": row.get("url"),
-                        "first_grabbed_at": row.get("first_grabbed_at"),
-                    }
-        return links
+                out[row["url"]] = row.get("date_added")
+        return out
 
     def get_download_result_id(self, package_uuid, name):
         """Resolve a download_results row id for a package: by ``package_uuid``

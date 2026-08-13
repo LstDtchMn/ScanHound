@@ -26,11 +26,11 @@
   function gb(bytes: number): string {
     return (bytes / 1e9).toFixed(1);
   }
-  /** '' whenever the package name did not map to exactly one release — the row
-   *  then shows progress only, rather than a date borrowed from the wrong
-   *  release. See database.get_download_source_links(). */
+  /** '' unless the package has recorded provenance — the row then shows
+   *  progress only, rather than a date borrowed from an unrelated release.
+   *  See backend/download_links.py. */
   function firstSeen(r: DownloadResult): string {
-    const ago = checkedAgo(r.first_grabbed_at ?? '');
+    const ago = checkedAgo(r.first_seen_at ?? '');
     return ago ? `first seen ${ago}` : '';
   }
   function stateLabel(s: string): string {
@@ -158,7 +158,7 @@
             {#if firstSeen(r) || safeHttpUrl(r.source_url)}
               <div class="mt-0.5 text-[11px] text-[var(--text-secondary)] flex items-center gap-2">
                 {#if firstSeen(r)}
-                  <span title={exactTime(r.first_grabbed_at ?? '')}>{firstSeen(r)}</span>
+                  <span title={exactTime(r.first_seen_at ?? '')}>{firstSeen(r)}</span>
                 {/if}
                 {#if safeHttpUrl(r.source_url)}
                   <a href={safeHttpUrl(r.source_url)} target="_blank" rel="noopener noreferrer"

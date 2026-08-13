@@ -659,9 +659,9 @@
               {/if}
             {/if}
           </div>
-          {#if firstSeenFrom(r.first_grabbed_at)}
+          {#if firstSeenFrom(r.first_seen_at)}
             <span class="text-[10px] text-[var(--text-secondary)] whitespace-nowrap"
-                  title={exactTime(r.first_grabbed_at ?? '')}>{firstSeenFrom(r.first_grabbed_at)}</span>
+                  title={exactTime(r.first_seen_at ?? '')}>{firstSeenFrom(r.first_seen_at)}</span>
           {/if}
           {#if r.host}<span class="text-[var(--text-secondary)] whitespace-nowrap">{r.host}</span>{/if}
           <span class="text-[10px] text-[var(--text-secondary)] uppercase whitespace-nowrap w-20 text-right">{r.state === 'extracted' && r.extraction === 'na' ? 'Complete' : stateLabel(r.state)}</span>

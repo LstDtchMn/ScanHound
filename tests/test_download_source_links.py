@@ -1,14 +1,24 @@
-"""The downloads views claim two things about every row they render:
-"first grabbed <when>" and "this link goes to that release's page".
+"""What authorises a source link on a LIVE download row, and what the date means.
 
-These tests hold those two claims to the data, because both fail silently and
-convincingly when wrong: a date that quietly means "last grabbed" still renders
-a plausible date, and a link resolved from an ambiguous package name still
-renders a working link -- to the wrong release.
+Peer review Finding 1 rejected the previous answer. Links used to be resolved by
+JDownloader package NAME, refusing only when two ScanHound releases shared one.
+That is a closed-world guard: poll_results() enumerates JDownloader's ENTIRE
+package list, so a package added by hand has no history row, collides with
+nothing, and was handed a confident link to an unrelated release.
+
+Name matching is gone from this path. A row gets a link because
+`provenance_url` was recorded -- its file-host links matched links ScanHound
+recorded submitting -- or it gets none.
+
+The peer's required cases are here: an unproven package whose name matches
+history must resolve to NOTHING, with a positive control beside it so the first
+assertion cannot pass merely because resolution is broken.
 """
 import pytest
 
 from backend.download_links import annotate_source_links
+
+A = "https://source.example/release-A"
 
 
 @pytest.fixture
@@ -17,153 +27,135 @@ def db(tmp_path):
     return DatabaseManager(str(tmp_path / "links.db"))
 
 
-def _first_grab(db, url):
-    row = db._query("SELECT date_added, last_grabbed_at FROM downloads WHERE url = ?",
-                    (url,), one=True, default=None)
-    return (row[0], row[1])
-
-
-class TestFirstGrabDate:
-    def test_a_regrab_does_not_move_the_first_grab_date(self, db):
-        """The whole label rests on this. date_added is second-resolution, so
-        calling add_to_history twice in the same second would agree no matter
-        what the ON CONFLICT clause did -- the date is pinned to a known past
-        value first, so a reset to CURRENT_TIMESTAMP is unmissable."""
-        url = "https://example.test/a-release"
-        db.add_to_history(url, "A Release", package_name="A.Release.2026")
-        db._mutate("UPDATE downloads SET date_added = ?, last_grabbed_at = ? WHERE url = ?",
-                   ("2020-01-01 00:00:00", "2020-01-01 00:00:00", url))
-
-        db.add_to_history(url, "A Release", package_name="A.Release.2026")
-
-        date_added, last_grabbed = _first_grab(db, url)
-        assert date_added == "2020-01-01 00:00:00", "the regrab overwrote the first-grab date"
-        # Positive control: without this, the assertion above would also pass if
-        # the second add_to_history had silently done nothing at all.
-        assert last_grabbed != "2020-01-01 00:00:00", "the regrab never touched the row"
-
-    def test_the_reported_first_grab_date_is_the_pinned_one(self, db):
-        url = "https://example.test/dated"
-        db.add_to_history(url, "Dated", package_name="Dated.2026")
-        db._mutate("UPDATE downloads SET date_added = ? WHERE url = ?",
-                   ("2021-06-05 12:00:00", url))
-
-        links = db.get_download_source_links(["Dated.2026"])
-
-        assert links["Dated.2026"]["first_grabbed_at"] == "2021-06-05 12:00:00"
-
-
-class TestSourceLinkResolution:
-    def test_an_unambiguous_name_maps_to_its_release(self, db):
-        db.add_to_history("https://example.test/only", "Only", package_name="Only.2026")
-
-        links = db.get_download_source_links(["Only.2026"])
-
-        assert links["Only.2026"]["source_url"] == "https://example.test/only"
-
-    def test_a_name_used_by_two_different_releases_maps_to_neither(self, db):
-        """The safety property. Either url would render as a working link, so a
-        wrong guess is indistinguishable from a right one at the UI."""
-        db.add_to_history("https://example.test/one", "Dup", package_name="Same.Name.2026")
-        db.add_to_history("https://example.test/two", "Dup", package_name="Same.Name.2026")
-
-        links = db.get_download_source_links(["Same.Name.2026"])
-
-        assert "Same.Name.2026" not in links
-
-    def test_a_regrab_of_one_release_still_maps(self, db):
-        """Contrast with the test above: a regrab reuses the same url, so the
-        name still resolves to exactly one release and must NOT be suppressed."""
-        url = "https://example.test/regrabbed"
-        db.add_to_history(url, "Regrabbed", package_name="Regrabbed.2026")
-        db.add_to_history(url, "Regrabbed", package_name="Regrabbed.2026")
-
-        links = db.get_download_source_links(["Regrabbed.2026"])
-
-        assert links["Regrabbed.2026"]["source_url"] == url
-
-    def test_jd_confirmed_name_resolves_too(self, db):
-        """JD sanitizes punctuation, so the name on a live row is often the
-        confirmed one rather than the package_name recorded at grab time."""
-        url = "https://example.test/confirmed"
-        db.add_to_history(url, "Confirmed", package_name="Original.Name.2026")
-        db._mutate("UPDATE downloads SET jd_confirmed_name = ? WHERE url = ?",
-                   ("JD Sanitized Name 2026", url))
-
-        links = db.get_download_source_links(["JD Sanitized Name 2026"])
-
-        assert links["JD Sanitized Name 2026"]["source_url"] == url
-
-    def test_an_unknown_name_is_absent(self, db):
-        db.add_to_history("https://example.test/known", "Known", package_name="Known.2026")
-
-        assert db.get_download_source_links(["Never.Seen.2026"]) == {}
-
-    def test_empty_and_missing_names_are_ignored(self, db):
-        assert db.get_download_source_links([]) == {}
-        assert db.get_download_source_links(None) == {}
-        assert db.get_download_source_links([None, ""]) == {}
-
-    def test_more_names_than_one_chunk(self, db):
-        """The name list is chunked to bound bind variables; a release in a
-        later chunk must resolve exactly like one in the first."""
-        db.add_to_history("https://example.test/late", "Late", package_name="Late.2026")
-        names = [f"Filler.{i}" for i in range(700)] + ["Late.2026"]
-
-        links = db.get_download_source_links(names)
-
-        assert links["Late.2026"]["source_url"] == "https://example.test/late"
-
-
-class TestSchema:
-    def test_the_lookup_indexes_exist_on_a_fresh_database(self, db):
-        """`package_name` and `jd_confirmed_name` are added by migration, not by
-        the CREATE TABLE -- a fresh `downloads` is (url, title, date_added).
-        Indexing them before that migration raises "no such column" and takes
-        startup down with it, and a fresh database is precisely where it breaks.
-        Constructing the fixture at all is half the assertion."""
-        names = {r["name"] for r in db._query_dicts(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'downloads'")}
-
-        assert "idx_downloads_package_name" in names
-        assert "idx_downloads_jd_confirmed_name" in names
-
-
-class TestAnnotation:
-    def test_both_keys_are_set_even_when_unresolved(self, db):
-        """Consistent shape across the REST poll and the WebSocket push. An
-        unresolved row must still carry both keys, or the two transports
-        disagree and the page blanks a link it just rendered."""
-        rows = [{"name": "Never.Seen.2026", "state": "downloading"}]
+class TestFindingOne:
+    def test_a_name_match_without_provenance_gets_nothing(self, db):
+        """THE regression. The package calls itself exactly what a real release
+        is called, and that must now buy it nothing at all."""
+        db.add_to_history(A, "A Release", package_name="A.Release.2026")
+        rows = [{"name": "A.Release.2026", "state": "downloading", "provenance_url": None}]
 
         annotate_source_links(db, rows)
 
         assert rows[0]["source_url"] is None
-        assert rows[0]["first_grabbed_at"] is None
+        assert rows[0]["first_seen_at"] is None
 
-    def test_resolved_rows_carry_the_link(self, db):
-        db.add_to_history("https://example.test/live", "Live", package_name="Live.2026")
-        rows = [{"name": "Live.2026", "state": "downloading"}]
+    def test_the_same_name_WITH_provenance_resolves(self, db):
+        """Positive control. Without it, the test above would also pass if
+        annotation were broken outright."""
+        db.add_to_history(A, "A Release", package_name="A.Release.2026")
+        rows = [{"name": "A.Release.2026", "state": "downloading", "provenance_url": A}]
 
         annotate_source_links(db, rows)
 
-        assert rows[0]["source_url"] == "https://example.test/live"
+        assert rows[0]["source_url"] == A
+
+    def test_an_unproven_row_BESIDE_a_proven_one_still_gets_nothing(self, db):
+        """The case that actually exercises the guard.
+
+        annotate_source_links returns early when NO row carries provenance, so a
+        list of only-unproven rows never reaches the per-row resolution at all --
+        a test using one passes for the wrong reason. Found by mutation: a
+        name-matching fallback reintroduced into that loop was NOT caught until
+        this case existed, because the early return short-circuited it. A live
+        JDownloader list is exactly this mixed shape: our packages beside
+        whatever else the user added.
+        """
+        db.add_to_history(A, "A Release", package_name="A.Release.2026")
+        other = "https://source.example/release-B"
+        db.add_to_history(other, "B Release", package_name="B.Release.2026")
+        rows = [
+            {"name": "B.Release.2026", "provenance_url": other},   # proven
+            {"name": "A.Release.2026", "provenance_url": None},    # name matches, unproven
+        ]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["source_url"] == other, "the proven row lost its link"
+        assert rows[1]["source_url"] is None, "a name match bought an unproven row a link"
+
+    def test_a_foreign_package_is_unaffected_by_history(self, db):
+        """A hand-added package shares nothing with ScanHound: no provenance, and
+        a name that happens to collide changes nothing."""
+        db.add_to_history(A, "A Release", package_name="Movie (2026) [2160p]")
+        rows = [{"name": "Movie (2026) [2160p]", "state": "downloading"}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["source_url"] is None
+
+
+class TestFirstSeenDate:
+    def test_the_date_comes_from_the_PROVEN_release(self, db):
+        db.add_to_history(A, "A Release", package_name="A.Release.2026")
+        db._mutate("UPDATE downloads SET date_added = ? WHERE url = ?",
+                   ("2021-06-05 12:00:00", A))
+        rows = [{"name": "whatever", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["first_seen_at"] == "2021-06-05 12:00:00"
+
+    def test_a_regrab_does_not_move_it(self, db):
+        """date_added is second-resolution, so two writes in one second would
+        agree no matter what ON CONFLICT did -- pin it to a known past value
+        first, then a reset to CURRENT_TIMESTAMP is unmissable."""
+        db.add_to_history(A, "A Release", package_name="A.Release.2026")
+        db._mutate("UPDATE downloads SET date_added = ?, last_grabbed_at = ? WHERE url = ?",
+                   ("2020-01-01 00:00:00", "2020-01-01 00:00:00", A))
+
+        db.add_to_history(A, "A Release", package_name="A.Release.2026")
+
+        row = db._query_dicts(
+            "SELECT date_added, last_grabbed_at FROM downloads WHERE url = ?", (A,))[0]
+        assert row["date_added"] == "2020-01-01 00:00:00", "the regrab moved the date"
+        # Positive control: without this the assertion above would also pass if
+        # the second write had silently done nothing at all.
+        assert row["last_grabbed_at"] != "2020-01-01 00:00:00", "the regrab never wrote"
+
+    def test_a_proven_release_with_no_history_row_still_links(self, db):
+        """Provenance authorises the LINK; the date is separate information that
+        may simply be absent. Withholding the link too would hide a package we
+        can actually prove is ours."""
+        rows = [{"name": "x", "provenance_url": "https://source.example/never-in-history"}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["source_url"] == "https://source.example/never-in-history"
+        assert rows[0]["first_seen_at"] is None
+
+
+class TestAnnotationShape:
+    def test_both_keys_are_always_set(self, db):
+        """Consistent shape across the REST poll and the WebSocket push. A
+        consumer that has to distinguish missing from None will guess wrong."""
+        rows = [{"name": "unproven", "state": "downloading"}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["source_url"] is None
+        assert rows[0]["first_seen_at"] is None
 
     def test_a_lookup_failure_does_not_break_the_download_list(self):
         """Decoration must never take down the live progress view, nor the
         poller loop that broadcasts it."""
         class Exploding:
-            def get_download_source_links(self, names):
+            def get_release_first_seen(self, urls):
                 raise RuntimeError("db is gone")
 
-        rows = [{"name": "Whatever", "state": "downloading"}]
+        rows = [{"name": "x", "state": "downloading", "provenance_url": A}]
 
         annotate_source_links(Exploding(), rows)
 
         assert rows[0]["source_url"] is None
+        assert rows[0]["first_seen_at"] is None
         assert rows[0]["state"] == "downloading"
 
     def test_no_db_is_tolerated(self):
-        rows = [{"name": "Whatever"}]
+        rows = [{"name": "x", "provenance_url": A}]
         annotate_source_links(None, rows)
-        assert rows[0]["first_grabbed_at"] is None
+        assert rows[0]["source_url"] is None
+
+    def test_the_retired_name_resolver_is_gone(self, db):
+        """Deleted rather than left unused: a name-based resolver sitting in the
+        codebase is a loaded gun for the next caller who reaches for it."""
+        assert not hasattr(db, "get_download_source_links")

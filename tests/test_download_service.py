@@ -1855,6 +1855,11 @@ class TestPollResults:
         if db is None:
             db = MagicMock()
             db.get_scraped_link_titles.return_value = {}
+            # A stub package has no recorded link provenance, which is the
+            # realistic default. Without this the MagicMock returns a MagicMock,
+            # so rows would carry a mock object as their provenance_url and any
+            # exact-row assertion would compare against one.
+            db.resolve_release_by_links.return_value = None
         return _make_service(config={"jd_method": "api"}, db=db), db
 
     def test_jd_unreachable_returns_empty(self):
@@ -1869,7 +1874,8 @@ class TestPollResults:
         with patch.object(svc, "_connect_jd_device", return_value=device):
             results = svc.poll_results(record=False)
         assert results == [{
-            "id": None, "name": "Pkg.Queued", "title": "Pkg.Queued", "host": "",
+            "id": None, "provenance_url": None,
+            "name": "Pkg.Queued", "title": "Pkg.Queued", "host": "",
             "bytes_total": 1000, "bytes_loaded": 0, "downloaded": 0,
             "extraction": "na", "state": "queued", "error": None,
             "package_uuid": "1", "save_to": "",
