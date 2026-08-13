@@ -280,6 +280,13 @@ class HDEncodeActionService:
                 action.get("package_name") or "RSS Candidate",
                 action.get("destination") or "",
             )
+            # The SECOND caller of send_to_jdownloader. Record provenance here
+            # too, or every RSS-acquired package resolves to no source link --
+            # safe, but silently link-less for the source most releases arrive
+            # through. Only on a successful submit, and never fatal: provenance
+            # is decoration, and this action's outcome must not turn on it.
+            if submitted and self.db is not None:
+                self.db.record_submitted_links(action.get("canonical_url"), links)
         except Exception as exc:
             # Submission may have crossed the process boundary before raising.
             # Never make that automatically retryable.
