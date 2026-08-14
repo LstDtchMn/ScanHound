@@ -209,12 +209,16 @@ def deliver_transition(marker_path, kinds, send):
     marker = read_marker(marker_path)
     notification, target = marker_transition(marker, kinds)
     if notification is None:
-        return None
+        # Nothing to send: either the delivered state already matches, or
+        # there is nothing to clear. Distinct from "blocked" (below) so the
+        # caller cannot log "set unchanged" for a send that was actually
+        # stopped by marker persistence (peer review round 3, LOW).
+        return "suppressed"
     try:
         write_marker(marker_path, {"state": "pending", "target": target})
     except OSError as e:
         log_line(f"marker: could not persist pending state ({e}); not sending")
-        return None
+        return "blocked"
     if send(notification):
         try:
             write_marker(marker_path, target)
@@ -503,7 +507,7 @@ def main():
                 "the window. (Alerts now fire only when the condition SET "
                 "changes; the log records every run.)",
                 8))
-        if sent is None:
+        if sent == "suppressed":
             log_line("notify suppressed: stop-condition set unchanged")
         return 3
 

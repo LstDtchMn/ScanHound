@@ -90,7 +90,7 @@ class TestRequiredRegression:
         out = m.deliver_transition(marker, None, lambda n: sends.append(n) or True)
         m.write_marker = real_write
 
-        assert out is None and sends == [], "nothing may be sent without a durable pending"
+        assert out == "blocked" and sends == [], "nothing may be sent without a durable pending"
         assert m.read_marker(marker) == {"state": "stop", "signature": SIG_A}
         # and the unchanged stop stays suppressed, which is correct here
         note, _ = m.marker_transition(m.read_marker(marker), SIG_A)
@@ -112,7 +112,7 @@ class TestStateMachine:
         m = _load()
         marker = tmp_path / "stop-condition.last"
         m.deliver_transition(marker, SIG_A, lambda _n: True)
-        assert m.deliver_transition(marker, SIG_A, lambda _n: True) is None
+        assert m.deliver_transition(marker, SIG_A, lambda _n: True) == "suppressed"
 
     def test_a_changed_stop_alerts(self, tmp_path):
         m = _load()
@@ -131,13 +131,13 @@ class TestStateMachine:
 
     def test_no_stop_and_no_history_stays_silent(self, tmp_path):
         m = _load()
-        assert m.deliver_transition(tmp_path / "absent", None, lambda _n: True) is None
+        assert m.deliver_transition(tmp_path / "absent", None, lambda _n: True) == "suppressed"
 
     def test_clear_after_clear_stays_silent(self, tmp_path):
         m = _load()
         marker = tmp_path / "stop-condition.last"
         m.write_marker(marker, {"state": "clear"})
-        assert m.deliver_transition(marker, None, lambda _n: True) is None
+        assert m.deliver_transition(marker, None, lambda _n: True) == "suppressed"
 
     def test_pending_never_suppresses(self, tmp_path):
         """The rule stated in one line: pending means unconfirmed, and the only
@@ -157,7 +157,7 @@ class TestMarkerParsing:
         marker = tmp_path / "stop-condition.last"
         marker.write_text(SIG_A, encoding="utf-8")
         assert m.read_marker(marker) == {"state": "stop", "signature": SIG_A}
-        assert m.deliver_transition(marker, SIG_A, lambda _n: True) is None
+        assert m.deliver_transition(marker, SIG_A, lambda _n: True) == "suppressed"
 
     def test_corrupt_json_fails_conservative(self, tmp_path):
         m = _load()
