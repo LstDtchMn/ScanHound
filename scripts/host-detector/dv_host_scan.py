@@ -89,6 +89,18 @@ def is_retry_due(next_retry_at, now):
 # with no additional prefix in backend/api/main.py.
 DV_IMPORT_PATH = "/rename/dv-import"          # legacy file-read endpoint
 DV_ROWS_PATH = "/rename/dv-host-rows"         # durable row-POST endpoint
+
+#: What the run says when its final handoff fails. NAMED, because the wrapper's
+#: test suite asserts on it and the two live in different languages -- the string
+#: was previously duplicated as a literal in both, and when the endpoint moved
+#: from DV_IMPORT_PATH to DV_ROWS_PATH the message changed here and nothing
+#: changed there. Those assertions then failed on main for weeks, unnoticed,
+#: because that suite is not in CI. The test now reads this constant, so the
+#: two cannot drift apart again regardless of what CI does or does not run.
+FINAL_POST_FAILED_MSG = (
+    "final dv-host-rows POST failed; host rows are durable but "
+    "container/Plex are stale"
+)
 # Sent in every row-POST body and enforced server-side. Bump in lockstep with
 # any change to the row shape so an old detector can never feed a new container
 # (or vice-versa) a body it will silently mis-parse (round-4 cleanup).
@@ -516,8 +528,7 @@ def main(argv=None):
     # belongs in the exit status. (Consolidation blocker 2.)
     ok = _post_rows(args.api, final_rows)
     if not ok:
-        logger.error("final dv-host-rows POST failed; host rows are durable but "
-                     "container/Plex are stale")
+        logger.error(FINAL_POST_FAILED_MSG)
     return 0 if ok else 1
 
 

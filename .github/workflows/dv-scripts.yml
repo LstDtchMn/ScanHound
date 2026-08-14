@@ -1,0 +1,69 @@
+name: DV scripts
+
+# WHY A SEPARATE, PATH-FILTERED WORKFLOW.
+#
+# These suites need Windows. run-dv-scan.ps1 launches the detector through
+# `cmd /c` on purpose -- that OS-level redirection is the fix for a real bug
+# where PowerShell's pipeline turned the detector's stderr into a terminating
+# error and killed the run. Porting the suites to Linux would undo the thing
+# they exist to protect, so they cannot join the ubuntu-latest jobs in tests.yml.
+#
+# Windows runners bill at 2x, and these suites take ~10-15 minutes. tests.yml
+# runs on every push to fix/** and agent/**, on every PR, and nightly -- adding
+# ~25 billable minutes to that cadence would be a large share of the budget on a
+# repo that has exhausted its Actions minutes before. So this workflow triggers
+# ONLY when the DV scripts or the detector actually change, which is the only
+# time it can catch anything.
+#
+# KNOWN LIMIT OF THE PATH FILTER: drift caused from a file outside these paths
+# will not be caught here. The specific failure that motivated this -- the
+# detector's message changing while the test's copy of it did not -- is handled
+# separately and structurally: the test now reads the string from
+# dv_host_scan.FINAL_POST_FAILED_MSG rather than duplicating it, so those two
+# cannot disagree whether or not this job ever runs.
+
+on:
+  push:
+    branches: [main, master, develop, 'agent/**', 'fix/**', 'feat/**']
+    paths:
+      - 'scripts/run-dv-scan.ps1'
+      - 'scripts/test-dv-scan-*.ps1'
+      - 'scripts/host-detector/**'
+      - '.github/workflows/dv-scripts.yml'
+  pull_request:
+    branches: [main, master, develop]
+    paths:
+      - 'scripts/run-dv-scan.ps1'
+      - 'scripts/test-dv-scan-*.ps1'
+      - 'scripts/host-detector/**'
+      - '.github/workflows/dv-scripts.yml'
+  workflow_dispatch:
+
+jobs:
+  dv-scripts:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Production runs 3.12. The suites stub the detector with a real
+          # interpreter rather than a .bat, because python's buffering is part
+          # of the behaviour under test.
+          python-version: '3.12'
+
+      - name: Ingest-key suite
+        shell: powershell
+        run: |
+          # Deliberately first: it is the faster of the two, and a failure here
+          # (the wrapper not handing the credential to the detector) makes the
+          # streaming results harder to read.
+          .\scripts\test-dv-scan-ingest-key.ps1
+
+      - name: Streaming suite
+        shell: powershell
+        run: |
+          .\scripts\test-dv-scan-streaming.ps1

@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import logging
 import os
 import types
 
@@ -737,3 +739,26 @@ def test_a_failed_final_import_is_a_failed_run(tmp_path):
         tmp_path, 2, 0.0, ["--max-runtime-minutes", "0"], post_ok=False)
     assert rc == 1, "a final import that failed must not report success"
     assert posts, "the final import must still be attempted"
+
+
+def test_a_failed_final_handoff_SAYS_WHY(tmp_path, caplog):
+    """The half the existing exit-code test does not cover.
+
+    test_a_failed_final_import_is_a_failed_run already pins rc == 1, so this
+    asserts only what was missing: the run must NAME the failed handoff, or an
+    operator reading LastTaskResult=1 has a number and no cause. That is the
+    contract the two stale PowerShell assertions existed to protect, and it
+    belongs here too -- this runs on every push, while the Windows suite runs
+    only when a DV path changes.
+
+    Asserted on the endpoint token rather than the full prose: the wording may
+    reasonably evolve, but a failure that does not identify the handoff is a
+    regression whatever it says.
+    """
+    with caplog.at_level(logging.ERROR):
+        rc, _rows, _posts, _paths = _main_harness(
+            tmp_path, 2, 0.0, ["--max-runtime-minutes", "0"], post_ok=False)
+
+    assert rc == 1
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "dv-host-rows" in text, f"the failure must name the handoff; got: {text!r}"
