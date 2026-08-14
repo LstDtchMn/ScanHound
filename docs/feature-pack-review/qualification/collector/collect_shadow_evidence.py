@@ -126,61 +126,102 @@ def log_line(text):
 
 
 def read_marker(path):
-    """Parse the last-DELIVERED-notification marker.
+    """Parse the notification marker into a dict, or None when absent.
 
-    Returns ``("stop", signature)``, ``("clear", None)``, or ``(None, None)``
-    when no notification has ever been delivered. A pre-JSON marker (the
-    original format stored the raw signature text) parses as a delivered STOP
-    with that signature; corrupt JSON does too, which is conservative -- a
-    garbage signature never equals a real one, so the next stop re-alerts.
+    States: ``{"state":"stop","signature":...}`` and ``{"state":"clear"}`` are
+    DELIVERED states; ``{"state":"pending","target":{...}}`` means a send was
+    attempted whose delivery or persistence was never confirmed. A pre-JSON
+    marker (the original format stored the raw signature text) parses as a
+    delivered STOP with that signature; corrupt JSON does too, which is
+    conservative -- a garbage signature never equals a real one, so the next
+    stop re-alerts.
     """
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
-        return (None, None)
+        return None
     try:
         d = json.loads(raw)
-        if isinstance(d, dict) and d.get("state") == "clear":
-            return ("clear", None)
-        if isinstance(d, dict) and d.get("state") == "stop":
-            return ("stop", str(d.get("signature") or ""))
+        if isinstance(d, dict) and d.get("state") in ("stop", "clear", "pending"):
+            return d
     except json.JSONDecodeError:
         pass
-    return ("stop", raw)
+    return {"state": "stop", "signature": raw}
 
 
 def write_marker(path, payload):
-    """Atomically persist the last delivered state (write temp, then replace),
-    so a crash mid-write cannot leave a half-written marker."""
+    """Atomically persist a marker state (write temp, then replace), so a
+    crash mid-write cannot leave a half-written marker."""
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
     tmp.replace(path)
 
 
-def marker_transition(state, prev_sig, kinds):
+def marker_transition(marker, kinds):
     """The notification state machine, pure so it can be tested directly.
 
-    Inputs are the last DELIVERED state and the current normalised stop
-    signature (``None`` when no stop condition exists). Returns
-    ``(notification, new_marker)`` where notification is ``"stop"``,
-    ``"clear"`` or ``None``; the caller sends, and persists ``new_marker``
-    ONLY on a confirmed delivery.
+    ``marker`` is the parsed marker dict (or None); ``kinds`` is the current
+    normalised stop signature, or None when no stop condition exists. Returns
+    ``(notification, target)`` where notification is ``"stop"``, ``"clear"``
+    or None, and target is the DELIVERED state to record once the send is
+    confirmed.
 
-    WHY EXPLICIT CLEAR IS A STATE AND NOT A DELETED FILE (peer review of #70,
-    MEDIUM): the first design unlinked the marker on a delivered clear. A
-    delivered CLEAR followed by a FAILED unlink left the old STOP signature on
-    disk -- so when the same stop reappeared, it matched the stale marker and
-    was suppressed indefinitely, with the operator last told "cleared". With
-    CLEAR persisted as a value, a reappearing stop necessarily differs from it
-    and re-alerts; there is no deletion to fail.
+    THE ONE SUPPRESSION RULE: a notification is suppressed only when the
+    marker records a DELIVERED stop with the identical signature. A PENDING
+    marker never suppresses anything (peer review of #70, second round) --
+    pending means "a send happened whose delivery or persistence was never
+    confirmed", and the only safe reading of that is to notify again. A
+    failure can therefore produce a duplicate alert, never a silent one.
     """
+    state = (marker or {}).get("state")
     if kinds is not None:
-        if state != "stop" or kinds != prev_sig:
-            return ("stop", {"state": "stop", "signature": kinds})
-        return (None, None)
-    if state == "stop":
+        if state == "stop" and marker.get("signature") == kinds:
+            return (None, None)
+        return ("stop", {"state": "stop", "signature": kinds})
+    if state == "stop" or state == "pending":
         return ("clear", {"state": "clear"})
     return (None, None)
+
+
+def deliver_transition(marker_path, kinds, send):
+    """Run one notification transition under the pending-state protocol.
+
+    ``send(notification)`` performs the external push and returns confirmed
+    delivery. The ordering is the point (peer review of #70, second round):
+
+        1. durably write {"state":"pending","target":...}  BEFORE sending
+        2. send
+        3. on confirmed delivery, promote the marker to the target
+
+    The first design promoted in one post-send write, so a confirmed CLEAR
+    followed by a failed write left the old delivered STOP:A authoritative --
+    and A reappearing matched it and was suppressed, the same wedge as the
+    original unlink design with replace() substituted for unlink(). With the
+    pending write FIRST:
+
+        - pending write fails  -> nothing sent, nothing claimed; retry next run
+          (suppressing an unchanged stop then is correct: the operator was
+          never told anything new);
+        - send fails           -> pending remains; next run re-sends;
+        - promotion fails      -> pending remains; next run re-sends -- a
+          possible DUPLICATE notification, never a suppressed one.
+    """
+    marker = read_marker(marker_path)
+    notification, target = marker_transition(marker, kinds)
+    if notification is None:
+        return None
+    try:
+        write_marker(marker_path, {"state": "pending", "target": target})
+    except OSError as e:
+        log_line(f"marker: could not persist pending state ({e}); not sending")
+        return None
+    if send(notification):
+        try:
+            write_marker(marker_path, target)
+        except OSError as e:
+            log_line(f"marker: delivered but promotion failed ({e}); "
+                     "pending remains -- may duplicate, will not suppress")
+    return notification
 
 
 def miss_stop_conditions(graded, *, raw_misses):
@@ -441,15 +482,6 @@ def main():
         # Counts are normalised to xN so a creeping tally (x20 -> x21) does not
         # re-alert, but a NEW KIND of condition, one clearing, or a changed
         # schema value does.
-        #
-        # PENDING and AMBIGUOUS collapse to ONE token, not their own kinds.
-        # Measured on the last four runs before this change: those two classes
-        # flapped every cycle (x2 appearing, vanishing, swapping for each
-        # other), so a per-kind signature would have alerted on 3 of the 4 --
-        # barely a dedup at all. They are transient BY DEFINITION ("window too
-        # short", "cannot be closed from current data"), so their first
-        # appearance alerts once and their churn does not. RED, integrity,
-        # schema and blocker conditions keep per-kind granularity.
         def _kind(s):
             # PENDING and AMBIGUOUS collapse to one token because they demand
             # the SAME operator action (the window is already stopped) and the
@@ -462,39 +494,30 @@ def main():
                 return "TRANSIENT MISSES PRESENT (pending/ambiguous)"
             return re.sub(r"x\d+", "xN", s)
         kinds = "\n".join(sorted(set(_kind(s) for s in stop)))
-        marker = EVIDENCE / "stop-condition.last"
-        state, prev_sig = read_marker(marker)
-        notification, new_marker = marker_transition(state, prev_sig, kinds)
-        if notification == "stop":
-            # The marker advances ONLY on a confirmed send. Writing it after a
-            # failed one would convert a transient Gotify outage into a
-            # permanently suppressed alert -- the dedup would eat every retry.
-            # On failure the next run tries again: the old every-6-hours
-            # behaviour, degraded to exactly the failure window.
-            if notify("ScanHound QUAL: STOP CONDITION",
-                      "Mandatory stop condition detected: " + "; ".join(stop)
-                      + ". Per the runbook: stop and roll back. Do not continue "
-                      "the window. (Alerts now fire only when the condition SET "
-                      "changes; the log records every run.)",
-                      8):
-                write_marker(marker, new_marker)
-        else:
+        sent = deliver_transition(
+            EVIDENCE / "stop-condition.last", kinds,
+            lambda _n: notify(
+                "ScanHound QUAL: STOP CONDITION",
+                "Mandatory stop condition detected: " + "; ".join(stop)
+                + ". Per the runbook: stop and roll back. Do not continue "
+                "the window. (Alerts now fire only when the condition SET "
+                "changes; the log records every run.)",
+                8))
+        if sent is None:
             log_line("notify suppressed: stop-condition set unchanged")
         return 3
 
     # A stop condition that CLEARS is a change worth one alert too -- silence
     # after noise is ambiguous, and "it recovered" is exactly the event the
-    # operator wants to distinguish from "still failing". CLEAR is persisted as
-    # an explicit delivered state, never as a deleted file -- see
-    # marker_transition for the suppression wedge that deletion allowed.
-    marker = EVIDENCE / "stop-condition.last"
-    state, prev_sig = read_marker(marker)
-    notification, new_marker = marker_transition(state, prev_sig, None)
-    if notification == "clear":
-        if notify("ScanHound QUAL: stop condition CLEARED",
-                  "The previously reported stop condition is no longer present. "
-                  "The window is collecting normally again.", 5):
-            write_marker(marker, new_marker)
+    # operator wants to distinguish from "still failing". CLEAR is an explicit
+    # delivered state reached through the pending protocol -- see
+    # deliver_transition for the two wedges that simpler designs allowed.
+    deliver_transition(
+        EVIDENCE / "stop-condition.last", None,
+        lambda _n: notify(
+            "ScanHound QUAL: stop condition CLEARED",
+            "The previously reported stop condition is no longer present. "
+            "The window is collecting normally again.", 5))
 
     if ready:
         log_line("** READINESS GATE PASSED -- window complete, ready for review. **")
