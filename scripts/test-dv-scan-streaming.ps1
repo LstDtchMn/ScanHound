@@ -228,7 +228,13 @@ function Start-Wrapper {
     # identical to "produced no output", which cost real time to chase.
     $script:WrapperConsole = Join-Path $env:TEMP ("dv-wrapper-console-{0}.txt" -f [System.Guid]::NewGuid().ToString('N'))
     $ps  = (Get-Command powershell.exe).Source
-    $cmd = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -RepoRoot "{2}" -LogDir "{3}" -HeartbeatMinutes {4} > "{5}" 2>&1' `
+    # -MapDrive "" DISABLES the wrapper's network-drive step. These fixtures use
+    # local temp paths, so there is nothing to map -- and without this the
+    # wrapper would try to establish Y: -> the production share, which succeeds
+    # on a developer machine (where it already exists) and fails with exit 16 on
+    # a clean CI runner. That is the same host-dependency the ingest key had, so
+    # it is closed here rather than discovered by a red build.
+    $cmd = ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -RepoRoot "{2}" -LogDir "{3}" -HeartbeatMinutes {4} -MapDrive "" > "{5}" 2>&1' `
             -f $ps, $wrapper, $root, $LogDir, $Heartbeat, $script:WrapperConsole)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName        = $env:ComSpec

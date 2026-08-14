@@ -63,6 +63,16 @@ jobs:
           # streaming results harder to read.
           .\scripts\test-dv-scan-ingest-key.ps1
 
+      - name: Drive-mapping suite
+        shell: powershell
+        run: |
+          # Fast, and it fails closed. On a runner with no mapped drives the
+          # wrong-target case skips and says so, while the unestablishable-target
+          # case runs; on a machine with real mappings it is the other way round.
+          # The two environments cover different halves, which is stated in the
+          # suite rather than left for someone to discover.
+          .\scripts\test-dv-scan-drive-mapping.ps1
+
       - name: Streaming suite
         shell: powershell
         run: |

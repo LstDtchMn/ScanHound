@@ -99,8 +99,11 @@ function Invoke-Wrapper {
         $supportsKeyFile = (Get-Command $wrapper).Parameters.ContainsKey('IngestKeyFile')
         if ($supportsKeyFile) {
             & $wrapper -RepoRoot $root -LogDir $logDir -HeartbeatMinutes 0.05 `
-                       -IngestKeyFile $KeyFile *> $null
+                       -IngestKeyFile $KeyFile -MapDrive "" *> $null
         } else {
+            # The PRE-FIX wrapper has neither -IngestKeyFile nor -MapDrive, so the
+            # negative control passes neither. It predates both, which is exactly
+            # what makes it a control.
             & $wrapper -RepoRoot $root -LogDir $logDir -HeartbeatMinutes 0.05 *> $null
         }
         return $LASTEXITCODE

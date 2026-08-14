@@ -26,6 +26,8 @@
 #   12 python not found
 #   13 dovi_tool.exe not found
 #   14 the ingest key is unavailable, so nothing could be delivered
+#   15 the mapped drive points at the WRONG share (never remapped -- see below)
+#   16 the mapped drive could not be established
 #   1  the detector itself failed; see the log
 #
 # WHY 14 EXISTS (added 2026-08-13 after a live outage).
@@ -52,6 +54,13 @@ param(
     # SCANHOUND_DV_INGEST_KEY in the environment wins, so a caller or test can
     # inject one without a file on disk.
     [string]$IngestKeyFile = 'C:\DockerData\scanhound\dv_ingest_key.secret',
+    # The mapped drive this wrapper establishes before probing roots. An
+    # ELEVATED task does not inherit the interactive session's mappings, so
+    # relying on one already existing is what forced a second scheduled task to
+    # exist. Set -MapDrive '' to skip (the test suites do -- they use local
+    # paths and must not touch the machine's real drive letters).
+    [string]$MapDrive  = 'Y:',
+    [string]$MapTarget = '\\TURTLELANDSRV2\4K HDR Geronimo',
     # How often to log a "still running" line while the detector is silent. The
     # detector can legitimately say nothing for ~20 minutes (one 90 GB file at
     # the measured 79 MB/s), so streaming alone still leaves long gaps; this is
@@ -303,6 +312,58 @@ if ([string]::IsNullOrWhiteSpace($rootsRaw)) {
 # initialised as @() below.
 $roots = @($rootsRaw -split ';' | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
 Write-Log "configured roots: $($roots.Count)"
+
+# --- establish the mapped drive BEFORE probing the roots ---------------------
+#
+# Ported from the minimal wrapper at C:\DockerData\scanhound\run-dv-scan.ps1,
+# which existed solely because this one could not do it. That script ran as a
+# SECOND scheduled task at RunLevel=Highest, and an elevated session does not
+# inherit the interactive session's drive mappings -- so it mapped Y: itself.
+# This wrapper only ever DETECTED a missing root and aborted with exit 11.
+# With the mapping here, the two tasks stop being complementary and the minimal
+# one can be retired, which also ends two detectors writing one SQLite file on
+# overlapping 4h/6h schedules.
+#
+# THE EXACT-TARGET CHECK IS THE POINT, not merely "is Y: present". dv_host.db
+# keys rows on the raw path string, so a Y: pointing at a DIFFERENT share would
+# scan different bytes under an identity that already means something else --
+# silently corrupting the layer recorded for every file under it. A wrong
+# mapping therefore fails closed and is NEVER repaired by remapping.
+#
+# Pass -MapDrive '' to skip entirely (the test suites do; they use local paths).
+if ($MapDrive) {
+    $wantN = $MapTarget.TrimEnd('\')
+    $cur = $null
+    try { $cur = (Get-SmbMapping -LocalPath $MapDrive -ErrorAction SilentlyContinue).RemotePath } catch { }
+    $curN = if ($cur) { $cur.TrimEnd('\') } else { '' }
+
+    if ($curN -and ($curN -ine $wantN)) {
+        Write-Log "ABORT: $MapDrive maps to '$cur', expected '$MapTarget'." 'ERROR'
+        Write-Log "Refusing to remap: dv_host.db keys on the raw path, so scanning a" 'ERROR'
+        Write-Log "different share under this drive letter would record the wrong DV" 'ERROR'
+        Write-Log "layer for every file it walked." 'ERROR'
+        exit 15
+    }
+    if (-not $curN) {
+        Write-Log "$MapDrive not mapped; establishing -> $MapTarget"
+        try {
+            New-SmbMapping -LocalPath $MapDrive -RemotePath $MapTarget -Persistent $false -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Log "New-SmbMapping failed ($($_.Exception.Message)); trying net use" 'WARN'
+            # Redirect INSIDE cmd: a native stderr stream handled by PowerShell
+            # becomes a NativeCommandError, and under EAP='Stop' the first one
+            # is terminating -- the exact failure this wrapper documents above.
+            cmd /c "net use $MapDrive `"$MapTarget`" 2>&1" | ForEach-Object { Write-Log "net use: $_" }
+        }
+        try { $cur = (Get-SmbMapping -LocalPath $MapDrive -ErrorAction SilentlyContinue).RemotePath } catch { }
+        $curN = if ($cur) { $cur.TrimEnd('\') } else { '' }
+    }
+    if ((-not (Test-Path -LiteralPath "$MapDrive\")) -or ($curN -ine $wantN)) {
+        Write-Log "ABORT: could not establish $MapDrive -> '$MapTarget' (got '$cur')." 'ERROR'
+        exit 16
+    }
+    Write-Log "$MapDrive verified -> $curN"
+}
 
 $unreachable = @()
 foreach ($r in $roots) {
