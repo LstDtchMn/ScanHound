@@ -47,3 +47,35 @@ that Colombo (the naive 5th candidate) no longer holds movies at all.
 
 Colombo: repurposed to TV; its 265 seed titles reconciled against Plex — 257
 present, ~4 real absentees after normalization, accepted by Jesse.
+
+---
+
+## Review outcome (2026-08-14, same night)
+
+**Decision (1) REVERSED per review — and the reviewer was right twice over:**
+
+1. `plex_cache` holds **1,040 media parts under the BU directories** (the
+   container mounts the Ulysses/Gagarin BU drive as a Plex library source), so
+   BU scan rows would have been ACTIONABLE by the labeler, not inert. The
+   "matches neither consumer" claim in this doc was wrong.
+2. There are TWO BU folders (`4K Jefferson & Truman BU` AND
+   `4K Ulysses & Yuri Gagarin BU`) — the whole-root config included both.
+
+**Deeper finding: the original edit NEVER TOOK EFFECT.** `dv_library_roots` is
+owned by the APP config (`/data/.config/scanhound/config.json`);
+`app_service.py` exports `dv_host.json` from it, so the direct file edit was
+regenerated away. Verify-the-write-not-the-survivor, again. The 7 PM run
+scanned the old 4 roots; no BU scan ever happened.
+
+**Applied correctly through the owner** (PUT /settings; qualification token
+use explicitly authorized by Jesse for this one change): 13 roots — the
+original 4, Magellan/4K, the three Y:/…/4K siblings, and FIVE enumerated
+non-BU C:/4K Drives subdirs (`4K Columbo`, `4K Gambino`, `4K Quantum`,
+`4K Rickover`, `4k HDR Arnold` — the last three plus Columbo were unknown to
+the seed entirely). Verified: app reports 13; app-regenerated dv_host.json
+carries 13; every root Test-Path OK; `dv_file_tagging=false` confirmed live.
+
+**Decision (2)** (Y:/ spellings): approved as reviewed; the doc's
+"protects seed rows" rationale is corrected per the review — the durable seed
+evidence lives in `dv_seed_baseline`; the real reasons are namespace
+consistency with the live scanner and the wrapper's verified mapping.
