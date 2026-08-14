@@ -16,6 +16,28 @@
   import { connection } from '$lib/stores/connection';
   import { historyStatusVariant as _historyStatusVariant, historyStatusLabel as _historyStatusLabel, historyBorderColor } from '$lib/constants';
   import type { JdPackage, JdRunState, DownloadResult, DownloadHistoryEntry } from '$lib/api/types';
+  import { checkedAgo, exactTime } from '$lib/time';
+  import { safeHttpUrl } from '$lib/url';
+
+  /** History rows carry `date_added` (as `downloaded_at`): when this url was
+   *  FIRST SEEN in history, not when it first succeeded. add_to_history()'s
+   *  ON CONFLICT bumps `last_grabbed_at` and deliberately leaves date_added
+   *  alone, so a regrab does not move it — but download_item() also writes a
+   *  row with status="failed", so the first write can be a failed attempt
+   *  (peer review). Hence "first seen", NOT "first grabbed": a failed Monday
+   *  attempt followed by a successful Wednesday retry would otherwise claim a
+   *  grab happened on Monday. Labelled explicitly because the bare timestamp
+   *  read as "downloaded at". */
+  function firstSeenFrom(ts: string | null | undefined): string {
+    const ago = checkedAgo(ts ?? '');
+    return ago ? `first seen ${ago}` : '';
+  }
+  function firstSeenLabel(entry: DownloadHistoryEntry): string {
+    return firstSeenFrom(entry.downloaded_at ?? entry.timestamp);
+  }
+  function firstSeenExact(entry: DownloadHistoryEntry): string {
+    return exactTime(entry.downloaded_at ?? entry.timestamp ?? '');
+  }
 
   // JDownloader live status — links grouped into collapsible packages.
   let jdPackages = $state<JdPackage[]>([]);
@@ -619,7 +641,13 @@
             <Badge label={extractionLabel(r.extraction)} variant={extractionVariant(r.extraction)} />
           {/if}
           <div class="flex-1 min-w-0">
-            <div class="font-medium truncate" title={r.title}>{r.title || r.name}</div>
+            {#if safeHttpUrl(r.source_url)}
+              <a href={safeHttpUrl(r.source_url)} target="_blank" rel="noopener noreferrer"
+                 class="font-medium truncate block hover:underline"
+                 title="Open the release page">{r.title || r.name}</a>
+            {:else}
+              <div class="font-medium truncate" title={r.title}>{r.title || r.name}</div>
+            {/if}
             {#if r.error}
               <div class="text-[10px] text-[var(--error)] truncate" title={r.error}>{r.error}</div>
             {:else}
@@ -631,6 +659,10 @@
               {/if}
             {/if}
           </div>
+          {#if firstSeenFrom(r.first_seen_at)}
+            <span class="text-[10px] text-[var(--text-secondary)] whitespace-nowrap"
+                  title={exactTime(r.first_seen_at ?? '')}>{firstSeenFrom(r.first_seen_at)}</span>
+          {/if}
           {#if r.host}<span class="text-[var(--text-secondary)] whitespace-nowrap">{r.host}</span>{/if}
           <span class="text-[10px] text-[var(--text-secondary)] uppercase whitespace-nowrap w-20 text-right">{r.state === 'extracted' && r.extraction === 'na' ? 'Complete' : stateLabel(r.state)}</span>
         </div>
@@ -769,7 +801,13 @@
                       <path d="M5 10l2 2 2-2" stroke-linecap="round" stroke-linejoin="round"/>
                     </svg>
                     <div class="flex-1 min-w-0">
-                      <p class="text-sm font-medium truncate">{entry.title}</p>
+                      {#if safeHttpUrl(entry.url)}
+                        <a href={safeHttpUrl(entry.url)} target="_blank" rel="noopener noreferrer"
+                           title="Open the release page"
+                           class="text-sm font-medium truncate block hover:underline">{entry.title}</a>
+                      {:else}
+                        <p class="text-sm font-medium truncate">{entry.title}</p>
+                      {/if}
                       {#if entry.path}
                         <p class="text-xs text-[var(--text-secondary)] truncate">{entry.path}</p>
                       {/if}
@@ -780,7 +818,8 @@
                     {#if entry.size}
                       <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap">{entry.size}</span>
                     {/if}
-                    <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap">{entry.downloaded_at ?? entry.timestamp ?? ''}</span>
+                    <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap"
+                          title={firstSeenExact(entry)}>{firstSeenLabel(entry)}</span>
                     <Badge
                       label={historyStatusLabel(entry.status)}
                       variant={historyStatusVariant(entry.status)}
@@ -804,7 +843,13 @@
               <path d="M5 10l2 2 2-2" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
             <div class="flex-1 min-w-0">
-              <p class="text-sm font-medium truncate">{entry.title}</p>
+              {#if safeHttpUrl(entry.url)}
+                <a href={safeHttpUrl(entry.url)} target="_blank" rel="noopener noreferrer"
+                   title="Open the release page"
+                   class="text-sm font-medium truncate block hover:underline">{entry.title}</a>
+              {:else}
+                <p class="text-sm font-medium truncate">{entry.title}</p>
+              {/if}
               {#if entry.path}
                 <p class="text-xs text-[var(--text-secondary)] truncate">{entry.path}</p>
               {/if}
@@ -815,7 +860,8 @@
             {#if entry.size}
               <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap">{entry.size}</span>
             {/if}
-            <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap">{entry.downloaded_at ?? entry.timestamp ?? ''}</span>
+            <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap"
+                  title={firstSeenExact(entry)}>{firstSeenLabel(entry)}</span>
             <Badge
               label={historyStatusLabel(entry.status)}
               variant={historyStatusVariant(entry.status)}

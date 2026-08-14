@@ -782,6 +782,19 @@ class DatabaseManager:
                                'ON download_results(package_uuid) WHERE package_uuid IS NOT NULL')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_download_results_name '
                                'ON download_results(name)')
+                # PACKAGE PROVENANCE, PERSISTED (peer review Finding 1, part 2).
+                # The release a live package was PROVEN to belong to, by matching
+                # the file-host links ScanHound recorded submitting. Persisted
+                # rather than recomputed per request because the REST endpoint
+                # reads this table, not the live JD poll -- only the poller holds
+                # the child links, so without a column the two transports could
+                # not agree. NULL means unproven, which renders as no link.
+                try:
+                    cursor.execute('ALTER TABLE download_results '
+                                   'ADD COLUMN provenance_url TEXT')
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp DESC)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_bg_cache_last_seen ON background_scan_cache(last_seen_at)')
@@ -925,6 +938,41 @@ class DatabaseManager:
                 except sqlite3.OperationalError as e:
                     if "duplicate column" not in str(e).lower():
                         raise
+
+                # Must come AFTER the package_name / jd_confirmed_name column
+                # migrations above — on a fresh database `downloads` is created
+                # with only (url, title, date_added), so indexing these columns
+                # any earlier fails with "no such column" and takes startup with
+                # it. The live source-link resolver that first needed these was
+                # retired in favour of recorded link provenance; they stay for
+                # the remaining name queries, chiefly the jd_confirmed_name
+                # backfill, which scans package_name on every startup.
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_package_name '
+                               'ON downloads(package_name) WHERE package_name IS NOT NULL')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_jd_confirmed_name '
+                               'ON downloads(jd_confirmed_name) WHERE jd_confirmed_name IS NOT NULL')
+
+                # PACKAGE PROVENANCE (peer review Finding 1, 2026-08-12).
+                # The file-host links ScanHound actually submitted for a release.
+                # poll_results() enumerates JDownloader's ENTIRE package list, so
+                # a package added by hand is in scope; matching it to a release by
+                # display name is a coincidence, not evidence, and produced a
+                # confident link to the wrong release page. A link IS the release,
+                # so this is provenance by construction — and both send paths (API
+                # and .crawljob) know the links, which a package-uuid scheme could
+                # not say (JD assigns uuids asynchronously, and the folder path has
+                # nothing to ask).
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS download_package_links (
+                        url TEXT NOT NULL,
+                        link TEXT NOT NULL,
+                        recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (url, link)
+                    )
+                ''')
+                # Resolution goes link -> release, so `link` is the lookup key.
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_package_links_link '
+                               'ON download_package_links(link)')
 
                 # HDEncode RSS evidence tables (v3, additive-only).
                 cursor.execute("""
@@ -3862,11 +3910,28 @@ class DatabaseManager:
 
     def upsert_download_result(self, name, package_uuid=None, title=None, host=None,
                                bytes_total=0, bytes_loaded=0, downloaded=0,
-                               extraction="na", state="queued", error=None):
+                               extraction="na", state="queued", error=None,
+                               provenance_url=None, provenance_observed=False):
         """Insert/update a JD package's download outcome; returns the row id (int)
         or None on failure. Identity is package_uuid when present, else the row is
         adopted-by-name (a legacy NULL-uuid row) or inserted. Runs the whole
-        lookup-then-write under one lock hold to avoid poller-vs-remove races."""
+        lookup-then-write under one lock hold to avoid poller-vs-remove races.
+
+        ``provenance_url`` is written under ``provenance_observed``, which is the
+        difference between an absence of observation and an observation of
+        absence (peer review 2026-08-13):
+
+            observed=True   write the value AS GIVEN, including NULL. The caller
+                            looked, and either proved one release or proved there
+                            is no honest unique answer. The second RETRACTS.
+            observed=False  COALESCE. The caller could not look -- JDownloader's
+                            link query failed, or the lookup threw -- so whatever
+                            was proven earlier stands.
+
+        Unconditional COALESCE was the earlier behaviour and it let a stale proof
+        outlive its evidence: once a second release recorded the same host link,
+        the resolver correctly said "ambiguous", and that None was read as
+        "nothing to say" rather than "this is no longer authorised"."""
         try:
             with self._lock:
                 conn = self.get_connection()
@@ -3894,18 +3959,35 @@ class DatabaseManager:
                         "UPDATE download_results SET "
                         "package_uuid = COALESCE(?, package_uuid), name = ?, title = ?, "
                         "host = ?, bytes_total = ?, bytes_loaded = ?, downloaded = ?, "
-                        "extraction = ?, state = ?, error = ?, updated_at = CURRENT_TIMESTAMP "
+                        "extraction = ?, state = ?, error = ?, "
+                        # Observed -> take the value as given (NULL retracts).
+                        # Unobserved -> keep what is stored, MECHANICALLY.
+                        #
+                        # The unobserved branch ignores the passed value entirely
+                        # rather than COALESCEing it (peer review follow-up 2).
+                        # With COALESCE, a caller passing observed=False WITH a
+                        # url would still overwrite the stored one -- so the
+                        # docstring's promise ("the previous proof stands") held
+                        # only because the production caller never emits that
+                        # combination. An invariant that depends on callers
+                        # behaving is not an invariant; this makes it structural.
+                        "provenance_url = CASE WHEN ? = 1 THEN ? "
+                        "                      ELSE provenance_url END, "
+                        "updated_at = CURRENT_TIMESTAMP "
                         "WHERE id = ?",
                         (package_uuid, name, title, host, bytes_total, bytes_loaded,
-                         downloaded, extraction, state, error, rid))
+                         downloaded, extraction, state, error,
+                         1 if provenance_observed else 0, provenance_url,
+                         rid))
                     conn.commit()
                     return rid
                 cur.execute(
                     "INSERT INTO download_results (package_uuid, name, title, host, "
-                    "bytes_total, bytes_loaded, downloaded, extraction, state, error, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    "bytes_total, bytes_loaded, downloaded, extraction, state, error, "
+                    "provenance_url, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     (package_uuid, name, title, host, bytes_total, bytes_loaded,
-                     downloaded, extraction, state, error))
+                     downloaded, extraction, state, error, provenance_url))
                 conn.commit()
                 return cur.lastrowid
         except Exception as e:
@@ -3916,10 +3998,90 @@ class DatabaseManager:
         """Return tracked download/extraction outcomes, most recent first."""
         return self._query_dicts(
             "SELECT id, package_uuid, name, title, host, bytes_total, bytes_loaded, "
-            "downloaded, extraction, state, error, updated_at "
+            "downloaded, extraction, state, error, updated_at, provenance_url "
             "FROM download_results ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         )
+
+    def record_submitted_links(self, url, links):
+        """Remember the file-host links submitted to JDownloader for `url`.
+
+        Called for BOTH send paths. The folder/.crawljob path is the one that
+        matters most here: it has no API to read a package back from, so any
+        scheme that depended on asking JDownloader what it created would leave
+        that path with no provenance at all.
+
+        Idempotent (INSERT OR IGNORE on the natural key), so a regrab of the
+        same release re-affirms the same rows rather than duplicating them, and
+        a partial failure can be retried. Never raises: failing to record
+        provenance must not fail the grab itself -- the cost is a link that
+        stays unresolved, which is the safe direction.
+        """
+        rows = [(str(url), str(link)) for link in (links or []) if link]
+        if not url or not rows:
+            return 0
+        try:
+            with self.transaction() as conn:
+                if conn is None:
+                    return 0
+                conn.executemany(
+                    "INSERT OR IGNORE INTO download_package_links (url, link) "
+                    "VALUES (?, ?)", rows)
+            return len(rows)
+        except Exception:
+            logger.exception("failed to record submitted links for %s", url)
+            return 0
+
+    def resolve_release_by_links(self, link_urls):
+        """The release these live JDownloader links provably belong to, or None.
+
+        Provenance, not inference: a link resolves only because ScanHound
+        recorded submitting it. A package JDownloader shows that ScanHound never
+        sent contributes no rows and therefore resolves to nothing, which is the
+        whole point of Finding 1.
+
+        Returns None when the links map to more than one release, too. That is a
+        real possibility -- a hand-built package can mix links from two releases,
+        and a regrab at a different URL can reuse a host link -- and there is no
+        honest answer to "which release is this?" in that case.
+        """
+        wanted = [str(u) for u in dict.fromkeys(link_urls or []) if u]
+        if not wanted:
+            return None
+        found = set()
+        for start in range(0, len(wanted), 300):
+            chunk = wanted[start:start + 300]
+            rows = self._query_dicts(
+                "SELECT DISTINCT url FROM download_package_links WHERE link IN (%s)"
+                % ",".join("?" * len(chunk)),
+                tuple(chunk), default=[]) or []
+            found.update(r["url"] for r in rows)
+            if len(found) > 1:
+                return None   # ambiguous; no honest answer
+        return next(iter(found)) if len(found) == 1 else None
+
+    def get_release_first_seen(self, urls):
+        """Map release url -> `date_added`, the first time that url entered
+        history.
+
+        NOT "first grabbed": download_item() writes a history row for FAILED
+        attempts too, so this can be the moment a grab was first tried rather
+        than the moment one succeeded. The UI labels it "first seen" for exactly
+        that reason (peer review Finding 2).
+        """
+        wanted = [str(u) for u in dict.fromkeys(urls or []) if u]
+        if not wanted:
+            return {}
+        out = {}
+        for start in range(0, len(wanted), 300):
+            chunk = wanted[start:start + 300]
+            rows = self._query_dicts(
+                "SELECT url, date_added FROM downloads WHERE url IN (%s)"
+                % ",".join("?" * len(chunk)),
+                tuple(chunk), default=[]) or []
+            for row in rows:
+                out[row["url"]] = row.get("date_added")
+        return out
 
     def get_download_result_id(self, package_uuid, name):
         """Resolve a download_results row id for a package: by ``package_uuid``

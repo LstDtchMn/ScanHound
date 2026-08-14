@@ -649,6 +649,22 @@ export interface DownloadResult {
   error: string | null;
   updated_at?: string; // REST only
   save_to?: string; // WS only
+  // Null unless the package has RECORDED PROVENANCE: its file-host links match
+  // links ScanHound recorded submitting. A package added to JDownloader by hand
+  // resolves to nothing, so the UI shows no link rather than a confident wrong
+  // one. `first_seen_at` is when the release first entered history — which can
+  // be a FAILED attempt, hence "seen", not "grabbed".
+  source_url?: string | null;
+  first_seen_at?: string | null;
+  // The raw persisted association, carried on both transports. Declared because
+  // it IS on the wire; UI code should read `source_url`, which is the annotated
+  // answer and the only one guaranteed present on every row.
+  provenance_url?: string | null;
+  // WS only, and a SERVER-SIDE write decision, not a display value: whether this
+  // poll actually managed to observe the package's links. It distinguishes "no
+  // longer provable" from "could not look", which is what decides whether a
+  // stored association may be retracted. The UI has no use for it.
+  provenance_observed?: boolean;
 }
 
 export interface TmdbSearchResult {

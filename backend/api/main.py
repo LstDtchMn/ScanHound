@@ -371,15 +371,46 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                 dl = reg.download
                 if dl and cfg.get("jd_enabled") and cfg.get("jd_method") == "api":
                     results = dl.poll_results(record=True)
+                    # provenance_url participates so a provenance-ONLY change
+                    # (a link resolving, or being retracted, while nothing else
+                    # moves) still pushes. Without it the WebSocket would sit on
+                    # a stale link until the next 5s REST poll happened to
+                    # overwrite the list -- the two transports disagreeing for a
+                    # window, which is the class of bug the shared annotator
+                    # exists to prevent.
+                    # BOTH provenance fields, for the same reason change_key
+                    # carries both: url=None/observed=False (could not look) and
+                    # url=None/observed=True (looked, now ambiguous) are different
+                    # events, and a signature that cannot tell them apart cannot
+                    # push the second one.
+                    #
+                    # KNOWN AND ACCEPTED: an UNOBSERVED row carries url=None here
+                    # while the database still holds the previous proof, so a push
+                    # during an unobserved poll briefly hides a link the DB has
+                    # not retracted. The next REST poll restores it within 5s.
+                    # Fixing it properly means reading the persisted value back
+                    # per row, which costs a query on the poll path to remove a
+                    # 5-second cosmetic gap -- deliberately not done.
                     sig = tuple(
-                        (r["name"], r["state"], r["bytes_loaded"], r["extraction"])
+                        (r["name"], r["state"], r["bytes_loaded"], r["extraction"],
+                         r.get("provenance_url"), r.get("provenance_observed"))
                         for r in results
                     )
                     if sig != last_sig:
                         last_sig = sig
+                        # Same annotation the REST /results endpoint applies —
+                        # the page replaces its whole list from this push, so
+                        # skipping it here would blank the source link on every
+                        # progress change. Applied after `sig` is computed so
+                        # it can never affect change detection. Annotating in
+                        # place is safe for the code below: every downstream
+                        # reader takes named keys (name / state / save_to /
+                        # package_uuid), none enumerates the dict, so the two
+                        # added keys cannot shift a dedup key or a payload.
+                        from backend.download_links import annotate_source_links
                         ws_manager.broadcast_sync({
                             "type": "download:results",
-                            "data": {"results": results},
+                            "data": {"results": annotate_source_links(reg.db, results)},
                         })
                     # Empirical package-name capture: persist JD's own reported
                     # name for any grab still awaiting confirmation, so pipeline
