@@ -35,6 +35,22 @@ from pathlib import Path
 
 CYCLE_OUTCOMES = ("success", "relevant_miss")
 
+# THE ONE COPY of the expected PRAGMA user_version, used by both the readiness
+# check and the emitted safety.schema_version_expected field. Prod legitimately
+# advanced 6 -> 7 (4K metadata inventory) -> 8 (HDEncode persistent-browser +
+# durable download queue) -> 9 (Turnstile verification hold, PR #57, deployed
+# 2026-08-10) via authorized deploys. A value other than this signals an
+# unexpected/unauthorized schema change.
+#
+# MAINTENANCE, learned the slow way twice over: the pin went stale on 8/10 and
+# rode inside every 6-hourly stop alert for four days as noise -- and
+# selftest.py's healthy fixture was still building schema 6, meaning the
+# self-test had been failing silently since the 6 -> 7 bump because nothing
+# runs it automatically. When an authorized migration bumps user_version:
+# bump THIS constant, bump selftest.py's fixtures, re-run selftest.py, and
+# regenerate SHA256SUMS -- all in the SAME change.
+EXPECTED_SCHEMA_VERSION = 9
+
 
 def _parse_iso(value):
     if not value:
@@ -279,18 +295,7 @@ def main():
         reasons.append("normal_feeds_unhealthy_or_stale")
     if integrity != "ok":
         reasons.append(f"integrity_check={integrity}")
-    # Prod schema legitimately advanced 6 -> 7 (4K metadata inventory) -> 8
-    # (HDEncode persistent-browser + durable download queue) -> 9 (Turnstile
-    # verification hold, PR #57, deployed 2026-08-10) via authorized deploys
-    # during the shadow window; 9 is current main. A value other than 9 now
-    # signals an unexpected/unauthorized schema change.
-    #
-    # MAINTENANCE NOTE, learned the slow way: this pin went stale on 8/10 and
-    # then rode along inside every 6-hourly stop-condition alert for four days,
-    # teaching the reader that the schema line is noise -- which is the exact
-    # opposite of a tripwire's job. When an authorized migration bumps
-    # PRAGMA user_version, bump this in the SAME change.
-    if user_version != 9:
+    if user_version != EXPECTED_SCHEMA_VERSION:
         reasons.append(f"unexpected_schema_version={user_version}")
     if miss_count_mismatches:
         reasons.append("shadow_miss_count_mismatch")
@@ -355,7 +360,7 @@ def main():
             "auto_action_rows": int(auto_action_rows or 0),
             "active_action_rows": int(active_action_rows or 0),
             "miss_count_mismatches": int(miss_count_mismatches or 0),
-            "schema_version_expected": 9,
+            "schema_version_expected": EXPECTED_SCHEMA_VERSION,
             "violations": [
                 reason for reason in reasons
                 if reason.startswith((

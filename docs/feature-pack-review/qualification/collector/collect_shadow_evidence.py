@@ -17,9 +17,13 @@ What it does:
      RSS miss, or a database integrity failure), so the Scheduled Task shows
      as failed and the condition cannot pass unnoticed.
 
-Auth is optional. The authoritative numbers are computed from the database,
-so this keeps working even when the session token expires. If a file named
-`auth-token.txt` exists beside this script, its contents are additionally
+Auth is optional for COLLECTION only, and mandatory for QUALIFICATION: the
+DB-derived numbers keep being computed and logged without a token, but
+reconciliation_blockers() deliberately treats missing credentials as a
+mandatory stop, so a window observed without the independent /rss/status
+cross-check can never pass the gate. (Peer review wording fix -- the previous
+"auth is optional" read as though qualification could pass without it.)
+If a file named `auth-token.txt` exists beside this script, its contents are additionally
 used to fetch the app's own GET /rss/status readiness and reconcile it
 against the independent DB-derived computation.
 """
@@ -119,6 +123,64 @@ def log_line(text):
     print(line)
     with LOG.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def read_marker(path):
+    """Parse the last-DELIVERED-notification marker.
+
+    Returns ``("stop", signature)``, ``("clear", None)``, or ``(None, None)``
+    when no notification has ever been delivered. A pre-JSON marker (the
+    original format stored the raw signature text) parses as a delivered STOP
+    with that signature; corrupt JSON does too, which is conservative -- a
+    garbage signature never equals a real one, so the next stop re-alerts.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return (None, None)
+    try:
+        d = json.loads(raw)
+        if isinstance(d, dict) and d.get("state") == "clear":
+            return ("clear", None)
+        if isinstance(d, dict) and d.get("state") == "stop":
+            return ("stop", str(d.get("signature") or ""))
+    except json.JSONDecodeError:
+        pass
+    return ("stop", raw)
+
+
+def write_marker(path, payload):
+    """Atomically persist the last delivered state (write temp, then replace),
+    so a crash mid-write cannot leave a half-written marker."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(path)
+
+
+def marker_transition(state, prev_sig, kinds):
+    """The notification state machine, pure so it can be tested directly.
+
+    Inputs are the last DELIVERED state and the current normalised stop
+    signature (``None`` when no stop condition exists). Returns
+    ``(notification, new_marker)`` where notification is ``"stop"``,
+    ``"clear"`` or ``None``; the caller sends, and persists ``new_marker``
+    ONLY on a confirmed delivery.
+
+    WHY EXPLICIT CLEAR IS A STATE AND NOT A DELETED FILE (peer review of #70,
+    MEDIUM): the first design unlinked the marker on a delivered clear. A
+    delivered CLEAR followed by a FAILED unlink left the old STOP signature on
+    disk -- so when the same stop reappeared, it matched the stale marker and
+    was suppressed indefinitely, with the operator last told "cleared". With
+    CLEAR persisted as a value, a reappearing stop necessarily differs from it
+    and re-alerts; there is no deletion to fail.
+    """
+    if kinds is not None:
+        if state != "stop" or kinds != prev_sig:
+            return ("stop", {"state": "stop", "signature": kinds})
+        return (None, None)
+    if state == "stop":
+        return ("clear", {"state": "clear"})
+    return (None, None)
 
 
 def miss_stop_conditions(graded, *, raw_misses):
@@ -389,40 +451,50 @@ def main():
         # appearance alerts once and their churn does not. RED, integrity,
         # schema and blocker conditions keep per-kind granularity.
         def _kind(s):
+            # PENDING and AMBIGUOUS collapse to one token because they demand
+            # the SAME operator action (the window is already stopped) and the
+            # subclassification is empirically unstable -- on the real 8/13-14
+            # runs the two flapped every cycle, so per-kind dedup would have
+            # alerted on 3 of 4. NOT because they are "transient by definition":
+            # AMBIGUOUS can be durable (evidence that cannot currently prove
+            # resolution may never be able to).
             if s.startswith(("RSS MISS STILL UNRESOLVED", "RSS MISS UNPROVABLE")):
                 return "TRANSIENT MISSES PRESENT (pending/ambiguous)"
             return re.sub(r"x\d+", "xN", s)
         kinds = "\n".join(sorted(set(_kind(s) for s in stop)))
-        last = EVIDENCE / "stop-condition.last"
-        prev = last.read_text(encoding="utf-8") if last.is_file() else None
-        if kinds != prev:
-            # The marker is written ONLY on a confirmed send. Writing it after
-            # a failed one would convert a transient Gotify outage into a
+        marker = EVIDENCE / "stop-condition.last"
+        state, prev_sig = read_marker(marker)
+        notification, new_marker = marker_transition(state, prev_sig, kinds)
+        if notification == "stop":
+            # The marker advances ONLY on a confirmed send. Writing it after a
+            # failed one would convert a transient Gotify outage into a
             # permanently suppressed alert -- the dedup would eat every retry.
-            # On failure the next run simply tries again, which is the old
-            # every-6-hours behaviour, degraded to exactly the failure window.
+            # On failure the next run tries again: the old every-6-hours
+            # behaviour, degraded to exactly the failure window.
             if notify("ScanHound QUAL: STOP CONDITION",
                       "Mandatory stop condition detected: " + "; ".join(stop)
                       + ". Per the runbook: stop and roll back. Do not continue "
                       "the window. (Alerts now fire only when the condition SET "
                       "changes; the log records every run.)",
                       8):
-                last.write_text(kinds, encoding="utf-8")
+                write_marker(marker, new_marker)
         else:
             log_line("notify suppressed: stop-condition set unchanged")
         return 3
 
     # A stop condition that CLEARS is a change worth one alert too -- silence
     # after noise is ambiguous, and "it recovered" is exactly the event the
-    # operator wants to distinguish from "still failing".
-    cleared = EVIDENCE / "stop-condition.last"
-    if cleared.is_file():
-        # Unlink only after a confirmed send, same reasoning as above: if the
-        # cleared alert is lost, the marker stays and the next run retries it.
+    # operator wants to distinguish from "still failing". CLEAR is persisted as
+    # an explicit delivered state, never as a deleted file -- see
+    # marker_transition for the suppression wedge that deletion allowed.
+    marker = EVIDENCE / "stop-condition.last"
+    state, prev_sig = read_marker(marker)
+    notification, new_marker = marker_transition(state, prev_sig, None)
+    if notification == "clear":
         if notify("ScanHound QUAL: stop condition CLEARED",
                   "The previously reported stop condition is no longer present. "
                   "The window is collecting normally again.", 5):
-            cleared.unlink()
+            write_marker(marker, new_marker)
 
     if ready:
         log_line("** READINESS GATE PASSED -- window complete, ready for review. **")
