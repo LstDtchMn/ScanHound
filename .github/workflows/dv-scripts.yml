@@ -29,6 +29,15 @@ on:
       - 'scripts/run-dv-scan.ps1'
       - 'scripts/test-dv-scan-*.ps1'
       - 'scripts/host-detector/**'
+      # The detector imports backend.rename.dv_detect, which imports
+      # backend.rename.process_control, and BOTH participate in the Windows
+      # real-detector cases -- subprocess launching, stall/timeout handling,
+      # error propagation. A change there can alter what these suites observe
+      # without touching any path above, so the filter follows the production
+      # dependency rather than just the directory the scripts live in.
+      # (peer review of #68)
+      - 'backend/rename/dv_detect.py'
+      - 'backend/rename/process_control.py'
       - '.github/workflows/dv-scripts.yml'
   pull_request:
     branches: [main, master, develop]
@@ -36,6 +45,15 @@ on:
       - 'scripts/run-dv-scan.ps1'
       - 'scripts/test-dv-scan-*.ps1'
       - 'scripts/host-detector/**'
+      # The detector imports backend.rename.dv_detect, which imports
+      # backend.rename.process_control, and BOTH participate in the Windows
+      # real-detector cases -- subprocess launching, stall/timeout handling,
+      # error propagation. A change there can alter what these suites observe
+      # without touching any path above, so the filter follows the production
+      # dependency rather than just the directory the scripts live in.
+      # (peer review of #68)
+      - 'backend/rename/dv_detect.py'
+      - 'backend/rename/process_control.py'
       - '.github/workflows/dv-scripts.yml'
   workflow_dispatch:
 
@@ -62,6 +80,16 @@ jobs:
           # (the wrapper not handing the credential to the detector) makes the
           # streaming results harder to read.
           .\scripts\test-dv-scan-ingest-key.ps1
+
+      - name: Drive-mapping suite
+        shell: powershell
+        run: |
+          # Fast, and it fails closed. On a runner with no mapped drives the
+          # wrong-target case skips and says so, while the unestablishable-target
+          # case runs; on a machine with real mappings it is the other way round.
+          # The two environments cover different halves, which is stated in the
+          # suite rather than left for someone to discover.
+          .\scripts\test-dv-scan-drive-mapping.ps1
 
       - name: Streaming suite
         shell: powershell
