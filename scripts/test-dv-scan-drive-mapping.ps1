@@ -62,8 +62,16 @@ function Get-FreeDriveLetter {
     # skipped this case entirely on a machine that happened to use all six --
     # a test that silently opts out because of local drive assignments is not
     # coverage, it is a coin flip on whose machine it runs.
+    # MATERIALISE the mappings before projecting a property off them. Under
+    # StrictMode, `(Get-SmbMapping ...).LocalPath` on an EMPTY result is a
+    # PropertyNotFoundStrict error -- which is exactly the state of a CI runner
+    # with no mapped drives. The suite runs with EAP='Continue', so it printed
+    # that error, carried on, and still reported success: a green run containing
+    # an uncategorised PowerShell error, which is worse than a red one because
+    # nobody reads it. Caught in the exact-head CI log by peer review.
+    $maps = @(Get-SmbMapping -ErrorAction SilentlyContinue)
     $used = @(Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name) +
-            @((Get-SmbMapping -ErrorAction SilentlyContinue).LocalPath -replace ':', '')
+            @($maps | ForEach-Object { $_.LocalPath -replace ':', '' })
     foreach ($c in [char[]]'NOSTUVWXYZQRIJKLM') {
         if ($used -notcontains "$c") { return "$c`:" }
     }

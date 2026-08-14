@@ -29,6 +29,15 @@ on:
       - 'scripts/run-dv-scan.ps1'
       - 'scripts/test-dv-scan-*.ps1'
       - 'scripts/host-detector/**'
+      # The detector imports backend.rename.dv_detect, which imports
+      # backend.rename.process_control, and BOTH participate in the Windows
+      # real-detector cases -- subprocess launching, stall/timeout handling,
+      # error propagation. A change there can alter what these suites observe
+      # without touching any path above, so the filter follows the production
+      # dependency rather than just the directory the scripts live in.
+      # (peer review of #68)
+      - 'backend/rename/dv_detect.py'
+      - 'backend/rename/process_control.py'
       - '.github/workflows/dv-scripts.yml'
   pull_request:
     branches: [main, master, develop]
@@ -36,6 +45,15 @@ on:
       - 'scripts/run-dv-scan.ps1'
       - 'scripts/test-dv-scan-*.ps1'
       - 'scripts/host-detector/**'
+      # The detector imports backend.rename.dv_detect, which imports
+      # backend.rename.process_control, and BOTH participate in the Windows
+      # real-detector cases -- subprocess launching, stall/timeout handling,
+      # error propagation. A change there can alter what these suites observe
+      # without touching any path above, so the filter follows the production
+      # dependency rather than just the directory the scripts live in.
+      # (peer review of #68)
+      - 'backend/rename/dv_detect.py'
+      - 'backend/rename/process_control.py'
       - '.github/workflows/dv-scripts.yml'
   workflow_dispatch:
 
