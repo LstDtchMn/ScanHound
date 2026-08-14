@@ -171,9 +171,16 @@ def test_settings_guard():
     print("PASS  04_settings_guard: disabled/shadow apply with no 422; RSS mode via /rss/mode")
 
 
-def _make_db(path, *, cycles, misses, recovery, feeds_ok, span_days):
+def _make_db(path, *, cycles, misses, recovery, feeds_ok, span_days, schema=9):
+    # schema defaults to the CURRENT expected version, hardcoded on purpose: a
+    # dynamic read from 05_shadow_evidence would silently follow the next pin
+    # bump, and this self-test failing loudly on a bump is the reminder to
+    # update fixtures + SHA256SUMS in the same change. This fixture sat at 6
+    # through the 7, 8 AND 9 bumps -- the healthy case had been asserting
+    # ready=True against a script that could never say it, and nothing runs
+    # this file automatically, so nobody noticed.
     con = sqlite3.connect(path)
-    con.execute("PRAGMA user_version = 6")
+    con.execute(f"PRAGMA user_version = {int(schema)}")
     con.execute("""CREATE TABLE hdencode_shadow_cycles (
         id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_uuid TEXT NOT NULL UNIQUE,
         started_at TEXT NOT NULL, completed_at TEXT NOT NULL,
@@ -252,7 +259,25 @@ def test_shadow_evidence():
         r = json.loads(p.stdout)["readiness"]
         assert r["normal_feeds_healthy"] is False, r
         assert "normal_feeds_unhealthy_or_stale" in r["reasons"], r
-    print("PASS  05_shadow_evidence: cycles/recovery/misses/feeds read from real columns")
+
+        # SCHEMA-MISMATCH NEGATIVE CONTROL (peer review of PR #70). An otherwise
+        # perfectly healthy window on the WRONG schema must fail closed, name
+        # the version it saw, and state the one it expected. Without this case
+        # the healthy fixture above passes trivially whenever fixture and pin
+        # happen to agree -- which is exactly how it silently rotted at 6
+        # through three pin bumps.
+        db4 = Path(tmp) / "schema.sqlite3"
+        _make_db(db4, cycles=20, misses=0, recovery=3, feeds_ok=True, span_days=8,
+                 schema=8)
+        p = _run(["05_shadow_evidence.py", "--db", str(db4), "--evidence-dir", str(ev)])
+        assert p.returncode == 0, p.stderr
+        s = json.loads(p.stdout)
+        r = s["readiness"]
+        assert r["ready"] is False, r
+        assert "unexpected_schema_version=8" in r["reasons"], r
+        assert s["safety"]["schema_version_expected"] == 9, s["safety"]
+    print("PASS  05_shadow_evidence: cycles/recovery/misses/feeds read from real "
+          "columns; wrong schema fails closed")
 
 
 def main():

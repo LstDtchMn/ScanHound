@@ -60,6 +60,16 @@ jobs:
         run: |
           python -m pytest tests/ --tb=short -q
 
+      - name: Qualification bundle self-test
+        # Stdlib-only, seconds to run — and unowned until now. This self-test
+        # sat FAILING through three schema pin bumps (fixture at 6 while the
+        # pin advanced 7 -> 8 -> 9) because nothing executed it automatically;
+        # it was found only when a review made someone run it by hand. A
+        # validation program without an automated owner rots silently
+        # (peer review of #70).
+        run: |
+          python docs/feature-pack-review/qualification/scripts/selftest.py
+
       - name: Run tests with coverage
         if: matrix.python-version == '3.11'
         run: |
