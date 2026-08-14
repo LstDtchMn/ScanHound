@@ -280,10 +280,17 @@ def main():
     if integrity != "ok":
         reasons.append(f"integrity_check={integrity}")
     # Prod schema legitimately advanced 6 -> 7 (4K metadata inventory) -> 8
-    # (HDEncode persistent-browser + durable download queue) via authorized
-    # deploys during the shadow window; 8 is current main. A value other than 8
-    # now signals an unexpected/unauthorized schema change.
-    if user_version != 8:
+    # (HDEncode persistent-browser + durable download queue) -> 9 (Turnstile
+    # verification hold, PR #57, deployed 2026-08-10) via authorized deploys
+    # during the shadow window; 9 is current main. A value other than 9 now
+    # signals an unexpected/unauthorized schema change.
+    #
+    # MAINTENANCE NOTE, learned the slow way: this pin went stale on 8/10 and
+    # then rode along inside every 6-hourly stop-condition alert for four days,
+    # teaching the reader that the schema line is noise -- which is the exact
+    # opposite of a tripwire's job. When an authorized migration bumps
+    # PRAGMA user_version, bump this in the SAME change.
+    if user_version != 9:
         reasons.append(f"unexpected_schema_version={user_version}")
     if miss_count_mismatches:
         reasons.append("shadow_miss_count_mismatch")
@@ -348,7 +355,7 @@ def main():
             "auto_action_rows": int(auto_action_rows or 0),
             "active_action_rows": int(active_action_rows or 0),
             "miss_count_mismatches": int(miss_count_mismatches or 0),
-            "schema_version_expected": 8,
+            "schema_version_expected": 9,
             "violations": [
                 reason for reason in reasons
                 if reason.startswith((
