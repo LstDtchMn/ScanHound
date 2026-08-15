@@ -79,3 +79,47 @@ carries 13; every root Test-Path OK; `dv_file_tagging=false` confirmed live.
 "protects seed rows" rationale is corrected per the review — the durable seed
 evidence lives in `dv_seed_baseline`; the real reasons are namespace
 consistency with the live scanner and the wrapper's verified mapping.
+
+---
+
+## Decision (1) REVERSED again, on evidence the review did not have (2026-08-15)
+
+The reviewer required excluding `4K Jefferson & Truman BU`, and I widened that
+to both BU folders. **Both exclusions were wrong, and so was the premise both
+of us reasoned from: that "BU" meant backup.** Jesse challenged it and asked
+for a Plex cross-check. Plex disagrees with the folder names:
+
+| C:\4K Drives subdir | Plex parts | titles found NOWHERE else |
+|---|---|---|
+| 4K Columbo | 574 | 269 |
+| 4K Gambino | 446 | 125 |
+| 4K Quantum | 433 | 87 |
+| 4K Rickover | 383 | 63 |
+| 4k HDR Arnold | 323 | 49 |
+| **4K Jefferson & Truman BU** | 586 | **95** |
+| **4K Ulysses & Yuri Gagarin BU** | 454 | **58** |
+
+All seven are Plex library sources, and the two BU drives hold **153 titles
+that exist on no other drive**. Their internal layout is live-content shaped
+(`Rickover BU 2 (8TB)/DV/`, `BU1 8TB/4K DV/`). The names are legacy.
+
+Excluding them was therefore not conservative, it was harmful: those 153 titles
+could never be labeled, and — per the confirmed `pick_layer` rule-2 finding —
+any Plex movie merging a BU copy with another copy is pinned to `unknown`
+forever, which blocks BOTH stale-label removal and the planned HDR10-only tag.
+The risk the reviewer actually worried about (mkvpropedit writing into backup
+files) is nil: `dv_file_tagging=false`, verified live again today.
+
+(Title matching is normalized text, so a few counts either way may be off; the
+magnitude is not in doubt.)
+
+**Applied:** the five enumerated `C:/4K Drives/<subdir>` entries are replaced by
+the single parent `C:/4K Drives` — 9 roots total. A hand-maintained subfolder
+list went stale within one day *twice*; the parent root cannot. Verified at the
+app (9 roots), at the regenerated `dv_host.json`, and by Test-Path on each.
+`dv_library_roots` is a SEMICOLON-SEPARATED STRING (the detector splits on `;`
+and newlines) — not a JSON array, which is worth knowing before editing it.
+
+**Standing lesson for this file:** twice now the roots were set from folder
+NAMES. The authoritative question is what Plex actually serves, and that is one
+query away.
