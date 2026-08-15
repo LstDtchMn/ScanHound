@@ -13,34 +13,52 @@ from backend.rename.dv_paths import normalize_path
 logger = logging.getLogger(__name__)
 
 #: Labels the layer tags map to — one per layer, renameable via dv_label_vocab.
-_LAYER_LABELS = {"DV FEL", "DV MEL", "DV P8", "DV P5"}
+_LAYER_LABELS = {"DV FEL", "DV MEL", "DV8", "DV5"}
+
+#: Labels this module used to apply and no longer wants. They stay in MANAGED
+#: so the next sync REMOVES them; dropping them from MANAGED instead would make
+#: the labeler blind to them and leave a stale 'DV P8' on every Profile 8 title
+#: forever, unmanaged and indistinguishable from a label the user applied.
+#:
+#: A rename is only finished when the old name is cleaned up, so this set is
+#: the migration. It can be emptied once a full sync has run against the live
+#: library and the old labels are gone.
+RETIRED_LABELS = {"DV P8", "DV P5"}
 
 #: Broader tags DERIVED from the same verdict, so Kometa can key an overlay on
 #: "any Profile 7" or "any Dolby Vision" without enumerating layers. A FEL title
 #: carries DV FEL *and* DV7 *and* DV: they describe the same fact at three
 #: widths, they are not alternatives.
 #:
-#: DV8/DV5 are deliberately REDUNDANT with DV P8/DV P5 (identical sets). They
-#: exist because both spellings were asked for, and adding rather than renaming
-#: keeps the existing Kometa overlays working — a rename would silently break
-#: every overlay already keyed to the old name. Dropping either later is a
-#: one-line change here.
+#: A group tag is only worth having when it spans MORE THAN ONE badge. Profile
+#: 7 does (FEL and MEL), so DV7 earns its place; profiles 8 and 5 are each a
+#: single badge already, so a 'DV8' group tag beside a 'DV8' badge would be a
+#: pure alias — identical set of titles, no expressive gain, one more label to
+#: write and to get wrong. That rule is why this map is asymmetric.
 _GROUP_LABELS = {
     "fel": ("DV7", "DV"),
     "mel": ("DV7", "DV"),
-    "profile8": ("DV8", "DV"),
-    "profile5": ("DV5", "DV"),
+    "profile8": ("DV",),
+    "profile5": ("DV",),
 }
+
+#: The one tag that is NOT derived from a DV verdict alone. dv_scan has no HDR
+#: axis: 'none' means "dovi_tool found no Dolby Vision", equally true of an
+#: HDR10 remux and a plain SDR 4K file. HDR10 therefore requires BOTH an
+#: authoritative 'none' AND Plex's own wide-gamut flag, and is withheld when
+#: either is missing.
+HDR10_LABEL = "HDR10"
 
 #: THE CLOSED SET this module may remove. Everything reconcile_movie strips
 #: comes from here, so a user's own label ('DV Cut' is the historical example)
-#: is never touched.
+#: is never touched. RETIRED_LABELS are included precisely so they CAN be
+#: removed — see that constant.
 #:
 #: CAUTION when extending: adding a label here hands it to the labeler, which
 #: will REMOVE it from any title whose verdict does not call for it. 'DV' is
 #: the broadest and therefore the most likely to collide with a hand-applied
 #: label of the same name.
-MANAGED = _LAYER_LABELS | {"DV7", "DV8", "DV5", "DV"}
+MANAGED = _LAYER_LABELS | {"DV7", "DV", HDR10_LABEL} | RETIRED_LABELS
 
 # highest-first preference when a title's parts disagree
 _LAYER_RANK = ["fel", "mel", "profile8", "profile5"]
@@ -183,8 +201,15 @@ def _existing_labels(movie):
 
 
 def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
-                    additive_only=False):
-    """Reconcile one movie's managed label. Returns {added, removed, matched}.
+                    additive_only=False, hdr_index=None):
+    """Reconcile one movie's managed labels. Returns {added, removed, matched}.
+
+    ``hdr_index`` is ``{rating_key: bool}`` from Plex (see
+    ``get_plex_hdr_by_rating_key``). A key that is ABSENT means UNKNOWN, and
+    unknown is not False: HDR10 is then neither added NOR removed, because a
+    cache gap must not be read as "this title is not HDR" and strip a correct
+    label. Passing None disables HDR10 handling entirely, which is what every
+    caller that has no Plex cache to consult should do.
 
     ``additive_only`` leaves an unmatched movie untouched. A positive path
     match may still replace a stale managed label so unattended reconciliation
@@ -206,6 +231,19 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     desired = desired_label(layer, vocab)      # the layer badge, for reporting
     existing_managed = _existing_labels(movie) & MANAGED
     authoritative = is_authoritative(layer)
+
+    # HDR10 needs BOTH halves: the tool ran and found no Dolby Vision, AND Plex
+    # sees wide-gamut video. Either half missing means the label is withheld.
+    # `hdr_state is None` is UNKNOWN — no cached Plex row, or no index supplied
+    # — and unknown must not authorise removal, so HDR10 is exempted from the
+    # removal set entirely in that case. Reading absent-from-cache as "not HDR"
+    # is the same silent-strip shape as the vocab gap.
+    hdr_state = None
+    if hdr_index is not None:
+        hdr_state = hdr_index.get(str(getattr(movie, "ratingKey", "")))
+    if layer == "none" and hdr_state is True:
+        desired_set = desired_set | {HDR10_LABEL}
+    exempt = {HDR10_LABEL} if hdr_state is None else set()
 
     # Removal is the destructive half, so it needs its own rule per case:
     #   'unknown'      -> NEVER remove, in any mode. Classification failed;
@@ -244,7 +282,7 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     # the two writers would have fought forever. Sorted for deterministic
     # output, which the summaries and tests both rely on.
     added = sorted(desired_set - existing_managed)
-    removed = sorted(existing_managed - desired_set) if may_remove else []
+    removed = sorted(existing_managed - desired_set - exempt) if may_remove else []
 
     if not dry_run:
         for lbl in added:
@@ -275,7 +313,13 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     }
 
 
-_DEFAULT_VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}
+#: The live config still stores the OLD names for profile8/profile5. Those
+#: values are no longer layer labels, so _vocab_from_config filters them out
+#: and the merge-over-defaults added earlier supplies these instead — the
+#: rename needs no settings edit to take effect, and logs which entries it
+#: ignored. That fallback existing is the only reason this rename is a
+#: one-file change.
+_DEFAULT_VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}
 
 
 def _vocab_from_config(config):
@@ -339,6 +383,21 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     vocab = _vocab_from_config(config)
     rows = db.get_dv_scans(source="scan", limit=1000000)
     index, norm_to_path = build_index_and_paths(rows, mappings)
+
+    # Built ONCE for the whole sync, like the dv index — asking Plex per movie
+    # would add an API round trip per title across the entire library. A db
+    # without the method (older stubs, and every test double that predates it)
+    # leaves this None, which disables HDR10 rather than guessing.
+    hdr_index = None
+    get_hdr = getattr(db, "get_plex_hdr_by_rating_key", None)
+    if callable(get_hdr):
+        try:
+            hdr_index = get_hdr()
+        except Exception as e:  # noqa: BLE001
+            # Degrade to "unknown for every title": HDR10 is then neither added
+            # nor removed. A cache read failure must not strip labels.
+            logger.warning("HDR index unavailable; HDR10 labels left untouched: %s", e)
+            hdr_index = None
     seed_rows = []
     list_seed = getattr(db, "list_dv_seed_baseline", None)
     if callable(list_seed):
@@ -372,7 +431,8 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
         try:
             res = reconcile_movie(mv, index, vocab, pm,
                                   dry_run=dry_run, mappings=mappings,
-                                  additive_only=additive_only)
+                                  additive_only=additive_only,
+                                  hdr_index=hdr_index)
             added_n += len(res["added"])
             removed_n += len(res["removed"])
             if res["matched"]:

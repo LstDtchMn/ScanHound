@@ -5483,6 +5483,46 @@ class DatabaseManager:
             'scanned_at, last_seen_at FROM dv_scan'
             f'{where} ORDER BY last_seen_at DESC LIMIT ?', tuple(params), default=[])
 
+    def get_plex_hdr_by_rating_key(self):
+        """``{rating_key: bool}`` — whether Plex sees wide-gamut video.
+
+        The HDR10 label needs an HDR axis, and dv_scan has none: 'none' means
+        "dovi_tool found no Dolby Vision", which is equally true of an HDR10
+        remux and a plain SDR 4K file. Plex already records the distinction
+        (plex_service sets ``hdr`` when a video stream's colorPrimaries carry
+        bt2020), so the labeler joins on that rather than inventing a second
+        detector.
+
+        A rating_key ABSENT from this map is UNKNOWN, not False. The two must
+        stay distinguishable: treating "no cached row" as "not HDR" would let a
+        cache gap strip a correct HDR10 label, which is the same shape as every
+        other silent-removal bug in this module. Callers get a plain dict, so
+        ``.get(rk)`` returns None for unknown.
+
+        Note plex_service stops scanning streams at the first Dolby Vision hit,
+        so a DV title records hdr=0. That is correct for this consumer: HDR10
+        here means "HDR and no DV", which is exactly what the label says.
+
+        AGGREGATION IS EXPLICIT, and it has to be. plex_cache holds one row per
+        media PART/version, so a title with several versions has several rows:
+        1,032 rating_keys have more than one row here, and 225 of those have
+        rows that DISAGREE about hdr (a 4K HDR version beside a 4K SDR one).
+        A plain dict comprehension over the rows lets whichever duplicate SQLite
+        happened to return last decide the title, which is nondeterministic --
+        and a False is destructive, because it authorises removing HDR10.
+
+        MAX(hdr) encodes the intended rule: **any served version being HDR makes
+        the title HDR**. That matches the label's meaning ("this title is
+        available in HDR") and fails in the safe direction, since the failure
+        mode that matters is wrongly concluding "not HDR" and stripping a
+        correct label. Found in peer review 2026-08-15.
+        """
+        rows = self._query_dicts(
+            'SELECT rating_key, MAX(hdr) AS hdr FROM plex_cache '
+            'WHERE rating_key IS NOT NULL AND hdr IS NOT NULL '
+            'GROUP BY rating_key', default=[])
+        return {str(r["rating_key"]): bool(r["hdr"]) for r in rows}
+
     def count_dv_scans_by_layer(self, source=None):
         """Return ``{layer: count}`` over the dv_scan table.
 
