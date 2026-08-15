@@ -176,23 +176,135 @@ def check_db():
     return (problems, stats)
 
 
+#: A stalled JDownloader poll beyond this is an outage, not a blip: the poller
+#: runs every few seconds, so 30 minutes of no successful poll cannot be
+#: transient. Calibrated against the observed failure -- the 2026-08-15 stall
+#: ran ~15 HOURS unnoticed because nothing watched for it at all.
+JD_STALL_SECONDS = 1800
+API_HEALTH = "http://127.0.0.1:9721/health"
+
+
+def check_jd():
+    """Is the JDownloader poll alive? Returns a list of problems.
+
+    Reads the app's own health surface rather than reaching into JDownloader.
+    The question is not "is JD running" -- it was, throughout the outage -- but
+    "is ScanHound still getting answers from it", which is what actually decides
+    whether downloads move.
+
+    Two ways to have no timestamp, opposite meanings:
+      * never succeeded AND never failed -> the app just started; say nothing.
+      * never succeeded BUT failing      -> broken since boot; alert.
+    Treating both as healthy is how the stall stayed invisible; treating both as
+    broken would alert on every restart.
+    """
+    try:
+        with urllib.request.urlopen(API_HEALTH, timeout=20) as r:
+            body = json.loads(r.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return ["ScanHound API is not answering /health: %s" % str(e)[:90]]
+
+    if not body.get("jd_enabled"):
+        return []                       # JD deliberately off: silence is correct
+    jd = body.get("jd_poll")
+    if not isinstance(jd, dict):
+        return []                       # older build, or sub-report failed
+
+    stalled = jd.get("stalled_seconds")
+    fails = jd.get("consecutive_failures") or 0
+    err = jd.get("last_error") or "no error recorded"
+
+    if stalled is None:
+        if fails:
+            return ["JDownloader has NEVER answered since ScanHound started "
+                    "(%d consecutive failures). Downloads cannot progress. "
+                    "Last error: %s" % (fails, err)]
+        return []
+    if stalled > JD_STALL_SECONDS:
+        return ["JDownloader poll stalled for %.1f hours (last success %s, "
+                "%d consecutive failures). The downloads list is frozen. "
+                "Restarting the scanhound container reconnects it. "
+                "Last error: %s"
+                % (stalled / 3600.0, jd.get("last_success_at"), fails, err)]
+    return []
+
+
+def _read_active_keys():
+    """The problem KEYS alerted about last run, as a set."""
+    try:
+        raw = MARKER.read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    # Tolerates the pre-2026-08-15 marker, which held human text rather than
+    # keys: unknown content parses to an empty set, so the first run after an
+    # upgrade re-alerts once rather than staying silent. Re-alerting is the
+    # safe direction for a watchdog.
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and isinstance(data.get("active"), list):
+            return set(data["active"])
+    except ValueError:
+        pass
+    return set()
+
+
+def _write_active_keys(keys):
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        MARKER.write_text(json.dumps({"active": sorted(keys)}), encoding="utf-8")
+        return True
+    except OSError as e:
+        log("check: alert delivered but marker not written: %s" % e)
+        return False
+
+
 def main() -> int:
     tool_problems = check_tools()
     db_problems, stats = check_db()
-    problems = tool_problems + db_problems
+    jd_problems = check_jd()
 
-    log("check: tools_ok=%s denied=%s classified=%s/%s"
-        % (not tool_problems, stats.get("denied", "?"),
+    # Keyed by SUBSYSTEM, not by "some problem exists". Peer review 2026-08-15:
+    # a single global latch meant that once ANY problem had alerted, a LATER and
+    # unrelated failure stayed silent until every problem cleared. A tool outage
+    # could therefore hide a JDownloader stall indefinitely, and vice versa --
+    # the exact cross-subsystem suppression this watchdog exists to prevent.
+    #
+    # Keys are stable identities, deliberately NOT the human message text:
+    # messages carry durations and streak counts that change every run, which
+    # would re-alert forever.
+    active = {}
+    if tool_problems:
+        active["tool_exec"] = tool_problems
+    if db_problems:
+        active["detector_db"] = db_problems
+    if jd_problems:
+        active["jd_stalled"] = jd_problems
+    problems = tool_problems + db_problems + jd_problems
+
+    log("check: jd_ok=%s tools_ok=%s denied=%s classified=%s/%s"
+        % (not jd_problems, not tool_problems, stats.get("denied", "?"),
            stats.get("classified", "?"), stats.get("total", "?")))
 
+    previously = _read_active_keys()
+    now_keys = set(active)
+
     if not problems:
-        # Recovered: drop the marker so the NEXT failure alerts again.
         try:
             if MARKER.exists():
                 MARKER.unlink()
-                log("check: healthy again; dedup marker cleared")
+                log("check: healthy again; alert state cleared")
         except OSError:
             pass
+        return 0
+
+    fresh = now_keys - previously
+    if not fresh:
+        # Everything currently wrong has already been reported. Recording the
+        # CURRENT set (not the union) is what lets a subsystem that recovers and
+        # later breaks again alert a second time.
+        if now_keys != previously:
+            _write_active_keys(now_keys)
+        log("check: problems unchanged (%s); already alerted" % ",".join(sorted(now_keys)))
         return 0
 
     body = "\n".join("- " + p for p in problems)
@@ -201,19 +313,13 @@ def main() -> int:
                  % (stats.get("classified"), stats.get("total"),
                     stats.get("denied")))
 
-    if MARKER.exists():
-        log("check: PROBLEMS present but already alerted (marker exists):\n" + body)
-        return 0
-
-    if notify("ScanHound: DV detection is broken", body, 8):
-        try:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            MARKER.write_text(body, encoding="utf-8")
-        except OSError as e:
-            log("check: alert delivered but marker not written: %s" % e)
+    title = "ScanHound: %s" % ", ".join(sorted(fresh)).replace("_", " ")
+    if notify(title, body, 8):
+        # Only what was actually announced becomes "already alerted". If the
+        # send fails nothing is recorded, so the next run retries -- a transient
+        # Gotify outage must never convert into a permanently suppressed alert.
+        _write_active_keys(now_keys)
     else:
-        # Deliberately NOT writing the marker: an undelivered alert must be
-        # retried next run, never suppressed.
         log("check: alert NOT delivered; will retry next run")
     return 0
 
