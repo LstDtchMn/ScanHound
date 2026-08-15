@@ -5364,6 +5364,56 @@ class DatabaseManager:
         ''', (path, title, dv_layer, sig_mtime, sig_size, source,
               rating_key, imdb_id, obs, obs, obs), label="upsert_dv_scan")
 
+    def annotate_dv_scan_rating_key(self, path, rating_key):
+        """Attach a Plex rating_key to an EXISTING dv_scan row. Nothing else.
+
+        The label sync is a CONSUMER of scan observations, not a producer of
+        them, and this is the only write it is entitled to make. Authority
+        splits cleanly:
+
+            detector / import : dv_layer, signature, observation freshness
+            Plex labeler      : Plex identity, i.e. this column
+
+        Using upsert_dv_scan for this was wrong even with observed=False. The
+        sync snapshots path->layer once at the start and back-writes that
+        SNAPSHOT later, so a detector import landing in between was partially
+        overwritten (peer review 2026-08-15):
+
+            T0  sync snapshots  P = FEL / sig1 / t0
+            T1  detector writes P = MEL / sig2 / t1
+            T2  sync annotates  P with the stale FEL
+
+        leaving dv_layer=FEL beside signature=sig2 and last_seen_at=t1 --
+        contradictory evidence, with a consumer having erased part of a newer
+        producer observation. Preserving the timestamp and signature actually
+        SHARPENED that contradiction, which is why the annotation had to become
+        UPDATE-only rather than merely gentler.
+
+        UPDATE-only also means it never inserts: a row that no producer has
+        written is not something the labeler may create, and silently inserting
+        one would invent an observation with no layer and no signature.
+
+        Returns True only if a row was ACTUALLY updated. _mutate reports
+        statement success, which an UPDATE matching zero rows also satisfies --
+        so it cannot answer "did this path exist", and callers that need to know
+        an annotation landed would silently believe it had.
+        """
+        if not path or rating_key is None:
+            return False
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                cur = conn.execute(
+                    'UPDATE dv_scan SET rating_key = ? WHERE path = ?',
+                    (str(rating_key), path))
+                conn.commit()
+                return cur.rowcount > 0
+        except Exception as e:  # noqa: BLE001
+            logger.error("DB Error (annotate_dv_scan_rating_key): %s", e)
+            return False
+
     def get_latest_dv_scan_at(self, source="scan"):
         """Newest ``last_seen_at`` among dv_scan rows for *source*, else None.
 

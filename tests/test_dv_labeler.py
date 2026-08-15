@@ -100,6 +100,7 @@ def test_sync_labels_finally_emits_done_on_plex_failure(monkeypatch):
     class _DB:
         def get_dv_scans(self, **kw): return [{"path": "Y:/a.mkv", "dv_layer": "fel"}]
         def upsert_dv_scan(self, *a, **k): return True
+        def annotate_dv_scan_rating_key(self, *a, **k): return True
 
     class _PM:
         def get_library_section(self, name):
@@ -117,6 +118,7 @@ def test_sync_labels_dry_run_no_writes():
     class _DB:
         def get_dv_scans(self, **kw): return [{"path": "Y:/a.mkv", "dv_layer": "fel"}]
         upsert_dv_scan = MagicMock(return_value=True)
+        annotate_dv_scan_rating_key = MagicMock(return_value=True)
 
     pm = MagicMock()
     lib = MagicMock()
@@ -142,6 +144,7 @@ def test_sync_labels_backwrite_uses_original_row_path(monkeypatch):
         def get_dv_scans(self, **kw):
             return rows
         upsert_dv_scan = MagicMock(return_value=True)
+        annotate_dv_scan_rating_key = MagicMock(return_value=True)
 
     pm = MagicMock()
     lib = MagicMock()
@@ -153,9 +156,11 @@ def test_sync_labels_backwrite_uses_original_row_path(monkeypatch):
     res = L.sync_labels(db, pm, {"movie_libs": ["Movies"]}, dry_run=False)
 
     assert res["matched"] == 1
-    db.upsert_dv_scan.assert_called_once_with(
-        r"Y:\Movies\A\f.mkv", "fel", rating_key="42", source="scan",
-        observed=False)
+    # UPDATE-only annotation carrying NO layer. The sync's index is a snapshot,
+    # so writing a layer back could restore a stale one over a newer import.
+    db.annotate_dv_scan_rating_key.assert_called_once_with(
+        r"Y:\Movies\A\f.mkv", "42")
+    db.upsert_dv_scan.assert_not_called()
 
 
 def test_sync_labels_normalize_path_is_on_o_rows_not_o_movies_x_rows(monkeypatch):
@@ -183,6 +188,8 @@ def test_sync_labels_normalize_path_is_on_o_rows_not_o_movies_x_rows(monkeypatch
         def get_dv_scans(self, **kw):
             return rows
         def upsert_dv_scan(self, *a, **k):
+            return True
+        def annotate_dv_scan_rating_key(self, *a, **k):
             return True
 
     pm = MagicMock()
@@ -231,6 +238,8 @@ def test_sync_labels_normalize_calls_dont_scale_with_movie_count(monkeypatch):
         def get_dv_scans(self, **kw):
             return rows
         def upsert_dv_scan(self, *a, **k):
+            return True
+        def annotate_dv_scan_rating_key(self, *a, **k):
             return True
 
     def _make_movies(n):
