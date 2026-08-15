@@ -485,6 +485,10 @@ class DownloadService:
         self._jd_poll_fail_streak = 0
         self._jd_last_poll_error: Optional[str] = None
         self._jd_last_log_ts = 0.0
+        #: Which step of the connect/poll sequence was last ATTEMPTED. Named
+        #: so a recurrence is attributable instead of guessed from one
+        #: generic exception (peer review 2026-08-15).
+        self._jd_phase = "idle"
         #: Seconds between repeats of the same connect-failure WARNING. The
         #: poller runs every few seconds; logging each failure would bury the
         #: log, and logging none is what hid this for 15 hours.
@@ -718,9 +722,17 @@ class DownloadService:
             password = self.config.get("jd_password", "")
             if not email or not password:
                 raise RuntimeError("MyJDownloader email/password not configured")
+            # Which STEP failed, recorded as it is attempted. One generic
+            # exception cannot say whether MyJDownloader auth, the device
+            # listing, or the device lookup is what keeps failing -- and that
+            # was exactly the gap after the 2026-08-15 stall: the silence was
+            # fixed, but the cause stayed a guess. Peer review asked for this.
             jd = myjdapi.Myjdapi()
+            self._jd_phase = "connect"
             jd.connect(email, password)
+            self._jd_phase = "update_devices"
             jd.update_devices()
+            self._jd_phase = "get_device"
             device_name = self.config.get("jd_device", "")
             if device_name:
                 device = jd.get_device(device_name)
@@ -757,14 +769,17 @@ class DownloadService:
         with self._jd_poll_lock:
             self._jd_poll_fail_streak += 1
             self._jd_last_poll_error = str(exc)[:200]
+            self._jd_fail_phase = getattr(self, "_jd_phase", "unknown")
             streak = self._jd_poll_fail_streak
             due = (now - self._jd_last_log_ts) >= self._JD_LOG_EVERY
             if due:
                 self._jd_last_log_ts = now
         if due:
             logger.warning(
-                "JDownloader poll failing (%d consecutive; last success %s): %s",
-                streak, self._jd_last_poll_ok_wall or "never this run", exc)
+                "JDownloader poll failing at phase '%s' (%d consecutive; "
+                "last success %s): %s",
+                getattr(self, "_jd_fail_phase", "unknown"), streak,
+                self._jd_last_poll_ok_wall or "never this run", exc)
 
     def _note_poll_success(self):
         """Record that JDownloader answered. This is the liveness signal."""
@@ -792,6 +807,8 @@ class DownloadService:
                 "stalled_seconds": (time.monotonic() - ok_ts) if ok_ts else None,
                 "consecutive_failures": self._jd_poll_fail_streak,
                 "last_error": self._jd_last_poll_error,
+                "failure_phase": getattr(self, "_jd_fail_phase", None)
+                                 if self._jd_poll_fail_streak else None,
             }
 
     def test_jd_connection(self) -> dict:
@@ -1100,6 +1117,7 @@ class DownloadService:
         norm_titles = self._scraped_titles_normalized()
 
         try:
+            self._jd_phase = "query_packages"
             packages = device.downloads.query_packages([{
                 "name": True, "uuid": True, "bytesLoaded": True,
                 "bytesTotal": True, "finished": True, "status": True,

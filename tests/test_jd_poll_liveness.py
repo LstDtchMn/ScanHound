@@ -196,3 +196,37 @@ class TestProductionWiring:
         assert h["consecutive_failures"] == 0
         assert h["last_success_at"] is not None
         assert h["stalled_seconds"] is not None
+
+
+class TestFailurePhase:
+    """Which STEP failed, so a recurrence is attributable.
+
+    Peer review 2026-08-15: the silence is fixed but the CAUSE of the 15-hour
+    stall is still unproven, because one generic exception cannot say whether
+    MyJDownloader auth, the device listing, or the package query is what kept
+    failing.
+    """
+
+    def test_a_connect_failure_names_the_connect_phase(self, svc):
+        svc._jd_phase = "connect"
+        svc._note_poll_failure(RuntimeError("401"))
+        assert svc.jd_poll_health()["failure_phase"] == "connect"
+
+    def test_a_package_query_failure_names_that_phase(self, svc):
+        svc._jd_phase = "query_packages"
+        svc._note_poll_failure(RuntimeError("boom"))
+        assert svc.jd_poll_health()["failure_phase"] == "query_packages"
+
+    def test_the_phase_is_LOGGED_not_just_stored(self, svc, caplog):
+        svc._jd_phase = "update_devices"
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="backend.download_service"):
+            svc._note_poll_failure(RuntimeError("boom"))
+        assert "update_devices" in caplog.records[0].getMessage()
+
+    def test_a_healthy_poller_reports_no_phase(self, svc):
+        """Control: a stale phase from an old failure must not read as current."""
+        svc._jd_phase = "connect"
+        svc._note_poll_failure(RuntimeError("boom"))
+        svc._note_poll_success()
+        assert svc.jd_poll_health()["failure_phase"] is None
