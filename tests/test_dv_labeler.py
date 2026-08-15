@@ -2,7 +2,7 @@ from unittest.mock import MagicMock
 from backend.rename.dv_labeler import (
     MANAGED, desired_label, pick_layer, reconcile_movie, build_index)
 
-VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}
+VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}
 
 
 def _movie(rk, files, labels):
@@ -505,9 +505,9 @@ def test_rebuilt_plex_recovery_works_under_additive_only():
 
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
 
-    assert set(res["added"]) == {"DV P8", "DV8", "DV"}
+    assert set(res["added"]) == {"DV8", "DV"}
     assert {c.args for c in pm.add_label.call_args_list} == {
-        (90003, "DV P8"), (90003, "DV8"), (90003, "DV")}
+        (90003, "DV8"), (90003, "DV")}
 
 
 def test_rebuilt_plex_does_not_touch_unmanaged_user_labels():

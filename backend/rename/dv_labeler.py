@@ -13,33 +13,35 @@ from backend.rename.dv_paths import normalize_path
 logger = logging.getLogger(__name__)
 
 #: Labels the layer tags map to — one per layer, renameable via dv_label_vocab.
-_LAYER_LABELS = {"DV FEL", "DV MEL", "DV P8", "DV P5"}
+_LAYER_LABELS = {"DV FEL", "DV MEL", "DV8", "DV5"}
+
+#: Labels this module used to apply and no longer wants. They stay in MANAGED
+#: so the next sync REMOVES them; dropping them from MANAGED instead would make
+#: the labeler blind to them and leave a stale 'DV P8' on every Profile 8 title
+#: forever, unmanaged and indistinguishable from a label the user applied.
+#:
+#: A rename is only finished when the old name is cleaned up, so this set is
+#: the migration. It can be emptied once a full sync has run against the live
+#: library and the old labels are gone.
+RETIRED_LABELS = {"DV P8", "DV P5"}
 
 #: Broader tags DERIVED from the same verdict, so Kometa can key an overlay on
 #: "any Profile 7" or "any Dolby Vision" without enumerating layers. A FEL title
 #: carries DV FEL *and* DV7 *and* DV: they describe the same fact at three
 #: widths, they are not alternatives.
 #:
-#: DV8/DV5 are deliberately REDUNDANT with DV P8/DV P5 (identical sets). They
-#: exist because both spellings were asked for, and adding rather than renaming
-#: keeps the existing Kometa overlays working — a rename would silently break
-#: every overlay already keyed to the old name. Dropping either later is a
-#: one-line change here.
+#: A group tag is only worth having when it spans MORE THAN ONE badge. Profile
+#: 7 does (FEL and MEL), so DV7 earns its place; profiles 8 and 5 are each a
+#: single badge already, so a 'DV8' group tag beside a 'DV8' badge would be a
+#: pure alias — identical set of titles, no expressive gain, one more label to
+#: write and to get wrong. That rule is why this map is asymmetric.
 _GROUP_LABELS = {
     "fel": ("DV7", "DV"),
     "mel": ("DV7", "DV"),
-    "profile8": ("DV8", "DV"),
-    "profile5": ("DV5", "DV"),
+    "profile8": ("DV",),
+    "profile5": ("DV",),
 }
 
-#: THE CLOSED SET this module may remove. Everything reconcile_movie strips
-#: comes from here, so a user's own label ('DV Cut' is the historical example)
-#: is never touched.
-#:
-#: CAUTION when extending: adding a label here hands it to the labeler, which
-#: will REMOVE it from any title whose verdict does not call for it. 'DV' is
-#: the broadest and therefore the most likely to collide with a hand-applied
-#: label of the same name.
 #: The one tag that is NOT derived from a DV verdict alone. dv_scan has no HDR
 #: axis: 'none' means "dovi_tool found no Dolby Vision", equally true of an
 #: HDR10 remux and a plain SDR 4K file. HDR10 therefore requires BOTH an
@@ -47,7 +49,16 @@ _GROUP_LABELS = {
 #: either is missing.
 HDR10_LABEL = "HDR10"
 
-MANAGED = _LAYER_LABELS | {"DV7", "DV8", "DV5", "DV", HDR10_LABEL}
+#: THE CLOSED SET this module may remove. Everything reconcile_movie strips
+#: comes from here, so a user's own label ('DV Cut' is the historical example)
+#: is never touched. RETIRED_LABELS are included precisely so they CAN be
+#: removed — see that constant.
+#:
+#: CAUTION when extending: adding a label here hands it to the labeler, which
+#: will REMOVE it from any title whose verdict does not call for it. 'DV' is
+#: the broadest and therefore the most likely to collide with a hand-applied
+#: label of the same name.
+MANAGED = _LAYER_LABELS | {"DV7", "DV", HDR10_LABEL} | RETIRED_LABELS
 
 # highest-first preference when a title's parts disagree
 _LAYER_RANK = ["fel", "mel", "profile8", "profile5"]
@@ -302,7 +313,13 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     }
 
 
-_DEFAULT_VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}
+#: The live config still stores the OLD names for profile8/profile5. Those
+#: values are no longer layer labels, so _vocab_from_config filters them out
+#: and the merge-over-defaults added earlier supplies these instead — the
+#: rename needs no settings edit to take effect, and logs which entries it
+#: ignored. That fallback existing is the only reason this rename is a
+#: one-file change.
+_DEFAULT_VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}
 
 
 def _vocab_from_config(config):

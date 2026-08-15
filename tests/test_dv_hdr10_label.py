@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 from backend.rename.dv_labeler import HDR10_LABEL, reconcile_movie
 
-VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}
+VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}
 
 
 def _movie(rk, files, labels):

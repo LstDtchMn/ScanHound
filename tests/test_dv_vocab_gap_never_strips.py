@@ -30,7 +30,7 @@ from unittest.mock import MagicMock
 from backend.rename.dv_labeler import (
     MANAGED, _vocab_from_config, desired_label, reconcile_movie)
 
-FULL = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}
+FULL = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}
 
 
 def _movie(rk, files, labels):
@@ -52,15 +52,15 @@ class TestVocabMerge:
     def test_partial_vocab_keeps_the_other_layers_mapped(self):
         """The reported failure: a vocab naming only fel must not unmap p8."""
         v = _vocab_from_config({"dv_label_vocab": json.dumps({"fel": "DV FEL"})})
-        assert v["profile8"] == "DV P8"
-        assert v["profile5"] == "DV P5"
+        assert v["profile8"] == "DV8"
+        assert v["profile5"] == "DV5"
         assert v["mel"] == "DV MEL"
 
     def test_a_typo_in_one_value_does_not_unmap_that_layer(self):
         """'DV-FEL' is not in MANAGED, so it is dropped -- and must fall back."""
         v = _vocab_from_config({"dv_label_vocab": json.dumps(
-            {"fel": "DV-FEL", "mel": "DV MEL", "profile8": "DV P8",
-             "profile5": "DV P5"})})
+            {"fel": "DV-FEL", "mel": "DV MEL", "profile8": "DV8",
+             "profile5": "DV5"})})
         assert v["fel"] == "DV FEL"          # the default, not None
         assert desired_label("fel", v) == "DV FEL"
 
@@ -87,7 +87,7 @@ class TestUnmappedLayerNeverRemoves:
         idx = {"y:/a.mkv": "profile8"}
         vocab = {"fel": "DV FEL"}            # profile8 deliberately unmapped
         pm = MagicMock()
-        mv = _movie(1, ["Y:/a.mkv"], ["DV P8"])
+        mv = _movie(1, ["Y:/a.mkv"], ["DV8"])
 
         res = reconcile_movie(mv, idx, vocab, pm, dry_run=False, additive_only=True)
 
@@ -99,7 +99,7 @@ class TestUnmappedLayerNeverRemoves:
         idx = {"y:/a.mkv": "profile8"}
         vocab = {"fel": "DV FEL"}
         pm = MagicMock()
-        mv = _movie(1, ["Y:/a.mkv"], ["DV P8"])
+        mv = _movie(1, ["Y:/a.mkv"], ["DV8"])
 
         res = reconcile_movie(mv, idx, vocab, pm, dry_run=False, additive_only=False)
 
