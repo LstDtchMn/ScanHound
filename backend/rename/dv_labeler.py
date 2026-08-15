@@ -158,7 +158,19 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     #                     unattended reconciliation converge after a rescan).
     #   no match       -> the pre-existing policy: full reconcile removes,
     #                     additive_only leaves the title alone.
-    if layer == LAYER_DETECTION_FAILED:
+    #   unmapped layer -> NEVER remove. A POSITIVE finding with no label in the
+    #                     vocab is a CONFIGURATION gap, not evidence that the
+    #                     title should carry nothing. Without this, an unmapped
+    #                     layer looks identical to 'none' at the removal step
+    #                     (both give desired=None) and strips the correct badge.
+    #                     _vocab_from_config now merges over the defaults so the
+    #                     four known layers cannot go unmapped -- but a NEW
+    #                     layer value (the planned DV7/DV8/HDR10-only work adds
+    #                     some) would reintroduce it the moment a layer reaches
+    #                     this code before its vocab entry does.
+    positive = layer is not None and layer not in ("none", LAYER_DETECTION_FAILED)
+    unmapped = positive and desired is None
+    if layer == LAYER_DETECTION_FAILED or unmapped:
         may_remove = False
     else:
         may_remove = authoritative or not additive_only
@@ -203,14 +215,44 @@ _DEFAULT_VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profil
 
 
 def _vocab_from_config(config):
+    """Build the layer -> label map, MERGED OVER the defaults.
+
+    A partial or partly-invalid vocab must never leave a layer unmapped. It
+    used to: entries whose value was not in MANAGED were filtered out, and the
+    default was restored only when NOTHING survived. So one typo -- 'DV-FEL'
+    for 'DV FEL' -- silently dropped the fel mapping while the other three
+    stayed, and dv_label_vocab is stored as a free-text string with no
+    validation at the settings boundary.
+
+    That is not a cosmetic gap. desired_label() then returns None for a layer
+    that is still AUTHORITATIVE, so reconcile_movie treats it as "this title
+    should carry no managed label" and REMOVES the correct badge, in every
+    mode including the unattended additive-only hourly sync, with nothing added
+    back. One character in a settings field could strip DV FEL from every FEL
+    title in the library.
+
+    Merging over the defaults means an unmapped layer is impossible for the
+    four known layers: a caller can rename labels, but cannot accidentally
+    delete a mapping. Dropped entries are logged, because silently ignoring
+    what someone typed is how the typo stayed invisible.
+    """
+    vocab = dict(_DEFAULT_VOCAB)
     raw = config.get("dv_label_vocab")
     if not raw:
-        return dict(_DEFAULT_VOCAB)
+        return vocab
     try:
         v = json.loads(raw)
         parsed = {k: val for k, val in v.items() if val in MANAGED}
-        return parsed or dict(_DEFAULT_VOCAB)
+        dropped = sorted(set(v) - set(parsed)) if isinstance(v, dict) else []
+        if dropped:
+            logger.warning(
+                "dv_label_vocab: ignoring %d entr(y/ies) whose label is not in "
+                "the managed set %s: %s — the default label is used for those "
+                "layers instead", len(dropped), sorted(MANAGED), dropped)
+        vocab.update(parsed)
+        return vocab
     except (ValueError, TypeError):
+        logger.warning("dv_label_vocab is not valid JSON; using defaults")
         return dict(_DEFAULT_VOCAB)
 
 
