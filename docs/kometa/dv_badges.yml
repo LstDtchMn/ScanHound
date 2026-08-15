@@ -111,3 +111,48 @@ overlays:
     plex_search:
       all:
         label: HDR10
+
+  # ---------------------------------------------------------------------------
+  # TRANSITIONAL, remove once converged. Peer review 2026-08-15 recommended a
+  # both-names window for the DV P8 -> DV8 / DV P5 -> DV5 rename:
+  #
+  #   1. Kometa accepts old AND new names   <-- these two blocks
+  #   2. run ScanHound to convergence (it removes the old labels)
+  #   3. verify a clean Kometa pass
+  #   4. delete these two blocks
+  #
+  # Without them, ~220 Profile 8/5 posters show no DV badge between ScanHound's
+  # first post-rename sync and Kometa's next run. Harmless while both exist: a
+  # title carries either the old or the new label, never both, because
+  # ScanHound removes the retired name in the same pass it adds the new one.
+  DV P8 (retiring):
+    overlay:
+      name: text(DV8)
+      horizontal_offset: 15
+      horizontal_align: left
+      vertical_offset: 15
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 200
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: DV P8
+
+  DV P5 (retiring):
+    overlay:
+      name: text(DV5)
+      horizontal_offset: 15
+      horizontal_align: left
+      vertical_offset: 15
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 200
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: DV P5
