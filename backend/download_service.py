@@ -463,6 +463,32 @@ class DownloadService:
         self._jd_device = None
         self._jd_conn_ts = 0.0
         self._JD_CONN_TTL = 90.0
+
+        # --- poll liveness ------------------------------------------------
+        # A stalled poller is INVISIBLE without this. When JDownloader restarts,
+        # the cached device handle goes stale; the failing poll invalidates the
+        # cache correctly, but every subsequent failed RECONNECT returned []
+        # with no log at all, and the surrounding loop logs at debug (off in
+        # production). The poller kept running, failing silently, until someone
+        # restarted the container -- observed 2026-08-15 after JD restarted at
+        # 21:36 the night before: ~15 hours of frozen downloads, one WARNING in
+        # the entire log.
+        #
+        # What is tracked is the ABSENCE OF SUCCESS, not any particular failure.
+        # Enumerating failure modes (stale handle, JD down, network, expired
+        # credentials, rate limit) guarantees missing the next one; "no
+        # successful poll in N minutes while enabled" catches all of them,
+        # including causes nobody has thought of yet.
+        self._jd_poll_lock = threading.Lock()
+        self._jd_last_poll_ok_ts: Optional[float] = None   # monotonic
+        self._jd_last_poll_ok_wall: Optional[str] = None   # human/UI
+        self._jd_poll_fail_streak = 0
+        self._jd_last_poll_error: Optional[str] = None
+        self._jd_last_log_ts = 0.0
+        #: Seconds between repeats of the same connect-failure WARNING. The
+        #: poller runs every few seconds; logging each failure would bury the
+        #: log, and logging none is what hid this for 15 hours.
+        self._JD_LOG_EVERY = 300.0
         # Per-package last-recorded signature so the poller only writes rows
         # that actually changed (avoids re-upserting a large stable queue).
         # Keyed by cache_key = str(package uuid) when JD reports one, else the
@@ -717,6 +743,56 @@ class DownloadService:
             self._jd = None
             self._jd_device = None
             self._jd_conn_ts = 0.0
+
+    # --- poll liveness ----------------------------------------------------
+
+    def _note_poll_failure(self, exc):
+        """Record a failed poll and log it, at most once per _JD_LOG_EVERY.
+
+        Rate limiting matters in both directions: the poller runs every few
+        seconds, so logging every failure buries the log, and logging none is
+        precisely what made a 15-hour stall invisible.
+        """
+        now = time.monotonic()
+        with self._jd_poll_lock:
+            self._jd_poll_fail_streak += 1
+            self._jd_last_poll_error = str(exc)[:200]
+            streak = self._jd_poll_fail_streak
+            due = (now - self._jd_last_log_ts) >= self._JD_LOG_EVERY
+            if due:
+                self._jd_last_log_ts = now
+        if due:
+            logger.warning(
+                "JDownloader poll failing (%d consecutive; last success %s): %s",
+                streak, self._jd_last_poll_ok_wall or "never this run", exc)
+
+    def _note_poll_success(self):
+        """Record that JDownloader answered. This is the liveness signal."""
+        with self._jd_poll_lock:
+            recovered = self._jd_poll_fail_streak
+            self._jd_poll_fail_streak = 0
+            self._jd_last_poll_error = None
+            self._jd_last_poll_ok_ts = time.monotonic()
+            self._jd_last_poll_ok_wall = datetime.now().isoformat(timespec="seconds")
+        if recovered:
+            logger.info("JDownloader poll recovered after %d failure(s)", recovered)
+
+    def jd_poll_health(self) -> Dict[str, Any]:
+        """Liveness of the JDownloader poll, for the health surface and alerts.
+
+        ``stalled_seconds`` is time since the last SUCCESSFUL poll, or None when
+        no poll has succeeded since start. Callers decide the threshold; this
+        reports absence of success rather than any particular failure, so a
+        cause nobody anticipated still shows up here.
+        """
+        with self._jd_poll_lock:
+            ok_ts = self._jd_last_poll_ok_ts
+            return {
+                "last_success_at": self._jd_last_poll_ok_wall,
+                "stalled_seconds": (time.monotonic() - ok_ts) if ok_ts else None,
+                "consecutive_failures": self._jd_poll_fail_streak,
+                "last_error": self._jd_last_poll_error,
+            }
 
     def test_jd_connection(self) -> dict:
         """Quick MyJDownloader connectivity check for the UI status indicator."""
@@ -1011,7 +1087,12 @@ class DownloadService:
         """
         try:
             device = self._connect_jd_device()
-        except Exception:
+        except Exception as e:
+            # NEVER silent. This bare `return []` is exactly what hid a 15-hour
+            # download stall: a failed reconnect looked identical to "nothing to
+            # report". Rate-limited so a persistent outage leaves a periodic
+            # trail rather than either a flood or nothing.
+            self._note_poll_failure(e)
             return []
 
         # Title cross-reference: clipboard adds get JD's filename-based package
@@ -1025,9 +1106,15 @@ class DownloadService:
                 "saveTo": True,
             }]) or []
         except Exception as e:
-            logger.warning("JD package poll failed: %s", e)
+            self._note_poll_failure(e)
             self._invalidate_jd_cache()
             return []
+
+        # JD answered. Recorded HERE rather than at the end of the function so
+        # liveness means "JDownloader is reachable", not "the whole poll body
+        # ran without raising" -- a bug in the parsing below must not be able to
+        # masquerade as a connection outage, nor hide one.
+        self._note_poll_success()
 
         try:
             links = device.downloads.query_links([{
