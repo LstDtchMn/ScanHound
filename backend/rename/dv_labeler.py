@@ -272,10 +272,14 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
                     # O(1) rating_key back-write for the matched copy
                     for p in _movie_norm_paths(mv, mappings):
                         if p in index:
+                            # observed=False: this annotates a row from PLEX and
+                            # reads no media, so it must not refresh last_seen_at
+                            # (the scheduled sync's own change-gate) or blank the
+                            # signature columns. See upsert_dv_scan's docstring.
                             db.upsert_dv_scan(
                                 norm_to_path.get(p, p),
                                 index[p], rating_key=str(mv.ratingKey),
-                                source="scan")
+                                source="scan", observed=False)
                             break
             if dry_run:
                 movie_paths = _movie_norm_paths(mv, mappings)

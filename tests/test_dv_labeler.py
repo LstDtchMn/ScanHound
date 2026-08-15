@@ -154,7 +154,8 @@ def test_sync_labels_backwrite_uses_original_row_path(monkeypatch):
 
     assert res["matched"] == 1
     db.upsert_dv_scan.assert_called_once_with(
-        r"Y:\Movies\A\f.mkv", "fel", rating_key="42", source="scan")
+        r"Y:\Movies\A\f.mkv", "fel", rating_key="42", source="scan",
+        observed=False)
 
 
 def test_sync_labels_normalize_path_is_on_o_rows_not_o_movies_x_rows(monkeypatch):

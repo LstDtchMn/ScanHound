@@ -5304,7 +5304,8 @@ class DatabaseManager:
         return facets
 
     def upsert_dv_scan(self, path, dv_layer, *, title=None, sig_mtime=None,
-                       sig_size=None, source="scan", rating_key=None, imdb_id=None):
+                       sig_size=None, source="scan", rating_key=None, imdb_id=None,
+                       observed=True):
         """Insert/update a DV-layer record for ``path``. Refreshes last_seen_at;
         preserves scanned_at on update. Returns True on success.
 
@@ -5314,9 +5315,29 @@ class DatabaseManager:
         a failed host scan writes keeps forcing a retry on the next run, but
         the last real finding survives to keep the Kometa labels correct in
         the meantime. Same preserve-on-worse rule the title/rating_key/imdb_id
-        COALESCEs in this statement already apply."""
+        COALESCEs in this statement already apply.
+
+        ``observed=False`` marks a write that LOOKED AT NO FILE — currently the
+        label sync's rating_key back-write, which annotates a row from Plex and
+        never touches the media. Such a write must not claim freshness:
+
+        * ``last_seen_at`` means "when a scanner last saw this file". The
+          scheduled sync gates itself on MAX(last_seen_at) for source='scan'
+          (see get_latest_dv_scan_at) and records a PRE-sync watermark, so a
+          sync that bumped this column re-armed its own trigger and ran a full
+          library pass EVERY hour forever — 11 runs in 14 hours against a
+          detector that produces new rows about twice a day, which is exactly
+          the "pure waste" the gate exists to prevent.
+        * the sig columns are the change-signal. Taking a caller's NULLs here
+          is deliberate for a FAILED host scan (above), but the back-write
+          passes no signature at all and would blank a healthy row, making
+          dv_scan_is_current permanently False for it.
+
+        Both are preserved when observed is False; everything the caller
+        genuinely supplies (rating_key, layer, title) still applies."""
         if not path:
             return False
+        obs = 1 if observed else 0
         return self._mutate('''
             INSERT INTO dv_scan
                 (path, title, dv_layer, sig_mtime, sig_size, source,
@@ -5331,14 +5352,17 @@ class DatabaseManager:
                     THEN dv_scan.dv_layer
                     ELSE excluded.dv_layer
                 END,
-                sig_mtime = excluded.sig_mtime,
-                sig_size = excluded.sig_size,
+                sig_mtime = CASE WHEN ? = 1 THEN excluded.sig_mtime
+                                 ELSE dv_scan.sig_mtime END,
+                sig_size = CASE WHEN ? = 1 THEN excluded.sig_size
+                                ELSE dv_scan.sig_size END,
                 source = excluded.source,
                 rating_key = COALESCE(excluded.rating_key, dv_scan.rating_key),
                 imdb_id = COALESCE(excluded.imdb_id, dv_scan.imdb_id),
-                last_seen_at = CURRENT_TIMESTAMP
+                last_seen_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP
+                                    ELSE dv_scan.last_seen_at END
         ''', (path, title, dv_layer, sig_mtime, sig_size, source,
-              rating_key, imdb_id), label="upsert_dv_scan")
+              rating_key, imdb_id, obs, obs, obs), label="upsert_dv_scan")
 
     def get_latest_dv_scan_at(self, source="scan"):
         """Newest ``last_seen_at`` among dv_scan rows for *source*, else None.
