@@ -81,7 +81,7 @@ def test_end_to_end_fel_labels_exactly_once(monkeypatch, tmp_path):
         "movie_libs": ["Movies"],
         "dv_detection": True,
         "dv_library_roots": r"Y:\Movies",
-        "dv_label_vocab": '{"fel":"DV FEL","mel":"DV MEL","profile8":"DV P8","profile5":"DV P5"}',
+        "dv_label_vocab": '{"fel":"DV FEL","mel":"DV MEL","profile8":"DV8","profile5":"DV5"}',
     })
 
     # 2. Seed the host store (the import endpoint takes the path directly in

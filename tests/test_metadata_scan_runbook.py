@@ -15,6 +15,6 @@ def test_runbook_requires_pilot_before_full_scan_and_keeps_writes_gated():
 
 def test_kometa_badges_cover_the_closed_managed_label_set():
     text = Path("docs/kometa/dv_badges.yml").read_text(encoding="utf-8")
-    for label in ("DV FEL", "DV MEL", "DV P8", "DV P5"):
+    for label in ("DV FEL", "DV MEL", "DV8", "DV5"):
         assert f"  {label}:" in text
         assert f"label: {label}" in text

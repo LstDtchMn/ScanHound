@@ -19,7 +19,7 @@ import pytest
 from backend.rename.dv_labeler import (
     MANAGED, _LAYER_LABELS, desired_label, desired_labels, reconcile_movie)
 
-VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}
+VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}
 
 
 def _movie(rk, files, labels):
@@ -41,8 +41,8 @@ class TestDesiredLabels:
     @pytest.mark.parametrize("layer,expected", [
         ("fel", {"DV FEL", "DV7", "DV"}),
         ("mel", {"DV MEL", "DV7", "DV"}),
-        ("profile8", {"DV P8", "DV8", "DV"}),
-        ("profile5", {"DV P5", "DV5", "DV"}),
+        ("profile8", {"DV8", "DV"}),
+        ("profile5", {"DV5", "DV"}),
     ])
     def test_each_layer_yields_its_full_tag_set(self, layer, expected):
         assert desired_labels(layer, VOCAB) == expected
@@ -103,7 +103,7 @@ class TestReconcileWithSets:
 
         res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
 
-        assert set(res["added"]) == {"DV P8", "DV8"}
+        assert set(res["added"]) == {"DV8"}
         assert set(res["removed"]) == {"DV FEL", "DV7"}
         assert "DV" not in res["added"] and "DV" not in res["removed"]
 
@@ -162,6 +162,36 @@ class TestReconcileWithSets:
 
         assert set(res["added"]) == {"DV FEL", "DV7"}
         assert res["removed"] == []
+
+    def test_the_renamed_labels_are_actually_CLEANED_UP(self):
+        """A rename is only finished when the old name is removed.
+
+        'DV P8'/'DV P5' stay in MANAGED via RETIRED_LABELS purely so the sync
+        can strip them. Drop them from MANAGED instead and the labeler goes
+        BLIND to them: every Profile 8 title keeps a stale 'DV P8' forever,
+        indistinguishable from a label the user applied by hand. Nothing else
+        in the suite catches that — a mutation removing RETIRED_LABELS from
+        MANAGED passed 58 tests before this one existed.
+        """
+        idx = {"y:/a.mkv": "profile8"}
+        pm = MagicMock()
+        mv = _movie(1, ["Y:/a.mkv"], ["DV P8"])          # the pre-rename label
+
+        res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
+
+        assert "DV P8" in res["removed"], "the retired label must be cleaned up"
+        assert set(res["added"]) == {"DV8", "DV"}
+        pm.remove_label.assert_called_once_with(1, "DV P8")
+
+    def test_a_retired_label_is_removed_even_on_an_unrelated_layer(self):
+        """The old name must go regardless of which verdict the title now has."""
+        idx = {"y:/a.mkv": "fel"}
+        pm = MagicMock()
+        mv = _movie(1, ["Y:/a.mkv"], ["DV P5"])
+
+        res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
+
+        assert res["removed"] == ["DV P5"]
 
     def test_dry_run_reports_the_set_but_writes_nothing(self):
         idx = {"y:/a.mkv": "fel"}
