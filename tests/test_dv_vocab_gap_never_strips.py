@@ -130,7 +130,7 @@ class TestUnmappedLayerNeverRemoves:
 
         res = reconcile_movie(mv, idx, FULL, pm, dry_run=False, additive_only=True)
 
-        assert res["added"] == ["DV FEL"] and res["removed"] == ["DV MEL"]
+        assert set(res["added"]) == {"DV FEL", "DV7", "DV"} and res["removed"] == ["DV MEL"]
 
     def test_a_newly_RANKED_layer_without_a_vocab_entry_is_safe(self, monkeypatch):
         """The forward-looking case, on the axis the bug is actually on.

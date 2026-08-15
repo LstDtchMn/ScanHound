@@ -12,7 +12,35 @@ from backend.rename.dv_paths import normalize_path
 
 logger = logging.getLogger(__name__)
 
-MANAGED = {"DV FEL", "DV MEL", "DV P8", "DV P5"}
+#: Labels the layer tags map to — one per layer, renameable via dv_label_vocab.
+_LAYER_LABELS = {"DV FEL", "DV MEL", "DV P8", "DV P5"}
+
+#: Broader tags DERIVED from the same verdict, so Kometa can key an overlay on
+#: "any Profile 7" or "any Dolby Vision" without enumerating layers. A FEL title
+#: carries DV FEL *and* DV7 *and* DV: they describe the same fact at three
+#: widths, they are not alternatives.
+#:
+#: DV8/DV5 are deliberately REDUNDANT with DV P8/DV P5 (identical sets). They
+#: exist because both spellings were asked for, and adding rather than renaming
+#: keeps the existing Kometa overlays working — a rename would silently break
+#: every overlay already keyed to the old name. Dropping either later is a
+#: one-line change here.
+_GROUP_LABELS = {
+    "fel": ("DV7", "DV"),
+    "mel": ("DV7", "DV"),
+    "profile8": ("DV8", "DV"),
+    "profile5": ("DV5", "DV"),
+}
+
+#: THE CLOSED SET this module may remove. Everything reconcile_movie strips
+#: comes from here, so a user's own label ('DV Cut' is the historical example)
+#: is never touched.
+#:
+#: CAUTION when extending: adding a label here hands it to the labeler, which
+#: will REMOVE it from any title whose verdict does not call for it. 'DV' is
+#: the broadest and therefore the most likely to collide with a hand-applied
+#: label of the same name.
+MANAGED = _LAYER_LABELS | {"DV7", "DV8", "DV5", "DV"}
 
 # highest-first preference when a title's parts disagree
 _LAYER_RANK = ["fel", "mel", "profile8", "profile5"]
@@ -39,11 +67,40 @@ def is_authoritative(layer):
 
 
 def desired_label(layer, vocab):
-    """Map a dv_layer to its managed label, or None for none/unknown/NULL."""
+    """The single LAYER label for a dv_layer, or None for none/unknown/NULL.
+
+    The specific badge only ('DV FEL'), never the derived group tags. Callers
+    deciding what a title should carry want desired_labels(); this remains for
+    reporting the one label that names the layer itself.
+    """
     if not layer or layer in ("none", LAYER_DETECTION_FAILED):
         return None
     label = vocab.get(layer)
-    return label if label in MANAGED else None
+    return label if label in _LAYER_LABELS else None
+
+
+def desired_labels(layer, vocab):
+    """EVERY managed label a title with this layer should carry, as a set.
+
+    One verdict yields several tags at different widths — 'fel' means the title
+    is FEL, is Profile 7, and is Dolby Vision, all true at once. Returning a set
+    is what lets reconcile_movie compute removals as "managed labels this title
+    should not have", instead of the old "everything managed except THE label",
+    which could only ever express one tag per title.
+
+    An empty set means "carry no managed label": correct for 'none' (the tool
+    ran and found no DV) and for 'unknown'/NULL — but at the removal step an
+    empty set from a POSITIVE layer means a configuration gap, which
+    reconcile_movie must distinguish. See its may_remove rules.
+    """
+    if not layer or layer in ("none", LAYER_DETECTION_FAILED):
+        return set()
+    out = set()
+    primary = vocab.get(layer)
+    if primary in _LAYER_LABELS:
+        out.add(primary)
+    out.update(g for g in _GROUP_LABELS.get(layer, ()) if g in MANAGED)
+    return out
 
 
 def pick_layer(norm_paths, index):
@@ -145,7 +202,8 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     """
     norm_paths = _movie_norm_paths(movie, mappings)
     layer = pick_layer(norm_paths, index)
-    desired = desired_label(layer, vocab)
+    desired_set = desired_labels(layer, vocab)
+    desired = desired_label(layer, vocab)      # the layer badge, for reporting
     existing_managed = _existing_labels(movie) & MANAGED
     authoritative = is_authoritative(layer)
 
@@ -168,6 +226,11 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     #                     layer value (the planned DV7/DV8/HDR10-only work adds
     #                     some) would reintroduce it the moment a layer reaches
     #                     this code before its vocab entry does.
+    # "Unmapped" means the LAYER BADGE is missing, not that the whole set is
+    # empty. Once group tags exist a positive layer almost always yields DV7/DV,
+    # so testing the set would have made this guard unreachable for the four
+    # known layers -- and a vocab gap would once again strip the correct badge
+    # while quietly adding the group tags. Test the badge itself.
     positive = layer is not None and layer not in ("none", LAYER_DETECTION_FAILED)
     unmapped = positive and desired is None
     if layer == LAYER_DETECTION_FAILED or unmapped:
@@ -175,12 +238,13 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     else:
         may_remove = authoritative or not additive_only
 
-    added, removed = [], []
-    if desired and desired not in existing_managed:
-        added.append(desired)
-    if may_remove:
-        for stale in existing_managed - ({desired} if desired else set()):
-            removed.append(stale)
+    # Set arithmetic, not "everything except THE label". The old form could
+    # only ever express one managed tag per title, so a second correct tag
+    # (DV7 beside DV FEL) was computed as stale and removed on the next pass —
+    # the two writers would have fought forever. Sorted for deterministic
+    # output, which the summaries and tests both rely on.
+    added = sorted(desired_set - existing_managed)
+    removed = sorted(existing_managed - desired_set) if may_remove else []
 
     if not dry_run:
         for lbl in added:
@@ -241,14 +305,17 @@ def _vocab_from_config(config):
     if not raw:
         return vocab
     try:
+        # Only LAYER labels are renameable. Mapping a layer onto a derived tag
+        # ('fel' -> 'DV7') would make the group tag the layer badge as well, so
+        # the two could no longer be told apart at the removal step.
         v = json.loads(raw)
-        parsed = {k: val for k, val in v.items() if val in MANAGED}
+        parsed = {k: val for k, val in v.items() if val in _LAYER_LABELS}
         dropped = sorted(set(v) - set(parsed)) if isinstance(v, dict) else []
         if dropped:
             logger.warning(
-                "dv_label_vocab: ignoring %d entr(y/ies) whose label is not in "
-                "the managed set %s: %s — the default label is used for those "
-                "layers instead", len(dropped), sorted(MANAGED), dropped)
+                "dv_label_vocab: ignoring %d entr(y/ies) whose label is not a "
+                "layer label %s: %s — the default label is used for those "
+                "layers instead", len(dropped), sorted(_LAYER_LABELS), dropped)
         vocab.update(parsed)
         return vocab
     except (ValueError, TypeError):

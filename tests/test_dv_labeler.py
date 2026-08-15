@@ -40,8 +40,8 @@ def test_reconcile_add_when_none():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], [])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
-    assert res["added"] == ["DV FEL"] and res["removed"] == []
-    pm.add_label.assert_called_once_with(1, "DV FEL")
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"} and res["removed"] == []
+    assert pm.add_label.call_count == 3  # layer badge + DV7 + DV
 
 
 def test_reconcile_swaps_stale_managed():
@@ -49,7 +49,7 @@ def test_reconcile_swaps_stale_managed():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], ["DV MEL"])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
-    assert res["added"] == ["DV FEL"] and res["removed"] == ["DV MEL"]
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"} and res["removed"] == ["DV MEL"]
 
 
 def test_reconcile_never_touches_non_managed():
@@ -57,7 +57,8 @@ def test_reconcile_never_touches_non_managed():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], ["DV Cut", "DV FEL"])  # already correct
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
-    assert res["added"] == [] and res["removed"] == []   # idempotent
+    # The layer badge is already right; the derived group tags are added.
+    assert set(res["added"]) == {"DV7", "DV"} and res["removed"] == []
     pm.remove_label.assert_not_called()                  # DV Cut survives
 
 
@@ -75,7 +76,7 @@ def test_reconcile_multipart_tie_break():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv", "Y:/b.mkv"], [])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
-    assert res["added"] == ["DV FEL"]  # fel outranks mel
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"}  # fel outranks mel
 
 
 def test_dry_run_writes_nothing():
@@ -83,7 +84,7 @@ def test_dry_run_writes_nothing():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], ["DV MEL"])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=True)
-    assert res["added"] == ["DV FEL"] and res["removed"] == ["DV MEL"]
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"} and res["removed"] == ["DV MEL"]
     pm.add_label.assert_not_called()
     pm.remove_label.assert_not_called()
 
@@ -125,7 +126,7 @@ def test_sync_labels_dry_run_no_writes():
     pm.get_library_section.return_value = lib
     db = _DB()
     res = L.sync_labels(db, pm, {"movie_libs": ["Movies"]}, dry_run=True)
-    assert res["added"] == 1 and res["removed"] == 1
+    assert res["added"] == 3 and res["removed"] == 1  # badge + DV7 + DV
     pm.add_label.assert_not_called()
     db.upsert_dv_scan.assert_not_called()  # no back-write in dry_run
 
@@ -290,8 +291,8 @@ def test_additive_only_still_adds_missing_label():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], [])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
-    assert res["added"] == ["DV FEL"]
-    pm.add_label.assert_called_once_with(1, "DV FEL")
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"}
+    assert pm.add_label.call_count == 3
 
 
 def test_additive_only_converges_conflicting_label_when_path_is_matched():
@@ -304,7 +305,7 @@ def test_additive_only_converges_conflicting_label_when_path_is_matched():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], ["DV MEL"])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
-    assert res["added"] == ["DV FEL"]
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"}
     assert res["removed"] == ["DV MEL"]
     pm.remove_label.assert_called_once_with(1, "DV MEL")
 
@@ -481,8 +482,10 @@ def test_rebuilt_plex_restores_labels_from_dv_scan_by_path():
     r1 = reconcile_movie(alpha, idx, VOCAB, pm, dry_run=False)
     r2 = reconcile_movie(beta, idx, VOCAB, pm, dry_run=False)
 
-    assert r1["added"] == ["DV FEL"], "FEL label not restored after a Plex rebuild"
-    assert r2["added"] == ["DV MEL"], "MEL label not restored after a Plex rebuild"
+    assert set(r1["added"]) == {"DV FEL", "DV7", "DV"}, \
+        "FEL tag set not restored after a Plex rebuild"
+    assert set(r2["added"]) == {"DV MEL", "DV7", "DV"}, \
+        "MEL tag set not restored after a Plex rebuild"
     # Written against the NEW ids, proving the stale rating_key column is unused
     # for both matching and writing.
     pm.add_label.assert_any_call(90001, "DV FEL")
@@ -502,8 +505,9 @@ def test_rebuilt_plex_recovery_works_under_additive_only():
 
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
 
-    assert res["added"] == ["DV P8"]
-    pm.add_label.assert_called_once_with(90003, "DV P8")
+    assert set(res["added"]) == {"DV P8", "DV8", "DV"}
+    assert {c.args for c in pm.add_label.call_args_list} == {
+        (90003, "DV P8"), (90003, "DV8"), (90003, "DV")}
 
 
 def test_rebuilt_plex_does_not_touch_unmanaged_user_labels():
@@ -518,7 +522,7 @@ def test_rebuilt_plex_does_not_touch_unmanaged_user_labels():
 
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
 
-    assert res["added"] == ["DV FEL"]
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"}
     assert res["removed"] == [], "recovery removed a label it does not manage"
     pm.remove_label.assert_not_called()
 
