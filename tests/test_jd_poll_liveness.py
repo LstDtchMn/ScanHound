@@ -133,3 +133,66 @@ class TestRecovery:
             svc._note_poll_success()
             svc._note_poll_success()
         assert not [r for r in caplog.records if "recovered" in r.message]
+
+
+class TestProductionWiring:
+    """The helpers are useless unless poll_results ACTUALLY calls them.
+
+    Peer review 2026-08-15 (LOW): every test above drives _note_poll_failure /
+    _note_poll_success / jd_poll_health directly, so deleting those calls from
+    poll_results() would leave the whole class green while liveness silently
+    stopped being recorded -- the same consumer-vs-component gap that produced
+    the outage being fixed here.
+    """
+
+    def _svc(self, svc):
+        """Give the bare instance the few attributes poll_results touches."""
+        svc.db = None
+        svc.config = {}
+        svc._results_cache = {}
+        svc._log = lambda *a, **k: None
+        # The rest of poll_results' collaborators. Stubbed rather than mocked
+        # wholesale so the REAL control flow runs -- a MagicMock service would
+        # make the liveness calls unobservable, which is the whole point here.
+        svc._best_titles = {}          # dict, per __init__
+        svc._uuid_id = {}              # dict, per __init__
+        svc._scraped_titles_normalized = lambda: {}   # method
+        svc._resolve_title = lambda *a, **k: ""       # staticmethod
+        return svc
+
+    def test_a_failed_CONNECT_increments_the_failure_state(self, svc):
+        svc = self._svc(svc)
+        svc._connect_jd_device = MagicMock(side_effect=RuntimeError("No connection established"))
+
+        assert svc.poll_results(record=False) == []
+
+        h = svc.jd_poll_health()
+        assert h["consecutive_failures"] == 1
+        assert "No connection established" in (h["last_error"] or "")
+
+    def test_a_failed_PACKAGE_QUERY_increments_and_invalidates(self, svc):
+        svc = self._svc(svc)
+        device = MagicMock()
+        device.downloads.query_packages.side_effect = RuntimeError("boom")
+        svc._connect_jd_device = MagicMock(return_value=device)
+        svc._jd_device = device                      # pretend a cache exists
+
+        assert svc.poll_results(record=False) == []
+
+        assert svc.jd_poll_health()["consecutive_failures"] == 1
+        assert svc._jd_device is None, "the stale handle must be dropped"
+
+    def test_a_SUCCESSFUL_query_records_liveness(self, svc):
+        """Control: without this, a fix that only ever counts failures passes."""
+        svc = self._svc(svc)
+        device = MagicMock()
+        device.downloads.query_packages.return_value = []
+        device.downloads.query_links.return_value = []
+        svc._connect_jd_device = MagicMock(return_value=device)
+
+        svc.poll_results(record=False)
+
+        h = svc.jd_poll_health()
+        assert h["consecutive_failures"] == 0
+        assert h["last_success_at"] is not None
+        assert h["stalled_seconds"] is not None
