@@ -46,6 +46,10 @@ def svc():
     s._jd_last_poll_error = None
     s._jd_last_log_ts = 0.0
     s._JD_LOG_EVERY = 300.0
+    s._jd_phase = "idle"
+    s._poll_iters_started = 0
+    s._poll_iters_completed = 0
+    s._poll_iter_start_ts = None
     return s
 
 
@@ -230,3 +234,65 @@ class TestFailurePhase:
         svc._note_poll_failure(RuntimeError("boom"))
         svc._note_poll_success()
         assert svc.jd_poll_health()["failure_phase"] is None
+
+
+class TestHeartbeat:
+    """Was the poller cycling at all? Nothing recorded that before.
+
+    Peer review 2026-08-15 named this THE unanswered question about the
+    15-hour stall. "One warning then silence" is equally consistent with
+    cycling-and-failing-silently, blocked-inside-one-call, and
+    thread-stopped -- and those want different fixes, so backoff alone would
+    have been built on an unproven cause. failure_phase cannot separate them
+    either: it comes from an EXCEPTION, and a blocked call raises nothing.
+    """
+
+    def test_a_completed_iteration_advances_BOTH_counters(self, svc):
+        svc.note_poll_iteration_start()
+        svc.note_poll_iteration_end()
+        h = svc.jd_poll_health()
+        assert h["iterations_started"] == 1
+        assert h["iterations_completed"] == 1
+        assert h["current_iteration_seconds"] is None
+
+    def test_an_IN_FLIGHT_iteration_is_visible_as_such(self, svc):
+        """The blocked case: started but never completed, and the age grows."""
+        svc.note_poll_iteration_start()
+        h = svc.jd_poll_health()
+        assert h["iterations_started"] == 1
+        assert h["iterations_completed"] == 0
+        assert h["current_iteration_seconds"] is not None
+
+    def test_a_stuck_iteration_shows_a_GROWING_age(self, svc):
+        svc.note_poll_iteration_start()
+        svc._poll_iter_start_ts -= 3600
+        assert svc.jd_poll_health()["current_iteration_seconds"] >= 3600
+
+    def test_poll_results_completes_the_heartbeat_even_when_it_FAILS(self, svc):
+        """The wiring pin: a failing poll must still close its iteration, or a
+        fast-failing poller would be misread as blocked."""
+        svc.db = None
+        svc.config = {}
+        svc._results_cache = {}
+        svc._log = lambda *a, **k: None
+        svc._connect_jd_device = MagicMock(side_effect=RuntimeError("boom"))
+
+        svc.poll_results(record=False)
+
+        h = svc.jd_poll_health()
+        assert h["iterations_started"] == 1 and h["iterations_completed"] == 1
+        assert h["consecutive_failures"] == 1
+
+    def test_the_three_states_are_distinguishable(self, svc):
+        """The whole point, stated as the operator would read it."""
+        # cycling: both advance together
+        for _ in range(3):
+            svc.note_poll_iteration_start(); svc.note_poll_iteration_end()
+        h = svc.jd_poll_health()
+        assert h["iterations_started"] == h["iterations_completed"] == 3
+
+        # blocked: started runs ahead and stays there
+        svc.note_poll_iteration_start()
+        h = svc.jd_poll_health()
+        assert h["iterations_started"] - h["iterations_completed"] == 1
+        assert h["current_iteration_seconds"] is not None
