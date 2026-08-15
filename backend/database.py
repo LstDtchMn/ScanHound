@@ -5409,6 +5409,31 @@ class DatabaseManager:
             'scanned_at, last_seen_at FROM dv_scan'
             f'{where} ORDER BY last_seen_at DESC LIMIT ?', tuple(params), default=[])
 
+    def get_plex_hdr_by_rating_key(self):
+        """``{rating_key: bool}`` — whether Plex sees wide-gamut video.
+
+        The HDR10 label needs an HDR axis, and dv_scan has none: 'none' means
+        "dovi_tool found no Dolby Vision", which is equally true of an HDR10
+        remux and a plain SDR 4K file. Plex already records the distinction
+        (plex_service sets ``hdr`` when a video stream's colorPrimaries carry
+        bt2020), so the labeler joins on that rather than inventing a second
+        detector.
+
+        A rating_key ABSENT from this map is UNKNOWN, not False. The two must
+        stay distinguishable: treating "no cached row" as "not HDR" would let a
+        cache gap strip a correct HDR10 label, which is the same shape as every
+        other silent-removal bug in this module. Callers get a plain dict, so
+        ``.get(rk)`` returns None for unknown.
+
+        Note plex_service stops scanning streams at the first Dolby Vision hit,
+        so a DV title records hdr=0. That is correct for this consumer: HDR10
+        here means "HDR and no DV", which is exactly what the label says.
+        """
+        rows = self._query_dicts(
+            'SELECT rating_key, hdr FROM plex_cache '
+            'WHERE rating_key IS NOT NULL AND hdr IS NOT NULL', default=[])
+        return {str(r["rating_key"]): bool(r["hdr"]) for r in rows}
+
     def count_dv_scans_by_layer(self, source=None):
         """Return ``{layer: count}`` over the dv_scan table.
 

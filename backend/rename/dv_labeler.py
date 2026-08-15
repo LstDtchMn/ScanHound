@@ -40,7 +40,14 @@ _GROUP_LABELS = {
 #: will REMOVE it from any title whose verdict does not call for it. 'DV' is
 #: the broadest and therefore the most likely to collide with a hand-applied
 #: label of the same name.
-MANAGED = _LAYER_LABELS | {"DV7", "DV8", "DV5", "DV"}
+#: The one tag that is NOT derived from a DV verdict alone. dv_scan has no HDR
+#: axis: 'none' means "dovi_tool found no Dolby Vision", equally true of an
+#: HDR10 remux and a plain SDR 4K file. HDR10 therefore requires BOTH an
+#: authoritative 'none' AND Plex's own wide-gamut flag, and is withheld when
+#: either is missing.
+HDR10_LABEL = "HDR10"
+
+MANAGED = _LAYER_LABELS | {"DV7", "DV8", "DV5", "DV", HDR10_LABEL}
 
 # highest-first preference when a title's parts disagree
 _LAYER_RANK = ["fel", "mel", "profile8", "profile5"]
@@ -183,8 +190,15 @@ def _existing_labels(movie):
 
 
 def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
-                    additive_only=False):
-    """Reconcile one movie's managed label. Returns {added, removed, matched}.
+                    additive_only=False, hdr_index=None):
+    """Reconcile one movie's managed labels. Returns {added, removed, matched}.
+
+    ``hdr_index`` is ``{rating_key: bool}`` from Plex (see
+    ``get_plex_hdr_by_rating_key``). A key that is ABSENT means UNKNOWN, and
+    unknown is not False: HDR10 is then neither added NOR removed, because a
+    cache gap must not be read as "this title is not HDR" and strip a correct
+    label. Passing None disables HDR10 handling entirely, which is what every
+    caller that has no Plex cache to consult should do.
 
     ``additive_only`` leaves an unmatched movie untouched. A positive path
     match may still replace a stale managed label so unattended reconciliation
@@ -206,6 +220,19 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     desired = desired_label(layer, vocab)      # the layer badge, for reporting
     existing_managed = _existing_labels(movie) & MANAGED
     authoritative = is_authoritative(layer)
+
+    # HDR10 needs BOTH halves: the tool ran and found no Dolby Vision, AND Plex
+    # sees wide-gamut video. Either half missing means the label is withheld.
+    # `hdr_state is None` is UNKNOWN — no cached Plex row, or no index supplied
+    # — and unknown must not authorise removal, so HDR10 is exempted from the
+    # removal set entirely in that case. Reading absent-from-cache as "not HDR"
+    # is the same silent-strip shape as the vocab gap.
+    hdr_state = None
+    if hdr_index is not None:
+        hdr_state = hdr_index.get(str(getattr(movie, "ratingKey", "")))
+    if layer == "none" and hdr_state is True:
+        desired_set = desired_set | {HDR10_LABEL}
+    exempt = {HDR10_LABEL} if hdr_state is None else set()
 
     # Removal is the destructive half, so it needs its own rule per case:
     #   'unknown'      -> NEVER remove, in any mode. Classification failed;
@@ -244,7 +271,7 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     # the two writers would have fought forever. Sorted for deterministic
     # output, which the summaries and tests both rely on.
     added = sorted(desired_set - existing_managed)
-    removed = sorted(existing_managed - desired_set) if may_remove else []
+    removed = sorted(existing_managed - desired_set - exempt) if may_remove else []
 
     if not dry_run:
         for lbl in added:
@@ -339,6 +366,21 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     vocab = _vocab_from_config(config)
     rows = db.get_dv_scans(source="scan", limit=1000000)
     index, norm_to_path = build_index_and_paths(rows, mappings)
+
+    # Built ONCE for the whole sync, like the dv index — asking Plex per movie
+    # would add an API round trip per title across the entire library. A db
+    # without the method (older stubs, and every test double that predates it)
+    # leaves this None, which disables HDR10 rather than guessing.
+    hdr_index = None
+    get_hdr = getattr(db, "get_plex_hdr_by_rating_key", None)
+    if callable(get_hdr):
+        try:
+            hdr_index = get_hdr()
+        except Exception as e:  # noqa: BLE001
+            # Degrade to "unknown for every title": HDR10 is then neither added
+            # nor removed. A cache read failure must not strip labels.
+            logger.warning("HDR index unavailable; HDR10 labels left untouched: %s", e)
+            hdr_index = None
     seed_rows = []
     list_seed = getattr(db, "list_dv_seed_baseline", None)
     if callable(list_seed):
@@ -372,7 +414,8 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
         try:
             res = reconcile_movie(mv, index, vocab, pm,
                                   dry_run=dry_run, mappings=mappings,
-                                  additive_only=additive_only)
+                                  additive_only=additive_only,
+                                  hdr_index=hdr_index)
             added_n += len(res["added"])
             removed_n += len(res["removed"])
             if res["matched"]:
