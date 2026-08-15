@@ -2,14 +2,24 @@ name: Tests
 
 on:
   push:
-    # agent/** and fix/** are included deliberately. Long-lived work happens on
-    # those branches, often without an open PR, so they otherwise produce NO
-    # status checks at all -- a reviewer inspecting a pushed head finds nothing
-    # machine-attested and every figure is locally produced. This branch went
-    # six commits with zero CI runs for exactly that reason.
-    branches: [main, master, develop, 'agent/**', 'fix/**']
+    # agent/**, fix/**, feat/** and docs/** are included deliberately. Long-lived
+    # work happens on those branches, often without an open PR, so they otherwise
+    # produce NO status checks at all -- a reviewer inspecting a pushed head finds
+    # nothing machine-attested and every figure is locally produced. This branch
+    # went six commits with zero CI runs for exactly that reason.
+    #
+    # feat/** was added 2026-08-15 after the same gap reappeared: a STACKED PR
+    # (feat/dv-tag-set -> fix/dv-vocab-gap) matched neither this list nor the
+    # pull_request filter below, so the largest change of the day -- a rewrite of
+    # how labels are written to the live Plex library -- was about to be merged
+    # with zero CI. Locally it was green and mutation-verified; none of that is
+    # visible to anyone but its author.
+    branches: [main, master, develop, 'agent/**', 'fix/**', 'feat/**', 'docs/**']
   pull_request:
-    branches: [main, master, develop]
+    # '**' rather than the three long-lived branches: a PR whose BASE is another
+    # feature branch is exactly the case that slipped through, and a stack is
+    # where an untested change is most likely to hide.
+    branches: ['**']
   schedule:
     # Run nightly at 03:00 UTC
     - cron: '0 3 * * *'

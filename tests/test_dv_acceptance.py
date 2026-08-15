@@ -136,10 +136,13 @@ def test_end_to_end_fel_labels_exactly_once(monkeypatch, tmp_path):
             db, pm, config, dry_run=False)
 
     # 6. Assertions -- the merge gate.
-    movie.addLabel.assert_called_once_with("DV FEL")    # exactly one add
+    # One verdict, three widths. "Exactly once" here guards against DUPLICATE
+    # writes per label -- not against a title carrying more than one tag.
+    assert sorted(c.args[0] for c in movie.addLabel.call_args_list) == [
+        "DV", "DV FEL", "DV7"]
     movie.removeLabel.assert_not_called()                # nothing to remove
     tags = {getattr(lab, "tag", lab) for lab in movie.labels}
     assert "Favorites" in tags                           # non-managed untouched
-    assert result["added"] == 1
+    assert result["added"] == 3          # badge + profile group + blanket DV
     assert result["removed"] == 0
     assert result["matched"] == 1
