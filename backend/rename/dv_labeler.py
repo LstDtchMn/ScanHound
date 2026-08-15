@@ -311,13 +311,19 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
             if res["matched"]:
                 matched_n += 1
                 if not dry_run:
-                    # O(1) rating_key back-write for the matched copy
+                    # O(1) rating_key annotation for the matched copy.
+                    #
+                    # UPDATE-only, and it passes NO layer. `index` is a snapshot
+                    # taken at the start of the sync, so writing index[p] back
+                    # would let a stale layer overwrite a detector import that
+                    # landed while the sync was running -- leaving a stale layer
+                    # beside a fresh signature. The labeler consumes scan
+                    # observations; it does not produce them, and the only
+                    # column it owns here is the Plex identity.
                     for p in _movie_norm_paths(mv, mappings):
                         if p in index:
-                            db.upsert_dv_scan(
-                                norm_to_path.get(p, p),
-                                index[p], rating_key=str(mv.ratingKey),
-                                source="scan")
+                            db.annotate_dv_scan_rating_key(
+                                norm_to_path.get(p, p), str(mv.ratingKey))
                             break
             if dry_run:
                 movie_paths = _movie_norm_paths(mv, mappings)
