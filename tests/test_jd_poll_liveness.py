@@ -50,6 +50,10 @@ def svc():
     s._poll_iters_started = 0
     s._poll_iters_completed = 0
     s._poll_iter_start_ts = None
+    s._cycles_started = 0
+    s._cycles_completed = 0
+    s._cycle_start_ts = None
+    s._cycle_end_ts = None
     return s
 
 
@@ -296,3 +300,72 @@ class TestHeartbeat:
         h = svc.jd_poll_health()
         assert h["iterations_started"] - h["iterations_completed"] == 1
         assert h["current_iteration_seconds"] is not None
+
+
+class TestOuterCycleHeartbeat:
+    """The PRIMARY heartbeat, per design review P1-1.
+
+    Wrapping poll_results alone cannot answer "is the thread cycling?". The
+    loop does more after poll_results returns -- source-link annotation, the
+    WebSocket broadcast, the rename hand-off -- and a block in any of those
+    leaves the INNER counters equal and stationary, which the documented table
+    read as "thread stopped". The thread is alive and blocked outside the
+    measured span: the same unsupported conclusion this instrumentation exists
+    to prevent.
+    """
+
+    def test_a_block_AFTER_poll_results_is_visible_as_blocked(self, svc):
+        """The exact case the inner span cannot see.
+
+        poll_results completed cleanly -- its counters are equal -- yet the
+        cycle is still open and ageing. Without the outer heartbeat this reads
+        as a stopped thread.
+        """
+        svc.note_cycle_start()
+        svc.note_poll_iteration_start()
+        svc.note_poll_iteration_end()          # the poll finished fine
+        svc._cycle_start_ts -= 3600            # then something after it blocked
+
+        h = svc.jd_poll_health()
+
+        assert h["iterations_started"] == h["iterations_completed"] == 1, \
+            "the inner span looks perfectly healthy"
+        assert h["cycles_started"] - h["cycles_completed"] == 1, \
+            "but the outer cycle never closed"
+        assert h["current_cycle_seconds"] >= 3600
+
+    def test_a_completed_cycle_advances_both_and_starts_the_age_clock(self, svc):
+        svc.note_cycle_start()
+        svc.note_cycle_end()
+        h = svc.jd_poll_health()
+        assert h["cycles_started"] == h["cycles_completed"] == 1
+        assert h["current_cycle_seconds"] is None
+        assert h["seconds_since_cycle_completed"] is not None
+
+    def test_a_STOPPED_thread_is_distinguishable_from_a_blocked_one(self, svc):
+        """Equal counters carry no age on their own -- hence the clock.
+
+        A single snapshot must separate a healthy idle poller from a dead one,
+        because the host checker only ever takes one snapshot.
+        """
+        svc.note_cycle_start()
+        svc.note_cycle_end()
+        svc._cycle_end_ts -= 7200              # nothing has started since
+
+        h = svc.jd_poll_health()
+
+        assert h["cycles_started"] == h["cycles_completed"]     # not blocked
+        assert h["current_cycle_seconds"] is None
+        assert h["seconds_since_cycle_completed"] >= 7200       # but long dead
+
+    def test_a_healthy_poller_reports_a_SMALL_age(self, svc):
+        """Control: without this, 'stopped' would match a working poller."""
+        svc.note_cycle_start()
+        svc.note_cycle_end()
+        assert svc.jd_poll_health()["seconds_since_cycle_completed"] < 5
+
+    def test_a_never_started_poller_reports_None_not_zero(self, svc):
+        h = svc.jd_poll_health()
+        assert h["cycles_started"] == 0
+        assert h["seconds_since_cycle_completed"] is None
+        assert h["current_cycle_seconds"] is None

@@ -366,10 +366,18 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
         last_sig = None
         handed_to_rename: set = set()  # packages already sent to auto-rename
         while not reg.shutdown_requested:
+            dl = None
             try:
                 cfg = reg.config or {}
                 dl = reg.download
                 if dl and cfg.get("jd_enabled") and cfg.get("jd_method") == "api":
+                    # PRIMARY heartbeat, around the whole active cycle and
+                    # closed in the finally below -- NOT around poll_results
+                    # alone. A block after poll_results returns (the broadcast,
+                    # the rename hand-off) would otherwise leave the counters
+                    # equal and stationary and read as "thread stopped", when
+                    # the thread is alive and blocked. Design review P1-1.
+                    dl.note_cycle_start()
                     results = dl.poll_results(record=True)
                     # provenance_url participates so a provenance-ONLY change
                     # (a link resolving, or being retracted, while nothing else
@@ -446,6 +454,18 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                         handed_to_rename &= live_keys
             except Exception as e:
                 logger.debug("results poller error: %s", e)
+            finally:
+                # Closes however the cycle ended. If this never runs, the cycle
+                # never returned -- which is exactly the blocked-thread state
+                # the heartbeat exists to expose. Guarded because `dl` may be
+                # None (no download service) or the cycle may not have started
+                # (JD disabled), and closing an unstarted cycle would invent
+                # progress that never happened.
+                if dl is not None and getattr(dl, "_cycle_start_ts", None) is not None:
+                    try:
+                        dl.note_cycle_end()
+                    except Exception:  # noqa: BLE001
+                        pass
             # Sleep in short slices so shutdown stays responsive.
             waited = 0.0
             while waited < interval and not reg.shutdown_requested:

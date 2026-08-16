@@ -489,8 +489,17 @@ class DownloadService:
         #: so a recurrence is attributable instead of guessed from one
         #: generic exception (peer review 2026-08-15).
         self._jd_phase = "idle"
-        #: Heartbeat. See note_poll_iteration_start for why started/completed
-        #: are tracked separately rather than a single 'last poll' timestamp.
+        #: PRIMARY heartbeat: the OUTER poller cycle. Design review P1-1 --
+        #: wrapping poll_results alone cannot answer "is the thread cycling?",
+        #: because a block AFTER it returns (the WebSocket broadcast, the rename
+        #: hand-off) leaves the inner counters equal and stationary, which reads
+        #: as "thread stopped" when the thread is alive and blocked.
+        self._cycles_started = 0
+        self._cycles_completed = 0
+        self._cycle_start_ts: Optional[float] = None
+        self._cycle_end_ts: Optional[float] = None
+        #: NESTED span: localises a block to JD polling specifically once the
+        #: outer heartbeat has established the thread is stuck at all.
         self._poll_iters_started = 0
         self._poll_iters_completed = 0
         self._poll_iter_start_ts: Optional[float] = None
@@ -797,6 +806,30 @@ class DownloadService:
         if recovered:
             logger.info("JDownloader poll recovered after %d failure(s)", recovered)
 
+    def note_cycle_start(self):
+        """The poller thread is entering an OUTER cycle. PRIMARY heartbeat.
+
+        Design review P1-1: wrapping poll_results alone is the wrong authority
+        for "is the thread cycling?". The loop does more after poll_results
+        returns -- source-link annotation, the WebSocket broadcast, the rename
+        hand-off. A block in any of those leaves the INNER counters equal and
+        stationary, which the documented table read as "thread stopped" when
+        the thread is alive and blocked outside the measured span.
+
+        Closed BEFORE the sleep, so a healthy sleeping poller does not look
+        like an operation in flight.
+        """
+        with self._jd_poll_lock:
+            self._cycles_started += 1
+            self._cycle_start_ts = time.monotonic()
+
+    def note_cycle_end(self):
+        """The outer cycle finished, however it went."""
+        with self._jd_poll_lock:
+            self._cycles_completed += 1
+            self._cycle_start_ts = None
+            self._cycle_end_ts = time.monotonic()
+
     def note_poll_iteration_start(self):
         """The poller is entering an iteration. Half of the heartbeat.
 
@@ -844,6 +877,23 @@ class DownloadService:
                 "last_error": self._jd_last_poll_error,
                 "failure_phase": getattr(self, "_jd_fail_phase", None)
                                  if self._jd_poll_fail_streak else None,
+                # PRIMARY: the outer cycle. cycles_started > cycles_completed
+                # while current_cycle_seconds grows == the thread is BLOCKED.
+                # Both equal and seconds_since_cycle_completed growing == the
+                # thread has STOPPED. Equal counters alone carry no age, which
+                # is why the "since completed" clock is required rather than
+                # optional -- a single snapshot cannot otherwise tell a healthy
+                # idle poller from a dead one.
+                "cycles_started": self._cycles_started,
+                "cycles_completed": self._cycles_completed,
+                "current_cycle_seconds": (
+                    (time.monotonic() - self._cycle_start_ts)
+                    if self._cycle_start_ts else None),
+                "seconds_since_cycle_completed": (
+                    (time.monotonic() - self._cycle_end_ts)
+                    if self._cycle_end_ts else None),
+                # NESTED: localises a block to JD polling once the outer
+                # heartbeat has established the thread is stuck at all.
                 "iterations_started": self._poll_iters_started,
                 "iterations_completed": self._poll_iters_completed,
                 # Seconds the CURRENT iteration has been running. A value that
