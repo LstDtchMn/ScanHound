@@ -5556,6 +5556,125 @@ class DatabaseManager:
             "last_progress_at": out.get("last_progress_at"),
         }
 
+    #: Grace after an item becomes due before "nothing started" is a fault.
+    #: Generous: the worker polls every couple of seconds, so 15 minutes of a
+    #: due item with no attempt is not scheduling jitter.
+    QUEUE_EXECUTOR_GRACE_SECONDS = 900
+    #: Floor for the no-progress deadline, and the multiple of the pacing
+    #: interval above it. At 600s pacing this is 2h; at 3600s it is 6h. The
+    #: multiplier means the deadline scales with how slowly we deliberately
+    #: chose to go, instead of a hardcoded number that is wrong at both ends.
+    QUEUE_PROGRESS_FLOOR_SECONDS = 7200
+    QUEUE_PROGRESS_INTERVAL_MULTIPLE = 6
+
+    def queue_stall_report(self):
+        """Three DISTINCT stall conditions, because one timer cannot separate
+        the two histories the 2026-08-13 incident could not distinguish.
+
+        "No completion in N hours" conflates "nothing was attempted" with
+        "everything attempted failed" -- and those want different diagnoses.
+        So this reports:
+
+          executor_starved   work is due, and nothing has even STARTED.
+                             A scheduler/ownership/liveness fault.
+          source_no_progress attempts are happening, but the source has
+                             delivered nothing for longer than the pacing
+                             justifies. A source fault.
+          human_required     a state no automatic action can leave:
+                             verification hold, or deferred work with
+                             auto-resume switched off.
+
+        A verification hold is reported as human_required and NEVER as a
+        scheduler stall -- mislabelling it would send someone hunting a worker
+        bug when the truth is that a person must complete a challenge.
+
+        Completion is deliberately NOT the progress signal: a queue can make
+        real source progress without an item completing, and an item can
+        complete without any new source reveal.
+        """
+        now_expr = "datetime('now')"
+        report = {"executor_starved": False, "source_no_progress": False,
+                  "human_required": False, "evidence": {}}
+        try:
+            due = self._query_dicts(
+                "SELECT COUNT(*) AS n, MIN(scheduled_for) AS oldest "
+                "FROM download_queue_items "
+                "WHERE state IN ('scheduled','ready') AND scheduled_for IS NOT NULL "
+                f"  AND scheduled_for <= {now_expr}", default=[])
+            due_n = int((due[0] if due else {}).get("n") or 0)
+            oldest_due = (due[0] if due else {}).get("oldest")
+
+            last_attempt = self._query_dicts(
+                "SELECT MAX(started_at) AS t FROM download_queue_attempts",
+                default=[])
+            last_attempt_at = (last_attempt[0] if last_attempt else {}).get("t")
+
+            held = self._query_dicts(
+                "SELECT COUNT(*) AS n FROM download_queue_batches "
+                "WHERE verification_hold_source IS NOT NULL "
+                "  AND verification_hold_source <> ''", default=[])
+            held_n = int((held[0] if held else {}).get("n") or 0)
+
+            stuck = self._query_dicts(
+                "SELECT COUNT(*) AS n FROM download_queue_batches b "
+                "WHERE b.auto_resume_after_cooldown = 0 AND EXISTS ("
+                "  SELECT 1 FROM download_queue_items i WHERE i.batch_uuid = b.batch_uuid"
+                "    AND i.state IN ('waiting_source','verification_required'))",
+                default=[])
+            stuck_n = int((stuck[0] if stuck else {}).get("n") or 0)
+
+            report["human_required"] = bool(held_n or stuck_n)
+            report["evidence"] = {
+                "due_now": due_n, "oldest_due_at": oldest_due,
+                "last_attempt_at": last_attempt_at,
+                "verification_holds": held_n,
+                "batches_deferred_without_auto_resume": stuck_n,
+            }
+
+            # 1. EXECUTOR STARVATION -- work is due and nothing has started.
+            #    Suppressed while a verification hold is active: not attempting
+            #    is then CORRECT, and calling it a scheduler fault would send
+            #    someone after the wrong bug.
+            if due_n and not held_n and oldest_due:
+                starved = self._query_dicts(
+                    "SELECT 1 AS x WHERE ? < datetime('now', ?) AND NOT EXISTS ("
+                    "  SELECT 1 FROM download_queue_attempts WHERE started_at > ?)",
+                    (oldest_due, "-%d seconds" % self.QUEUE_EXECUTOR_GRACE_SECONDS,
+                     oldest_due), default=[])
+                report["executor_starved"] = bool(starved)
+
+            # 2. SOURCE NO PROGRESS -- attempts happen, nothing comes back.
+            eligible = self._query_dicts(
+                "SELECT COUNT(*) AS n FROM download_queue_items "
+                "WHERE state IN ('scheduled','ready','claimed','waiting_source')",
+                default=[])
+            if int((eligible[0] if eligible else {}).get("n") or 0) and not held_n:
+                pace = self._query_dicts(
+                    "SELECT MAX(interval_seconds) AS s FROM download_queue_batches "
+                    "WHERE state NOT IN ('completed','cancelled')", default=[])
+                interval = int((pace[0] if pace else {}).get("s") or 600)
+                deadline = max(self.QUEUE_PROGRESS_FLOOR_SECONDS,
+                               interval * self.QUEUE_PROGRESS_INTERVAL_MULTIPLE)
+                prog = self._query_dicts(
+                    "SELECT MAX(started_at) AS t FROM download_queue_attempts "
+                    "WHERE source_progress = 1", default=[])
+                last_progress = (prog[0] if prog else {}).get("t")
+                report["evidence"]["last_source_progress_at"] = last_progress
+                report["evidence"]["progress_deadline_seconds"] = deadline
+                if last_attempt_at:
+                    stale = self._query_dicts(
+                        "SELECT 1 AS x WHERE COALESCE(?, '1970-01-01') "
+                        "  < datetime('now', ?)",
+                        (last_progress, "-%d seconds" % deadline), default=[])
+                    report["source_no_progress"] = bool(stale)
+        except Exception as e:  # noqa: BLE001
+            # A health report that throws must not take its caller down, but it
+            # must not read as healthy either.
+            logger.error("queue_stall_report failed: %s", e)
+            report["evidence"]["error"] = str(e)[:120]
+            report["human_required"] = True
+        return report
+
     def get_latest_dv_scan_at(self, source="scan"):
         """Newest ``last_seen_at`` among dv_scan rows for *source*, else None.
 
