@@ -5458,8 +5458,45 @@ class DatabaseManager:
 
     # --- queue attempt history (append-only) ---------------------------------
 
-    def begin_queue_attempt(self, attempt_id, item_uuid, batch_uuid, source):
+    @staticmethod
+    def _attempt_stamp(when=None):
+        """The ONE timestamp format the attempts table may hold.
+
+        `datetime.now()` -- what this table used until 2026-08-16 -- is naive
+        LOCAL time, and every window over this table compares it against
+        sqlite's `datetime('now')`, which is UTC. On the production host that is
+        a 4-hour skew, and the separator differs too ('T' vs ' '), so the
+        comparison does not even fail in one consistent direction: a same-day
+        row sorts AFTER any same-day UTC cutoff because 'T' > ' '.
+
+        What it cost: _scope_is_earned asks distinct_items_failing for the same
+        failure on 2 distinct items within 3600s. A row written seconds earlier
+        never matched that window, so the answer was permanently 0, so an
+        ambiguous reveal stall was ALWAYS treated as item-local -- and the
+        item-local path was itself raising on a CHECK constraint. Two bugs, each
+        of which hid the other.
+
+        Format is sqlite's own so the existing `datetime('now', ?)` comparisons
+        are correct as written. Rows from before this fix stay in the old shape;
+        they carry reason_code 'attempt_not_closed', match no structural or
+        source reason, and age out of every window within 24h.
+        """
+        when = when or datetime.datetime.now(datetime.timezone.utc)
+        if isinstance(when, str):
+            return when
+        if when.tzinfo is not None:
+            when = when.astimezone(datetime.timezone.utc)
+        return when.strftime("%Y-%m-%d %H:%M:%S")
+
+    def begin_queue_attempt(self, attempt_id, item_uuid, batch_uuid, source,
+                            started_at=None):
         """Open an attempt row BEFORE the work starts. Returns True on success.
+
+        ``started_at`` lets the caller supply its OWN clock. The queue's clock
+        is injectable and its integration tests advance it; if this row were
+        stamped from the real clock while the pacing window was computed from
+        the injected one, the gate would be unfalsifiable in exactly the tests
+        written to falsify it.
 
         Opened first and closed in a finally, so an attempt that never returns
         leaves an IN_PROGRESS row behind. That row IS the evidence a blocked
@@ -5475,7 +5512,7 @@ class DatabaseManager:
             "(attempt_id, item_uuid, batch_uuid, source, started_at, terminal_status) "
             "VALUES (?, ?, ?, ?, ?, 'IN_PROGRESS')",
             (str(attempt_id), str(item_uuid), str(batch_uuid or ""),
-             str(source or ""), datetime.datetime.now().isoformat(timespec="seconds")),
+             str(source or ""), self._attempt_stamp(started_at)),
             label="begin_queue_attempt")
 
     def close_queue_attempt(self, attempt_id, terminal_status, *, reason_code=None,
@@ -5511,7 +5548,7 @@ class DatabaseManager:
             sql += " AND terminal_status = 'IN_PROGRESS'"
         return self._mutate(
             sql,
-            (datetime.datetime.now().isoformat(timespec="seconds"), terminal_status,
+            (self._attempt_stamp(), terminal_status,
              reason_code, affected_scope, 1 if transport_attempted else 0,
              1 if source_progress else 0, str(attempt_id)),
             label="close_queue_attempt")
@@ -5529,7 +5566,8 @@ class DatabaseManager:
             "AND started_at < datetime('now', ?) ORDER BY started_at",
             ("-%d seconds" % int(older_than_seconds),), default=[])
 
-    def distinct_items_failing(self, source, reason_code, within_seconds=3600):
+    def distinct_items_failing(self, source, reason_code, within_seconds=3600,
+                               now=None, including_item=None):
         """How many DISTINCT items hit `reason_code` on `source` recently.
 
         The promotion evidence for source-wide scope. "Scope must be earned by
@@ -5543,14 +5581,75 @@ class DatabaseManager:
 
         Counts only transport_attempted=1: a sibling parked by policy never
         asked the source anything and is not evidence about it.
+
+        ``now`` is the CALLER'S clock. The queue stamps these rows from its own
+        injectable clock, so a cutoff taken from sqlite's `datetime('now')`
+        here would be comparing two different clocks -- which is precisely the
+        defect this window already suffered in the other direction. Defaults to
+        real UTC for the monitoring callers, which have no injected clock.
+
+        ``including_item`` is the item being classified RIGHT NOW. Its attempt
+        is still open -- it has no reason_code yet, because the reason is what
+        the caller is currently deciding about -- so without this it is invisible
+        to its own promotion check and the constant means N+1 items, not N. That
+        made AMBIGUOUS_PROMOTION_DISTINCT_ITEMS = 2 require three stalls.
         """
+        cutoff = self._attempt_stamp(
+            (now or datetime.datetime.now(datetime.timezone.utc))
+            - datetime.timedelta(seconds=int(within_seconds)))
         rows = self._query_dicts(
-            "SELECT COUNT(DISTINCT item_uuid) AS n FROM download_queue_attempts "
+            "SELECT DISTINCT item_uuid FROM download_queue_attempts "
             "WHERE source = ? AND reason_code = ? AND transport_attempted = 1 "
-            "  AND started_at > datetime('now', ?)",
-            (str(source), str(reason_code), "-%d seconds" % int(within_seconds)),
+            "  AND started_at > ?",
+            (str(source), str(reason_code), cutoff),
             default=[])
-        return int((rows[0] if rows else {}).get("n") or 0)
+        seen = {str(r.get("item_uuid")) for r in rows}
+        if including_item:
+            seen.add(str(including_item))
+        return len(seen)
+
+    #: Distinct items failing structurally within the window before it reads as
+    #: scraper drift rather than bad individual releases. Three, because one or
+    #: two pulled releases are ordinary and a genuine template change breaks
+    #: everything at once.
+    SCRAPER_DRIFT_DISTINCT_ITEMS = 3
+    #: Structural failures: the page did not look the way the scraper expects.
+    #: Explicitly NOT source gating -- a changed template and a blocked source
+    #: need opposite responses (fix the selector vs. back off), and today they
+    #: are indistinguishable in the UI.
+    _STRUCTURAL_REASONS = ("layout_changed", "reveal_control_absent")
+
+    def scraper_drift_report(self, within_seconds=86400):
+        """Structural scrape failures, surfaced APART from source gating.
+
+        Design review F10. Seven items were cancelled for `layout_changed` and
+        sat in the same bucket as "the source blocked us" -- but a broken
+        selector and a hostile source want opposite responses, and drift
+        absorbed into a gating bucket is how a scraper stays broken for weeks.
+
+        Counts DISTINCT items with transport_attempted = 1: a page we never
+        fetched says nothing about the template, and one stubborn release must
+        not look like a site-wide redesign.
+        """
+        out = {"drifting": False, "by_reason": {}, "distinct_items": 0}
+        try:
+            rows = self._query_dicts(
+                "SELECT reason_code, COUNT(DISTINCT item_uuid) AS n "
+                "FROM download_queue_attempts "
+                "WHERE reason_code IN (%s) AND transport_attempted = 1 "
+                "  AND started_at > datetime('now', ?) "
+                "GROUP BY reason_code"
+                % ",".join("?" for _ in self._STRUCTURAL_REASONS),
+                tuple(self._STRUCTURAL_REASONS) + ("-%d seconds" % int(within_seconds),),
+                default=[])
+            for r in rows:
+                out["by_reason"][str(r.get("reason_code"))] = int(r.get("n") or 0)
+            out["distinct_items"] = sum(out["by_reason"].values())
+            out["drifting"] = out["distinct_items"] >= self.SCRAPER_DRIFT_DISTINCT_ITEMS
+        except Exception as e:  # noqa: BLE001
+            logger.error("scraper_drift_report failed: %s", e)
+            out["error"] = str(e)[:120]
+        return out
 
     def queue_source_observations(self, source, within_seconds=86400):
         """OBSERVED source outcomes only -- never policy deferrals.
@@ -5646,7 +5745,12 @@ class DatabaseManager:
                 default=[])
             stuck_n = int((stuck[0] if stuck else {}).get("n") or 0)
 
-            report["human_required"] = bool(held_n or stuck_n)
+            # Scraper drift is reported ALONGSIDE, never folded into the
+            # source buckets: a broken selector and a hostile source need
+            # opposite responses (design review F10).
+            drift = self.scraper_drift_report()
+            report["scraper_drift"] = drift
+            report["human_required"] = bool(held_n or stuck_n or drift.get("drifting"))
             report["evidence"] = {
                 "due_now": due_n, "oldest_due_at": oldest_due,
                 "last_attempt_at": last_attempt_at,
