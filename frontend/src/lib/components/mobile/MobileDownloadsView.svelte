@@ -11,6 +11,9 @@
   let results = $state<DownloadResult[]>([]);
   let loaded = $state(false);
   let busy = $state(false);
+  // Separate from `busy`, which Pause/Resume/Stop also set: sharing it made
+  // the Clear button say 'Clearing…' while an unrelated control was running.
+  let clearing = $state(false);
   let timer: ReturnType<typeof setTimeout> | null = null;
   let delay = 2500;
   let alive = true;
@@ -87,14 +90,21 @@
 
   /** Finished, from the user's point of view.
    *
-   *  'downloaded' is included deliberately: a package whose archive is fully
-   *  downloaded but whose extraction never ran sits there forever, and it is
-   *  exactly the "100% but still listed" row that makes Clear done look
-   *  broken. 'downloading', 'extracting' and 'queued' are live work and stay. */
-  const FINISHED = ['extracted', 'downloaded', 'failed'];
+   *  'downloaded' is deliberately NOT here (peer review 2026-08-16). It looks
+   *  like "complete, nothing left to extract", and sometimes it is — but the
+   *  backend also falls back to it when a poll's query_links() FAILED, because
+   *  the classifier then sees no child links and cannot tell "nothing to
+   *  extract" from "we could not look". Clearing on that would let a transient
+   *  JDownloader hiccup present live extraction work as safe to delete.
+   *
+   *  Fixing it properly means the backend distinguishing "extraction is not
+   *  applicable" from "extraction was not observed" — it already tracks
+   *  links_observed for provenance, so the signal exists but does not reach the
+   *  state. Until then this stays conservative. */
+  const FINISHED = ['extracted', 'failed'];
 
   async function clearFinished() {
-    if (busy) return;
+    if (busy || clearing) return;
     const done = results.filter((r) => FINISHED.includes(r.state) && r.id != null);
     if (!done.length) {
       addToast('Nothing to clear', 'No finished downloads in the list.');
@@ -105,23 +115,34 @@
     // each re-reading every row server-side and calling JDownloader again. With
     // no busy state and no completion message the button simply looked dead,
     // and leaving the screen abandoned the job half-done.
-    busy = true;
+    clearing = true;
     try {
       const r = await api.removeDownloadResults(done.map((d) => d.id));
       // Report what actually happened. `requested` can exceed `removed` when a
       // row was already gone, and saying "cleared 563" when 40 survived is how
       // a partial failure gets mistaken for a UI bug.
-      addToast(
-        'Cleared',
-        r.removed === r.requested
-          ? `${r.removed} finished download${r.removed === 1 ? '' : 's'} removed.`
-          : `${r.removed} of ${r.requested} removed; the rest were already gone.`
-      );
-      results = results.filter((x) => !done.some((d) => d.id === x.id));  // optimistic
+      if (!r.jd_removed) {
+        // NOT a success. The packages are still in JDownloader, so anything we
+        // dropped locally would come back — saying "Cleared" here is the
+        // failure mode this whole change exists to avoid.
+        addToast(
+          'Could not clear',
+          `JDownloader did not remove ${r.kept ?? 0} item(s), so they were left in the list. Try again once it is reachable.`,
+          'warning'
+        );
+      } else {
+        addToast(
+          'Cleared',
+          r.errors && r.errors.length
+            ? `${r.removed} of ${r.requested} removed; some rows could not be deleted.`
+            : `${r.removed} finished download${r.removed === 1 ? '' : 's'} removed.`
+        );
+        results = results.filter((x) => !done.some((d) => d.id === x.id));  // optimistic
+      }
     } catch (e) {
       addToast('Could not clear', e instanceof Error ? e.message : 'Please try again.', 'error');
     } finally {
-      busy = false;
+      clearing = false;
       await poll();
     }
   }
@@ -150,7 +171,7 @@
     <button class="px-2 py-1 rounded bg-[var(--bg-tertiary)] text-xs" disabled={busy} onclick={() => control('pause')}>Pause</button>
     <button class="px-2 py-1 rounded bg-[var(--bg-tertiary)] text-xs" disabled={busy} onclick={() => control('resume')}>Resume</button>
     <button class="px-2 py-1 rounded bg-[var(--bg-tertiary)] text-xs" disabled={busy} onclick={() => control('stop')}>Stop</button>
-    <button class="px-2 py-1 rounded bg-[var(--bg-tertiary)] text-xs disabled:opacity-50" disabled={busy} onclick={clearFinished}>{busy ? 'Clearing…' : 'Clear done'}</button>
+    <button class="px-2 py-1 rounded bg-[var(--bg-tertiary)] text-xs disabled:opacity-50" disabled={busy || clearing} onclick={clearFinished}>{clearing ? 'Clearing…' : 'Clear done'}</button>
   </div>
 
   <div class="flex-1 overflow-y-auto">

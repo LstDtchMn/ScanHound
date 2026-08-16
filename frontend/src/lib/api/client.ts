@@ -416,7 +416,9 @@ export const api = {
    * straight back. This removes them from JD too, which is what makes them
    * stay gone. */
   removeDownloadResults: (ids: number[]) =>
-    request<{ ok: boolean; removed: number; requested: number }>(
+    request<{ ok: boolean; removed: number; requested: number;
+             jd_removed: boolean; durable: boolean; kept?: number;
+             errors?: string[] }>(
       '/download/results/remove-many',
       { method: 'POST', body: JSON.stringify({ ids }) }
     ),

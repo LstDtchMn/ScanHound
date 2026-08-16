@@ -33,9 +33,14 @@ button, and navigating away abandons the job part-done.
 
 A bulk route already exists — `DELETE /download/results` → `clear_download_results()`
 — and wiring the button to it is the obvious one-line fix. **It would be worse than
-the bug.** It deletes our rows and tells JDownloader nothing; `poll_results()`
-re-upserts every package JD still holds, so the list empties and returns on the next
-poll. "Half works" is harder to diagnose than "does nothing".
+the bug.** It deletes our rows and tells JDownloader nothing. JDownloader still OWNS the
+packages, so the clear is **non-durable**: once the poller needs to persist them
+again — a state change, cache invalidation, or a restart — they reappear. "Half
+works" is harder to diagnose than "does nothing".
+
+*(Round-2 correction, adopted from the review: "the next poll re-upserts every
+package" was too strong. With a hot `_results_cache` an unchanged package can skip
+the immediate write — which makes the old route more deceptive, not safer.)*
 
 The `remove_package` docstring and its cache-eviction comment already describe this
 resurrection path for the single-row case. The bulk route predates them and never
@@ -53,17 +58,18 @@ learned it.
    unchanged package still in JD hits `poll_results()`'s unchanged-state skip and
    re-emits the id we just deleted.
 
-Idempotent like the single path: an unreachable JD still clears the rows, because
-the user asked for them to go. New route `POST /download/results/remove-many`. The
+**REVISED IN ROUND 2 — see §Round 2.** This first version cleared the rows even
+when JD failed, on an idempotence argument. That was wrong: it reports a durable
+removal that the next poll undoes. It now fails closed. New route
+`POST /download/results/remove-many`. The
 caller sends the ids it means, so "finished" stays the client's policy rather than
 being re-derived server-side where the two could disagree.
 
-Also: **`downloaded` now counts as finished.** A package whose archive downloaded
-but whose extraction never ran sits in that state permanently — it is exactly the
-"100% complete but still listed" row, and the old filter matched only `extracted`
-and `failed`.
+~~Also: `downloaded` now counts as finished.~~ **REVERTED IN ROUND 2** — a failed
+`query_links()` also produces `downloaded`, so it cannot distinguish "nothing to
+extract" from "we could not look". See §Round 2, MEDIUM 3.
 
-## Tests — 13
+## Tests — 13 in round 1, **27 after round 2**
 
 Including *exactly one* JDownloader call for 563 rows, rows read once rather than
 per id, int-not-string uuids, cache eviction, an unreachable JD still clearing, a
@@ -96,3 +102,74 @@ cosmetic table-only clear.
    every id-recovery attempt fails. The new code guards with `r.id != null`. Should
    the type be `number | null`, or should the backend refuse to emit an id-less row
    at all?
+
+---
+
+## Round 2 — all three MEDIUMs closed
+
+Each was verified against the code before being acted on.
+
+### MEDIUM 1 — the stale-snapshot race: **fixed**
+
+A results **epoch**. A poll captures it immediately before its JD snapshot and
+`poll_results` refuses to persist if it changed underneath; a removal that actually
+deleted something advances it under a short lock. No lock is held across a network
+call, as you specified. A removal that deleted nothing does **not** advance it, so an
+unrelated no-op cannot discard a healthy poll.
+
+Also fixed alongside it: the first version evicted the caches for **every** targeted
+row, including ones it deliberately kept. That would push the next poll into the
+cache-miss branch and have it rewrite exactly the rows we chose not to delete —
+performing the resurrection by hand. Eviction is now scoped to what was actually
+deleted.
+
+### MEDIUM 2 — success reported for a failed removal: **fixed, fail-closed**
+
+`remove_links`'s return is now checked. An explicit `False` is a refusal; `None`
+stays success, because `removeLinks` is a void action and demanding truthiness would
+fail every real call — the mirror mistake.
+
+If JD did not positively succeed, the **known-JD rows are kept**, `jd_removed: false`
+and `durable: false` are returned, and the UI says *"Could not clear"* rather than a
+success message. Orphans with no JD side are still dropped. A DB read failure now
+returns a failure instead of being folded into "already gone", and a partial delete
+sets `ok: false` with `errors`.
+
+You were right that the tests did not constrain this contract at all: **the double
+returned `None` on its success path**, so neither direction was pinned. It now takes
+an explicit `returns` and there are cases for `False`, `None` and `True`.
+
+### MEDIUM 3 — `downloaded` as "finished": **reverted**
+
+Verified: a failed `query_links()` sets `links_observed = False` and leaves
+`child_links` empty, and the state classifier ignores that distinction, so a fully
+downloaded package falls through to `downloaded`. Taking the conservative option —
+`FINISHED` is back to `['extracted', 'failed']`.
+
+Worth noting the signal already exists: `links_observed` was introduced by your
+2026-08-13 round precisely to separate "absence of observation" from "observation of
+absence", and it reaches the provenance write but not the state field. Making it
+reach the state is the real fix and is **not** on this branch.
+
+### LOW — `Clearing…` during Pause/Resume/Stop: **fixed**, dedicated `clearing` flag.
+
+### One more, found by the suite rather than by either of us
+
+Reading the epoch from `poll_results()` made a missing epoch field raise — so any
+`DownloadService` not built through `__init__` turned **every poll into a FAILURE**,
+surfaced as "JDownloader poll failing". An accounting field raising a liveness alarm.
+The helpers are now self-initialising, with a test that a bare service still polls.
+This codebase already has the rule (a log write under fail-fast once killed a job at
+line 1); I re-learned it in a new place.
+
+**Tests: 13 → 27.** Full suite green.
+
+### Not done
+
+- The `poll -> remove -> poll -> assert absent` lifecycle test you asked for. The
+  epoch unit tests pin the mechanism, but not the end-to-end promise, and I would
+  rather say so than imply coverage I have not written.
+- `remove_package()` (single) still lacks the epoch discipline. It has the same race;
+  I did not want to change the single-row path in the same commit that changes the
+  bulk one.
+- Splitting `DownloadResult` into persisted/live types.

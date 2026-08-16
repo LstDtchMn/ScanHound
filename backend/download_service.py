@@ -479,6 +479,20 @@ class DownloadService:
         # credentials, rate limit) guarantees missing the next one; "no
         # successful poll in N minutes while enabled" catches all of them,
         # including causes nobody has thought of yet.
+        # RESULTS EPOCH (peer review 2026-08-16, MEDIUM 1). A poll takes its
+        # JDownloader snapshot, then persists it. A removal that lands in
+        # between deletes rows the in-flight poll is about to write back from
+        # its PRE-removal snapshot -- and because the removal also evicts the
+        # caches, the stale poll takes the cache-miss branch and upserts. The
+        # package is gone from JD and back in our table, permanently, because
+        # the end-of-poll prune only trims the in-memory caches and never
+        # deletes rows for packages JD no longer has.
+        #
+        # The epoch makes the ordering decidable without holding a lock across
+        # a network call: a poll records the epoch before its snapshot and
+        # refuses to persist if it changed underneath.
+        self._results_epoch = 0
+        self._results_epoch_lock = threading.Lock()
         self._jd_poll_lock = threading.Lock()
         self._jd_last_poll_ok_ts: Optional[float] = None   # monotonic
         self._jd_last_poll_ok_wall: Optional[str] = None   # human/UI
@@ -1149,6 +1163,46 @@ class DownloadService:
             self._invalidate_jd_cache()
             return {"ok": False, "error": str(e)}
 
+    def _epoch_lock(self) -> threading.Lock:
+        """The epoch lock, created on demand.
+
+        SELF-INITIALISING ON PURPOSE. The epoch is bookkeeping, and bookkeeping
+        must never be a hard dependency of the work it describes: reading it
+        from poll_results() meant any DownloadService not built through
+        __init__ turned every poll into a FAILURE, reported as "JDownloader poll
+        failing" -- a real liveness alarm raised by an accounting field. Caught
+        by a liveness test, not by the bulk-clear tests, because those build the
+        attribute themselves.
+        """
+        lock = getattr(self, "_results_epoch_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._results_epoch_lock = lock
+            if not hasattr(self, "_results_epoch"):
+                self._results_epoch = 0
+        return lock
+
+    def _current_epoch(self) -> int:
+        with self._epoch_lock():
+            return getattr(self, "_results_epoch", 0)
+
+    def _bump_epoch(self) -> int:
+        """A local removal happened; any snapshot older than this is stale."""
+        with self._epoch_lock():
+            self._results_epoch = getattr(self, "_results_epoch", 0) + 1
+            return self._results_epoch
+
+    def _epoch_is_current(self, captured: Optional[int]) -> bool:
+        """May a poll that started at `captured` still write what it saw?
+
+        None means the caller did not capture one, which is treated as current
+        so an unrelated caller cannot be silently prevented from persisting.
+        """
+        if captured is None:
+            return True
+        with self._epoch_lock():
+            return captured == getattr(self, "_results_epoch", 0)
+
     def remove_package(self, id_: int) -> dict:
         """Remove a single tracked download by its row id: remove ONLY that
         package from JD (by its uuid) and delete its result row. Idempotent:
@@ -1217,52 +1271,102 @@ class DownloadService:
         """
         wanted = {int(i) for i in (ids or []) if str(i).strip().lstrip("-").isdigit()}
         if not wanted:
-            return {"ok": True, "removed": 0, "requested": 0}
+            return {"ok": True, "removed": 0, "requested": 0, "jd_removed": True,
+                    "durable": True, "errors": []}
+        errors = []
         try:
             rows = self.db.get_download_results(limit=100000) if self.db else []
-        except Exception:  # noqa: BLE001
-            rows = []
+        except Exception as e:  # noqa: BLE001
+            # A read failure is NOT "they were already gone" -- reporting it as a
+            # clear would tell the user the rows are deleted when we never even
+            # saw them.
+            logger.warning("remove_packages could not read results: %s", e)
+            return {"ok": False, "removed": 0, "requested": len(wanted),
+                    "jd_removed": False, "durable": False,
+                    "errors": ["could not read the download list"]}
         targets = [r for r in rows if r.get("id") in wanted]
 
-        uuids, keys = [], []
+        with_uuid, orphans, uuids, keys = [], [], [], []
         for row in targets:
             uuid_ = row.get("package_uuid")
             keys.append((uuid_, row.get("name")))
+            parsed = None
             if uuid_:
                 try:
-                    uuids.append(int(uuid_))
+                    parsed = int(uuid_)
                 except (TypeError, ValueError):
                     logger.debug("skipping unparsable package uuid %r", uuid_)
+            if parsed is None:
+                orphans.append(row)      # JD does not know it; only ours to drop
+            else:
+                with_uuid.append(row)
+                uuids.append(parsed)
+
+        jd_removed = True
         if uuids:
             try:
+                self._jd_phase = "remove_links"
                 device = self._connect_jd_device()
-                device.downloads.remove_links([], uuids)
-                self._log("JDownloader: removed %d package(s)" % len(uuids), "info")
+                resp = device.downloads.remove_links([], uuids)
+                # CHECK THE RETURN, not just for an exception. remove_links
+                # returns the API response; an explicit False is a rejection and
+                # was previously read as success, because the test double
+                # returned None and never constrained it. None stays success:
+                # removeLinks is a void action, so "no data" is its normal
+                # answer, and demanding truthiness would fail every real call.
+                if resp is False:
+                    jd_removed = False
+                    errors.append("JDownloader refused the removal")
+                else:
+                    self._log("JDownloader: removed %d package(s)" % len(uuids),
+                              "info")
             except Exception as e:  # noqa: BLE001
-                # ONE failure for the whole set, not N. The rows are still
-                # cleared below -- but say so, because "removed" would otherwise
-                # imply JD forgot them too and the next poll will disagree.
+                jd_removed = False
+                errors.append("JDownloader could not be reached")
                 logger.warning("remove_packages JD step failed for %d package(s): %s",
                                len(uuids), e)
                 self._invalidate_jd_cache()
 
+        # FAIL CLOSED. If JD still holds these packages, deleting our rows is not
+        # a removal -- it is a disappearing act the next poll undoes. Keeping the
+        # rows means the list still shows the truth and the user can retry, which
+        # is strictly better than a success message followed by their silent
+        # return. Orphans have no JD side, so they go regardless.
+        deletable = (with_uuid + orphans) if jd_removed else list(orphans)
+
         removed = 0
-        for row in targets:
+        for row in deletable:
             try:
                 removed += self.db.delete_download_result(row["id"]) or 0
             except Exception as e:  # noqa: BLE001
+                errors.append("one row could not be deleted")
                 logger.warning("remove_packages DB delete failed for id %s: %s",
                                row.get("id"), e)
-        # Same cache eviction as the single path: without it an unchanged
-        # package still present in JD hits poll_results()'s unchanged-state skip
-        # and re-emits the id we just deleted (ghost-id resurrection).
-        for uuid_, name in keys:
-            for key in (uuid_, name):
+        # Evict ONLY what we actually deleted. Evicting a row we deliberately
+        # kept would push the next poll into the cache-miss branch and have it
+        # rewrite the row -- doing the resurrection by hand.
+        deleted_ids = {r["id"] for r in deletable}
+        for row in targets:
+            if row.get("id") not in deleted_ids:
+                continue
+            for key in (row.get("package_uuid"), row.get("name")):
                 if key:
                     self._results_cache.pop(key, None)
                     self._uuid_id.pop(key, None)
                     self._best_titles.pop(key, None)
-        return {"ok": True, "removed": removed, "requested": len(wanted)}
+        if removed:
+            self._bump_epoch()
+        return {
+            "ok": jd_removed and not errors,
+            "removed": removed,
+            "requested": len(wanted),
+            # Named for what the caller needs to decide: did the packages leave
+            # JDownloader, and will this stay cleared?
+            "jd_removed": jd_removed,
+            "durable": jd_removed,
+            "kept": len(with_uuid) if not jd_removed else 0,
+            "errors": errors,
+        }
 
     def poll_results(self, record: bool = True) -> List[Dict[str, Any]]:
         """Poll JDownloader's Downloads list, derive each package's download +
@@ -1301,6 +1405,10 @@ class DownloadService:
         norm_titles = self._scraped_titles_normalized()
 
         try:
+            # Capture BEFORE the snapshot: everything below describes the
+            # world as of this moment, and a removal that lands while we
+            # are reading must invalidate it.
+            snapshot_epoch = self._current_epoch()
             self._jd_phase = "query_packages"
             packages = device.downloads.query_packages([{
                 "name": True, "uuid": True, "bytesLoaded": True,
@@ -1454,7 +1562,22 @@ class DownloadService:
             }
             results.append(row)
 
-            if record and self.db:
+            # THE STALE-SNAPSHOT GUARD (peer review 2026-08-16, MEDIUM 1).
+            # A removal that landed since `snapshot_epoch` was captured deleted
+            # rows this poll is about to write back from its PRE-removal view --
+            # and since the removal also evicted the caches, the change-key
+            # check below takes the miss branch and upserts. The package would
+            # be gone from JDownloader and permanently back in our table,
+            # because the end-of-poll prune only trims the in-memory caches and
+            # never deletes rows for packages JD no longer has.
+            #
+            # Skipping persistence costs one cycle; the next poll re-reads JD
+            # and writes a snapshot that reflects the removal.
+            if record and self.db and not self._epoch_is_current(snapshot_epoch):
+                logger.debug(
+                    "skipping persistence for %r: a removal landed while this "
+                    "poll was reading JDownloader", name)
+            elif record and self.db:
                 # 'save_to' is for the returned dict (auto-rename hook) and
                 # 'id' is derived, not stored — passing either would TypeError
                 # and the whole row would (silently) never persist.
