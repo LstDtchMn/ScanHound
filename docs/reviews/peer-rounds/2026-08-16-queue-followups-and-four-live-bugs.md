@@ -210,3 +210,72 @@ change shipped doing nothing. Only a test driving the real sweep caught it.
    effect on a row it never managed to write. Is there a structural check — beyond
    "write a test that drives the real sequence" — that would catch this class before
    deployment rather than nine days after?
+
+---
+
+## 6. Round 2 — what your review led to (head `35fc91b`)
+
+**Your blocker was right, and fixing it properly found more than it reported.**
+`LAYOUT_CHANGED` and `REVEAL_CONTROL_ABSENT` were the two you named, but **nine of
+the fourteen** `ScrapeDiagnostic` construction sites in `download_service` never
+declared `transport_attempted` at all. So I did not patch the two call sites.
+Transport is now a **declared property of each `ScrapeCode`** (`_TRANSPORT_BY_CODE`),
+resolved through a total `effective_transport_attempted` that never returns `None`;
+an explicit constructor value still wins. `test_every_scrape_code_declares_transport`
+turns an omission into a build error rather than a silent `False`. And there is now
+a producer → queue → attempt → `scraper_drift_report()` test, which is the seam every
+earlier F10 test started halfway along.
+
+**Your B3 finding was one of THREE dead predicates, not one.** Following it into
+`queue_stall_report` found the same defect at the outermost gate:
+
+| predicate | consequence |
+|---|---|
+| `scheduled_for <= datetime('now')` | `due_now` has read **0 for every same-day item** since this report was written. It gates the whole starvation branch. |
+| `? < datetime('now',?) AND NOT EXISTS(... started_at > ?)` | the one you found; both halves cross-format |
+| `MAX(started_at)` | lexical, so a pre-fix legacy row outranks every same-day real one as "most recent" — and that value decides whether the source is declared dead |
+
+So `executor_starved` was dead behind **three independent gates**. It has never
+once been capable of firing, including during the 2026-08-13 starvation it was
+built to catch. All three now meet inside `julianday()`.
+
+**Also fixed, with tests:**
+
+- *(my own defect, found by an independent sweep, not by you)* the `manual_retry`
+  pacing exemption was opened by the BULK paths — `retry_ready()` and a manual
+  `_resume_batch()` stamp the same marker on every row, so one tap on "Retry all
+  ready" sent N items at the source that was already refusing. Now exempt only
+  when exactly **one** manual row is due.
+- **Q2:** an `IN_PROGRESS` attempt holds the lane while its **claim lease** is
+  live, not for the pacing interval.
+- **`_defer_item_only`:** confirmed on every sub-claim including the double
+  increment — `_claim_due` does increment `attempt_count`. Now requires
+  `state='claimed' AND claimed_by=?`, checks rowcount, releases the claim, and
+  does not re-increment.
+- **F10 distinct:** confirmed. Threshold now counts globally distinct items.
+
+**Q4 — the legacy rows: not done, deliberately.** You recommended deleting them. I
+have left them in place: the `julianday()` fixes make them harmless where they were
+previously actively misleading, and deleting production rows is the owner's call,
+not mine. Flagging rather than silently declining.
+
+**Q3 and the restructuring.** Jesse has asked for the full architectural programme,
+not the instance fixes. Recommendation #3 is done — one declared vocabulary,
+enforced by a test — and it is the one that would have prevented this round's
+blocker. #1, #2, #4, #5, #6 and F5's dedicated `last_exhausted_probe_at` are
+staged for subsequent rounds; this branch is not claiming them.
+
+**Full suite: 5035 passed, 0 failed.** `origin/main` baseline in the same
+container: 5 failed, 4971 passed.
+
+### Question for round 2
+
+Your #5 argued the fix must be architectural because the pattern reproduced inside
+the branch fixing it. Agreed. But note *how* this round's blocker was found: not by
+the structure, but by an external reader checking the producer of a value the
+consumer depended on. Of the six recommendations, **which single one would have
+caught THIS blocker without a reviewer?** I believe it is #3 as generalised above —
+make the fact a declared property of the type so omission is impossible — and I
+would rather do that one thoroughly across the other implicit-default fields than
+do all six shallowly. Push back if you think #5's contract matrix is the stronger
+first move.
