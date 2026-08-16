@@ -325,3 +325,132 @@ class TestBookkeepingIsNotAHardDependency:
     def test_it_does_not_raise_before_any_removal(self):
         bare = DownloadService.__new__(DownloadService)
         assert bare._epoch_is_current(bare._current_epoch()) is True
+
+
+class TestTheCheckAndTheWriteAreATOMIC:
+    """Round-2 review, the one MEDIUM left open.
+
+    The first epoch attempt checked, RELEASED the lock, and only then wrote. The
+    original race survived, just narrower:
+
+        poll passes its epoch check
+        removal deletes + evicts + bumps
+        stale poll writes the row back from its pre-removal snapshot
+
+    The earlier epoch tests could not catch this: they proved a COMPLETED removal
+    invalidates an older snapshot, never that a removal landing mid-check is
+    excluded. These force the exact order with real threads.
+    """
+
+    def test_a_removal_cannot_land_between_the_check_and_the_write(self, svc):
+        """The interleaving the reviewer specified, driven by barriers.
+
+        The poll thread enters the critical section and PAUSES inside it. The
+        removal thread then tries to delete. If the two share one lock, the
+        removal cannot proceed until the poll is done -- so the operations are
+        serialised and neither observes a half-applied state.
+        """
+        import threading as _t
+        inside = _t.Event()
+        release = _t.Event()
+        order = []
+
+        _wire(svc, _rows(2))
+
+        def poll_like():
+            # Exactly what poll_results does: one critical section holding both
+            # the epoch check and the persistence.
+            with svc._results_state():
+                order.append("poll:enter")
+                inside.set()
+                release.wait(timeout=5)
+                # the check and the write are both in here
+                assert svc._epoch_is_current_locked(0) is True
+                order.append("poll:wrote")
+
+        def remove_like():
+            inside.wait(timeout=5)
+            order.append("remove:start")
+            svc.remove_packages([1, 2])
+            order.append("remove:done")
+
+        t1 = _t.Thread(target=poll_like)
+        t2 = _t.Thread(target=remove_like)
+        t1.start(); t2.start()
+        inside.wait(timeout=5)
+        release.set()
+        t1.join(timeout=5); t2.join(timeout=5)
+
+        assert order.index("poll:wrote") < order.index("remove:done"), (
+            "the removal completed while the poll held the results lock: %s" % order)
+
+    def test_the_poll_sees_a_STALE_epoch_when_the_removal_won_the_race(self, svc):
+        """The other ordering. If the removal gets there first, the poll's check
+        must fail -- otherwise it writes back a package JD no longer has."""
+        import threading as _t
+        captured = svc._current_epoch()
+        _wire(svc, _rows(2))
+        svc.remove_packages([1, 2])          # removal wins
+        with svc._results_state():
+            assert svc._epoch_is_current_locked(captured) is False, (
+                "a poll holding a pre-removal snapshot would have persisted it")
+
+    def test_the_epoch_advance_is_inside_the_same_section_as_the_deletes(self):
+        """Reading the source, because the ordering is what matters and a unit
+        test cannot see it. The deletes, the cache eviction and the bump must be
+        in ONE `with self._results_state():` -- if the bump drifts outside it
+        again, a poll can slip between the deletes and the advance and write the
+        rows straight back."""
+        import inspect, re
+        src = inspect.getsource(DownloadService.remove_packages)
+        after = src.split("with self._results_state():", 1)
+        assert len(after) == 2, "remove_packages no longer uses the shared section"
+        body = after[1]
+        assert "delete_download_result" in body, "deletes moved outside the lock"
+        assert "_results_cache.pop" in body, "cache eviction moved outside the lock"
+        assert "_results_epoch" in body, "the epoch advance moved outside the lock"
+
+    def test_the_JD_call_stays_OUTSIDE_the_lock(self):
+        """A wedged JDownloader must never block the API route -- that was the
+        reviewer's constraint on the fix, and it is easy to lose by widening the
+        critical section later."""
+        import inspect
+        src = inspect.getsource(DownloadService.remove_packages)
+        head, _, tail = src.partition("with self._results_state():")
+        # Match the CALL EXPRESSION, not the word. The first version asserted
+        # `"remove_links" in head`, which the method's own docstring satisfies --
+        # so deleting the call entirely still passed. A mutant caught it.
+        CALL = "device.downloads.remove_links("
+        assert CALL in head, (
+            "the JDownloader call is not before the results lock; a stuck JD "
+            "call would now block every poll and every other removal")
+        assert CALL not in tail
+
+    def test_the_poll_uses_the_LOCKED_predicate_inside_the_section(self):
+        """`_epoch_is_current` acquires the lock itself. Calling it from inside
+        _results_state() would DEADLOCK on a plain threading.Lock -- and the
+        deadlock would be a hung poller, not a test failure. The lock is left
+        non-reentrant deliberately: an RLock would let the racy check-then-write
+        pattern silently work again, which is the bug this whole section exists
+        to prevent. So the discipline is asserted here instead."""
+        import inspect
+        # _poll_results_inner, not poll_results -- the latter is only the
+        # heartbeat wrapper, and inspecting it finds nothing.
+        src = inspect.getsource(DownloadService._poll_results_inner)
+        head, _, tail = src.partition("with self._results_state():")
+        assert tail, "the poll no longer uses the shared critical section"
+        assert "_epoch_is_current_locked(" in tail, (
+            "the poll must use the _locked predicate inside the section")
+        assert "self._epoch_is_current(" not in tail, (
+            "poll_results calls the self-locking predicate INSIDE the critical "
+            "section -- that deadlocks the poller on a non-reentrant lock")
+
+    def test_the_lock_is_not_reentrant_on_purpose(self):
+        """If this ever becomes an RLock, the check-then-write race can come
+        back silently instead of announcing itself."""
+        import threading as _t
+        bare = DownloadService.__new__(DownloadService)
+        lock = bare._epoch_lock()
+        assert isinstance(lock, type(_t.Lock())), (
+            "the results lock is reentrant; a nested check-then-write would "
+            "stop deadlocking and start racing again")

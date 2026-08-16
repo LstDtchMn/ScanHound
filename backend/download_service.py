@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import time
+import contextlib
 import threading
 import webbrowser
 from contextlib import nullcontext
@@ -1192,6 +1193,31 @@ class DownloadService:
             self._results_epoch = getattr(self, "_results_epoch", 0) + 1
             return self._results_epoch
 
+    @contextlib.contextmanager
+    def _results_state(self):
+        """The short critical section that orders local results state.
+
+        Everything that mutates our own view of the results -- the poll's
+        persistence, and the removal's deletes + cache eviction + epoch advance
+        -- happens inside this. JDownloader network calls stay OUTSIDE it, so a
+        wedged JD call can never block the API route.
+
+        WHY A CONTEXT MANAGER AND NOT JUST THE PREDICATE. The first version
+        checked the epoch, RELEASED the lock, and only then wrote. That leaves
+        the original race intact, just narrower: the poll passes its check, the
+        removal deletes and bumps, and the poll then writes the row back from
+        its pre-removal snapshot. Checking and acting must be one step, or the
+        check is only advice. (Peer review 2026-08-16, round 2.)
+        """
+        with self._epoch_lock():
+            yield
+
+    def _epoch_is_current_locked(self, captured: Optional[int]) -> bool:
+        """The epoch test, for a caller ALREADY inside _results_state()."""
+        if captured is None:
+            return True
+        return captured == getattr(self, "_results_epoch", 0)
+
     def _epoch_is_current(self, captured: Optional[int]) -> bool:
         """May a poll that started at `captured` still write what it saw?
 
@@ -1334,28 +1360,34 @@ class DownloadService:
         # return. Orphans have no JD side, so they go regardless.
         deletable = (with_uuid + orphans) if jd_removed else list(orphans)
 
+        # ONE CRITICAL SECTION, matching the poll's. Deletes, cache eviction and
+        # the epoch advance happen together, so a poll either persists BEFORE all
+        # of this (and the deletes below remove what it wrote) or arrives after
+        # and sees a stale epoch. The JD call above is deliberately outside it --
+        # a wedged JDownloader must never hold this lock.
         removed = 0
-        for row in deletable:
-            try:
-                removed += self.db.delete_download_result(row["id"]) or 0
-            except Exception as e:  # noqa: BLE001
-                errors.append("one row could not be deleted")
-                logger.warning("remove_packages DB delete failed for id %s: %s",
-                               row.get("id"), e)
-        # Evict ONLY what we actually deleted. Evicting a row we deliberately
-        # kept would push the next poll into the cache-miss branch and have it
-        # rewrite the row -- doing the resurrection by hand.
-        deleted_ids = {r["id"] for r in deletable}
-        for row in targets:
-            if row.get("id") not in deleted_ids:
-                continue
-            for key in (row.get("package_uuid"), row.get("name")):
-                if key:
-                    self._results_cache.pop(key, None)
-                    self._uuid_id.pop(key, None)
-                    self._best_titles.pop(key, None)
-        if removed:
-            self._bump_epoch()
+        with self._results_state():
+            for row in deletable:
+                try:
+                    removed += self.db.delete_download_result(row["id"]) or 0
+                except Exception as e:  # noqa: BLE001
+                    errors.append("one row could not be deleted")
+                    logger.warning("remove_packages DB delete failed for id %s: %s",
+                                   row.get("id"), e)
+            # Evict ONLY what we actually deleted. Evicting a row we deliberately
+            # kept would push the next poll into the cache-miss branch and have it
+            # rewrite the row -- doing the resurrection by hand.
+            deleted_ids = {r["id"] for r in deletable}
+            for row in targets:
+                if row.get("id") not in deleted_ids:
+                    continue
+                for key in (row.get("package_uuid"), row.get("name")):
+                    if key:
+                        self._results_cache.pop(key, None)
+                        self._uuid_id.pop(key, None)
+                        self._best_titles.pop(key, None)
+            if removed:
+                self._results_epoch = getattr(self, "_results_epoch", 0) + 1
         return {
             "ok": jd_removed and not errors,
             "removed": removed,
@@ -1573,11 +1605,16 @@ class DownloadService:
             #
             # Skipping persistence costs one cycle; the next poll re-reads JD
             # and writes a snapshot that reflects the removal.
-            if record and self.db and not self._epoch_is_current(snapshot_epoch):
+            # ONE CRITICAL SECTION: verify the epoch AND persist inside it.
+            # Checking and then releasing before the write is what left the race
+            # open after round 1 -- the removal could land in the gap and this
+            # poll would write the row back from its pre-removal snapshot.
+            with self._results_state():
+              if record and self.db and not self._epoch_is_current_locked(snapshot_epoch):
                 logger.debug(
                     "skipping persistence for %r: a removal landed while this "
                     "poll was reading JDownloader", name)
-            elif record and self.db:
+              elif record and self.db:
                 # 'save_to' is for the returned dict (auto-rename hook) and
                 # 'id' is derived, not stored — passing either would TypeError
                 # and the whole row would (silently) never persist.
