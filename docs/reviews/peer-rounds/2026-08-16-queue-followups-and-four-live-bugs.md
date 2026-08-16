@@ -303,7 +303,7 @@ Only `transport_attempted = 1` counts, in both halves: a policy deferral never a
 the source anything. `evidence.no_progress_episode_since` is reported so the verdict
 is checkable.
 
-Your three suggested tests are all present and pass, plus four more.
+Your three suggested tests are all present and pass, plus six more (nine in the class).
 
 ### Two process notes, because both are the session's recurring lesson
 
