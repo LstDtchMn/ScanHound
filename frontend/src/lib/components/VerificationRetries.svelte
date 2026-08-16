@@ -130,6 +130,39 @@
     }
   }
 
+  /** Whether anything is currently held for manual attention.
+   *
+   * Drives the visibility of the clear action so the button only exists when
+   * it can do something — an always-present "clear the hold" invites clicking
+   * it as a general unstick, which is the opposite of what a hold means. */
+  let heldCount = $derived(
+    items.filter((i) => i.state === 'verification_required').length
+  );
+
+  async function clearHold() {
+    busy = 'hold';
+    try {
+      const r = await api.clearVerificationHold('hdencode');
+      // The backend's own wording is better than anything invented here: it
+      // says plainly that a still-active challenge will re-arm the hold within
+      // a cycle, and that this is fail-safe rather than a failure.
+      addToast(
+        r.cleared > 0 ? 'Verification hold released' : 'No hold was open',
+        r.message,
+        r.cleared > 0 ? 'success' : 'info'
+      );
+      await load();
+    } catch (e) {
+      addToast(
+        'Could not release the hold',
+        e instanceof Error ? e.message : 'The request was rejected.',
+        'warning'
+      );
+    } finally {
+      busy = '';
+    }
+  }
+
   async function remove(item: DownloadQueueItem) {
     busy = item.item_uuid;
     try {
@@ -178,6 +211,19 @@
       >
         {busy === 'all' ? 'Scheduling…' : 'Retry all ready'}
       </button>
+      {#if heldCount > 0}
+        <!-- Only shown while something is actually held. This is an operator
+             assertion — "I have dealt with the challenge" — not a general
+             unstick, so it must not be available as ambient furniture. -->
+        <button
+          class="px-3 py-1.5 rounded bg-[var(--bg-tertiary)] border border-[var(--accent)] text-xs disabled:opacity-50"
+          disabled={busy !== ''}
+          title="Releases the hold so ScanHound retries this source. This says you have dealt with the challenge — it does not pass it. If the challenge is still live the hold re-arms within a cycle."
+          onclick={clearHold}
+        >
+          {busy === 'hold' ? 'Releasing…' : 'Release verification hold'}
+        </button>
+      {/if}
       <button class="px-2 py-1.5 rounded bg-[var(--bg-tertiary)] text-xs" onclick={load} disabled={loading}>
         {loading ? 'Loading…' : 'Refresh'}
       </button>

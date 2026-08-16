@@ -360,6 +360,22 @@ export const api = {
     }),
   cancelDownloadBatch: (batchUuid: string) =>
     request<{ ok: boolean; batch_uuid: string }>(`/download/batches/${encodeURIComponent(batchUuid)}`, { method: 'DELETE' }),
+  /** Abandon an open verification hold for a source.
+   *
+   * The route existed from the start but was never wired to any UI, so the
+   * only way to reach the escape hatch was a hand-rolled API call with a
+   * bearer token — which is exactly how it was cleared on 2026-08-16, after
+   * three attempts at shell quoting. The hold is deliberately releasable only
+   * by an affirmative reveal or by this action, so leaving it unreachable made
+   * a permanently-challenged source a dead end. */
+  clearVerificationHold: (source = 'hdencode') =>
+    request<{
+      source: string; cleared: number; remaining_triggers: number;
+      next_action: string; message: string;
+    }>('/download/verification-hold/clear', {
+      method: 'POST',
+      body: JSON.stringify({ source })
+    }),
   scrapeLinks: (url: string, serviceType = 'Rapidgator', title = '', resolution = '') =>
     request<{ links: string[]; count: number }>('/download/scrape', {
       method: 'POST',
