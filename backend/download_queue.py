@@ -783,21 +783,60 @@ class DownloadQueueService:
                   -- silently declines to claim it for up to a minute, and the UI
                   -- reports success for something that has not started.
                   AND (
-                      download_queue_items.queue_reason = 'manual_retry'
+                      -- ONE row, not a batch. retry_ready() and a manual
+                      -- _resume_batch() stamp the SAME marker on every row they
+                      -- promote, so a blanket exemption let one tap on "Retry
+                      -- all ready" send N items back-to-back at the very source
+                      -- that was refusing -- precisely the stampede this gate
+                      -- exists to prevent. A lone due manual row is somebody
+                      -- pressing "Retry now" on one item; several at once is a
+                      -- bulk action, and bulk actions get paced like anything
+                      -- else.
+                      (
+                          download_queue_items.queue_reason = 'manual_retry'
+                          AND (
+                              SELECT COUNT(*) FROM download_queue_items m
+                              WHERE m.source = download_queue_items.source
+                                AND m.queue_reason = 'manual_retry'
+                                AND m.state IN ('scheduled', 'ready')
+                                AND m.scheduled_for IS NOT NULL
+                                AND m.scheduled_for <= ?
+                          ) = 1
+                      )
                       OR NOT EXISTS (
                           SELECT 1 FROM download_queue_attempts a
                           WHERE a.source = download_queue_items.source
-                            AND a.started_at > ?
-                            AND (a.transport_attempted = 1
-                                 OR a.terminal_status = 'IN_PROGRESS')
+                            AND (
+                                -- A KNOWN attempt blocks for the pacing
+                                -- interval...
+                                (a.terminal_status <> 'IN_PROGRESS'
+                                 AND a.transport_attempted = 1
+                                 AND a.started_at > ?)
+                                -- ...but an UNFINISHED one blocks while its
+                                -- claim is still live, which is the rule the
+                                -- comment always claimed. Tying it to the pacing
+                                -- interval instead meant a wedged worker stopped
+                                -- holding the lane after 60s while its lease ran
+                                -- for far longer (2026-08-16 review, Q2).
+                                OR (a.terminal_status = 'IN_PROGRESS'
+                                    AND EXISTS (
+                                        SELECT 1 FROM download_queue_items c
+                                        WHERE c.item_uuid = a.item_uuid
+                                          AND c.state = 'claimed'
+                                          AND c.claim_expires_at IS NOT NULL
+                                          AND c.claim_expires_at > ?
+                                    ))
+                            )
                       )
                   )
                 ORDER BY scheduled_for, sequence_number
                 LIMIT 1
                 """,
                 (now,
+                 now,
                  _sql_utc(_utcnow() - timedelta(
-                     seconds=self._source_interval_seconds()))),
+                     seconds=self._source_interval_seconds())),
+                 now),
             ).fetchone()
             if row is None:
                 return None
@@ -1287,7 +1326,7 @@ class DownloadQueueService:
         with self.db.transaction() as conn:
             if not conn:
                 return False
-            conn.execute(
+            updated = conn.execute(
                 """
                 UPDATE download_queue_items
                 SET state = 'ready',
@@ -1311,16 +1350,43 @@ class DownloadQueueService:
                     last_reason_code = ?,
                     last_cause_code = ?,
                     last_message = ?,
-                    attempt_count = attempt_count + 1,
+                    -- NOT attempt_count + 1: _claim_due already incremented it
+                    -- when it claimed this row, so adding another here counted
+                    -- one attempt twice and made every deferral look like two.
                     transport_attempted = 1,
+                    -- RELEASE THE CLAIM. Leaving claimed_by/claim_expires_at set
+                    -- on a row put back to 'ready' leaves it owned by a worker
+                    -- that is finished with it, which the lease watchdog would
+                    -- later read as an expired claim on live work.
+                    claimed_by = NULL,
+                    claim_expires_at = NULL,
                     updated_at = ?
+                -- OWNERSHIP PREDICATE, matching _complete/_fail/_pause_for_source.
+                -- This used to be `WHERE item_uuid = ?` alone -- the only terminal
+                -- path with no ownership check. That is a real race: once the
+                -- lease expires the watchdog writes operation_timeout_unknown, a
+                -- safety state whose whole meaning is "we do not know whether the
+                -- delivery happened". A late worker arriving here could overwrite
+                -- it back to 'ready' and the item would be retried -- possibly
+                -- duplicating a delivery that already succeeded.
                 WHERE item_uuid = ?
+                  AND state = 'claimed'
+                  AND claimed_by = ?
                 """,
                 (outcome.get("cooldown_until") or now,
                  outcome.get("cooldown_until"),
                  outcome.get("reason_code"), outcome.get("cause_code"),
-                 outcome.get("message"), now, item["item_uuid"]),
-            )
+                 outcome.get("message"), now, item["item_uuid"], self.worker_id),
+            ).rowcount
+            if updated != 1:
+                # Same discipline as _pause_for_source: no row means we no longer
+                # own this item, and writing anything further would be a stale
+                # worker overwriting whoever does.
+                logger.warning(
+                    "ignored stale item-local deferral for queue item %s",
+                    item.get("item_uuid"),
+                )
+                return False
         row = self.get_item(item["item_uuid"]) or {"item_uuid": item["item_uuid"]}
         self._emit("download:queue_updated", row)
         return True

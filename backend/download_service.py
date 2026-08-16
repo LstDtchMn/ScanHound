@@ -2145,17 +2145,31 @@ class DownloadService:
                 # test_scrape_reason_policy_invariant flags because a static audit
                 # of reason codes can no longer see it. The invariant is worth more
                 # than the brevity.
+                # transport_attempted=True IS LOAD-BEARING, not decoration.
+                # Both of these are decided AFTER navigation -- we are looking at
+                # `reveal_tier`, which only exists because the page was fetched
+                # and inspected. ScrapeDiagnostic defaults the flag to None,
+                # which _close_attempt reduces to False, and
+                # scraper_drift_report() counts only transport_attempted = 1.
+                # So without this the drift detector could never see a single
+                # real structural failure: the feature shipped inert, and its
+                # own tests passed because they build attempt rows directly
+                # instead of going through this producer. (2026-08-16 peer
+                # review, and the same consumer-not-verified shape as the four
+                # bugs that review was about.)
                 if reveal_tier in ("ambiguous", "destination-rejected"):
                     return ScrapeDiagnostic(
                         ScrapeCode.LAYOUT_CHANGED,
                         retryable=False,
                         affects_source_health=True,
+                        transport_attempted=True,
                         signals=tuple(signals),
                     )
                 return ScrapeDiagnostic(
                     ScrapeCode.REVEAL_CONTROL_ABSENT,
                     retryable=False,
                     affects_source_health=True,
+                    transport_attempted=True,
                     signals=tuple(signals),
                 )
             if stage == "requested_host":

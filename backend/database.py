@@ -5633,18 +5633,39 @@ class DatabaseManager:
         """
         out = {"drifting": False, "by_reason": {}, "distinct_items": 0}
         try:
+            # One canonical cutoff string, in the attempts table's own shape --
+            # never a bare datetime('now', ?), which is a DIFFERENT shape from
+            # what _attempt_stamp writes and compares wrong on the same day.
+            cutoff = self._attempt_stamp(
+                datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(seconds=int(within_seconds)))
             rows = self._query_dicts(
                 "SELECT reason_code, COUNT(DISTINCT item_uuid) AS n "
                 "FROM download_queue_attempts "
                 "WHERE reason_code IN (%s) AND transport_attempted = 1 "
-                "  AND started_at > datetime('now', ?) "
+                "  AND started_at > ? "
                 "GROUP BY reason_code"
                 % ",".join("?" for _ in self._STRUCTURAL_REASONS),
-                tuple(self._STRUCTURAL_REASONS) + ("-%d seconds" % int(within_seconds),),
+                tuple(self._STRUCTURAL_REASONS) + (cutoff,),
                 default=[])
             for r in rows:
                 out["by_reason"][str(r.get("reason_code"))] = int(r.get("n") or 0)
-            out["distinct_items"] = sum(out["by_reason"].values())
+            # GLOBALLY distinct, not the sum of the per-reason counts. Summing
+            # them double-counts an item that failed once with layout_changed
+            # and once with reveal_control_absent, so ONE stubborn release could
+            # contribute 2 toward a threshold documented as three DISTINCT items
+            # -- the exact "one page manufactures its own evidence" failure the
+            # DISTINCT was there to prevent. by_reason stays per-reason; only the
+            # threshold input changes.
+            total = self._query_dicts(
+                "SELECT COUNT(DISTINCT item_uuid) AS n "
+                "FROM download_queue_attempts "
+                "WHERE reason_code IN (%s) AND transport_attempted = 1 "
+                "  AND started_at > ?"
+                % ",".join("?" for _ in self._STRUCTURAL_REASONS),
+                tuple(self._STRUCTURAL_REASONS) + (cutoff,),
+                default=[])
+            out["distinct_items"] = int((total[0] if total else {}).get("n") or 0)
             out["drifting"] = out["distinct_items"] >= self.SCRAPER_DRIFT_DISTINCT_ITEMS
         except Exception as e:  # noqa: BLE001
             logger.error("scraper_drift_report failed: %s", e)
@@ -5718,17 +5739,41 @@ class DatabaseManager:
         report = {"executor_starved": False, "source_no_progress": False,
                   "human_required": False, "evidence": {}}
         try:
+            # EVERY TIMESTAMP PREDICATE IN THIS REPORT GOES THROUGH julianday().
+            #
+            # This one decided whether ANY work is due, and it gates the whole
+            # starvation branch below. scheduled_for is written by
+            # download_queue._iso() as "2026-08-16T09:00:00+00:00"; datetime('now')
+            # is "2026-08-16 14:00:00". 'T' (0x54) sorts after ' ' (0x20), so on
+            # the same calendar day the ISO string is always the larger and
+            # `scheduled_for <= now` is FALSE for everything. due_now has
+            # therefore read 0 for every same-day item since this report was
+            # written, which is why the stall detector it was built for could
+            # never fire -- three separate predicates here had the same defect.
+            #
+            # julianday() parses both shapes to a number. The rule for this file:
+            # if two timestamps meet in SQL and they might not share a shape,
+            # they meet inside julianday().
             due = self._query_dicts(
-                "SELECT COUNT(*) AS n, MIN(scheduled_for) AS oldest "
+                "SELECT COUNT(*) AS n, "
+                "       (SELECT scheduled_for FROM download_queue_items "
+                "        WHERE state IN ('scheduled','ready') "
+                "          AND scheduled_for IS NOT NULL "
+                f"          AND julianday(scheduled_for) <= julianday({now_expr}) "
+                "        ORDER BY julianday(scheduled_for) LIMIT 1) AS oldest "
                 "FROM download_queue_items "
                 "WHERE state IN ('scheduled','ready') AND scheduled_for IS NOT NULL "
-                f"  AND scheduled_for <= {now_expr}", default=[])
+                f"  AND julianday(scheduled_for) <= julianday({now_expr})",
+                default=[])
             due_n = int((due[0] if due else {}).get("n") or 0)
             oldest_due = (due[0] if due else {}).get("oldest")
 
+            # By TIME, not by spelling: this column still holds pre-2026-08-16
+            # rows in the old ISO shape beside the canonical one, and a lexical
+            # MAX() would hand back a stale legacy row as "most recent".
             last_attempt = self._query_dicts(
-                "SELECT MAX(started_at) AS t FROM download_queue_attempts",
-                default=[])
+                "SELECT started_at AS t FROM download_queue_attempts "
+                "ORDER BY julianday(started_at) DESC LIMIT 1", default=[])
             last_attempt_at = (last_attempt[0] if last_attempt else {}).get("t")
 
             held = self._query_dicts(
@@ -5763,9 +5808,31 @@ class DatabaseManager:
             #    is then CORRECT, and calling it a scheduler fault would send
             #    someone after the wrong bug.
             if due_n and not held_n and oldest_due:
+                # julianday() ON BOTH SIDES, and it is not a style preference.
+                #
+                # This compared timestamp STRINGS in two different shapes:
+                # `oldest_due` comes from download_queue_items.scheduled_for,
+                # written by download_queue._iso() as "2026-08-16T09:00:00+00:00",
+                # while datetime('now') and download_queue_attempts.started_at are
+                # "2026-08-16 14:00:00". 'T' (0x54) sorts after ' ' (0x20), so on
+                # the SAME calendar day the ISO string always compares as the
+                # larger one whatever the real times are.
+                #
+                # Both halves were therefore wrong. `oldest_due < cutoff` was
+                # false all day, so THIS ALERT COULD NEVER FIRE -- present on main
+                # since the alert was written, which is why the 2026-08-13
+                # starvation it was built for stayed invisible. And an attempt
+                # that really did start hours after the item came due compared as
+                # "has not started", so once the first half was fixed the second
+                # would have reported starvation while work was running.
+                #
+                # julianday() parses both shapes to a number, so the comparison is
+                # about time again rather than about ASCII.
                 starved = self._query_dicts(
-                    "SELECT 1 AS x WHERE ? < datetime('now', ?) AND NOT EXISTS ("
-                    "  SELECT 1 FROM download_queue_attempts WHERE started_at > ?)",
+                    "SELECT 1 AS x WHERE julianday(?) < julianday(datetime('now', ?)) "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM download_queue_attempts "
+                    "  WHERE julianday(started_at) > julianday(?))",
                     (oldest_due, "-%d seconds" % self.QUEUE_EXECUTOR_GRACE_SECONDS,
                      oldest_due), default=[])
                 report["executor_starved"] = bool(starved)
@@ -5782,16 +5849,26 @@ class DatabaseManager:
                 interval = int((pace[0] if pace else {}).get("s") or 600)
                 deadline = max(self.QUEUE_PROGRESS_FLOOR_SECONDS,
                                interval * self.QUEUE_PROGRESS_INTERVAL_MULTIPLE)
+                # MAX() BY TIME, NOT BY SPELLING. A bare MAX(started_at) is a
+                # lexical max, and this column still holds rows written before
+                # 2026-08-16 in the old "2026-08-16T03:51:41" shape alongside the
+                # canonical "2026-08-16 03:51:41". 'T' sorts after ' ', so a
+                # stale legacy row wins MAX() against every same-day real one --
+                # and this value is what decides whether the source is declared
+                # dead. Ordering by julianday picks the genuinely newest whatever
+                # shape it is, so the legacy rows are harmless rather than
+                # actively misleading.
                 prog = self._query_dicts(
-                    "SELECT MAX(started_at) AS t FROM download_queue_attempts "
-                    "WHERE source_progress = 1", default=[])
+                    "SELECT started_at AS t FROM download_queue_attempts "
+                    "WHERE source_progress = 1 "
+                    "ORDER BY julianday(started_at) DESC LIMIT 1", default=[])
                 last_progress = (prog[0] if prog else {}).get("t")
                 report["evidence"]["last_source_progress_at"] = last_progress
                 report["evidence"]["progress_deadline_seconds"] = deadline
                 if last_attempt_at:
                     stale = self._query_dicts(
-                        "SELECT 1 AS x WHERE COALESCE(?, '1970-01-01') "
-                        "  < datetime('now', ?)",
+                        "SELECT 1 AS x WHERE julianday(COALESCE(?, '1970-01-01')) "
+                        "  < julianday(datetime('now', ?))",
                         (last_progress, "-%d seconds" % deadline), default=[])
                     report["source_no_progress"] = bool(stale)
         except Exception as e:  # noqa: BLE001

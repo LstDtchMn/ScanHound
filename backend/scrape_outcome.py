@@ -128,6 +128,64 @@ _SIGNAL_BEARING_CODES = frozenset({
 })
 
 
+#: DID REACHING THIS VERDICT REQUIRE CONTACTING THE SOURCE?
+#:
+#: This is a property of the CODE, not of the call site. It used to be an
+#: optional constructor argument defaulting to None, and nine of the fourteen
+#: construction sites in download_service never passed it -- including
+#: LAYOUT_CHANGED and REVEAL_CONTROL_ABSENT, which are decided only AFTER the
+#: page has been fetched and inspected. `bool(None)` is False, so those two were
+#: persisted as "never contacted the source", and scraper_drift_report() counts
+#: only transport_attempted = 1. The drift detector therefore shipped unable to
+#: see a single real structural failure, while its own tests passed because they
+#: build attempt rows directly instead of going through this producer.
+#:
+#: Declared here so the question is answered once per code and cannot be
+#: forgotten at a call site. `test_every_scrape_code_declares_transport` fails if
+#: a new code is added without an entry -- an omission must be a build error, not
+#: a silent False. A call site may still pass transport_attempted explicitly to
+#: override, for the genuinely conditional cases.
+#:
+#: The consumers this feeds, and why a wrong answer is costly in BOTH directions:
+#:   * F4 source pacing -- True spends the source's capacity lane
+#:   * _scope_is_earned  -- only True rows are evidence about the source
+#:   * queue_source_observations -- source liveness
+#:   * scraper_drift_report -- only True rows can indicate template drift
+#: False on something that did contact the source hides evidence; True on
+#: something that did not manufactures it.
+_TRANSPORT_BY_CODE = {
+    # Refused locally, before any request. The message says so in as many words.
+    ScrapeCode.SOURCE_DISABLED: False,
+    ScrapeCode.SOURCE_TEMPORARILY_BLOCKED: False,
+    # The browser never started, so nothing left the machine.
+    ScrapeCode.BROWSER_LAUNCH_FAILED: False,
+    # A network or DNS error IS an attempt to reach the source. It failed, but
+    # "we tried and could not connect" is not the same as "we never asked", and
+    # only the first is evidence about the source.
+    ScrapeCode.BROWSER_NETWORK_ERROR: True,
+    ScrapeCode.BROWSER_NAVIGATION_FAILED: True,
+    # Everything below is decided by looking at a page we fetched.
+    ScrapeCode.INTERACTIVE_CHALLENGE: True,
+    ScrapeCode.LAYOUT_CHANGED: True,
+    ScrapeCode.REVEAL_CONTROL_ABSENT: True,
+    ScrapeCode.REVEAL_VERIFICATION_STALLED: True,
+    ScrapeCode.REQUESTED_HOST_MISSING: True,
+    ScrapeCode.NO_FILE_HOST_LINKS: True,
+    # AMBIGUOUS BY NATURE, resolved CONSERVATIVELY as True. The exception may
+    # have been raised before or after navigation; we cannot tell from the code
+    # alone. True is the safer error: it spends the source's pacing lane for one
+    # interval, where False would let a failure that may well have hammered the
+    # source go unpaced. Pass transport_attempted=False explicitly at a site that
+    # KNOWS nothing was sent.
+    ScrapeCode.SCRAPE_EXCEPTION: True,
+    # The URL is already a file-host link, so there is no source page and this is
+    # not a failure at all -- nothing was fetched from a source.
+    ScrapeCode.DIRECT_LINK_NO_SOURCE_PAGE: False,
+    # Declined before dispatch: we have no scraper for this host.
+    ScrapeCode.UNSUPPORTED_SOURCE: False,
+}
+
+
 @dataclass(frozen=True)
 class ScrapeDiagnostic:
     code: ScrapeCode
@@ -151,6 +209,21 @@ class ScrapeDiagnostic:
     def public_message(self) -> str:
         """Stable user-facing text that never includes raw exception details."""
         return _MESSAGES[self.code]
+
+    @property
+    def effective_transport_attempted(self) -> bool:
+        """Whether this outcome means the source was actually contacted.
+
+        An explicit constructor value wins; otherwise the answer comes from the
+        code itself (_TRANSPORT_BY_CODE). Never returns None: every consumer
+        coerces with bool(), so a None here silently becomes False, and False is
+        an ASSERTION that nothing was sent -- which for a post-navigation code is
+        simply untrue. Making this total is what stops the drift detector, the
+        scope classifier and the pacing gate from being fed a fabricated fact.
+        """
+        if self.transport_attempted is not None:
+            return bool(self.transport_attempted)
+        return _TRANSPORT_BY_CODE[self.code]
 
     @property
     def persisted_message(self) -> str:
@@ -193,7 +266,10 @@ class ScrapeDiagnostic:
             "retryable": self.retryable,
             "retry_mode": self.retry_mode,
             "cooldown_until": self.cooldown_until,
-            "transport_attempted": self.transport_attempted,
+            # An explicit value at the call site still wins; None means "you did
+            # not say", and the answer is a property of the code, not an
+            # accidental False. See _TRANSPORT_BY_CODE.
+            "transport_attempted": self.effective_transport_attempted,
             "affected_scope": self.affected_scope,
             "action_code": self.action_code,
             "deferred": self.deferred,

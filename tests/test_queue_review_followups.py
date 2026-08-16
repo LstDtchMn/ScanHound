@@ -554,3 +554,266 @@ class TestPacingThrottlesTheMachineNotTheOperator:
                 f"{fn} writes queue_reason='manual_retry' but no longer parks the "
                 "row as 'failed'. If it is now claimable it BYPASSES source "
                 "pacing, because the gate treats manual_retry as 'a human asked'.")
+
+
+class TestTransportIsDeclaredPerCode:
+    """The 2026-08-16 review blocker: LAYOUT_CHANGED and REVEAL_CONTROL_ABSENT
+    are decided only AFTER the page is fetched, but neither construction site
+    passed transport_attempted, so it defaulted to None -> bool(None) is False
+    -> persisted as 0 -> scraper_drift_report (which counts only 1) could never
+    see a real structural failure. F10 shipped inert, and its own tests passed
+    because they insert attempt rows directly instead of using the producer."""
+
+    def test_every_scrape_code_declares_transport(self):
+        """An omission must be a BUILD ERROR, not a silent False. This is the
+        whole point of moving the answer off the call sites: nine of fourteen
+        sites had quietly omitted it."""
+        from backend.scrape_outcome import ScrapeCode, _TRANSPORT_BY_CODE
+        missing = [c.name for c in ScrapeCode if c not in _TRANSPORT_BY_CODE]
+        assert not missing, (
+            "ScrapeCode(s) with no declared transport semantics: %s. Add an entry "
+            "to _TRANSPORT_BY_CODE -- defaulting silently is how F10 shipped "
+            "unable to see its own evidence." % missing)
+
+    def test_the_structural_codes_report_contact(self):
+        from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
+        for code in (ScrapeCode.LAYOUT_CHANGED, ScrapeCode.REVEAL_CONTROL_ABSENT):
+            d = ScrapeDiagnostic(code, retryable=False, affects_source_health=True)
+            assert d.to_dict()["transport_attempted"] is True, code.name
+
+    def test_the_pre_request_refusals_report_no_contact(self):
+        """Control: if everything said True the flag would carry no information."""
+        from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
+        for code in (ScrapeCode.SOURCE_DISABLED,
+                     ScrapeCode.SOURCE_TEMPORARILY_BLOCKED,
+                     ScrapeCode.BROWSER_LAUNCH_FAILED,
+                     ScrapeCode.UNSUPPORTED_SOURCE,
+                     ScrapeCode.DIRECT_LINK_NO_SOURCE_PAGE):
+            d = ScrapeDiagnostic(code)
+            assert d.to_dict()["transport_attempted"] is False, code.name
+
+    def test_an_explicit_value_still_wins(self):
+        """A site that KNOWS nothing was sent must be able to say so."""
+        from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
+        d = ScrapeDiagnostic(ScrapeCode.SCRAPE_EXCEPTION, transport_attempted=False)
+        assert d.to_dict()["transport_attempted"] is False
+
+    def test_the_flag_is_never_None_on_the_wire(self):
+        """Every consumer coerces with bool(), so None silently becomes False --
+        an assertion of 'no request was made' that nobody wrote."""
+        from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
+        for code in ScrapeCode:
+            assert ScrapeDiagnostic(code).to_dict()["transport_attempted"] in (True, False), code.name
+
+    def test_a_real_structural_failure_reaches_the_drift_report(self, db):
+        """The seam the blocker lived in: producer -> queue -> attempt row ->
+        scraper_drift_report. Every earlier F10 test started halfway along it."""
+        from unittest.mock import MagicMock
+        from backend.download_outcome import public_download_result
+        from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
+
+        for n in range(3):
+            fake = MagicMock()
+            fake.download_item.return_value = public_download_result(
+                {"success": False, "method": "", "link_count": 0,
+                 **ScrapeDiagnostic(ScrapeCode.LAYOUT_CHANGED, retryable=False,
+                                    affects_source_health=True).to_dict()},
+                title="T%d" % n, url="https://hdencode.org/%d" % n)
+            svc = DownloadQueueService({}, db, fake, broadcast=lambda *a: None)
+            svc.schedule_batch(
+                [{"url": "https://hdencode.org/%d" % n, "title": "T%d" % n,
+                  "year": 2020, "resolution": "2160p", "size_text": "1 GB",
+                  "hdr": "", "dovi": 0, "service_type": "Rapidgator",
+                  "source": "hdencode"}], interval_minutes=0, mode="immediate")
+            item = svc._claim_due()
+            assert item is not None, "claim %d refused; fixture is vacuous" % n
+            svc._execute(item)
+            db._mutate("UPDATE download_queue_attempts SET started_at = "
+                       "datetime('now', '-1 minute')", (), label="t")
+
+        rows = db._query_dicts(
+            "SELECT reason_code, transport_attempted FROM download_queue_attempts",
+            (), default=[])
+        assert all(r["transport_attempted"] == 1 for r in rows), (
+            "the producer still records structural failures as 'never contacted "
+            "the source': %s" % rows)
+        report = db.scraper_drift_report()
+        assert report["drifting"] is True, report
+        assert report["distinct_items"] == 3, report
+
+
+class TestPeerReviewFixes:
+    """The 2026-08-16 ChatGPT round, beyond the F10 blocker."""
+
+    def _svc(self, db, n=3, result=None):
+        from unittest.mock import MagicMock
+        fake = MagicMock()
+        fake.download_item.return_value = result or {
+            "success": True, "method": "jdownloader", "link_count": 2,
+            "message": "Sent"}
+        svc = DownloadQueueService({}, db, fake, broadcast=lambda *a: None)
+        svc.schedule_batch(
+            [{"url": "https://hdencode.org/%d" % i, "title": "T%d" % i,
+              "year": 2020, "resolution": "2160p", "size_text": "1 GB",
+              "hdr": "", "dovi": 0, "service_type": "Rapidgator",
+              "source": "hdencode"} for i in range(n)],
+            interval_minutes=0, mode="immediate")
+        return svc
+
+    def _spend_the_lane(self, svc):
+        first = svc._claim_due()
+        assert first is not None
+        svc._execute(first)
+        assert svc._claim_due() is None, "the lane was not spent; test is vacuous"
+
+    def _stall(self):
+        return {"success": False, "method": "", "link_count": 0,
+                "message": "stalled", "reason_code": "reveal_verification_stalled",
+                "stage": "reveal", "retryable": True, "retry_mode": "auto",
+                "transport_attempted": True, "affected_scope": "source",
+                "action_code": "retry", "signals": []}
+
+    # --- the exemption must not open the gate for a BULK retry ---------------
+
+    def test_one_manual_row_is_exempt(self, db):
+        """Positive control for the two negatives below."""
+        svc = self._svc(db)
+        self._spend_the_lane(svc)
+        row = db._query_dicts("SELECT item_uuid FROM download_queue_items "
+                              "WHERE state IN ('scheduled','ready') "
+                              "ORDER BY sequence_number LIMIT 1", (), default=[])[0]
+        db._mutate("UPDATE download_queue_items SET queue_reason = 'manual_retry' "
+                   "WHERE item_uuid = ?", (row["item_uuid"],), label="t")
+        assert svc._claim_due() is not None
+
+    def test_a_BULK_manual_retry_is_still_paced(self, db):
+        """retry_ready() and a manual resume stamp the SAME marker on every row.
+        A blanket exemption let one tap send N items at the source that was
+        already refusing -- the stampede the gate exists to prevent."""
+        svc = self._svc(db)
+        self._spend_the_lane(svc)
+        db._mutate("UPDATE download_queue_items SET queue_reason = 'manual_retry' "
+                   "WHERE state IN ('scheduled','ready')", (), label="t")
+        due = db._query_dicts("SELECT COUNT(*) AS n FROM download_queue_items "
+                              "WHERE queue_reason='manual_retry' AND state IN "
+                              "('scheduled','ready')", (), default=[])[0]["n"]
+        assert due >= 2, "fixture must promote MORE than one row"
+        assert svc._claim_due() is None, (
+            "a bulk manual promotion bypassed source pacing")
+
+    def test_retry_ready_does_not_bypass_pacing(self, db):
+        """The real bulk path, not a hand-written UPDATE."""
+        svc = self._svc(db, n=3)
+        self._spend_the_lane(svc)
+        db._mutate("UPDATE download_queue_items SET state='waiting_source', "
+                   "queue_reason='source_deferred', "
+                   "cooldown_until=datetime('now','-1 hour') "
+                   "WHERE state IN ('scheduled','ready')", (), label="t")
+        svc.retry_ready(interval_minutes=0)
+        assert svc._claim_due() is None, (
+            "Retry all ready opened the source lane for the whole batch")
+
+    # --- IN_PROGRESS holds by the CLAIM LEASE, not the pacing interval -------
+
+    def test_a_live_claim_holds_the_lane_past_the_pacing_interval(self, db):
+        svc = self._svc(db)
+        first = svc._claim_due()
+        db.begin_queue_attempt("open-1", first["item_uuid"], first["batch_uuid"],
+                               first["source"])
+        db._mutate("UPDATE download_queue_attempts SET started_at = "
+                   "datetime('now', '-2 hours') WHERE attempt_id = 'open-1'",
+                   (), label="t")
+        assert svc._claim_due() is None, (
+            "an unfinished attempt stopped holding the lane after the pacing "
+            "interval instead of while its claim was live")
+
+    def test_an_EXPIRED_claim_stops_holding_the_lane(self, db):
+        """Control: otherwise a dead worker would block the source forever."""
+        svc = self._svc(db)
+        first = svc._claim_due()
+        db.begin_queue_attempt("open-2", first["item_uuid"], first["batch_uuid"],
+                               first["source"])
+        db._mutate("UPDATE download_queue_attempts SET started_at = "
+                   "datetime('now', '-2 hours') WHERE attempt_id = 'open-2'",
+                   (), label="t")
+        db._mutate("UPDATE download_queue_items SET claim_expires_at = ? "
+                   "WHERE item_uuid = ?",
+                   ("1999-01-01T00:00:00+00:00", first["item_uuid"]), label="t")
+        assert svc._claim_due() is not None
+
+    # --- _defer_item_only ownership discipline ------------------------------
+
+    def test_a_deferral_does_not_double_count_the_attempt(self, db):
+        """_claim_due already incremented attempt_count when it claimed."""
+        svc = self._svc(db, n=1, result=self._stall())
+        item = svc._claim_due()
+        svc._execute(item)
+        row = db._query_dicts("SELECT attempt_count FROM download_queue_items "
+                              "WHERE item_uuid = ?", (item["item_uuid"],),
+                              default=[])[0]
+        assert row["attempt_count"] == 1, (
+            "one attempt was counted %d times" % row["attempt_count"])
+
+    def test_a_deferral_releases_the_claim(self, db):
+        svc = self._svc(db, n=1, result=self._stall())
+        item = svc._claim_due()
+        svc._execute(item)
+        row = db._query_dicts("SELECT state, claimed_by, claim_expires_at FROM "
+                              "download_queue_items WHERE item_uuid = ?",
+                              (item["item_uuid"],), default=[])[0]
+        assert row["state"] == "ready"
+        assert row["claimed_by"] is None and row["claim_expires_at"] is None, (
+            "a row put back to ready is still owned by a finished worker")
+
+    def test_a_deferral_cannot_overwrite_the_watchdogs_safety_state(self, db):
+        """THE RACE: once the lease expires the watchdog writes
+        operation_timeout_unknown, whose whole meaning is 'we do not know
+        whether the delivery happened'. A late worker must not resurrect it to
+        ready and risk duplicating a delivery that already succeeded."""
+        svc = self._svc(db, n=1, result=self._stall())
+        item = svc._claim_due()
+        db._mutate("UPDATE download_queue_items SET state='failed', "
+                   "claimed_by=NULL, last_reason_code='operation_timeout_unknown' "
+                   "WHERE item_uuid = ?", (item["item_uuid"],), label="t")
+        assert svc._defer_item_only(item, self._stall()) is False
+        row = db._query_dicts("SELECT state, last_reason_code FROM "
+                              "download_queue_items WHERE item_uuid = ?",
+                              (item["item_uuid"],), default=[])[0]
+        assert row["state"] == "failed"
+        assert row["last_reason_code"] == "operation_timeout_unknown"
+
+    # --- F10 distinct is GLOBAL ---------------------------------------------
+
+    def test_one_item_failing_two_structural_ways_counts_once(self, db):
+        """Summing per-reason DISTINCT counts let ONE release contribute 2
+        toward a threshold documented as three distinct items."""
+        same = str(uuid.uuid4())
+        _attempt(db, reason="layout_changed", item=same)
+        _attempt(db, reason="reveal_control_absent", item=same)
+        r = db.scraper_drift_report()
+        assert r["distinct_items"] == 1, r
+        assert r["drifting"] is False
+        assert r["by_reason"] == {"layout_changed": 1, "reveal_control_absent": 1}
+
+    # --- the starvation alert can actually fire -----------------------------
+
+    def test_the_starvation_alert_can_fire_on_the_same_day(self, db):
+        """It compared scheduled_for (ISO T) against sqlite's space format, so
+        on any given day it was false all day. Dead since it was written."""
+        self._svc(db, n=1)
+        db._mutate("UPDATE download_queue_items SET state='ready', "
+                   "scheduled_for = REPLACE(datetime('now','-3 hours'),' ','T') "
+                   "|| '+00:00'", (), label="t")
+        rep = db.queue_stall_report()
+        assert rep["executor_starved"] is True, (
+            "work due 3 hours ago with no attempt is starvation: %s" % rep)
+
+    def test_an_attempt_that_started_after_the_due_time_is_not_starvation(self, db):
+        """Control: with the fix, a real attempt must clear the alarm."""
+        self._svc(db, n=1)
+        db._mutate("UPDATE download_queue_items SET state='ready', "
+                   "scheduled_for = REPLACE(datetime('now','-3 hours'),' ','T') "
+                   "|| '+00:00'", (), label="t")
+        _attempt(db, started="-1 hour")
+        rep = db.queue_stall_report()
+        assert rep["executor_starved"] is False, rep
