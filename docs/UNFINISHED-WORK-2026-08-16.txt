@@ -1,4 +1,15 @@
 UNFINISHED WORK AUDIT - 2026-08-16
+(RAW SWEEP - SCOPE TOO WIDE, SEE NOTE)
+
+SCOPE ERROR, recorded 2026-08-16: this raw sweep covers ScanHound AND the whole
+homelab (Frigate, Immich, Procare, VLANs, UniFi, the MedSpa site, TL-* items).
+The request was about recent CODING work; widening it to the house was a mistake
+in how the sweep was commissioned, not a finding.
+
+For the ScanHound-only view -- which is the actionable one -- read
+PRIORITY-PLAN-2026-08-16.md. Infrastructure items belong in
+C:\DockerData\infra-ops\BACKLOG.md and are already tracked there as TL-numbers.
+This file is kept only as the raw evidence dump behind the plan.
 =================================
 
 HOW THIS WAS PRODUCED. A parallel sweep of: the memory directory, git branches and
