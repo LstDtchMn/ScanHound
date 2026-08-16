@@ -186,6 +186,54 @@ _TRANSPORT_BY_CODE = {
 }
 
 
+#: WHOSE PROBLEM IS THIS -- the source, or this one item?
+#:
+#: Declared per code for the same reason as _TRANSPORT_BY_CODE, and with a
+#: sharper motive: `is_source_wide_denial()` is an AND of TWO registries --
+#: `affected_scope == "source"` AND `reason_code in _SOURCE_WIDE_REASONS`. Two
+#: places answering one question is exactly how `_source()` drifted in 2026-08-07,
+#: and the failure mode here is severe: a code listed in the set but constructed
+#: without `affected_scope="source"` silently routes to _fail instead of
+#: _pause_for_source, which is how 78 items became permanent failures.
+#:
+#: Today all four source-wide codes do pass it explicitly, so this is not a live
+#: bug -- it is a live TRAP, disarmed by making the set derive from this table
+#: instead of being maintained beside it. Adding a code to one and not the other
+#: is now impossible.
+_SCOPE_BY_CODE = {
+    # The source is refusing or unavailable to everyone, so pausing the batch is
+    # the correct response and continuing would burn the queue.
+    ScrapeCode.SOURCE_DISABLED: "source",
+    ScrapeCode.SOURCE_TEMPORARILY_BLOCKED: "source",
+    ScrapeCode.INTERACTIVE_CHALLENGE: "source",
+    ScrapeCode.REVEAL_VERIFICATION_STALLED: "source",
+    # Everything below is about THIS request or THIS page. A sibling has no
+    # reason to expect the same outcome, so parking the batch on one of these
+    # would strand work for no evidence.
+    #
+    # The browser failures are deliberately item-scoped even though a broken
+    # browser affects everything: the fault is OURS, not the source's, and
+    # labelling it "source" would pause the source and hide a local outage
+    # behind a message about HDEncode.
+    ScrapeCode.BROWSER_LAUNCH_FAILED: "item",
+    ScrapeCode.BROWSER_NETWORK_ERROR: "item",
+    ScrapeCode.BROWSER_NAVIGATION_FAILED: "item",
+    ScrapeCode.LAYOUT_CHANGED: "item",
+    ScrapeCode.REVEAL_CONTROL_ABSENT: "item",
+    ScrapeCode.REQUESTED_HOST_MISSING: "item",
+    ScrapeCode.NO_FILE_HOST_LINKS: "item",
+    ScrapeCode.SCRAPE_EXCEPTION: "item",
+    ScrapeCode.DIRECT_LINK_NO_SOURCE_PAGE: "item",
+    ScrapeCode.UNSUPPORTED_SOURCE: "item",
+}
+
+#: The reason codes whose scope is source-wide, DERIVED rather than declared.
+#: `download_outcome._SOURCE_WIDE_REASONS` is built from this, so the set and the
+#: per-diagnostic value can never disagree.
+SOURCE_WIDE_CODES = frozenset(
+    code.value for code, scope in _SCOPE_BY_CODE.items() if scope == "source")
+
+
 @dataclass(frozen=True)
 class ScrapeDiagnostic:
     code: ScrapeCode
@@ -224,6 +272,19 @@ class ScrapeDiagnostic:
         if self.transport_attempted is not None:
             return bool(self.transport_attempted)
         return _TRANSPORT_BY_CODE[self.code]
+
+    @property
+    def effective_affected_scope(self) -> str:
+        """Whose problem this is, defaulting from the code rather than to "item".
+
+        A call site may still override -- some outcomes genuinely are conditional
+        -- but omitting it now yields the code's own answer instead of the
+        blanket "item" that made routing depend on every author remembering.
+        """
+        declared = _SCOPE_BY_CODE.get(self.code)
+        if self.affected_scope != "item":
+            return self.affected_scope        # explicit non-default wins
+        return declared or self.affected_scope
 
     @property
     def persisted_message(self) -> str:
@@ -270,7 +331,9 @@ class ScrapeDiagnostic:
             # not say", and the answer is a property of the code, not an
             # accidental False. See _TRANSPORT_BY_CODE.
             "transport_attempted": self.effective_transport_attempted,
-            "affected_scope": self.affected_scope,
+            # Defaults from the code (see _SCOPE_BY_CODE); an explicit
+            # non-default value at the call site still wins.
+            "affected_scope": self.effective_affected_scope,
             "action_code": self.action_code,
             "deferred": self.deferred,
             "stage": self.stage,

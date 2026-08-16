@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
+from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, SOURCE_WIDE_CODES
 
 
 _FAILURE_TITLES = {
@@ -50,18 +50,17 @@ _FAILURE_TITLES = {
     ScrapeCode.UNSUPPORTED_SOURCE.value: "Website not supported",
 }
 
-_SOURCE_WIDE_REASONS = {
-    ScrapeCode.SOURCE_DISABLED.value,
-    ScrapeCode.SOURCE_TEMPORARILY_BLOCKED.value,
-    ScrapeCode.INTERACTIVE_CHALLENGE.value,
-    # A stalled link-reveal verification throttles the whole source, not one
-    # item: once HDEncode stops clearing the countdown, every subsequent item in
-    # the queue meets the same closed door. Without membership here,
-    # is_source_wide_denial returns False, the outcome routes to _fail instead of
-    # _pause_for_source, and the batch grinds on converting the rest of the queue
-    # into permanent failures -- which is exactly how 78 items accumulated.
-    ScrapeCode.REVEAL_VERIFICATION_STALLED.value,
-}
+# DERIVED, NOT MAINTAINED. This used to be a hand-written set living apart from
+# each diagnostic's `affected_scope`, and `is_source_wide_denial()` requires BOTH
+# to agree -- so a code added here but constructed without affected_scope="source"
+# routes to _fail instead of _pause_for_source, which is how 78 items became
+# permanent failures. Two registries answering one question is also precisely how
+# `_source()` drifted (see download_queue._source). Both now come from
+# scrape_outcome._SCOPE_BY_CODE, so they cannot disagree.
+#
+# Retained under this name because it is imported by name elsewhere, including
+# tests that assert the routing contract.
+_SOURCE_WIDE_REASONS = set(SOURCE_WIDE_CODES)
 
 
 # Active interactive-challenge evidence. A source-wide challenge must be proven

@@ -955,3 +955,116 @@ class TestSourceNoProgressNeedsAnEpisode:
         rep = db.queue_stall_report()
         assert rep["source_no_progress"] is False, (
             "a policy deferral backdated the start of the episode: %s" % rep)
+
+
+class TestScopeIsDeclaredPerCode:
+    """Second pass of the structural programme, on the same principle as
+    transport: `is_source_wide_denial()` is an AND of TWO registries --
+    `affected_scope == 'source'` AND `reason_code in _SOURCE_WIDE_REASONS`.
+
+    Not a live bug today (all four source-wide codes do pass the scope), but a
+    live TRAP: a code added to the set and constructed without the scope routes
+    to _fail instead of _pause_for_source, which is how 78 items became
+    permanent failures. Two registries answering one question is also how
+    `_source()` drifted on 2026-08-07.
+    """
+
+    def test_every_scrape_code_declares_a_scope(self):
+        from backend.scrape_outcome import ScrapeCode, _SCOPE_BY_CODE
+        missing = [c.name for c in ScrapeCode if c not in _SCOPE_BY_CODE]
+        assert not missing, (
+            "ScrapeCode(s) with no declared scope: %s. Add an entry to "
+            "_SCOPE_BY_CODE; defaulting to 'item' silently is what made routing "
+            "depend on every author remembering." % missing)
+
+    def test_only_source_or_item(self):
+        from backend.scrape_outcome import _SCOPE_BY_CODE
+        assert set(_SCOPE_BY_CODE.values()) <= {"source", "item"}
+
+    def test_the_routing_set_is_DERIVED_not_a_second_copy(self):
+        """The whole point: the set and the per-diagnostic value cannot disagree
+        because there is only one of them."""
+        from backend.scrape_outcome import SOURCE_WIDE_CODES, _SCOPE_BY_CODE
+        from backend.download_outcome import _SOURCE_WIDE_REASONS
+        assert set(_SOURCE_WIDE_REASONS) == set(SOURCE_WIDE_CODES)
+        assert set(SOURCE_WIDE_CODES) == {
+            c.value for c, s in _SCOPE_BY_CODE.items() if s == "source"}
+
+    def test_a_bare_source_wide_diagnostic_routes_as_source_wide(self):
+        """THE TRAP, closed. Before this, ScrapeDiagnostic(INTERACTIVE_CHALLENGE)
+        with no explicit scope yielded affected_scope='item', so
+        is_source_wide_denial returned False for a code that IS source-wide --
+        it only worked because every call site happened to remember."""
+        from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
+        from backend.download_outcome import (is_source_wide_denial,
+                                              public_download_result)
+        for code in (ScrapeCode.SOURCE_DISABLED,
+                     ScrapeCode.SOURCE_TEMPORARILY_BLOCKED,
+                     ScrapeCode.INTERACTIVE_CHALLENGE,
+                     ScrapeCode.REVEAL_VERIFICATION_STALLED):
+            result = public_download_result(
+                {"success": False, "method": "", "link_count": 0,
+                 **ScrapeDiagnostic(code).to_dict()},
+                title="T", url="https://hdencode.org/x")
+            assert result["affected_scope"] == "source", code.name
+            assert is_source_wide_denial(result) is True, code.name
+
+    def test_an_item_scoped_code_does_NOT_route_as_source_wide(self):
+        """Control: if everything read as source-wide, one bad page would park
+        the whole queue -- the failure the scope exists to prevent."""
+        from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
+        from backend.download_outcome import (is_source_wide_denial,
+                                              public_download_result)
+        for code in (ScrapeCode.LAYOUT_CHANGED, ScrapeCode.REVEAL_CONTROL_ABSENT,
+                     ScrapeCode.NO_FILE_HOST_LINKS, ScrapeCode.SCRAPE_EXCEPTION,
+                     ScrapeCode.BROWSER_LAUNCH_FAILED):
+            result = public_download_result(
+                {"success": False, "method": "", "link_count": 0,
+                 **ScrapeDiagnostic(code).to_dict()},
+                title="T", url="https://hdencode.org/x")
+            assert result["affected_scope"] == "item", code.name
+            assert is_source_wide_denial(result) is False, code.name
+
+    def test_a_local_browser_fault_is_not_blamed_on_the_source(self):
+        """A broken browser affects every item, but the fault is OURS. Calling
+        it source-wide would pause HDEncode and hide a local outage behind a
+        message about the source."""
+        from backend.scrape_outcome import ScrapeCode, _SCOPE_BY_CODE
+        for code in (ScrapeCode.BROWSER_LAUNCH_FAILED,
+                     ScrapeCode.BROWSER_NETWORK_ERROR,
+                     ScrapeCode.BROWSER_NAVIGATION_FAILED):
+            assert _SCOPE_BY_CODE[code] == "item", code.name
+
+    def test_an_explicit_scope_still_wins(self):
+        from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
+        d = ScrapeDiagnostic(ScrapeCode.LAYOUT_CHANGED, affected_scope="source")
+        assert d.to_dict()["affected_scope"] == "source"
+
+    def test_the_declared_scope_matches_what_production_actually_passes(self):
+        """The table must describe the code as it is, not as I would like it.
+        Every construction site that DOES pass affected_scope must agree with
+        the declaration -- otherwise the default is a lie for that code."""
+        import ast, glob
+        from backend.scrape_outcome import ScrapeCode, _SCOPE_BY_CODE
+        by_value = {c.value: c for c in ScrapeCode}
+        disagreements = []
+        for path in glob.glob("backend/*.py"):
+            tree = ast.parse(open(path, encoding="utf-8").read())
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call)
+                        and getattr(node.func, "id", None) == "ScrapeDiagnostic"):
+                    continue
+                if not node.args or not isinstance(node.args[0], ast.Attribute):
+                    continue
+                name = node.args[0].attr
+                code = getattr(ScrapeCode, name, None)
+                if code is None:
+                    continue
+                for kw in node.keywords:
+                    if kw.arg == "affected_scope" and isinstance(kw.value, ast.Constant):
+                        if kw.value.value != _SCOPE_BY_CODE[code]:
+                            disagreements.append(
+                                "%s:%d %s passes %r, table says %r"
+                                % (path, node.lineno, name, kw.value.value,
+                                   _SCOPE_BY_CODE[code]))
+        assert not disagreements, "\n".join(disagreements)
