@@ -151,3 +151,49 @@ feature is supposed to deliver.
     provenance: 1 link set recorded (the feature populates as new grabs flow)
 
 Deployed today: #72, #73, #74, #75, #76, #77, #78. JDownloader healthy.
+
+---
+
+## CORRECTION after design review — the failure evidence was mostly synthetic
+
+The review's F3 is right, and it is the most important correction in this
+document. Verified against the live database:
+
+| last_reason_code | transport_attempted | n | meaning |
+|---|---|---|---|
+| source_temporarily_blocked | 0 | 53 | NO request was made |
+| layout_changed | 0 | 7 | no request made |
+| reveal_control_absent | 0 | 1 | no request made |
+| **interactive_challenge** | **1** | **1** | **the only observed refusal** |
+
+`_pause_for_source()` rewrites every same-source sibling in the batch to
+`state='waiting_source'`, `last_reason_code='source_temporarily_blocked'`,
+`transport_attempted=0`. So the "59 source_temporarily_blocked" I presented as
+evidence of source gating is 53 policy-generated rows plus consequences.
+
+**Exactly ONE source refusal was observed.** It parked 61 items for 48 hours —
+a blast radius of 61:1 from a single event.
+
+This is the same error as the rest of the day in different clothing: counting
+rows without asking whether each row represents an OBSERVATION or a
+CONSEQUENCE. Any source-health classifier must consume only
+`transport_attempted=1` rows.
+
+Two further claims of mine the review corrected:
+
+* **"~20/day is what a 600s stagger produces" is arithmetically FALSE.** A 600s
+  interval gives 144 slots/day; 20 deliveries occupy 200 minutes. The stagger
+  does not explain the observed rate and I asserted a causal link that is not
+  there.
+* **Proposal 3 as written would have erased a safety property.** Widening the
+  stagger on a RECOGNISED interactive challenge would recreate exactly the
+  turnstile churn the verification hold was built to prevent. A recognised
+  challenge must remain a non-timer-releasable hold; only an explicit operator
+  probe may reopen it. "Slow, do not stop" applies to established ordinary
+  degradation, never to a recognised challenge.
+
+The corrected shape is three scopes, not two:
+
+    item-local / ambiguous failure   -> item only; siblings stay runnable
+    established source degradation   -> global source pacing, continues slowly
+    recognised interactive challenge -> source hold, no timer may release it
