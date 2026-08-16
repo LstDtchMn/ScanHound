@@ -258,10 +258,50 @@ def _write_active_keys(keys):
         return False
 
 
+def check_queue(body):
+    """Download-queue stall conditions, from the same /health body.
+
+    Three separate conditions rather than one timer, because "nothing was
+    attempted" and "everything attempted failed" want different responses --
+    the ambiguity that left the 2026-08-13 stall unresolvable. A verification
+    hold is reported as needing a person, never as a scheduler fault.
+    """
+    q = (body or {}).get("queue")
+    if not isinstance(q, dict):
+        return []                      # older build, or the sub-report failed
+    ev = q.get("evidence") or {}
+    out = []
+    if q.get("executor_starved"):
+        out.append("Download queue: %s item(s) are DUE but nothing has been "
+                   "attempted (oldest due %s, last attempt %s). The queue "
+                   "worker is not picking up work."
+                   % (ev.get("due_now"), ev.get("oldest_due_at"),
+                      ev.get("last_attempt_at") or "never"))
+    if q.get("source_no_progress"):
+        out.append("Download queue: attempts are running but the source has "
+                   "delivered nothing since %s (deadline %ss). Downloads are "
+                   "not progressing."
+                   % (ev.get("last_source_progress_at") or "never",
+                      ev.get("progress_deadline_seconds")))
+    if q.get("human_required"):
+        out.append("Download queue needs a person: %s verification hold(s), "
+                   "%s batch(es) holding deferred work with auto-resume off. "
+                   "No automatic action can clear these."
+                   % (ev.get("verification_holds"),
+                      ev.get("batches_deferred_without_auto_resume")))
+    return out
+
+
 def main() -> int:
     tool_problems = check_tools()
     db_problems, stats = check_db()
     jd_problems = check_jd()
+    try:
+        with urllib.request.urlopen(API_HEALTH, timeout=20) as r:
+            _body = json.loads(r.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        _body = {}     # check_jd already reports an unreachable API
+    queue_problems = check_queue(_body)
 
     # Keyed by SUBSYSTEM, not by "some problem exists". Peer review 2026-08-15:
     # a single global latch meant that once ANY problem had alerted, a LATER and
@@ -279,10 +319,15 @@ def main() -> int:
         active["detector_db"] = db_problems
     if jd_problems:
         active["jd_stalled"] = jd_problems
-    problems = tool_problems + db_problems + jd_problems
+    # Keyed separately so a queue stall alerts even while a JD problem persists
+    # -- the cross-subsystem suppression the last review caught.
+    if queue_problems:
+        active["queue_stalled"] = queue_problems
+    problems = tool_problems + db_problems + jd_problems + queue_problems
 
-    log("check: jd_ok=%s tools_ok=%s denied=%s classified=%s/%s"
-        % (not jd_problems, not tool_problems, stats.get("denied", "?"),
+    log("check: queue_ok=%s jd_ok=%s tools_ok=%s denied=%s classified=%s/%s"
+        % (not queue_problems, not jd_problems, not tool_problems,
+           stats.get("denied", "?"),
            stats.get("classified", "?"), stats.get("total", "?")))
 
     previously = _read_active_keys()
