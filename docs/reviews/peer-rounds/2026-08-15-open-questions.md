@@ -111,3 +111,36 @@ with Gotify delivery proven end-to-end.
 
 Open PRs: #79 (heartbeat — needs the outer-cycle rework before merging),
 #61 (RSS hybrid design), #59 (detector runbook).
+
+---
+
+## RESOLVED after the closing review — question 5 (the C:\Tools causal gap)
+
+The reviewer said attribution was recoverable IF the old task and wrapper
+artifacts survived unchanged. They did. Recovered 2026-08-15:
+
+    ScanHound DV Detector (Disabled; definition intact)
+      -File "C:\DockerData\scanhound\run-dv-scan.ps1"
+
+    that wrapper, line 5:
+      $env:Path='C:\Tools;'+$env:Path
+
+    dv_detect.available() -> shutil.which("dovi_tool") -> resolves via PATH
+      => C:\Tools\dovi_tool.exe WINS
+
+    wrapper last modified 2026-08-11, i.e. BEFORE the 13-15 Aug outage,
+    so this is the version that actually ran.
+
+    For contrast, the surviving task's repo wrapper pins a DIFFERENT binary:
+      run-dv-scan.ps1 L251-252
+        $doviDir = <RepoRoot>\scripts\host-detector
+        $doviExe = $doviDir\dovi_tool.exe
+
+So the pinned task DID resolve the damaged `C:\Tools\dovi_tool.exe`. The gap I
+recorded as possibly-lost is closed.
+
+**Still not individually proven:** which of the two tasks wrote each specific
+`[WinError 5]` row, since both write the same dv_host.db. Only the pinned task
+could fail that way, and the repo-wrapper task was observed running healthily
+at full throughput, so the inference is strong — but it is an inference, not a
+per-row attribution.
