@@ -117,6 +117,21 @@ the source, because `download_service` decides it against our own records and
 returns before the scraper runs ("don't scrape or re-send it"). So a batch of
 already-grabbed titles does not pace itself against a source it never contacted.
 
+**The gate also carries an exemption, added after the first full-suite run.** Five
+tests in `test_verification_hold.py` — a file this branch does not touch — went red,
+because they call `retry_item()` and then claim. The gate was refusing a human's
+"Retry now" for up to 60s, which in production is worse than slow: the API accepts
+the retry, the worker silently declines to claim it, and the UI has already reported
+success. Rows with `queue_reason = 'manual_retry'` are therefore exempt — pacing
+throttles the machine, not the operator.
+
+That exemption keys on a string that **two automatic paths also write**
+(`recover_interrupted`, `_recover_expired_claim`). They are harmless only because
+both also set `state = 'failed'`, which `_claim_due` never selects. That is
+load-bearing and entirely implicit, so there is now a test that reads those two
+functions and fails if either stops parking the row as `failed`. Question 5 asks
+whether that is good enough or whether it wants a dedicated column.
+
 **F5.** A quiet-window exit from `BUDGET_SPENT` in `queue_recovery_policy.decide()`,
 via `_quiet_long_enough()`, which fails **closed** on every uncertainty — absent
 timestamp, absent window, non-positive window, unparsable value. The counter is
@@ -136,7 +151,13 @@ change shipped doing nothing. Only a test driving the real sweep caught it.
 
 ## 4. Verification
 
-- **26 mutants, 26 caught.** Applied by line number where the anchor was not unique.
+- **Full suite: branch 0 failed / 5014 passed. `origin/main` baseline: 5 failed /
+  4971 passed**, all five in `test_throttle_lifecycle_integration.py` — the ones
+  §2 explains. Both runs in the same container, same session, whole tree copied in.
+- **31 mutants, 31 caught.** Applied by line number where the anchor was not unique.
+  One mutant initially "survived" because I had anchored it on a matching string in
+  the wrong function — a dict literal in `_recover_expired_claim` rather than the
+  SQL in `retry_item`. Unique anchor, wrong occurrence.
 - The harness produced **two false survivors** first: two mutants that shorten a
   file by the same number of bytes within one second are indistinguishable to
   Python's `(mtime, size)` `.pyc` check, so the second silently ran the first's
@@ -169,7 +190,21 @@ change shipped doing nothing. Only a test driving the real sweep caught it.
    They carry `attempt_not_closed`, match no structural or source reason, and age
    out of every window within 24h — so I left them. Convert, delete, or leave?
 
-5. **The pattern.** B1, B2 and B4 are the same shape: a component was written and
+5. **The manual-retry exemption's key.** It keys on `queue_reason = 'manual_retry'`,
+   a value two automatic recovery paths also write. They cannot reach the gate today
+   only because they park the row as `failed`, and a test now pins that. Is an
+   asserted invariant acceptable here, or does this want an explicit column
+   (`pacing_exempt`) so the intent is declared rather than inferred? I chose the pin
+   because both automatic paths recover at most one item and a migration on this
+   branch adds deployment risk of its own, but I do not have strong conviction.
+
+6. **Did the gate need a floor at all?** `SOURCE_MIN_INTERVAL_SECONDS = 60` cannot
+   be lowered by configuration. The review asked for pacing to be *global* rather
+   than *per-batch*; the un-overridable floor is my addition, and it is what made
+   those five verification-hold tests fail. Is the floor defensible, or should the
+   configured interval simply be honoured, including zero as an explicit opt-out?
+
+7. **The pattern.** B1, B2 and B4 are the same shape: a component was written and
    tested, and *nothing verified its consumer*. The attempt row was tested; that
    `_execute_inner` closes it was not. `_defer_item_only` was tested through its
    effect on a row it never managed to write. Is there a structural check — beyond

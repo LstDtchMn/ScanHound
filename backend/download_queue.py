@@ -773,12 +773,24 @@ class DownloadQueueService:
                   -- sqlite-side window would freeze while the rest of the
                   -- sequence moved -- untestable, and unfalsifiable in exactly
                   -- the tests written to falsify it.
-                  AND NOT EXISTS (
-                      SELECT 1 FROM download_queue_attempts a
-                      WHERE a.source = download_queue_items.source
-                        AND a.started_at > ?
-                        AND (a.transport_attempted = 1
-                             OR a.terminal_status = 'IN_PROGRESS')
+                  --
+                  -- PACING THROTTLES THE MACHINE, NOT THE OPERATOR. A row
+                  -- promoted by a human -- the "Retry now" button, retry_item(),
+                  -- a manual resume -- carries queue_reason='manual_retry' and
+                  -- is exempt. Someone who has just clicked a button is not the
+                  -- runaway this gate exists to prevent, and refusing them would
+                  -- be invisible: the API accepts the retry, the worker then
+                  -- silently declines to claim it for up to a minute, and the UI
+                  -- reports success for something that has not started.
+                  AND (
+                      download_queue_items.queue_reason = 'manual_retry'
+                      OR NOT EXISTS (
+                          SELECT 1 FROM download_queue_attempts a
+                          WHERE a.source = download_queue_items.source
+                            AND a.started_at > ?
+                            AND (a.transport_attempted = 1
+                                 OR a.terminal_status = 'IN_PROGRESS')
+                      )
                   )
                 ORDER BY scheduled_for, sequence_number
                 LIMIT 1

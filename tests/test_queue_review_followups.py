@@ -474,3 +474,83 @@ class TestAmbiguousDeferralActuallyWrites:
         state = db._query_dicts("SELECT state FROM download_queue_batches", (),
                                 default=[])[0]["state"]
         assert state != "paused_source"
+
+
+class TestPacingThrottlesTheMachineNotTheOperator:
+    """The gate refused a human's 'Retry now' for up to 60s. That is worse than
+    slow, it is INVISIBLE: the API accepts the retry, the worker then declines
+    to claim it, and the UI has already reported success. Five verification-hold
+    tests caught this -- tests about the hold, not about pacing."""
+
+    def _svc(self, db):
+        from unittest.mock import MagicMock
+        fake = MagicMock()
+        fake.download_item.return_value = {"success": True, "method": "jdownloader",
+                                           "link_count": 2, "message": "Sent"}
+        svc = DownloadQueueService({}, db, fake, broadcast=lambda *a: None)
+        svc.schedule_batch(
+            [{"url": "https://hdencode.org/%d" % n, "title": "T%d" % n, "year": 2020,
+              "resolution": "2160p", "size_text": "1 GB", "hdr": "", "dovi": 0,
+              "service_type": "Rapidgator", "source": "hdencode"} for n in (1, 2)],
+            interval_minutes=0, mode="immediate")
+        first = svc._claim_due()
+        assert first is not None
+        svc._execute(first)              # spends the source lane
+        return svc
+
+    def _remaining(self, db):
+        return db._query_dicts(
+            "SELECT item_uuid FROM download_queue_items WHERE state IN "
+            "('scheduled','ready') ORDER BY sequence_number", (), default=[])[0]
+
+    def test_an_automatic_row_is_still_paced(self, db):
+        """Positive control: without this the exemption test proves nothing."""
+        svc = self._svc(db)
+        assert svc._claim_due() is None
+
+    def test_a_human_promoted_row_is_claimed_immediately(self, db):
+        svc = self._svc(db)
+        row = self._remaining(db)
+        db._mutate("UPDATE download_queue_items SET queue_reason = 'manual_retry' "
+                   "WHERE item_uuid = ?", (row["item_uuid"],), label="t")
+        claimed = svc._claim_due()
+        assert claimed is not None, "a human pressed Retry and the worker refused"
+        assert claimed["item_uuid"] == row["item_uuid"]
+
+    def test_the_exemption_is_spelled_the_same_way_retry_item_writes_it(self, db):
+        """The gate keys on a literal string. If retry_item ever writes a
+        different one the exemption silently stops applying, and the symptom is
+        a button that does nothing for a minute -- nobody would connect that to
+        this line."""
+        svc = self._svc(db)
+        row = self._remaining(db)
+        svc.retry_item(row["item_uuid"])
+        after = db._query_dicts("SELECT queue_reason FROM download_queue_items "
+                                "WHERE item_uuid = ?", (row["item_uuid"],),
+                                default=[])[0]["queue_reason"]
+        assert after == "manual_retry", (
+            f"retry_item now writes {after!r}; the pacing exemption keys on "
+            "'manual_retry' and would no longer apply")
+        assert svc._claim_due() is not None
+
+    def test_only_human_paths_can_reach_the_exemption(self, db):
+        """The gate keys on queue_reason='manual_retry', and TWO AUTOMATIC paths
+        also write that value -- recover_interrupted() and
+        _recover_expired_claim(). They are harmless only because both also write
+        state='failed', which _claim_due never selects. That is load-bearing and
+        entirely implicit, so it is pinned here: if either is ever changed to
+        leave a row runnable, it silently gains a pacing bypass, and the symptom
+        (a restart briefly ignoring source pacing) would be near-impossible to
+        trace back to this line."""
+        import re
+        src = open("backend/download_queue.py", encoding="utf-8").read()
+        for fn in ("recover_interrupted", "_recover_expired_claim"):
+            start = src.index("def %s(" % fn)
+            nxt = re.search(r"\n    (?:async )?def ", src[start:])
+            body = src[start:start + (nxt.start() if nxt else len(src))]
+            assert "queue_reason = 'manual_retry'" in body, (
+                f"{fn} no longer writes manual_retry; re-check this pin")
+            assert "state = 'failed'" in body, (
+                f"{fn} writes queue_reason='manual_retry' but no longer parks the "
+                "row as 'failed'. If it is now claimable it BYPASSES source "
+                "pacing, because the gate treats manual_retry as 'a human asked'.")
