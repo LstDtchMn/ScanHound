@@ -645,3 +645,26 @@ def remove_download_result(req: RemoveResultRequest, reg: ServiceRegistry = Depe
     if not dl:
         raise HTTPException(status_code=503, detail="Download service not available")
     return dl.remove_package(req.id)
+
+
+class RemoveResultsRequest(BaseModel):
+    ids: List[int]
+
+
+@router.post("/results/remove-many")
+def remove_download_results(req: RemoveResultsRequest,
+                            reg: ServiceRegistry = Depends(get_registry)):
+    """Remove MANY tracked download packages in ONE request.
+
+    Distinct from `DELETE /results`, which only empties our own table and tells
+    JDownloader nothing -- so the next poll re-inserts every package JD still
+    holds. This removes them from JD as well, which is the part that makes them
+    stay gone.
+
+    The caller sends the ids it means, so the client keeps ownership of what
+    "done" means; the server does not re-derive that policy.
+    """
+    dl = reg.download
+    if not dl:
+        raise HTTPException(status_code=503, detail="Download service not available")
+    return dl.remove_packages(req.ids)

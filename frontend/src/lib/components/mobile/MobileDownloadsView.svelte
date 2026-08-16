@@ -85,13 +85,45 @@
     }
   }
 
+  /** Finished, from the user's point of view.
+   *
+   *  'downloaded' is included deliberately: a package whose archive is fully
+   *  downloaded but whose extraction never ran sits there forever, and it is
+   *  exactly the "100% but still listed" row that makes Clear done look
+   *  broken. 'downloading', 'extracting' and 'queued' are live work and stay. */
+  const FINISHED = ['extracted', 'downloaded', 'failed'];
+
   async function clearFinished() {
-    const done = results.filter((r) => r.state === 'extracted' || r.state === 'failed');
-    if (!done.length) return;
-    for (const r of done) {
-      try { await api.removeDownloadResult(r.id); } catch { /* idempotent; ignore */ }
+    if (busy) return;
+    const done = results.filter((r) => FINISHED.includes(r.state) && r.id != null);
+    if (!done.length) {
+      addToast('Nothing to clear', 'No finished downloads in the list.');
+      return;
     }
-    await poll();
+    // ONE request, not one per row. This looped removeDownloadResult and
+    // awaited each: with 563 finished rows that is 563 sequential round trips,
+    // each re-reading every row server-side and calling JDownloader again. With
+    // no busy state and no completion message the button simply looked dead,
+    // and leaving the screen abandoned the job half-done.
+    busy = true;
+    try {
+      const r = await api.removeDownloadResults(done.map((d) => d.id));
+      // Report what actually happened. `requested` can exceed `removed` when a
+      // row was already gone, and saying "cleared 563" when 40 survived is how
+      // a partial failure gets mistaken for a UI bug.
+      addToast(
+        'Cleared',
+        r.removed === r.requested
+          ? `${r.removed} finished download${r.removed === 1 ? '' : 's'} removed.`
+          : `${r.removed} of ${r.requested} removed; the rest were already gone.`
+      );
+      results = results.filter((x) => !done.some((d) => d.id === x.id));  // optimistic
+    } catch (e) {
+      addToast('Could not clear', e instanceof Error ? e.message : 'Please try again.', 'error');
+    } finally {
+      busy = false;
+      await poll();
+    }
   }
 
   async function cancel(r: DownloadResult) {
@@ -118,7 +150,7 @@
     <button class="px-2 py-1 rounded bg-[var(--bg-tertiary)] text-xs" disabled={busy} onclick={() => control('pause')}>Pause</button>
     <button class="px-2 py-1 rounded bg-[var(--bg-tertiary)] text-xs" disabled={busy} onclick={() => control('resume')}>Resume</button>
     <button class="px-2 py-1 rounded bg-[var(--bg-tertiary)] text-xs" disabled={busy} onclick={() => control('stop')}>Stop</button>
-    <button class="px-2 py-1 rounded bg-[var(--bg-tertiary)] text-xs" onclick={clearFinished}>Clear&nbsp;done</button>
+    <button class="px-2 py-1 rounded bg-[var(--bg-tertiary)] text-xs disabled:opacity-50" disabled={busy} onclick={clearFinished}>{busy ? 'Clearing…' : 'Clear done'}</button>
   </div>
 
   <div class="flex-1 overflow-y-auto">

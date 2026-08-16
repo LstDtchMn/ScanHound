@@ -1190,6 +1190,80 @@ class DownloadService:
                 self._best_titles.pop(key, None)
         return {"ok": True, "removed": removed}
 
+    def remove_packages(self, ids) -> dict:
+        """Remove MANY tracked downloads in one pass. Same semantics as
+        remove_package, done once instead of N times.
+
+        WHY THIS EXISTS. The mobile "Clear done" button looped remove_package
+        over every finished row, awaiting each: with 578 rows (563 finished)
+        that is 563 sequential HTTP requests, each of which re-read all 578 rows
+        server-side and made its own JDownloader round trip. The button has no
+        busy state and no completion message, so it reads as simply not working
+        -- and navigating away part-way leaves the job half done.
+
+        The pre-existing bulk route (DELETE /download/results) is NOT the fix:
+        it deletes the rows and never tells JDownloader, so the very next poll
+        re-upserts every package JD still holds and the list comes straight
+        back. Removing from the source of truth is the whole job; deleting our
+        copy of it is cosmetic.
+
+        JDownloader's remove_links takes a LIST of package uuids, so the entire
+        set goes in a single call.
+
+        Idempotent in the same way as the single version: the DB rows are always
+        cleared, even when JD is unreachable or the packages are already gone,
+        so the UI reflects the removal rather than silently keeping rows the
+        user asked to drop.
+        """
+        wanted = {int(i) for i in (ids or []) if str(i).strip().lstrip("-").isdigit()}
+        if not wanted:
+            return {"ok": True, "removed": 0, "requested": 0}
+        try:
+            rows = self.db.get_download_results(limit=100000) if self.db else []
+        except Exception:  # noqa: BLE001
+            rows = []
+        targets = [r for r in rows if r.get("id") in wanted]
+
+        uuids, keys = [], []
+        for row in targets:
+            uuid_ = row.get("package_uuid")
+            keys.append((uuid_, row.get("name")))
+            if uuid_:
+                try:
+                    uuids.append(int(uuid_))
+                except (TypeError, ValueError):
+                    logger.debug("skipping unparsable package uuid %r", uuid_)
+        if uuids:
+            try:
+                device = self._connect_jd_device()
+                device.downloads.remove_links([], uuids)
+                self._log("JDownloader: removed %d package(s)" % len(uuids), "info")
+            except Exception as e:  # noqa: BLE001
+                # ONE failure for the whole set, not N. The rows are still
+                # cleared below -- but say so, because "removed" would otherwise
+                # imply JD forgot them too and the next poll will disagree.
+                logger.warning("remove_packages JD step failed for %d package(s): %s",
+                               len(uuids), e)
+                self._invalidate_jd_cache()
+
+        removed = 0
+        for row in targets:
+            try:
+                removed += self.db.delete_download_result(row["id"]) or 0
+            except Exception as e:  # noqa: BLE001
+                logger.warning("remove_packages DB delete failed for id %s: %s",
+                               row.get("id"), e)
+        # Same cache eviction as the single path: without it an unchanged
+        # package still present in JD hits poll_results()'s unchanged-state skip
+        # and re-emits the id we just deleted (ghost-id resurrection).
+        for uuid_, name in keys:
+            for key in (uuid_, name):
+                if key:
+                    self._results_cache.pop(key, None)
+                    self._uuid_id.pop(key, None)
+                    self._best_titles.pop(key, None)
+        return {"ok": True, "removed": removed, "requested": len(wanted)}
+
     def poll_results(self, record: bool = True) -> List[Dict[str, Any]]:
         """Poll JDownloader's Downloads list, derive each package's download +
         extraction outcome, and optionally persist it to the DB.
