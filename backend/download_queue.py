@@ -767,6 +767,42 @@ class DownloadQueueService:
             return claimed
 
     def _execute(self, item: dict) -> None:
+        # Open the durable attempt row BEFORE any work, close it in a finally.
+        # An attempt that never returns therefore leaves an IN_PROGRESS row --
+        # the only evidence that distinguishes a blocked worker from one that
+        # never started, which the 2026-08-13 incident had no way to record.
+        attempt_id = str(uuid.uuid4())
+        if self.db is not None:
+            try:
+                self.db.begin_queue_attempt(
+                    attempt_id, item.get("item_uuid"),
+                    item.get("batch_uuid"), item.get("source"))
+            except Exception:  # noqa: BLE001
+                logger.exception("could not open attempt record for %s",
+                                 item.get("item_uuid"))
+        try:
+            self._execute_inner(item, attempt_id)
+        finally:
+            self._close_attempt_if_open(attempt_id)
+
+    def _close_attempt_if_open(self, attempt_id: str) -> None:
+        """Backstop: an attempt must never be left open by an escaping error.
+
+        _execute_inner closes with the real outcome. This only fires when it
+        could not -- and FAILED is the honest terminal state for "we started and
+        cannot say it worked". Never SUCCESS.
+        """
+        if self.db is None:
+            return
+        try:
+            self.db.close_queue_attempt(
+                attempt_id, "FAILED", reason_code="attempt_not_closed",
+                affected_scope="item", transport_attempted=False,
+                only_if_open=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _execute_inner(self, item: dict, attempt_id: str) -> None:
         self._emit("download:queue_updated", {**item, "state": "claimed"})
         self._emit_batch_progress(
             item["batch_uuid"],

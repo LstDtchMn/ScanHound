@@ -1379,6 +1379,48 @@ class DatabaseManager:
                         cancelled_at TEXT
                     )
                 """)
+                # APPEND-ONLY attempt history. The queue's item/batch rows carry
+                # only CURRENT state, which is why the 2026-08-13 incident could
+                # not be diagnosed: after a container restart there was no way
+                # to tell "the source was attempted repeatedly and every attempt
+                # failed" from "nothing was ever attempted". Both look identical
+                # in a durable row that just says waiting_source.
+                #
+                # transport_attempted is the load-bearing column. _pause_for_source
+                # rewrites every same-source sibling with a source_temporarily_blocked
+                # reason and transport_attempted=0, so a COUNT of reason codes
+                # measures policy consequences, not observations. Of 62 such rows
+                # in that incident exactly ONE had transport_attempted=1. Any
+                # source-health decision must read observations only.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS download_queue_attempts (
+                        attempt_id TEXT PRIMARY KEY,
+                        item_uuid TEXT NOT NULL,
+                        batch_uuid TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        finished_at TEXT,
+                        -- IN_PROGRESS until closed. An attempt that outlives its
+                        -- deadline while still IN_PROGRESS is STALE, which is the
+                        -- signal a blocked worker cannot otherwise produce.
+                        terminal_status TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+                        reason_code TEXT,
+                        affected_scope TEXT,
+                        -- 1 only when a request actually reached the source.
+                        transport_attempted INTEGER NOT NULL DEFAULT 0,
+                        -- 1 when the source affirmatively delivered. This, not
+                        -- item completion, is the source-liveness signal.
+                        source_progress INTEGER NOT NULL DEFAULT 0
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_queue_attempts_source_time
+                    ON download_queue_attempts(source, started_at)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_queue_attempts_open
+                    ON download_queue_attempts(terminal_status, started_at)
+                """)
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_download_queue_due
                     ON download_queue_items(state, scheduled_for, sequence_number)
@@ -5413,6 +5455,106 @@ class DatabaseManager:
         except Exception as e:  # noqa: BLE001
             logger.error("DB Error (annotate_dv_scan_rating_key): %s", e)
             return False
+
+    # --- queue attempt history (append-only) ---------------------------------
+
+    def begin_queue_attempt(self, attempt_id, item_uuid, batch_uuid, source):
+        """Open an attempt row BEFORE the work starts. Returns True on success.
+
+        Opened first and closed in a finally, so an attempt that never returns
+        leaves an IN_PROGRESS row behind. That row IS the evidence a blocked
+        worker cannot otherwise produce: the 2026-08-13 incident could not
+        distinguish "attempted repeatedly, all failed" from "never attempted",
+        because only current state was durable and both look like
+        waiting_source after a restart.
+        """
+        if not attempt_id or not item_uuid:
+            return False
+        return self._mutate(
+            "INSERT INTO download_queue_attempts "
+            "(attempt_id, item_uuid, batch_uuid, source, started_at, terminal_status) "
+            "VALUES (?, ?, ?, ?, ?, 'IN_PROGRESS')",
+            (str(attempt_id), str(item_uuid), str(batch_uuid or ""),
+             str(source or ""), datetime.datetime.now().isoformat(timespec="seconds")),
+            label="begin_queue_attempt")
+
+    def close_queue_attempt(self, attempt_id, terminal_status, *, reason_code=None,
+                            affected_scope=None, transport_attempted=False,
+                            source_progress=False, only_if_open=False):
+        """Close an attempt with a POSITIVELY evidenced terminal state.
+
+        terminal_status is one of SUCCESS / EXPECTED_EMPTY / FAILED /
+        INTENTIONALLY_SKIPPED. Silence is never success: an attempt left open
+        stays IN_PROGRESS and ages into stale_queue_attempts().
+
+        ``transport_attempted`` must reflect whether a request actually reached
+        the source. A policy deferral -- a sibling parked because some OTHER
+        item hit a source-wide outcome -- is INTENTIONALLY_SKIPPED with
+        transport_attempted False, and must never be counted as an observed
+        source failure.
+
+        ``only_if_open`` is for the caller's finally-backstop: it closes an
+        attempt ONLY if it is still IN_PROGRESS, so a backstop that always runs
+        cannot overwrite the real outcome recorded moments earlier. Without it
+        every successful attempt would be rewritten to FAILED by its own
+        cleanup.
+        """
+        allowed = ("SUCCESS", "EXPECTED_EMPTY", "FAILED", "INTENTIONALLY_SKIPPED")
+        if terminal_status not in allowed:
+            logger.error("close_queue_attempt: refusing unknown terminal status %r "
+                         "(expected one of %s)", terminal_status, allowed)
+            return False
+        sql = ("UPDATE download_queue_attempts SET finished_at = ?, terminal_status = ?, "
+               "reason_code = ?, affected_scope = ?, transport_attempted = ?, "
+               "source_progress = ? WHERE attempt_id = ?")
+        if only_if_open:
+            sql += " AND terminal_status = 'IN_PROGRESS'"
+        return self._mutate(
+            sql,
+            (datetime.datetime.now().isoformat(timespec="seconds"), terminal_status,
+             reason_code, affected_scope, 1 if transport_attempted else 0,
+             1 if source_progress else 0, str(attempt_id)),
+            label="close_queue_attempt")
+
+    def stale_queue_attempts(self, older_than_seconds=1800):
+        """Attempts still IN_PROGRESS past their deadline.
+
+        A non-empty result means a worker started something and never finished
+        it -- blocked, killed, or crashed. That is the state no amount of
+        current-state inspection reveals, and the one the 48-hour gap needed.
+        """
+        return self._query_dicts(
+            "SELECT attempt_id, item_uuid, batch_uuid, source, started_at "
+            "FROM download_queue_attempts WHERE terminal_status = 'IN_PROGRESS' "
+            "AND started_at < datetime('now', ?) ORDER BY started_at",
+            ("-%d seconds" % int(older_than_seconds),), default=[])
+
+    def queue_source_observations(self, source, within_seconds=86400):
+        """OBSERVED source outcomes only -- never policy deferrals.
+
+        Returns {attempted, failed, progressed, last_attempt_at,
+        last_progress_at}. Only rows with transport_attempted = 1 count, because
+        a source-health classifier that consumes synthetic sibling deferrals
+        will conclude a source is refusing when it was asked exactly once.
+        """
+        row = self._query_dicts(
+            "SELECT COUNT(*) AS attempted, "
+            "       SUM(CASE WHEN terminal_status = 'FAILED' THEN 1 ELSE 0 END) AS failed, "
+            "       SUM(source_progress) AS progressed, "
+            "       MAX(started_at) AS last_attempt_at, "
+            "       MAX(CASE WHEN source_progress = 1 THEN started_at END) AS last_progress_at "
+            "FROM download_queue_attempts "
+            "WHERE source = ? AND transport_attempted = 1 "
+            "  AND started_at > datetime('now', ?)",
+            (str(source), "-%d seconds" % int(within_seconds)), default=[])
+        out = row[0] if row else {}
+        return {
+            "attempted": int(out.get("attempted") or 0),
+            "failed": int(out.get("failed") or 0),
+            "progressed": int(out.get("progressed") or 0),
+            "last_attempt_at": out.get("last_attempt_at"),
+            "last_progress_at": out.get("last_progress_at"),
+        }
 
     def get_latest_dv_scan_at(self, source="scan"):
         """Newest ``last_seen_at`` among dv_scan rows for *source*, else None.
