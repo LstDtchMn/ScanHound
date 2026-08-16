@@ -112,10 +112,45 @@ class TestExecutorStarvation:
 
 class TestSourceNoProgress:
     def test_attempts_with_no_delivery_for_too_long(self, db):
+        """CORRECTED 2026-08-16 (peer review round 2). This used to assert that
+        a SINGLE attempt five hours ago was enough, which encoded the defect:
+        the report asked only whether some attempt existed EVER, then compared
+        COALESCE(last_progress, '1970-01-01') to the deadline. With no delivery
+        ever recorded the epoch fallback is older than every deadline, so the
+        very first failed attempt declared the source dead -- and a stale
+        attempt made a CURRENT scheduler stall read as a source fault too, so
+        executor_starved and source_no_progress both fired at once. Those two
+        are the entire reason this report exists.
+
+        The claim this test is really about is "attempts are happening and
+        nothing comes back", so the attempts now span the window.
+        """
         _batch(db, "b1")
         i = _item(db, "b1")
         _attempt(db, i, "b1", progress=False, started="-5 hours")
+        _attempt(db, i, "b1", progress=False, started="-2 hours")
+        _attempt(db, i, "b1", progress=False, started="-3 minutes")
         assert db.queue_stall_report()["source_no_progress"] is True
+
+    def test_one_old_attempt_alone_is_a_SCHEDULER_fault(self, db):
+        """The other half of the correction, and the distinction the whole
+        report is for: we have not ASKED the source in five hours, so any
+        verdict about the source is unfounded. Nothing is being attempted --
+        that is starvation."""
+        _batch(db, "b1")
+        i = _item(db, "b1")
+        _attempt(db, i, "b1", progress=False, started="-5 hours")
+        r = db.queue_stall_report()
+        assert r["source_no_progress"] is False
+        assert r["executor_starved"] is True, (
+            "work is due and nothing is being attempted: %s" % r)
+
+    def test_a_first_failure_does_not_condemn_the_source(self, db):
+        """One fresh failure with no history is a normal first try."""
+        _batch(db, "b1")
+        i = _item(db, "b1")
+        _attempt(db, i, "b1", progress=False, started="-1 minute")
+        assert db.queue_stall_report()["source_no_progress"] is False
 
     def test_recent_source_progress_clears_it(self, db):
         """Control: a source that is delivering must not alarm."""

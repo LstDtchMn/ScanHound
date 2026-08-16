@@ -5865,12 +5865,53 @@ class DatabaseManager:
                 last_progress = (prog[0] if prog else {}).get("t")
                 report["evidence"]["last_source_progress_at"] = last_progress
                 report["evidence"]["progress_deadline_seconds"] = deadline
-                if last_attempt_at:
-                    stale = self._query_dicts(
-                        "SELECT 1 AS x WHERE julianday(COALESCE(?, '1970-01-01')) "
+
+                # A NO-PROGRESS EPISODE, NOT "ANY ATTEMPT EVER PLUS THE EPOCH".
+                #
+                # This used to read: if any attempt row exists at all, is
+                # COALESCE(last_progress, '1970-01-01') older than the deadline?
+                # With no progress ever recorded the fallback is the epoch, which
+                # is older than every conceivable deadline -- so THE FIRST FAILED
+                # ATTEMPT IN A FRESH HISTORY set source_no_progress immediately,
+                # flatly contradicting the contract this key states ("attempts
+                # are happening, but the source has delivered nothing for longer
+                # than the pacing justifies"). And because `last_attempt_at` was
+                # tested only for EXISTENCE, a months-old attempt satisfied it
+                # during a current starvation, so executor_starved and
+                # source_no_progress could both be true at once -- the two
+                # diagnoses this report exists to keep apart. (2026-08-16 peer
+                # review round 2.)
+                #
+                # The episode is defined positively instead:
+                #   start   the EARLIEST source-spending attempt since the last
+                #           delivery (or ever, if the source has never delivered)
+                #   open    that start is older than the deadline
+                #   live    we are still ASKING -- a source-spending attempt
+                #           inside the deadline window. Without this, "we gave up
+                #           hours ago" would read as a source fault when it is a
+                #           scheduler one.
+                # Only transport_attempted = 1 counts: a policy deferral never
+                # asked the source anything and is not evidence about it.
+                window = "-%d seconds" % deadline
+                episode = self._query_dicts(
+                    "SELECT started_at AS t FROM download_queue_attempts "
+                    "WHERE transport_attempted = 1 "
+                    "  AND (? IS NULL OR julianday(started_at) > julianday(?)) "
+                    "ORDER BY julianday(started_at) ASC LIMIT 1",
+                    (last_progress, last_progress), default=[])
+                episode_start = (episode[0] if episode else {}).get("t")
+                recent = self._query_dicts(
+                    "SELECT 1 AS x FROM download_queue_attempts "
+                    "WHERE transport_attempted = 1 "
+                    "  AND julianday(started_at) >= julianday(datetime('now', ?)) "
+                    "LIMIT 1", (window,), default=[])
+                report["evidence"]["no_progress_episode_since"] = episode_start
+                if episode_start and recent:
+                    open_long_enough = self._query_dicts(
+                        "SELECT 1 AS x WHERE julianday(?) "
                         "  < julianday(datetime('now', ?))",
-                        (last_progress, "-%d seconds" % deadline), default=[])
-                    report["source_no_progress"] = bool(stale)
+                        (episode_start, window), default=[])
+                    report["source_no_progress"] = bool(open_long_enough)
         except Exception as e:  # noqa: BLE001
             # A health report that throws must not take its caller down, but it
             # must not read as healthy either.

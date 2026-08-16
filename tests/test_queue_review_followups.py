@@ -27,13 +27,25 @@ def db():
 
 
 def _attempt(db, *, source="hdencode", reason=None, item=None, started="-1 minute",
-             transport=True):
+             transport=True, progress=None):
+    """One closed attempt row, aged by `started`.
+
+    `progress` defaults to "a success delivered": source_progress is the
+    SOURCE-LIVENESS signal, and an attempt that succeeded without setting it is
+    not a thing production produces. Leaving it 0 by default made a fixture
+    "delivery" invisible to the episode logic that reads it, so a test asserting
+    that a delivery closes a no-progress episode failed against correct code.
+    Pass progress=False for a success that never reached the source, e.g. a
+    cache-resolved duplicate.
+    """
     aid = str(uuid.uuid4())
     db.begin_queue_attempt(aid, item or str(uuid.uuid4()), "b1", source)
     db._mutate("UPDATE download_queue_attempts SET started_at = datetime('now', ?) "
                "WHERE attempt_id = ?", (started, aid), label="test_age")
     db.close_queue_attempt(aid, "FAILED" if reason else "SUCCESS",
-                           reason_code=reason, transport_attempted=transport)
+                           reason_code=reason, transport_attempted=transport,
+                           source_progress=(not reason) if progress is None
+                           else progress)
     return aid
 
 
@@ -817,3 +829,129 @@ class TestPeerReviewFixes:
         _attempt(db, started="-1 hour")
         rep = db.queue_stall_report()
         assert rep["executor_starved"] is False, rep
+
+
+class TestSourceNoProgressNeedsAnEpisode:
+    """Round-2 peer review, the one finding left open.
+
+    `source_no_progress` used to be: does ANY attempt row exist, and is
+    COALESCE(last_progress, '1970-01-01') older than the deadline? With no
+    delivery ever recorded the fallback is the epoch, so the FIRST failed
+    attempt in a fresh history set it immediately -- contradicting the key's own
+    stated contract. And `last_attempt_at` was tested only for EXISTENCE, so a
+    months-old attempt satisfied it during a current starvation, letting
+    executor_starved and source_no_progress both be true at once. Those two are
+    the whole reason this report exists.
+    """
+
+    def _due_item(self, db):
+        """One item due 3 hours ago, in the shape download_queue._iso() writes."""
+        from unittest.mock import MagicMock
+        svc = DownloadQueueService({}, db, MagicMock(), broadcast=lambda *a: None)
+        svc.schedule_batch(
+            [{"url": "https://hdencode.org/x", "title": "T", "year": 2020,
+              "resolution": "2160p", "size_text": "1 GB", "hdr": "", "dovi": 0,
+              "service_type": "Rapidgator", "source": "hdencode"}],
+            interval_minutes=0, mode="immediate")
+        db._mutate("UPDATE download_queue_items SET state='ready', "
+                   "scheduled_for = REPLACE(datetime('now','-3 hours'),' ','T') "
+                   "|| '+00:00'", (), label="t")
+        return svc
+
+    def test_ONE_fresh_failure_with_no_history_is_not_a_dead_source(self, db):
+        """The reported defect. One attempt, seconds old, nothing delivered yet
+        -- that is a normal first try, not evidence the source is gone."""
+        self._due_item(db)
+        _attempt(db, reason="layout_changed", started="-1 minute")
+        rep = db.queue_stall_report()
+        assert rep["source_no_progress"] is False, rep
+
+    def test_failing_for_longer_than_the_deadline_IS_a_dead_source(self, db):
+        """Positive control: without this the test above proves only that the
+        key never fires."""
+        self._due_item(db)
+        for age in ("-5 hours", "-3 hours", "-10 minutes"):
+            _attempt(db, reason="layout_changed", started=age)
+        rep = db.queue_stall_report()
+        assert rep["source_no_progress"] is True, rep
+
+    def test_starvation_with_only_STALE_history_is_not_a_source_fault(self, db):
+        """The two diagnoses must not coexist because of old history: work is
+        due and NOTHING is being attempted, which is a scheduler fault."""
+        self._due_item(db)
+        _attempt(db, reason="layout_changed", started="-30 days")
+        rep = db.queue_stall_report()
+        assert rep["executor_starved"] is True, rep
+        assert rep["source_no_progress"] is False, (
+            "a 30-day-old attempt made a current starvation look like the "
+            "source's fault: %s" % rep)
+
+    def test_a_delivery_ends_the_episode(self, db):
+        """Failures BEFORE the last delivery belong to a closed episode."""
+        self._due_item(db)
+        _attempt(db, reason="layout_changed", started="-8 hours")
+        _attempt(db, started="-4 hours")          # SUCCESS, source_progress=1
+        _attempt(db, reason="layout_changed", started="-5 minutes")
+        rep = db.queue_stall_report()
+        assert rep["source_no_progress"] is False, (
+            "an episode that a real delivery already closed still counts: %s" % rep)
+
+    def test_a_delivery_that_is_itself_old_reopens_nothing_on_its_own(self, db):
+        """Control for the above: same shape, but the failures AFTER the
+        delivery now span the deadline, so the episode is genuinely open."""
+        self._due_item(db)
+        _attempt(db, started="-9 hours")          # SUCCESS
+        _attempt(db, reason="layout_changed", started="-6 hours")
+        _attempt(db, reason="layout_changed", started="-5 minutes")
+        rep = db.queue_stall_report()
+        assert rep["source_no_progress"] is True, rep
+
+    def test_policy_deferrals_are_not_evidence_about_the_source(self, db):
+        """Rows that never opened a page cannot make the source look dead."""
+        self._due_item(db)
+        for age in ("-5 hours", "-10 minutes"):
+            _attempt(db, reason="source_temporarily_blocked", started=age,
+                     transport=False)
+        rep = db.queue_stall_report()
+        assert rep["source_no_progress"] is False, rep
+
+    def test_the_episode_start_is_reported_as_evidence(self, db):
+        """A diagnosis nobody can check is worth little."""
+        self._due_item(db)
+        _attempt(db, reason="layout_changed", started="-5 hours")
+        _attempt(db, reason="layout_changed", started="-5 minutes")
+        rep = db.queue_stall_report()
+        assert rep["evidence"]["no_progress_episode_since"] is not None
+
+    def test_policy_skips_do_not_count_as_STILL_ASKING(self, db):
+        """We stopped asking 5 hours ago; everything since is the queue
+        declining to send. That is not 'attempts are happening'.
+
+        Distinguishes the transport filter on the RECENT query specifically:
+        the episode query alone cannot keep this False, because a real request
+        DID open the episode.
+        """
+        self._due_item(db)
+        _attempt(db, reason="layout_changed", started="-5 hours")
+        _attempt(db, reason="source_temporarily_blocked", started="-10 minutes",
+                 transport=False)
+        rep = db.queue_stall_report()
+        assert rep["source_no_progress"] is False, (
+            "policy deferrals were counted as us still asking: %s" % rep)
+
+    def test_the_episode_begins_when_we_actually_ASKED(self, db):
+        """A policy deferral 5 hours ago did not open a no-progress episode --
+        nothing was sent. The episode begins at the first REAL request, 10
+        minutes ago, which is well inside the deadline.
+
+        Distinguishes the transport filter on the EPISODE query specifically:
+        the recent query alone cannot keep this False, because a real request
+        did happen recently.
+        """
+        self._due_item(db)
+        _attempt(db, reason="source_temporarily_blocked", started="-5 hours",
+                 transport=False)
+        _attempt(db, reason="layout_changed", started="-10 minutes")
+        rep = db.queue_stall_report()
+        assert rep["source_no_progress"] is False, (
+            "a policy deferral backdated the start of the episode: %s" % rep)

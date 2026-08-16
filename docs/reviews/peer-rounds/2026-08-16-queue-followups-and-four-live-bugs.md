@@ -279,3 +279,67 @@ make the fact a declared property of the type so omission is impossible — and 
 would rather do that one thoroughly across the other implicit-default fields than
 do all six shallowly. Push back if you think #5's contract matrix is the stronger
 first move.
+
+---
+
+## 7. Round 3 — the last open MEDIUM
+
+**`source_no_progress` fixed.** Verified your reading before changing anything: with
+no delivery ever recorded, `COALESCE(last_progress, '1970-01-01')` is older than any
+deadline, so the first failed attempt in a fresh history declared the source dead —
+and `last_attempt_at` being tested for existence only meant a stale attempt let
+`executor_starved` and `source_no_progress` fire together.
+
+Rewritten as a **no-progress episode**, per your three points:
+
+* **start** — the earliest source-spending attempt since the last delivery, or the
+  earliest ever if the source has never delivered
+* **open** — that start is older than the deadline
+* **live** — a source-spending attempt inside the deadline window, i.e. we are still
+  *asking*. Without this, "we gave up hours ago" reads as a source fault when it is a
+  scheduler one.
+
+Only `transport_attempted = 1` counts, in both halves: a policy deferral never asked
+the source anything. `evidence.no_progress_episode_since` is reported so the verdict
+is checkable.
+
+Your three suggested tests are all present and pass, plus four more.
+
+### Two process notes, because both are the session's recurring lesson
+
+**My first mutation run had two survivors, and they were the TESTS' fault.** The
+episode filter and the recent filter were each independently sufficient to keep
+`test_policy_deferrals...` green, so neither was actually constrained. Fixed by
+adding the two asymmetric cases where only one filter can save you — a transported
+failure followed only by policy skips (tests the *recent* filter), and a policy skip
+followed by a real request (tests the *episode* filter). **7 of 7 mutants now caught,
+including one that restores your reported defect verbatim.**
+
+**A pre-existing test encoded the defect.**
+`test_queue_stall_alerts.py::test_attempts_with_no_delivery_for_too_long` asserted
+that ONE attempt five hours ago sets `source_no_progress`. Under the old code both
+alarms fired for that fixture — the exact collapse you identified. Rather than
+weaken the new rule to keep it green, the test now spans the window (which is the
+claim it was really about) and two cases were added for the corrected contract,
+including the one where a lone old attempt is a *scheduler* fault. Flagging it
+because "an existing test went red" is precisely where a correct fix gets quietly
+reverted.
+
+**Also corrected: a lying fixture.** The `_attempt` helper never set
+`source_progress` on a success, so a fixture "delivery" was invisible to the logic
+that reads it — a test asserting "a delivery closes the episode" failed against
+correct code. It now defaults to "a success delivered", which is what production
+produces.
+
+### On your answer to the round-2 question
+
+Noted, and it changes the plan: you rank the generalized type-boundary declaration
+*ahead* of the contract matrix for this class, because it prevents the bad state
+rather than detecting it. Jesse has authorised the full programme; I will do the
+remaining passes in that order — extend the declared-semantics treatment to the
+other implicit-default fields first, then the seam contract tests, then mutate the
+contract. Not on this branch.
+
+**Full suite: 5046 passed, 0 failed.** `origin/main` baseline in the same
+container: 5 failed, 4971 passed.
+
