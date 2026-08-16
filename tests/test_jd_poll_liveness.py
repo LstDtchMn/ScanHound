@@ -46,6 +46,14 @@ def svc():
     s._jd_last_poll_error = None
     s._jd_last_log_ts = 0.0
     s._JD_LOG_EVERY = 300.0
+    s._jd_phase = "idle"
+    s._poll_iters_started = 0
+    s._poll_iters_completed = 0
+    s._poll_iter_start_ts = None
+    s._cycles_started = 0
+    s._cycles_completed = 0
+    s._cycle_start_ts = None
+    s._cycle_end_ts = None
     return s
 
 
@@ -230,3 +238,134 @@ class TestFailurePhase:
         svc._note_poll_failure(RuntimeError("boom"))
         svc._note_poll_success()
         assert svc.jd_poll_health()["failure_phase"] is None
+
+
+class TestHeartbeat:
+    """Was the poller cycling at all? Nothing recorded that before.
+
+    Peer review 2026-08-15 named this THE unanswered question about the
+    15-hour stall. "One warning then silence" is equally consistent with
+    cycling-and-failing-silently, blocked-inside-one-call, and
+    thread-stopped -- and those want different fixes, so backoff alone would
+    have been built on an unproven cause. failure_phase cannot separate them
+    either: it comes from an EXCEPTION, and a blocked call raises nothing.
+    """
+
+    def test_a_completed_iteration_advances_BOTH_counters(self, svc):
+        svc.note_poll_iteration_start()
+        svc.note_poll_iteration_end()
+        h = svc.jd_poll_health()
+        assert h["iterations_started"] == 1
+        assert h["iterations_completed"] == 1
+        assert h["current_iteration_seconds"] is None
+
+    def test_an_IN_FLIGHT_iteration_is_visible_as_such(self, svc):
+        """The blocked case: started but never completed, and the age grows."""
+        svc.note_poll_iteration_start()
+        h = svc.jd_poll_health()
+        assert h["iterations_started"] == 1
+        assert h["iterations_completed"] == 0
+        assert h["current_iteration_seconds"] is not None
+
+    def test_a_stuck_iteration_shows_a_GROWING_age(self, svc):
+        svc.note_poll_iteration_start()
+        svc._poll_iter_start_ts -= 3600
+        assert svc.jd_poll_health()["current_iteration_seconds"] >= 3600
+
+    def test_poll_results_completes_the_heartbeat_even_when_it_FAILS(self, svc):
+        """The wiring pin: a failing poll must still close its iteration, or a
+        fast-failing poller would be misread as blocked."""
+        svc.db = None
+        svc.config = {}
+        svc._results_cache = {}
+        svc._log = lambda *a, **k: None
+        svc._connect_jd_device = MagicMock(side_effect=RuntimeError("boom"))
+
+        svc.poll_results(record=False)
+
+        h = svc.jd_poll_health()
+        assert h["iterations_started"] == 1 and h["iterations_completed"] == 1
+        assert h["consecutive_failures"] == 1
+
+    def test_the_three_states_are_distinguishable(self, svc):
+        """The whole point, stated as the operator would read it."""
+        # cycling: both advance together
+        for _ in range(3):
+            svc.note_poll_iteration_start(); svc.note_poll_iteration_end()
+        h = svc.jd_poll_health()
+        assert h["iterations_started"] == h["iterations_completed"] == 3
+
+        # blocked: started runs ahead and stays there
+        svc.note_poll_iteration_start()
+        h = svc.jd_poll_health()
+        assert h["iterations_started"] - h["iterations_completed"] == 1
+        assert h["current_iteration_seconds"] is not None
+
+
+class TestOuterCycleHeartbeat:
+    """The PRIMARY heartbeat, per design review P1-1.
+
+    Wrapping poll_results alone cannot answer "is the thread cycling?". The
+    loop does more after poll_results returns -- source-link annotation, the
+    WebSocket broadcast, the rename hand-off -- and a block in any of those
+    leaves the INNER counters equal and stationary, which the documented table
+    read as "thread stopped". The thread is alive and blocked outside the
+    measured span: the same unsupported conclusion this instrumentation exists
+    to prevent.
+    """
+
+    def test_a_block_AFTER_poll_results_is_visible_as_blocked(self, svc):
+        """The exact case the inner span cannot see.
+
+        poll_results completed cleanly -- its counters are equal -- yet the
+        cycle is still open and ageing. Without the outer heartbeat this reads
+        as a stopped thread.
+        """
+        svc.note_cycle_start()
+        svc.note_poll_iteration_start()
+        svc.note_poll_iteration_end()          # the poll finished fine
+        svc._cycle_start_ts -= 3600            # then something after it blocked
+
+        h = svc.jd_poll_health()
+
+        assert h["iterations_started"] == h["iterations_completed"] == 1, \
+            "the inner span looks perfectly healthy"
+        assert h["cycles_started"] - h["cycles_completed"] == 1, \
+            "but the outer cycle never closed"
+        assert h["current_cycle_seconds"] >= 3600
+
+    def test_a_completed_cycle_advances_both_and_starts_the_age_clock(self, svc):
+        svc.note_cycle_start()
+        svc.note_cycle_end()
+        h = svc.jd_poll_health()
+        assert h["cycles_started"] == h["cycles_completed"] == 1
+        assert h["current_cycle_seconds"] is None
+        assert h["seconds_since_cycle_completed"] is not None
+
+    def test_a_STOPPED_thread_is_distinguishable_from_a_blocked_one(self, svc):
+        """Equal counters carry no age on their own -- hence the clock.
+
+        A single snapshot must separate a healthy idle poller from a dead one,
+        because the host checker only ever takes one snapshot.
+        """
+        svc.note_cycle_start()
+        svc.note_cycle_end()
+        svc._cycle_end_ts -= 7200              # nothing has started since
+
+        h = svc.jd_poll_health()
+
+        assert h["cycles_started"] == h["cycles_completed"]     # not blocked
+        assert h["current_cycle_seconds"] is None
+        assert h["seconds_since_cycle_completed"] >= 7200       # but long dead
+
+    def test_a_healthy_poller_reports_a_SMALL_age(self, svc):
+        """Control: without this, 'stopped' would match a working poller."""
+        svc.note_cycle_start()
+        svc.note_cycle_end()
+        assert svc.jd_poll_health()["seconds_since_cycle_completed"] < 5
+
+    def test_a_never_started_poller_reports_None_not_zero(self, svc):
+        h = svc.jd_poll_health()
+        assert h["cycles_started"] == 0
+        assert h["seconds_since_cycle_completed"] is None
+        assert h["current_cycle_seconds"] is None

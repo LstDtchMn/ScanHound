@@ -489,6 +489,20 @@ class DownloadService:
         #: so a recurrence is attributable instead of guessed from one
         #: generic exception (peer review 2026-08-15).
         self._jd_phase = "idle"
+        #: PRIMARY heartbeat: the OUTER poller cycle. Design review P1-1 --
+        #: wrapping poll_results alone cannot answer "is the thread cycling?",
+        #: because a block AFTER it returns (the WebSocket broadcast, the rename
+        #: hand-off) leaves the inner counters equal and stationary, which reads
+        #: as "thread stopped" when the thread is alive and blocked.
+        self._cycles_started = 0
+        self._cycles_completed = 0
+        self._cycle_start_ts: Optional[float] = None
+        self._cycle_end_ts: Optional[float] = None
+        #: NESTED span: localises a block to JD polling specifically once the
+        #: outer heartbeat has established the thread is stuck at all.
+        self._poll_iters_started = 0
+        self._poll_iters_completed = 0
+        self._poll_iter_start_ts: Optional[float] = None
         #: Seconds between repeats of the same connect-failure WARNING. The
         #: poller runs every few seconds; logging each failure would bury the
         #: log, and logging none is what hid this for 15 hours.
@@ -792,6 +806,60 @@ class DownloadService:
         if recovered:
             logger.info("JDownloader poll recovered after %d failure(s)", recovered)
 
+    def note_cycle_start(self):
+        """The poller thread is entering an OUTER cycle. PRIMARY heartbeat.
+
+        Design review P1-1: wrapping poll_results alone is the wrong authority
+        for "is the thread cycling?". The loop does more after poll_results
+        returns -- source-link annotation, the WebSocket broadcast, the rename
+        hand-off. A block in any of those leaves the INNER counters equal and
+        stationary, which the documented table read as "thread stopped" when
+        the thread is alive and blocked outside the measured span.
+
+        Closed BEFORE the sleep, so a healthy sleeping poller does not look
+        like an operation in flight.
+        """
+        with self._jd_poll_lock:
+            self._cycles_started += 1
+            self._cycle_start_ts = time.monotonic()
+
+    def note_cycle_end(self):
+        """The outer cycle finished, however it went."""
+        with self._jd_poll_lock:
+            self._cycles_completed += 1
+            self._cycle_start_ts = None
+            self._cycle_end_ts = time.monotonic()
+
+    def note_poll_iteration_start(self):
+        """The poller is entering an iteration. Half of the heartbeat.
+
+        Peer review 2026-08-15 identified this as THE unanswered question about
+        the 15-hour stall: *was the poller cycling at all?* Nothing recorded it,
+        so "one warning then silence" could equally mean
+
+          * cycling and failing silently (the rate-limit hypothesis), or
+          * blocked inside one iteration and never returning, or
+          * the thread stopped entirely.
+
+        Those want opposite fixes -- backoff helps only the first -- and the old
+        instrumentation could not tell them apart. `failure_phase` cannot either:
+        it is populated from an EXCEPTION, and a blocked call raises nothing.
+
+        started vs completed is what separates them:
+          started == completed, neither advancing  -> thread stopped
+          started  > completed, not advancing      -> BLOCKED inside an iteration
+          both advancing, no success               -> cycling and failing
+        """
+        with self._jd_poll_lock:
+            self._poll_iters_started += 1
+            self._poll_iter_start_ts = time.monotonic()
+
+    def note_poll_iteration_end(self):
+        """The poller finished an iteration -- however it went."""
+        with self._jd_poll_lock:
+            self._poll_iters_completed += 1
+            self._poll_iter_start_ts = None
+
     def jd_poll_health(self) -> Dict[str, Any]:
         """Liveness of the JDownloader poll, for the health surface and alerts.
 
@@ -809,6 +877,33 @@ class DownloadService:
                 "last_error": self._jd_last_poll_error,
                 "failure_phase": getattr(self, "_jd_fail_phase", None)
                                  if self._jd_poll_fail_streak else None,
+                # PRIMARY: the outer cycle. cycles_started > cycles_completed
+                # while current_cycle_seconds grows == the thread is BLOCKED.
+                # Both equal and seconds_since_cycle_completed growing == the
+                # thread has STOPPED. Equal counters alone carry no age, which
+                # is why the "since completed" clock is required rather than
+                # optional -- a single snapshot cannot otherwise tell a healthy
+                # idle poller from a dead one.
+                "cycles_started": self._cycles_started,
+                "cycles_completed": self._cycles_completed,
+                "current_cycle_seconds": (
+                    (time.monotonic() - self._cycle_start_ts)
+                    if self._cycle_start_ts else None),
+                "seconds_since_cycle_completed": (
+                    (time.monotonic() - self._cycle_end_ts)
+                    if self._cycle_end_ts else None),
+                # NESTED: localises a block to JD polling once the outer
+                # heartbeat has established the thread is stuck at all.
+                "iterations_started": self._poll_iters_started,
+                "iterations_completed": self._poll_iters_completed,
+                # Seconds the CURRENT iteration has been running. A value that
+                # keeps growing while iterations_completed stands still means
+                # the poller is BLOCKED inside one call, not failing fast --
+                # the distinction backoff cannot make and a stuck lock or a
+                # timeout-less network call would produce.
+                "current_iteration_seconds": (
+                    (time.monotonic() - self._poll_iter_start_ts)
+                    if self._poll_iter_start_ts else None),
             }
 
     def test_jd_connection(self) -> dict:
@@ -1101,7 +1196,22 @@ class DownloadService:
 
         Returns a list of per-package result dicts. Safe to call when JD is
         unreachable (returns []).
+
+        Wrapped in the heartbeat so a stall is CLASSIFIABLE. See
+        note_poll_iteration_start: started-vs-completed is the only thing that
+        separates "cycling and failing" from "blocked inside one call" from
+        "thread stopped", and those want different fixes.
         """
+        self.note_poll_iteration_start()
+        try:
+            return self._poll_results_inner(record)
+        finally:
+            # ALWAYS, however the iteration ends. If this never runs, the
+            # iteration never returned -- which is precisely the state the
+            # heartbeat exists to make visible.
+            self.note_poll_iteration_end()
+
+    def _poll_results_inner(self, record: bool = True) -> List[Dict[str, Any]]:
         try:
             device = self._connect_jd_device()
         except Exception as e:
