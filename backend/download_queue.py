@@ -892,6 +892,17 @@ class DownloadQueueService:
             self._emit("notification", notification)
             return
 
+        if is_source_wide_denial(outcome) and not self._scope_is_earned(item, outcome):
+            # Item-local DEFERRAL, not failure. The distinction matters: this
+            # outcome was made source-wide originally because routing it to
+            # _fail turned 78 items into permanent failures. Deferring keeps
+            # the item retryable while leaving its siblings runnable, which is
+            # what "item-local" has to mean here to be safe.
+            if not self._defer_item_only(item, outcome):
+                return
+            self._emit("download:result", outcome)
+            return
+
         if is_source_wide_denial(outcome):
             if not self._pause_for_source(item, outcome):
                 return
@@ -1042,6 +1053,95 @@ class DownloadQueueService:
             {**item, **outcome, "state": "failed"},
         )
         self._emit_batch_progress(item["batch_uuid"])
+        return True
+
+    #: Distinct items that must hit the SAME ambiguous outcome inside the window
+    #: before it is treated as evidence about the SOURCE rather than the item.
+    #: Two is deliberately low -- the cost of a wrong source pause is now bounded
+    #: (siblings keep running until it fires) while the cost of never promoting
+    #: is hammering a genuinely blocked source.
+    AMBIGUOUS_PROMOTION_DISTINCT_ITEMS = 2
+    AMBIGUOUS_PROMOTION_WINDOW_SECONDS = 3600
+    #: Outcomes that are AMBIGUOUS about scope: the producer observed that the
+    #: reveal did not complete, which is equally consistent with a bad release,
+    #: a changed template, or the source throttling everyone.
+    #:
+    #: A RECOGNISED interactive challenge is deliberately NOT here. That one is
+    #: positive evidence about the source by construction, it creates a
+    #: verification hold, and no timer or vote may weaken it -- the safety
+    #: property the turnstile work established.
+    _AMBIGUOUS_SOURCE_REASONS = {"reveal_verification_stalled"}
+
+    def _scope_is_earned(self, item: dict, outcome: dict) -> bool:
+        """Has source-wide scope been EARNED by evidence, for this outcome?
+
+        Design review: "an item-local failure must not become a source-wide
+        control action without positive evidence that the failure is
+        source-wide." One observed reveal stall parked 61 items for 48 hours;
+        the stall itself was never evidence about the source.
+
+        Unambiguous source outcomes (disabled, explicitly blocked, recognised
+        challenge) are earned by definition. Ambiguous ones must show the same
+        failure on SEVERAL DISTINCT items in a window -- distinct, so retrying
+        one stubborn page cannot manufacture its own evidence.
+
+        Fails SAFE: if the evidence cannot be read, behave as before and take
+        the source-wide path. A telemetry gap must not silently disable a
+        protection.
+        """
+        reason = str(outcome.get("reason_code") or "")
+        if reason not in self._AMBIGUOUS_SOURCE_REASONS:
+            return True                     # unambiguous: scope is inherent
+        if self.db is None or not hasattr(self.db, "distinct_items_failing"):
+            return True                     # cannot judge -> preserve old behaviour
+        try:
+            n = self.db.distinct_items_failing(
+                item.get("source"), reason,
+                within_seconds=self.AMBIGUOUS_PROMOTION_WINDOW_SECONDS)
+        except Exception:  # noqa: BLE001
+            logger.exception("scope classifier failed; treating as source-wide")
+            return True
+        earned = n >= self.AMBIGUOUS_PROMOTION_DISTINCT_ITEMS
+        logger.info(
+            "%s on %s: %d distinct item(s) in %ds -> %s",
+            reason, item.get("source"), n,
+            self.AMBIGUOUS_PROMOTION_WINDOW_SECONDS,
+            "SOURCE-wide (evidence earned)" if earned else "item-local only")
+        return earned
+
+    def _defer_item_only(self, item: dict, outcome: dict) -> bool:
+        """Defer THIS item and leave every sibling runnable.
+
+        The counterpart to _pause_for_source. Same durable-row discipline, but
+        it touches exactly one row: no sibling rewrite, so no synthetic
+        source_temporarily_blocked reasons and no batch state change.
+        """
+        now = _utcnow()
+        with self.db.transaction() as conn:
+            if not conn:
+                return False
+            conn.execute(
+                """
+                UPDATE download_queue_items
+                SET state = 'ready',
+                    queue_reason = 'item_retry',
+                    scheduled_for = ?,
+                    cooldown_until = ?,
+                    last_reason_code = ?,
+                    last_cause_code = ?,
+                    last_message = ?,
+                    attempt_count = attempt_count + 1,
+                    transport_attempted = 1,
+                    updated_at = ?
+                WHERE item_uuid = ?
+                """,
+                (outcome.get("cooldown_until") or now,
+                 outcome.get("cooldown_until"),
+                 outcome.get("reason_code"), outcome.get("cause_code"),
+                 outcome.get("message"), now, item["item_uuid"]),
+            )
+        row = self.get_item(item["item_uuid"]) or {"item_uuid": item["item_uuid"]}
+        self._emit("download:queue_updated", row)
         return True
 
     def _pause_for_source(self, item: dict, outcome: dict) -> bool:

@@ -5529,6 +5529,29 @@ class DatabaseManager:
             "AND started_at < datetime('now', ?) ORDER BY started_at",
             ("-%d seconds" % int(older_than_seconds),), default=[])
 
+    def distinct_items_failing(self, source, reason_code, within_seconds=3600):
+        """How many DISTINCT items hit `reason_code` on `source` recently.
+
+        The promotion evidence for source-wide scope. "Scope must be earned by
+        evidence" (design review): one item failing proves something about that
+        item; several DIFFERENT items failing the same way in a window is what
+        suggests the source itself is the problem.
+
+        DISTINCT is the load-bearing word. Retrying one stubborn page ten times
+        must not manufacture ten pieces of evidence -- that is how a single bad
+        release convinces the system an entire source is refusing.
+
+        Counts only transport_attempted=1: a sibling parked by policy never
+        asked the source anything and is not evidence about it.
+        """
+        rows = self._query_dicts(
+            "SELECT COUNT(DISTINCT item_uuid) AS n FROM download_queue_attempts "
+            "WHERE source = ? AND reason_code = ? AND transport_attempted = 1 "
+            "  AND started_at > datetime('now', ?)",
+            (str(source), str(reason_code), "-%d seconds" % int(within_seconds)),
+            default=[])
+        return int((rows[0] if rows else {}).get("n") or 0)
+
     def queue_source_observations(self, source, within_seconds=86400):
         """OBSERVED source outcomes only -- never policy deferrals.
 
