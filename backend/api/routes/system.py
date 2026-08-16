@@ -37,6 +37,18 @@ def health(reg: ServiceRegistry = Depends(get_registry)):
         ),
         "jd_enabled": bool(cfg.get("jd_enabled") and cfg.get("jd_method") == "api"),
     }
+    # Queue stall conditions, on the same unauthenticated health route and for
+    # the same reason as jd_poll: the scheduled host checker must be able to see
+    # a stalled queue without holding a credential. Three separate conditions,
+    # because one timer cannot tell "nothing was attempted" from "everything
+    # attempted failed" -- the ambiguity that made the 2026-08-13 incident
+    # unresolvable.
+    if reg.db is not None and hasattr(reg.db, "queue_stall_report"):
+        try:
+            body["queue"] = reg.db.queue_stall_report()
+        except Exception:  # noqa: BLE001
+            body["queue"] = None
+
     health_fn = getattr(reg.download, "jd_poll_health", None) if reg.download else None
     if callable(health_fn):
         try:
