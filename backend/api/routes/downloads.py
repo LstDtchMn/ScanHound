@@ -17,6 +17,7 @@ from backend.download_queue import (
     DownloadQueueUnavailable,
 )
 from backend.source_health import record_scrape_outcome
+from backend.item_history import item_history
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 from backend.download_outcome import (
     deferred_result,
@@ -269,6 +270,32 @@ def retry_ready_downloads(
     except Exception as exc:
         detail = exc.detail() if hasattr(exc, "detail") else str(exc)
         raise HTTPException(status_code=409, detail=detail)
+
+
+@router.get("/queue/items/{item_uuid}/history")
+def download_item_history(
+    item_uuid: str,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    """Everything the per-item detail sheet shows, already in display terms.
+
+    Assembled server-side on purpose. The alternative -- ship raw rows and let
+    the UI phrase them -- creates a second wording vocabulary beside
+    _FAILURE_TITLES, and the two would drift; this codebase has been bitten by
+    two registries answering one question repeatedly. It also keeps the
+    trustworthy-history cutoff in ONE place, so the UI cannot render rows the
+    backend considers fabricated.
+    """
+    queue = reg.download_queue
+    if queue is None or reg.db is None:
+        raise HTTPException(status_code=503, detail="Download queue not available")
+    item = queue.get_item(item_uuid)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    attempts = reg.db.queue_attempts_for_item(item_uuid)
+    return item_history(
+        item, attempts,
+        trusted_from=reg.db.ATTEMPT_HISTORY_TRUSTED_FROM)
 
 
 @router.post("/retries/{item_uuid}/retry")

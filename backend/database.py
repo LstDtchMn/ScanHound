@@ -5566,6 +5566,43 @@ class DatabaseManager:
             "AND started_at < datetime('now', ?) ORDER BY started_at",
             ("-%d seconds" % int(older_than_seconds),), default=[])
 
+    #: Attempt rows written before this date CANNOT BE SHOWN TO A USER.
+    #:
+    #: Until 2026-08-16 nothing closed an attempt with its real outcome -- the
+    #: finally-backstop was the only closer, so every row reads
+    #: FAILED/attempt_not_closed with transport_attempted 0 regardless of what
+    #: actually happened. All 3 rows in production at the time of the fix were
+    #: fabricated in exactly that way. A per-item history built on them would
+    #: show a wall of failures for downloads that succeeded, which is worse than
+    #: showing nothing: it is confidently wrong, and the whole point of the
+    #: history is to answer "what happened to this one".
+    #:
+    #: The rows are deliberately NOT deleted (they are evidence of the defect,
+    #: and the owner chose to keep them) -- they are simply not rendered as
+    #: history. The UI says so rather than implying the item has no past.
+    ATTEMPT_HISTORY_TRUSTED_FROM = "2026-08-16 00:00:00"
+
+    def queue_attempts_for_item(self, item_uuid, trusted_only=True):
+        """Every recorded attempt for one queue item, oldest first.
+
+        Ordered by julianday() rather than lexically: this column holds both the
+        pre-fix "2026-08-16T03:51:41" shape and the canonical
+        "2026-08-16 03:51:41", and 'T' sorts after ' ', so a plain ORDER BY puts
+        legacy rows after same-day real ones no matter when they happened.
+        """
+        if not item_uuid:
+            return []
+        sql = ("SELECT attempt_id, started_at, finished_at, terminal_status, "
+               "       reason_code, affected_scope, transport_attempted, "
+               "       source_progress "
+               "FROM download_queue_attempts WHERE item_uuid = ? ")
+        params = [str(item_uuid)]
+        if trusted_only:
+            sql += "  AND julianday(started_at) >= julianday(?) "
+            params.append(self.ATTEMPT_HISTORY_TRUSTED_FROM)
+        sql += "ORDER BY julianday(started_at) ASC"
+        return self._query_dicts(sql, tuple(params), default=[])
+
     def distinct_items_failing(self, source, reason_code, within_seconds=3600,
                                now=None, including_item=None):
         """How many DISTINCT items hit `reason_code` on `source` recently.
