@@ -4,10 +4,12 @@ Several rows normalize onto a single key whenever the same file was recorded
 under a drive letter and its UNC share, under different separators or case, or
 simply stored twice under two spellings. Every index in dv_labeler used to be
 built with a last-write-wins assignment in a loop, and get_dv_scans() orders
-``last_seen_at DESC``, so the OLDEST row won. 311 colliding keys in the live
-database resolve to the correct layer today only because the older row happens
-to be the determinate one; a rescan that reorders them flips the verdict with
-nothing logged.
+``last_seen_at DESC`` -- which is not a tie-break, because a bulk rescan stamps
+thousands of rows within one second (the live table: 6,948 rows, 5 distinct
+timestamps, 5,975 sharing one). The winner is whichever row the sorter emits
+first among equals, and that shifts whenever rows are added: 346 keys have a
+real layer on one row and a failed scan on the other, and the count resolving
+wrongly measured 335 and then 0 on the same database twenty minutes apart.
 
 Permutation invariance is therefore the property under test, not a nicety: every
 case below is asserted in BOTH orders, because the old code passes one order of
@@ -16,7 +18,8 @@ each pair. A test that fed only one order would pass unchanged against the bug.
 from unittest.mock import MagicMock
 
 from backend.rename.dv_labeler import (
-    _index_by_normalized_path, build_index, build_index_and_paths,
+    LAYER_CONFLICT, LAYER_DETECTION_FAILED, _index_by_normalized_path,
+    build_index, build_index_and_paths, is_authoritative, pick_layer,
     reconcile_movie, sync_labels)
 
 VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}
@@ -98,7 +101,8 @@ def test_two_different_real_layers_are_a_conflict_in_either_order():
     for rows in (_rows(("fel", PATH_A), ("mel", PATH_B)),
                  _rows(("mel", PATH_A), ("fel", PATH_B))):
         idx, _, conflicts = _index_by_normalized_path(rows, mappings=[])
-        assert idx[NORM] == "unknown", f"a contradiction became a verdict: {rows}"
+        assert idx[NORM] == LAYER_CONFLICT, \
+            f"a contradiction became a verdict: {rows}"
         assert conflicts == {NORM: ["fel", "mel"]}, "the conflict was not reported"
 
 
@@ -109,7 +113,7 @@ def test_none_versus_a_real_layer_is_also_a_conflict():
     for rows in (_rows(("fel", PATH_A), ("none", PATH_B)),
                  _rows(("none", PATH_A), ("fel", PATH_B))):
         idx, _, conflicts = _index_by_normalized_path(rows, mappings=[])
-        assert idx[NORM] == "unknown"
+        assert idx[NORM] == LAYER_CONFLICT
         assert conflicts == {NORM: ["fel", "none"]}
 
 
@@ -242,6 +246,133 @@ def test_build_index_and_paths_still_returns_two_values():
         _rows(("fel", PATH_A), ("unknown", PATH_B)), mappings=[])
     assert idx == {NORM: "fel"}
     assert norm_to_path == {NORM: PATH_A}
+
+
+#: A second part of the same title, on its own normalized key.
+SIBLING = "Y:/Movies/Alpha (2001)/Alpha-pt2.mkv"
+SIBLING_NORM = "y:/movies/alpha (2001)/alpha-pt2.mkv"
+
+
+def test_a_conflict_is_not_the_same_state_as_a_failed_scan():
+    """Both are non-authoritative, and they are non-authoritative DIFFERENTLY.
+
+    'unknown' means "no evidence for this part" and is meant to lose to a
+    sibling's positive finding. A conflict means "evidence that contradicts
+    itself" and must not. Collapsing the second onto the first is what created
+    the multipart hole, so the distinctness is worth pinning.
+    """
+    assert LAYER_CONFLICT != LAYER_DETECTION_FAILED
+    assert is_authoritative(LAYER_CONFLICT) is False
+    assert is_authoritative(LAYER_DETECTION_FAILED) is False
+    assert is_authoritative("none") is True
+
+
+def test_ordinary_unknown_is_still_beaten_by_a_positive_sibling():
+    """REGRESSION CONTROL for the fix to the multipart hole.
+
+    "One part proving DV proves it for the title" is deliberate and predates
+    this work. If the conflict fix had been implemented by making pick_layer
+    pessimistic about `unknown` too, this is the test that would have caught
+    it, and the whole existing suite depends on the behaviour.
+    """
+    idx = {"y:/a.mkv": LAYER_DETECTION_FAILED, "y:/b.mkv": "fel"}
+    assert pick_layer(["y:/a.mkv", "y:/b.mkv"], idx) == "fel"
+    assert pick_layer(["y:/b.mkv", "y:/a.mkv"], idx) == "fel"
+
+
+def test_conflict_beats_a_positive_sibling_at_the_title_level():
+    """A contradicting part poisons the title, in either part order.
+
+    pick_layer's rank loop runs before its `unknown` handling, so a conflict
+    reported as `unknown` was simply invisible whenever any sibling part had a
+    positive layer. Profile 5 is the sibling on purpose: it is the LOWEST rank,
+    so the contradicting file (fel or mel) would outrank it if the truth were
+    known -- acting on the sibling is therefore not merely incomplete, it is
+    likely wrong.
+    """
+    idx = {NORM: LAYER_CONFLICT, SIBLING_NORM: "profile5"}
+    assert pick_layer([NORM, SIBLING_NORM], idx) == LAYER_CONFLICT
+    assert pick_layer([SIBLING_NORM, NORM], idx) == LAYER_CONFLICT
+    # And with a sibling that outranks nothing in question:
+    idx_fel = {NORM: LAYER_CONFLICT, SIBLING_NORM: "fel"}
+    assert pick_layer([NORM, SIBLING_NORM], idx_fel) == LAYER_CONFLICT
+    assert pick_layer([SIBLING_NORM, NORM], idx_fel) == LAYER_CONFLICT
+
+
+def test_conflicted_part_stops_removal_on_a_multipart_title():
+    """The reviewer's counterexample, end to end, in a DESTRUCTIVE reconcile.
+
+    One part's rows say fel and mel; a clean sibling part says profile5. Before
+    the fix the title resolved to profile5, which is authoritative, so the
+    labeler would add DV5/DV and REMOVE the DV FEL/DV7 the contradicting part
+    may well justify. Both part orders, because the old failure was order-shaped.
+    """
+    rows = _rows(("fel", PATH_A), ("mel", PATH_B), ("profile5", SIBLING))
+    idx = build_index(rows, mappings=[])
+    assert idx[NORM] == LAYER_CONFLICT and idx[SIBLING_NORM] == "profile5"
+
+    for files in ([PATH_B, SIBLING], [SIBLING, PATH_B]):
+        pm = MagicMock()
+        mv = _movie(11, files, ["DV FEL", "DV7", "DV"])
+        res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, mappings=[],
+                              additive_only=False)
+        assert res["layer"] == LAYER_CONFLICT, f"order {files} lost the conflict"
+        assert res["removed"] == [], "a masked conflict stripped a label"
+        assert res["added"] == [], "a masked conflict invented a label"
+        assert res["matched"] is False
+        pm.remove_label.assert_not_called()
+        pm.add_label.assert_not_called()
+
+
+def test_conflicted_part_blocks_the_rating_key_back_write_on_a_multipart_title():
+    """Same shape, checked at the database boundary rather than the flag.
+
+    The back-write loop annotates the first movie path merely PRESENT in the
+    index, so a clean sibling making the title authoritative was enough to
+    stamp a rating_key onto the contradicting path.
+    """
+    rows = _rows(("fel", PATH_A), ("mel", PATH_B), ("profile5", SIBLING))
+
+    class _DB:
+        def get_dv_scans(self, **kw):
+            return rows
+        upsert_dv_scan = MagicMock(return_value=True)
+        annotate_dv_scan_rating_key = MagicMock(return_value=True)
+
+    for files in ([PATH_B, SIBLING], [SIBLING, PATH_B]):
+        pm = MagicMock()
+        lib = MagicMock()
+        lib.all.return_value = [_movie(11, files, [])]
+        pm.get_library_section.return_value = lib
+        db = _DB()
+        db.annotate_dv_scan_rating_key.reset_mock()
+
+        res = sync_labels(db, pm, {"movie_libs": ["Movies"]}, dry_run=False,
+                          mappings=[])
+
+        assert res["matched"] == 0, f"order {files} matched a conflicted title"
+        assert res["layer_conflicts"] == 1
+        db.annotate_dv_scan_rating_key.assert_not_called()
+
+
+def test_a_clean_multipart_title_is_unaffected():
+    """Negative control for the four tests above.
+
+    Without it they would all still pass if the conflict state had been made so
+    sticky that ordinary multi-version titles stopped being labelled at all --
+    and 1,029 of this library's movies have more than one version.
+    """
+    rows = _rows(("mel", "Y:/m/one.mkv"), ("fel", "Y:/m/two.mkv"))
+    idx = build_index(rows, mappings=[])
+    pm = MagicMock()
+    mv = _movie(12, ["Y:/m/one.mkv", "Y:/m/two.mkv"], [])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, mappings=[],
+                          additive_only=False)
+
+    assert res["layer"] == "fel", "fel must still outrank mel across parts"
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"}
+    assert res["matched"] is True
 
 
 def test_seed_baseline_collapse_is_order_independent_too():

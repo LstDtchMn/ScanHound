@@ -74,14 +74,35 @@ _THROTTLE_S = 0.05  # inter-write pause so a big library can't hammer Plex
 #: Dolby Vision.
 LAYER_DETECTION_FAILED = "unknown"
 
+#: A verdict for a normalized file whose OWN rows make DIFFERENT authoritative
+#: claims — one spelling says fel, another says mel.
+#:
+#: Distinct from 'unknown' deliberately. 'unknown' means "no evidence for this
+#: part", and pick_layer is built so a sibling part's positive finding outranks
+#: it: one part proving Dolby Vision proves it for the title. A contradiction
+#: is the opposite situation — there IS evidence and it disagrees with itself,
+#: so the file could be any of the claimed layers, possibly one that OUTRANKS
+#: the sibling. Collapsing it onto 'unknown' therefore let a clean sibling part
+#: re-authorise destructive reconciliation for the whole title and re-open the
+#: rating_key back-write, which is exactly what the single-part reasoning
+#: missed (peer review 2026-08-17).
+LAYER_CONFLICT = "conflict"
+
+#: Layer values that are NOT evidence and may never authorise a destructive
+#: action. One set, because the guards that consume it are spread across
+#: is_authoritative, desired_label(s), pick_layer and reconcile_movie — adding a
+#: third such state to four of the five is how the conflict hole was created.
+_NON_EVIDENCE = frozenset({LAYER_DETECTION_FAILED, LAYER_CONFLICT})
+
 
 def is_authoritative(layer):
     """Whether a dv_layer is a real finding we may act on destructively.
 
     The distinction dv_detect documents — "could not run" vs "confirmed no
-    DV" — is only meaningful if it is enforced where labels are removed.
+    DV" — is only meaningful if it is enforced where labels are removed. A
+    self-contradicting file is likewise not something to act on.
     """
-    return layer is not None and layer != LAYER_DETECTION_FAILED
+    return layer is not None and layer not in _NON_EVIDENCE
 
 
 def desired_label(layer, vocab):
@@ -91,7 +112,7 @@ def desired_label(layer, vocab):
     deciding what a title should carry want desired_labels(); this remains for
     reporting the one label that names the layer itself.
     """
-    if not layer or layer in ("none", LAYER_DETECTION_FAILED):
+    if not layer or layer == "none" or layer in _NON_EVIDENCE:
         return None
     label = vocab.get(layer)
     return label if label in _LAYER_LABELS else None
@@ -111,7 +132,7 @@ def desired_labels(layer, vocab):
     empty set from a POSITIVE layer means a configuration gap, which
     reconcile_movie must distinguish. See its may_remove rules.
     """
-    if not layer or layer in ("none", LAYER_DETECTION_FAILED):
+    if not layer or layer == "none" or layer in _NON_EVIDENCE:
         return set()
     out = set()
     primary = vocab.get(layer)
@@ -126,12 +147,23 @@ def pick_layer(norm_paths, index):
 
     The contract, in order:
 
+    0. any part that CONTRADICTS ITSELF poisons the title -- see below;
     1. any positive DV finding wins, by the documented rank (fel > mel > p8 > p5)
        -- one part proving Dolby Vision proves it for the title;
     2. otherwise, if ANY part is unclassified ('unknown') or has no row at all,
        the aggregate is 'unknown' -- absence has not been established;
     3. only when EVERY part is matched and authoritatively 'none' is the
        aggregate 'none'.
+
+    Rule 0 has to precede rule 1, and that ordering is the whole point. A
+    LAYER_CONFLICT part is a file whose own rows claim two DIFFERENT layers, so
+    its true layer is unknown but is definitely one of them -- possibly one that
+    OUTRANKS a clean sibling. Running the rank loop first would let a sibling's
+    'profile5' become the title's verdict and authorise REMOVING a DV FEL label
+    that the contradicting part may well justify. "One part proves DV for the
+    title" is sound for evidence; it is not sound for evidence that disagrees
+    with itself. Found by peer review after the single-part case was traced
+    through the consumer and the multi-part case was not.
 
     Rules 2 and 3 are the fix for two unsafe behaviours. The old
     ``found[0] if found else None`` made a mixed ['none','unknown'] title
@@ -142,6 +174,8 @@ def pick_layer(norm_paths, index):
     read as "don't know", never as "no".
     """
     found = [index[p] for p in norm_paths if p in index]
+    if LAYER_CONFLICT in found:
+        return LAYER_CONFLICT            # rule 0: before the rank loop
     for rank in _LAYER_RANK:
         if rank in found:
             return rank
@@ -161,10 +195,20 @@ def _collapse_observations(observations):
     a drive letter and its UNC share, under different separators or case, or
     simply stored twice under two spellings. Every index here used to be built
     with ``idx[p] = row[layer]`` inside a loop, so the LAST row silently won.
-    With get_dv_scans() ordering ``last_seen_at DESC`` that is the OLDEST row —
-    311 colliding keys in the live database currently resolve to the correct
-    layer purely because the older row happens to be the determinate one, and a
-    rescan that reorders them flips the answer with nothing logged.
+
+    ``get_dv_scans()`` orders ``last_seen_at DESC``, which LOOKS like a
+    tie-break and is not one. A bulk rescan stamps thousands of rows inside the
+    same second: the live table holds 6,948 scan rows across FIVE distinct
+    timestamps, 5,975 of them sharing a single value. The winner is therefore
+    whichever row the sorter happens to emit first among equals, and that
+    shifts as rows are added.
+
+    346 keys carry a real layer on one row and a failed scan on the other (180
+    of them a layer that produces a badge). Measured twice against the same
+    database twenty minutes apart, the count resolving WRONGLY was 335, then 0.
+    Both the original "they all happen to be right" reading and the later "335
+    are wrong" reading were snapshots of a coin toss, which is the actual
+    defect: not a wrong answer, an arbitrary one.
 
     The rule depends only on the SET of layers observed, never on row order:
 
@@ -190,13 +234,16 @@ def _collapse_observations(observations):
       file making different positive claims is a contradiction, not a union;
       taking the higher would launder a disagreement into a confident answer.
 
-    A CONFLICT reports ``unknown``, which is not a fudge but the whole point:
-    it routes the case through the failure path this module already has, where
-    reconcile_movie sets may_remove=False and matched=False. A contradiction
-    therefore cannot strip a label and cannot back-write a rating_key, which is
-    exactly how an unresolved disagreement should behave. Returning the layers
-    alongside is what keeps it EXPLICIT rather than silent — sync_labels logs
-    them and counts them in its summary.
+    A CONFLICT reports ``LAYER_CONFLICT`` — its own value, not a reuse of
+    ``unknown``. Reusing 'unknown' was the first attempt and it was wrong: the
+    two states are non-authoritative in DIFFERENT ways. pick_layer is built to
+    let a sibling part's positive finding beat an 'unknown', which is right for
+    a failed scan and wrong for a contradiction, so on a multi-part title the
+    conflict silently vanished and destructive reconciliation was re-enabled.
+    See LAYER_CONFLICT and pick_layer's rule 0.
+
+    Returning the layers alongside is what keeps the disagreement EXPLICIT
+    rather than silent — sync_labels logs them and counts them in its summary.
     """
     authoritative = sorted({lay for lay, _ in observations if is_authoritative(lay)})
     conflict = None
@@ -210,7 +257,7 @@ def _collapse_observations(observations):
                  if any(lay == LAYER_DETECTION_FAILED for lay, _ in observations)
                  else None)
     else:
-        layer = LAYER_DETECTION_FAILED
+        layer = LAYER_CONFLICT
         conflict = authoritative
 
     # The path must come from a row that CARRIES the winning layer. Taking the
@@ -344,6 +391,11 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     #                     a manual full reconcile may ask to reconcile known
     #                     evidence, but it cannot convert failed evidence into
     #                     proof of absence.
+    #   'conflict'     -> NEVER remove, in any mode, for the same reason and
+    #                     one more: the file's own rows disagree, so the layer
+    #                     that would justify the existing label may be the
+    #                     correct one. Both live in _NON_EVIDENCE so this guard
+    #                     cannot be updated for one and forgotten for the other.
     #   authoritative  -> remove stale labels, in any mode (that is what makes
     #                     unattended reconciliation converge after a rescan).
     #   no match       -> the pre-existing policy: full reconcile removes,
@@ -363,9 +415,10 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     # so testing the set would have made this guard unreachable for the four
     # known layers -- and a vocab gap would once again strip the correct badge
     # while quietly adding the group tags. Test the badge itself.
-    positive = layer is not None and layer not in ("none", LAYER_DETECTION_FAILED)
+    positive = (layer is not None and layer != "none"
+                and layer not in _NON_EVIDENCE)
     unmapped = positive and desired is None
-    if layer == LAYER_DETECTION_FAILED or unmapped:
+    if layer in _NON_EVIDENCE or unmapped:
         may_remove = False
     else:
         may_remove = authoritative or not additive_only
@@ -517,9 +570,15 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     seed_index, _, seed_conflicts = _index_by_normalized_path(
         seed_rows, mappings, layer_key="seed_layer")
     if seed_conflicts:
+        # Says what the report ACTUALLY renders rather than "unverified": the
+        # discrepancy string is built from the seed value verbatim, so a
+        # conflicted seed shows up as seed_conflict_live_<layer>, not as a
+        # generic unverified state.
         logger.warning(
             "dv sync: %d seed-baseline path(s) carry conflicting seed layers; "
-            "each is reported as unverified", len(seed_conflicts))
+            "each collapses to %r and appears in the dry-run discrepancy "
+            "report as seed_%s_live_<layer>",
+            len(seed_conflicts), LAYER_CONFLICT, LAYER_CONFLICT)
 
     movie_libs = (config.get("movie_libs")
                   or config.get("known_movie_libraries") or [])
@@ -561,8 +620,18 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
                     # beside a fresh signature. The labeler consumes scan
                     # observations; it does not produce them, and the only
                     # column it owns here is the Plex identity.
+                    #
+                    # Skips a CONFLICTED path. pick_layer's rule 0 already
+                    # means a title with a conflicting part is never matched,
+                    # so this branch should be unreachable for one -- but the
+                    # loop annotates the first path merely PRESENT in the
+                    # index, without asking whether that path produced the
+                    # title's verdict. That gap is what let a clean sibling
+                    # carry a contradicting path's rating_key. Keeping the
+                    # guard local means the invariant does not depend on
+                    # pick_layer continuing to hold the line.
                     for p in _movie_norm_paths(mv, mappings):
-                        if p in index:
+                        if p in index and p not in layer_conflicts:
                             db.annotate_dv_scan_rating_key(
                                 norm_to_path.get(p, p), str(mv.ratingKey))
                             break
@@ -608,4 +677,12 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
             # titles were skipped on purpose"; without it a conflict is
             # arithmetically identical to an unscanned file in this summary.
             "layer_conflicts": len(layer_conflicts),
+            # The PATHS as well as the count, because the alert that consumes
+            # this dedups on the SET. A conflict does not self-heal -- the two
+            # rows keep disagreeing until a rescan resolves them -- so an
+            # unconditional alert fires on every pass forever, and a
+            # count-based guard goes quiet on exactly the pass where one file
+            # resolves and a different one appears. Bounded by the number of
+            # colliding keys, which cannot exceed the row count.
+            "layer_conflict_paths": sorted(layer_conflicts),
             "details": details}

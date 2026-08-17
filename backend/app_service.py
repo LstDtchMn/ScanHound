@@ -732,10 +732,97 @@ class AppService:
                         self._last_dv_scan_at = latest
                         logger.info(
                             "DV auto-sync: %d matched, %d label(s) added "
-                            "(additive-only)",
-                            result.get("matched", 0), result.get("added", 0))
+                            "(additive-only), %d file(s) with contradicting "
+                            "scan records",
+                            result.get("matched", 0), result.get("added", 0),
+                            result.get("layer_conflicts", 0))
+                        self._alert_dv_layer_conflicts(result)
         except Exception:
             logger.exception("DV auto label sync failed (non-fatal)")
+
+    def _alert_dv_layer_conflicts(self, result):
+        """Alert ONCE per distinct set of self-contradicting DV files.
+
+        A file whose two dv_scan rows claim different layers is deliberately
+        left alone by the labeler -- no badge added, none removed -- so nothing
+        about it is visible in the ordinary counts. This is the only thing that
+        says so out loud, and the unattended hourly sync is where it matters,
+        because nobody is watching the log.
+
+        Dedups on the SET of paths, not the count. A conflict does not
+        self-heal: the rows keep disagreeing until a rescan resolves them, so
+        an unconditional alert would fire every hour forever. A count-based
+        guard has the opposite failure -- it stays silent on precisely the pass
+        where one file resolves and a different one starts conflicting.
+
+        Goes out on TWO channels, and the in-app websocket is the one that
+        actually delivers today. Probing the live deployment rather than
+        assuming: every outbound channel is unconfigured —
+        `desktop_notifications` is on but plyer's Linux backend is disabled in
+        a headless container (no gdbus/notify-send), and Discord, Slack,
+        Pushover and the generic webhook are all unset — so the channel list is
+        empty and any notifier send is a no-op. An alert that reaches nobody
+        while reading as coverage is worse than no alert.
+
+        So the websocket carries it: the same path the unmapped-Plex-path check
+        above uses, which needs no configuration and surfaces in the ScanHound
+        UI. The bridge send is the forward-looking half, so that configuring a
+        webhook later starts carrying this with no code change.
+
+        Never lets a notification failure reach the caller, on either channel.
+        The label work has already succeeded by this point; a dead channel must
+        not undo it or stop the watermark advancing (the
+        logging-as-hard-dependency outage, 2026-08-12).
+        """
+        try:
+            paths = frozenset(result.get("layer_conflict_paths") or ())
+            previous = getattr(self, "_dv_conflict_paths", None)
+            if paths == previous:
+                return
+            self._dv_conflict_paths = paths
+            if not paths:
+                if previous:
+                    logger.info("DV auto-sync: all contradicting scan records "
+                                "have resolved")
+                return
+            sample = sorted(paths)[:5]
+            body = (f"{len(paths)} file(s) have two scan records claiming "
+                    f"different Dolby Vision layers. Those titles are left "
+                    f"untouched — no badge added or removed — until the "
+                    f"records agree. First {len(sample)}: "
+                    + "; ".join(sample))
+            logger.warning("DV auto-sync: %s", body)
+
+            try:
+                from backend.api.ws import ws_manager
+                ws_manager.broadcast_sync({"type": "notification", "data": {
+                    "title": "Dolby Vision: contradicting scan records",
+                    "body": body, "priority": "high"}})
+            except Exception:
+                logger.exception("DV conflict alert: websocket broadcast failed")
+
+            # The registry's NotificationBridge, NOT self.notification_manager.
+            # This service's own NotificationManager is constructed bare and
+            # nothing ever calls configure_from_dict on it, so its channel list
+            # is permanently empty and sending through it could never deliver
+            # no matter what anyone configured. The bridge is the instance that
+            # IS configured from config (NotificationBridge.configure), so a
+            # webhook added later starts carrying this alert with no code
+            # change. Verified rather than assumed: the live manager reported
+            # zero channels.
+            try:
+                from backend.api.dependencies import registry
+                bridge = getattr(registry, "notifications", None)
+                if bridge is not None:
+                    bridge.send(
+                        "error",
+                        "Dolby Vision: contradicting scan records",
+                        body,
+                        {"count": len(paths), "paths": sorted(paths)[:50]})
+            except Exception:
+                logger.exception("DV conflict alert: notifier failed")
+        except Exception:
+            logger.exception("DV conflict alert failed (non-fatal)")
 
     def _start_maintenance_loop(self, interval_seconds: float = 3600.0):
         """Start the hourly trash-sweep + WAL-checkpoint background thread."""

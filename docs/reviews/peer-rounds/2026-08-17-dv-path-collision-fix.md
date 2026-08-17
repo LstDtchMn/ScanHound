@@ -1,18 +1,41 @@
 # Review round — normalized-path collision fix (dv_labeler)
 
 **Date:** 2026-08-17
-**Scope:** `backend/rename/dv_labeler.py`, `tests/test_dv_path_collision.py`
-**Asking for:** a check on the resolution rule, and on one live measurement that
-**contradicts** what the 2026-08-17 handoff says about this bug.
+**Scope:** `backend/rename/dv_labeler.py`, `backend/app_service.py`,
+`backend/api/routes/rename.py`, `tests/test_dv_path_collision.py`,
+`tests/test_dv_conflict_alert.py`
+**Round 2** — responds to the peer review of `c1bbac4`, which returned
+REQUEST CHANGES with one MEDIUM blocker.
+
+> **Round 1's §4 has been retracted and replaced.** Not softened — the central
+> claim was wrong in a way neither I nor the reviewer caught, and the corrected
+> version is in §4 below.
+
+---
+
+## 0. Response to round 1
+
+| # | Required change | Status |
+|---|---|---|
+| 1 | Multipart conflict hole: a true conflict must not be maskable by a positive sibling | **Fixed** — `LAYER_CONFLICT` sentinel + `pick_layer` rule 0 (§3) |
+| 2 | End-to-end multipart test: conflict + clean positive sibling | **Added** — 2 tests, both part orders, plus a regression control (§5) |
+| 3 | Annotation loop must not select a conflicted path | **Fixed** — local guard in `sync_labels` (§3) |
+| 4 | Correct stale "311 all correct" comments | **Fixed**, and they were replaced with something different again — see §4 |
+| 5 | Preserve the measurement command + collision-size histogram | **Added** (§4); histogram **confirms** the reviewer's inferred invariant |
+
+The blocker was real and I reproduced it before fixing it. It is also a repeat
+of the failure this project keeps logging: I traced the conflict state through
+the consumer for a **single-part** title, found `may_remove=False` and
+`matched=False`, and stopped. `pick_layer` runs its positive-rank loop *before*
+its `unknown` handling, so on a multi-part title a clean sibling made the whole
+title authoritative and re-opened both label removal and the `rating_key`
+back-write.
 
 ---
 
 ## 1. The bug
 
-Several `dv_scan` rows can normalize onto one key — the same file recorded under
-a drive letter and its UNC share, under different separators or case, or stored
-twice under two spellings. All three indexes in `dv_labeler` were built with a
-last-write-wins assignment in a loop:
+All three indexes in `dv_labeler` were built with last-write-wins in a loop:
 
 ```python
 for r in rows:
@@ -22,149 +45,272 @@ for r in rows:
         norm_to_path[p] = r.get("path")
 ```
 
-`get_dv_scans()` orders `last_seen_at DESC`, so the **oldest** row wins.
-
-## 2. The rule implemented
+## 2. The rule
 
 Depends only on the SET of layers observed, so it is permutation-invariant:
 
 ```
 exactly one distinct authoritative layer (+ any failures) -> that layer
 no authoritative layer at all                             -> the failure value
-two or more DIFFERENT authoritative layers                -> CONFLICT
+two or more DIFFERENT authoritative layers                -> LAYER_CONFLICT
 ```
 
 `none` is authoritative (the detector ran, found no DV). `unknown`/NULL is a
-failed detection and is never evidence.
+failed detection and is never evidence. `last_seen_at` is not used to arbitrate
+(a failed scan preserves the old layer while advancing the timestamp), and
+`_LAYER_RANK` is not used (it ranks parts of one title, not observations of one
+file). All three call sites share `_index_by_normalized_path`.
 
-Per the spec, **not** used to arbitrate: `last_seen_at` (a failed scan preserves
-the old layer while advancing the timestamp, so it dates the observation, not
-the layer) and `_LAYER_RANK` (it ranks the parts of one title, not two
-observations of one file).
+## 3. The conflict state — changed per review
 
-All three call sites — `build_index`, `build_index_and_paths`, and the
-`seed_index` comprehension — now share `_index_by_normalized_path`.
+Round 1 emitted `unknown` for a conflict. **The reviewer was right that this is
+wrong**, and the argument that convinced me is the one I had not considered:
+`unknown` and "contradiction" are non-authoritative in *different* ways.
+`pick_layer` deliberately lets a sibling part's positive finding beat an
+`unknown` — "one part proving DV proves it for the title" — which is correct for
+a failed scan and wrong for evidence that disagrees with itself, because the
+contradicting file could be *any* of its claimed layers, including one that
+outranks the sibling.
 
-## 3. Design decision I want checked
+Now:
 
-**A conflict is emitted as `unknown`, and the key STAYS in the index.**
+* `LAYER_CONFLICT = "conflict"`, its own value.
+* `_NON_EVIDENCE = frozenset({LAYER_DETECTION_FAILED, LAYER_CONFLICT})` — one
+  set consumed by `is_authoritative`, `desired_label`, `desired_labels` and
+  `reconcile_movie`, because updating four guards out of five is precisely how
+  this hole was created.
+* `pick_layer` gains **rule 0**: a conflicting part poisons the title, checked
+  *before* the rank loop.
+* `sync_labels`' annotation loop skips a conflicted path. Rule 0 already makes
+  that unreachable; the guard is local so the invariant does not depend on
+  `pick_layer` continuing to hold the line.
 
-The alternative — omitting the conflicting key — looks equivalent and is not.
-Traced through the consumer:
+The ordinary `unknown + positive -> positive` behaviour is unchanged and now has
+its own explicit regression control.
 
-| | key present, `unknown` | key omitted |
-|---|---|---|
-| `pick_layer`, multi-part title | `unknown` | `unknown` |
-| `pick_layer`, **single-part title** | `unknown` | `None` ("not our title") |
-| `reconcile_movie` `may_remove` | **False** (layer is `LAYER_DETECTION_FAILED`) | `authoritative or not additive_only` → **True under a full reconcile** |
+## 4. Measurement — round 1's §4 was wrong, and so was the handoff's
 
-So omitting the key would let a contradiction **strip managed labels** from a
-single-part title whenever someone ran a non-additive reconcile. Keeping it as
-`unknown` routes the case through the existing failure path, where
-`may_remove=False` and `matched=False`, and `matched` is what gates the
-`rating_key` back-write in `sync_labels`. Both spec requirements — a conflict
-must neither remove a label nor back-write a `rating_key` — then hold without
-any new branch.
+Round 1 said the deployed code was *currently wrong on 335 keys*. The handoff
+before it said all colliding keys *happen to resolve correctly*. **Both are
+snapshots of a coin toss.**
 
-`tests/test_dv_path_collision.py::test_conflict_never_removes_a_label_under_full_reconcile`
-is the test that distinguishes the two designs; it is the only one that does.
-
-## 4. Live measurement — this contradicts the handoff
-
-The handoff §2A says: *"311 normalized keys ... All 311 currently resolve to the
-real layer — accidentally."*
-
-**That is not what the live data shows.** Measured by calling the deployed
-`build_index_and_paths` from `/app` and the candidate
-`_index_by_normalized_path` on the *same* row list, in the same process, DB
-opened `mode=ro`:
+`ORDER BY last_seen_at DESC` looks like a tie-break and is not one:
 
 ```
-rows (source='scan')                       6,937
-normalized keys                            4,725
-colliding keys (>1 row)                    2,212
-true conflicts (>=2 authoritative layers)      0
-keys whose LAYER changes                     335   <-- all 'unknown' -> authoritative
-    'unknown' -> 'none'                      163
-    'unknown' -> 'profile8'                   60
-    'unknown' -> 'mel'                        49
-    'unknown' -> 'fel'                        49
-    'unknown' -> 'profile5'                   14
-keys whose back-annotation PATH changes    1,177
+rows (source='scan')                 6,948
+distinct last_seen_at values             5
+   5,975 rows   '2026-08-17 12:32:09'
+     970 rows   '2026-08-17 12:32:08'
+       1 row    '2026-07-25 16:45:35'
+       1 row    '2026-07-25 15:47:37'
+       1 row    '2026-07-22 19:08:19'
 ```
 
-So the old code is not "accidentally right" on these — it is **currently wrong**
-on 335 keys, resolving them to `unknown` when a real layer exists. 172 of those
-are layers that produce a badge.
+A bulk rescan stamps everything within one second, so 6,945 of 6,948 rows sit in
+two tie groups and the "winner" is whatever order the sorter emits among equals
+— which shifts as rows are added. Re-running the identical old-vs-new comparison
+twenty minutes later, after 11 rows were appended, the count of keys whose layer
+changed went **335 → 0**.
 
-**Do these correspond to real Plex titles?** Joined against `plex_cache`
-(`file_path` is Plex's own reported path, per `rename/service.py:2056`) using
-the same `normalize_path`:
+So the defect is not a wrong answer. It is an **arbitrary** one:
 
 ```
-all 335 changed keys present in plex_cache:  335/335, library 'Movies (4K HDR)', is_tv 0
-172 badge-gaining keys present:              172/172
-control: unchanged keys sampled 2,000        777 present  (join works; not vacuous)
+normalized keys                                       4,725
+keys with >1 row                                      2,223
+max rows per key                                          2   <-- see below
+keys where a real layer and a failed scan coexist       346   <-- order decides
+   of those, whose real layer produces a badge          180
+keys with two DIFFERENT real layers (true conflict)       0
 ```
 
-The 100% vs 39% asymmetry is *expected* and is the mechanism, not an artefact:
-being in Plex is what produces the second path spelling in the first place.
-**Flagging this as inferred, not measured.**
+**Collision-size histogram** (the reviewer inferred every group must have
+exactly two rows from `rows - keys == colliding keys`, and asked for
+confirmation — it holds):
 
-**Are they visibly missing the badge today? UNKNOWN — and I could not
-establish it.** Removal is blocked for `unknown`, so a title badged before its
-duplicate row appeared would still carry the badge, and the count of titles
-*currently* unbadged could be anywhere from 0 to 172.
+```
+  1 row  : 2,502 keys
+  2 rows : 2,223 keys
+  max    : 2
+  rows - keys = 2,223 = sum(group_size - 1) = keys with >1 row   [consistent]
+```
 
-I tried to estimate it from `dv_scan.rating_key`, on the theory that
-`sync_labels` back-writes it only when `matched=True` (which requires an
-authoritative layer, and labels are added in that same pass), so its presence
-would evidence a past successful label pass. **That theory is wrong and the
-estimate is withdrawn:** `plex_metadata_scan.py:301` also calls
-`upsert_dv_scan(..., source="scan", rating_key=item.get("rating_key"))`, so a
-`rating_key` on a `source='scan'` row can come from the metadata scanner and
-says nothing about labelling. For the record, the numbers were 134 of 172 with a
-`rating_key` against a 703-of-733 baseline; they do not mean what I first said
-they meant.
+**Consumer-level effect, measured as a bound.** The real
+`sync_labels(dry_run=True)` run three times against the live Plex server —
+identical except for row order, library fetched once and reused, no writes:
 
-**The only thing that answers this is asking Plex what labels those 172 titles
-carry.** Not done — it is a live Plex read, and it is the obvious next step.
-Nothing in the fix depends on the answer; it changes only how the fix is
-*described*.
+| run | matched | would add | would remove | titles gaining a label |
+|---|---|---|---|---|
+| OLD, adverse order (failed row last) | 764 | 0 | 0 | **0** |
+| OLD, favourable order (real layer last) | 1,079 | 72 | 7 | **30** |
+| **NEW, order-independent** | **1,079** | **72** | **7** | **30** |
 
-### Side finding
+Asserted in the run: `NEW == FAVOURABLE` is true, `NEW == ADVERSE` is false. The
+candidate lands on the good outcome by construction rather than by luck.
 
-`unknown` counted as **rows** is 5,584; as **distinct files** after collapsing
-duplicate spellings it is **3,566**. The DV detector monitor reports the row
-count. (My independent row count came out 5,584 against the monitor's 5,583,
-measured minutes apart while the detector was running — same population.) This
-does not explain `otherErr=1814`, which remains uninvestigated.
+So an unlucky sort order costs **72 labels across 30 titles** — 14 FEL, 10
+Profile 8, 5 MEL, 1 HDR10 (*A Shot in the Dark*, *Alien: Romulus*, *Babe*,
+*Lucy*, *One Battle After Another* among them) — and drops 315 titles out of
+`matched` altogether.
+
+An earlier single run comparing old and new on the *current* row order showed no
+difference whatsoever. That is exactly why the bound is the right thing to
+report: it caught the coin on a favourable landing.
+
+### Still not established
+
+How many titles are *visibly* missing a badge in Plex at any given moment. Round
+1 estimated ~38 from `dv_scan.rating_key`; **that estimate was withdrawn**
+because `plex_metadata_scan.py:301` also writes `rating_key` on `source='scan'`
+rows, so it is not labeller provenance. The reviewer independently confirmed the
+withdrawal. Since the underlying count is unstable anyway, the useful figure is
+the 346/180 bound, not a point estimate.
+
+### Reproducing
+
+Scripts are preserved outside the repo (they read the live DB and Plex, both
+read-only, `mode=ro`). Method that matters: **import the deployed function and
+the candidate and run both on the same row list in one process** — not a
+re-implementation of either.
 
 ## 5. Test evidence
 
-`tests/test_dv_path_collision.py` — 12 tests, every case asserted in **both**
-row orders, because the old code passes one order of each pair.
+`tests/test_dv_path_collision.py` — 18 tests, every case asserted in **both**
+orders. New in round 2:
 
-Mutation-tested: reinstating last-write-wins inside `_collapse_observations`
-(inserted by line number after asserting the anchor was unique) makes **10 of
-12 fail**. The 2 that survive are the positive control (the two spellings really
-do collide) and the no-collision regression test — both are supposed to be blind
-to this bug.
+* conflicted part + clean `profile5` sibling → no add, no remove,
+  `matched=False`, no `rating_key` write, in both part orders
+* the same with a clean `fel` sibling
+* `pick_layer` returns `LAYER_CONFLICT` regardless of part order
+* **regression control**: ordinary `unknown` + positive sibling → still positive
+* **negative control**: a clean multi-version title still labels normally
+  (1,029 of this library's movies have more than one version)
 
-Full suite run in a throwaway container from `scanhound:latest` with the source
-tree copied in, against a same-session `HEAD` baseline built the same way.
+**Mutation-tested, one mutant per half of the fix**, each applied alone:
 
-## 6. What I would like checked
+```
+M1  collapse emits 'unknown' again (round 1's design)  -> 4 tests fail,
+                                    including both multipart end-to-end tests
+M2  pick_layer rule 0 disabled                         -> 3 tests fail
+restored                                               -> 55 pass
+```
 
-1. Is emitting `unknown` for a conflict right, versus a distinct sentinel? A
-   distinct value would require touching `is_authoritative`, `desired_labels`,
-   `pick_layer` and `reconcile_movie`'s `may_remove` — four places to get wrong
-   — for no behavioural gain I can see.
-2. `min()` on the raw path among rows carrying the winning layer: chosen for
-   order-independence. It changes which of two duplicate spellings gets the
-   `rating_key` on 1,177 keys. Both spellings are the same file, and
-   `annotate_dv_scan_rating_key` is `UPDATE ... WHERE path = ?` so it still
-   matches a real row — but is there a consumer of `norm_to_path` I have missed?
-3. Does the §4 contradiction hold? It is the number that changes what this fix
-   is *for*, and the handoff's §4 lists four retractions from exactly this kind
-   of measurement.
+M1 *is* the reviewed-out bug, reproduced and caught.
+
+Full suite: run in a throwaway container from `scanhound:latest` with the source
+tree copied in, against a same-session `HEAD` baseline built identically.
+Baseline: 35 failed / 5,067 passed. The 35 are pre-existing and the failure sets
+are **byte-identical** (32 are `test_network.py` tests that cannot reach the
+internet from the container).
+
+## 5b. Conflict alert (owner decision, this round)
+
+Round 1's open question — *is it right that one contradicting part suppresses an
+otherwise-labelable title?* — was put to the owner. His answer: **keep it
+hands-off, and tell me when it happens.**
+
+`sync_labels` now returns `layer_conflict_paths` alongside the count, and the
+unattended hourly sync raises a HIGH-priority alert.
+
+**On two channels, and checking that was not optional.** The obvious
+implementation — `NotificationManager.send_notification()` — would have reached
+**nobody on this deployment**. Probed against the live config:
+
+```
+desktop_notifications  True     <- but plyer's Linux backend is disabled in a
+                                   headless container (no gdbus/notify-send),
+                                   notifications.py:143
+discord_webhook        empty
+slack_webhook          empty
+pushover_token/user    empty
+webhook_url            empty
+NotificationManager channels: []          <- send_notification is a no-op
+```
+
+So the alert broadcasts on the in-app websocket — the channel
+`app_service`'s own unmapped-Plex-path check already uses, which needs no
+configuration and surfaces in the ScanHound UI.
+
+**And the second channel had to be repointed.** The first attempt sent through
+`AppService.notification_manager`. That instance is constructed bare at
+`app_service.py:552` and *nothing ever calls `configure_from_dict` on it*, so
+its channel list is permanently empty — it could never deliver regardless of
+configuration. The instance that IS configured from config is the registry's
+`NotificationBridge` (`NotificationBridge.configure` → `configure_from_dict`),
+so the alert now uses `registry.notifications.send(...)`. Same class of mistake
+as the one being guarded against, one level down, and only visible by asking
+which object actually holds a channel.
+
+Neither channel can take the sync down; a failure on one still attempts the
+other, and a missing bridge is survivable (startup order is not guaranteed).
+
+This is the `.ps1.NEW` shape from the handoff: correct code that cannot run,
+failing silently while reading as coverage. It is only caught by asking whether
+the thing is *delivered*, not whether it is *called*.
+
+**The manual sync path needed it too.** `/rename/dv-sync-labels` reports one
+summary line and has no alert. A conflicted title moves none of
+matched/added/removed, so a run that silently skipped files was
+indistinguishable from one with nothing to do. The summary now names them, and
+the string-building moved to a module-level `dv_sync_summary_body()` so it is
+testable without driving the route's background thread — a threaded end-to-end
+test for a display string would be flaky for no gain.
+
+**Dedups on the SET of paths, and that is load-bearing in both directions.** A
+conflict does not self-heal — the two rows keep disagreeing until a rescan
+resolves them — so an unconditional alert fires every hour forever. But a
+*count*-based guard has the opposite failure: it goes silent on precisely the
+pass where one file resolves and a different one starts conflicting. Both are
+pinned by tests, and both are mutation-proven:
+
+```
+M1  dedup on the count      -> test_alert_fires_again_when_a_DIFFERENT_file_conflicts fails
+M2  dedup removed           -> test_alert_does_not_repeat_for_the_same_set fails
+M3  in-app broadcast killed -> 3 delivery tests fail (the no-op state above)
+restored                    -> 20 pass
+```
+
+**A phone alert is NOT in this branch, deliberately.** The in-app alert works
+with no setup and there are 0 conflicts live, so nothing is currently going
+unreported. Reaching the owner's Gotify server is agreed as the next piece of
+work, scoped separately so it does not ride along on a correctness fix. Two
+things established while scoping it, neither yet addressed:
+
+* `GenericWebhookChannel` posts `Notification.to_dict()`
+  (`id/type/title/message/priority/data/timestamp`). Gotify expects
+  `title/message/priority`. It may tolerate the extras; unverified against a
+  real server.
+* Gotify's token conventionally rides the URL query string. That is a
+  credential in a URL; its `X-Gotify-Key` header form is preferable, and
+  `configure_from_dict` exposes no custom headers for the generic webhook —
+  so a small code change is needed, not just a settings entry.
+
+A dedicated `GotifyChannel` (correct payload, correct 0–10 priority mapping,
+header auth) looks better than widening the generic one. The token itself stays
+with the owner, entered through ScanHound's own settings.
+
+Clearing is silent but re-arms, so the same file conflicting again after a
+rescan fixed it is reported. A notifier that raises, or is absent entirely,
+cannot propagate: the label work has already succeeded when the alert runs, and
+a dead channel must not stop the watermark advancing (the shape of the
+2026-08-12 logging-as-hard-dependency outage).
+
+## 6. Open for this round
+
+1. Does rule 0 belong in `pick_layer`, or should the conflict set be threaded
+   into `reconcile_movie` separately? Rule 0 is simpler and keeps one verdict
+   type flowing through the existing code. The *behavioural* half of this
+   question — one contradicting part suppressing an otherwise-labelable title —
+   is settled: the owner chose hands-off plus an alert (§5b). What remains is
+   whether the plumbing is right, given rule 0 makes `pick_layer` consult a
+   value it cannot itself produce.
+   Also worth a look: `layer_conflict_paths` is unbounded in principle (capped
+   only by the colliding-key count, currently 2,223 max, 0 in practice) and
+   rides the `dv:sync_done` websocket payload on dry runs. The alert's `data`
+   is capped at 50; the summary list is not.
+2. `min()` on the raw path is now documented as *a deterministic representative
+   row, not the newest and not the filesystem's preferred spelling*, per the
+   round-1 suggestion. Annotating **all** equivalent winner rows was considered
+   and deliberately not done — no consumer requires it.
+3. The seed-conflict log now states what the report actually renders
+   (`seed_conflict_live_<layer>`) rather than claiming a generic "unverified"
+   state, per the round-1 note.

@@ -821,6 +821,27 @@ def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)
     return _import_response(result)
 
 
+def dv_sync_summary_body(result, dry_run):
+    """The one-line summary the manual DV sync reports when it finishes.
+
+    Module-level and pure so it can be tested without driving the route's
+    background thread — the counts are the only thing worth asserting and a
+    threaded end-to-end test for a display string would be flaky for no gain.
+
+    Mentions conflicts because this summary is the ONLY place a manual run
+    reports them. A file whose two scan rows claim different DV layers is left
+    strictly alone, so it moves none of matched/added/removed: without this,
+    a sync that skipped titles is indistinguishable from one that had nothing
+    to do. The scheduled sync has its own alert; a manual run has only this.
+    """
+    conflicts = result.get("layer_conflicts", 0)
+    return (f"{result['matched']} matched, {result['added']} added, "
+            f"{result['removed']} removed"
+            + (f", {conflicts} file(s) skipped — contradicting scan records"
+               if conflicts else "")
+            + (" (dry run)" if dry_run else ""))
+
+
 @router.post("/dv-sync-labels")
 def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_registry)):
     """Reconcile managed DV labels on every movie against dv_scan (source='scan').
@@ -845,10 +866,9 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
                 additive_only=additive_only)
             ws_manager.broadcast_sync({"type": "notification", "data": {
                 "title": "Dolby Vision label sync",
-                "body": (f"{result['matched']} matched, "
-                         f"{result['added']} added, {result['removed']} removed"
-                         f"{' (dry run)' if dry_run else ''}"),
-                "priority": "normal"}})
+                "body": dv_sync_summary_body(result, dry_run),
+                "priority": ("high" if result.get("layer_conflicts")
+                             else "normal")}})
         except Exception as e:
             public = capture_public_exception(
                 logger, e, code="dv_label_sync_failed",
