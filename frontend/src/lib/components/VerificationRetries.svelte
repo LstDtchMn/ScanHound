@@ -225,11 +225,11 @@
   </div>
 
   {#each holds as hold (hold.source)}
-    <!-- ONE condition, not N stuck downloads. Every held item also renders a
-         "Retry after <time>" of its own, and while this hold is armed that time
-         is meaningless -- decide() returns VERIFICATION_HOLD before it looks at
-         any cooldown. So this card contradicts it explicitly rather than leaving
-         the reader to reconcile forty misleading timestamps. -->
+    <!-- ONE condition, not N stuck downloads. Held item cards deliberately
+         suppress their own "Retry after <time>" (see the item card below): the
+         timestamp is real but has no authority, because decide() returns
+         VERIFICATION_HOLD before it looks at any cooldown. This card states the
+         condition once instead of leaving forty rows to imply it will heal. -->
     <div class="mx-4 mb-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
       <div class="flex items-start gap-2 flex-wrap">
         <span class="text-sm font-semibold text-amber-300">
@@ -248,9 +248,9 @@
           ScanHound met a verification challenge it cannot complete on its own, so
           it stopped sending requests to {hold.source}.
         {:else}
-          The hold on {hold.source} is still switched on, but nothing is queued
-          behind it any more. Releasing it now costs nothing and stops it
-          blocking future downloads.
+          No current retry is blocked by this hold, but the marker on
+          {hold.source} is still armed. Releasing it stops the stale hold
+          blocking later recovery attempts.
         {/if}
         <strong class="text-amber-300">This will not clear on its own</strong> —
         not when the retry times below run out. It clears when
@@ -268,7 +268,15 @@
         {#if hold.affected > 0}
           <button class="px-2.5 py-1 rounded bg-[var(--bg-tertiary)] text-xs"
                   onclick={() => (expanded = { ...expanded, [hold.source]: !expanded[hold.source] })}>
-            {expanded[hold.source] ? 'Hide' : 'Show'} the {hold.affected} paused
+            <!-- Promise only what can be rendered. `affected` counts every held
+                 row; the retries list is capped, so above the cap the two differ
+                 and the button must say so rather than expand to fewer. -->
+            {expanded[hold.source] ? 'Hide' : 'Show'}
+            {#if (hold.shown ?? hold.affected) < hold.affected}
+              {hold.shown} of the {hold.affected} paused
+            {:else}
+              the {hold.affected} paused
+            {/if}
           </button>
         {/if}
       </div>

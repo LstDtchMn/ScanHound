@@ -272,6 +272,18 @@ def list_download_retries(
         item["verification_held"] = source is not None
         item["verification_hold_source"] = source
 
+    # HOW MANY OF THE HELD ROWS ARE ACTUALLY ON THIS PAGE.
+    #
+    # active_verification_holds() counts every effectively-held row for the
+    # source; list_retries() is capped by `limit`. Above the cap the card would
+    # promise "400 requests paused", the operator would expand it, and fewer
+    # would render -- a UI that overstates what it can show, which is the same
+    # class of defect as the timestamp that implied a retry would happen.
+    # Latent at today's 40; deterministic once the queue crosses the limit.
+    returned = {i.get("item_uuid") for i in items}
+    for h in holds:
+        h["shown"] = sum(1 for u in (h.get("item_uuids") or []) if u in returned)
+
     return {"items": items, "count": len(items), "status": queue.status(),
             "holds": holds}
 

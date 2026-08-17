@@ -202,6 +202,9 @@ export interface VerificationHold {
    *  a timer would fix this. */
   clears_on_timer: boolean;
   clears_when: string;
+  /** How many of `affected` are present in this response. The retries list is
+   *  capped, so above the cap the UI must not promise rows it cannot render. */
+  shown?: number;
   holding_batches: number;
 }
 

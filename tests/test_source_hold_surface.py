@@ -241,3 +241,48 @@ class TestAffectedIsThePOLICYCount:
         _item(db, "b1", n=1, state="verification_required",
               reason="source_deferred")
         assert svc.active_verification_holds()[0]["triggers"] == 1
+
+
+class TestTheCardCannotPromiseRowsItCannotShow:
+    """Review LOW 1. active_verification_holds() counts EVERY effectively-held
+    row; /download/retries is capped by `limit`. Above the cap the card would
+    say "400 requests paused", the operator expands it, and fewer render -- a UI
+    overstating what it can deliver, which is the same class of defect as the
+    retry timestamp that implied a fix was coming.
+
+    Latent at today's 40. Deterministic once the queue crosses the limit.
+    """
+
+    def _annotate(self, items, holds):
+        """The route's annotation step, exercised directly."""
+        returned = {i.get("item_uuid") for i in items}
+        for h in holds:
+            h["shown"] = sum(1 for u in (h.get("item_uuids") or []) if u in returned)
+        return holds
+
+    def test_shown_equals_affected_when_everything_fits(self, svc, db):
+        _batch(db, "b1", hold="hdencode")
+        _item(db, "b1", n=0)
+        _item(db, "b1", n=1)
+        holds = svc.active_verification_holds()
+        items = [{"item_uuid": u} for u in holds[0]["item_uuids"]]
+        h = self._annotate(items, holds)[0]
+        assert h["shown"] == h["affected"] == 2
+
+    def test_shown_is_LOWER_when_the_page_is_capped(self, svc, db):
+        """The case the button copy has to handle."""
+        _batch(db, "b1", hold="hdencode")
+        for i in range(5):
+            _item(db, "b1", n=i)
+        holds = svc.active_verification_holds()
+        assert holds[0]["affected"] == 5
+        capped = [{"item_uuid": u} for u in holds[0]["item_uuids"][:2]]   # limit=2
+        h = self._annotate(capped, holds)[0]
+        assert h["shown"] == 2
+        assert h["shown"] < h["affected"], (
+            "the card would promise 5 and render 2 with no way to tell")
+
+    def test_a_zero_affected_hold_shows_nothing_and_claims_nothing(self, svc, db):
+        _batch(db, "b1", hold="hdencode")
+        holds = self._annotate([], svc.active_verification_holds())
+        assert holds[0]["affected"] == 0 and holds[0]["shown"] == 0

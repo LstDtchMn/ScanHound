@@ -2749,9 +2749,12 @@ class DownloadQueueService:
         """The source-level holds, as a condition rather than 39 identical rows.
 
         WHY THIS EXISTS. A single interactive challenge arms a SOURCE-SCOPED
-        hold, and every deferred row for that source is then held by
-        decide() -- which returns VERIFICATION_HOLD *before* it looks at
-        auto-resume, the retry budget, the shared cooldown or the item cooldown.
+        hold, and every deferred row for that source whose EFFECTIVE policy
+        verdict is VERIFICATION_HOLD is then stopped by it -- decide() returns
+        that verdict *before* it looks at auto-resume, the retry budget, the
+        shared cooldown or the item cooldown. (Not every deferred row: an
+        unknown outcome or an unowned reason outranks the hold. That is what
+        _rows_held_by_verification exists to measure.)
         So those rows will NOT resume when their displayed "Retry after" time
         passes, and the UI showing that timestamp on each of them is actively
         misleading: it names a deadline that has no bearing on the outcome.
