@@ -154,14 +154,112 @@ def pick_layer(norm_paths, index):
     return "none"                        # every part authoritatively no-DV
 
 
+def _collapse_observations(observations):
+    """One (layer, row_path, conflict) verdict from every row naming ONE file.
+
+    Several rows can normalize onto a single key: the same file recorded under
+    a drive letter and its UNC share, under different separators or case, or
+    simply stored twice under two spellings. Every index here used to be built
+    with ``idx[p] = row[layer]`` inside a loop, so the LAST row silently won.
+    With get_dv_scans() ordering ``last_seen_at DESC`` that is the OLDEST row —
+    311 colliding keys in the live database currently resolve to the correct
+    layer purely because the older row happens to be the determinate one, and a
+    rescan that reorders them flips the answer with nothing logged.
+
+    The rule depends only on the SET of layers observed, never on row order:
+
+        exactly one distinct authoritative layer -> that layer
+        no authoritative layer at all            -> the failure value
+        two or more DIFFERENT authoritative      -> CONFLICT
+
+    ``none`` is authoritative — the detector ran and found no Dolby Vision.
+    ``unknown``/NULL records that detection FAILED, so it is not evidence and
+    can never outvote or contradict a real finding; that is what makes the
+    common ``<real layer> vs unknown`` collision resolve cleanly either way
+    round.
+
+    Two tempting tie-breakers are deliberately NOT used:
+
+    * ``last_seen_at``. upsert_dv_scan lets a failed 'unknown' scan keep the
+      previous layer while still refreshing last_seen_at, so that column dates
+      the OBSERVATION and not the LAYER. Ranking by it would let a file whose
+      last real finding is older lose to a newer failure. Dating the layer
+      would need its own column first.
+    * ``_LAYER_RANK``. That ranks the PARTS of one Plex title, where "any part
+      proving DV proves it for the title" is sound. Two observations of one
+      file making different positive claims is a contradiction, not a union;
+      taking the higher would launder a disagreement into a confident answer.
+
+    A CONFLICT reports ``unknown``, which is not a fudge but the whole point:
+    it routes the case through the failure path this module already has, where
+    reconcile_movie sets may_remove=False and matched=False. A contradiction
+    therefore cannot strip a label and cannot back-write a rating_key, which is
+    exactly how an unresolved disagreement should behave. Returning the layers
+    alongside is what keeps it EXPLICIT rather than silent — sync_labels logs
+    them and counts them in its summary.
+    """
+    authoritative = sorted({lay for lay, _ in observations if is_authoritative(lay)})
+    conflict = None
+    if len(authoritative) == 1:
+        layer = authoritative[0]
+    elif not authoritative:
+        # Every row failed. Preserve the distinction the rows themselves draw:
+        # an explicit 'unknown' stays 'unknown' and an absent layer stays None,
+        # so a key with no collision still yields exactly what it did before.
+        layer = (LAYER_DETECTION_FAILED
+                 if any(lay == LAYER_DETECTION_FAILED for lay, _ in observations)
+                 else None)
+    else:
+        layer = LAYER_DETECTION_FAILED
+        conflict = authoritative
+
+    # The path must come from a row that CARRIES the winning layer. Taking the
+    # layer from one row and the raw path from another would annotate a
+    # different row's rating_key than the one the verdict came from. min()
+    # rather than "first seen" so the choice is order-independent as well; for
+    # the overwhelming majority of keys there is one candidate and it is a
+    # no-op. A conflict has no winning row, so every path stays eligible —
+    # nothing consumes it in that case, but it must still be deterministic.
+    if conflict is None:
+        candidates = [raw for lay, raw in observations if lay == layer]
+    else:
+        candidates = [raw for _, raw in observations]
+    return layer, min(candidates), conflict
+
+
+def _index_by_normalized_path(rows, mappings=None, *, layer_key="dv_layer"):
+    """({norm -> layer}, {norm -> row path}, {norm -> conflicting layers}).
+
+    Groups rows by normalized path in one pass, then collapses each group —
+    see _collapse_observations for why the collapse cannot be a plain
+    last-write-wins assignment. EVERY index this module builds goes through
+    here, including the seed baseline (``layer_key='seed_layer'``), so the
+    call sites cannot drift apart and be fixed one at a time again.
+    """
+    grouped = {}
+    for r in rows or ():
+        raw = r.get("path")
+        p = normalize_path(raw, mappings)
+        if not p:
+            continue
+        grouped.setdefault(p, []).append((r.get(layer_key), raw))
+
+    index = {}
+    norm_to_path = {}
+    conflicts = {}
+    for p, observations in grouped.items():
+        layer, raw, conflict = _collapse_observations(observations)
+        index[p] = layer
+        norm_to_path[p] = raw
+        if conflict:
+            conflicts[p] = conflict
+    return index, norm_to_path, conflicts
+
+
 def build_index(rows, mappings=None):
     """{normalize_path(path) -> dv_layer} from scan-source rows."""
-    idx = {}
-    for r in rows:
-        p = normalize_path(r.get("path"), mappings)
-        if p:
-            idx[p] = r.get("dv_layer")
-    return idx
+    index, _, _ = _index_by_normalized_path(rows, mappings)
+    return index
 
 
 def build_index_and_paths(rows, mappings=None):
@@ -169,16 +267,12 @@ def build_index_and_paths(rows, mappings=None):
 
     Same normalization semantics as build_index, but also captures the
     original (un-normalized) row path so callers can recover it in O(1)
-    instead of re-scanning all rows per lookup.
+    instead of re-scanning all rows per lookup. A caller that wants to REPORT
+    collisions rather than just survive them wants _index_by_normalized_path,
+    which returns them as a third value.
     """
-    idx = {}
-    norm_to_path = {}
-    for r in rows:
-        p = normalize_path(r.get("path"), mappings)
-        if p:
-            idx[p] = r.get("dv_layer")
-            norm_to_path[p] = r.get("path")
-    return idx, norm_to_path
+    index, norm_to_path, _ = _index_by_normalized_path(rows, mappings)
+    return index, norm_to_path
 
 
 def _movie_norm_paths(movie, mappings):
@@ -382,7 +476,21 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     """
     vocab = _vocab_from_config(config)
     rows = db.get_dv_scans(source="scan", limit=1000000)
-    index, norm_to_path = build_index_and_paths(rows, mappings)
+    index, norm_to_path, layer_conflicts = _index_by_normalized_path(rows, mappings)
+    if layer_conflicts:
+        # Loud, because the collapse deliberately makes a contradiction LOOK
+        # like an ordinary detection failure to every consumer downstream. That
+        # is the safe behaviour, but it is also indistinguishable from a file
+        # that simply has not been scanned, so the only place the disagreement
+        # is visible is here. Capped sample: 311 keys collide today and a log
+        # line per key would bury the count.
+        sample = sorted(layer_conflicts.items())[:5]
+        logger.warning(
+            "dv sync: %d file(s) have dv_scan rows claiming DIFFERENT DV "
+            "layers. Each is treated as an unverified detection — no label "
+            "added or removed, no rating_key written — until the rows agree. "
+            "First %d: %s", len(layer_conflicts), len(sample),
+            [f"{p} ({' vs '.join(lays)})" for p, lays in sample])
 
     # Built ONCE for the whole sync, like the dv index — asking Plex per movie
     # would add an API round trip per title across the entire library. A db
@@ -402,10 +510,16 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     list_seed = getattr(db, "list_dv_seed_baseline", None)
     if callable(list_seed):
         seed_rows = list_seed(limit=1000000)
-    seed_index = {
-        normalize_path(row.get("path"), mappings): row.get("seed_layer")
-        for row in seed_rows if normalize_path(row.get("path"), mappings)
-    }
+    # Same collapse as the scan index. The seed baseline can carry two rows for
+    # one file just as dv_scan can, and its only consumer is the dry-run
+    # discrepancy report — so an order-dependent pick here would make that
+    # report disagree with itself between two runs over unchanged data.
+    seed_index, _, seed_conflicts = _index_by_normalized_path(
+        seed_rows, mappings, layer_key="seed_layer")
+    if seed_conflicts:
+        logger.warning(
+            "dv sync: %d seed-baseline path(s) carry conflicting seed layers; "
+            "each is reported as unverified", len(seed_conflicts))
 
     movie_libs = (config.get("movie_libs")
                   or config.get("known_movie_libraries") or [])
@@ -489,4 +603,9 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     return {"total": total, "added": added_n, "removed": removed_n,
             "matched": matched_n, "dry_run": dry_run,
             "writes": 0 if dry_run else added_n + removed_n,
+            # Files whose dv_scan rows contradict each other. Counted rather
+            # than left to the log because it is the one number that says "some
+            # titles were skipped on purpose"; without it a conflict is
+            # arithmetically identical to an unscanned file in this summary.
+            "layer_conflicts": len(layer_conflicts),
             "details": details}
