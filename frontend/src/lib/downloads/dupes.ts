@@ -39,23 +39,46 @@ export function resRank(name: string): number {
  *  group captioned "10 duplicates" — six unrelated seasons the user was being
  *  invited to de-duplicate. Different seasons are not duplicates of each other.
  *
- *  Parsed from `name` rather than added to the wire because `name` already
- *  carries it and `resRank` already parses that same field for resolution.
+ *  Parsed from `name` as a LEGACY FALLBACK, not as the authority. The backend
+ *  already receives and stores the season for ScanHound-originated grabs and
+ *  builds the canonical package name from it; the right long-term fix is to
+ *  carry that identity on the wire and use this only for rows that predate it
+ *  or came from outside ScanHound (peer review 2026-08-17).
+ *
+ *  `resRank` parses the same field, but it is NOT an equivalent precedent: a
+ *  wrong resolution picks the wrong "best" WITHIN an established group, while a
+ *  wrong season decides whether two unrelated things are the same thing at all —
+ *  and that answer authorises deletion.
  *
  *  Measured against 361 live rows: 61 carry the `S01` form, and NONE carry
- *  `S01E02`, `1x02`, or a bare `Season N` — but `Season N` is common enough in
- *  release naming to be worth matching. Rows with no marker at all (300 of 361,
- *  all older history) fall back to title-only grouping, exactly as before.
+ *  `S01E02`, `1x02`, or a bare `Season N` — `Season N` is matched anyway as a
+ *  common release form. Rows with no marker at all (300 of 361, all older
+ *  history) return `''`, which means UNKNOWN IDENTITY, not "no season" — see
+ *  `identityKnown` on the group.
  */
 export function seasonKey(name: string): string {
   const n = name || '';
-  const sxx = /\bS(\d{1,2})(?:\s*E(\d{1,3}))?\b/i.exec(n);
-  if (sxx) {
-    const s = `S${sxx[1].padStart(2, '0')}`;
-    return sxx[2] ? `${s}E${sxx[2].padStart(2, '0')}` : s;
+
+  // A RANGE or several markers cannot name one season, and must not be reduced
+  // to the first token: "Show S01-S03" is not season 1, and "Show S01E01-E10"
+  // is not episode 1. Returning the first match would give a whole-run package
+  // the same identity as a single season and let one be cancelled against the
+  // other. Unknown is the honest answer.
+  const markers = [...n.matchAll(/\bS(\d{1,2})(?:\s*E(\d{1,3}))?\b/gi)];
+  if (markers.length > 1) return '';
+  if (markers.length === 1) {
+    const m = markers[0];
+    const rest = n.slice((m.index ?? 0) + m[0].length);
+    if (/^\s*[-–—]\s*(?:[SE]\s*)?\d/i.test(rest)) return '';
+    const s = `S${m[1].padStart(2, '0')}`;
+    return m[2] ? `${s}E${m[2].padStart(2, '0')}` : s;
   }
-  const word = /\bSeason\s*(\d{1,2})\b/i.exec(n);
-  return word ? `S${word[1].padStart(2, '0')}` : '';
+
+  const words = [...n.matchAll(/\bSeason\s*(\d{1,2})\b/gi)];
+  if (words.length !== 1) return '';
+  const w = words[0];
+  if (/^\s*[-–—]\s*\d/.test(n.slice((w.index ?? 0) + w[0].length))) return '';
+  return `S${w[1].padStart(2, '0')}`;
 }
 
 /** States that count as "in flight" — not yet a finished/historical row. */
@@ -75,6 +98,14 @@ export interface DownloadGroup {
   isDuplicate: boolean;
   best: DownloadResult;
   canKeepBest: boolean;
+  /** Whether these rows are PROVABLY the same content unit.
+   *
+   *  False when the names carry no season marker, which is UNKNOWN IDENTITY —
+   *  not proof of a movie, and not proof of the same season. 300 of 361 live
+   *  rows are in that state, including fourteen identically-named
+   *  `Law & Order; LA (2010) [1080p]` rows that may well be different seasons.
+   *  Display may still group them; a destructive action may not act on them. */
+  identityKnown: boolean;
 }
 
 /** Group downloads by normalized title AND season. A group with >1 item is a
@@ -118,7 +149,9 @@ export function groupDownloads(results: DownloadResult[]): DownloadGroup[] {
     // seasons now render as separate cards, and without this they would all
     // read "The Repair Shop [1080p]" with nothing to tell them apart.
     const base = items[0].title || items[0].name;
+    // Every item in a group shares the key, so it shares the season too.
     const season = seasonKey(items[0].name);
+    const identityKnown = season !== '';
     groups.push({
       key,
       title: season ? `${base} · ${season}` : base,
@@ -126,7 +159,20 @@ export function groupDownloads(results: DownloadResult[]): DownloadGroup[] {
       activeItems,
       isDuplicate: items.length > 1,
       best,
-      canKeepBest: activeItems.length >= 2
+      // FAIL CLOSED. "Keep best" cancels every other active row, so it must be
+      // offered only where the rows are provably the same content unit. An
+      // absent season marker is unknown identity, not evidence of a movie —
+      // two indistinguishable rows could be different seasons, and cancelling
+      // one would discard content the owner deliberately queued.
+      //
+      // This does currently withhold the button from genuine movie duplicates
+      // too, because DownloadResult carries nothing that separates "known
+      // movie" from "TV row whose season we cannot read". Losing that
+      // convenience is the cheaper mistake, and measured against live data it
+      // costs nothing today: zero groups have >=2 active rows at all. Restore
+      // it for movies when the wire carries an authoritative identity.
+      canKeepBest: activeItems.length >= 2 && identityKnown,
+      identityKnown
     });
   }
   return groups;

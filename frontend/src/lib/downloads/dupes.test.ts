@@ -126,6 +126,74 @@ describe('groupDownloads — seasons are not duplicates', () => {
   });
 });
 
+describe('unknown identity must not authorise deletion', () => {
+  // "Keep best" cancels every other active row. An absent season marker is
+  // UNKNOWN identity, not proof of a movie — so it cannot be evidence that two
+  // rows are the same thing. 300 of 361 live rows are in that state, including
+  // fourteen identically-named Law & Order; LA rows that may be different
+  // seasons (peer review 2026-08-17).
+  const lawAndOrder = (id: number) =>
+    r({ id, title: 'Law & Order; LA [1080p]',
+        name: 'Law & Order; LA (2010) [1080p]', state: 'queued' });
+
+  it('does NOT offer Keep best for two active rows of unknown season identity', () => {
+    const g = groupDownloads([lawAndOrder(1), lawAndOrder(2)])[0];
+    expect(g.identityKnown).toBe(false);
+    expect(g.canKeepBest).toBe(false); // the safety boundary
+    expect(g.isDuplicate).toBe(true);  // still SHOWN as a possible duplicate
+  });
+
+  it('DOES offer Keep best when the season is known and matches', () => {
+    // The positive control. Without it, "never offer Keep best" would pass the
+    // test above and silently kill the feature.
+    const g = groupDownloads([
+      r({ id: 1, title: 'The Repair Shop [1080p]',
+          name: 'The Repair Shop (2017) S02 [1080p]', state: 'queued' }),
+      r({ id: 2, title: 'The Repair Shop [1080p]',
+          name: 'The Repair Shop (2017) S02 [1080p]', state: 'queued',
+          bytes_total: 999 })
+    ])[0];
+    expect(g.identityKnown).toBe(true);
+    expect(g.canKeepBest).toBe(true);
+    expect(g.best.id).toBe(2);
+  });
+
+  it('a multi-season or episode-range package is UNKNOWN, not its first token', () => {
+    // "Show S01-S03" is not season 1. Reducing it to the first marker would let
+    // a whole-run package share an identity with a single season and be
+    // cancelled against it.
+    expect(seasonKey('Some Show S01-S03 [1080p]')).toBe('');
+    expect(seasonKey('Some Show S01E01-E10 [1080p]')).toBe('');
+    expect(seasonKey('Some Show Season 1-3 [1080p]')).toBe('');
+    expect(seasonKey('Some Show S01 S02 [1080p]')).toBe('');
+  });
+
+  it('a range package does not group with the single season it starts at', () => {
+    const groups = groupDownloads([
+      r({ id: 1, title: 'Some Show [1080p]', name: 'Some Show S01 [1080p]', state: 'queued' }),
+      r({ id: 2, title: 'Some Show [1080p]', name: 'Some Show S01-S03 [1080p]', state: 'queued' })
+    ]);
+    expect(groups).toHaveLength(2);
+    expect(groups.every((g) => !g.canKeepBest)).toBe(true);
+  });
+
+  it('still ranks a best within an unknown-identity group, just cannot act on it', () => {
+    // `best` remains meaningful for display; only the destructive offer is
+    // withheld. Asserting this keeps the guard from being "quietly break the
+    // whole group".
+    // Same title on purpose: the server-resolved title carries the resolution
+    // ('Foo [4K]' vs 'Foo [1080p]'), so differing resolutions already land in
+    // separate groups before any of this. Size is what separates these two.
+    const g = groupDownloads([
+      r({ id: 1, title: 'Foo [1080p]', name: 'Foo (2001) [1080p]', bytes_total: 10, state: 'queued' }),
+      r({ id: 2, title: 'Foo [1080p]', name: 'Foo (2001) [1080p]', bytes_total: 40, state: 'queued' })
+    ])[0];
+    expect(g.items).toHaveLength(2);
+    expect(g.best.id).toBe(2);        // still ranked
+    expect(g.canKeepBest).toBe(false); // but not actionable
+  });
+});
+
 describe('groupDownloads', () => {
   it('groups same-title releases and flags duplicates, picking best', () => {
     const items = [
@@ -168,9 +236,13 @@ describe('groupDownloads', () => {
   });
 
   it('canKeepBest true only with >=2 active rows', () => {
+    // Names now carry S01 because Keep-best additionally requires a KNOWN
+    // identity — see the fail-closed block below. Without a season marker these
+    // rows are indistinguishable from two different seasons, and the button
+    // cancels the losers.
     const g = groupDownloads([
-      r({ id: 1, title: 'Foo', name: 'Foo.2160p', state: 'downloading' }),
-      r({ id: 2, title: 'Foo', name: 'Foo.1080p', state: 'downloading' })
+      r({ id: 1, title: 'Foo', name: 'Foo S01 2160p', state: 'downloading' }),
+      r({ id: 2, title: 'Foo', name: 'Foo S01 1080p', state: 'downloading' })
     ])[0];
     expect(g.canKeepBest).toBe(true);
     expect(g.best.id).toBe(1);
