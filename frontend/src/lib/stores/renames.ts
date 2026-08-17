@@ -1,7 +1,7 @@
 import { writable, derived, get } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { connection } from './connection';
-import type { RenameJob, RenameStatus, DvScan } from '$lib/api/types';
+import type { RenameJob, RenameStatus, DvScan, DvConflictStatus } from '$lib/api/types';
 import { persisted } from '$lib/stores/results';
 import { addToast } from '$lib/stores/notifications';
 import type { RenameCategory } from '$lib/renames/category';
@@ -638,11 +638,26 @@ export const dvScanResult = writable<DvScanResult | null>(null);
 export const dvScans = writable<DvScan[]>([]);
 export const dvCounts = writable<Record<string, number>>({});
 
+/** Files whose two scan rows claim different Dolby Vision layers.
+ *
+ *  CURRENT state, recomputed by the backend on every fetch — not a memory of
+ *  whether anyone was notified. The unattended alert broadcasts to whoever is
+ *  connected at that instant and marks the set seen either way, so a conflict
+ *  that appeared while no tab was open would never be mentioned again. Because
+ *  this is derived from the scan rows, it reappears here on the next load
+ *  regardless (peer review round 2). Same reasoning as the rename store's
+ *  refetch-after-reconnect: a missed WebSocket event is gone for good, so
+ *  anything that matters must also be reachable as state.
+ */
+const NO_CONFLICTS: DvConflictStatus = { count: 0, sample: [], truncated: false };
+export const dvConflicts = writable<DvConflictStatus>(NO_CONFLICTS);
+
 export async function loadDvScans(layer?: string) {
   try {
-    const { scans, counts } = await api.getDvScans(layer);
+    const { scans, counts, conflicts } = await api.getDvScans(layer);
     dvScans.set(scans);
     dvCounts.set(counts);
+    dvConflicts.set(conflicts ?? NO_CONFLICTS);
   } catch {
     /* offline */
   }

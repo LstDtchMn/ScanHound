@@ -6,7 +6,7 @@
     loadRenameJobs, loadRenameStatus, loadDvScans,
     applyJob, undoJob, deleteJob, cancelApply,
     acceptCombinedJob, acceptCorrectionJob,
-    dvScanProgress, dvScanResult, dvScans, dvCounts, dvScanRunning,
+    dvScanProgress, dvScanResult, dvScans, dvCounts, dvScanRunning, dvConflicts,
     dvSyncRunning, dvSyncProgress, dvSyncResult,
     archivedRenameJobs, loadArchivedRenameJobs, clearSelection, setOrderedVisibleIds
   } from '$lib/stores/renames';
@@ -511,6 +511,36 @@
               <span class="text-[var(--error)]">{$dvScanResult.error}</span>
             {:else}
               Scanned <strong>{$dvScanResult.scanned}</strong> of {$dvScanResult.found} file(s){#if $dvScanResult.skipped}, {$dvScanResult.skipped} unchanged{/if}.
+            {/if}
+          </div>
+        {/if}
+        <!-- Persistent, and deliberately OUTSIDE the inventory guard. This is
+             current state fetched with the inventory, not a toast: the
+             unattended alert only reaches whoever is connected when it fires,
+             so a conflict that appeared overnight has to be findable here on
+             the next visit. -->
+        {#if $dvConflicts.count}
+          <div class="mt-2 rounded-lg border border-[var(--error)] px-3 py-2 text-xs">
+            <div class="font-medium text-[var(--error)]">
+              {$dvConflicts.count} file(s) need attention
+            </div>
+            <div class="mt-1 text-[var(--text-secondary)]">
+              These have two scan records claiming different Dolby Vision layers.
+              Their titles are left untouched — no badge added or removed — until
+              the records agree.
+            </div>
+            <div class="mt-1.5 divide-y divide-[var(--border)]">
+              {#each $dvConflicts.sample as c}
+                <div class="py-1 flex items-center gap-2">
+                  <span class="shrink-0 px-1.5 py-0.5 rounded {dvFallbackBadge}">{c.layers.join(' vs ')}</span>
+                  <span class="truncate flex-1" title={c.path}>{c.path}</span>
+                </div>
+              {/each}
+            </div>
+            {#if $dvConflicts.truncated}
+              <div class="mt-1 text-[var(--text-secondary)]">
+                Showing the first {$dvConflicts.sample.length} of {$dvConflicts.count}.
+              </div>
             {/if}
           </div>
         {/if}

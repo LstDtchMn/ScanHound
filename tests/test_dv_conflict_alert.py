@@ -227,3 +227,115 @@ def test_manual_sync_summary_marks_a_dry_run():
     assert _summary(dry_run=True).endswith("(dry run)")
     assert _summary(conflicts=1, dry_run=True).endswith("(dry run)")
     assert "1 file(s) skipped" in _summary(conflicts=1, dry_run=True)
+
+
+# --- DURABLE DISCOVERY ----------------------------------------------------
+# The alert is an EVENT and its delivery is best-effort: the in-app broadcast
+# reaches whoever is connected at that instant and raises nothing if that is
+# nobody. Since the alert also marks the set "seen" before delivering, a
+# conflict appearing while no client is open would be announced to an empty
+# room and never mentioned again (peer review round 2, M1).
+#
+# The answer is that a conflict is not an event at all, it is a property the
+# rows currently have -- so it is recomputed on demand and stays discoverable
+# no matter what happened to the notification.
+
+CONFLICT_ROWS = [
+    {"path": r"Y:\Movies\Alpha (2001)\Alpha.mkv", "dv_layer": "fel"},
+    {"path": "Y:/movies/alpha (2001)/alpha.mkv", "dv_layer": "mel"},
+]
+
+
+def _conflicts(rows=None, **kw):
+    from backend.rename.dv_labeler import current_conflicts
+    return current_conflicts(CONFLICT_ROWS if rows is None else rows,
+                             mappings=[], **kw)
+
+
+def test_unresolved_conflict_is_discoverable_after_the_alert_reached_nobody(
+        ws, monkeypatch):
+    """THE regression test for M1, and the reason current state is derived.
+
+    Sequence that used to lose a conflict permanently:
+      1. conflict appears; the sync alerts
+      2. zero clients connected -- the broadcast targets nobody, no exception
+      3. no outbound channel configured -- the bridge cannot reach anyone
+      4. the set is already marked seen, so later passes return early
+      5. nobody ever learns
+    Step 5 is what this pins: after all of that, the conflict is still there to
+    be found.
+    """
+    monkeypatch.setattr("backend.api.dependencies.registry._notification_bridge",
+                        None, raising=False)          # no notifier at all
+    svc = object.__new__(AppService)
+    result = {"matched": 0, "added": 0, "layer_conflicts": 1,
+              "layer_conflict_paths": [CONFLICT_ROWS[0]["path"]]}
+    svc._alert_dv_layer_conflicts(result)                   # announced to nobody
+    svc._alert_dv_layer_conflicts(result)                   # deduped, silent
+
+    assert ws.broadcast_sync.call_count == 1, "sanity: the event fired once"
+
+    # ...and the state is still discoverable, which is the whole point.
+    status = _conflicts()
+    assert status["count"] == 1
+    assert status["sample"][0]["layers"] == ["fel", "mel"]
+
+
+def test_discovery_does_not_depend_on_the_alert_having_run_at_all():
+    """Current state is derived from rows, so it needs no prior notification,
+    no stored flag, and no live process that happened to observe it."""
+    assert _conflicts()["count"] == 1
+
+
+def test_no_conflicts_reports_a_clean_empty_state():
+    """Negative control: a clean library must not show 'needs attention'."""
+    clean = [{"path": "Y:/m/a.mkv", "dv_layer": "fel"},
+             {"path": "Y:/m/b.mkv", "dv_layer": "unknown"}]
+    status = _conflicts(clean)
+    assert status["count"] == 0
+    assert status["sample"] == [] and status["truncated"] is False
+
+
+def test_conflict_status_is_bounded_but_the_count_is_exact():
+    """The wire gets a sample; the count stays truthful (review L1)."""
+    rows = []
+    for i in range(40):
+        # Two spellings of one file: separators and case, as in live data.
+        rows.append({"path": f"Y:/m/f{i}.mkv", "dv_layer": "fel"})
+        rows.append({"path": f"Y:\\M\\F{i}.MKV", "dv_layer": "mel"})
+    status = _conflicts(rows, sample=25)
+    assert status["count"] == 40, "the count must not be capped"
+    assert len(status["sample"]) == 25
+    assert status["truncated"] is True
+
+
+def test_wire_payload_caps_the_conflict_path_list():
+    """The completion event goes to every client on every manual sync."""
+    from backend.api.routes.rename import wire_safe_sync_result
+    from backend.rename.dv_labeler import CONFLICT_SAMPLE
+
+    paths = [f"Y:/m/f{i}.mkv" for i in range(CONFLICT_SAMPLE + 10)]
+    out = wire_safe_sync_result(
+        {"matched": 1, "layer_conflicts": len(paths),
+         "layer_conflict_paths": list(paths)})
+
+    assert len(out["layer_conflict_paths"]) == CONFLICT_SAMPLE
+    assert out["layer_conflict_paths_truncated"] is True
+    assert out["layer_conflicts"] == len(paths), "the exact count must survive"
+
+
+def test_wire_payload_leaves_a_small_list_alone_and_says_so():
+    from backend.api.routes.rename import wire_safe_sync_result
+    out = wire_safe_sync_result(
+        {"matched": 1, "layer_conflicts": 2,
+         "layer_conflict_paths": ["a", "b"]})
+    assert out["layer_conflict_paths"] == ["a", "b"]
+    assert out["layer_conflict_paths_truncated"] is False
+
+
+def test_wire_payload_survives_an_error_result():
+    """The finally block broadcasts whatever it has, including None or an error
+    dict from the exception path. Trimming must not become a second failure."""
+    from backend.api.routes.rename import wire_safe_sync_result
+    assert wire_safe_sync_result(None) is None
+    assert wire_safe_sync_result({"error": "boom"}) == {"error": "boom"}

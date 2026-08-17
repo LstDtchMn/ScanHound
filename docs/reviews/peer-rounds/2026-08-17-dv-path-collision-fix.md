@@ -13,7 +13,59 @@ REQUEST CHANGES with one MEDIUM blocker.
 
 ---
 
-## 0. Response to round 1
+## 0. Response to round 2
+
+Round 2 returned REQUEST CHANGES: **M1 MEDIUM** (the unattended alert can be
+lost permanently), **L1** (uncapped path list on the wire), **L2** (stale
+round-1 comments still present despite the doc claiming otherwise). All three
+are addressed.
+
+**M1 — and the reviewer was right about the shape of it.** The alert marks a
+conflict set "seen" *before* attempting delivery. The in-app broadcast targets
+whoever is connected at that instant and raises nothing when that is nobody, and
+no outbound channel is configured, so a conflict appearing while no tab was open
+was announced to an empty room and then permanently deduped. The reviewer also
+spotted that the scheduled sync only runs when `get_latest_dv_scan_at()`
+advances, so there is not even an hourly retry.
+
+That is the same distinction this branch exists to enforce — *the function ran*
+is not *the result arrived* — applied one level further out than I applied it.
+
+Fixed by making an unresolved conflict **current state rather than only an
+event**, per the reviewer's preferred shape. The key property is that conflicts
+are **derived, not stored**: they are a pure function of the `dv_scan` rows, so
+`current_conflicts()` recomputes them on demand. Nothing to persist, replay, or
+let drift. `/rename/dv-scans` returns them, and the Renames DV panel shows a
+persistent "N file(s) need attention" card — deliberately outside the inventory
+guard, so it appears whether or not any scan counts exist, and regardless of
+what happened to any notification. The event/dedup path is unchanged and still
+does its job for *changes*; it is simply no longer the only way to find out.
+
+The regression test the reviewer asked for is
+`test_unresolved_conflict_is_discoverable_after_the_alert_reached_nobody`: it
+runs the alert with no notifier and a broadcast nobody receives, fires it twice
+so the dedup engages, and then asserts the conflict is *still* discoverable.
+
+**L1** — `wire_safe_sync_result()` caps `layer_conflict_paths` at the route,
+i.e. at the boundary that transmits, adding
+`layer_conflict_paths_truncated`. The exact set stays in the returned summary
+because the alert's dedup needs it, and `layer_conflicts` remains the exact
+count so a client is never misled about scale.
+
+**L2** — the stale comments are gone: the "311 keys collide today" log comment,
+the test docstring claiming "all 311 colliding keys" and that `unknown` "strips
+the badge" (it does not — it fails to add or converge one), and the docstring
+still saying a conflict "is reported as 'unknown'".
+
+**On §8, the `0x800710E0` lead — the reviewer's correction is accepted.** The
+installer sets and asserts `-MultipleInstances IgnoreNew`, which *prevents*
+scheduled overlap rather than causing it, and `0x800710E0` is
+`HRESULT_FROM_WIN32(ERROR_REQUEST_REFUSED)` — consistent with a trigger being
+refused, not with a second scanner having started. My duplicate-spelling
+mechanism does not follow from it. I had marked it inferred; it is weaker than
+that framing implied and should not be pursued as stated.
+
+## 0b. Response to round 1
 
 | # | Required change | Status |
 |---|---|---|

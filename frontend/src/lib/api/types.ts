@@ -149,6 +149,18 @@ export interface DvScan {
   last_seen_at?: string | null;
 }
 
+/** Files whose scan rows contradict each other about the Dolby Vision layer.
+ *
+ *  Recomputed server-side from the scan rows on every request, so it reflects
+ *  what is true NOW rather than whether a notification was ever delivered.
+ *  `count` is exact; `sample` is capped and `truncated` says whether it was.
+ */
+export interface DvConflictStatus {
+  count: number;
+  sample: { path: string; layers: string[] }[];
+  truncated: boolean;
+}
+
 export interface RenameStats {
   applied: number;
   total_jobs: number;

@@ -821,6 +821,31 @@ def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)
     return _import_response(result)
 
 
+def wire_safe_sync_result(result):
+    """A copy of the sync summary that is safe to put on the WebSocket.
+
+    ``layer_conflict_paths`` is unbounded in principle — capped only by the
+    number of colliding keys — and the completion event goes to every connected
+    client on every manual sync, dry runs included. The EXACT set is wanted
+    server-side, because the unattended alert dedups on it, so it stays in the
+    returned summary and is trimmed here instead: at the boundary that actually
+    transmits it (peer review round 2, L1).
+
+    ``layer_conflicts`` remains the exact count either way, so a client can
+    always tell how many there are even when it only receives a sample.
+    """
+    if not isinstance(result, dict):
+        return result
+    paths = result.get("layer_conflict_paths")
+    if not isinstance(paths, list):
+        return result
+    trimmed = dict(result)
+    trimmed["layer_conflict_paths"] = paths[:dv_labeler.CONFLICT_SAMPLE]
+    trimmed["layer_conflict_paths_truncated"] = (
+        len(paths) > dv_labeler.CONFLICT_SAMPLE)
+    return trimmed
+
+
 def dv_sync_summary_body(result, dry_run):
     """The one-line summary the manual DV sync reports when it finishes.
 
@@ -880,7 +905,8 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
                                            title="Dolby Vision label sync failed")})
             result = {"error": public.message, **public.as_detail()}
         finally:
-            ws_manager.broadcast_sync({"type": "dv:sync_done", "data": result})
+            ws_manager.broadcast_sync({"type": "dv:sync_done",
+                                       "data": wire_safe_sync_result(result)})
 
     threading.Thread(target=_run, name="dv-sync-labels", daemon=True).start()
     return {"status": "started", "dry_run": dry_run}
@@ -899,11 +925,25 @@ def search_tmdb(query: str = "", media_type: str = "movie",
 @router.get("/dv-scans")
 def dv_scans(layer: Optional[str] = None, limit: int = 500,
              reg: ServiceRegistry = Depends(get_registry)):
-    """The Dolby Vision inventory: scanned files + per-layer counts."""
+    """The Dolby Vision inventory: scanned files, per-layer counts, conflicts.
+
+    ``conflicts`` is CURRENT STATE, recomputed from the rows on every call, not
+    a record of whether anyone was ever told. The unattended conflict alert
+    broadcasts to whoever is connected at that instant and raises nothing if
+    that is nobody, so a conflict that appeared while no client was open would
+    be marked "seen" and never re-announced. Deriving it here means an
+    unresolved conflict is discoverable whenever someone next opens the panel,
+    regardless of what happened to the notification (peer review round 2, M1).
+    """
     if reg.db is None:
-        return {"scans": [], "counts": {}}
+        return {"scans": [], "counts": {}, "conflicts": {"count": 0, "sample": [],
+                                                         "truncated": False}}
     limit = max(1, min(int(limit), 2000))  # clamp: never let a client OOM the box
+    # Separate read from the paged `scans` above: the conflict set is a property
+    # of ALL scan rows, so a page of 500 cannot answer it.
+    all_rows = reg.db.get_dv_scans(limit=1000000, source="scan")
     return {
         "scans": reg.db.get_dv_scans(dv_layer=layer, limit=limit, source="scan"),
         "counts": reg.db.count_dv_scans_by_layer(source="scan"),
+        "conflicts": dv_labeler.current_conflicts(all_rows),
     }

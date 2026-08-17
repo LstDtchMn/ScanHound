@@ -63,10 +63,16 @@ def test_both_spellings_really_do_collide():
 def test_a_failed_rescan_cannot_erase_a_real_layer_in_either_order():
     """`unknown` is a FAILED detection, so it can never outvote a real finding.
 
-    This is the live shape: all 311 colliding keys are `<real layer> vs
-    unknown`. Under last-write-wins the two orders disagree — the ('fel',
-    'unknown') order yields 'unknown' and strips the badge — so asserting both
-    is what makes the test discriminating.
+    The live shape: 346 colliding keys carry a real layer on one row and a
+    failed scan on the other (180 badge-producing), and 0 carry two different
+    real layers. Under last-write-wins the two orders disagree — the ('fel',
+    'unknown') order yields 'unknown' — so asserting both is what makes the
+    test discriminating.
+
+    Note what the damage actually is: `unknown` is non-destructive at the
+    removal step, so it does not STRIP a badge. It fails to add or converge
+    one. Measured at the consumer, an adverse row order applies 0 labels where
+    a favourable one applies 72 across 30 titles.
     """
     for rows in (_rows(("fel", PATH_A), ("unknown", PATH_B)),
                  _rows(("unknown", PATH_A), ("fel", PATH_B))):
@@ -95,8 +101,10 @@ def test_two_different_real_layers_are_a_conflict_in_either_order():
     _LAYER_RANK must NOT arbitrate here. It ranks the PARTS of one title, where
     "any part proving DV proves it for the title" holds; applied to two
     observations of a single file it would launder a disagreement into a
-    confident 'fel'. The conflict is reported as 'unknown' so it travels the
-    failure path, and is returned separately so it is not silent.
+    confident 'fel'. The conflict gets its OWN value, LAYER_CONFLICT, rather
+    than reusing 'unknown' -- see test_a_conflict_is_not_the_same_state_as_a
+    _failed_scan for why that distinction is load-bearing -- and the layers are
+    returned separately so the disagreement is not silent.
     """
     for rows in (_rows(("fel", PATH_A), ("mel", PATH_B)),
                  _rows(("mel", PATH_A), ("fel", PATH_B))):

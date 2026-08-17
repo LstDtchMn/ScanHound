@@ -309,6 +309,42 @@ def build_index(rows, mappings=None):
     return index
 
 
+#: How many conflicting paths a status payload carries. The full set stays
+#: server-side for exact dedup; the wire gets a bounded sample (review L1).
+CONFLICT_SAMPLE = 25
+
+
+def current_conflicts(rows, mappings=None, *, sample=CONFLICT_SAMPLE):
+    """Unresolved DV-layer conflicts RIGHT NOW, derived from *rows*.
+
+    Deliberately a pure function of the scan rows rather than stored state.
+    A conflict is not an event that happened, it is a property the data
+    currently has: two rows naming one file and claiming different layers. So
+    it can always be recomputed and there is nothing to persist, replay, or let
+    drift out of sync with the rows themselves.
+
+    That property is what makes the alert safe. `_alert_dv_layer_conflicts`
+    fires once per distinct set, and its delivery is best-effort — the in-app
+    broadcast reaches whoever is connected AT THAT MOMENT and raises nothing if
+    that is nobody, so a conflict appearing while no client is open would
+    otherwise be marked "seen", never re-announced, and lost (peer review round
+    2). Because this recomputes from the rows, an unresolved conflict stays
+    discoverable whenever someone next looks, independent of whether any
+    notification was ever delivered. Event for the change, current state for
+    the truth.
+
+    Bounded on purpose: `count` is exact, `sample` is capped, `truncated` says
+    so. Callers that need every path can build the index themselves.
+    """
+    _, _, conflicts = _index_by_normalized_path(rows, mappings)
+    paths = sorted(conflicts)
+    return {
+        "count": len(paths),
+        "sample": [{"path": p, "layers": conflicts[p]} for p in paths[:sample]],
+        "truncated": len(paths) > sample,
+    }
+
+
 def build_index_and_paths(rows, mappings=None):
     """Single pass over rows: ({norm -> dv_layer}, {norm -> original_path}).
 
@@ -531,12 +567,12 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     rows = db.get_dv_scans(source="scan", limit=1000000)
     index, norm_to_path, layer_conflicts = _index_by_normalized_path(rows, mappings)
     if layer_conflicts:
-        # Loud, because the collapse deliberately makes a contradiction LOOK
-        # like an ordinary detection failure to every consumer downstream. That
-        # is the safe behaviour, but it is also indistinguishable from a file
-        # that simply has not been scanned, so the only place the disagreement
-        # is visible is here. Capped sample: 311 keys collide today and a log
-        # line per key would bury the count.
+        # Loud, because a contradiction is otherwise invisible in this sync's
+        # own numbers: the title is left strictly alone, so it moves none of
+        # matched/added/removed. Note the log is NOT the durable record --
+        # current_conflicts() recomputes the set on demand for exactly that
+        # reason. Capped sample: 2,223 keys collide in live data (0 of them
+        # true conflicts today) and a line per key would bury the count.
         sample = sorted(layer_conflicts.items())[:5]
         logger.warning(
             "dv sync: %d file(s) have dv_scan rows claiming DIFFERENT DV "

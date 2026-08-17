@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, PlexMetadataScanStatus, MediaInventoryResponse, MediaInventoryFacets, MetadataScanRun, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, DownloadQueueItem, BrowserStatus, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, TrashDeleteResponse, TrashEmptyResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult, VerificationHold } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, DvConflictStatus, PlexStatus, PlexMetadataScanStatus, MediaInventoryResponse, MediaInventoryFacets, MetadataScanRun, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, DownloadQueueItem, BrowserStatus, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, TrashDeleteResponse, TrashEmptyResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult, VerificationHold } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -651,7 +651,14 @@ export const api = {
     }),
   getDvScans: (layer?: string) => {
     const qs = layer ? `?layer=${encodeURIComponent(layer)}` : '';
-    return request<{ scans: DvScan[]; counts: Record<string, number> }>(`/rename/dv-scans${qs}`);
+    // `conflicts` is CURRENT state, recomputed server-side on every call, not a
+    // record of whether a notification was ever delivered. Optional so an older
+    // backend still type-checks.
+    return request<{
+      scans: DvScan[];
+      counts: Record<string, number>;
+      conflicts?: DvConflictStatus;
+    }>(`/rename/dv-scans${qs}`);
   },
   dvImport: () =>
     request<{ imported: number; updated: number }>('/rename/dv-import', {
