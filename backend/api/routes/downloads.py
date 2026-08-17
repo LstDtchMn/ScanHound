@@ -253,7 +253,11 @@ def list_download_retries(
     if queue is None:
         raise HTTPException(status_code=503, detail="Download queue not available")
     items = queue.list_retries(limit=limit)
-    return {"items": items, "count": len(items), "status": queue.status()}
+    # Source-level holds travel BESIDE the items, not inferred from them. A hold
+    # is a property of the source, and deriving it from item state gets it wrong
+    # in both directions -- see active_verification_holds() for the specifics.
+    return {"items": items, "count": len(items), "status": queue.status(),
+            "holds": queue.active_verification_holds()}
 
 
 @router.post("/retries/retry-ready")

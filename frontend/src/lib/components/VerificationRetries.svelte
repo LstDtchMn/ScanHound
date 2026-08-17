@@ -3,7 +3,7 @@
   import { api } from '$lib/api/client';
   import { connection } from '$lib/stores/connection';
   import { addToast } from '$lib/stores/notifications';
-  import type { BrowserStatus, DownloadQueueItem } from '$lib/api/types';
+  import type { BrowserStatus, DownloadQueueItem, VerificationHold } from '$lib/api/types';
   import { checkedAgo } from '$lib/components/pipeline/pipelineDisplay';
 
   /** How long this item has been queued, e.g. "3d". '' when the timestamp is
@@ -16,6 +16,9 @@
   }
 
   let items = $state<DownloadQueueItem[]>([]);
+  let holds = $state<VerificationHold[]>([]);
+  let showHeld = $state(false);
+  let releasing = $state('');
   let browser = $state<BrowserStatus | null>(null);
   let loading = $state(false);
   let busy = $state('');
@@ -60,6 +63,7 @@
         api.browserStatus()
       ]);
       items = retryResponse.items;
+      holds = retryResponse.holds ?? [];
       browser = browserResponse;
     } catch {
       // Retain the last useful snapshot.
@@ -94,6 +98,29 @@
     alive = false;
     if (timer) clearTimeout(timer);
   });
+
+  /** Release a hold, using the source the BACKEND reported.
+   *
+   *  Not a hardcoded 'hdencode': the hold marker names its own source, and
+   *  hardcoding one is why the earlier attempt at this could only ever clear a
+   *  single source. */
+  async function releaseHold(hold: VerificationHold) {
+    releasing = hold.source;
+    try {
+      const r = await api.clearVerificationHold(hold.source);
+      // Show what the backend says to do next rather than inventing our own
+      // wording -- it knows whether a trigger item is left to probe.
+      addToast(
+        'Hold released',
+        `${hold.affected} request(s) for ${hold.source} can be tried again. ${r.next_action ?? ''}`.trim()
+      );
+      await load();
+    } catch (e) {
+      addToast('Could not release', e instanceof Error ? e.message : 'Please try again.', 'error');
+    } finally {
+      releasing = '';
+    }
+  }
 
   async function retry(item: DownloadQueueItem) {
     busy = item.item_uuid;
@@ -184,7 +211,46 @@
     </div>
   </div>
 
-  {#if items.length > 0}
+  {#each holds as hold (hold.source)}
+    <!-- ONE condition, not N stuck downloads. Every held item also renders a
+         "Retry after <time>" of its own, and while this hold is armed that time
+         is meaningless -- decide() returns VERIFICATION_HOLD before it looks at
+         any cooldown. So this card contradicts it explicitly rather than leaving
+         the reader to reconcile forty misleading timestamps. -->
+    <div class="mx-4 mb-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
+      <div class="flex items-start gap-2 flex-wrap">
+        <span class="text-sm font-semibold text-amber-300">
+          {hold.source} — waiting for verification
+        </span>
+        <span class="text-[11px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-200">
+          {hold.affected} request{hold.affected === 1 ? '' : 's'} paused
+        </span>
+      </div>
+      <p class="mt-2 text-xs text-[var(--text-secondary)]">
+        ScanHound met a verification challenge it cannot complete on its own, so
+        it stopped sending requests to {hold.source}.
+        <strong class="text-amber-300">This will not clear on its own</strong> —
+        not when the retry times below run out. It clears when
+        {hold.clears_when}.
+      </p>
+      <div class="mt-3 flex gap-2 flex-wrap">
+        <button
+          class="px-2.5 py-1 rounded bg-[var(--accent)] text-white text-xs disabled:opacity-40"
+          disabled={releasing !== ''}
+          title="Stop holding these back and let them try {hold.source} again"
+          onclick={() => releaseHold(hold)}
+        >
+          {releasing === hold.source ? 'Releasing…' : 'Try again anyway'}
+        </button>
+        <button class="px-2.5 py-1 rounded bg-[var(--bg-tertiary)] text-xs"
+                onclick={() => (showHeld = !showHeld)}>
+          {showHeld ? 'Hide' : 'Show'} the {hold.affected} paused
+        </button>
+      </div>
+    </div>
+  {/each}
+
+  {#if items.length > 0 && (holds.length === 0 || showHeld)}
     <div class="px-4 pb-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
       {#each items as item (item.item_uuid)}
         <article class="rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] p-3">
@@ -238,7 +304,7 @@
         </article>
       {/each}
     </div>
-  {:else}
+  {:else if holds.length === 0}
     <p class="px-4 pb-3 text-xs text-[var(--text-secondary)]">No verification retries or scheduled link grabs.</p>
   {/if}
 </section>

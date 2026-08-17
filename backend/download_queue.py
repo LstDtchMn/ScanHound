@@ -2696,6 +2696,82 @@ class DownloadQueueService:
             automated=False,
         )
 
+    def active_verification_holds(self) -> list:
+        """The source-level holds, as a condition rather than 39 identical rows.
+
+        WHY THIS EXISTS. A single interactive challenge arms a SOURCE-SCOPED
+        hold, and every deferred row for that source is then held by
+        decide() -- which returns VERIFICATION_HOLD *before* it looks at
+        auto-resume, the retry budget, the shared cooldown or the item cooldown.
+        So those rows will NOT resume when their displayed "Retry after" time
+        passes, and the UI showing that timestamp on each of them is actively
+        misleading: it names a deadline that has no bearing on the outcome.
+
+        On 2026-08-16 that produced 39 cards that each looked like an
+        independently stuck download, when the truth was one condition affecting
+        one source.
+
+        THE BUG THIS AVOIDS. The obvious shortcut is to infer the hold from
+        `state = 'verification_required'` rows, which is what the open PR #84
+        does. That is not the same fact:
+
+          * the triggering item can be removed or completed while
+            verification_hold_source stays armed -- the hold survives and the
+            only escape hatch vanishes from the UI. Today ONE row holds 39, so
+            that is a single click away from happening;
+          * a triggering row can still read verification_required after the
+            hold was cleared, showing a button that does nothing;
+          * it cannot name WHICH source is held, so any action built on it has
+            to hard-code one.
+
+        The marker is the marker. Read it directly.
+        """
+        if self.db is None:
+            return []
+        try:
+            rows = self.db._query_dicts(
+                "SELECT verification_hold_source AS source, "
+                "       COUNT(*) AS holding_batches "
+                "FROM download_queue_batches "
+                "WHERE verification_hold_source IS NOT NULL "
+                "  AND verification_hold_source <> '' "
+                "GROUP BY verification_hold_source", (), default=[])
+        except Exception:  # noqa: BLE001
+            logger.exception("could not read verification holds")
+            return []
+
+        out = []
+        for row in rows:
+            source = str(row.get("source") or "")
+            if not source:
+                continue
+            counts = self.db._query_dicts(
+                "SELECT "
+                "  SUM(CASE WHEN state IN ('waiting_source','verification_required') "
+                "           THEN 1 ELSE 0 END) AS affected, "
+                "  SUM(CASE WHEN state = 'verification_required' "
+                "           THEN 1 ELSE 0 END) AS triggers, "
+                "  MIN(cooldown_until) AS earliest_cooldown "
+                "FROM download_queue_items WHERE source = ?",
+                (source,), default=[])
+            c = counts[0] if counts else {}
+            out.append({
+                "source": source,
+                "holding_batches": int(row.get("holding_batches") or 0),
+                "affected": int(c.get("affected") or 0),
+                "triggers": int(c.get("triggers") or 0),
+                # Reported so the UI can say the cooldown is IRRELEVANT, rather
+                # than silently omitting it and leaving the old card's "Retry
+                # after" as the only timestamp anyone sees.
+                "cooldown_until": c.get("earliest_cooldown"),
+                # The single most important field: this is what the old UI got
+                # wrong by implying a timer would fix it.
+                "clears_on_timer": False,
+                "clears_when": ("a probe actually succeeds in revealing links "
+                                "from this source"),
+            })
+        return out
+
     def clear_verification_hold(self, source: str = "hdencode") -> dict:
         """Operator action: abandon an open verification hold for a source.
 

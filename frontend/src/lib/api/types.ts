@@ -182,6 +182,29 @@ export interface BrowserStatus {
   detected_browser_major?: number | null;
 }
 
+/** A SOURCE-LEVEL verification hold.
+ *
+ *  Reported beside the items, never inferred from them. The hold lives on the
+ *  source, so deriving it from `state === 'verification_required'` rows is a
+ *  different fact and wrong in both directions: the trigger row can be removed
+ *  while the hold stays armed (on 2026-08-16 ONE row held 40), and a trigger row
+ *  can outlive a cleared hold. */
+export interface VerificationHold {
+  source: string;
+  /** Queue rows this hold is stopping, across ALL batches for the source. */
+  affected: number;
+  /** How many actually met the challenge. Usually 1. */
+  triggers: number;
+  /** Reported so the UI can CONTRADICT it. Item cards show their own
+   *  "Retry after" time, and while a hold is armed that time means nothing. */
+  cooldown_until: string | null;
+  /** Always false. Named explicitly because the whole defect was a UI implying
+   *  a timer would fix this. */
+  clears_on_timer: boolean;
+  clears_when: string;
+  holding_batches: number;
+}
+
 export interface DownloadQueueItem {
   item_uuid: string;
   batch_uuid: string;
