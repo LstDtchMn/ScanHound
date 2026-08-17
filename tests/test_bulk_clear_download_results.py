@@ -408,7 +408,19 @@ class TestTheCheckAndTheWriteAreATOMIC:
         body = after[1]
         assert "delete_download_result" in body, "deletes moved outside the lock"
         assert "_results_cache.pop" in body, "cache eviction moved outside the lock"
-        assert "_results_epoch" in body, "the epoch advance moved outside the lock"
+        # Either spelling of the advance counts: the literal assignment, or the
+        # _bump_epoch_locked() helper added in review. Asserting only on
+        # "_results_epoch" made this fail the moment the same behaviour moved
+        # behind a well-named helper -- a source-text test pinning the WORDING
+        # rather than the property it exists to protect.
+        assert ("_results_epoch" in body) or ("_bump_epoch_locked" in body), (
+            "the epoch advance moved outside the lock")
+        # And it must not be the LOCKING variant: _epoch_lock() is a plain Lock
+        # and _results_state() already holds it, so self._bump_epoch() here
+        # would deadlock rather than merely be redundant.
+        assert "self._bump_epoch()" not in body, (
+            "_bump_epoch() inside _results_state() deadlocks on the "
+            "non-reentrant lock; use _bump_epoch_locked()")
 
     def test_the_JD_call_stays_OUTSIDE_the_lock(self):
         """A wedged JDownloader must never block the API route -- that was the
