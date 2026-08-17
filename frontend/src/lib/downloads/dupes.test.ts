@@ -89,9 +89,26 @@ describe('isCanonicalSeasonName — the authorization grammar', () => {
   it('accepts the canonical form the backend builds', () => {
     // compute_package_name(): "Title (YYYY) SNN [resolution]".
     expect(isCanonicalSeasonName('The Repair Shop (2017) S02 [1080p]')).toBe(true);
-    expect(isCanonicalSeasonName('Breaking Bad (2008) S1 [4K]')).toBe(true);
-    expect(isCanonicalSeasonName('Some Show S03E07 [1080p]')).toBe(true);
-    expect(isCanonicalSeasonName('Some Show S04')).toBe(true); // resolution optional
+    expect(isCanonicalSeasonName('Breaking Bad (2008) S01 [4K]')).toBe(true);
+    // The bracket is optional because the PRODUCER's is: compute_package_name
+    // appends [resolution] only when a resolution is known.
+    expect(isCanonicalSeasonName('Some Show S04')).toBe(true);
+  });
+
+  it('accepts ONLY what compute_package_name can actually emit', () => {
+    // The backend writes f" S{season:02d}" and never appends an episode. Both
+    // of these name one unit and neither is unsafe, but accepting them made the
+    // trust argument ("this is the shape we emit") false -- and that argument
+    // is the entire reason this predicate may authorise deletion.
+    //
+    // Measured before narrowing: across 361 download_results names and 430
+    // package names, all 218 season markers are zero-padded SNN, and none is
+    // single-digit or episode-level. This rejects nothing that exists.
+    expect(isCanonicalSeasonName('Breaking Bad (2008) S1 [4K]')).toBe(false);
+    expect(isCanonicalSeasonName('Some Show S03E07 [1080p]')).toBe(false);
+    // ...and both still GROUP, which is the half that stays permissive.
+    expect(seasonKey('Breaking Bad (2008) S1 [4K]')).toBe('S01');
+    expect(seasonKey('Some Show S03E07 [1080p]')).toBe('S03E07');
   });
 
   it('rejects every range form, including ones seasonKey also catches', () => {

@@ -54,11 +54,24 @@ const CONTINUES_INTO_ANOTHER_UNIT = /^\s*(?:[-–—&+/,]|to\b)\s*(?:[SE]\s*)?\d
  *  optional bracketed tag, and preceded by the year or a title word rather than
  *  by a separator (so `Show 1 & S02` is not mistaken for it).
  *
+ *  LITERALLY the producer's grammar, not a family that resembles it. The
+ *  backend writes `f" S{season:02d}"` and never appends an episode, so this
+ *  takes exactly two digits and no `Exx`. An earlier version allowed `S1` and
+ *  `S03E07`; both are single-unit-shaped and neither was unsafe, but accepting
+ *  them made the docstring's trust argument — "this is the shape we emit" —
+ *  false, and that argument is the whole reason the predicate may authorise
+ *  deletion (peer review round 4). Measured before narrowing: across 361
+ *  download_results names and 430 package names, all 218 season markers are
+ *  zero-padded `SNN` and NONE is single-digit or episode-level, so the
+ *  tightening rejects nothing that exists.
+ *
+ *  The bracket stays optional because the producer's is: `compute_package_name`
+ *  appends `[resolution]` only when a resolution is known.
+ *
  *  Anchored at the END on purpose. `S01-S03 [1080p]` cannot satisfy it (nothing
  *  separates the range endpoint from the bracket the way the canonical form
  *  does), and `Season 1 & 2 [1080p]` has no `SNN` there at all. */
-const CANONICAL_SEASON_SUFFIX =
-  /(?:^|[\w)\]])\s+S(\d{1,2})(?:E(\d{1,3}))?(?:\s*\[[^\]]*\])?\s*$/i;
+const CANONICAL_SEASON_SUFFIX = /(?:^|[\w)\]])\s+S(\d{2})(?:\s*\[[^\]]*\])?\s*$/i;
 
 /** THE AUTHORIZATION PARSER. True only when the name is structurally ScanHound's
  *  own single-season form, and therefore proves ONE content unit.
@@ -76,9 +89,17 @@ const CANONICAL_SEASON_SUFFIX =
  *  positive that authorises deletion. A narrow positive grammar fails closed on
  *  syntax it has never seen (peer review 2026-08-17, round 3).
  *
- *  The cost is real and accepted: `Show Season 4 [1080p]` is a perfectly clear
- *  single season, but it is not the form ScanHound emits, so it does not
- *  authorise. It still GROUPS correctly — see `seasonKey`. */
+ *  The cost is real and accepted: `Show Season 4 [1080p]`, `Show S1 [1080p]`
+ *  and `Show S03E07 [1080p]` all name a perfectly clear single unit, but none
+ *  is the form ScanHound emits, so none authorises. They still GROUP correctly
+ *  — see `seasonKey`.
+ *
+ *  NOT semantic proof, and deliberately not documented as such. The leading
+ *  `[\w)\]]` guard rejects `Show 1 & S02`, but it cannot establish that the
+ *  prefix is really a title: `Show 1 to 2 S03 [1080p]` satisfies the grammar
+ *  because the character before ` S03` is a digit. A frontend suffix parser
+ *  cannot close that; authoritative identity from the backend can, and is the
+ *  follow-up (peer review round 4). */
 export function isCanonicalSeasonName(name: string): boolean {
   const n = name || '';
   if (!CANONICAL_SEASON_SUFFIX.test(n)) return false;
