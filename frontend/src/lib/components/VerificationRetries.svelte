@@ -17,7 +17,12 @@
 
   let items = $state<DownloadQueueItem[]>([]);
   let holds = $state<VerificationHold[]>([]);
-  let showHeld = $state(false);
+  /** Which source cards are expanded. A single global flag hid the ENTIRE
+   *  retry list whenever any hold existed -- unrelated ready retries and failed
+   *  items vanished by default, and expanding one card revealed all of them
+   *  rather than that card's rows. Keyed by source so two held sources behave
+   *  independently. */
+  let expanded = $state<Record<string, boolean>>({});
   let releasing = $state('');
   let browser = $state<BrowserStatus | null>(null);
   let loading = $state(false);
@@ -25,6 +30,14 @@
   let intervalMinutes = $state(10);
   let timer: ReturnType<typeof setTimeout> | null = null;
   let alive = true;
+
+  /** Rows the backend classified as held, per source. Never re-derived from
+   *  state/source here: one classification, computed by the layer that owns the
+   *  policy. */
+  const heldFor = $derived((source: string) =>
+    items.filter((i) => i.verification_held && i.verification_hold_source === source));
+  /** Everything NOT behind a hold stays visible, always. */
+  const unheld = $derived(items.filter((i) => !i.verification_held));
 
   function localTime(value?: string | null): string {
     if (!value) return '';
@@ -223,12 +236,22 @@
           {hold.source} — waiting for verification
         </span>
         <span class="text-[11px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-200">
-          {hold.affected} request{hold.affected === 1 ? '' : 's'} paused
+          {#if hold.affected > 0}
+            {hold.affected} request{hold.affected === 1 ? '' : 's'} paused
+          {:else}
+            nothing waiting on it
+          {/if}
         </span>
       </div>
       <p class="mt-2 text-xs text-[var(--text-secondary)]">
-        ScanHound met a verification challenge it cannot complete on its own, so
-        it stopped sending requests to {hold.source}.
+        {#if hold.affected > 0}
+          ScanHound met a verification challenge it cannot complete on its own, so
+          it stopped sending requests to {hold.source}.
+        {:else}
+          The hold on {hold.source} is still switched on, but nothing is queued
+          behind it any more. Releasing it now costs nothing and stops it
+          blocking future downloads.
+        {/if}
         <strong class="text-amber-300">This will not clear on its own</strong> —
         not when the retry times below run out. It clears when
         {hold.clears_when}.
@@ -242,17 +265,41 @@
         >
           {releasing === hold.source ? 'Releasing…' : 'Try again anyway'}
         </button>
-        <button class="px-2.5 py-1 rounded bg-[var(--bg-tertiary)] text-xs"
-                onclick={() => (showHeld = !showHeld)}>
-          {showHeld ? 'Hide' : 'Show'} the {hold.affected} paused
-        </button>
+        {#if hold.affected > 0}
+          <button class="px-2.5 py-1 rounded bg-[var(--bg-tertiary)] text-xs"
+                  onclick={() => (expanded = { ...expanded, [hold.source]: !expanded[hold.source] })}>
+            {expanded[hold.source] ? 'Hide' : 'Show'} the {hold.affected} paused
+          </button>
+        {/if}
       </div>
     </div>
   {/each}
 
-  {#if items.length > 0 && (holds.length === 0 || showHeld)}
+  <!-- Held rows expand UNDER their own source card, above. Unrelated retry work
+       is never hidden by a hold: the previous version's single flag made ready
+       retries and failed items disappear the moment any hold existed. -->
+  {#each holds as hold (hold.source + '-rows')}
+    {#if expanded[hold.source]}
+      <div class="px-4 pb-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+        {#each heldFor(hold.source) as item (item.item_uuid)}
+          {@render itemCard(item)}
+        {/each}
+      </div>
+    {/if}
+  {/each}
+
+  {#if unheld.length > 0}
     <div class="px-4 pb-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-      {#each items as item (item.item_uuid)}
+      {#each unheld as item (item.item_uuid)}
+        {@render itemCard(item)}
+      {/each}
+    </div>
+  {:else if holds.length === 0}
+    <p class="px-4 pb-3 text-xs text-[var(--text-secondary)]">No verification retries or scheduled link grabs.</p>
+  {/if}
+</section>
+
+{#snippet itemCard(item: DownloadQueueItem)}
         <article class="rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] p-3">
           <div class="flex items-start gap-2">
             <div class="min-w-0 flex-1">
@@ -273,7 +320,13 @@
           {#if item.last_message}
             <p class="mt-2 text-xs text-[var(--text-secondary)]">{item.last_message}</p>
           {/if}
-          {#if item.source_cooldown_until || item.cooldown_until}
+          {#if item.verification_held}
+            <!-- Do NOT show a retry time on a held row. That timestamp is real
+                 but irrelevant: the hold outranks every clock in decide(), and
+                 showing it is what made 40 rows look like they would fix
+                 themselves at 8:57 PM. -->
+            <p class="mt-1 text-[11px] text-amber-300">Waiting on verification — no retry time applies</p>
+          {:else if item.source_cooldown_until || item.cooldown_until}
             <p class="mt-1 text-[11px] text-amber-300">
               Retry after {localTime(item.source_cooldown_until || item.cooldown_until)}
             </p>
@@ -302,9 +355,4 @@
             </button>
           </div>
         </article>
-      {/each}
-    </div>
-  {:else if holds.length === 0}
-    <p class="px-4 pb-3 text-xs text-[var(--text-secondary)]">No verification retries or scheduled link grabs.</p>
-  {/if}
-</section>
+{/snippet}

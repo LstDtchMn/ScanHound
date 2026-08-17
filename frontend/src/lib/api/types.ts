@@ -206,6 +206,13 @@ export interface VerificationHold {
 }
 
 export interface DownloadQueueItem {
+  /** Set by the BACKEND, never derived here. True when this row's effective
+   *  recovery decision is VERIFICATION_HOLD -- which is NOT the same as "its
+   *  source has a hold armed": decide() ranks SAFETY_HOLD and UNOWNED_REASON
+   *  above it, so a deferred row on a held source may be stopped by something
+   *  else entirely. */
+  verification_held?: boolean;
+  verification_hold_source?: string | null;
   item_uuid: string;
   batch_uuid: string;
   sequence_number: number;

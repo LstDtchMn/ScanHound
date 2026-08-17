@@ -256,8 +256,24 @@ def list_download_retries(
     # Source-level holds travel BESIDE the items, not inferred from them. A hold
     # is a property of the source, and deriving it from item state gets it wrong
     # in both directions -- see active_verification_holds() for the specifics.
+    holds = queue.active_verification_holds()
+
+    # EACH ITEM CARRIES ITS OWN VERDICT. The UI must be able to show a held row
+    # under its source's card while leaving unrelated retries visible, and it
+    # must not re-derive "is this held?" from state and source in Svelte -- that
+    # would recreate the drift this surface exists to remove. One classification,
+    # computed once, by the layer that owns the policy.
+    held_by_uuid = {}
+    for h in holds:
+        for uuid_ in h.get("item_uuids") or []:
+            held_by_uuid[uuid_] = h["source"]
+    for item in items:
+        source = held_by_uuid.get(item.get("item_uuid"))
+        item["verification_held"] = source is not None
+        item["verification_hold_source"] = source
+
     return {"items": items, "count": len(items), "status": queue.status(),
-            "holds": queue.active_verification_holds()}
+            "holds": holds}
 
 
 @router.post("/retries/retry-ready")

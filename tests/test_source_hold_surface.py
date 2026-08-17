@@ -164,3 +164,80 @@ class TestItFailsQuietlyRatherThanBreakingTheScreen:
         s.db = MagicMock()
         s.db._query_dicts.side_effect = RuntimeError("db gone")
         assert s.active_verification_holds() == []
+
+
+class TestAffectedIsThePOLICYCount:
+    """Review MEDIUM 1. `affected` used to count every row in a deferred state
+    for a held source. decide() ranks SAFETY_HOLD (unknown outcome) and
+    UNOWNED_REASON ABOVE the verification hold, so that set is not the set the
+    hold is stopping -- and the card says "N requests paused", which was
+    therefore a false statement for those rows.
+
+    Counting the wrong set and naming it the right one is the same error PR #84
+    made from item state. Doing it in SQL would only have moved it.
+    """
+
+    def test_an_ordinary_deferred_row_IS_counted(self, svc, db):
+        """Positive control: without this the negatives below are vacuous."""
+        _batch(db, "b1", hold="hdencode")
+        _item(db, "b1")
+        assert svc.active_verification_holds()[0]["affected"] == 1
+
+    def test_an_UNKNOWN_OUTCOME_row_is_not_counted(self, svc, db):
+        """SAFETY_HOLD outranks the verification hold: we do not know whether
+        the previous attempt took effect, so it is parked for a different and
+        stronger reason. The hold is not what is stopping it."""
+        _batch(db, "b1", hold="hdencode")
+        _item(db, "b1", n=0)
+        _item(db, "b1", n=1)
+        db._mutate("UPDATE download_queue_items SET last_reason_code = "
+                   "'operation_timeout_unknown' WHERE item_uuid = 'i-b1-1'",
+                   (), label="t")
+        h = svc.active_verification_holds()[0]
+        assert h["affected"] == 1, "counted a row held by SAFETY_HOLD, not by us"
+        assert "i-b1-1" not in h["item_uuids"]
+
+    def test_an_UNOWNED_REASON_row_is_not_counted(self, svc, db):
+        """Automatic recovery does not own this row at all."""
+        _batch(db, "b1", hold="hdencode")
+        _item(db, "b1", n=0)
+        _item(db, "b1", n=1, reason="manual_retry")
+        h = svc.active_verification_holds()[0]
+        assert h["affected"] == 1, "counted a row the recovery policy does not own"
+
+    def test_a_NON_DEFERRED_row_is_not_counted(self, svc, db):
+        """A ready row is not held by anything."""
+        _batch(db, "b1", hold="hdencode")
+        _item(db, "b1", n=0)
+        _item(db, "b1", n=1, state="ready", reason="user_batch")
+        assert svc.active_verification_holds()[0]["affected"] == 1
+
+    def test_a_marker_with_NOTHING_behind_it_is_still_reported(self, svc, db):
+        """Deliberate. cancel_item()/cancel_batch() do not clear the marker, so
+        it can outlive its rows. Hiding a zero-affected hold would make a sticky
+        marker invisible while it silently blocks future work -- the card says
+        so instead, and offers the release."""
+        _batch(db, "b1", hold="hdencode")
+        holds = svc.active_verification_holds()
+        assert len(holds) == 1
+        assert holds[0]["affected"] == 0
+        assert holds[0]["item_uuids"] == []
+
+    def test_the_held_uuids_are_returned_so_the_UI_need_not_guess(self, svc, db):
+        """MEDIUM 2's fix depends on this: the UI must partition by the
+        BACKEND's verdict, not re-derive it from state and source."""
+        _batch(db, "b1", hold="hdencode")
+        _item(db, "b1", n=0)
+        _item(db, "b1", n=1)
+        h = svc.active_verification_holds()[0]
+        assert sorted(h["item_uuids"]) == ["i-b1-0", "i-b1-1"]
+
+    def test_a_trigger_needs_BOTH_facts(self, svc, db):
+        """verification_required alone is not proof of being the trigger; the
+        queue_reason has to say interactive_challenge too."""
+        _batch(db, "b1", hold="hdencode")
+        _item(db, "b1", n=0, state="verification_required",
+              reason="interactive_challenge")
+        _item(db, "b1", n=1, state="verification_required",
+              reason="source_deferred")
+        assert svc.active_verification_holds()[0]["triggers"] == 1
