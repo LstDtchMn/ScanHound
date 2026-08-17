@@ -253,7 +253,39 @@ def list_download_retries(
     if queue is None:
         raise HTTPException(status_code=503, detail="Download queue not available")
     items = queue.list_retries(limit=limit)
-    return {"items": items, "count": len(items), "status": queue.status()}
+    # Source-level holds travel BESIDE the items, not inferred from them. A hold
+    # is a property of the source, and deriving it from item state gets it wrong
+    # in both directions -- see active_verification_holds() for the specifics.
+    holds = queue.active_verification_holds()
+
+    # EACH ITEM CARRIES ITS OWN VERDICT. The UI must be able to show a held row
+    # under its source's card while leaving unrelated retries visible, and it
+    # must not re-derive "is this held?" from state and source in Svelte -- that
+    # would recreate the drift this surface exists to remove. One classification,
+    # computed once, by the layer that owns the policy.
+    held_by_uuid = {}
+    for h in holds:
+        for uuid_ in h.get("item_uuids") or []:
+            held_by_uuid[uuid_] = h["source"]
+    for item in items:
+        source = held_by_uuid.get(item.get("item_uuid"))
+        item["verification_held"] = source is not None
+        item["verification_hold_source"] = source
+
+    # HOW MANY OF THE HELD ROWS ARE ACTUALLY ON THIS PAGE.
+    #
+    # active_verification_holds() counts every effectively-held row for the
+    # source; list_retries() is capped by `limit`. Above the cap the card would
+    # promise "400 requests paused", the operator would expand it, and fewer
+    # would render -- a UI that overstates what it can show, which is the same
+    # class of defect as the timestamp that implied a retry would happen.
+    # Latent at today's 40; deterministic once the queue crosses the limit.
+    returned = {i.get("item_uuid") for i in items}
+    for h in holds:
+        h["shown"] = sum(1 for u in (h.get("item_uuids") or []) if u in returned)
+
+    return {"items": items, "count": len(items), "status": queue.status(),
+            "holds": holds}
 
 
 @router.post("/retries/retry-ready")

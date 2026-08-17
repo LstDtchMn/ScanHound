@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, PlexMetadataScanStatus, MediaInventoryResponse, MediaInventoryFacets, MetadataScanRun, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, DownloadQueueItem, BrowserStatus, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, TrashDeleteResponse, TrashEmptyResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, PlexMetadataScanStatus, MediaInventoryResponse, MediaInventoryFacets, MetadataScanRun, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, DownloadQueueItem, BrowserStatus, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, TrashDeleteResponse, TrashEmptyResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult, VerificationHold } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -341,7 +341,8 @@ export const api = {
     }),
   browserStatus: () => request<BrowserStatus>('/download/browser-status'),
   downloadRetries: (limit = 250) =>
-    request<{ items: DownloadQueueItem[]; count: number; status: Record<string, unknown> }>(`/download/retries?limit=${limit}`),
+    request<{ items: DownloadQueueItem[]; count: number; status: Record<string, unknown>;
+             holds?: VerificationHold[] }>(`/download/retries?limit=${limit}`),
   retryDownloadItem: (itemUuid: string) =>
     request<DownloadQueueItem>(`/download/retries/${encodeURIComponent(itemUuid)}/retry`, { method: 'POST' }),
   retryReadyDownloads: (intervalMinutes = 10) =>
@@ -403,6 +404,17 @@ export const api = {
     request<DownloadResult[]>(`/download/results?limit=${limit}`),
   clearDownloadResults: () =>
     request<{ status: string }>('/download/results', { method: 'DELETE' }),
+  /** Release a source-level verification hold.
+   *
+   *  Takes the source rather than assuming one: the hold marker names its own
+   *  source, and a hold can be armed for any of them. */
+  clearVerificationHold: (source: string) =>
+    request<{ source: string; cleared: number; remaining_triggers: number;
+              next_action: string }>(
+      '/download/verification-hold/clear',
+      { method: 'POST', body: JSON.stringify({ source }) }
+    ),
+
   removeDownloadResult: (id: number) =>
     request<{ ok: boolean; removed: number }>('/download/results/remove', {
       method: 'POST',

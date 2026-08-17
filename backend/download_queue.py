@@ -2696,6 +2696,133 @@ class DownloadQueueService:
             automated=False,
         )
 
+    def _rows_held_by_verification(self, source: str):
+        """Which rows is the verification hold ACTUALLY stopping?
+
+        Asks decide() rather than re-encoding its precedence in SQL. decide()
+        deliberately ranks SAFETY_HOLD (an unknown execution outcome, which must
+        never be auto-retried) and UNOWNED_REASON above the verification hold, so
+        "deferred row on a held source" and "row the hold is blocking" are
+        different sets. Counting the first and calling it the second is exactly
+        the inference error this whole surface exists to remove -- PR #84 made it
+        from item state; doing it again in SQL would just move it.
+
+        Every shared fact except the hold is left neutral on purpose: the
+        verification branch returns BEFORE configuration, budget and clocks are
+        consulted, so those values cannot change this verdict. If that ordering
+        ever changes, the precedence tests fail rather than the count quietly
+        drifting.
+
+        Returns (held_item_uuids, trigger_count, earliest_cooldown).
+        """
+        from backend.queue_recovery_policy import (
+            ItemFacts, SharedFacts, VERIFICATION_HOLD, decide,
+        )
+        rows = self.db._query_dicts(
+            "SELECT item_uuid, state, cooldown_until, queue_reason, "
+            "       COALESCE(last_reason_code, '') AS last_reason_code "
+            "FROM download_queue_items WHERE source = ? "
+            "ORDER BY sequence_number", (source,), default=[])
+        now = _utcnow()
+        shared = SharedFacts(cooldown_until=None, auto_resume_enabled=True,
+                             attempts_used=0, verification_hold=True)
+        held, triggers, earliest = [], 0, None
+        for r in rows:
+            facts = ItemFacts(state=str(r.get("state") or ""),
+                              cooldown_until=_parse(r.get("cooldown_until")),
+                              queue_reason=str(r.get("queue_reason") or ""),
+                              last_reason_code=str(r.get("last_reason_code") or ""))
+            if decide(facts, shared, now=now) != VERIFICATION_HOLD:
+                continue
+            held.append(str(r.get("item_uuid")))
+            # A TRIGGER IS BOTH FACTS, not the state alone: a row can sit in
+            # verification_required for a reason automatic recovery does not own.
+            if (facts.state == "verification_required"
+                    and facts.queue_reason == "interactive_challenge"):
+                triggers += 1
+            cd = r.get("cooldown_until")
+            if cd and (earliest is None or str(cd) < str(earliest)):
+                earliest = cd
+        return held, triggers, earliest
+
+    def active_verification_holds(self) -> list:
+        """The source-level holds, as a condition rather than 39 identical rows.
+
+        WHY THIS EXISTS. A single interactive challenge arms a SOURCE-SCOPED
+        hold, and every deferred row for that source whose EFFECTIVE policy
+        verdict is VERIFICATION_HOLD is then stopped by it -- decide() returns
+        that verdict *before* it looks at auto-resume, the retry budget, the
+        shared cooldown or the item cooldown. (Not every deferred row: an
+        unknown outcome or an unowned reason outranks the hold. That is what
+        _rows_held_by_verification exists to measure.)
+        So those rows will NOT resume when their displayed "Retry after" time
+        passes, and the UI showing that timestamp on each of them is actively
+        misleading: it names a deadline that has no bearing on the outcome.
+
+        On 2026-08-16 that produced 39 cards that each looked like an
+        independently stuck download, when the truth was one condition affecting
+        one source.
+
+        THE BUG THIS AVOIDS. The obvious shortcut is to infer the hold from
+        `state = 'verification_required'` rows, which is what the open PR #84
+        does. That is not the same fact:
+
+          * the triggering item can be removed or completed while
+            verification_hold_source stays armed -- the hold survives and the
+            only escape hatch vanishes from the UI. Today ONE row holds 39, so
+            that is a single click away from happening;
+          * a triggering row can still read verification_required after the
+            hold was cleared, showing a button that does nothing;
+          * it cannot name WHICH source is held, so any action built on it has
+            to hard-code one.
+
+        The marker is the marker. Read it directly.
+        """
+        if self.db is None:
+            return []
+        try:
+            rows = self.db._query_dicts(
+                "SELECT verification_hold_source AS source, "
+                "       COUNT(*) AS holding_batches "
+                "FROM download_queue_batches "
+                "WHERE verification_hold_source IS NOT NULL "
+                "  AND verification_hold_source <> '' "
+                "GROUP BY verification_hold_source", (), default=[])
+        except Exception:  # noqa: BLE001
+            logger.exception("could not read verification holds")
+            return []
+
+        out = []
+        for row in rows:
+            source = str(row.get("source") or "")
+            if not source:
+                continue
+            held_uuids, triggers, earliest = self._rows_held_by_verification(source)
+            out.append({
+                "source": source,
+                "holding_batches": int(row.get("holding_batches") or 0),
+                # THE EFFECTIVE COUNT, not "rows in a deferred state". decide()
+                # gives SAFETY_HOLD (unknown outcome) and UNOWNED_REASON
+                # precedence OVER the verification hold, so a held source can
+                # contain deferred rows this hold is not what is stopping. The
+                # card says "N requests paused"; naming a row the hold does not
+                # actually block makes that a false statement, which is the same
+                # class of error as PR #84 inferring the hold from item state.
+                "affected": len(held_uuids),
+                "item_uuids": held_uuids,
+                "triggers": triggers,
+                # Reported so the UI can say the cooldown is IRRELEVANT, rather
+                # than silently omitting it and leaving the old card's "Retry
+                # after" as the only timestamp anyone sees.
+                "cooldown_until": earliest,
+                # The single most important field: this is what the old UI got
+                # wrong by implying a timer would fix it.
+                "clears_on_timer": False,
+                "clears_when": ("a probe actually succeeds in revealing links "
+                                "from this source"),
+            })
+        return out
+
     def clear_verification_hold(self, source: str = "hdencode") -> dict:
         """Operator action: abandon an open verification hold for a source.
 

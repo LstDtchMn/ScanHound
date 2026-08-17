@@ -182,7 +182,40 @@ export interface BrowserStatus {
   detected_browser_major?: number | null;
 }
 
+/** A SOURCE-LEVEL verification hold.
+ *
+ *  Reported beside the items, never inferred from them. The hold lives on the
+ *  source, so deriving it from `state === 'verification_required'` rows is a
+ *  different fact and wrong in both directions: the trigger row can be removed
+ *  while the hold stays armed (on 2026-08-16 ONE row held 40), and a trigger row
+ *  can outlive a cleared hold. */
+export interface VerificationHold {
+  source: string;
+  /** Queue rows this hold is stopping, across ALL batches for the source. */
+  affected: number;
+  /** How many actually met the challenge. Usually 1. */
+  triggers: number;
+  /** Reported so the UI can CONTRADICT it. Item cards show their own
+   *  "Retry after" time, and while a hold is armed that time means nothing. */
+  cooldown_until: string | null;
+  /** Always false. Named explicitly because the whole defect was a UI implying
+   *  a timer would fix this. */
+  clears_on_timer: boolean;
+  clears_when: string;
+  /** How many of `affected` are present in this response. The retries list is
+   *  capped, so above the cap the UI must not promise rows it cannot render. */
+  shown?: number;
+  holding_batches: number;
+}
+
 export interface DownloadQueueItem {
+  /** Set by the BACKEND, never derived here. True when this row's effective
+   *  recovery decision is VERIFICATION_HOLD -- which is NOT the same as "its
+   *  source has a hold armed": decide() ranks SAFETY_HOLD and UNOWNED_REASON
+   *  above it, so a deferred row on a held source may be stopped by something
+   *  else entirely. */
+  verification_held?: boolean;
+  verification_hold_source?: string | null;
   item_uuid: string;
   batch_uuid: string;
   sequence_number: number;
