@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { normalizeTitle, resRank, groupDownloads, isActive } from './dupes';
+import { normalizeTitle, resRank, groupDownloads, isActive, seasonKey } from './dupes';
 import type { DownloadResult } from '$lib/api/types';
 
 function r(over: Partial<DownloadResult>): DownloadResult {
@@ -32,6 +32,97 @@ describe('resRank', () => {
   it('ranks 4K > 1080p > 720p > other', () => {
     expect(resRank('Foo [4K]')).toBeGreaterThan(resRank('Foo [1080p]'));
     expect(resRank('Foo [1080p]')).toBeGreaterThan(resRank('Foo [720p]'));
+  });
+});
+
+describe('seasonKey', () => {
+  it('parses the form the real data actually uses', () => {
+    // 61 of 361 live rows carry this; none carried S01E02, 1x02 or "Season N"
+    // at the time of the fix, but the latter is common enough to match.
+    expect(seasonKey('The Repair Shop (2017) S02 [1080p]')).toBe('S02');
+    expect(seasonKey('Breaking Bad (2008) S1 [4K]')).toBe('S01'); // padded
+    expect(seasonKey('Some Show S03E07 [1080p]')).toBe('S03E07');
+    expect(seasonKey('Some Show Season 4 [1080p]')).toBe('S04');
+  });
+
+  it('is empty for a movie, so movies keep grouping on title alone', () => {
+    expect(seasonKey('Notting Hill (1999) [4K]')).toBe('');
+    expect(seasonKey('Law & Order; LA (2010) [1080p]')).toBe('');
+  });
+
+  it('does not mistake ordinary title text for a season marker', () => {
+    // A bare S needs digits immediately after it. These must not parse.
+    expect(seasonKey('Se7en (1995) [4K]')).toBe('');
+    expect(seasonKey('S.W.A.T. (2003) [1080p]')).toBe('');
+  });
+});
+
+describe('groupDownloads — seasons are not duplicates', () => {
+  // The reported bug: "10 duplicates — The Repair Shop [1080p]" over six
+  // distinct seasons. `title` has the season STRIPPED server-side, so grouping
+  // on title alone collapsed them and offered to cancel all but one — which
+  // would have discarded entire seasons the user deliberately queued.
+  const repairShop = (season: string, id: number) =>
+    r({ id, title: 'The Repair Shop [1080p]',
+        name: `The Repair Shop (2017) ${season} [1080p]`, state: 'queued' });
+
+  it('does NOT flag different seasons of one show as duplicates', () => {
+    const groups = groupDownloads([
+      repairShop('S02', 1), repairShop('S04', 2), repairShop('S07', 3)
+    ]);
+    expect(groups).toHaveLength(3);
+    expect(groups.every((g) => !g.isDuplicate)).toBe(true);
+    expect(groups.every((g) => !g.canKeepBest)).toBe(true);
+  });
+
+  it('DOES still flag two releases of the SAME season', () => {
+    // The case the feature exists for. Splitting by season must not break it.
+    const groups = groupDownloads([
+      repairShop('S02', 1),
+      r({ id: 2, title: 'The Repair Shop [1080p]',
+          name: 'The Repair Shop (2017) S02 [1080p]', state: 'queued', bytes_total: 999 })
+    ]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].isDuplicate).toBe(true);
+    expect(groups[0].canKeepBest).toBe(true);
+    expect(groups[0].best.id).toBe(2); // larger of the two
+  });
+
+  it('leaves movies grouping on title alone', () => {
+    // Negative control: no season marker anywhere, so behaviour is unchanged
+    // from before the fix.
+    const groups = groupDownloads([
+      r({ id: 1, title: 'Notting Hill [4K]', name: 'Notting Hill (1999) [4K]', state: 'extracted' }),
+      r({ id: 2, title: 'Notting Hill [4K]', name: 'Notting Hill (1999) [4K]', state: 'extracted' })
+    ]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].isDuplicate).toBe(true);
+  });
+
+  it('names the season in the heading so split cards are distinguishable', () => {
+    // Once seasons are separate groups they would otherwise all render as
+    // "The Repair Shop [1080p]" with nothing to tell them apart.
+    const groups = groupDownloads([repairShop('S02', 1), repairShop('S11', 2)]);
+    expect(groups.map((g) => g.title).sort()).toEqual([
+      'The Repair Shop [1080p] · S02',
+      'The Repair Shop [1080p] · S11'
+    ]);
+  });
+
+  it('does not put a season suffix on a movie heading', () => {
+    const groups = groupDownloads([
+      r({ id: 1, title: 'Notting Hill [4K]', name: 'Notting Hill (1999) [4K]' })
+    ]);
+    expect(groups[0].title).toBe('Notting Hill [4K]');
+  });
+
+  it('keeps two different shows apart even at the same season number', () => {
+    const groups = groupDownloads([
+      r({ id: 1, title: 'Workaholics [1080p]', name: 'Workaholics (2011) S02 [1080p]' }),
+      r({ id: 2, title: 'Wellington Paranormal [1080p]', name: 'Wellington Paranormal (2018) S02 [1080p]' })
+    ]);
+    expect(groups).toHaveLength(2);
+    expect(groups.every((g) => !g.isDuplicate)).toBe(true);
   });
 });
 
