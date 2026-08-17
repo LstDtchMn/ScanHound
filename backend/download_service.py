@@ -1187,11 +1187,26 @@ class DownloadService:
         with self._epoch_lock():
             return getattr(self, "_results_epoch", 0)
 
+    def _bump_epoch_locked(self) -> int:
+        """Advance the epoch for a caller ALREADY inside _results_state().
+
+        Exists so the removal paths do not each open-code the increment.
+        `_epoch_lock()` is a plain Lock, not an RLock, so a caller holding it
+        must NOT reach for _bump_epoch() — that deadlocks. Naming the two
+        variants apart makes the safe choice the visible one, which matters
+        because the unsafe one is the shorter name (peer review 2026-08-17).
+        """
+        self._results_epoch = getattr(self, "_results_epoch", 0) + 1
+        return self._results_epoch
+
     def _bump_epoch(self) -> int:
-        """A local removal happened; any snapshot older than this is stale."""
+        """A local removal happened; any snapshot older than this is stale.
+
+        For callers NOT already holding the lock. Inside _results_state(), use
+        _bump_epoch_locked().
+        """
         with self._epoch_lock():
-            self._results_epoch = getattr(self, "_results_epoch", 0) + 1
-            return self._results_epoch
+            return self._bump_epoch_locked()
 
     @contextlib.contextmanager
     def _results_state(self):
@@ -1251,23 +1266,47 @@ class DownloadService:
             except Exception as e:
                 logger.warning("remove_package JD step failed for id %s (uuid %s): %s", id_, uuid, e)
                 self._invalidate_jd_cache()
+        # ONE CRITICAL SECTION, matching remove_packages exactly. Delete, cache
+        # eviction and the epoch advance happen together, so a concurrent poll
+        # either persists BEFORE all of it (and the delete removes what it
+        # wrote) or arrives afterwards, sees a stale epoch, and declines.
+        #
+        # This path previously did the delete and eviction with NO lock and NO
+        # epoch advance, so it kept the exact race the bulk path was fixed for:
+        # a poll whose snapshot predates the delete writes the row straight back
+        # and the user watches a removed download reappear. Evicting the caches
+        # alone does not close it — eviction only stops the unchanged-state SKIP
+        # branch; a poll already holding a pre-delete snapshot still persists it.
+        #
+        # The JD network call above stays OUTSIDE this block on purpose: a
+        # wedged JDownloader must never hold the lock the poller needs.
         removed = 0
-        try:
-            removed = self.db.delete_download_result(id_) if self.db else 0
-        except Exception as e:
-            logger.warning("remove_package DB delete failed for id %s: %s", id_, e)
-        # Evict this package from the poller's in-memory caches (keyed by
-        # cache_key = package_uuid or name — pop both, since a legacy row may
-        # be name-keyed). Without this, an unchanged package still present in
-        # JD (e.g. the JD-side removal above failed) hits poll_results()'s
-        # unchanged-state skip branch on the next poll and re-emits the id we
-        # just deleted from the DB (ghost-id resurrection). Evicting forces
-        # that poll to treat it as a fresh row instead.
-        for key in (uuid, name):
-            if key:
-                self._results_cache.pop(key, None)
-                self._uuid_id.pop(key, None)
-                self._best_titles.pop(key, None)
+        with self._results_state():
+            try:
+                removed = self.db.delete_download_result(id_) if self.db else 0
+            except Exception as e:
+                logger.warning("remove_package DB delete failed for id %s: %s", id_, e)
+            # Keyed by cache_key = package_uuid or name — pop both, since a
+            # legacy row may be name-keyed. Without this, an unchanged package
+            # still present in JD (e.g. the JD-side removal above failed) hits
+            # poll_results()'s unchanged-state skip branch on the next poll and
+            # re-emits the id we just deleted (ghost-id resurrection).
+            for key in (uuid, name):
+                if key:
+                    self._results_cache.pop(key, None)
+                    self._uuid_id.pop(key, None)
+                    self._best_titles.pop(key, None)
+            # _bump_epoch_LOCKED — we already hold the lock, and _epoch_lock()
+            # is a plain Lock, so _bump_epoch() here would deadlock.
+            #
+            # State the guarantee narrowly, because it is narrow: no poll whose
+            # snapshot was captured BEFORE this successful local deletion may
+            # persist that snapshot afterwards. It does NOT stop a later, fresh
+            # poll from recreating the row when JDownloader still holds the
+            # package — the JD-removal-failed case — and that is correct, since
+            # the package really is still there (peer review 2026-08-17).
+            if removed:
+                self._bump_epoch_locked()
         return {"ok": True, "removed": removed}
 
     def remove_packages(self, ids) -> dict:
@@ -1387,7 +1426,7 @@ class DownloadService:
                         self._uuid_id.pop(key, None)
                         self._best_titles.pop(key, None)
             if removed:
-                self._results_epoch = getattr(self, "_results_epoch", 0) + 1
+                self._bump_epoch_locked()
         return {
             "ok": jd_removed and not errors,
             "removed": removed,
