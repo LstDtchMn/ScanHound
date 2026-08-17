@@ -57,6 +57,23 @@ $port = (Select-String -LiteralPath $composePath -Pattern '9721:9721' -AllMatche
 if ($port -lt 1) { Bad 'compose is missing the 127.0.0.1:9721 binding BEFORE we start. Stopping.'; return }
 Good 'compose has its required local modifications'
 
+# A DIRTY TREE IS THE MOST LIKELY REASON THIS SCRIPT STOPS.
+# `git checkout main` refuses when uncommitted edits would be overwritten, and
+# it fails QUIETLY -- the script's own branch check caught it on the first run,
+# but the message ("could not switch") did not say why. docker-compose.yml is
+# expected to be modified and is excluded; anything else has to be dealt with
+# before a merge can start.
+$dirty = (git status --porcelain --untracked-files=no) |
+         Where-Object { $_ -and ($_ -notmatch 'docker-compose\.yml') }
+if ($dirty) {
+    Bad 'Uncommitted changes would block the merge:'
+    $dirty | ForEach-Object { Say "        $_" }
+    Warn 'Commit or stash them first, then re-run. Do NOT `git stash` blindly --'
+    Warn 'it swallowed the compose file once today. Tell Claude instead.'
+    return
+}
+Good 'working tree clean (compose modifications excluded, as expected)'
+
 # ------------------------------------------------------------------- merge ---
 Head 'Step 1 of 6  -  Merge the reviewed work into main'
 Say '  feat/bulk-clear-download-results contains BOTH approved branches (14 commits).'
