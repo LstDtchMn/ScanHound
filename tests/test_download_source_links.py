@@ -260,10 +260,26 @@ class TestSemanticIdentity:
         assert rows[0]["identity_kind"] == "unknown"
         assert rows[0]["identity_title"] is None
 
+    #: Named here rather than imported from UNPROVEN ON PURPOSE. Asserting
+    #: `set(UNPROVEN) <= set(row)` compares production against itself: deleting
+    #: a key from UNPROVEN deletes it from BOTH sides and the assertion still
+    #: passes while that key silently vanishes from the wire. Verified -- with
+    #: `identity_year` removed from UNPROVEN the old form stayed green at 20/20.
+    #: This list is the contract; it has to be written down independently.
+    WIRE_KEYS = frozenset({
+        "source_url", "first_seen_at", "identity_kind", "identity_title",
+        "identity_year", "identity_season", "identity_source",
+    })
+
+    def test_the_declared_wire_keys_match_what_production_defaults(self):
+        """The two lists must agree, checked in BOTH directions so neither a
+        forgotten key nor a stale one can hide."""
+        from backend.download_links import UNPROVEN
+        assert set(UNPROVEN) == self.WIRE_KEYS
+
     def test_every_row_carries_the_full_shape_even_when_unproven(self, db):
         """The flicker defect this module exists to prevent was a row shape that
         differed between transports. Identity must not reintroduce it."""
-        from backend.download_links import UNPROVEN
         db.add_to_history(A, "The Repair Shop", season=2, year=2017)
         rows = [{"name": "proven", "provenance_url": A},
                 {"name": "not proven", "provenance_url": None}]
@@ -271,7 +287,54 @@ class TestSemanticIdentity:
         annotate_source_links(db, rows)
 
         for row in rows:
-            assert set(UNPROVEN) <= set(row)
+            missing = self.WIRE_KEYS - set(row)
+            assert not missing, f"keys never reached the wire: {missing}"
+
+    def test_a_placeholder_title_is_not_an_identity(self, db):
+        """`Untitled` is the POST route's default and `RSS Candidate` the RSS
+        path's. Both are stand-ins for "none recorded", and several unrelated
+        releases carry the same string -- so treating one as a title hands a
+        whole set of unrelated packages ONE identical identity, which is worse
+        than no title because it looks answered."""
+        b = "https://source.example/release-B"
+        db.add_to_history(A, "Untitled", year=2020)
+        db.add_to_history(b, "RSS Candidate", year=2021)
+        rows = [{"name": "x", "provenance_url": A}, {"name": "y", "provenance_url": b}]
+
+        annotate_source_links(db, rows)
+
+        for row in rows:
+            assert row["identity_kind"] == "unknown"
+            assert row["identity_title"] is None
+            assert row["identity_source"] == "unknown"
+
+    def test_a_real_title_that_merely_contains_a_placeholder_word_is_fine(self, db):
+        """The guard matches the WHOLE title, not a substring -- `Untitled` must
+        not disqualify a real film whose name happens to include the word."""
+        db.add_to_history(A, "The Untitled Star Wars Project", year=2020)
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "movie"
+        assert rows[0]["identity_title"] == "The Untitled Star Wars Project"
+
+    def test_the_RSS_path_url_shape_fails_CLOSED(self, db):
+        """The known coverage gap, pinned as a test so it is a documented
+        behaviour rather than a surprise. The RSS action path records provenance
+        under the canonical release url but writes history under each file-host
+        LINK, so the two never meet. That must yield UNKNOWN -- never a
+        confident wrong identity -- and must still render the source link."""
+        canonical = "https://hdencode.org/some-show-s03-1080p/"
+        db.add_to_history("https://rapidgator.net/file/abc", "Some Show",
+                          season=3, year=2019)
+        rows = [{"name": "Some Show (2019) S03 [1080p]", "provenance_url": canonical}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["source_url"] == canonical   # the link still resolves
+        assert rows[0]["identity_kind"] == "unknown"
+        assert rows[0]["identity_season"] is None
 
 
 class TestIdentityReachesTheConsumer:

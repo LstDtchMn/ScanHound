@@ -41,6 +41,19 @@ UNPROVEN = {
     "identity_source": "unknown",
 }
 
+#: Titles that are a stand-in for "we did not record one", casefolded. They are
+#: NOT identities: several unrelated releases carry the same string, so treating
+#: them as real would hand a whole set of unrelated packages one identical
+#: identity -- exactly the collision this module exists to prevent, and worse
+#: than an absent title because it looks answered.
+#:
+#: Both are live defaults, not hypotheticals: `DownloadRequest.title` defaults to
+#: "Untitled" (backend/api/routes/downloads.py) and the RSS action path falls
+#: back to "RSS Candidate" (backend/hdencode_action_service.py). Neither appears
+#: in the current `downloads` table -- this is a guard against the shape, not a
+#: fix for existing rows.
+_PLACEHOLDER_TITLES = frozenset({"untitled", "rss candidate"})
+
 
 def annotate_source_links(db, rows):
     """Add the source link and the SEMANTIC IDENTITY to each row, in place.
@@ -64,6 +77,21 @@ def annotate_source_links(db, rows):
     enforces, which is why a row we cannot look up stays `unknown` rather than
     defaulting to `movie` -- guessing "movie" would authorise cancelling one
     season against another.
+
+    KNOWN COVERAGE GAP, and it predates this function. Identity resolves only
+    when `provenance_url` matches a `downloads.url`. The RSS auto-grab path
+    records provenance under the canonical release url
+    (`hdencode_action_service.py` -> `record_submitted_links(canonical_url, ...)`)
+    but writes its history rows under EACH FILE-HOST LINK
+    (`for link in links: save_to_history(link, ...)`), so those two never meet
+    and such a row stays `unknown` forever. `first_seen_at` has been silently
+    absent for that path for the same reason since long before identity existed;
+    this simply inherits the join. Not fixed here because the fix belongs in how
+    that service records history, and changing which urls land in `downloads`
+    also changes `load_download_history()`, which suppresses re-grabs. All 31
+    provenance-carrying rows in the live table came through `download_item()`
+    and do join, so nothing is currently affected -- but a row from that path
+    would be, and it would fail CLOSED (unknown), not wrong.
 
     KNOWN LIMIT, stated rather than papered over. `movie` rests on that
     convention holding at INGEST: `download_item()` receives `season` from the
@@ -113,10 +141,12 @@ def annotate_source_links(db, rows):
             continue
         row["first_seen_at"] = rec.get("date_added")
         title = rec.get("title")
-        if not title:
+        if not title or str(title).strip().casefold() in _PLACEHOLDER_TITLES:
             # A row with no recorded title cannot identify anything, so it must
             # not claim a kind either -- "movie with no title" would group every
-            # such row together.
+            # such row together. A PLACEHOLDER is the same failure wearing a
+            # value: "Untitled" is not a title, and two rows carrying it are not
+            # the same release.
             continue
         season = rec.get("season")
         row["identity_title"] = title

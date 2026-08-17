@@ -651,9 +651,15 @@ def download_results(limit: int = 200, reg: ServiceRegistry = Depends(get_regist
     PROVENANCE -- its file-host links match links ScanHound recorded submitting
     (see download_links.annotate_source_links). All stay None/"unknown" for a
     package we cannot prove we sent, so the UI renders no link rather than a
-    confident wrong one, and withholds the destructive de-duplicate action
-    rather than acting on a guess. Enrichment failure must never take down the
-    live download list, which is this view's actual job.
+    confident wrong one. Enrichment failure must never take down the live
+    download list, which is this view's actual job.
+
+    NOTHING CONSUMES THE IDENTITY FIELDS YET. They are carried so the Downloads
+    page can stop deciding whether two rows are the same release by parsing the
+    JDownloader package name -- a string that provably cannot answer it, since
+    one name in the live table is recorded against 13 distinct seasons. The
+    frontend half is a separate change; until it lands these keys are inert, and
+    this docstring should not be read as describing behaviour the UI has.
     """
     if not reg.db:
         return []
