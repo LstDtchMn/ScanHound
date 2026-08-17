@@ -30,8 +30,71 @@ export function resRank(name: string): number {
   return 1;
 }
 
+/** Every season marker the name carries, in both spellings, scanned together.
+ *
+ *  Fresh literals on each call deliberately: a shared `/g` RegExp carries
+ *  `lastIndex`, and while `matchAll` clones rather than advancing it, a reader
+ *  should not have to know that to trust the token count. */
+function seasonTokens(n: string) {
+  return {
+    sxx: [...n.matchAll(/\bS(\d{1,2})(?:\s*E(\d{1,3}))?\b/gi)],
+    words: [...n.matchAll(/\bSeason\s*(\d{1,2})\b/gi)]
+  };
+}
+
+/** A continuation that introduces a SECOND unit right after a parsed token:
+ *  `S01-03`, `Season 1 & 2`, `S01 to 03`, `Season 1 / 2`, `S01+02`, `S01, 02`.
+ *
+ *  Not `/g` — `.test()` on a global RegExp advances `lastIndex` and would
+ *  alternate between true and false on identical input. */
+const CONTINUES_INTO_ANOTHER_UNIT = /^\s*(?:[-–—&+/,]|to\b)\s*(?:[SE]\s*)?\d/i;
+
+/** ScanHound's own canonical season suffix, which `compute_package_name()`
+ *  builds as `Title (YYYY) SNN [resolution]` — the season token last, before an
+ *  optional bracketed tag, and preceded by the year or a title word rather than
+ *  by a separator (so `Show 1 & S02` is not mistaken for it).
+ *
+ *  Anchored at the END on purpose. `S01-S03 [1080p]` cannot satisfy it (nothing
+ *  separates the range endpoint from the bracket the way the canonical form
+ *  does), and `Season 1 & 2 [1080p]` has no `SNN` there at all. */
+const CANONICAL_SEASON_SUFFIX =
+  /(?:^|[\w)\]])\s+S(\d{1,2})(?:E(\d{1,3}))?(?:\s*\[[^\]]*\])?\s*$/i;
+
+/** THE AUTHORIZATION PARSER. True only when the name is structurally ScanHound's
+ *  own single-season form, and therefore proves ONE content unit.
+ *
+ *  WHY THIS IS SEPARATE FROM `seasonKey`. The two callers want opposite things.
+ *  Grouping is a display decision and should read whatever it can — guessing
+ *  wrong there splits or merges a card. "Keep best" CANCELS the other rows, and
+ *  guessing wrong there destroys a season the owner queued. So this asks a
+ *  narrow positive question ("is this the shape we emit?") rather than
+ *  `seasonKey`'s permissive one ("can I find a season token anywhere?").
+ *
+ *  That direction matters more than any single separator. Enumerating range
+ *  spellings is an endless negative list — `-`, `&`, `to`, `/`, `+`, `,`, and
+ *  whatever a scene release invents next — and every one missed becomes a false
+ *  positive that authorises deletion. A narrow positive grammar fails closed on
+ *  syntax it has never seen (peer review 2026-08-17, round 3).
+ *
+ *  The cost is real and accepted: `Show Season 4 [1080p]` is a perfectly clear
+ *  single season, but it is not the form ScanHound emits, so it does not
+ *  authorise. It still GROUPS correctly — see `seasonKey`. */
+export function isCanonicalSeasonName(name: string): boolean {
+  const n = name || '';
+  if (!CANONICAL_SEASON_SUFFIX.test(n)) return false;
+  // The anchor alone would accept `Season 1 - S03 [1080p]`, whose suffix is a
+  // range endpoint. Exactly one token, in the one spelling we emit.
+  const { sxx, words } = seasonTokens(n);
+  return sxx.length === 1 && words.length === 0;
+}
+
 /** The season a package covers, parsed from the JD name — `''` when it carries
  *  no marker.
+ *
+ *  A GROUPING DISCRIMINATOR, NOT AN AUTHORIZATION. It decides which rows share
+ *  a card; `isCanonicalSeasonName` decides whether a destructive action may be
+ *  offered. Reading a positive result here as proof of identity is exactly the
+ *  bug that made `Season 1 & 2` cancellable against a real `S01`.
  *
  *  WHY THIS EXISTS. `title` is resolved server-side and has the season STRIPPED:
  *  every season of a show arrives as `'The Repair Shop [1080p]'`. Grouping on
@@ -59,31 +122,30 @@ export function resRank(name: string): number {
 export function seasonKey(name: string): string {
   const n = name || '';
 
-  // THE INVARIANT: return a positive identity only when the name proves exactly
-  // ONE content unit. A range or several markers cannot, and must not be
-  // reduced to the first token — "Show S01-S03" is not season 1 and
-  // "Show S01E01-E10" is not episode 1. Giving a whole-run package the same
-  // identity as a single season lets one be cancelled against the other.
+  // THE INVARIANT IT ACTUALLY HOLDS: return a key only when exactly one season
+  // marker is recognised and nothing adjacent reads as a range. That is a good
+  // grouping signal, NOT a proof of one content unit — an unrecognised spelling
+  // still yields a confident-looking key. Safety comes from
+  // `isCanonicalSeasonName`, which is why this may stay permissive.
   //
   // Both spellings are counted TOGETHER before anything is returned. Scanning
   // Sxx first and only falling back to "Season N" made "Season 1-S3" parse as
   // S03: the Sxx pass saw one marker with no range text after it and never
   // looked left at the "Season 1" (peer review 2026-08-17, round 2).
-  const sxx = [...n.matchAll(/\bS(\d{1,2})(?:\s*E(\d{1,3}))?\b/gi)];
-  const words = [...n.matchAll(/\bSeason\s*(\d{1,2})\b/gi)];
+  const { sxx, words } = seasonTokens(n);
   if (sxx.length + words.length !== 1) return '';
 
-  if (sxx.length === 1) {
-    const m = sxx[0];
-    // A trailing range the token count cannot see: "S01-03", "S01E01-E10".
-    if (/^\s*[-–—]\s*(?:[SE]\s*)?\d/i.test(n.slice((m.index ?? 0) + m[0].length))) return '';
-    const s = `S${m[1].padStart(2, '0')}`;
-    return m[2] ? `${s}E${m[2].padStart(2, '0')}` : s;
-  }
+  // A trailing range the token count cannot see, because the second endpoint
+  // carries no season syntax of its own: "S01-03", "Season 1 & 2", "S01 to 03".
+  const one = sxx.length === 1 ? sxx[0] : words[0];
+  const after = n.slice((one.index ?? 0) + one[0].length);
+  if (CONTINUES_INTO_ANOTHER_UNIT.test(after)) return '';
 
-  const w = words[0];
-  if (/^\s*[-–—]\s*\d/.test(n.slice((w.index ?? 0) + w[0].length))) return ''; // Season 1-3
-  return `S${w[1].padStart(2, '0')}`;
+  if (sxx.length === 1) {
+    const s = `S${one[1].padStart(2, '0')}`;
+    return one[2] ? `${s}E${one[2].padStart(2, '0')}` : s;
+  }
+  return `S${one[1].padStart(2, '0')}`;
 }
 
 /** States that count as "in flight" — not yet a finished/historical row. */
@@ -103,14 +165,21 @@ export interface DownloadGroup {
   isDuplicate: boolean;
   best: DownloadResult;
   canKeepBest: boolean;
-  /** Whether the name proved exactly one SEASON TOKEN — no more than that.
+  /** Whether EVERY row in the group carries ScanHound's own canonical season
+   *  suffix — no more than that.
    *
-   *  False when the names carry no season marker, or carry a range/multiple
-   *  markers. That is UNKNOWN IDENTITY — not proof of a movie, and not proof of
-   *  the same season. 300 of 361 live rows are in that state, including
-   *  fourteen identically-named `Law & Order; LA (2010) [1080p]` rows that may
-   *  well be different seasons. Display may still group them; a destructive
-   *  action may not act on them.
+   *  False when any name carries no season marker, a range, several markers, or
+   *  a spelling we do not emit (`Season 4`). That is UNKNOWN IDENTITY — not
+   *  proof of a movie, and not proof of the same season. 300 of 361 live rows
+   *  are in that state, including fourteen identically-named
+   *  `Law & Order; LA (2010) [1080p]` rows that may well be different seasons.
+   *  Display may still group them; a destructive action may not act on them.
+   *
+   *  EVERY row, not the first. `seasonKey` is permissive, so a canonical `S01`
+   *  and a non-canonical `Season 1 & 2` can legitimately share a card. Reading
+   *  the flag off `items[0]` would then make the answer depend on arrival
+   *  order, and half the time it would authorise cancelling the multi-season
+   *  package as though it were season 1 (peer review round 3).
    *
    *  DELIBERATELY NOT called "same content unit", because it is weaker than
    *  that and the weaker reading is the safe one to hold. `normalizeTitle`
@@ -166,7 +235,10 @@ export function groupDownloads(results: DownloadResult[]): DownloadGroup[] {
     const base = items[0].title || items[0].name;
     // Every item in a group shares the key, so it shares the season too.
     const season = seasonKey(items[0].name);
-    const identityKnown = season !== '';
+    // Deliberately NOT `season !== ''`. The key is a display discriminator and
+    // is permissive by design; authorization asks the narrow question of every
+    // row independently.
+    const identityKnown = items.every((r) => isCanonicalSeasonName(r.name));
     groups.push({
       key,
       title: season ? `${base} · ${season}` : base,
@@ -174,11 +246,15 @@ export function groupDownloads(results: DownloadResult[]): DownloadGroup[] {
       activeItems,
       isDuplicate: items.length > 1,
       best,
-      // FAIL CLOSED. "Keep best" cancels every other active row, so it must be
-      // offered only where the rows are provably the same content unit. An
-      // absent season marker is unknown identity, not evidence of a movie —
-      // two indistinguishable rows could be different seasons, and cancelling
-      // one would discard content the owner deliberately queued.
+      // FAIL CLOSED. "Keep best" cancels every other active row, so it is
+      // offered only where every name is ScanHound's canonical single-season
+      // form. That is NOT the same as "provably the same content unit" — a
+      // title+season match still cannot separate two TV remakes, as
+      // `identityKnown` documents. It is the strongest claim a display string
+      // supports, and everything weaker stays unknown: an absent, ranged, or
+      // unfamiliar marker is unknown identity, not evidence of a movie — two
+      // indistinguishable rows could be different seasons, and cancelling one
+      // would discard content the owner deliberately queued.
       //
       // This does currently withhold the button from genuine movie duplicates
       // too, because DownloadResult carries nothing that separates "known

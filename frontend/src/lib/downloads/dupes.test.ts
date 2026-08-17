@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { normalizeTitle, resRank, groupDownloads, isActive, seasonKey } from './dupes';
+import {
+  normalizeTitle, resRank, groupDownloads, isActive, seasonKey, isCanonicalSeasonName
+} from './dupes';
 import type { DownloadResult } from '$lib/api/types';
 
 function r(over: Partial<DownloadResult>): DownloadResult {
@@ -54,6 +56,86 @@ describe('seasonKey', () => {
     // A bare S needs digits immediately after it. These must not parse.
     expect(seasonKey('Se7en (1995) [4K]')).toBe('');
     expect(seasonKey('S.W.A.T. (2003) [1080p]')).toBe('');
+  });
+
+  it('rejects a range whose second endpoint carries no season syntax', () => {
+    // The token count cannot see these — only one marker is recognisable, so
+    // the adjacent text has to be read. Separators beyond the dash were the
+    // round-3 finding.
+    expect(seasonKey('Some Show Season 1 & 2 [1080p]')).toBe('');
+    expect(seasonKey('Some Show S01 & 02 [1080p]')).toBe('');
+    expect(seasonKey('Some Show Season 1 to 3 [1080p]')).toBe('');
+    expect(seasonKey('Some Show S01 to 03 [1080p]')).toBe('');
+    expect(seasonKey('Some Show Season 1 / 2 [1080p]')).toBe('');
+    expect(seasonKey('Some Show S01+02 [1080p]')).toBe('');
+    expect(seasonKey('Some Show S01, 02 [1080p]')).toBe('');
+    expect(seasonKey('Some Show S01-03 [1080p]')).toBe('');
+  });
+
+  it('does not read an ordinary word starting with "to" as a range', () => {
+    // `to\b` must not fire on "Tokyo". If it did, the separator list would be
+    // quietly eating real single-season names.
+    expect(seasonKey('Some Show S01 Tokyo Cut [1080p]')).toBe('S01');
+  });
+});
+
+describe('isCanonicalSeasonName — the authorization grammar', () => {
+  // seasonKey answers "can I find a season token?" and is allowed to be
+  // permissive because it only decides which card a row lands on. THIS answers
+  // "is this the shape ScanHound itself emits?", and it gates cancellation.
+  // Enumerating range spellings is an endless negative list; a narrow positive
+  // grammar fails closed on syntax nobody has seen yet (peer review round 3).
+
+  it('accepts the canonical form the backend builds', () => {
+    // compute_package_name(): "Title (YYYY) SNN [resolution]".
+    expect(isCanonicalSeasonName('The Repair Shop (2017) S02 [1080p]')).toBe(true);
+    expect(isCanonicalSeasonName('Breaking Bad (2008) S1 [4K]')).toBe(true);
+    expect(isCanonicalSeasonName('Some Show S03E07 [1080p]')).toBe(true);
+    expect(isCanonicalSeasonName('Some Show S04')).toBe(true); // resolution optional
+  });
+
+  it('rejects every range form, including ones seasonKey also catches', () => {
+    for (const n of [
+      'Some Show Season 1 & 2 [1080p]',
+      'Some Show S01 & 02 [1080p]',
+      'Some Show Season 1 to 3 [1080p]',
+      'Some Show S01 to 03 [1080p]',
+      'Some Show Season 1 / 2 [1080p]',
+      'Some Show S01+02 [1080p]',
+      'Some Show S01-03 [1080p]',
+      'Some Show S01-S03 [1080p]',
+      'Some Show S01 - S03 [1080p]',
+      'Some Show Season 1-S3 [1080p]'
+    ]) {
+      expect(isCanonicalSeasonName(n), n).toBe(false);
+    }
+  });
+
+  it('rejects a season token that is not where the canonical form puts it', () => {
+    // The anchor is the point: the token must be LAST, before an optional
+    // bracket. Anything structurally more complicated is unknown.
+    expect(isCanonicalSeasonName('Some Show S01 Extended Cut [1080p]')).toBe(false);
+    expect(isCanonicalSeasonName('Some Show (2017) S02 [1080p] (2)')).toBe(false);
+  });
+
+  it('rejects a token preceded by a separator rather than the title or year', () => {
+    // `1 & S02` ends in a legal-looking suffix and carries exactly one Sxx
+    // token, so neither the anchor nor the token count rejects it alone.
+    expect(isCanonicalSeasonName('Some Show 1 & S02 [1080p]')).toBe(false);
+    expect(isCanonicalSeasonName('Some Show 1 - S02 [1080p]')).toBe(false);
+  });
+
+  it('rejects a spelling ScanHound never emits, even when unambiguous', () => {
+    // The accepted cost of a narrow grammar. "Season 4" is one clear season,
+    // but it is not our form, so it groups without authorising.
+    expect(seasonKey('Some Show Season 4 [1080p]')).toBe('S04');
+    expect(isCanonicalSeasonName('Some Show Season 4 [1080p]')).toBe(false);
+  });
+
+  it('rejects a movie and junk input', () => {
+    expect(isCanonicalSeasonName('Notting Hill (1999) [4K]')).toBe(false);
+    expect(isCanonicalSeasonName('Se7en (1995) [4K]')).toBe(false);
+    expect(isCanonicalSeasonName('')).toBe(false);
   });
 });
 
@@ -141,6 +223,37 @@ describe('unknown identity must not authorise deletion', () => {
     expect(g.identityKnown).toBe(false);
     expect(g.canKeepBest).toBe(false); // the safety boundary
     expect(g.isDuplicate).toBe(true);  // still SHOWN as a possible duplicate
+  });
+
+  it('does NOT offer Keep best when a non-canonical row shares the card', () => {
+    // THE round-3 case. A multi-season pack and a real S01 can legitimately
+    // land on the same card, because seasonKey is permissive by design. What
+    // must not happen is the pack being cancelled as though it were season 1.
+    const g = groupDownloads([
+      r({ id: 1, title: 'Some Show [1080p]',
+          name: 'Some Show (2015) S01 [1080p]', state: 'queued' }),
+      r({ id: 2, title: 'Some Show [1080p]',
+          name: 'Some Show Season 1 & 2 [1080p]', state: 'queued',
+          bytes_total: 999 })
+    ]);
+    const withBoth = g.find((x) => x.items.length === 2);
+    if (withBoth) {
+      expect(withBoth.identityKnown).toBe(false);
+      expect(withBoth.canKeepBest).toBe(false);
+    }
+    // Whichever way they group, nothing in this set may be actionable.
+    expect(g.every((x) => !x.canKeepBest)).toBe(true);
+  });
+
+  it('judges identity per ROW, so arrival order cannot change the answer', () => {
+    // Reading identityKnown off items[0] would make this pass half the time.
+    const canonical = r({ id: 1, title: 'Some Show [1080p]',
+      name: 'Some Show (2015) S01 [1080p]', state: 'queued' });
+    const ranged = r({ id: 2, title: 'Some Show [1080p]',
+      name: 'Some Show Season 1 & 2 [1080p]', state: 'queued' });
+    for (const order of [[canonical, ranged], [ranged, canonical]]) {
+      expect(groupDownloads(order).every((x) => !x.canKeepBest)).toBe(true);
+    }
   });
 
   it('DOES offer Keep best when the season is known and matches', () => {
@@ -254,13 +367,14 @@ describe('groupDownloads', () => {
   });
 
   it('canKeepBest true only with >=2 active rows', () => {
-    // Names now carry S01 because Keep-best additionally requires a KNOWN
-    // identity — see the fail-closed block below. Without a season marker these
-    // rows are indistinguishable from two different seasons, and the button
-    // cancels the losers.
+    // Names carry the BRACKETED canonical form because Keep-best additionally
+    // requires a known identity — see the fail-closed block below. The brackets
+    // are not decoration: all 61 live rows with a season marker have them, and
+    // accepting a bare trailing token would make "Foo S01 02" canonical, which
+    // is the range bug this axis is not supposed to be testing.
     const g = groupDownloads([
-      r({ id: 1, title: 'Foo', name: 'Foo S01 2160p', state: 'downloading' }),
-      r({ id: 2, title: 'Foo', name: 'Foo S01 1080p', state: 'downloading' })
+      r({ id: 1, title: 'Foo', name: 'Foo S01 [2160p]', state: 'downloading' }),
+      r({ id: 2, title: 'Foo', name: 'Foo S01 [1080p]', state: 'downloading' })
     ])[0];
     expect(g.canKeepBest).toBe(true);
     expect(g.best.id).toBe(1);
