@@ -1,4 +1,6 @@
-"""Annotate live download rows with their source page and first-seen date.
+"""Annotate live download rows with their source page, first-seen date, and the
+semantic identity (movie/TV, title, year, season) recorded when they were
+grabbed.
 
 Both transports that carry download results to the UI must annotate, not just
 the REST one: the Downloads page replaces its whole list from the
@@ -24,24 +26,66 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def annotate_source_links(db, rows):
-    """Add `source_url` / `first_seen_at` to each row, in place.
+#: Every key this helper guarantees on a row, with its unproven value. Rows are
+#: initialised from this BEFORE any lookup, so a failure part-way through cannot
+#: leave some rows carrying identity keys and others not -- an inconsistent
+#: shape between the two transports is the exact defect this module exists to
+#: prevent, and identity is now load-bearing rather than decorative.
+UNPROVEN = {
+    "source_url": None,
+    "first_seen_at": None,
+    "identity_kind": "unknown",
+    "identity_title": None,
+    "identity_year": None,
+    "identity_season": None,
+    "identity_source": "unknown",
+}
 
-    Both keys are always set (to None when unproven) so consumers never have to
-    distinguish "not annotated yet" from "no match" -- an inconsistent shape
-    between the two transports is what produced the flicker this helper exists
-    to prevent.
+
+def annotate_source_links(db, rows):
+    """Add the source link and the SEMANTIC IDENTITY to each row, in place.
+
+    Every key in `UNPROVEN` is always set, so consumers never have to
+    distinguish "not annotated yet" from "no match".
+
+    WHAT IDENTITY IS FOR. The UI groups downloads to offer "keep the best copy,
+    cancel the rest", and until now it decided whether two rows were the same
+    thing by parsing their JDownloader package names. That string cannot carry
+    the answer: it is capped at 50 characters, and 17 live rows share a name
+    spanning several seasons -- `Law & Order: LA (2010) [1080p]` covers 13 of
+    them. Carrying what the grab actually recorded replaces a guess with a fact
+    for the rows that have it.
+
+    `identity_kind` is `tv_season` when a season was recorded and `movie` when
+    one was not. That is the discriminator the backend already uses on itself
+    (`save_to_history` keys its lookup on `season is not None`), and it holds in
+    the data: of 460 history rows with no season, none carry a season token in
+    their title or package name. It is a CONVENTION, not a constraint the schema
+    enforces, which is why a row we cannot look up stays `unknown` rather than
+    defaulting to `movie` -- guessing "movie" would authorise cancelling one
+    season against another.
+
+    KNOWN LIMIT, stated rather than papered over. `movie` rests on that
+    convention holding at INGEST: `download_item()` receives `season` from the
+    scraped listing, so a TV grab whose listing yielded no season would be
+    recorded with `season=None` and read back here as a movie. Two seasons of
+    such a show would then share one title+year identity. Nothing in the current
+    data is in that state, and no heuristic here can detect it -- the season is
+    absent from every column, not merely from the display name. The durable fix
+    is a recorded media type at ingest; until then a consumer that treats
+    `movie` as permission to cancel is trusting the ingest path, and should say
+    so where it makes that decision.
 
     Never raises: enrichment is decoration on a live progress list, and the
     caller's real job (showing downloads, driving the poller loop) must not fail
-    because a lookup did.
+    because a lookup did. A failure leaves every row `unknown`, which is the
+    fail-closed direction -- the UI withholds the destructive action.
     """
     rows = rows or []
     for row in rows:
         # Default to unproven, then upgrade. Set FIRST so an exception below
         # cannot leave some rows carrying the keys and others not.
-        row["source_url"] = None
-        row["first_seen_at"] = None
+        row.update(UNPROVEN)
     if db is None:
         return rows
     try:
@@ -52,7 +96,7 @@ def annotate_source_links(db, rows):
                 proven[str(url)] = True
         if not proven:
             return rows
-        dates = db.get_release_first_seen(list(proven)) or {}
+        found = db.get_release_identity(list(proven)) or {}
     except Exception:
         logger.exception("download results: source-link enrichment failed")
         return rows
@@ -62,7 +106,22 @@ def annotate_source_links(db, rows):
             continue
         row["source_url"] = str(url)
         # A proven url with no history row still gets its link: provenance is
-        # what authorises the link, and the date is separate information that
-        # may simply be absent.
-        row["first_seen_at"] = dates.get(str(url))
+        # what authorises the link, and the identity is separate information
+        # that may simply be absent.
+        rec = found.get(str(url))
+        if not rec:
+            continue
+        row["first_seen_at"] = rec.get("date_added")
+        title = rec.get("title")
+        if not title:
+            # A row with no recorded title cannot identify anything, so it must
+            # not claim a kind either -- "movie with no title" would group every
+            # such row together.
+            continue
+        season = rec.get("season")
+        row["identity_title"] = title
+        row["identity_year"] = rec.get("year")
+        row["identity_season"] = season
+        row["identity_kind"] = "movie" if season is None else "tv_season"
+        row["identity_source"] = "provenance"
     return rows

@@ -645,12 +645,15 @@ def jd_control(req: JdControlRequest, reg: ServiceRegistry = Depends(get_registr
 def download_results(limit: int = 200, reg: ServiceRegistry = Depends(get_registry)):
     """Persisted per-item download + extraction outcomes (polled from JDownloader).
 
-    Rows are annotated with `source_url` / `first_seen_at` where the package has
-    RECORDED PROVENANCE -- its file-host links match links ScanHound recorded
-    submitting (see download_links.annotate_source_links). Both stay None for a
+    Rows are annotated with `source_url` / `first_seen_at` and the SEMANTIC
+    IDENTITY (`identity_kind` / `identity_title` / `identity_year` /
+    `identity_season` / `identity_source`) where the package has RECORDED
+    PROVENANCE -- its file-host links match links ScanHound recorded submitting
+    (see download_links.annotate_source_links). All stay None/"unknown" for a
     package we cannot prove we sent, so the UI renders no link rather than a
-    confident wrong one. Enrichment failure must never
-    take down the live download list, which is this view's actual job.
+    confident wrong one, and withholds the destructive de-duplicate action
+    rather than acting on a guess. Enrichment failure must never take down the
+    live download list, which is this view's actual job.
     """
     if not reg.db:
         return []

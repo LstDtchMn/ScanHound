@@ -139,7 +139,7 @@ class TestAnnotationShape:
         """Decoration must never take down the live progress view, nor the
         poller loop that broadcasts it."""
         class Exploding:
-            def get_release_first_seen(self, urls):
+            def get_release_identity(self, urls):
                 raise RuntimeError("db is gone")
 
         rows = [{"name": "x", "state": "downloading", "provenance_url": A}]
@@ -149,6 +149,10 @@ class TestAnnotationShape:
         assert rows[0]["source_url"] is None
         assert rows[0]["first_seen_at"] is None
         assert rows[0]["state"] == "downloading"
+        # Fail CLOSED: a lookup failure must leave identity unknown, because
+        # unknown is what makes the UI withhold the destructive action.
+        assert rows[0]["identity_kind"] == "unknown"
+        assert rows[0]["identity_source"] == "unknown"
 
     def test_no_db_is_tolerated(self):
         rows = [{"name": "x", "provenance_url": A}]
@@ -159,3 +163,154 @@ class TestAnnotationShape:
         """Deleted rather than left unused: a name-based resolver sitting in the
         codebase is a loaded gun for the next caller who reaches for it."""
         assert not hasattr(db, "get_download_source_links")
+
+
+class TestSemanticIdentity:
+    """The identity carried on the wire, and why a name parser cannot replace it.
+
+    The Downloads page groups rows to offer "keep the best copy, cancel the
+    rest". Deciding whether two rows are the same thing by reading their
+    JDownloader package name is not a parser that needs improving -- it is
+    unanswerable from that string. Live data: `Law & Order: LA (2010) [1080p]`
+    is ONE package name recorded against 13 distinct seasons.
+    """
+
+    def test_a_tv_grab_carries_its_season(self, db):
+        db.add_to_history(A, "The Repair Shop", season=2, year=2017,
+                          package_name="The Repair Shop (2017) S02 [1080p]")
+        rows = [{"name": "whatever", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "tv_season"
+        assert rows[0]["identity_title"] == "The Repair Shop"
+        assert rows[0]["identity_year"] == 2017
+        assert rows[0]["identity_season"] == 2
+        assert rows[0]["identity_source"] == "provenance"
+
+    def test_a_movie_grab_reports_no_season(self, db):
+        """The positive control for `movie`. Without it, a bug that reported
+        everything as unknown would pass every fail-closed test here."""
+        db.add_to_history(A, "Notting Hill", year=1999,
+                          package_name="Notting Hill (1999) [4K]")
+        rows = [{"name": "whatever", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "movie"
+        assert rows[0]["identity_season"] is None
+        assert rows[0]["identity_year"] == 1999
+
+    def test_THE_case_a_name_parser_can_never_get_right(self, db):
+        """Two rows whose package names are character-for-character identical,
+        recorded against different seasons. This is live data, not a contrived
+        input: 17 rows sit behind such a name today.
+
+        Any parser reading the name must give these the same answer. The
+        recorded identity gives them different ones, which is the whole point of
+        putting it on the wire.
+        """
+        b = "https://source.example/release-B"
+        name = "Law & Order: LA (2010) [1080p]"
+        db.add_to_history(A, "Law & Order: LA", season=11, year=2010,
+                          package_name=name)
+        db.add_to_history(b, "Law & Order: LA", season=21, year=2010,
+                          package_name=name)
+        rows = [{"name": name, "provenance_url": A},
+                {"name": name, "provenance_url": b}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["name"] == rows[1]["name"]           # indistinguishable
+        assert rows[0]["identity_season"] == 11             # ...but not really
+        assert rows[1]["identity_season"] == 21
+
+    def test_an_unproven_row_gets_no_identity_at_all(self, db):
+        """Provenance is what authorises identity, exactly as it authorises the
+        link. A package added to JDownloader by hand must stay unknown."""
+        db.add_to_history(A, "The Repair Shop", season=2, year=2017,
+                          package_name="The Repair Shop (2017) S02 [1080p]")
+        rows = [{"name": "The Repair Shop (2017) S02 [1080p]",
+                 "provenance_url": None}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "unknown"
+        assert rows[0]["identity_season"] is None
+        assert rows[0]["identity_source"] == "unknown"
+
+    def test_a_proven_url_with_no_history_row_keeps_its_link_but_not_identity(self, db):
+        """The two answers are independent. Provenance proves the link; the
+        history row carries the identity, and it may simply be absent."""
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["source_url"] == A
+        assert rows[0]["identity_kind"] == "unknown"
+
+    def test_a_row_with_no_recorded_title_claims_no_kind(self, db):
+        """`movie` here would be worse than useless: every title-less row would
+        share an identity and group together."""
+        db.add_to_history(A, "", year=2001)
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "unknown"
+        assert rows[0]["identity_title"] is None
+
+    def test_every_row_carries_the_full_shape_even_when_unproven(self, db):
+        """The flicker defect this module exists to prevent was a row shape that
+        differed between transports. Identity must not reintroduce it."""
+        from backend.download_links import UNPROVEN
+        db.add_to_history(A, "The Repair Shop", season=2, year=2017)
+        rows = [{"name": "proven", "provenance_url": A},
+                {"name": "not proven", "provenance_url": None}]
+
+        annotate_source_links(db, rows)
+
+        for row in rows:
+            assert set(UNPROVEN) <= set(row)
+
+
+class TestIdentityReachesTheConsumer:
+    """The unit tests above hand-build their `rows`, so none of them can detect
+    that nothing in production PRODUCES those inputs.
+
+    This walks the real chain instead: the writer the poller calls, the reader
+    the REST route calls, and the annotator both transports share. If any link
+    stopped carrying `provenance_url`, every identity assertion elsewhere in
+    this file would still pass while the feature was dead on the wire.
+    """
+
+    def test_identity_survives_write_then_read_then_annotate(self, db):
+        db.add_to_history(A, "The Repair Shop", season=2, year=2017,
+                          package_name="The Repair Shop (2017) S02 [1080p]")
+        db.upsert_download_result(
+            name="The Repair Shop (2017) S02 [1080p]", package_uuid="uuid-1",
+            title="The Repair Shop", state="downloading",
+            provenance_url=A, provenance_observed=True)
+
+        # The exact call the /downloads/results route makes.
+        rows = annotate_source_links(db, db.get_download_results(limit=200))
+
+        assert len(rows) == 1, "the writer/reader pair produced no row"
+        assert rows[0]["provenance_url"] == A, "provenance did not survive the round trip"
+        assert rows[0]["identity_kind"] == "tv_season"
+        assert rows[0]["identity_season"] == 2
+        assert rows[0]["identity_source"] == "provenance"
+
+    def test_a_row_written_without_provenance_stays_unknown(self, db):
+        """The negative half of the same chain, so the test above cannot pass
+        merely because everything is labelled tv_season."""
+        db.add_to_history(A, "The Repair Shop", season=2, year=2017)
+        db.upsert_download_result(
+            name="hand added by the user", package_uuid="uuid-2",
+            state="downloading", provenance_url=None, provenance_observed=True)
+
+        rows = annotate_source_links(db, db.get_download_results(limit=200))
+
+        assert len(rows) == 1
+        assert rows[0]["identity_kind"] == "unknown"
+        assert rows[0]["identity_season"] is None

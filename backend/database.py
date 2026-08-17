@@ -4102,14 +4102,27 @@ class DatabaseManager:
                 return None   # ambiguous; no honest answer
         return next(iter(found)) if len(found) == 1 else None
 
-    def get_release_first_seen(self, urls):
-        """Map release url -> `date_added`, the first time that url entered
-        history.
+    def get_release_identity(self, urls):
+        """Map release url -> the SEMANTIC identity recorded when it was grabbed:
+        ``{"date_added", "title", "year", "season"}``.
 
-        NOT "first grabbed": download_item() writes a history row for FAILED
-        attempts too, so this can be the moment a grab was first tried rather
-        than the moment one succeeded. The UI labels it "first seen" for exactly
-        that reason (peer review Finding 2).
+        `date_added` is NOT "first grabbed": download_item() writes a history row
+        for FAILED attempts too, so this can be the moment a grab was first tried
+        rather than the moment one succeeded. The UI labels it "first seen" for
+        exactly that reason (peer review Finding 2).
+
+        WHY TITLE/YEAR/SEASON BELONG HERE RATHER THAN IN A NAME PARSER. These
+        columns are what the caller PASSED to download_item() from the scraped
+        listing, so they are the identity itself, not a reading of a display
+        string. The JDownloader package name cannot substitute for them: it is
+        capped at 50 characters, and 17 live rows carry a name that spans more
+        than one season -- `Law & Order: LA (2010) [1080p]` alone covers 13
+        distinct seasons (8, 9, and 11 through 21). No parser can recover a
+        season from a string that does not contain it.
+
+        Returns only urls that matched a row. A caller must treat a missing key
+        as UNKNOWN identity, never as "no season" -- the difference is what
+        stops a whole-series pack being cancelled against one season.
         """
         wanted = [str(u) for u in dict.fromkeys(urls or []) if u]
         if not wanted:
@@ -4118,11 +4131,16 @@ class DatabaseManager:
         for start in range(0, len(wanted), 300):
             chunk = wanted[start:start + 300]
             rows = self._query_dicts(
-                "SELECT url, date_added FROM downloads WHERE url IN (%s)"
-                % ",".join("?" * len(chunk)),
+                "SELECT url, date_added, title, year, season FROM downloads "
+                "WHERE url IN (%s)" % ",".join("?" * len(chunk)),
                 tuple(chunk), default=[]) or []
             for row in rows:
-                out[row["url"]] = row.get("date_added")
+                out[row["url"]] = {
+                    "date_added": row.get("date_added"),
+                    "title": row.get("title"),
+                    "year": row.get("year"),
+                    "season": row.get("season"),
+                }
         return out
 
     def get_download_result_id(self, package_uuid, name):

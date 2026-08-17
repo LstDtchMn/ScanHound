@@ -710,6 +710,21 @@ export interface DownloadResult {
   // longer provable" from "could not look", which is what decides whether a
   // stored association may be retracted. The UI has no use for it.
   provenance_observed?: boolean;
+  // THE SEMANTIC IDENTITY, carried on both transports. This is what the grab
+  // RECORDED, not a reading of `name` — and the two are not interchangeable.
+  // `name` is capped at 50 characters and 17 live rows share a name spanning
+  // several seasons (`Law & Order: LA (2010) [1080p]` covers 13 of them), so no
+  // parser can recover a season that the string does not contain.
+  //
+  // `unknown` means UNKNOWN, never "no season": it is what a row without
+  // recorded provenance gets, and what every row gets if the lookup fails. Code
+  // deciding whether two rows are the same thing must treat it as a refusal,
+  // because the action it gates cancels downloads.
+  identity_kind?: 'movie' | 'tv_season' | 'unknown';
+  identity_title?: string | null;
+  identity_year?: number | null;
+  identity_season?: number | null;
+  identity_source?: 'provenance' | 'unknown';
 }
 
 export interface TmdbSearchResult {
