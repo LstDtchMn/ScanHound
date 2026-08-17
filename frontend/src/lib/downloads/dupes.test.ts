@@ -140,6 +140,48 @@ describe('isCanonicalSeasonName — the authorization grammar', () => {
     // token, so neither the anchor nor the token count rejects it alone.
     expect(isCanonicalSeasonName('Some Show 1 & S02 [1080p]')).toBe(false);
     expect(isCanonicalSeasonName('Some Show 1 - S02 [1080p]')).toBe(false);
+    expect(isCanonicalSeasonName('Some Show 1 to S02 [1080p]')).toBe(false);
+    expect(isCanonicalSeasonName('Some Show 1, S02 [1080p]')).toBe(false);
+  });
+
+  it('accepts a title ending in punctuation even with no year', () => {
+    // The separator check is a DENYLIST for exactly this reason. An allowlist
+    // of preceding characters (`[\w)\]]`) rejected these, and compute_package_
+    // name really does emit them: a title ending in '!' or '?' with year=None
+    // puts that character immediately before the season token.
+    expect(isCanonicalSeasonName('Weird But True! S02 [1080p]')).toBe(true);
+    expect(isCanonicalSeasonName('Whose Line Is It Anyway? S05 [1080p]')).toBe(true);
+    expect(isCanonicalSeasonName('Malcolm in the Middle... S03')).toBe(true);
+    // The year form was never affected — ')' was in the old allowlist.
+    expect(isCanonicalSeasonName('Weird But True! (2017) S02 [1080p]')).toBe(true);
+  });
+
+  it('rejects a SECOND season token that the suffix alone cannot see', () => {
+    // THE test for the token-count guard, which the suffix tightening made
+    // look redundant. It is not: the character before ` S03` here is the digit
+    // '1', so the suffix matches and only the token count refuses.
+    // Deleting the guard passed the entire suite before this existed.
+    expect(/\sS(\d{2})(?:\s*\[[^\]]{0,40}\])?\s*$/i.test('Season 1 S03 [1080p]')).toBe(true);
+    expect(isCanonicalSeasonName('Season 1 S03 [1080p]')).toBe(false);
+    expect(isCanonicalSeasonName('Season 1 S03')).toBe(false);
+  });
+
+  it('does not backtrack quadratically on a hostile name', () => {
+    // `name` comes from JDownloader, not from us, and this runs per row on
+    // every render. An unbounded [^\]]* before an end anchor rescans to
+    // end-of-string from every candidate start: measured 4x per doubling
+    // (14 KB 13 ms -> 28 KB 53 ms -> 56 KB 206 ms) before the bound.
+    //
+    // A DELIBERATELY HUGE input against a DELIBERATELY LOOSE budget. A tight
+    // budget on a small input is a flaky test — wall-clock assertions drift
+    // under parallel suite load. At 1 MB the old behaviour extrapolates to
+    // well over a minute while the windowed version is a slice plus one short
+    // match, so the two are separated by orders of magnitude and no plausible
+    // machine load can blur them.
+    const hostile = 'a S01 ['.repeat(150000); // ~1 MB
+    const started = performance.now();
+    expect(isCanonicalSeasonName(hostile)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(2000);
   });
 
   it('rejects a spelling ScanHound never emits, even when unambiguous', () => {
@@ -242,34 +284,65 @@ describe('unknown identity must not authorise deletion', () => {
     expect(g.isDuplicate).toBe(true);  // still SHOWN as a possible duplicate
   });
 
-  it('does NOT offer Keep best when a non-canonical row shares the card', () => {
-    // THE round-3 case. A multi-season pack and a real S01 can legitimately
-    // land on the same card, because seasonKey is permissive by design. What
-    // must not happen is the pack being cancelled as though it were season 1.
-    const g = groupDownloads([
-      r({ id: 1, title: 'Some Show [1080p]',
-          name: 'Some Show (2015) S01 [1080p]', state: 'queued' }),
-      r({ id: 2, title: 'Some Show [1080p]',
-          name: 'Some Show Season 1 & 2 [1080p]', state: 'queued',
-          bytes_total: 999 })
-    ]);
-    const withBoth = g.find((x) => x.items.length === 2);
-    if (withBoth) {
-      expect(withBoth.identityKnown).toBe(false);
-      expect(withBoth.canKeepBest).toBe(false);
+  // THE MIXED CARD. A previous version of these two tests paired a canonical
+  // `S01` with a `Season 1 & 2` pack — a pair that CANNOT share a card, because
+  // seasonKey returns '' for the pack and the '|' in the group key separates
+  // them. `items.length === 2` never matched, the assertions sat inside an
+  // `if`, and both `items[0]` and `some()` — the two fail-open mutations these
+  // tests exist to catch — passed the whole suite.
+  //
+  // These names DO collide: seasonKey pads and is permissive, so each keys as
+  // S01 beside the canonical row while failing isCanonicalSeasonName.
+  const NONCANONICAL_S01 = [
+    'Foo (2015) S1 [1080p]',       // single-digit — not the emitted form
+    'Foo Season 1 [1080p]',        // a spelling we do not emit
+    'Foo S01 Extended [1080p]',    // token present, but not as the suffix
+    'Foo (2015) S01 [1080p] (2)'   // JD de-duplication suffix
+  ];
+  const CANONICAL_S01 = 'Foo (2015) S01 [1080p]';
+
+  it('the mixed card is REACHABLE — these really do land in one group', () => {
+    // The control for the two tests below. If this ever stops holding, they
+    // silently stop testing anything, which is exactly what went wrong before.
+    for (const other of NONCANONICAL_S01) {
+      expect(seasonKey(other), other).toBe(seasonKey(CANONICAL_S01));
+      expect(isCanonicalSeasonName(other), other).toBe(false);
+      const groups = groupDownloads([
+        r({ id: 1, title: 'Foo [1080p]', name: CANONICAL_S01, state: 'queued' }),
+        r({ id: 2, title: 'Foo [1080p]', name: other, state: 'queued' })
+      ]);
+      expect(groups, other).toHaveLength(1);
+      expect(groups[0].items, other).toHaveLength(2);
+      expect(groups[0].activeItems, other).toHaveLength(2); // arity gate satisfied
     }
-    // Whichever way they group, nothing in this set may be actionable.
-    expect(g.every((x) => !x.canKeepBest)).toBe(true);
+  });
+
+  it('does NOT offer Keep best when a non-canonical row shares the card', () => {
+    // With two ACTIVE rows the arity gate is satisfied, so canKeepBest is
+    // decided by identityKnown alone — the axis this test names.
+    for (const other of NONCANONICAL_S01) {
+      const [g] = groupDownloads([
+        r({ id: 1, title: 'Foo [1080p]', name: CANONICAL_S01, state: 'queued' }),
+        r({ id: 2, title: 'Foo [1080p]', name: other, state: 'queued', bytes_total: 999 })
+      ]);
+      expect(g.identityKnown, other).toBe(false);
+      expect(g.canKeepBest, other).toBe(false);
+      expect(g.isDuplicate, other).toBe(true); // still SHOWN, just not actionable
+    }
   });
 
   it('judges identity per ROW, so arrival order cannot change the answer', () => {
-    // Reading identityKnown off items[0] would make this pass half the time.
-    const canonical = r({ id: 1, title: 'Some Show [1080p]',
-      name: 'Some Show (2015) S01 [1080p]', state: 'queued' });
-    const ranged = r({ id: 2, title: 'Some Show [1080p]',
-      name: 'Some Show Season 1 & 2 [1080p]', state: 'queued' });
-    for (const order of [[canonical, ranged], [ranged, canonical]]) {
-      expect(groupDownloads(order).every((x) => !x.canKeepBest)).toBe(true);
+    // Kills the items[0] mutation specifically: with the non-canonical row
+    // FIRST, reading items[0] gives false; with it second, true.
+    for (const other of NONCANONICAL_S01) {
+      const canonical = r({ id: 1, title: 'Foo [1080p]', name: CANONICAL_S01, state: 'queued' });
+      const odd = r({ id: 2, title: 'Foo [1080p]', name: other, state: 'queued' });
+      for (const order of [[canonical, odd], [odd, canonical]]) {
+        const [g] = groupDownloads(order);
+        expect(g.items, other).toHaveLength(2);
+        expect(g.identityKnown, other).toBe(false);
+        expect(g.canKeepBest, other).toBe(false);
+      }
     }
   });
 

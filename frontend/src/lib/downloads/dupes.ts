@@ -70,8 +70,32 @@ const CONTINUES_INTO_ANOTHER_UNIT = /^\s*(?:[-–—&+/,]|to\b)\s*(?:[SE]\s*)?\d
  *
  *  Anchored at the END on purpose. `S01-S03 [1080p]` cannot satisfy it (nothing
  *  separates the range endpoint from the bracket the way the canonical form
- *  does), and `Season 1 & 2 [1080p]` has no `SNN` there at all. */
-const CANONICAL_SEASON_SUFFIX = /(?:^|[\w)\]])\s+S(\d{2})(?:\s*\[[^\]]*\])?\s*$/i;
+ *  does), and `Season 1 & 2 [1080p]` has no `SNN` there at all.
+ *
+ *  The bracket payload is LENGTH-BOUNDED, and the match runs against a bounded
+ *  tail (see `isCanonicalSeasonName`). An unbounded `[^\]]*` before an end
+ *  anchor rescans to end-of-string from every candidate position, which is
+ *  quadratic on a name that repeats `a S01 [`: measured 14 KB -> 13 ms,
+ *  28 KB -> 53 ms, 56 KB -> 206 ms, i.e. 4x per doubling. `name` comes from
+ *  JDownloader rather than from us, and this runs per row on every render. */
+const CANONICAL_SEASON_SUFFIX = /\sS(\d{2})(?:\s*\[[^\]]{0,40}\])?\s*$/i;
+
+/** How much of the tail the suffix match may look at. `compute_package_name`
+ *  caps the WHOLE name at 50 characters and the suffix itself is ~20, so this
+ *  is generous for anything the producer can emit while keeping the match cost
+ *  independent of an arbitrarily long JDownloader-supplied name. */
+const CANONICAL_TAIL_WINDOW = 80;
+
+/** A continuation separator sitting immediately BEFORE the season token, which
+ *  makes the token a range endpoint rather than the whole unit: `Show 1 & S02`.
+ *
+ *  A DENYLIST of separators, not an allowlist of title characters. The previous
+ *  version required the preceding character to be `[\w)\]]`, which also rejected
+ *  every title ending in punctuation when no year followed it — measured:
+ *  `Weird But True! S02 [1080p]` and `Whose Line Is It Anyway? S05 [1080p]` are
+ *  both producible by compute_package_name and were both refused, so those
+ *  shows could never offer the action at all. */
+const PRECEDED_BY_CONTINUATION = /(?:[-–—&+/,]|\bto)\s*$/i;
 
 /** THE AUTHORIZATION PARSER. True only when the name is structurally ScanHound's
  *  own single-season form, and therefore proves ONE content unit.
@@ -102,9 +126,16 @@ const CANONICAL_SEASON_SUFFIX = /(?:^|[\w)\]])\s+S(\d{2})(?:\s*\[[^\]]*\])?\s*$/
  *  follow-up (peer review round 4). */
 export function isCanonicalSeasonName(name: string): boolean {
   const n = name || '';
-  if (!CANONICAL_SEASON_SUFFIX.test(n)) return false;
-  // The anchor alone would accept `Season 1 - S03 [1080p]`, whose suffix is a
-  // range endpoint. Exactly one token, in the one spelling we emit.
+  // Bounded window keeps this linear in the length of a hostile name; see
+  // CANONICAL_SEASON_SUFFIX. Slicing can only remove leading context, and the
+  // separator that matters sits within a few characters of the token.
+  const tail = n.slice(-CANONICAL_TAIL_WINDOW);
+  const m = CANONICAL_SEASON_SUFFIX.exec(tail);
+  if (!m) return false;
+  if (PRECEDED_BY_CONTINUATION.test(tail.slice(0, m.index))) return false;
+  // STILL LOAD-BEARING after the suffix tightened, despite appearances:
+  // `Season 1 S03 [1080p]` satisfies the suffix (the character before ` S03`
+  // is the digit 1) and is rejected only here, by the second season token.
   const { sxx, words } = seasonTokens(n);
   return sxx.length === 1 && words.length === 0;
 }
@@ -196,11 +227,24 @@ export interface DownloadGroup {
    *  `Law & Order; LA (2010) [1080p]` rows that may well be different seasons.
    *  Display may still group them; a destructive action may not act on them.
    *
-   *  EVERY row, not the first. `seasonKey` is permissive, so a canonical `S01`
-   *  and a non-canonical `Season 1 & 2` can legitimately share a card. Reading
-   *  the flag off `items[0]` would then make the answer depend on arrival
-   *  order, and half the time it would authorise cancelling the multi-season
-   *  package as though it were season 1 (peer review round 3).
+   *  EVERY row, not the first, because a card CAN hold rows that disagree.
+   *  `seasonKey` is permissive and pads, so all of these key as `S01` beside a
+   *  canonical `Foo (2015) S01 [1080p]` while failing the narrow predicate:
+   *
+   *      Foo (2015) S1 [1080p]        single-digit — not the emitted form
+   *      Foo Season 1 [1080p]         a spelling we do not emit
+   *      Foo S01 Extended [1080p]     the token is not the suffix
+   *      Foo (2015) S01 [1080p] (2)   a JD de-duplication suffix
+   *
+   *  Reading the flag off `items[0]` makes the answer depend on arrival order,
+   *  and `some()` makes one canonical row vouch for the rest — either would
+   *  authorise cancelling a package the gate never actually vetted.
+   *
+   *  An earlier version of this comment justified `every` with a canonical
+   *  `S01` beside a `Season 1 & 2` pack. That pair CANNOT share a card:
+   *  seasonKey returns `''` for the pack, so the `|` in the key separates them
+   *  into two groups. The rule is right; the example was unreachable, and the
+   *  tests built on it asserted nothing.
    *
    *  DELIBERATELY NOT called "same content unit", because it is weaker than
    *  that and the weaker reading is the safe one to hold. `normalizeTitle`
