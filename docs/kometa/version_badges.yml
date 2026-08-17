@@ -1,0 +1,112 @@
+# ScanHound — version-count badges for Kometa.
+#
+# Badges a movie with HOW MANY versions it has. The owner keeps multiple
+# versions deliberately; this says so on the poster instead of requiring a click
+# into Plex to find out.
+#
+# A SEPARATE FILE from dv_badges.yml on purpose. These labels are managed by a
+# different ScanHound pass with its own closed set
+# (backend/rename/version_labeler.py, VERSION_LABELS) and must NOT be added to
+# the DV labeler's MANAGED set: the DV sync computes removals as
+# "managed labels this title should not have", so a version label inside MANAGED
+# would be stripped on every DV run.
+#
+# Drop into your Kometa config alongside the DV badges:
+#
+#   libraries:
+#     Movies:
+#       overlay_files:
+#         - file: config/dv_badges.yml
+#         - file: config/version_badges.yml
+#
+# Run AFTER ScanHound's version-label sync, the same ordering the DV badges need.
+
+# ---------------------------------------------------------------------------
+# DRAWN TOP-RIGHT, NOT TOP-LEFT.
+#
+# Every block in dv_badges.yml draws at horizontal_align: left / vertical_align:
+# top with the same offsets, and that file warns that adding another there
+# stacks overlapping labels. This is not a hypothetical collision: 1,032 movies
+# have multiple versions and most of them already carry a DV or HDR10 badge in
+# that corner, so top-left would overlap on the common case rather than the edge
+# case.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# ONE BLOCK PER LABEL, because Kometa overlays are label-gated with fixed text —
+# there is no way to interpolate a count into a single overlay. The label set is
+# therefore closed, and "5+ Versions" is the catch-all that keeps it closed.
+#
+# Without that bucket, importing a fifth version produces a count with no label,
+# no overlay, and a poster that silently loses its badge — indistinguishable
+# from a movie that never had duplicates.
+#
+# Live distribution when written (2026-08-17): 983 twos, 48 threes, 1 four,
+# 0 fives. The 4 and 5+ blocks badge one movie and none respectively; they exist
+# so the set cannot develop a hole.
+# ---------------------------------------------------------------------------
+
+overlays:
+  2 Versions:
+    overlay:
+      name: text(2 VERSIONS)
+      horizontal_offset: 15
+      horizontal_align: right
+      vertical_offset: 15
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 260
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: 2 Versions
+
+  3 Versions:
+    overlay:
+      name: text(3 VERSIONS)
+      horizontal_offset: 15
+      horizontal_align: right
+      vertical_offset: 15
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 260
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: 3 Versions
+
+  4 Versions:
+    overlay:
+      name: text(4 VERSIONS)
+      horizontal_offset: 15
+      horizontal_align: right
+      vertical_offset: 15
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 260
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: 4 Versions
+
+  5+ Versions:
+    overlay:
+      name: text(5+ VERSIONS)
+      horizontal_offset: 15
+      horizontal_align: right
+      vertical_offset: 15
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 260
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: 5+ Versions
