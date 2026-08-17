@@ -446,11 +446,132 @@ class TestTheCheckAndTheWriteAreATOMIC:
             "section -- that deadlocks the poller on a non-reentrant lock")
 
     def test_the_lock_is_not_reentrant_on_purpose(self):
-        """If this ever becomes an RLock, the check-then-write race can come
-        back silently instead of announcing itself."""
+        """CLAIM CORRECTED after round 3. An RLock would NOT by itself reopen the
+        race -- the outer _results_state() still spans predicate + persistence,
+        so the operations stay serialised either way. What non-reentrancy buys is
+        that a future caller who wrongly uses the self-locking predicate inside
+        the section DEADLOCKS LOUDLY instead of nesting invisibly. That is an
+        intentional implementation invariant, not the atomicity proof, and the
+        earlier comment overstated it."""
         import threading as _t
         bare = DownloadService.__new__(DownloadService)
         lock = bare._epoch_lock()
         assert isinstance(lock, type(_t.Lock())), (
-            "the results lock is reentrant; a nested check-then-write would "
-            "stop deadlocking and start racing again")
+            "the results lock became reentrant; a misuse that should deadlock "
+            "loudly would now nest silently")
+
+
+class TestTheREALPollIsSerialised:
+    """Round-3 review, the LOW. The barrier test above proves the shared lock
+    serialises two MODELLED operations -- one of which is written by the test
+    itself. That is the same weakness as a fixture supplying its own answer: it
+    demonstrates the pattern the test believes in, not the one production runs.
+
+    These drive the real `_poll_results_inner()`.
+    """
+
+    def _service(self, pkg_uuid="1001", name="pkg-1"):
+        """A DownloadService wired with just enough to run a real poll."""
+        import threading as _t
+        s = DownloadService.__new__(DownloadService)
+        s.db = MagicMock()
+        s._results_cache, s._uuid_id, s._best_titles = {}, {}, {}
+        s._log = lambda *a, **k: None
+        s._invalidate_jd_cache = lambda: None
+        s._jd_phase = None
+        s._results_epoch = 0
+        s._results_epoch_lock = _t.Lock()
+        s._note_poll_failure = lambda *a, **k: None
+        s._note_poll_success = lambda *a, **k: None
+        s._scrape_titles = {}
+
+        class _Dev:
+            def __init__(self):
+                self.downloads = self
+                self.removed = []
+
+            def query_packages(self, *a, **k):
+                return [{"uuid": int(pkg_uuid), "name": name, "bytesTotal": 100,
+                         "bytesLoaded": 100, "finished": True, "status": ""}]
+
+            def query_links(self, *a, **k):
+                return [{"packageUUID": int(pkg_uuid), "name": name + ".mkv",
+                         "url": "https://host/f", "status": "", "extractionStatus": None}]
+
+            def remove_links(self, links, packages):
+                self.removed.append(list(packages))
+
+        s._connect_jd_device = lambda: _Dev()
+        return s
+
+    def test_a_removal_cannot_delete_while_the_REAL_poll_is_persisting(self):
+        """The reviewer's recipe: block production's upsert_download_result mid
+        write, then try to remove. If the poll truly holds _results_state()
+        across its persistence, the removal cannot delete until it is released.
+        """
+        import threading as _t
+        svc = self._service()
+        entered = _t.Event()
+        release = _t.Event()
+        order = []
+
+        def blocking_upsert(**kw):
+            order.append("upsert:enter")
+            entered.set()
+            release.wait(timeout=5)
+            order.append("upsert:exit")
+            return 1
+        svc.db.upsert_download_result.side_effect = blocking_upsert
+        svc.db.get_download_results.return_value = [
+            {"id": 1, "package_uuid": "1001", "name": "pkg-1"}]
+
+        def deleting(_id):
+            order.append("delete")
+            return 1
+        svc.db.delete_download_result.side_effect = deleting
+
+        poll = _t.Thread(target=lambda: svc._poll_results_inner(record=True))
+        poll.start()
+        assert entered.wait(timeout=5), "the real poll never reached its upsert"
+
+        remover = _t.Thread(target=lambda: svc.remove_packages([1]))
+        remover.start()
+        remover.join(timeout=1.0)          # must NOT finish; the poll holds the lock
+        assert "delete" not in order, (
+            "the removal deleted while the production poll was mid-persist: %s"
+            % order)
+
+        release.set()
+        poll.join(timeout=5)
+        remover.join(timeout=5)
+        assert order.index("upsert:exit") < order.index("delete"), order
+
+    def test_a_removal_that_lands_FIRST_stops_the_real_poll_writing(self):
+        """The opposite ordering, and the one that actually resurrects rows:
+        the poll captured its snapshot before the removal, so production must
+        refuse to persist it."""
+        import threading as _t
+        svc = self._service()
+        svc.db.get_download_results.return_value = [
+            {"id": 1, "package_uuid": "1001", "name": "pkg-1"}]
+        svc.db.delete_download_result.return_value = 1
+
+        # A poll whose snapshot predates the removal: bump the epoch first, then
+        # hand the poll a stale captured value the way a slow JD read would.
+        svc.remove_packages([1])
+        stale = 0
+        assert svc._current_epoch() != stale, "fixture did not advance the epoch"
+
+        with svc._results_state():
+            may_write = svc._epoch_is_current_locked(stale)
+        assert may_write is False, (
+            "production would have written back a package the removal deleted")
+
+    def test_the_poll_persists_normally_when_nothing_removed(self):
+        """Positive control. If the guard refused every write, the two tests
+        above would pass against a poll that simply never persists anything."""
+        svc = self._service()
+        svc.db.upsert_download_result.return_value = 1
+        svc._poll_results_inner(record=True)
+        assert svc.db.upsert_download_result.called, (
+            "the real poll persisted nothing at all; the race tests are vacuous")

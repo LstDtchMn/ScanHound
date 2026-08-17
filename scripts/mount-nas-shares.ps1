@@ -212,6 +212,38 @@ $ComposeProjectDir = "X:\Docker Apps\ScanHound"
 # container recreate. A named system-wide mutex serializes them; a second
 # instance exits 0 without touching anything, because "someone else is already
 # doing this" is not a failure.
+# ---- RUN LOG -------------------------------------------------------------
+# This task fires every 12 minutes under wscript.exe via run-hidden.vbs, which
+# exists precisely so NO console is allocated. That means every line this script
+# prints -- including the RESULT: line naming which share failed -- goes nowhere.
+# On 2026-08-16 the task had been returning exit 2 roughly 288 times a day and
+# had recorded its reason exactly zero times, so the only way to find out was to
+# run it by hand in a visible shell.
+#
+# WRAPPED IN try/catch AND NEVER FATAL. A log write must not be able to kill the
+# mount: an earlier incident in this codebase had a log write under fail-fast
+# terminate a job at line 1 and erase its own evidence. If logging fails, the
+# mount still runs and the failure is simply unrecorded -- the status quo, not a
+# regression.
+$MountLog = 'C:\ProgramData\ScanHound\logs\mount-nas-shares.log'
+function Write-RunLog([string]$message) {
+    try {
+        $dir = Split-Path -Parent $MountLog
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
+        }
+        $line = (Get-Date -Format 's') + '  ' + $message
+        Add-Content -LiteralPath $MountLog -Value $line -Encoding utf8 -ErrorAction Stop
+        # Keep it bounded: this runs 120x/day and nothing else prunes it.
+        $f = Get-Item -LiteralPath $MountLog -ErrorAction Stop
+        if ($f.Length -gt 2MB) {
+            $keep = Get-Content -LiteralPath $MountLog -Tail 2000 -ErrorAction Stop
+            Set-Content -LiteralPath $MountLog -Value $keep -Encoding utf8 -ErrorAction Stop
+        }
+    } catch { }
+}
+Write-RunLog "=== run start (pid $PID) ==="
+
 $mutex = New-Object System.Threading.Mutex($false, "Global\ScanHound-MountNASShares")
 $haveLock = $false
 try {
@@ -230,6 +262,7 @@ function Fail([string]$message, [int]$code) {
     # TERMINATING error, so the `exit` below would never run and the intended
     # native exit code would not reach the Scheduled Task's LastTaskResult.
     [Console]::Error.WriteLine("ERROR: $message")
+    Write-RunLog "FAIL($code): $message"
     exit $code
 }
 
@@ -976,6 +1009,7 @@ if ($mountExit -ne 0) {
 }
 
 Write-Host "Done."
+Write-RunLog "OK: all shares mounted and identity-verified"
 exit 0
 
 }
