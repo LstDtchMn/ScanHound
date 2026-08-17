@@ -130,18 +130,33 @@ Say ''
 Say '  The container was rebuilt at 20:43, so this is a fair moment to retry.'
 Say '  If the challenge is still up they will simply re-arm the hold, which'
 Say '  costs nothing and tells you the challenge is still there.'
-$ans = Read-Host '  Release it? (y/N)'
+Say '  NOTE: this needs a login token. If it comes back 401, the hold card in'
+Say '  step 4 is what gives you a button for it.'
+$ans = Read-Host '  Try to release it? (y/N)'
 if ($ans -eq 'y') {
+    # THE PATH HAS NO /api PREFIX. app.include_router() is called without one,
+    # so the route is /download/... . The first attempt used /api/download/...,
+    # which fell through to the SPA catch-all -- a GET-only route -- and returned
+    # 405 Method Not Allowed. That read like a broken endpoint when it was a
+    # wrong URL. The real path answers 401, i.e. it exists and wants a token.
     try {
         $r = Invoke-RestMethod -Method Post `
-                -Uri 'http://localhost:9721/api/download/verification-hold/clear' `
+                -Uri 'http://localhost:9721/download/verification-hold/clear' `
                 -ContentType 'application/json' -Body '{"source":"hdencode"}' -TimeoutSec 30
         Good "released - cleared $($r.cleared) marker(s). $($r.next_action)"
         $results['hold'] = "released ($($r.cleared))"
     } catch {
-        Bad "Could not reach the API: $($_.Exception.Message)"
-        Warn 'If it needs a login, do it from the UI once the hold card is merged.'
-        $results['hold'] = 'FAILED'
+        $code = $null
+        try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+        if ($code -eq 401) {
+            Warn 'The API needs a login token, which this script deliberately does not handle.'
+            Warn 'Release it from the UI instead -- that is exactly the button the hold'
+            Warn 'card adds, so merging it in step 4 gives you a way to do this.'
+            $results['hold'] = 'needs the UI (401)'
+        } else {
+            Bad "Could not release: $($_.Exception.Message)"
+            $results['hold'] = 'FAILED'
+        }
     }
 } else {
     Say '  Left armed.'
