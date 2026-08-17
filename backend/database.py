@@ -5989,6 +5989,22 @@ class DatabaseManager:
             'scanned_at, last_seen_at FROM dv_scan'
             f'{where} ORDER BY last_seen_at DESC LIMIT ?', tuple(params), default=[])
 
+    def get_dv_layer_rows(self, source="scan"):
+        """Just ``path`` + ``dv_layer`` for every row of *source*. No limit.
+
+        The DV conflict state is a property of ALL scan rows -- a page cannot
+        answer it -- but computing it needs only these two columns. get_dv_scans
+        returns seven and is paged for the inventory view, so this exists to let
+        the conflict endpoint be refreshed cheaply on reconnect and panel-open
+        without dragging the inventory payload along (peer review round 3:
+        prefer query shape over caching, because a cache would put an
+        invalidation problem into state whose best property is that it can
+        always be recomputed).
+        """
+        return self._query_dicts(
+            "SELECT path, dv_layer FROM dv_scan WHERE source = ?",
+            (source,), default=[])
+
     def get_plex_hdr_by_rating_key(self):
         """``{rating_key: bool}`` — whether Plex sees wide-gamut video.
 

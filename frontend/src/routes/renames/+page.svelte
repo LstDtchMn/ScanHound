@@ -3,7 +3,7 @@
   import {
     renameJobs, renameStatus, renameCategory, renameQuery, renameSort,
     viewMode, renameQueue, applyCancelling, applyActive,
-    loadRenameJobs, loadRenameStatus, loadDvScans,
+    loadRenameJobs, loadRenameStatus, loadDvScans, loadDvConflicts,
     applyJob, undoJob, deleteJob, cancelApply,
     acceptCombinedJob, acceptCorrectionJob,
     dvScanProgress, dvScanResult, dvScans, dvCounts, dvScanRunning, dvConflicts,
@@ -89,6 +89,9 @@
   let dvOpen = $state(false);
   function dolbyVision() {
     dvOpen = true;
+    // Opening is a moment the user is asking "what's the state?" — answer with
+    // current truth, not whatever was cached when the tab was last loaded.
+    loadDvConflicts();
     // Defer until the panel is in the DOM (it lives in #dv-scan-surface).
     requestAnimationFrame(() =>
       document.getElementById('dv-scan-surface')?.scrollIntoView({ behavior: 'smooth' })
@@ -468,11 +471,22 @@
   <!-- Dolby Vision scan surface — the StatusDashboard DV card scrolls here. -->
   <div id="dv-scan-surface" class="rounded-lg border border-[var(--border)]">
     <button
-      onclick={() => (dvOpen = !dvOpen)}
+      onclick={() => { dvOpen = !dvOpen; if (dvOpen) loadDvConflicts(); }}
       aria-expanded={dvOpen}
       class="w-full flex items-center justify-between px-3 py-2 text-sm font-medium text-left hover:bg-[var(--bg-tertiary)]/40"
     >
-      <span>Dolby Vision FEL/MEL scan</span>
+      <span class="flex items-center gap-2">
+        Dolby Vision FEL/MEL scan
+        <!-- Shown while the panel is COLLAPSED, which is its default state. The
+             card inside only exists once expanded, so without this a conflict
+             nobody was told about stays invisible on a correctly-loaded page. -->
+        {#if $dvConflicts.count}
+          <span
+            class="px-1.5 py-0.5 rounded text-[11px] font-medium border border-[var(--error)] text-[var(--error)]"
+            title="Files whose scan records disagree about the Dolby Vision layer"
+          >{$dvConflicts.count} need attention</span>
+        {/if}
+      </span>
       <span class="text-[var(--text-secondary)] text-xs">{dvOpen ? '▴' : '▾'}</span>
     </button>
     {#if dvOpen}

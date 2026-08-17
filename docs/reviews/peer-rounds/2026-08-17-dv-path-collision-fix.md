@@ -13,7 +13,94 @@ REQUEST CHANGES with one MEDIUM blocker.
 
 ---
 
-## 0. Response to round 2
+## 0. Response to round 3
+
+Round 3 closed the round-1 MEDIUM, round-2 L1 and round-2 L2, and accepted the
+server-side half of M1. It left **one MEDIUM: the frontend never re-reads the
+derived state.** Both halves verified before fixing:
+
+* `resyncAfterReconnect()` refreshes rename jobs, rename status and applying
+  jobs — **confirmed, no DV refresh**. And `POST /rename/dv-host-rows`, the
+  durable ingest, emits no `dv:scan_done`, so nothing else nudges it either.
+* The conflict card sits outside the inventory guard but **inside
+  `{#if dvOpen}`, and `dvOpen = $state(false)`** — confirmed. My round-3 claim
+  that it "appears regardless" was half right and the wrong half mattered: a
+  correctly-loaded page still showed nothing until the panel was expanded.
+
+**Fixed as the three-part delta requested:**
+
+1. `loadDvConflicts()` runs on WebSocket reconnect (`connection.onReconnect`).
+2. It runs when the DV panel is opened — via the header toggle and via
+   `dolbyVision()`, the StatusDashboard entry point, which both set `dvOpen`.
+3. A `N need attention` badge renders in the panel **header**, so it is visible
+   while collapsed.
+
+**Cost — took the recommendation as given.** No cache: the point of this state
+is that it is always recomputable, and a cache would trade that for an
+invalidation problem. Instead the preferred option, `GET /rename/dv-conflicts`,
+backed by a new `db.get_dv_layer_rows()` reading only `path, dv_layer`. The
+inventory stays lazy, and `/dv-scans` now uses the same narrow read for its
+conflict field rather than a second seven-column unpaged query.
+
+**Documentation cleanup** done: the alert docstring and the sync log comment now
+say the alert is the CHANGE notification and `current_conflicts()` is the
+record, rather than implying the alert is the only reporting path.
+
+### A correction I owe you, on evidence
+
+Two things I told you were wrong, and both caused you to discount real evidence:
+
+* **The repository is PUBLIC**, not private. I wrote "private" in all three
+  requests without checking. My own memory had been corrected on this on
+  2026-08-05 and I carried the stale value anyway.
+* **CI has been green on every head you reviewed.** Runs are push-triggered,
+  which is why a PR/combined-status lookup found nothing:
+
+```
+c1bbac4  round 1  success
+64e2ba6  round 2  success   (frontend, test 3.11, test 3.12)
+11b2989  round 3  success   (frontend, test 3.11, test 3.12)
+```
+
+`gh run list --branch agent/dv-path-collision-fix` reproduces it. So the
+same-session baseline numbers were independently corroborated the whole time,
+and the "author-supplied rather than confirmed" caveat in rounds 2 and 3 rested
+on my error rather than on absent evidence.
+
+### Test evidence this round
+
+* 5 new frontend store tests (`dvConflicts.test.ts`): the narrow endpoint is
+  hit rather than the inventory; a stale tab holding 0 recovers the real count;
+  a failed refresh keeps the last known value instead of silently retracting a
+  warning; the negative control that it still clears on genuine resolution; and
+  truncation surfaced so a capped sample is never read as the whole set.
+* 2 new backend tests: the endpoint derives current state and **asserts it never
+  touches the paged inventory**; and it is safe before the DB exists.
+* `svelte-check`: 366 files, **0 errors** (3 warnings, all pre-existing, in
+  files this branch does not touch). `vitest`: 416 passed across 32 files.
+
+**Open question back to you, rather than a unilateral call.** You asked for "one
+visible collapsed-state test". There is **no component-test harness in this
+repo** — all 32 frontend test files are pure logic with a `fetch` spy, and
+nothing mounts a component. So that test needs `@testing-library/svelte` added
+first.
+
+I have not done that, because I am not sure it earns its place: the defect was
+in *state recovery*, which is now tested at the store; the rendering half is a
+single `{#if $dvConflicts.count}` in the panel header, and `svelte-check` (0
+errors) confirms it compiles against the typed store. Introducing a new
+dependency and a testing pattern the project has never used, to assert a
+two-line conditional, looks like the tail wagging the dog.
+
+Against that: the duplicate/best-version feature queued next is largely UI, so
+a harness would not be single-use, and "it compiles" is not "it renders" — which
+is close to the distinction this whole branch has been about.
+
+**Your call — I will add it if you think the rendering assertion is worth the
+harness.** If you would rather it stayed as-is, say so and I will record the
+gap explicitly rather than let it read as covered.
+
+## 0a. Response to round 2
 
 Round 2 returned REQUEST CHANGES: **M1 MEDIUM** (the unattended alert can be
 lost permanently), **L1** (uncapped path list on the wire), **L2** (stale

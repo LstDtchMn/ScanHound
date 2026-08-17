@@ -333,6 +333,52 @@ def test_wire_payload_leaves_a_small_list_alone_and_says_so():
     assert out["layer_conflict_paths_truncated"] is False
 
 
+def test_dv_conflicts_endpoint_derives_current_state():
+    """The endpoint the frontend refreshes on reconnect and panel-open.
+
+    Narrow by design: it must read only path+dv_layer, never the paged
+    inventory, because it is called on every reconnect and every panel open.
+    """
+    from backend.api.routes.rename import dv_conflicts
+
+    class _DB:
+        def __init__(self):
+            self.narrow_calls = 0
+
+        def get_dv_layer_rows(self, source="scan"):
+            self.narrow_calls += 1
+            assert source == "scan"
+            return [{"path": r"C:\Movies\Alpha (2001).mkv", "dv_layer": "fel"},
+                    {"path": "C:/movies/alpha (2001).mkv", "dv_layer": "mel"}]
+
+        def get_dv_scans(self, *a, **k):
+            raise AssertionError("must not read the paged inventory")
+
+        def count_dv_scans_by_layer(self, *a, **k):
+            raise AssertionError("must not read inventory counts")
+
+    class _Reg:
+        db = _DB()
+
+    reg = _Reg()
+    out = dv_conflicts(reg)
+
+    assert out["count"] == 1, "the two spellings are one file, and they disagree"
+    assert out["sample"][0]["layers"] == ["fel", "mel"]
+    assert out["truncated"] is False
+    assert reg.db.narrow_calls == 1
+
+
+def test_dv_conflicts_endpoint_is_safe_before_the_db_exists():
+    """Startup order is not guaranteed; a panel open must not 500."""
+    from backend.api.routes.rename import dv_conflicts
+
+    class _Reg:
+        db = None
+
+    assert dv_conflicts(_Reg()) == {"count": 0, "sample": [], "truncated": False}
+
+
 def test_wire_payload_survives_an_error_result():
     """The finally block broadcasts whatever it has, including None or an error
     dict from the exception path. Trimming must not become a second failure."""

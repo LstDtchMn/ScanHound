@@ -649,6 +649,9 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ folder, force })
     }),
+  // Narrow current-state read. Used on reconnect and DV-panel open so attention
+  // state refreshes without pulling the whole inventory each time.
+  getDvConflicts: () => request<DvConflictStatus>('/rename/dv-conflicts'),
   getDvScans: (layer?: string) => {
     const qs = layer ? `?layer=${encodeURIComponent(layer)}` : '';
     // `conflicts` is CURRENT state, recomputed server-side on every call, not a

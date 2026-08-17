@@ -745,9 +745,15 @@ class AppService:
 
         A file whose two dv_scan rows claim different layers is deliberately
         left alone by the labeler -- no badge added, none removed -- so nothing
-        about it is visible in the ordinary counts. This is the only thing that
-        says so out loud, and the unattended hourly sync is where it matters,
-        because nobody is watching the log.
+        about it is visible in the ordinary counts.
+
+        This is the CHANGE notification, not the record. The authoritative
+        answer is dv_labeler.current_conflicts(), recomputed from the rows by
+        GET /rename/dv-conflicts whenever the UI asks. The split is deliberate:
+        this alert is best-effort by nature -- it reaches whoever is connected
+        at that instant, and the dedup below means it says a given thing once --
+        so it must never be the only way to find out. Deliver the change here;
+        let the state be re-read there.
 
         Dedups on the SET of paths, not the count. A conflict does not
         self-heal: the rows keep disagreeing until a rescan resolves them, so

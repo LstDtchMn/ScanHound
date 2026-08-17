@@ -663,6 +663,29 @@ export async function loadDvScans(layer?: string) {
   }
 }
 
+/** Refresh ONLY the conflict state — cheap enough to call on reconnect and on
+ *  panel-open, which is the point.
+ *
+ *  A mounted page that held count 0 while the socket was down would otherwise
+ *  stay at 0 forever: the alert fires once and dedups, `resyncAfterReconnect`
+ *  refreshes rename state only, and the durable host-detector ingest
+ *  (`POST /rename/dv-host-rows`) emits no `dv:scan_done`. Nothing else would
+ *  bring the tab back to the truth short of a hard reload (peer review r3).
+ */
+export async function loadDvConflicts() {
+  try {
+    dvConflicts.set((await api.getDvConflicts()) ?? NO_CONFLICTS);
+  } catch {
+    /* offline — leave the last known value rather than falsely clearing it */
+  }
+}
+
+// Missed WebSocket events are gone for good, so anything that matters has to be
+// re-read as state. resyncAfterReconnect covers rename jobs; this covers DV.
+connection.onReconnect(() => {
+  loadDvConflicts();
+});
+
 connection.on('dv:scan_progress', (data) => {
   dvScanProgress.set(data as unknown as DvScanProgress);
 });

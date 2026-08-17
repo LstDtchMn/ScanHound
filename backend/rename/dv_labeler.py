@@ -569,10 +569,11 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     if layer_conflicts:
         # Loud, because a contradiction is otherwise invisible in this sync's
         # own numbers: the title is left strictly alone, so it moves none of
-        # matched/added/removed. Note the log is NOT the durable record --
-        # current_conflicts() recomputes the set on demand for exactly that
-        # reason. Capped sample: 2,223 keys collide in live data (0 of them
-        # true conflicts today) and a line per key would bury the count.
+        # matched/added/removed. Neither this log NOR the alert is the record --
+        # current_conflicts() recomputes the set on demand and is what the UI
+        # reads, so a missed line here costs nothing. Capped sample: 2,223 keys
+        # collide in live data (0 of them true conflicts today) and a line per
+        # key would bury the count.
         sample = sorted(layer_conflicts.items())[:5]
         logger.warning(
             "dv sync: %d file(s) have dv_scan rows claiming DIFFERENT DV "

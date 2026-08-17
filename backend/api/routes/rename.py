@@ -922,6 +922,21 @@ def search_tmdb(query: str = "", media_type: str = "movie",
     return {"results": results}
 
 
+@router.get("/dv-conflicts")
+def dv_conflicts(reg: ServiceRegistry = Depends(get_registry)):
+    """Files whose scan rows contradict each other — CURRENT state, derived.
+
+    Narrow on purpose. The frontend refreshes attention state on mount, on
+    WebSocket reconnect, and when the DV panel is opened; making that hit
+    /dv-scans would drag the 500-row inventory along every time. Reads two
+    columns and recomputes, so there is no cached value to invalidate — the
+    conflict set is a pure function of the rows and should stay that way.
+    """
+    if reg.db is None:
+        return {"count": 0, "sample": [], "truncated": False}
+    return dv_labeler.current_conflicts(reg.db.get_dv_layer_rows(source="scan"))
+
+
 @router.get("/dv-scans")
 def dv_scans(layer: Optional[str] = None, limit: int = 500,
              reg: ServiceRegistry = Depends(get_registry)):
@@ -939,11 +954,13 @@ def dv_scans(layer: Optional[str] = None, limit: int = 500,
         return {"scans": [], "counts": {}, "conflicts": {"count": 0, "sample": [],
                                                          "truncated": False}}
     limit = max(1, min(int(limit), 2000))  # clamp: never let a client OOM the box
-    # Separate read from the paged `scans` above: the conflict set is a property
-    # of ALL scan rows, so a page of 500 cannot answer it.
-    all_rows = reg.db.get_dv_scans(limit=1000000, source="scan")
+    # Separate, NARROW read: the conflict set is a property of ALL scan rows, so
+    # the paged `scans` above cannot answer it — but it only needs two columns,
+    # not the seven the inventory returns. Same computation as /dv-conflicts,
+    # which the frontend uses for cheap refreshes.
     return {
         "scans": reg.db.get_dv_scans(dv_layer=layer, limit=limit, source="scan"),
         "counts": reg.db.count_dv_scans_by_layer(source="scan"),
-        "conflicts": dv_labeler.current_conflicts(all_rows),
+        "conflicts": dv_labeler.current_conflicts(
+            reg.db.get_dv_layer_rows(source="scan")),
     }
