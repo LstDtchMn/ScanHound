@@ -672,18 +672,52 @@ export async function loadDvScans(layer?: string) {
  *  (`POST /rename/dv-host-rows`) emits no `dv:scan_done`. Nothing else would
  *  bring the tab back to the truth short of a hard reload (peer review r3).
  */
-export async function loadDvConflicts() {
+export async function loadDvConflicts(): Promise<boolean> {
   try {
     dvConflicts.set((await api.getDvConflicts()) ?? NO_CONFLICTS);
+    return true;
   } catch {
-    /* offline — leave the last known value rather than falsely clearing it */
+    // Keep the last known value — clearing on failure would retract a real
+    // warning. But the caller must be able to tell that this failed, because on
+    // the reconnect path the value being preserved may be a STALE ZERO.
+    return false;
   }
+}
+
+/** Reconnect repair for DV attention state: retry once, then say so.
+ *
+ *  A single REST call at reconnect is not enough, and this module already knows
+ *  that — `resyncAfterReconnect` documents the case where a backend restart
+ *  brings the WebSocket upgrade path back before plain HTTP is routable through
+ *  the reverse proxy, and retries once for exactly that reason. The first
+ *  version of this function was a one-shot with a silent catch, which
+ *  reproduced the bug the feature exists to prevent: if the tab held the stale
+ *  zero left by a missed alert and the refresh threw, the zero survived, no
+ *  badge appeared, and the user had no reason to open the panel that would have
+ *  corrected it (peer review round 4).
+ *
+ *  Deliberately NOT folded into `fetchResyncSnapshot()`: that would couple a DV
+ *  status failure to the entire rename-job resync.
+ */
+export async function resyncDvConflictsAfterReconnect() {
+  if (await loadDvConflicts()) return;
+  await new Promise((r) => setTimeout(r, RESYNC_RETRY_DELAY_MS));
+  if (await loadDvConflicts()) return;
+  // Both attempts failed, so the preserved value may be a stale zero. Staying
+  // silent here would render as "nothing needs attention" — the exact false
+  // negative this path exists to prevent, and indistinguishable from a healthy
+  // library. Surface it instead, the same way the rename resync does.
+  addToast(
+    'Reconnected, but DV status refresh failed',
+    'Files needing attention may be out of date until the next refresh.',
+    'warning'
+  );
 }
 
 // Missed WebSocket events are gone for good, so anything that matters has to be
 // re-read as state. resyncAfterReconnect covers rename jobs; this covers DV.
 connection.onReconnect(() => {
-  loadDvConflicts();
+  resyncDvConflictsAfterReconnect();
 });
 
 connection.on('dv:scan_progress', (data) => {

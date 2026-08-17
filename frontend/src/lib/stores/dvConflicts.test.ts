@@ -1,7 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { get } from 'svelte/store';
+
+// Spread the real module so anything else in the import graph keeps working;
+// only the toast is replaced, because "did the user get told" is an assertion
+// this file needs to make.
+vi.mock('$lib/stores/notifications', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$lib/stores/notifications')>()),
+  addToast: vi.fn()
+}));
+
 import { api } from '$lib/api/client';
-import { dvConflicts, loadDvConflicts } from './renames';
+import { addToast } from '$lib/stores/notifications';
+import { dvConflicts, loadDvConflicts, resyncDvConflictsAfterReconnect } from './renames';
 
 /**
  * Recovery of DV conflict state after a missed event.
@@ -36,6 +46,7 @@ const TWO_CONFLICTS = {
 describe('dv conflict current-state recovery', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.mocked(addToast).mockClear();
     dvConflicts.set({ count: 0, sample: [], truncated: false });
   });
 
@@ -85,6 +96,66 @@ describe('dv conflict current-state recovery', () => {
     // The negative control for the test above: "keep the old value on failure"
     // must not become "never clear", or the badge would be permanent.
     expect(get(dvConflicts).count).toBe(0);
+  });
+
+  // --- reconnect repair -------------------------------------------------
+  // A backend restart can bring the WebSocket back before plain HTTP is
+  // routable through the reverse proxy — the neighbouring resyncAfterReconnect
+  // documents exactly that and retries once. A one-shot here let the stale zero
+  // survive silently (peer review round 4).
+
+  it('retries once when the first reconnect read fails, and recovers', async () => {
+    // The tab is holding the stale zero left by an alert it never received.
+    expect(get(dvConflicts).count).toBe(0);
+
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValueOnce(new Error('REST not routable yet'))
+      .mockResolvedValueOnce(jsonResponse(TWO_CONFLICTS));
+
+    await resyncDvConflictsAfterReconnect();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(get(dvConflicts).count).toBe(2);
+    expect(addToast).not.toHaveBeenCalled(); // recovered, so nothing to report
+  }, 10_000);
+
+  it('warns when both attempts fail AND the preserved value is a stale zero', async () => {
+    // The discriminating case. Preserving the old value is right, but when the
+    // old value is 0 the UI renders "nothing needs attention" — indistinguishable
+    // from a healthy library. Silence here is the false negative.
+    expect(get(dvConflicts).count).toBe(0);
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('offline'));
+
+    await resyncDvConflictsAfterReconnect();
+
+    expect(get(dvConflicts).count).toBe(0);
+    expect(addToast).toHaveBeenCalledTimes(1);
+    expect(String(vi.mocked(addToast).mock.calls[0][0])).toMatch(/DV status/i);
+  }, 10_000);
+
+  it('keeps a known nonzero warning when both attempts fail', async () => {
+    dvConflicts.set(TWO_CONFLICTS);
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('offline'));
+
+    await resyncDvConflictsAfterReconnect();
+
+    expect(get(dvConflicts).count).toBe(2); // never retract a real warning
+    expect(addToast).toHaveBeenCalledTimes(1);
+  }, 10_000);
+
+  it('does not retry or warn when the first read succeeds', async () => {
+    // Negative control: without it, "retries once" could become "always makes
+    // two requests", doubling this call on every reconnect.
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(jsonResponse(TWO_CONFLICTS));
+
+    await resyncDvConflictsAfterReconnect();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(get(dvConflicts).count).toBe(2);
+    expect(addToast).not.toHaveBeenCalled();
   });
 
   it('surfaces truncation so a capped sample is never read as the whole set', async () => {

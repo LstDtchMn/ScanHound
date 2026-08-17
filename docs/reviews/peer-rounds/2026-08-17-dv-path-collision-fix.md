@@ -13,7 +13,65 @@ REQUEST CHANGES with one MEDIUM blocker.
 
 ---
 
-## 0. Response to round 3
+## 0. Response to round 4
+
+Round 4 approved the design outright — conflicts stay derived, the narrow
+endpoint is right, no cache, no persisted table, no component-test dependency —
+and withdrew the CI caveat. It left **M1 (MEDIUM)**, **I1 (INFO)** and
+**T1 (TEST)**. All three are addressed.
+
+### M1 — the reconnect refresh ignored the retry policy next door
+
+Verified before fixing: `loadDvConflicts()` was a one-shot with a silent catch,
+fired from the same reconnect moment as `resyncAfterReconnect()` — which
+documents the WS-up/REST-not-ready race, retries once after
+`RESYNC_RETRY_DELAY_MS` (2000, `renames.ts:515`), and raises a toast when both
+attempts fail. Mine did neither. Preserving the old value on failure is right;
+the bug is that the preserved value can be the **stale zero** left by a missed
+alert, which renders as "nothing needs attention" and suppresses the very badge
+that would have prompted the user to look.
+
+`resyncDvConflictsAfterReconnect()` now retries once at the same delay, then —
+if both attempts fail — keeps the old value **and** raises a warning toast.
+Deliberately **not** folded into `fetchResyncSnapshot()`, since that would take
+the whole rename-job resync down with a DV status failure.
+
+Tests, including the two you specified:
+
+* first read throws → second returns 2 → store ends at 2, **two** fetches, no
+  toast (recovered, so nothing to report);
+* both fail **while the preserved value is the stale zero** → value stays 0 and
+  a warning IS raised — the discriminating case, because silence there is
+  indistinguishable from a healthy library;
+* both fail with a known nonzero → the real warning is never retracted;
+* **negative control**: first read succeeds → exactly one fetch, no toast, so
+  "retry once" cannot silently become "always two requests".
+
+### T1 — the rendering test, and a correction
+
+I told you there was no component-test harness, so a rendering test would need a
+new dependency. **That was wrong, and the error is mine.** I searched for tests
+that mount components, found none, and reported the general absence — while
+`frontend/playwright.config.ts`, four specs under `frontend/tests/e2e/`,
+`@playwright/test`, `npm run test:e2e` and a CI job running Chromium were all
+present. I had even seen the `tests/e2e` directory in a listing earlier the same
+session. A narrower query than the claim I drew from it.
+
+Added `tests/e2e/shared/dvConflictBadge.spec.ts` — **no new dependency**, and it
+runs under both the desktop and mobile projects:
+
+* a conflict is visible while the panel is still `aria-expanded="false"`;
+* opening the panel re-reads the narrow endpoint (inventory says 0,
+  `/dv-conflicts` says 2, badge appears) and the badge **survives collapsing** —
+  which is exactly what would fail if it lived in the panel body;
+* **negative control**: a clean library shows no badge at all.
+
+### I1 — wording
+
+Corrected in §0a below. `onMount()` does fetch the inventory; what became cheap
+is the additional attention-state refresh.
+
+## 0a. Response to round 3
 
 Round 3 closed the round-1 MEDIUM, round-2 L1 and round-2 L2, and accepted the
 server-side half of M1. It left **one MEDIUM: the frontend never re-reads the
@@ -38,9 +96,17 @@ derived state.** Both halves verified before fixing:
 **Cost — took the recommendation as given.** No cache: the point of this state
 is that it is always recomputable, and a cache would trade that for an
 invalidation problem. Instead the preferred option, `GET /rename/dv-conflicts`,
-backed by a new `db.get_dv_layer_rows()` reading only `path, dv_layer`. The
-inventory stays lazy, and `/dv-scans` now uses the same narrow read for its
-conflict field rather than a second seven-column unpaged query.
+backed by a new `db.get_dv_layer_rows()` reading only `path, dv_layer`, and
+`/dv-scans` now uses that same narrow read for its conflict field rather than a
+second seven-column unpaged query.
+
+> **Correction (round 4, I1).** An earlier draft of this section and the round-4
+> commit message said "the inventory stays lazy". That is not literal:
+> `onMount()` still calls `loadDvScans()`, so the 500-row inventory is fetched
+> on page load exactly as before. What became cheap is the **additional
+> attention-state refresh** on reconnect and panel-open, which no longer drags
+> the inventory along. The commit message cannot be corrected without rewriting
+> a pushed commit, so it is corrected here.
 
 **Documentation cleanup** done: the alert docstring and the sync log comment now
 say the alert is the CHANGE notification and `current_conflicts()` is the
