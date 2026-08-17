@@ -204,6 +204,14 @@ class SharedFacts:
     #: caller resolves the source match; this type carries only the verdict, so
     #: the policy cannot mis-compare two different spellings of one source.
     verification_hold: bool = False
+    #: When this batch last changed (its `updated_at`), and how long it must
+    #: stay unchanged before a SPENT budget may release one further attempt.
+    #: See the BUDGET_SPENT branch in decide() for why this exists and why it
+    #: is not a counter reset. `None` disables it entirely, which is what a
+    #: caller that cannot supply the timestamp must get: the strict old
+    #: behaviour, never an accidental unlimited retry.
+    quiet_since: Optional[datetime] = None
+    exhausted_retry_window_seconds: Optional[int] = None
 
 
 def parse_max_attempts(config, default: int = 3) -> int:
@@ -217,6 +225,28 @@ def parse_max_attempts(config, default: int = 3) -> int:
         return max(1, min(10, int(raw)))
     except (TypeError, ValueError):
         return default
+
+
+def _quiet_long_enough(shared: SharedFacts, now: datetime) -> bool:
+    """Has this batch been untouched long enough to earn one more attempt?
+
+    Fails CLOSED on every uncertainty -- absent timestamp, absent window,
+    non-positive window, unparsable value. A spent budget that stays spent is
+    a visible stall someone can act on; a spent budget that silently retries
+    forever is the failure mode this whole clause was warned about.
+    """
+    if shared.quiet_since is None or shared.exhausted_retry_window_seconds is None:
+        return False
+    try:
+        window = int(shared.exhausted_retry_window_seconds)
+    except (TypeError, ValueError):
+        return False
+    if window <= 0:
+        return False
+    quiet = shared.quiet_since
+    if quiet.tzinfo is None:
+        quiet = quiet.replace(tzinfo=timezone.utc)
+    return (now - quiet).total_seconds() >= window
 
 
 def decide(item: ItemFacts, shared: SharedFacts,
@@ -278,7 +308,24 @@ def decide(item: ItemFacts, shared: SharedFacts,
 
     progressed = shared.source_delivery_count > shared.progress_mark
     if shared.attempts_used >= shared.max_attempts and not progressed:
-        return BUDGET_SPENT
+        # THE BUDGET DEADLOCKS ITSELF (design review F5). Refunding requires a
+        # source DELIVERY; getting a delivery requires a RETRY. Once the counter
+        # is spent with nothing delivered, the only exit is a human -- and the
+        # items that most need recovery are exactly the ones that never
+        # delivered.
+        #
+        # So a batch that has been completely QUIET for a long window gets one
+        # further attempt. This is deliberately NOT a counter reset, which the
+        # review warned turns a finite budget into an unbounded retry loop in
+        # slow motion: the counter stays spent, so the batch does not regain an
+        # allowance, and _resume_batch stamps `updated_at` on every attempt --
+        # which restarts the quiet period. The result is at most one attempt per
+        # window, forever, instead of none, forever.
+        #
+        # It cannot reach a held row: VERIFICATION_HOLD returns above this, and
+        # it is checked before the budget precisely so no timer can release one.
+        if not _quiet_long_enough(shared, now):
+            return BUDGET_SPENT
 
     # THE SHARED BRAKE IS A VETO, NEVER A VETO-BY-PROXY. If it is still in the future
     # the whole group waits -- but that is because the brake applies to every member,

@@ -106,7 +106,13 @@ def stall_outcome(clock, *, minutes=60):
         code=ScrapeCode.REVEAL_VERIFICATION_STALLED,
         retryable=True,
         affects_source_health=True,
-        transport_attempted=False,
+        # True, matching download_service.py where this diagnostic is really
+        # raised. It was False here, which is not merely cosmetic: the scope
+        # classifier counts only transport_attempted=1 as evidence about a
+        # source, so a fixture claiming no page was opened could never
+        # accumulate the evidence these tests then assert the results of. A
+        # reveal that stalls has by definition already loaded the page.
+        transport_attempted=True,
         affected_scope="source",
         retry_mode="after_cooldown",
         cooldown_until=until,
@@ -157,6 +163,44 @@ def _tick(service):
     return item
 
 
+def _stall_until_source_wide(service, downloads, clock, *, minutes=60):
+    """Stall enough DISTINCT items to earn source-wide scope, and prove it.
+
+    WHY THIS EXISTS. Every test below was written when one reveal stall paused
+    the whole batch. #83 changed that deliberately: a reveal stall is AMBIGUOUS
+    evidence about the source, so scope is now earned only after
+    AMBIGUOUS_PROMOTION_DISTINCT_ITEMS distinct items report it -- distinct, so
+    one stubborn page cannot manufacture its own evidence.
+
+    These tests did not catch the change, because the new item-local path was
+    raising sqlite3.IntegrityError on a CHECK constraint instead of running.
+    Rather than lower the assertions to whatever the code now does, this helper
+    drives the sequence to the state each test was actually about -- a source
+    the system has real grounds to believe is throttling -- and asserts the new
+    contract on the way there.
+    """
+    needed = service.AMBIGUOUS_PROMOTION_DISTINCT_ITEMS
+    attempted = []
+    for n in range(1, needed + 1):
+        # Clear the source pacing lane FIRST: this helper is also called
+        # part-way through sequences that already spent it, and a refusal there
+        # would look like the rig being broken.
+        clock.advance(seconds=service._source_interval_seconds() + 1)
+        downloads.queue(stall_outcome(clock, minutes=minutes))
+        item = _tick(service)
+        assert item is not None, (
+            f"the worker claimed nothing on stall {n}/{needed}; either the rig "
+            "is broken or source pacing refused the claim")
+        attempted.append(item)
+        batch = service.get_batch(item["batch_uuid"])
+        if n < needed:
+            assert batch["state"] != "paused_source", (
+                f"{n} ambiguous stall(s) must NOT pause the batch -- one item's "
+                "reveal stall is not evidence about the source, and treating it "
+                "as such parked 61 items for 48 hours")
+    return attempted
+
+
 def _schedule(service, count=3, *, auto_resume=False):
     items = [{"url": f"https://hdencode.org/release-{i}-2160p/",
               "title": f"Release {i}", "media_type": "movie"}
@@ -187,14 +231,15 @@ class TestTheThrottleLifecycle:
 
     def test_a_stall_defers_the_batch_and_holds_the_siblings(self, rig):
         clock, db, downloads, service = rig
-        batch = _schedule(service, 3)
+        batch = _schedule(service, 4)
         uuid = batch["batch_uuid"]
 
-        # (1) the first item returns REVEAL_VERIFICATION_STALLED
-        downloads.queue(stall_outcome(clock))
-        first = _tick(service)
-        assert first is not None, "the worker claimed nothing; the rig is broken"
-        assert len(downloads.calls) == 1
+        # (1) items return REVEAL_VERIFICATION_STALLED until the source-wide
+        # scope is EARNED. The helper asserts the item-local behaviour on the
+        # way -- see its docstring for why one stall is no longer enough.
+        hit = _stall_until_source_wide(service, downloads, clock)
+        first = hit[-1]
+        assert len(downloads.calls) == service.AMBIGUOUS_PROMOTION_DISTINCT_ITEMS
 
         current, states = _states(service, uuid)
         by_uuid = {r["item_uuid"]: r for r in current["items"]}
@@ -207,9 +252,12 @@ class TestTheThrottleLifecycle:
         assert attempted["state"] in ("waiting_source", "scheduled", "ready"), (
             attempted["state"])
 
-        # (3) pending siblings receive the cooldown
-        siblings = [r for r in current["items"]
-                    if r["item_uuid"] != first["item_uuid"]]
+        # (3) pending siblings receive the cooldown. "Pending" now excludes the
+        # earlier item-local deferrals: those were correctly left runnable while
+        # the evidence was still ambiguous, and _pause_for_source only rewrites
+        # rows that have not been attempted.
+        tried = {r["item_uuid"] for r in hit}
+        siblings = [r for r in current["items"] if r["item_uuid"] not in tried]
         assert siblings, "need siblings to test sibling behaviour"
         assert all(r["cooldown_until"] for r in siblings), (
             "a source-wide denial must defer the whole batch, not just the item "
@@ -237,19 +285,20 @@ class TestAutoResumePolicy:
         clock, db, downloads, service = rig
         batch = _schedule(service, 3, auto_resume=False)
         uuid = batch["batch_uuid"]
-        downloads.queue(stall_outcome(clock, minutes=60))
-        _tick(service)
+        _stall_until_source_wide(service, downloads, clock)
         assert _states(service, uuid)[0]["state"] == "paused_source"
 
         clock.advance(hours=6)          # long past the cooldown
         for _ in range(5):
+            clock.advance(seconds=service._source_interval_seconds() + 1)
             _tick(service)
         current, _ = _states(service, uuid)
         assert current["state"] == "paused_source", (
             "with auto-resume disabled the batch must stay parked; an automatic "
             "restart here would contradict the documented default")
-        assert len(downloads.calls) == 1, (
-            "no further attempt should have been made")
+        assert len(downloads.calls) == service.AMBIGUOUS_PROMOTION_DISTINCT_ITEMS, (
+            "no attempt beyond the ones that earned the source scope should "
+            "have been made")
 
     def test_with_auto_resume_enabled_the_clock_releases_it_once(self, rig):
         """(7) one resume, (8) the deferred item is reclaimed, (9) the batch
@@ -257,8 +306,7 @@ class TestAutoResumePolicy:
         clock, db, downloads, service = rig
         batch = _schedule(service, 3, auto_resume=True)
         uuid = batch["batch_uuid"]
-        downloads.queue(stall_outcome(clock, minutes=60))
-        _tick(service)
+        _stall_until_source_wide(service, downloads, clock)
         assert _states(service, uuid)[0]["state"] == "paused_source"
 
         # Before the cooldown expires: still nothing.
@@ -280,10 +328,17 @@ class TestAutoResumePolicy:
             "cannot be enforced")
 
         # (8)+(9) work continues
-        assert len(downloads.calls) == 2
+        assert len(downloads.calls) == (
+            service.AMBIGUOUS_PROMOTION_DISTINCT_ITEMS + 1), (
+            "the stalls that earned the scope, plus the one resumed retry")
         downloads.queue(success_outcome())
         downloads.queue(success_outcome())
         for _ in range(6):
+            # Advance past the source pacing interval each time. Production
+            # waits it out; a loop that ticks six times in the same instant
+            # gets one item and five refusals, which would read as "the batch
+            # stopped" rather than "the batch is being paced".
+            clock.advance(seconds=service._source_interval_seconds() + 1)
             _tick(service)
         _, states = _states(service, uuid)
         assert list(states.values()).count("completed") >= 2, states
@@ -310,13 +365,16 @@ class TestAutoResumePolicy:
         uuid = batch["batch_uuid"]
 
         # First stall, then a resume that also stalls: fruitless attempt #1.
-        downloads.queue(stall_outcome(clock, minutes=60))
-        _tick(service)
+        _stall_until_source_wide(service, downloads, clock)
         assert _states(service, uuid)[0]["state"] == "paused_source"
 
+        # 61 minutes is past AMBIGUOUS_PROMOTION_WINDOW_SECONDS, so the earlier
+        # stalls have aged out of the evidence window and the scope has to be
+        # earned again. That is the intended behaviour -- evidence about a source
+        # expires -- so the resume is driven the same way the original pause was.
         clock.advance(minutes=61)
-        downloads.queue(stall_outcome(clock, minutes=60))
-        assert _tick(service) is not None, "the first automatic resume must fire"
+        resumed = _stall_until_source_wide(service, downloads, clock)
+        assert resumed, "the first automatic resume must fire"
         current, _ = _states(service, uuid)
         assert current["auto_resume_used"] == 1
         assert current["state"] == "paused_source", "the second stall re-pauses it"
@@ -324,16 +382,27 @@ class TestAutoResumePolicy:
         # Second fruitless resume: allowed now, and this is the behaviour whose
         # absence stranded 44 items in production.
         clock.advance(minutes=61)
-        downloads.queue(stall_outcome(clock, minutes=60))
-        assert _tick(service) is not None, (
+        assert _stall_until_source_wide(service, downloads, clock), (
             "a SECOND automatic attempt must be permitted -- the single shot is what "
             "left four batches permanently parked on 2026-08-07")
         assert _states(service, uuid)[0]["auto_resume_used"] == 2
 
         # Budget spent with nothing delivered: it must now stop.
-        clock.advance(hours=6)
+        #
+        # 90 minutes, not 6 hours. Six would now cross the F5 quiet-window, which
+        # deliberately grants an exhausted batch one further attempt -- a real
+        # behaviour, but not the one this test is about. This test's claim is
+        # "a spent budget stops", and it is checked here where the batch has
+        # been active seconds ago; the window itself is exercised in
+        # test_queue_review_followups.py.
+        clock.advance(minutes=90)
         calls_before = len(downloads.calls)
         for _ in range(6):
+            # Advance past the source pacing interval each time. Production
+            # waits it out; a loop that ticks six times in the same instant
+            # gets one item and five refusals, which would read as "the batch
+            # stopped" rather than "the batch is being paced".
+            clock.advance(seconds=service._source_interval_seconds() + 1)
             _tick(service)
         current, _ = _states(service, uuid)
         assert current["state"] == "paused_source", (
@@ -362,8 +431,7 @@ class TestAutoResumePolicy:
         # The resume delivers for real, then the source shuts again.
         downloads.queue(success_outcome())
         assert _tick(service) is not None
-        downloads.queue(stall_outcome(clock, minutes=60))
-        _tick(service)
+        _stall_until_source_wide(service, downloads, clock)
         assert _states(service, uuid)[0]["state"] == "paused_source"
 
         clock.advance(minutes=61)

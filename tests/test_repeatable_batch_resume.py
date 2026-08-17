@@ -77,6 +77,16 @@ def _pause(db, service, batch_uuid):
             "  last_reason_code='reveal_verification_stalled' "
             "WHERE batch_uuid=?", (STAMP, EXPIRED, batch_uuid))
         service._refresh_batch_locked(conn, batch_uuid, STAMP)
+        # `updated_at` IS LIVE IN PRODUCTION. _pause_for_source stamps the batch
+        # with the real clock, and the F5 quiet-window exit reads that column --
+        # so leaving the frozen STAMP here would report a batch paused seconds
+        # ago as having been silent since 2026-08-07 and hand it the window's
+        # extra attempt. These tests are about a budget spent by a RECENTLY
+        # active batch; the window itself is exercised in
+        # test_queue_review_followups.py, where the age is set deliberately.
+        conn.execute(
+            "UPDATE download_queue_batches SET updated_at = datetime('now') "
+            "WHERE batch_uuid = ?", (batch_uuid,))
 
 
 def _outcome(method, *, transport=True):

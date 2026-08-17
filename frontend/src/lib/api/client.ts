@@ -409,6 +409,20 @@ export const api = {
       body: JSON.stringify({ id })
     }),
 
+  /** Remove many tracked packages in ONE request.
+   *
+   * Not `DELETE /download/results` — that empties our table without telling
+   * JDownloader, so the next poll re-inserts everything and the list comes
+   * straight back. This removes them from JD too, which is what makes them
+   * stay gone. */
+  removeDownloadResults: (ids: number[]) =>
+    request<{ ok: boolean; removed: number; requested: number;
+             jd_removed: boolean; durable: boolean; kept?: number;
+             errors?: string[] }>(
+      '/download/results/remove-many',
+      { method: 'POST', body: JSON.stringify({ ids }) }
+    ),
+
   // Settings
   getSettings: () => request<Settings>('/settings'),
   updateSettings: (updates: Settings) =>

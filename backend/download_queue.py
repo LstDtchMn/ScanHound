@@ -29,6 +29,22 @@ def _iso(value: Optional[datetime] = None) -> str:
     return (value or _utcnow()).isoformat()
 
 
+def _sql_utc(value: Optional[datetime] = None) -> str:
+    """UTC in sqlite's own 'YYYY-MM-DD HH:MM:SS' shape.
+
+    For columns compared against `datetime('now', ...)` -- currently only
+    download_queue_attempts. Everything else in this module stores
+    offset-carrying isoformat and compares against a value from this same
+    module, so it is self-consistent; the attempts table is the one place where
+    a sqlite-side expression is the other operand, and mixing the two shapes
+    there is what made the 3600s evidence window match nothing.
+    """
+    value = value or _utcnow()
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc)
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _parse(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -728,10 +744,99 @@ class DownloadQueueService:
                       'operation_timeout_unknown',
                       'interrupted_unknown_outcome'
                   )
+                  -- SOURCE-GLOBAL pacing (design review F4). Batch pacing is
+                  -- DEMAND; this is CAPACITY. Without it each batch gets its
+                  -- own 600s lane, so two concurrent batches hit the source
+                  -- twice as fast as configured -- which is itself a plausible
+                  -- contributor to the gating we then treat as the source's
+                  -- fault. An attempt must satisfy BOTH its item's due time and
+                  -- the source's global next-allowed time.
+                  --
+                  -- Derived from the attempt records rather than a new column:
+                  -- the last attempt against this source IS the pacing clock,
+                  -- and deriving it means a restart cannot silently reset the
+                  -- gate to "go now".
+                  --
+                  -- Only attempts that actually SPEND the source consume the
+                  -- lane. An item resolved from cache, or a sibling parked by
+                  -- another item's source-wide outcome, never opened a page --
+                  -- charging it would throttle work the source never saw. An
+                  -- attempt still IN_PROGRESS holds the lane regardless: it has
+                  -- not yet reported whether it reached the source, and the
+                  -- conservative reading of an unfinished attempt is that it
+                  -- did.
+                  --
+                  -- The cutoff is computed from the SAME clock as `now` above,
+                  -- not from sqlite's datetime('now'). Two clocks in one
+                  -- predicate is not a style point here: the queue's clock is
+                  -- injectable and the integration tests advance it, so a
+                  -- sqlite-side window would freeze while the rest of the
+                  -- sequence moved -- untestable, and unfalsifiable in exactly
+                  -- the tests written to falsify it.
+                  --
+                  -- PACING THROTTLES THE MACHINE, NOT THE OPERATOR. A row
+                  -- promoted by a human -- the "Retry now" button, retry_item(),
+                  -- a manual resume -- carries queue_reason='manual_retry' and
+                  -- is exempt. Someone who has just clicked a button is not the
+                  -- runaway this gate exists to prevent, and refusing them would
+                  -- be invisible: the API accepts the retry, the worker then
+                  -- silently declines to claim it for up to a minute, and the UI
+                  -- reports success for something that has not started.
+                  AND (
+                      -- ONE row, not a batch. retry_ready() and a manual
+                      -- _resume_batch() stamp the SAME marker on every row they
+                      -- promote, so a blanket exemption let one tap on "Retry
+                      -- all ready" send N items back-to-back at the very source
+                      -- that was refusing -- precisely the stampede this gate
+                      -- exists to prevent. A lone due manual row is somebody
+                      -- pressing "Retry now" on one item; several at once is a
+                      -- bulk action, and bulk actions get paced like anything
+                      -- else.
+                      (
+                          download_queue_items.queue_reason = 'manual_retry'
+                          AND (
+                              SELECT COUNT(*) FROM download_queue_items m
+                              WHERE m.source = download_queue_items.source
+                                AND m.queue_reason = 'manual_retry'
+                                AND m.state IN ('scheduled', 'ready')
+                                AND m.scheduled_for IS NOT NULL
+                                AND m.scheduled_for <= ?
+                          ) = 1
+                      )
+                      OR NOT EXISTS (
+                          SELECT 1 FROM download_queue_attempts a
+                          WHERE a.source = download_queue_items.source
+                            AND (
+                                -- A KNOWN attempt blocks for the pacing
+                                -- interval...
+                                (a.terminal_status <> 'IN_PROGRESS'
+                                 AND a.transport_attempted = 1
+                                 AND a.started_at > ?)
+                                -- ...but an UNFINISHED one blocks while its
+                                -- claim is still live, which is the rule the
+                                -- comment always claimed. Tying it to the pacing
+                                -- interval instead meant a wedged worker stopped
+                                -- holding the lane after 60s while its lease ran
+                                -- for far longer (2026-08-16 review, Q2).
+                                OR (a.terminal_status = 'IN_PROGRESS'
+                                    AND EXISTS (
+                                        SELECT 1 FROM download_queue_items c
+                                        WHERE c.item_uuid = a.item_uuid
+                                          AND c.state = 'claimed'
+                                          AND c.claim_expires_at IS NOT NULL
+                                          AND c.claim_expires_at > ?
+                                    ))
+                            )
+                      )
+                  )
                 ORDER BY scheduled_for, sequence_number
                 LIMIT 1
                 """,
-                (now,),
+                (now,
+                 now,
+                 _sql_utc(_utcnow() - timedelta(
+                     seconds=self._source_interval_seconds())),
+                 now),
             ).fetchone()
             if row is None:
                 return None
@@ -776,7 +881,11 @@ class DownloadQueueService:
             try:
                 self.db.begin_queue_attempt(
                     attempt_id, item.get("item_uuid"),
-                    item.get("batch_uuid"), item.get("source"))
+                    item.get("batch_uuid"), item.get("source"),
+                    # The queue's clock, not the database's: the F4 pacing
+                    # window is computed from _utcnow() and compared against
+                    # this column, so the two must be the same clock.
+                    started_at=_sql_utc(_utcnow()))
             except Exception:  # noqa: BLE001
                 logger.exception("could not open attempt record for %s",
                                  item.get("item_uuid"))
@@ -801,6 +910,54 @@ class DownloadQueueService:
                 only_if_open=True)
         except Exception:  # noqa: BLE001
             pass
+
+    def _close_attempt(self, attempt_id: str, status: str, outcome: dict,
+                       *, scope: Optional[str] = None) -> None:
+        """Record the REAL outcome of an attempt.
+
+        Without this every attempt closes through the finally-backstop as
+        FAILED/attempt_not_closed with transport_attempted 0 -- which is what
+        production actually recorded before 2026-08-16: 2 of 2 rows, no real
+        outcome among them. The backstop was doing exactly its job; nothing was
+        doing the ordinary one. Every consumer of these rows (stall reporting,
+        source-liveness, drift detection, source pacing) then reads a queue in
+        which nothing has ever succeeded and nothing has ever reached the
+        source.
+
+        transport_attempted is taken from the download service, which is the
+        only layer that knows whether a request left the machine -- except on
+        SUCCESS, where delivered links are themselves proof of contact and are
+        honoured even if the flag was not set.
+        """
+        if self.db is None:
+            return
+        method = outcome.get("method") or ""
+        links = int(outcome.get("link_count") or 0)
+        # A duplicate is decided against our OWN records and returns before the
+        # scraper runs -- download_service says so in as many words ("don't
+        # scrape or re-send it"). It is a success that never touched HDEncode,
+        # so it must not be charged to the source's capacity lane, or a batch of
+        # already-grabbed titles would pace itself against a source it never
+        # contacted.
+        delivered = links > 0 or method == "jdownloader"
+        transport = bool(outcome.get("transport_attempted"))
+        if status == "SUCCESS":
+            transport = transport or delivered
+        try:
+            self.db.close_queue_attempt(
+                attempt_id,
+                status,
+                reason_code=outcome.get("reason_code"),
+                affected_scope=scope or outcome.get("affected_scope") or "item",
+                transport_attempted=transport,
+                # Liveness is DELIVERY, not item completion: a duplicate that
+                # produced no links proves the page was read, not that the
+                # source is still handing out downloads.
+                source_progress=(status == "SUCCESS" and links > 0),
+                only_if_open=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("could not close attempt record %s", attempt_id)
 
     def _execute_inner(self, item: dict, attempt_id: str) -> None:
         self._emit("download:queue_updated", {**item, "state": "claimed"})
@@ -858,7 +1015,11 @@ class DownloadQueueService:
 
         if outcome.get("success"):
             if not self._complete(item, outcome):
+                # The durable write lost its claim. We cannot say this worked,
+                # so the backstop's FAILED/attempt_not_closed is the honest
+                # record -- do NOT close it as SUCCESS here.
                 return
+            self._close_attempt(attempt_id, "SUCCESS", outcome)
             self._emit("download:result", outcome)
             method = outcome.get("method")
             message = outcome.get("message") or f"Sent: {item['title']}"
@@ -900,12 +1061,18 @@ class DownloadQueueService:
             # what "item-local" has to mean here to be safe.
             if not self._defer_item_only(item, outcome):
                 return
+            # A deferral is not a source failure: the scope was not earned, so
+            # counting it as one is how a single ambiguous item talks the
+            # system into believing the whole source is down.
+            self._close_attempt(attempt_id, "INTENTIONALLY_SKIPPED", outcome,
+                                scope="item")
             self._emit("download:result", outcome)
             return
 
         if is_source_wide_denial(outcome):
             if not self._pause_for_source(item, outcome):
                 return
+            self._close_attempt(attempt_id, "FAILED", outcome, scope="source")
             self._emit("download:result", outcome)
             self._emit(
                 "notification",
@@ -915,6 +1082,7 @@ class DownloadQueueService:
 
         if not self._fail(item, outcome):
             return
+        self._close_attempt(attempt_id, "FAILED", outcome, scope="item")
         self._emit("download:result", outcome)
         self._emit(
             "notification",
@@ -1072,6 +1240,43 @@ class DownloadQueueService:
     #: property the turnstile work established.
     _AMBIGUOUS_SOURCE_REASONS = {"reveal_verification_stalled"}
 
+    #: Floor for source-global pacing when nothing else says otherwise. Kept
+    #: well under the batch interval so the source gate never becomes the
+    #: binding constraint for a SINGLE batch running at its configured pace --
+    #: it exists to stop N concurrent batches multiplying the request rate, not
+    #: to slow the normal case.
+    SOURCE_MIN_INTERVAL_SECONDS = 60
+
+    #: How long a budget-exhausted batch stays parked before it may make ONE
+    #: more attempt. Deliberately long: this restores liveness, it is not a
+    #: retry cadence. Six hours means an exhausted batch costs the source at
+    #: most four extra attempts a day rather than being dead until a human
+    #: notices -- which is what happened for 48 hours on 2026-08-13.
+    EXHAUSTED_RETRY_WINDOW_SECONDS = 21600
+
+    def _exhausted_retry_window_seconds(self) -> int:
+        try:
+            return max(3600, int(self.config.get(
+                "download_queue_exhausted_retry_window_seconds",
+                self.EXHAUSTED_RETRY_WINDOW_SECONDS)))
+        except Exception:  # noqa: BLE001
+            return self.EXHAUSTED_RETRY_WINDOW_SECONDS
+
+    def _source_interval_seconds(self) -> int:
+        """Minimum seconds between attempts against one source, globally.
+
+        Design review F4: batch pacing is demand, the source gate is capacity.
+        Two batches must not each consume a separate lane.
+        """
+        try:
+            return max(
+                self.SOURCE_MIN_INTERVAL_SECONDS,
+                int(self.config.get("download_source_min_interval_seconds",
+                                    self.SOURCE_MIN_INTERVAL_SECONDS)),
+            )
+        except Exception:  # noqa: BLE001
+            return self.SOURCE_MIN_INTERVAL_SECONDS
+
     def _scope_is_earned(self, item: dict, outcome: dict) -> bool:
         """Has source-wide scope been EARNED by evidence, for this outcome?
 
@@ -1097,7 +1302,8 @@ class DownloadQueueService:
         try:
             n = self.db.distinct_items_failing(
                 item.get("source"), reason,
-                within_seconds=self.AMBIGUOUS_PROMOTION_WINDOW_SECONDS)
+                within_seconds=self.AMBIGUOUS_PROMOTION_WINDOW_SECONDS,
+                now=_utcnow(), including_item=item.get("item_uuid"))
         except Exception:  # noqa: BLE001
             logger.exception("scope classifier failed; treating as source-wide")
             return True
@@ -1120,26 +1326,67 @@ class DownloadQueueService:
         with self.db.transaction() as conn:
             if not conn:
                 return False
-            conn.execute(
+            updated = conn.execute(
                 """
                 UPDATE download_queue_items
                 SET state = 'ready',
-                    queue_reason = 'item_retry',
+                    -- 'item_retry' UNTIL 2026-08-16, and it is not in the
+                    -- column's CHECK list -- so every call to this method
+                    -- raised sqlite3.IntegrityError out of _execute_inner. The
+                    -- method exists to stop an ambiguous source-wide denial
+                    -- turning 78 items into permanent failures, and it had
+                    -- never once completed. Nothing caught it because the only
+                    -- tests that reach this path assert on the resulting row,
+                    -- and the write that raises leaves no row to assert on.
+                    --
+                    -- 'source_deferred' is the honest label: a source outcome
+                    -- deferred it. It is safe here because this row stays
+                    -- 'ready', and every recovery consumer keys on the DEFERRED
+                    -- states -- so the reason never reaches decide(), and the
+                    -- deferred-item diagnostics never count it.
+                    queue_reason = 'source_deferred',
                     scheduled_for = ?,
                     cooldown_until = ?,
                     last_reason_code = ?,
                     last_cause_code = ?,
                     last_message = ?,
-                    attempt_count = attempt_count + 1,
+                    -- NOT attempt_count + 1: _claim_due already incremented it
+                    -- when it claimed this row, so adding another here counted
+                    -- one attempt twice and made every deferral look like two.
                     transport_attempted = 1,
+                    -- RELEASE THE CLAIM. Leaving claimed_by/claim_expires_at set
+                    -- on a row put back to 'ready' leaves it owned by a worker
+                    -- that is finished with it, which the lease watchdog would
+                    -- later read as an expired claim on live work.
+                    claimed_by = NULL,
+                    claim_expires_at = NULL,
                     updated_at = ?
+                -- OWNERSHIP PREDICATE, matching _complete/_fail/_pause_for_source.
+                -- This used to be `WHERE item_uuid = ?` alone -- the only terminal
+                -- path with no ownership check. That is a real race: once the
+                -- lease expires the watchdog writes operation_timeout_unknown, a
+                -- safety state whose whole meaning is "we do not know whether the
+                -- delivery happened". A late worker arriving here could overwrite
+                -- it back to 'ready' and the item would be retried -- possibly
+                -- duplicating a delivery that already succeeded.
                 WHERE item_uuid = ?
+                  AND state = 'claimed'
+                  AND claimed_by = ?
                 """,
                 (outcome.get("cooldown_until") or now,
                  outcome.get("cooldown_until"),
                  outcome.get("reason_code"), outcome.get("cause_code"),
-                 outcome.get("message"), now, item["item_uuid"]),
-            )
+                 outcome.get("message"), now, item["item_uuid"], self.worker_id),
+            ).rowcount
+            if updated != 1:
+                # Same discipline as _pause_for_source: no row means we no longer
+                # own this item, and writing anything further would be a stale
+                # worker overwriting whoever does.
+                logger.warning(
+                    "ignored stale item-local deferral for queue item %s",
+                    item.get("item_uuid"),
+                )
+                return False
         row = self.get_item(item["item_uuid"]) or {"item_uuid": item["item_uuid"]}
         self._emit("download:queue_updated", row)
         return True
@@ -1654,11 +1901,40 @@ class DownloadQueueService:
               AND (
                     b.auto_resume_used < ?
                  OR b.source_delivery_count > b.auto_resume_progress_mark
+                 -- TIME-BASED CAPACITY (design review F5). The two clauses
+                 -- above deadlock: a batch needs a DELIVERY to refund its
+                 -- budget, and a RETRY to get a delivery. Once the counter is
+                 -- spent with no progress, only a human can revive it.
+                 --
+                 -- This is NOT "reset the counter every N hours", which the
+                 -- review warned turns a finite budget into an unbounded retry
+                 -- loop in slow motion. The budget still governs PACE; this
+                 -- only restores LIVENESS, and only after a long quiet period,
+                 -- so an exhausted batch retries at most once per window
+                 -- instead of never.
+                 --
+                 -- A verification hold is unaffected, but NOT because this
+                 -- query excludes it -- it does not. Discovery here is
+                 -- deliberately dumb (see below); _resume_batch is the single
+                 -- authority and refuses a held source there. Widening
+                 -- eligibility at this layer is therefore safe only for as
+                 -- long as that stays true, which is why it is stated rather
+                 -- than assumed.
+                 --
+                 -- Same clock as the authority (see the F4 note in _claim_due):
+                 -- decide() is handed `now` from _utcnow(), so this cutoff must
+                 -- come from _utcnow() too. A sqlite-side datetime('now') here
+                 -- would disagree with the authority under an injected clock,
+                 -- and the disagreement would show up as "discovered, then
+                 -- refused" -- the exact silent shape this finding is about.
+                 OR b.updated_at < ?
               )
             GROUP BY i.batch_uuid, i.source
             ORDER BY i.batch_uuid
             """,
-            (self._auto_resume_max_attempts(),),
+            (self._auto_resume_max_attempts(),
+             _iso(now - timedelta(
+                 seconds=self._exhausted_retry_window_seconds()))),
             default=[],
         )
         # PROGRESS IS AN INDEPENDENT PATH TO ELIGIBILITY, and it has to be.
@@ -2113,7 +2389,8 @@ class DownloadQueueService:
                 brow = conn.execute(
                     "SELECT cooldown_until, auto_resume_after_cooldown, "
                     "       auto_resume_used, source_delivery_count, "
-                    "       auto_resume_progress_mark, verification_hold_source "
+                    "       auto_resume_progress_mark, verification_hold_source, "
+                    "       updated_at "
                     "FROM download_queue_batches WHERE batch_uuid = ?",
                     (batch_uuid,),
                 ).fetchone()
@@ -2141,6 +2418,16 @@ class DownloadQueueService:
                     progress_mark=int(brow["auto_resume_progress_mark"] or 0),
                     max_attempts=parse_max_attempts(self.config),
                     verification_hold=held is not None,
+                    # F5: the deadlock exit. Supplied here and not only in the
+                    # discovery query because _resume_batch is the single
+                    # authority -- widening discovery alone left the batch
+                    # discovered and then refused, which is how this shipped
+                    # doing nothing until a test drove the real sweep.
+                    quiet_since=_parse(brow["updated_at"]),
+                    exhausted_retry_window_seconds=(
+                        self._exhausted_retry_window_seconds()
+                        if automated else None
+                    ),
                 )
                 candidates = conn.execute(
                     """
