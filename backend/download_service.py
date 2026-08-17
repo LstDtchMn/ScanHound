@@ -1251,23 +1251,42 @@ class DownloadService:
             except Exception as e:
                 logger.warning("remove_package JD step failed for id %s (uuid %s): %s", id_, uuid, e)
                 self._invalidate_jd_cache()
+        # ONE CRITICAL SECTION, matching remove_packages exactly. Delete, cache
+        # eviction and the epoch advance happen together, so a concurrent poll
+        # either persists BEFORE all of it (and the delete removes what it
+        # wrote) or arrives afterwards, sees a stale epoch, and declines.
+        #
+        # This path previously did the delete and eviction with NO lock and NO
+        # epoch advance, so it kept the exact race the bulk path was fixed for:
+        # a poll whose snapshot predates the delete writes the row straight back
+        # and the user watches a removed download reappear. Evicting the caches
+        # alone does not close it — eviction only stops the unchanged-state SKIP
+        # branch; a poll already holding a pre-delete snapshot still persists it.
+        #
+        # The JD network call above stays OUTSIDE this block on purpose: a
+        # wedged JDownloader must never hold the lock the poller needs.
         removed = 0
-        try:
-            removed = self.db.delete_download_result(id_) if self.db else 0
-        except Exception as e:
-            logger.warning("remove_package DB delete failed for id %s: %s", id_, e)
-        # Evict this package from the poller's in-memory caches (keyed by
-        # cache_key = package_uuid or name — pop both, since a legacy row may
-        # be name-keyed). Without this, an unchanged package still present in
-        # JD (e.g. the JD-side removal above failed) hits poll_results()'s
-        # unchanged-state skip branch on the next poll and re-emits the id we
-        # just deleted from the DB (ghost-id resurrection). Evicting forces
-        # that poll to treat it as a fresh row instead.
-        for key in (uuid, name):
-            if key:
-                self._results_cache.pop(key, None)
-                self._uuid_id.pop(key, None)
-                self._best_titles.pop(key, None)
+        with self._results_state():
+            try:
+                removed = self.db.delete_download_result(id_) if self.db else 0
+            except Exception as e:
+                logger.warning("remove_package DB delete failed for id %s: %s", id_, e)
+            # Keyed by cache_key = package_uuid or name — pop both, since a
+            # legacy row may be name-keyed. Without this, an unchanged package
+            # still present in JD (e.g. the JD-side removal above failed) hits
+            # poll_results()'s unchanged-state skip branch on the next poll and
+            # re-emits the id we just deleted (ghost-id resurrection).
+            for key in (uuid, name):
+                if key:
+                    self._results_cache.pop(key, None)
+                    self._uuid_id.pop(key, None)
+                    self._best_titles.pop(key, None)
+            # Advanced INLINE, not via _bump_epoch(): _epoch_lock() returns a
+            # plain Lock, not an RLock, and _results_state() is already holding
+            # it — calling _bump_epoch() here would deadlock. remove_packages
+            # does the same thing for the same reason.
+            if removed:
+                self._results_epoch = getattr(self, "_results_epoch", 0) + 1
         return {"ok": True, "removed": removed}
 
     def remove_packages(self, ids) -> dict:
