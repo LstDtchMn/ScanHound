@@ -59,25 +59,30 @@ export function resRank(name: string): number {
 export function seasonKey(name: string): string {
   const n = name || '';
 
-  // A RANGE or several markers cannot name one season, and must not be reduced
-  // to the first token: "Show S01-S03" is not season 1, and "Show S01E01-E10"
-  // is not episode 1. Returning the first match would give a whole-run package
-  // the same identity as a single season and let one be cancelled against the
-  // other. Unknown is the honest answer.
-  const markers = [...n.matchAll(/\bS(\d{1,2})(?:\s*E(\d{1,3}))?\b/gi)];
-  if (markers.length > 1) return '';
-  if (markers.length === 1) {
-    const m = markers[0];
-    const rest = n.slice((m.index ?? 0) + m[0].length);
-    if (/^\s*[-–—]\s*(?:[SE]\s*)?\d/i.test(rest)) return '';
+  // THE INVARIANT: return a positive identity only when the name proves exactly
+  // ONE content unit. A range or several markers cannot, and must not be
+  // reduced to the first token — "Show S01-S03" is not season 1 and
+  // "Show S01E01-E10" is not episode 1. Giving a whole-run package the same
+  // identity as a single season lets one be cancelled against the other.
+  //
+  // Both spellings are counted TOGETHER before anything is returned. Scanning
+  // Sxx first and only falling back to "Season N" made "Season 1-S3" parse as
+  // S03: the Sxx pass saw one marker with no range text after it and never
+  // looked left at the "Season 1" (peer review 2026-08-17, round 2).
+  const sxx = [...n.matchAll(/\bS(\d{1,2})(?:\s*E(\d{1,3}))?\b/gi)];
+  const words = [...n.matchAll(/\bSeason\s*(\d{1,2})\b/gi)];
+  if (sxx.length + words.length !== 1) return '';
+
+  if (sxx.length === 1) {
+    const m = sxx[0];
+    // A trailing range the token count cannot see: "S01-03", "S01E01-E10".
+    if (/^\s*[-–—]\s*(?:[SE]\s*)?\d/i.test(n.slice((m.index ?? 0) + m[0].length))) return '';
     const s = `S${m[1].padStart(2, '0')}`;
     return m[2] ? `${s}E${m[2].padStart(2, '0')}` : s;
   }
 
-  const words = [...n.matchAll(/\bSeason\s*(\d{1,2})\b/gi)];
-  if (words.length !== 1) return '';
   const w = words[0];
-  if (/^\s*[-–—]\s*\d/.test(n.slice((w.index ?? 0) + w[0].length))) return '';
+  if (/^\s*[-–—]\s*\d/.test(n.slice((w.index ?? 0) + w[0].length))) return ''; // Season 1-3
   return `S${w[1].padStart(2, '0')}`;
 }
 
@@ -98,13 +103,23 @@ export interface DownloadGroup {
   isDuplicate: boolean;
   best: DownloadResult;
   canKeepBest: boolean;
-  /** Whether these rows are PROVABLY the same content unit.
+  /** Whether the name proved exactly one SEASON TOKEN — no more than that.
    *
-   *  False when the names carry no season marker, which is UNKNOWN IDENTITY —
-   *  not proof of a movie, and not proof of the same season. 300 of 361 live
-   *  rows are in that state, including fourteen identically-named
-   *  `Law & Order; LA (2010) [1080p]` rows that may well be different seasons.
-   *  Display may still group them; a destructive action may not act on them. */
+   *  False when the names carry no season marker, or carry a range/multiple
+   *  markers. That is UNKNOWN IDENTITY — not proof of a movie, and not proof of
+   *  the same season. 300 of 361 live rows are in that state, including
+   *  fourteen identically-named `Law & Order; LA (2010) [1080p]` rows that may
+   *  well be different seasons. Display may still group them; a destructive
+   *  action may not act on them.
+   *
+   *  DELIBERATELY NOT called "same content unit", because it is weaker than
+   *  that and the weaker reading is the safe one to hold. `normalizeTitle`
+   *  strips the year, so two TV remakes sharing a title and a season number
+   *  still collapse — `Battlestar Galactica (1978) S01` and
+   *  `(2004) S01` both reduce to `battlestar galactica|S01` and would be
+   *  actionable. That predates this field and is narrowed by it, not caused by
+   *  it; closing it needs kind/year/season carried authoritatively from the
+   *  backend rather than more display-string heuristics (peer review round 2). */
   identityKnown: boolean;
 }
 

@@ -168,6 +168,24 @@ describe('unknown identity must not authorise deletion', () => {
     expect(seasonKey('Some Show S01 S02 [1080p]')).toBe('');
   });
 
+  it('a MIXED-spelling range is unknown too', () => {
+    // The Sxx scan runs before the "Season N" scan, so "Season 1-S3" found one
+    // marker (S3) with no range text after it and returned S03 — giving a
+    // whole-run package the same actionable identity as a real S03 release.
+    expect(seasonKey('Some Show Season 1-S3 [1080p]')).toBe('');
+    expect(seasonKey('Some Show Season 1 - S03 [1080p]')).toBe('');
+    expect(seasonKey('Some Show S1-Season 3 [1080p]')).toBe('');
+  });
+
+  it('a mixed-range package never becomes actionable against a real season', () => {
+    const groups = groupDownloads([
+      r({ id: 1, title: 'Some Show [1080p]', name: 'Some Show S03 [1080p]', state: 'queued' }),
+      r({ id: 2, title: 'Some Show [1080p]', name: 'Some Show Season 1-S3 [1080p]', state: 'queued' })
+    ]);
+    expect(groups).toHaveLength(2);
+    expect(groups.every((g) => !g.canKeepBest)).toBe(true);
+  });
+
   it('a range package does not group with the single season it starts at', () => {
     const groups = groupDownloads([
       r({ id: 1, title: 'Some Show [1080p]', name: 'Some Show S01 [1080p]', state: 'queued' }),
