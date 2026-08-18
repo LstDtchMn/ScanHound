@@ -377,3 +377,80 @@ class TestIdentityReachesTheConsumer:
         assert len(rows) == 1
         assert rows[0]["identity_kind"] == "unknown"
         assert rows[0]["identity_season"] is None
+
+
+class TestIdentityGuardsThatNearlyWentUntested:
+    """Cases an adversarial pass named. Each is a way a test above could pass
+    while the property it claims is broken."""
+
+    def test_a_whitespace_only_title_is_not_an_identity(self, db):
+        """The placeholder fix stripped for the COMPARISON but tested emptiness
+        on the raw value, so "   " is truthy, strips to nothing, matches no
+        placeholder, and sailed through as a confident movie identity."""
+        db.add_to_history(A, "   ", year=2020)
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "unknown"
+        assert rows[0]["identity_title"] is None
+
+    def test_a_padded_title_lands_on_the_wire_stripped(self, db):
+        """Otherwise the same show padded differently would carry two different
+        identities, which is the collision this module exists to prevent."""
+        db.add_to_history(A, "  The Repair Shop  ", season=2, year=2017)
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_title"] == "The Repair Shop"
+
+    def test_an_unproven_row_BESIDE_a_proven_one_gets_no_identity(self, db):
+        """THE early-return trap, which this file already documents for links
+        and which the identity tests had NOT covered.
+
+        annotate_source_links returns before the resolution loop when NO row
+        carries provenance, so a list of only-unproven rows never reaches the
+        per-row code at all -- a fail-closed test built that way passes for the
+        wrong reason, and a name-matching identity fallback added to that loop
+        would survive it. This list is the mixed shape a live JDownloader
+        session actually has.
+        """
+        db.add_to_history(A, "The Repair Shop", season=2, year=2017,
+                          package_name="The Repair Shop (2017) S02 [1080p]")
+        other = "https://source.example/release-B"
+        db.add_to_history(other, "Other Show", season=9, year=2001)
+        rows = [
+            {"name": "Other Show (2001) S09 [1080p]", "provenance_url": other},
+            # Name matches a real history row exactly, but is UNPROVEN.
+            {"name": "The Repair Shop (2017) S02 [1080p]", "provenance_url": None},
+        ]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_season"] == 9, "the proven row lost its identity"
+        assert rows[1]["identity_kind"] == "unknown", "a name match bought an identity"
+        assert rows[1]["identity_season"] is None
+        assert rows[1]["identity_title"] is None
+
+    def test_identity_source_stays_unknown_when_only_the_link_resolves(self, db):
+        """A proven url with no history row gets its LINK but no identity. If
+        identity_source were set on the link path, a consumer would read
+        'provenance' beside kind='unknown' and title=None."""
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["source_url"] == A
+        assert rows[0]["identity_source"] == "unknown"
+        assert rows[0]["identity_kind"] == "unknown"
+
+    def test_a_placeholder_is_matched_WHOLE_not_by_prefix(self, db):
+        """Loosening the guard to startswith would survive a mid-string test."""
+        db.add_to_history(A, "Untitled Horror Project", year=2020)
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "movie"
+        assert rows[0]["identity_title"] == "Untitled Horror Project"

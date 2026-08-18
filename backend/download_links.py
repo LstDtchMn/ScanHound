@@ -141,7 +141,8 @@ def annotate_source_links(db, rows):
             continue
         row["first_seen_at"] = rec.get("date_added")
         title = rec.get("title")
-        if not title or str(title).strip().casefold() in _PLACEHOLDER_TITLES:
+        clean = str(title).strip() if title else ""
+        if not clean or clean.casefold() in _PLACEHOLDER_TITLES:
             # A row with no recorded title cannot identify anything, so it must
             # not claim a kind either -- "movie with no title" would group every
             # such row together. A PLACEHOLDER is the same failure wearing a
@@ -149,7 +150,7 @@ def annotate_source_links(db, rows):
             # the same release.
             continue
         season = rec.get("season")
-        row["identity_title"] = title
+        row["identity_title"] = clean
         row["identity_year"] = rec.get("year")
         row["identity_season"] = season
         row["identity_kind"] = "movie" if season is None else "tv_season"
