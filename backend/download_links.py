@@ -166,7 +166,15 @@ def annotate_source_links(db, rows):
             # the same release.
             continue
         season = rec.get("season")
-        year = rec.get("year")
+        # `or None` because 0 IS THE INGEST SENTINEL FOR "no year", not a year.
+        # scanner_service writes `year=d.get('year', 0) or 0`, and 6 live rows
+        # carry year=0 -- the only sub-1900 value in the column. Testing
+        # `year is None` alone let all six through: five have a season and would
+        # have gone out as tv_season carrying identity_year=0, a WRONG value
+        # rather than an absent one, and the sixth has no season either and would
+        # have been a confident `movie` whose guard had just been added to stop
+        # exactly that.
+        year = rec.get("year") or None
         if season is None and year is None:
             # NEITHER discriminator. "movie" here would be a guess, and a wrong
             # one: 16 live history rows are plainly TV -- their source url slug

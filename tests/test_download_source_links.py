@@ -472,6 +472,36 @@ class TestIdentityGuardsThatNearlyWentUntested:
                for r in rows if r["identity_title"] is not None]
         assert ids == [], f"rows share an identity: {ids}"
 
+    def test_year_ZERO_is_the_no_year_SENTINEL_not_a_year(self, db):
+        """`scanner_service` writes `year=d.get('year', 0) or 0`, so 0 means "we
+        did not parse one" -- it is the only sub-1900 value in the live column,
+        across 6 rows. Testing `year is None` let every one through, which
+        re-opened the collision the year requirement had just been added to
+        close."""
+        b = "https://source.example/release-B"
+        db.add_to_history(A, "Some Show", year=0)   # no season, sentinel year
+        db.add_to_history(b, "Some Show", year=0)
+        rows = [{"name": "a", "provenance_url": A}, {"name": "b", "provenance_url": b}]
+
+        annotate_source_links(db, rows)
+
+        for row in rows:
+            assert row["identity_kind"] == "unknown", "year=0 was treated as a year"
+            assert row["identity_title"] is None
+
+    def test_a_sentinel_year_never_reaches_the_wire_as_a_value(self, db):
+        """A TV row keeps its identity on the season alone, but must not carry
+        year=0 outward. A consumer grouping on (title, year) would treat 0 as a
+        real year, which is worse than a missing one -- it looks answered."""
+        db.add_to_history(A, "Frankie vs the Internet", season=2, year=0)
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "tv_season"
+        assert rows[0]["identity_season"] == 2
+        assert rows[0]["identity_year"] is None, "the 0 sentinel leaked onto the wire"
+
     def test_a_movie_WITH_a_year_still_gets_its_identity(self, db):
         """The positive control. Without it, "always return unknown" would pass
         every fail-closed assertion in this class."""
