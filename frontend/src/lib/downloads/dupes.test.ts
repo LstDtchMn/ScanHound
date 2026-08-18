@@ -144,6 +144,49 @@ describe('isCanonicalSeasonName — the authorization grammar', () => {
     expect(isCanonicalSeasonName('Some Show 1, S02 [1080p]')).toBe(false);
   });
 
+  it('rejects a WORD continuation separator, not just punctuation', () => {
+    // Round 6: the denylist only had symbols, so "Season 1 and S02" and
+    // "1 through S03" still read as one unit and could authorise cancelling a
+    // multi-season pack against a single season.
+    expect(isCanonicalSeasonName('Some Show 1 and S02 [1080p]')).toBe(false);
+    expect(isCanonicalSeasonName('Some Show 1 through S03 [1080p]')).toBe(false);
+    expect(isCanonicalSeasonName('Some Show 1 til S02 [1080p]')).toBe(false);
+    expect(isCanonicalSeasonName('Some Show 1 until S02 [1080p]')).toBe(false);
+    expect(isCanonicalSeasonName('Some Show 1 plus S02 [1080p]')).toBe(false);
+  });
+
+  it('does not let a separator WORD inside a title reject the name', () => {
+    // The denylist is word-bounded. Without \b, "Toronto" ends in "to" and
+    // "Thailand" in "and", so both would be refused -- a real coverage loss,
+    // and exactly what a stray escape produced while writing this.
+    expect(isCanonicalSeasonName('Toronto S02 [1080p]')).toBe(true);
+    expect(isCanonicalSeasonName('Thailand S02 [1080p]')).toBe(true);
+    expect(isCanonicalSeasonName('Cagney and Lacey S02 [1080p]')).toBe(true);
+  });
+
+  it("enforces the producer's own 50-character contract", () => {
+    // Round 6: matching against the last N characters silently ACCEPTED names
+    // outside the contract, and slicing could cut away the very separator that
+    // disqualifies one. compute_package_name returns at most 50 chars on every
+    // path, so anything longer did not come from us.
+    const long51 = 'A'.repeat(51 - ' S02'.length) + ' S02';
+    expect(long51.length).toBe(51);
+    expect(isCanonicalSeasonName(long51)).toBe(false);
+    // ...and exactly 50 is still accepted, so the boundary is not off by one.
+    const long50 = 'A'.repeat(50 - ' S02'.length) + ' S02';
+    expect(long50.length).toBe(50);
+    expect(isCanonicalSeasonName(long50)).toBe(true);
+    // The real longest producer output measured in the live table.
+    expect(isCanonicalSeasonName("Andrew Zimmern's Wild Game Kitc (2022) S01 [1080p]")).toBe(true);
+  });
+
+  it('cannot be fooled by a separator pushed outside a tail window', () => {
+    // The unsoundness the length cap removes: with a last-80 window, padding
+    // the prefix moved the disqualifying separator out of view.
+    const padded = 'A'.repeat(200) + ' 1 & S02 [1080p]';
+    expect(isCanonicalSeasonName(padded)).toBe(false);
+  });
+
   it('accepts a title ending in punctuation even with no year', () => {
     // The separator check is a DENYLIST for exactly this reason. An allowlist
     // of preceding characters (`[\w)\]]`) rejected these, and compute_package_

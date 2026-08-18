@@ -72,30 +72,51 @@ const CONTINUES_INTO_ANOTHER_UNIT = /^\s*(?:[-–—&+/,]|to\b)\s*(?:[SE]\s*)?\d
  *  separates the range endpoint from the bracket the way the canonical form
  *  does), and `Season 1 & 2 [1080p]` has no `SNN` there at all.
  *
- *  The bracket payload is LENGTH-BOUNDED, and the match runs against a bounded
- *  tail (see `isCanonicalSeasonName`). An unbounded `[^\]]*` before an end
- *  anchor rescans to end-of-string from every candidate position, which is
- *  quadratic on a name that repeats `a S01 [`: measured 14 KB -> 13 ms,
- *  28 KB -> 53 ms, 56 KB -> 206 ms, i.e. 4x per doubling. `name` comes from
- *  JDownloader rather than from us, and this runs per row on every render. */
+ *  The bracket payload is LENGTH-BOUNDED and the whole NAME is length-capped
+ *  (below). An unbounded `[^\]]*` before an end anchor rescans to
+ *  end-of-string from every candidate position, which is quadratic on a name
+ *  that repeats `a S01 [`: measured 14 KB -> 13 ms, 28 KB -> 53 ms,
+ *  56 KB -> 206 ms, i.e. 4x per doubling. `name` comes from JDownloader rather
+ *  than from us, and this runs per row on every render. */
 const CANONICAL_SEASON_SUFFIX = /\sS(\d{2})(?:\s*\[[^\]]{0,40}\])?\s*$/i;
 
-/** How much of the tail the suffix match may look at. `compute_package_name`
- *  caps the WHOLE name at 50 characters and the suffix itself is ~20, so this
- *  is generous for anything the producer can emit while keeping the match cost
- *  independent of an arbitrarily long JDownloader-supplied name. */
-const CANONICAL_TAIL_WINDOW = 80;
+/** The producer's OWN length contract. `compute_package_name()` returns at most
+ *  50 characters on every path — it trims the title to fit the suffix, and its
+ *  fallback branch truncates the whole string — so a longer name did not come
+ *  from us and cannot be vouched for.
+ *
+ *  This replaced a "look at the last N characters" window, which was unsound in
+ *  two ways the round-6 review named: slicing can cut away the very separator
+ *  that disqualifies a name, and a window silently ACCEPTS names outside the
+ *  contract instead of refusing them. Enforcing the real bound is both stricter
+ *  and simpler, and it makes the regex input bounded, so the quadratic case
+ *  cannot arise at all rather than being merely survivable.
+ *
+ *  Measured: all 437 `downloads.package_name` values are <= 50 (max exactly
+ *  50). Four `download_results.name` rows exceed it, all hand-added scene names
+ *  such as `The.World.Will.Tremble.2025...-SPHD`; the only one carrying a
+ *  season token is `Wild.Kratts.S07E13E14...`, a multi-episode range that must
+ *  never authorise and is already refused. So this rejects nothing that
+ *  currently authorises. */
+const MAX_PRODUCER_NAME = 50;
 
 /** A continuation separator sitting immediately BEFORE the season token, which
  *  makes the token a range endpoint rather than the whole unit: `Show 1 & S02`.
  *
  *  A DENYLIST of separators, not an allowlist of title characters. The previous
- *  version required the preceding character to be `[\w)\]]`, which also rejected
- *  every title ending in punctuation when no year followed it — measured:
- *  `Weird But True! S02 [1080p]` and `Whose Line Is It Anyway? S05 [1080p]` are
- *  both producible by compute_package_name and were both refused, so those
- *  shows could never offer the action at all. */
-const PRECEDED_BY_CONTINUATION = /(?:[-–—&+/,]|\bto)\s*$/i;
+ *  version required the preceding character to be `[\w)\]]`, which also
+ *  rejected every title ending in punctuation when no year followed it —
+ *  measured: `Weird But True! S02 [1080p]` and
+ *  `Whose Line Is It Anyway? S05 [1080p]` are both producible by
+ *  compute_package_name and were both refused, so those shows could never offer
+ *  the action at all.
+ *
+ *  WORD separators count too, which round 6 caught: `Season 1 and S02`,
+ *  `1 through S03`, `1 til S02`. Rejecting a title that genuinely ends in one
+ *  of these words is a false NEGATIVE — it withholds the button — so the list
+ *  errs long deliberately. */
+const PRECEDED_BY_CONTINUATION =
+  /(?:[-–—&+/,~]|\b(?:to|and|through|thru|til|till|until|plus|versus|vs))\s*$/i;
 
 /** THE AUTHORIZATION PARSER. True only when the name is structurally ScanHound's
  *  own single-season form, and therefore proves ONE content unit.
@@ -118,21 +139,22 @@ const PRECEDED_BY_CONTINUATION = /(?:[-–—&+/,]|\bto)\s*$/i;
  *  is the form ScanHound emits, so none authorises. They still GROUP correctly
  *  — see `seasonKey`.
  *
- *  NOT semantic proof, and deliberately not documented as such. The leading
- *  `[\w)\]]` guard rejects `Show 1 & S02`, but it cannot establish that the
- *  prefix is really a title: `Show 1 to 2 S03 [1080p]` satisfies the grammar
- *  because the character before ` S03` is a digit. A frontend suffix parser
- *  cannot close that; authoritative identity from the backend can, and is the
- *  follow-up (peer review round 4). */
+ *  NOT semantic proof, and deliberately not documented as such. The separator
+ *  denylist rejects `Show 1 & S02` and `Show 1 and S02`, but it cannot
+ *  establish that the prefix is really a title: `Show 1 to 2 S03 [1080p]`
+ *  satisfies the grammar because what precedes ` S03` is the digit 2, not a
+ *  separator. A frontend suffix parser cannot close that; authoritative
+ *  identity from the backend can, and is the follow-up (peer review round 4). */
 export function isCanonicalSeasonName(name: string): boolean {
   const n = name || '';
-  // Bounded window keeps this linear in the length of a hostile name; see
-  // CANONICAL_SEASON_SUFFIX. Slicing can only remove leading context, and the
-  // separator that matters sits within a few characters of the token.
-  const tail = n.slice(-CANONICAL_TAIL_WINDOW);
-  const m = CANONICAL_SEASON_SUFFIX.exec(tail);
+  // The producer's own length contract, enforced FIRST. It refuses names we
+  // cannot have written, and it bounds the regex input so the quadratic case
+  // cannot arise. Checked before the match, never after — a window over the
+  // tail would have silently accepted these instead.
+  if (n.length > MAX_PRODUCER_NAME) return false;
+  const m = CANONICAL_SEASON_SUFFIX.exec(n);
   if (!m) return false;
-  if (PRECEDED_BY_CONTINUATION.test(tail.slice(0, m.index))) return false;
+  if (PRECEDED_BY_CONTINUATION.test(n.slice(0, m.index))) return false;
   // STILL LOAD-BEARING after the suffix tightened, despite appearances:
   // `Season 1 S03 [1080p]` satisfies the suffix (the character before ` S03`
   // is the digit 1) and is rejected only here, by the second season token.
