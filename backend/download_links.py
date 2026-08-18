@@ -71,10 +71,26 @@ def annotate_source_links(db, rows):
 
     `identity_kind` is `tv_season` when a season was recorded and `movie` when
     one was not. That is the discriminator the backend already uses on itself
-    (`save_to_history` keys its lookup on `season is not None`), and it holds in
-    the data: of 460 history rows with no season, none carry a season token in
-    their title or package name. It is a CONVENTION, not a constraint the schema
-    enforces, which is why a row we cannot look up stays `unknown` rather than
+    (`save_to_history` keys its lookup on `season is not None`), but it is a
+    CONVENTION rather than a schema constraint, and on its own it DOES NOT HOLD.
+
+    An earlier version of this docstring defended it by noting that no
+    season-less history row carries a season token in its title or package name.
+    That was true and misleading: the season is in the SOURCE URL, which that
+    check never looked at. Measured properly, 16 season-less rows are plainly TV
+    (`...-s02-...` in the hdencode slug), and four title groups hold more than
+    one -- `Law & Order: Special Victims Unit` has three, which are seasons 1, 2
+    and 3.
+
+    So `movie` additionally requires a YEAR. All 16 of those rows also lack one,
+    which makes the year a clean discriminator rather than a patch aimed at
+    them, and it is the principled rule anyway: a movie identity IS title+year,
+    so a row with neither season nor year has nothing to identify with and stays
+    `unknown`. Cost: 179 year-less rows lose a movie identity, 273 keep one.
+    None of the 16 reaches the wire today (none carries provenance), so this
+    closes the mechanism before it can produce a wrong answer rather than after.
+
+    A row we cannot look up at all likewise stays `unknown` rather than
     defaulting to `movie` -- guessing "movie" would authorise cancelling one
     season against another.
 
@@ -150,8 +166,19 @@ def annotate_source_links(db, rows):
             # the same release.
             continue
         season = rec.get("season")
+        year = rec.get("year")
+        if season is None and year is None:
+            # NEITHER discriminator. "movie" here would be a guess, and a wrong
+            # one: 16 live history rows are plainly TV -- their source url slug
+            # says `-s02-` -- with no season recorded, and ALL 16 also lack a
+            # year. Three are Law & Order: Special Victims Unit seasons 1, 2
+            # and 3, which would have collapsed onto ONE identity: the exact
+            # collision this module exists to prevent, produced by the module
+            # itself. A movie identity IS title+year, so a row with neither
+            # season nor year has nothing to identify with.
+            continue
         row["identity_title"] = clean
-        row["identity_year"] = rec.get("year")
+        row["identity_year"] = year
         row["identity_season"] = season
         row["identity_kind"] = "movie" if season is None else "tv_season"
         row["identity_source"] = "provenance"

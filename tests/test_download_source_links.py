@@ -445,6 +445,57 @@ class TestIdentityGuardsThatNearlyWentUntested:
         assert rows[0]["identity_source"] == "unknown"
         assert rows[0]["identity_kind"] == "unknown"
 
+    def test_THE_live_shape_that_would_have_collapsed_three_seasons(self, db):
+        """The real rows, from the live table. `Law & Order: Special Victims
+        Unit` has three history rows whose source urls say seasons 1, 2 and 3
+        but whose `season` column was never filled in. Under "no season means
+        movie" all three became ONE identity -- kind=movie, same title, year
+        None, season None -- and a consumer grouping on that would have offered
+        to cancel between three different seasons.
+
+        Requiring a year for `movie` closes it: all 16 such live rows also lack
+        a year. This asserts they stay UNKNOWN and, critically, that they do not
+        share an identity."""
+        urls = [f"https://hdencode.org/law-and-order-svu-s0{n}-1080p/" for n in (1, 2, 3)]
+        for u in urls:
+            db.add_to_history(u, "Law & Order: Special Victims Unit")  # no season, no year
+        rows = [{"name": f"row-{i}", "provenance_url": u} for i, u in enumerate(urls)]
+
+        annotate_source_links(db, rows)
+
+        for row in rows:
+            assert row["identity_kind"] == "unknown"
+            assert row["identity_source"] == "unknown"
+            assert row["identity_title"] is None
+        # No two rows may present the same non-null identity.
+        ids = [(r["identity_title"], r["identity_year"], r["identity_season"])
+               for r in rows if r["identity_title"] is not None]
+        assert ids == [], f"rows share an identity: {ids}"
+
+    def test_a_movie_WITH_a_year_still_gets_its_identity(self, db):
+        """The positive control. Without it, "always return unknown" would pass
+        every fail-closed assertion in this class."""
+        db.add_to_history(A, "Notting Hill", year=1999)
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "movie"
+        assert rows[0]["identity_year"] == 1999
+
+    def test_a_tv_row_with_a_season_but_no_year_is_still_tv(self, db):
+        """The year requirement applies ONLY to the movie verdict. A recorded
+        season is itself the discriminator, so a year-less TV row keeps its
+        identity rather than being caught by the new guard."""
+        db.add_to_history(A, "Some Show", season=4)
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "tv_season"
+        assert rows[0]["identity_season"] == 4
+        assert rows[0]["identity_year"] is None
+
     def test_a_placeholder_is_matched_WHOLE_not_by_prefix(self, db):
         """Loosening the guard to startswith would survive a mid-string test."""
         db.add_to_history(A, "Untitled Horror Project", year=2020)
