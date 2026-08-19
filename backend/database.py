@@ -3981,6 +3981,7 @@ class DatabaseManager:
                     return None
                 cur = conn.cursor()
                 row = None
+                adopted_by_name = False
                 if package_uuid is not None:
                     cur.execute("SELECT id FROM download_results WHERE package_uuid = ?",
                                 (package_uuid,))
@@ -3990,6 +3991,9 @@ class DatabaseManager:
                                     "WHERE package_uuid IS NULL AND name = ? "
                                     "ORDER BY updated_at DESC LIMIT 1", (name,))
                         row = cur.fetchone()
+                        # ADOPTION: this row was matched by NAME, so the
+                        # package it belongs to is about to CHANGE.
+                        adopted_by_name = row is not None
                 else:
                     cur.execute("SELECT id FROM download_results WHERE name = ? "
                                 "ORDER BY (package_uuid IS NULL) DESC, updated_at DESC LIMIT 1",
@@ -4013,13 +4017,23 @@ class DatabaseManager:
                         # only because the production caller never emits that
                         # combination. An invariant that depends on callers
                         # behaving is not an invariant; this makes it structural.
+                        # ...UNLESS this update also changes which package
+                        # the row belongs to. A legacy NULL-uuid row adopted
+                        # by NAME keeps its id, so "the previous proof stands"
+                        # would hand the OLD package's proof to the NEW one --
+                        # and identical names across releases are the exact
+                        # collision this whole feature exists to remove. Proof
+                        # does not transfer across a name-based ownership change
+                        # without current evidence (peer review round 3).
                         "provenance_url = CASE WHEN ? = 1 THEN ? "
+                        "                      WHEN ? = 1 THEN NULL "
                         "                      ELSE provenance_url END, "
                         "updated_at = CURRENT_TIMESTAMP "
                         "WHERE id = ?",
                         (package_uuid, name, title, host, bytes_total, bytes_loaded,
                          downloaded, extraction, state, error,
                          1 if provenance_observed else 0, provenance_url,
+                         1 if (adopted_by_name and not provenance_observed) else 0,
                          rid))
                     conn.commit()
                     return rid
@@ -4179,12 +4193,19 @@ class DatabaseManager:
         """
         wanted = []
         for value in (ids or []):
-            try:
-                wanted.append(int(value))
-            except (TypeError, ValueError):
-                # No id, or not one. Skip rather than guess -- an unrecovered
-                # row stays unknown, which is the direction that cannot be wrong.
-                continue
+            # STRICT, not coercive. Production ids are SQLite integers, so
+            # int() bought nothing and quietly widened the contract -- True
+            # became 1 and 1.0 became 1, either of which would look up a real
+            # row. `type(value) is int` rather than isinstance() because bool
+            # IS an int subclass. Fail closed and log: annotation is
+            # deliberately non-fatal, so a malformed id must not take down the
+            # downloads view, but it should not pass silently either.
+            if type(value) is int and value > 0:
+                wanted.append(value)
+            elif value is not None:
+                logger.warning(
+                    "download results: ignoring malformed row id %r (%s) in "
+                    "provenance recovery", value, type(value).__name__)
         wanted = list(dict.fromkeys(wanted))
         if not wanted:
             return {}

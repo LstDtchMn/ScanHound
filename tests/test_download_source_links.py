@@ -706,3 +706,89 @@ class TestFreshnessAgreesAcrossTransports:
 
         assert ws[0]["source_url"] is None
         assert ws[0]["identity_kind"] == "unknown"
+
+    def test_an_unobserved_NAME_ADOPTION_does_not_inherit_the_old_proof(self, db):
+        """THE round-3 finding. `download_results.id` is durable, but the
+        PACKAGE the row belongs to is not.
+
+        upsert_download_result adopts a legacy NULL-uuid row BY NAME when an
+        exact uuid lookup misses. The update installs the new uuid
+        (COALESCE) while preserving the stored provenance (CASE WHEN
+        observed). So the row keeps its id, changes owner, and keeps the OLD
+        owner's proof -- and id-keyed recovery then faithfully hands that proof
+        to the new package. Identical names across releases are exactly the
+        collision this feature exists to remove, so proof must not transfer
+        across a name-based ownership change without current evidence."""
+        name = "Adopted Name (2019) S01 [1080p]"
+        db.add_to_history(A, "Legacy Show", season=1, year=2019, package_name=name)
+        # A legacy row: no uuid, with a proof.
+        db.upsert_download_result(name=name, package_uuid=None, state="downloading",
+                                  provenance_url=A, provenance_observed=True)
+        legacy_id = db.get_download_result_id(None, name)
+        assert legacy_id is not None
+
+        # A DIFFERENT package, same display name, arriving on an UNOBSERVED poll.
+        db.upsert_download_result(name=name, package_uuid="uuid-NEW",
+                                  state="downloading", provenance_url=None,
+                                  provenance_observed=False)
+
+        adopted = db._query_dicts(
+            "SELECT id, package_uuid, provenance_url FROM download_results WHERE name = ?",
+            (name,))
+        assert len(adopted) == 1, "expected adoption, not a second row"
+        assert adopted[0]["id"] == legacy_id, "fixture did not exercise adoption"
+        assert adopted[0]["package_uuid"] == "uuid-NEW", "ownership did not change"
+        assert adopted[0]["provenance_url"] is None, (
+            "the new package inherited the old package's proof")
+
+        ws = [{"id": legacy_id, "package_uuid": "uuid-NEW", "name": name,
+               "state": "downloading", "provenance_url": None,
+               "provenance_observed": False}]
+        annotate_source_links(db, ws)
+        assert ws[0]["identity_kind"] == "unknown"
+        assert ws[0]["source_url"] is None
+
+    def test_an_OBSERVED_adoption_still_applies_the_current_value(self, db):
+        """The control. Clearing on adoption must apply only to the unobserved
+        case -- an observed poll is current evidence and stays authoritative,
+        including a NULL retraction."""
+        name = "Observed Adopt (2019) S02 [1080p]"
+        b = "https://source.example/release-B"
+        db.add_to_history(A, "Old Show", season=1, year=2019, package_name=name)
+        db.add_to_history(b, "New Show", season=2, year=2019, package_name=name)
+        db.upsert_download_result(name=name, package_uuid=None, state="downloading",
+                                  provenance_url=A, provenance_observed=True)
+        db.upsert_download_result(name=name, package_uuid="uuid-OBS", state="downloading",
+                                  provenance_url=b, provenance_observed=True)
+
+        row = db._query_dicts(
+            "SELECT provenance_url FROM download_results WHERE name = ?", (name,))[0]
+        assert row["provenance_url"] == b, "an observed adoption lost its own proof"
+
+    def test_a_uuidless_row_gets_no_last_proof_recovery(self, db):
+        """For a package with no uuid the persisted row is resolved BY NAME, so
+        the id itself came from the ambiguous signal. Resurrecting a stored
+        proof onto it would launder a name match into an identity."""
+        name = "No UUID (2019) S03 [1080p]"
+        db.add_to_history(A, "Some Show", season=3, year=2019, package_name=name)
+        db.upsert_download_result(name=name, package_uuid=None, state="downloading",
+                                  provenance_url=A, provenance_observed=True)
+        rid = db.get_download_result_id(None, name)
+
+        ws = [{"id": rid, "package_uuid": None, "name": name,
+               "state": "downloading", "provenance_url": None,
+               "provenance_observed": False}]
+        annotate_source_links(db, ws)
+
+        assert ws[0]["source_url"] is None
+        assert ws[0]["identity_kind"] == "unknown"
+
+    def test_a_malformed_row_id_is_ignored_rather_than_coerced(self, db):
+        """`True` and `1.0` both coerce to 1 under int(), which would look up a
+        real row. Strict validation, and never a raise -- annotation must not
+        take down the downloads view."""
+        self._seed(db)
+        real = db.get_download_result_id(self.UUID, self.NAME)
+        assert db.get_persisted_provenance([real]) == {real: A}
+        for bogus in (True, 1.0, "1", -1, 0, None, object()):
+            assert db.get_persisted_provenance([bogus]) == {}, f"accepted {bogus!r}"

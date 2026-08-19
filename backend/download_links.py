@@ -138,10 +138,18 @@ def annotate_source_links(db, rows):
         # carry the same one; a row that somehow has none is left unrecovered,
         # because recovering by name would let a different same-named row donate
         # its provenance -- the exact collision identity exists to remove.
+        # A UUID IS REQUIRED, not just an id. For a package with no uuid,
+        # `get_download_result_id(None, name)` resolves the persisted row BY
+        # NAME, so the id itself was chosen with the ambiguous signal this
+        # feature exists to stop trusting. Recovering a stored proof onto such a
+        # row would launder a name match into an identity. Those rows may still
+        # use provenance they observed directly this poll; they just do not get
+        # a previous proof resurrected (peer review round 3).
         stale = [r for r in rows
                  if not r.get("provenance_url")
                  and r.get("provenance_observed") is False
-                 and r.get("id") is not None]
+                 and r.get("id") is not None
+                 and r.get("package_uuid")]
         if stale:
             persisted = db.get_persisted_provenance([r.get("id") for r in stale]) or {}
             for row in stale:
