@@ -22,14 +22,25 @@
 # Run AFTER ScanHound's version-label sync, the same ordering the DV badges need.
 
 # ---------------------------------------------------------------------------
-# DRAWN TOP-RIGHT, NOT TOP-LEFT.
+# DRAWN TOP-RIGHT, STACKED BELOW THE DOLBY VISION BADGE.
 #
-# Every block in dv_badges.yml draws at horizontal_align: left / vertical_align:
-# top with the same offsets, and that file warns that adding another there
-# stacks overlapping labels. This is not a hypothetical collision: 1,029 movies
-# have multiple versions and most of them already carry a DV or HDR10 badge in
-# that corner, so top-left would overlap on the common case rather than the edge
-# case.
+# Measured against the file Kometa ACTUALLY LOADS, which is /config/dv-layer.yml
+# in the running container -- not docs/kometa/dv_badges.yml in this repo. Those
+# two disagree, and trusting the repo copy is how this file first shipped with a
+# guaranteed collision: it draws the DV pill at
+#
+#     horizontal_align: right   vertical_align: top   offsets 15 / 15
+#     image 250 x 96, so it occupies y = 15..111
+#
+# while this file used the IDENTICAL position. Every movie carrying both would
+# have drawn one badge on top of the other -- and that is the common case, not
+# the edge case: 1,029 movies have multiple versions and most of them are also
+# DV or HDR10.
+#
+# vertical_offset 123 = 15 (DV top) + 96 (DV height) + 12 (gap), so the two
+# stack in a right-hand column. The other corners are taken: the ratings row is
+# top-left and the resolution badge is at the bottom, both per dv-layer.yml's
+# own comment.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -53,7 +64,7 @@ overlays:
       name: text(2 VERSIONS)
       horizontal_offset: 15
       horizontal_align: right
-      vertical_offset: 15
+      vertical_offset: 123
       vertical_align: top
       font_color: "#FFFFFF"
       back_color: "#00000099"
@@ -69,7 +80,7 @@ overlays:
       name: text(3 VERSIONS)
       horizontal_offset: 15
       horizontal_align: right
-      vertical_offset: 15
+      vertical_offset: 123
       vertical_align: top
       font_color: "#FFFFFF"
       back_color: "#00000099"
@@ -85,7 +96,7 @@ overlays:
       name: text(4 VERSIONS)
       horizontal_offset: 15
       horizontal_align: right
-      vertical_offset: 15
+      vertical_offset: 123
       vertical_align: top
       font_color: "#FFFFFF"
       back_color: "#00000099"
@@ -101,7 +112,7 @@ overlays:
       name: text(5+ VERSIONS)
       horizontal_offset: 15
       horizontal_align: right
-      vertical_offset: 15
+      vertical_offset: 123
       vertical_align: top
       font_color: "#FFFFFF"
       back_color: "#00000099"

@@ -235,14 +235,34 @@ class TestTheKometaConfigCoversEveryLabel:
                  for block in self._overlays().values()}
         assert gated - set(VERSION_LABELS) == set()
 
-    def test_the_badges_do_not_draw_over_the_DV_badges(self):
-        """dv_badges.yml draws every block top-LEFT and warns that a second one
-        there stacks overlapping labels. Most of these 1,029 movies already
-        carry a DV or HDR10 badge, so a collision would be the common case."""
+    #: The DV badge as Kometa ACTUALLY loads it (/config/dv-layer.yml in the
+    #: running container): top-right, offsets 15/15, image 250x96 -> y = 15..111.
+    #: NOT what docs/kometa/dv_badges.yml in this repo says, which is top-LEFT.
+    #: Trusting the repo copy is how this file first shipped drawing at exactly
+    #: the DV badge's coordinates.
+    DV_TOP, DV_HEIGHT = 15, 96
+
+    def test_the_badges_do_not_draw_over_the_DV_badge(self):
+        """A collision here is the COMMON case, not the edge case: 1,029 movies
+        have multiple versions and most also carry a DV or HDR10 badge.
+
+        Asserted as clearance arithmetic rather than 'is it on the right', so
+        moving either badge into the other's box fails instead of passing
+        because both happen to say 'right'."""
         for name, block in self._overlays().items():
             o = block["overlay"]
-            assert o["horizontal_align"] == "right", (
-                f"{name} draws on the left, where the DV badge already is")
+            assert o["horizontal_align"] == "right", f"{name} is not in the DV column"
+            assert o["vertical_align"] == "top", f"{name} is not top-anchored"
+            assert o["vertical_offset"] >= self.DV_TOP + self.DV_HEIGHT, (
+                f"{name} starts at y={o['vertical_offset']}, inside the DV badge "
+                f"which occupies y={self.DV_TOP}..{self.DV_TOP + self.DV_HEIGHT}")
+
+    def test_the_badges_do_not_overlap_EACH_OTHER(self):
+        """They are mutually exclusive per title, but a shared column means a
+        future edit could stagger them; pin that they agree on one position."""
+        boxes = {(b["overlay"]["horizontal_align"], b["overlay"]["vertical_offset"])
+                 for b in self._overlays().values()}
+        assert len(boxes) == 1, f"version badges disagree on placement: {boxes}"
 
 
 def test_it_shares_no_labels_with_the_dv_labeler():
