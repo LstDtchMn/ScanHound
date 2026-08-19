@@ -720,7 +720,18 @@ export interface DownloadResult {
   // recorded provenance gets, and what every row gets if the lookup fails. Code
   // deciding whether two rows are the same thing must treat it as a refusal,
   // because the action it gates cancels downloads.
+  // `movie` is DECLARED BUT NOT CURRENTLY EMITTED. Nothing in `downloads`
+  // records a media type, so a row with no season is indistinguishable from a
+  // TV release whose season was never captured — ("Notting Hill", 1999, null)
+  // has the same shape as a 1999 show with a missing season. Seasonless rows
+  // are therefore `unknown`, and the value stays in the union only so a
+  // consumer written against it keeps compiling when ingest starts recording
+  // a kind. Treat anything that is not `tv_season` as unknown today.
   identity_kind?: 'movie' | 'tv_season' | 'unknown';
+  // The CURRENT recorded metadata for that release url, not an immutable
+  // per-submission snapshot: `downloads.url` is the primary key and
+  // `add_to_history` updates title and season on conflict. Two grabs of the
+  // same url therefore share one identity by construction.
   identity_title?: string | null;
   identity_year?: number | null;
   identity_season?: number | null;
