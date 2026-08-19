@@ -1549,7 +1549,22 @@ class ScannerService:
                 # release whose season did not parse -- a complete-series pack, a
                 # title the regex missed -- into find_movie_matches below, to be
                 # matched against the film library.
-                'is_tv': item.is_tv,
+                # An OR OF POSITIVE SIGNALS, the same shape _process_post uses when it
+                # decides the value in the first place:
+                #     is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'
+                #
+                # `season is not None` was the ORIGINAL bug when it REPLACED the recorded
+                # value -- that is what lost every TV release with no parsed season. As an
+                # ADDITIONAL positive signal it cannot cause that loss: it only ever turns
+                # unknown into TV, never TV into film.
+                #
+                # It also settles `is_tv=False` alongside a recorded season, which peer
+                # review (round 10, Q8) flagged. False here is usually the ABSENCE of
+                # positive TV evidence -- the detail scraper initialises it False and only
+                # raises it on an Sxx match -- not an affirmative statement that this is a
+                # film. A recorded season IS affirmative. Pinning 'False wins' would have
+                # let an absence outrank an observation.
+                'is_tv': item.is_tv or item.season is not None,
                 'season': item.season,
                 'episodes': item.episodes,
                 'search_key': normalize_title(item.title),

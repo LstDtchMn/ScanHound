@@ -84,18 +84,41 @@ class TestTelevisionWithNoSeasonNumber:
         assert m.find_tv_season_matches.called
         assert not m.find_movie_matches.called
 
-    def test_the_recorded_value_wins_over_the_season_heuristic(self):
-        """Pins WHICH source of truth is consulted.
+    def test_a_recorded_season_alongside_is_tv_False_is_treated_as_TV(self):
+        """Peer review round 10, Q8. The previous version of this test pinned
+        the opposite -- False wins -- and that was the wrong precedence.
 
-        Both fields are present and they disagree. Under the old code the
-        season decided; under the fix the recorded value does. A fixture where
-        they agree cannot tell the two implementations apart.
+        `False` is normally the ABSENCE of positive TV evidence: the detail
+        scraper initialises it False and raises it only on an Sxx match. A
+        recorded season is an affirmative observation. Letting the absence
+        outrank the observation is how a show ends up compared against the film
+        library, which is the whole failure this file exists for.
+
+        This does NOT restore the original bug. That bug was `season is not
+        None` REPLACING the recorded value; here it is an additional positive
+        signal, so it can only ever turn unknown into TV -- never TV into film.
         """
         m = _matching()
-        _run(_scanner(m), [_item(is_tv=False, season=3, title="Film With A 3")])
-        assert m.find_movie_matches.called, (
-            "the season heuristic overrode the value the scanner actually recorded"
+        _run(_scanner(m), [_item(is_tv=False, season=3, title="Show With A Season")])
+        assert m.find_tv_season_matches.called, (
+            "a recorded season was overridden by an is_tv=False that only means "
+            "'no positive TV evidence was seen'"
         )
+        assert not m.find_movie_matches.called
+
+    def test_is_tv_True_with_no_season_is_still_TV(self):
+        """The signal that must not be lost -- guarded again here because the
+        OR above is the line most likely to be 'simplified' back into the bug."""
+        m = _matching()
+        _run(_scanner(m), [_item(is_tv=True, season=None)])
+        assert m.find_tv_season_matches.called
+        assert not m.find_movie_matches.called
+
+    def test_neither_signal_means_movie(self):
+        """The only combination that reaches the film matcher."""
+        m = _matching()
+        _run(_scanner(m), [_item(is_tv=False, season=None, title="A Film")])
+        assert m.find_movie_matches.called
         assert not m.find_tv_season_matches.called
 
 
