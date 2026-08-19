@@ -3981,6 +3981,7 @@ class DatabaseManager:
                     return None
                 cur = conn.cursor()
                 row = None
+                adopted_by_name = False
                 if package_uuid is not None:
                     cur.execute("SELECT id FROM download_results WHERE package_uuid = ?",
                                 (package_uuid,))
@@ -3990,6 +3991,9 @@ class DatabaseManager:
                                     "WHERE package_uuid IS NULL AND name = ? "
                                     "ORDER BY updated_at DESC LIMIT 1", (name,))
                         row = cur.fetchone()
+                        # ADOPTION: this row was matched by NAME, so the
+                        # package it belongs to is about to CHANGE.
+                        adopted_by_name = row is not None
                 else:
                     cur.execute("SELECT id FROM download_results WHERE name = ? "
                                 "ORDER BY (package_uuid IS NULL) DESC, updated_at DESC LIMIT 1",
@@ -4013,13 +4017,37 @@ class DatabaseManager:
                         # only because the production caller never emits that
                         # combination. An invariant that depends on callers
                         # behaving is not an invariant; this makes it structural.
+                        # ...UNLESS this update also changes which package
+                        # the row belongs to. A legacy NULL-uuid row adopted
+                        # by NAME keeps its id, so "the previous proof stands"
+                        # would hand the OLD package's proof to the NEW one --
+                        # and identical names across releases are the exact
+                        # collision this whole feature exists to remove. Proof
+                        # does not transfer across a name-based ownership change
+                        # without current evidence (peer review round 3).
+                        #
+                        # ...NOR when the current package has no uuid at all.
+                        # That row was selected BY NAME too, so which package
+                        # it refers to cannot be identified stably across
+                        # polls. Kept as a SEPARATE flag from adoption because
+                        # the reasons differ: adoption is "ownership changed
+                        # based on a name", this is "ownership cannot be pinned
+                        # at all". Enforcing it HERE rather than only in the
+                        # annotator is the point -- REST reads this column
+                        # directly and never reaches the annotator's recovery
+                        # gate, so a caller-side rule left the two transports
+                        # disagreeing exactly as before (peer review round 4).
                         "provenance_url = CASE WHEN ? = 1 THEN ? "
+                        "                      WHEN ? = 1 THEN NULL "
+                        "                      WHEN ? = 1 THEN NULL "
                         "                      ELSE provenance_url END, "
                         "updated_at = CURRENT_TIMESTAMP "
                         "WHERE id = ?",
                         (package_uuid, name, title, host, bytes_total, bytes_loaded,
                          downloaded, extraction, state, error,
                          1 if provenance_observed else 0, provenance_url,
+                         1 if (adopted_by_name and not provenance_observed) else 0,
+                         1 if (package_uuid is None and not provenance_observed) else 0,
                          rid))
                     conn.commit()
                     return rid
@@ -4102,14 +4130,27 @@ class DatabaseManager:
                 return None   # ambiguous; no honest answer
         return next(iter(found)) if len(found) == 1 else None
 
-    def get_release_first_seen(self, urls):
-        """Map release url -> `date_added`, the first time that url entered
-        history.
+    def get_release_identity(self, urls):
+        """Map release url -> the SEMANTIC identity recorded when it was grabbed:
+        ``{"date_added", "title", "year", "season"}``.
 
-        NOT "first grabbed": download_item() writes a history row for FAILED
-        attempts too, so this can be the moment a grab was first tried rather
-        than the moment one succeeded. The UI labels it "first seen" for exactly
-        that reason (peer review Finding 2).
+        `date_added` is NOT "first grabbed": download_item() writes a history row
+        for FAILED attempts too, so this can be the moment a grab was first tried
+        rather than the moment one succeeded. The UI labels it "first seen" for
+        exactly that reason (peer review Finding 2).
+
+        WHY TITLE/YEAR/SEASON BELONG HERE RATHER THAN IN A NAME PARSER. These
+        columns are what the caller PASSED to download_item() from the scraped
+        listing, so they are the identity itself, not a reading of a display
+        string. The JDownloader package name cannot substitute for them: it is
+        capped at 50 characters, and 17 live rows carry a name that spans more
+        than one season -- `Law & Order: LA (2010) [1080p]` alone covers 13
+        distinct seasons (8, 9, and 11 through 21). No parser can recover a
+        season from a string that does not contain it.
+
+        Returns only urls that matched a row. A caller must treat a missing key
+        as UNKNOWN identity, never as "no season" -- the difference is what
+        stops a whole-series pack being cancelled against one season.
         """
         wanted = [str(u) for u in dict.fromkeys(urls or []) if u]
         if not wanted:
@@ -4118,11 +4159,79 @@ class DatabaseManager:
         for start in range(0, len(wanted), 300):
             chunk = wanted[start:start + 300]
             rows = self._query_dicts(
-                "SELECT url, date_added FROM downloads WHERE url IN (%s)"
+                "SELECT url, date_added, title, year, season FROM downloads "
+                "WHERE url IN (%s)" % ",".join("?" * len(chunk)),
+                tuple(chunk), default=[]) or []
+            for row in rows:
+                out[row["url"]] = {
+                    "date_added": row.get("date_added"),
+                    "title": row.get("title"),
+                    "year": row.get("year"),
+                    "season": row.get("season"),
+                }
+        return out
+
+    def get_persisted_provenance(self, ids):
+        """Map ``download_results.id`` -> its PERSISTED ``provenance_url``.
+
+        KEYED BY THE DURABLE ROW ID, not by package name. An earlier version
+        also matched on ``name`` for rows without a uuid, and that was wrong in
+        the one way this whole feature exists to prevent: the query carried no
+        ``package_uuid IS NULL`` predicate and no ``ORDER BY``, so a DIFFERENT
+        same-named row -- including a uuid-backed one -- could donate its
+        provenance, and the "last-write-wins" the comment claimed was really
+        whichever row SQLite happened to return last. Identical package names
+        across distinct seasons are precisely why identity is being moved off
+        names, so recovering by name reintroduced the collision through the back
+        door, for both `source_url` and identity (peer review round 2).
+
+        ``poll_results()`` attaches this id to every row it emits -- from its
+        uuid->id cache, else via ``get_download_result_id()``, writing the row
+        first if need be, explicitly so it never emits an id-less row -- and
+        REST rows carry the same persisted id. A row that still has no id is
+        left unrecovered, which is the safe direction.
+
+        WHY THIS EXISTS. The poller's in-memory row carries
+        ``provenance_url=None`` whenever it could not observe a package's links,
+        while this table deliberately KEEPS the previous proof in that case --
+        ``upsert_download_result`` writes the new value only when
+        ``provenance_observed`` is true, because "could not look" is not
+        "no longer ours". So the WebSocket row and the persisted row disagree
+        for the length of an unobserved poll. That was accepted while the only
+        consequence was a source link blinking; it is not acceptable for
+        identity, which is meant to authorise cancelling other downloads
+        (peer review 2026-08-18, M2).
+
+        ONE batched query, and only for the rows that need it -- the caller
+        filters to unobserved-and-urlless rows first, which is normally none.
+        """
+        wanted = []
+        for value in (ids or []):
+            # STRICT, not coercive. Production ids are SQLite integers, so
+            # int() bought nothing and quietly widened the contract -- True
+            # became 1 and 1.0 became 1, either of which would look up a real
+            # row. `type(value) is int` rather than isinstance() because bool
+            # IS an int subclass. Fail closed and log: annotation is
+            # deliberately non-fatal, so a malformed id must not take down the
+            # downloads view, but it should not pass silently either.
+            if type(value) is int and value > 0:
+                wanted.append(value)
+            elif value is not None:
+                logger.warning(
+                    "download results: ignoring malformed row id %r (%s) in "
+                    "provenance recovery", value, type(value).__name__)
+        wanted = list(dict.fromkeys(wanted))
+        if not wanted:
+            return {}
+        out = {}
+        for start in range(0, len(wanted), 300):
+            chunk = wanted[start:start + 300]
+            rows = self._query_dicts(
+                "SELECT id, provenance_url FROM download_results WHERE id IN (%s)"
                 % ",".join("?" * len(chunk)),
                 tuple(chunk), default=[]) or []
             for row in rows:
-                out[row["url"]] = row.get("date_added")
+                out[row["id"]] = row.get("provenance_url")
         return out
 
     def get_download_result_id(self, package_uuid, name):

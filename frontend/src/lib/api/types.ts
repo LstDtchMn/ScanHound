@@ -710,6 +710,32 @@ export interface DownloadResult {
   // longer provable" from "could not look", which is what decides whether a
   // stored association may be retracted. The UI has no use for it.
   provenance_observed?: boolean;
+  // THE SEMANTIC IDENTITY, carried on both transports. This is what the grab
+  // RECORDED, not a reading of `name` — and the two are not interchangeable.
+  // `name` is capped at 50 characters and 17 live rows share a name spanning
+  // several seasons (`Law & Order: LA (2010) [1080p]` covers 13 of them), so no
+  // parser can recover a season that the string does not contain.
+  //
+  // `unknown` means UNKNOWN, never "no season": it is what a row without
+  // recorded provenance gets, and what every row gets if the lookup fails. Code
+  // deciding whether two rows are the same thing must treat it as a refusal,
+  // because the action it gates cancels downloads.
+  // `movie` is DECLARED BUT NOT CURRENTLY EMITTED. Nothing in `downloads`
+  // records a media type, so a row with no season is indistinguishable from a
+  // TV release whose season was never captured — ("Notting Hill", 1999, null)
+  // has the same shape as a 1999 show with a missing season. Seasonless rows
+  // are therefore `unknown`, and the value stays in the union only so a
+  // consumer written against it keeps compiling when ingest starts recording
+  // a kind. Treat anything that is not `tv_season` as unknown today.
+  identity_kind?: 'movie' | 'tv_season' | 'unknown';
+  // The CURRENT recorded metadata for that release url, not an immutable
+  // per-submission snapshot: `downloads.url` is the primary key and
+  // `add_to_history` updates title and season on conflict. Two grabs of the
+  // same url therefore share one identity by construction.
+  identity_title?: string | null;
+  identity_year?: number | null;
+  identity_season?: number | null;
+  identity_source?: 'provenance' | 'unknown';
 }
 
 export interface TmdbSearchResult {

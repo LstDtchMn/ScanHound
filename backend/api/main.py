@@ -413,8 +413,10 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                         # it can never affect change detection. Annotating in
                         # place is safe for the code below: every downstream
                         # reader takes named keys (name / state / save_to /
-                        # package_uuid), none enumerates the dict, so the two
-                        # added keys cannot shift a dedup key or a payload.
+                        # package_uuid), none enumerates the dict, so the keys
+                        # it adds cannot shift a dedup key or a payload. That
+                        # is why the set can grow -- it is now the seven in
+                        # download_links.UNPROVEN, not the original two.
                         from backend.download_links import annotate_source_links
                         ws_manager.broadcast_sync({
                             "type": "download:results",
