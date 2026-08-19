@@ -792,3 +792,76 @@ class TestFreshnessAgreesAcrossTransports:
         assert db.get_persisted_provenance([real]) == {real: A}
         for bogus in (True, 1.0, "1", -1, 0, None, object()):
             assert db.get_persisted_provenance([bogus]) == {}, f"accepted {bogus!r}"
+
+    def test_a_uuidless_unobserved_poll_clears_the_PERSISTED_proof_too(self, db):
+        """THE round-4 finding, and the honest version of the round-3 test.
+
+        Round 3 enforced "uuid-less rows get no last-proof recovery" in the
+        ANNOTATOR only. REST does not go through that gate: get_download_results
+        returns the persisted provenance_url directly, so the row already has a
+        truthy url and never reaches the recovery filter at all. The result was
+        the round-1 transport split, narrowed to uuid-less rows:
+
+            WS   -> unknown        (caller-side uuid gate)
+            REST -> release-A      (read straight from the column)
+
+        The previous test built only the WS row, so it could not see the
+        persisted half -- exactly the test weakness this branch keeps finding.
+        This one drives the real transition and compares BOTH transports.
+        """
+        name = "UUIDless Transition (2019) S04 [1080p]"
+        db.add_to_history(A, "Some Show", season=4, year=2019, package_name=name)
+        # 1. a uuid-less row, previously OBSERVED with a real proof
+        db.upsert_download_result(name=name, package_uuid=None, state="downloading",
+                                  provenance_url=A, provenance_observed=True)
+        rid = db.get_download_result_id(None, name)
+        assert db._query_dicts(
+            "SELECT provenance_url FROM download_results WHERE id = ?",
+            (rid,))[0]["provenance_url"] == A, "fixture never established a proof"
+
+        # 2. a later uuid-less poll that could NOT observe the links
+        db.upsert_download_result(name=name, package_uuid=None, state="downloading",
+                                  provenance_url=None, provenance_observed=False)
+
+        # 3. the persisted proof must be gone, not merely hidden from one transport
+        assert db._query_dicts(
+            "SELECT provenance_url FROM download_results WHERE id = ?",
+            (rid,))[0]["provenance_url"] is None, (
+                "the database still holds a proof it cannot attribute")
+
+        # 4/5/6. both transports, and they must agree
+        rest = [r for r in db.get_download_results(limit=200) if r.get("id") == rid]
+        ws = [{"id": rid, "package_uuid": None, "name": name, "state": "downloading",
+               "provenance_url": None, "provenance_observed": False}]
+        annotate_source_links(db, rest)
+        annotate_source_links(db, ws)
+
+        fields = ("source_url", "identity_kind", "identity_source",
+                  "identity_title", "identity_season")
+        assert [rest[0][f] for f in fields] == [ws[0][f] for f in fields], (
+            f"transports disagree: REST={[rest[0][f] for f in fields]} "
+            f"WS={[ws[0][f] for f in fields]}")
+        assert rest[0]["identity_kind"] == "unknown"
+        assert rest[0]["source_url"] is None
+
+    def test_a_uuidless_OBSERVED_poll_keeps_its_own_current_proof(self, db):
+        """The positive control. Directly observed evidence is still valid for
+        the current poll, so clearing must apply only to the unobserved case --
+        otherwise uuid-less packages could never hold a proof at all and the
+        test above would pass for the wrong reason."""
+        name = "UUIDless Observed (2019) S05 [1080p]"
+        b = "https://source.example/release-B"
+        db.add_to_history(b, "Some Show", season=5, year=2019, package_name=name)
+        db.upsert_download_result(name=name, package_uuid=None, state="downloading",
+                                  provenance_url=b, provenance_observed=True)
+        rid = db.get_download_result_id(None, name)
+
+        assert db._query_dicts(
+            "SELECT provenance_url FROM download_results WHERE id = ?",
+            (rid,))[0]["provenance_url"] == b
+
+        rest = [r for r in db.get_download_results(limit=200) if r.get("id") == rid]
+        annotate_source_links(db, rest)
+        assert rest[0]["source_url"] == b
+        assert rest[0]["identity_kind"] == "tv_season"
+        assert rest[0]["identity_season"] == 5

@@ -4025,7 +4025,20 @@ class DatabaseManager:
                         # collision this whole feature exists to remove. Proof
                         # does not transfer across a name-based ownership change
                         # without current evidence (peer review round 3).
+                        #
+                        # ...NOR when the current package has no uuid at all.
+                        # That row was selected BY NAME too, so which package
+                        # it refers to cannot be identified stably across
+                        # polls. Kept as a SEPARATE flag from adoption because
+                        # the reasons differ: adoption is "ownership changed
+                        # based on a name", this is "ownership cannot be pinned
+                        # at all". Enforcing it HERE rather than only in the
+                        # annotator is the point -- REST reads this column
+                        # directly and never reaches the annotator's recovery
+                        # gate, so a caller-side rule left the two transports
+                        # disagreeing exactly as before (peer review round 4).
                         "provenance_url = CASE WHEN ? = 1 THEN ? "
+                        "                      WHEN ? = 1 THEN NULL "
                         "                      WHEN ? = 1 THEN NULL "
                         "                      ELSE provenance_url END, "
                         "updated_at = CURRENT_TIMESTAMP "
@@ -4034,6 +4047,7 @@ class DatabaseManager:
                          downloaded, extraction, state, error,
                          1 if provenance_observed else 0, provenance_url,
                          1 if (adopted_by_name and not provenance_observed) else 0,
+                         1 if (package_uuid is None and not provenance_observed) else 0,
                          rid))
                     conn.commit()
                     return rid
