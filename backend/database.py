@@ -6029,6 +6029,35 @@ class DatabaseManager:
             report["human_required"] = True
         return report
 
+    def get_latest_plex_cache_at(self, content_type="Movies"):
+        """Newest ``last_updated`` among plex_cache rows for *content_type*,
+        else None.
+        
+        Change-detector for the scheduled version-label sync, mirroring
+        ``get_latest_dv_scan_at``. A higher value means the Plex cache was
+        rewritten, so the per-title file counts the badges are derived from may
+        have moved.
+        
+        SAFE TO ``MAX()`` HERE, which is not true of every timestamp in this
+        schema: ``plex_cache.last_updated`` is a FLOAT epoch, so the comparison
+        is numeric. The string-shaped columns elsewhere mix `T`-separated and
+        space-separated forms, where `MAX()` compares lexically and can order
+        same-day values backwards. Measured: all 16,332 Movies rows carry one
+        identical float, because the cache is rewritten wholesale each refresh --
+        so this advances exactly once per refresh rather than per row.
+        
+        Fail-safe: any error returns None, which the caller reads as "nothing
+        new", so a DB hiccup can never trigger a spurious full-library pass.
+        """
+        try:
+            rows = self._query_dicts(
+                "SELECT MAX(last_updated) AS latest FROM plex_cache "
+                "WHERE content_type = ?", (content_type,))
+            return (rows[0].get("latest") if rows else None) or None
+        except Exception as e:
+            logger.error("DB Error (get_latest_plex_cache_at): %s", e)
+            return None
+
     def get_latest_dv_scan_at(self, source="scan"):
         """Newest ``last_seen_at`` among dv_scan rows for *source*, else None.
 

@@ -216,3 +216,89 @@ def test_it_shares_no_labels_with_the_dv_labeler():
     why these labels are NOT in MANAGED."""
     from backend.rename.dv_labeler import MANAGED
     assert VERSION_LABELS & MANAGED == set()
+
+
+class TestTheSyncIsActuallyREACHABLE:
+    """A module with tests and no caller ships nothing.
+
+    This suite's other tests build their own inputs, so every one of them would
+    still pass if `sync_version_labels` were never invoked by anything -- which
+    was true for two days: 23 green tests, a live dry-run finding 1,032 movies,
+    and zero badges on any poster.
+    """
+
+    def _pass_source(self):
+        import ast
+        import inspect
+        import textwrap
+        from backend.app_service import AppService
+        return ast.parse(textwrap.dedent(inspect.getsource(AppService._run_maintenance_pass)))
+
+    def test_the_maintenance_pass_calls_it(self):
+        import ast
+        calls = [n for n in ast.walk(self._pass_source())
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "sync_version_labels"]
+        assert calls, "nothing in the maintenance pass calls sync_version_labels"
+
+    def test_the_watermark_advances_only_AFTER_the_sync_returns(self):
+        """THE failure the DV block documents at length: assigning the watermark
+        before the work succeeds consumes the generation on every failure path,
+        so the labels never get applied until something unrelated moves it.
+
+        Structural because that is where the property lives -- the assignment
+        must be a LATER STATEMENT in the same block as the call, not merely
+        somewhere in the function."""
+        import ast
+        tree = self._pass_source()
+        # Only the INNERMOST block counts: at an outer level a single `if`
+        # statement contains both the call and the assignment, so they share an
+        # index and prove nothing about ordering.
+        ordered = False
+        blocks = []
+        for node in ast.walk(tree):
+            # body, orelse AND finalbody: the call and the assignment live in an
+            # `else:` branch, so a walk that only looks at `.body` is blind to
+            # exactly the block being asserted about -- which is how the first
+            # version of this test failed while the code was correct.
+            for attr in ("body", "orelse", "finalbody"):
+                b = getattr(node, attr, None)
+                if isinstance(b, list) and b:
+                    blocks.append(b)
+        for body in blocks:
+            call_at = next((i for i, s in enumerate(body)
+                            if "sync_version_labels" in ast.unparse(s)), None)
+            assign_at = next((i for i, s in enumerate(body)
+                              if isinstance(s, ast.Assign)
+                              and "_last_version_cache_at" in ast.unparse(s.targets[0])), None)
+            if call_at is None or assign_at is None or call_at == assign_at:
+                continue          # not the block that holds both as siblings
+            assert assign_at > call_at, (
+                "the watermark is advanced before the sync call, so a failure "
+                "would silently consume the refresh")
+            ordered = True
+        assert ordered, "call and watermark assignment are never siblings in one block"
+
+    def test_plex_not_ready_does_NOT_advance_the_watermark(self):
+        """The other failure path the DV block names: a maintenance pass shortly
+        after container start finds Plex uninitialised. Skipping is correct;
+        skipping while having already moved the watermark is not."""
+        import ast
+        import inspect
+        import textwrap
+        from backend.app_service import AppService
+        src = textwrap.dedent(inspect.getsource(AppService._run_maintenance_pass))
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            test = ast.unparse(node.test)
+            if "pm is None" not in test:
+                continue
+            body = "\n".join(ast.unparse(s) for s in node.body)
+            if "Version-badge" in body:
+                assert "_last_version_cache_at" not in body, (
+                    "the not-ready branch advances the watermark")
+                return
+        raise AssertionError("no `pm is None` guard found for the version sync")

@@ -740,6 +740,47 @@ class AppService:
         except Exception:
             logger.exception("DV auto label sync failed (non-fatal)")
 
+        # ── Version-count badges ──────────────────────────────────────────
+        # Same shape as the DV sync above, and deliberately so: the failure it
+        # is built to avoid is the one that block's comment documents at
+        # length -- advancing a watermark before the work succeeded, which
+        # silently consumes a generation and leaves the labels unapplied until
+        # something unrelated moves it again.
+        #
+        # TRIGGER: plex_cache.last_updated. The counts are derived from that
+        # cache, so a rewrite is exactly when a title's file count can change.
+        # A separate watermark from the DV one because they move independently:
+        # a DV scan does not change how many files a movie has, and a Plex
+        # refresh does not change what layer they are.
+        try:
+            if self.db is not None and self.config.get("plex_enabled", True):
+                latest = self.db.get_latest_plex_cache_at(content_type="Movies")
+                if not hasattr(self, "_last_version_cache_at"):
+                    self._last_version_cache_at = latest  # baseline only
+                elif latest and (self._last_version_cache_at is None
+                                 or latest > self._last_version_cache_at):
+                    from backend.api.dependencies import registry
+                    from backend.rename import version_labeler
+                    plex_service = getattr(registry, "_plex_service", None)
+                    pm = getattr(plex_service, "plex_manager", None) if plex_service else None
+                    if pm is None:
+                        logger.info("Version-badge sync: cache refreshed but Plex "
+                                    "not initialized — watermark NOT advanced, "
+                                    "will retry next pass")
+                    else:
+                        result = version_labeler.sync_version_labels(
+                            self.db, pm, self.config)
+                        # Success only, for the reason the DV block spells out.
+                        self._last_version_cache_at = latest
+                        logger.info(
+                            "Version-badge sync: %d title(s) seen, %d added, "
+                            "%d removed, %d multi-version, %d uncached",
+                            result.get("total", 0), result.get("added", 0),
+                            result.get("removed", 0), result.get("multi_version", 0),
+                            result.get("unknown", 0))
+        except Exception:
+            logger.exception("Version-badge sync failed (non-fatal)")
+
     def _alert_dv_layer_conflicts(self, result):
         """Alert ONCE per distinct set of self-contradicting DV files.
 
