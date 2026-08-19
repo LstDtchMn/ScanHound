@@ -4,8 +4,15 @@ Runs on TurtleLandSRVR (.170) where dovi_tool.exe reaches both local drives and
 the .180 SMB media. Reads data/dv_host.json (NOT config.py), keeps its OWN
 standalone dv_host.db (raw sqlite3 — it must NEVER open the container's crawler
 database or construct its ORM layer, which runs DDL), reuses
-dv_detect.detect_layer, optionally tags MKVs with mkvpropedit, then POSTs
-/rename/dv-import so the container ingests it.
+dv_detect.detect_layer, optionally tags MKVs with mkvpropedit, then POSTs its
+rows to /rename/dv-host-rows so the container ingests them.
+
+TRANSPORT (round-4 redesign): the detector reads its OWN dv_host.db and sends the
+rows in the request body — the container never reads the host file. That removes
+the Windows bind-mount / WAL-mmap read that used to fail silently (zero rows
+behind an HTTP 200) while a scan held the file open, and with it the interim
+close/reopen dance. The response is validated (ok + processed==source_rows +
+failed==0), so a partial or failed import can never read as success.
 
 Usage (Task Scheduler action, with dovi_tool.exe's dir on PATH; run from the
 repo root so the --config default resolves — --db and --api already default
@@ -21,6 +28,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -35,10 +44,94 @@ logger = logging.getLogger("dv_host_scan")
 
 DV_MTIME_TOL = 2.0  # >= FAT/exFAT 2s granularity — below this = endless rescans
 
+# ── retry backoff for failed detections ────────────────────────────────
+#
+# WHY THIS EXISTS. A failed detection stores a NULL signature so the file is
+# retried, which is correct on its own. Combined with a per-file time cap it
+# was not: two titles that wedge dovi_tool were retried at the FRONT of every
+# run (they sit in an otherwise fully-scanned root that os.walk reaches first),
+# burning 1800 s each before the run ever reached the 236 files that had never
+# been scanned at all. Measured 2026-08-09: three such runs in one day, one
+# hour of every six-hour window, and because the run was then hard-killed at
+# its Task Scheduler limit it never reached the dv-import POST either -- so
+# the container's dv_scan gained nothing for two weeks while the host database
+# kept growing.
+#
+# Escalating backoff means a permanently-failing file costs one attempt per
+# week instead of one per run, without ever declaring it unscannable: it stays
+# eligible forever, just not constantly.
+DV_RETRY_BACKOFF_HOURS = (6, 24, 72, 168)
+
+
+def retry_delay_hours(attempts, schedule=DV_RETRY_BACKOFF_HOURS):
+    """Hours to wait before retrying a file that has failed *attempts* times."""
+    if attempts <= 0:
+        return 0
+    return schedule[min(attempts, len(schedule)) - 1]
+
+
+def is_retry_due(next_retry_at, now):
+    """Whether a failed row is eligible again. A NULL due-time is always due.
+
+    NULL is 'due' rather than 'never' on purpose: rows written before this
+    column existed carry NULL, and the safe reading of a missing schedule is
+    "we have no reason to hold this back", not "hold it back forever".
+    """
+    if next_retry_at is None:
+        return True
+    try:
+        return float(next_retry_at) <= float(now)
+    except (TypeError, ValueError):
+        return True
+
 # The API router mounts at bare /rename (no /api prefix) — see
 # APIRouter(prefix="/rename", ...) in backend/api/routes/rename.py, included
 # with no additional prefix in backend/api/main.py.
-DV_IMPORT_PATH = "/rename/dv-import"
+DV_IMPORT_PATH = "/rename/dv-import"          # legacy file-read endpoint
+DV_ROWS_PATH = "/rename/dv-host-rows"         # durable row-POST endpoint
+
+#: What the run says when its final handoff fails. NAMED, because the wrapper's
+#: test suite asserts on it and the two live in different languages -- the string
+#: was previously duplicated as a literal in both, and when the endpoint moved
+#: from DV_IMPORT_PATH to DV_ROWS_PATH the message changed here and nothing
+#: changed there. Those assertions then failed on main for weeks, unnoticed,
+#: because that suite is not in CI. The test now reads this constant, so the
+#: two cannot drift apart again regardless of what CI does or does not run.
+FINAL_POST_FAILED_MSG = (
+    "final dv-host-rows POST failed; host rows are durable but "
+    "container/Plex are stale"
+)
+# Sent in every row-POST body and enforced server-side. Bump in lockstep with
+# any change to the row shape so an old detector can never feed a new container
+# (or vice-versa) a body it will silently mis-parse (round-4 cleanup).
+DV_ROWS_SCHEMA_VERSION = 1
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect on the DV ingest POST.
+
+    The detector calls one fixed endpoint; a 3xx there is configuration drift,
+    and following it would send the credentialed request to an unintended origin.
+    Raising here turns any redirect into an HTTPError, which ``_post_rows``
+    already treats as a failure (peer review 2026-08-10)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            "refused redirect on the DV ingest endpoint (%s -> %s)"
+            % (code, newurl), headers, fp)
+
+
+#: Opener for the credentialed ingest POST (built once; handlers are stateless).
+#: ProxyHandler({}) disables ambient/system proxy discovery: build_opener()
+#: otherwise installs a default ProxyHandler that honours http_proxy / system
+#: proxy settings, which would route the request — and its X-DV-Ingest-Key
+#: header — through a proxy that can read it (a proxy is the transport, not a
+#: redirect, so add_unredirected_header does not help). The detector's endpoint
+#: is fixed, so the credential must reach ONLY the configured origin: no
+#: redirects, no ambient proxies (peer review round-2, 2026-08-10).
+_INGEST_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirectHandler())
 
 # The container's import endpoint (backend/api/routes/rename.py's
 # _DEFAULT_DV_HOST_DB) reads /data/dv_host.db, bind-mounted from
@@ -93,15 +186,64 @@ def sig_is_current(stored_mtime, stored_size, st_mtime, st_size,
         return False
 
 
-def classify_to_row(path, layer, st):
-    """Build a dv_host.db row. 'unknown' stores NULL mtime so the next run retries."""
+def classify_to_row(path, layer, st, *, attempts=0, error=None, now=None):
+    """Build a dv_host.db row. 'unknown' stores NULL mtime so the next run retries.
+
+    A failed row additionally carries how many times it has failed and when it
+    next becomes eligible, so "retry it" does not have to mean "retry it on
+    every single run".
+    """
     unknown = layer in ("unknown", None)
-    return {
+    if now is None:
+        now = time.time()
+    row = {
         "path": path,
         "dv_layer": layer,
         "sig_mtime": None if unknown else float(st.st_mtime),
         "sig_size": None if unknown else int(st.st_size),
+        "attempts": 0,
+        "last_error": None,
+        "next_retry_at": None,
     }
+    if unknown:
+        row["attempts"] = int(attempts) + 1
+        row["last_error"] = error
+        row["next_retry_at"] = float(now) + retry_delay_hours(row["attempts"]) * 3600.0
+    return row
+
+
+def partition_work(candidates, now):
+    """Order the run's work: never-scanned, then changed, then due retries.
+
+    *candidates* are ``(path, st, row)`` with ``row`` None when the file has no
+    database entry at all. Returns a single ordered list.
+
+    WHY ORDER MATTERS, AND WHY 'NEWEST FIRST' IS THE LOAD-BEARING PART.
+    os.walk yields directory order, which is roughly alphabetical and entirely
+    unrelated to what deserves attention. A title acquired an hour ago sat
+    behind hundreds of backlog entries purely because its name starts with a
+    late letter. Sorting the unscanned bucket by mtime descending is what makes
+    a fresh acquisition the FIRST thing a run looks at -- ordering the buckets
+    alone would not have done it, because a new acquisition and a two-month-old
+    backlog entry are both simply 'never scanned'.
+    """
+    never, changed, retries = [], [], []
+    for path, st, row in candidates:
+        if row is None:
+            never.append((path, st, row))
+            continue
+        if row["dv_layer"] in ("unknown", None):
+            if is_retry_due(row["next_retry_at"], now):
+                retries.append((path, st, row))
+            continue
+        if not sig_is_current(row["sig_mtime"], row["sig_size"],
+                              st.st_mtime, st.st_size):
+            changed.append((path, st, row))
+    never.sort(key=lambda c: c[1].st_mtime, reverse=True)
+    changed.sort(key=lambda c: c[1].st_mtime, reverse=True)
+    # Longest-waiting failure first, so backoff cannot starve one file forever.
+    retries.sort(key=lambda c: (c[2]["next_retry_at"] or 0.0))
+    return never + changed + retries
 
 
 def tag_name_for(layer):
@@ -110,6 +252,15 @@ def tag_name_for(layer):
 
 
 # ── db (own standalone sqlite — not the container's ORM layer) ──────────
+#: Columns added after the table shipped. ALTER TABLE ADD COLUMN is the only
+#: migration this file may perform — it must never run the container's ORM DDL.
+_ADDED_COLUMNS = (
+    ("attempts", "INTEGER DEFAULT 0"),
+    ("last_error", "TEXT"),
+    ("next_retry_at", "REAL"),
+)
+
+
 def _open_db(db_path):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -123,24 +274,34 @@ def _open_db(db_path):
             title TEXT,
             scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(dv_host)")}
+    for name, decl in _ADDED_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE dv_host ADD COLUMN {name} {decl}")
     conn.commit()
     return conn
 
 
-def _get_sig(conn, path):
-    row = conn.execute(
-        "SELECT sig_mtime, sig_size FROM dv_host WHERE path = ?", (path,)).fetchone()
-    return (row["sig_mtime"], row["sig_size"]) if row else (None, None)
+def _load_rows(conn):
+    """Every row, keyed by path — one query instead of one per walked file."""
+    return {r["path"]: dict(r) for r in conn.execute(
+        "SELECT path, dv_layer, sig_mtime, sig_size, attempts, next_retry_at "
+        "FROM dv_host")}
 
 
 def _upsert(conn, row):
     conn.execute('''
-        INSERT INTO dv_host (path, dv_layer, sig_mtime, sig_size, scanned_at)
-        VALUES (:path, :dv_layer, :sig_mtime, :sig_size, CURRENT_TIMESTAMP)
+        INSERT INTO dv_host (path, dv_layer, sig_mtime, sig_size,
+                             attempts, last_error, next_retry_at, scanned_at)
+        VALUES (:path, :dv_layer, :sig_mtime, :sig_size,
+                :attempts, :last_error, :next_retry_at, CURRENT_TIMESTAMP)
         ON CONFLICT(path) DO UPDATE SET
             dv_layer = excluded.dv_layer,
             sig_mtime = excluded.sig_mtime,
             sig_size = excluded.sig_size,
+            attempts = excluded.attempts,
+            last_error = excluded.last_error,
+            next_retry_at = excluded.next_retry_at,
             scanned_at = CURRENT_TIMESTAMP
     ''', row)
     conn.commit()
@@ -165,16 +326,79 @@ def _tag_file(path, layer):
         return False
 
 
-def _post_import(api_base):
-    url = api_base.rstrip("/") + DV_IMPORT_PATH
-    req = urllib.request.Request(url, data=b"{}",
-                                 headers={"Content-Type": "application/json"},
-                                 method="POST")
+def _read_host_rows(conn):
+    """Every dv_host row as a plain dict, for POSTing to the container.
+
+    THE DETECTOR OWNS dv_host.db, so reading it here is a local same-OS read with
+    no bind mount and no cross-process contention — the exact thing the container
+    could not do. Round-4 review: sending rows in the request body removes the
+    file handoff (and its WAL/mmap/checkpoint failure class) from the protocol.
+    """
+    return [
+        {"path": r["path"], "dv_layer": r["dv_layer"],
+         "sig_mtime": r["sig_mtime"], "sig_size": r["sig_size"],
+         "title": r["title"]}
+        for r in conn.execute(
+            "SELECT path, dv_layer, sig_mtime, sig_size, title FROM dv_host")
+    ]
+
+
+def _post_rows(api_base, rows):
+    """POST the rows and accept the result ONLY if it is mechanically valid.
+
+    A cumulative snapshot: every call sends every row. The upsert is idempotent,
+    so a missed call self-heals on the next one. Success requires HTTP 2xx AND a
+    parseable body with ``ok`` true, ``processed == source_rows == len(rows)``,
+    and ``failed == 0`` (round-4 review). Anything else — non-2xx, unparseable,
+    or a count that does not reconcile — is a FAILURE, never a silent success.
+    """
+    url = api_base.rstrip("/") + DV_ROWS_PATH
+    payload = json.dumps(
+        {"schema_version": DV_ROWS_SCHEMA_VERSION,
+         "rows": rows, "source_rows": len(rows)}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    # Scoped machine credential for exactly this endpoint (env
+    # SCANHOUND_DV_INGEST_KEY). The server configures only its SHA-256, so the
+    # raw secret is never STORED server-side. Two protections keep it from
+    # escaping the configured origin (peer review 2026-08-10):
+    #  * add_unredirected_header — urllib copies ordinary headers onto a
+    #    redirected request, but NOT unredirected ones, so a 3xx can never carry
+    #    the secret to another host;
+    #  * the no-redirect opener below refuses any redirect outright, since the
+    #    detector's endpoint is fixed and a redirect is configuration drift.
+    # Unset key => no header => the server 401s and the POST fails loudly.
+    ingest_key = os.environ.get("SCANHOUND_DV_INGEST_KEY", "").strip()
+    if ingest_key:
+        req.add_unredirected_header("X-DV-Ingest-Key", ingest_key)
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            logger.info("dv-import -> %s", resp.read().decode("utf-8", "replace"))
+        with _INGEST_OPENER.open(req, timeout=300) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace") if e.fp else ""
+        logger.error("dv-host-rows POST rejected: HTTP %s %s", e.code, detail)
+        return False
     except OSError as e:
-        logger.error("dv-import POST failed: %s", e)
+        logger.error("dv-host-rows POST failed: %s", e)
+        return False
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        logger.error("dv-host-rows: unparseable response body: %s", raw[:300])
+        return False
+    # Guard the contract exactly: a valid-JSON non-object (null, list) must fail
+    # the same way an unparseable body does, not raise on .get (round-4 cleanup).
+    if not isinstance(body, dict):
+        logger.error("dv-host-rows: response was not a JSON object: %s", raw[:300])
+        return False
+    if not (body.get("ok") is True
+            and body.get("failed") == 0
+            and body.get("processed") == body.get("source_rows") == len(rows)):
+        logger.error("dv-host-rows: response did not validate: %s", body)
+        return False
+    logger.info("dv-host-rows OK: %s", body)
+    return True
 
 
 def _iter_files(roots):
@@ -191,6 +415,21 @@ def main(argv=None):
     ap.add_argument("--config", default="data/dv_host.json")
     ap.add_argument("--db", default=DEFAULT_DB_PATH)
     ap.add_argument("--api", default="http://localhost:9721")
+    # 5h30m under a PT6H Task Scheduler limit. A HARD KILL at the limit loses
+    # the file in flight AND skips the final row POST at the end of main(),
+    # which is why the container's dv_scan gained nothing while the host
+    # database grew: every run died before reaching the handoff. Stopping
+    # ourselves BETWEEN files, with time to spare, converts that into a normal
+    # exit 0 that always imports what it found.
+    ap.add_argument("--max-runtime-minutes", type=float, default=330.0,
+                    help="stop between files once this much wall clock is used "
+                         "(0 disables the budget)")
+    ap.add_argument("--mode", choices=("backfill", "steady"), default="backfill",
+                    help="backfill: everything, ordered. steady: only "
+                         "never-scanned and changed files, no retry sweep.")
+    ap.add_argument("--import-every", type=int, default=25,
+                    help="POST the accumulated rows after this many files so a "
+                         "long run publishes progress instead of only at the end")
     args = ap.parse_args(argv)
 
     cfg = load_host_config(args.config)
@@ -203,25 +442,94 @@ def main(argv=None):
 
     tagging = bool(cfg.get("dv_file_tagging"))
     conn = _open_db(args.db)
-    scanned = 0
+    started = time.monotonic()
+    budget = float(args.max_runtime_minutes) * 60.0
+
+    rows = _load_rows(conn)
+    candidates = []
     for path in _iter_files(parse_roots(cfg)):
         try:
             st = os.stat(path)
         except OSError:
             continue
-        stored_m, stored_s = _get_sig(conn, path)
-        if sig_is_current(stored_m, stored_s, st.st_mtime, st.st_size):
-            continue
-        layer = dv_detect.detect_layer(path).get("layer")
-        _upsert(conn, classify_to_row(path, layer, st))
+        candidates.append((path, st, rows.get(path)))
+
+    now = time.time()
+    work = partition_work(candidates, now)
+    if args.mode == "steady":
+        work = [c for c in work if c[2] is None
+                or c[2]["dv_layer"] not in ("unknown", None)]
+    logger.info("walked %d file(s); %d need work (mode=%s, budget=%.0f min)",
+                len(candidates), len(work), args.mode, budget / 60.0)
+
+    scanned = 0
+    stopped_early = False
+    for path, st, row in work:
+        if budget > 0 and (time.monotonic() - started) >= budget:
+            logger.info("time budget reached — stopping cleanly with %d file(s) "
+                        "left for the next run", len(work) - scanned)
+            stopped_early = True
+            break
+        # Log BEFORE the work, not after. The detector was silent for hours at a
+        # time, which is what made a wedged run indistinguishable from a busy
+        # one and led to throughput being inferred from process snapshots
+        # instead of read from the database.
+        logger.info("[%d/%d] scanning %.1f GB  %s",
+                    scanned + 1, len(work), st.st_size / 1e9, path)
+        t0 = time.monotonic()
+        result = dv_detect.detect_layer(path)
+        layer = result.get("layer")
+        secs = max(time.monotonic() - t0, 1e-6)
+        error = result.get("error")
+        evidence = result.get("evidence") or error or "?"
+        # NO RATE ON A FAILED DETECTION.
+        #
+        # detect_layer() returns unknown WITH an error rather than raising --
+        # stall, timeout, read failure, parse failure. On a stall dovi_tool may
+        # have read any fraction of the file, so size/elapsed is not a
+        # measurement; it is a guess wearing a unit. It would be fabricated on
+        # exactly the titles that already wedge: an 80 GB file stalling for
+        # 1800 s printed "44 MB/s  FAILED". That is the error which caused the
+        # throughput retraction, automated. (Round-1 blocker on the
+        # live-progress branch; consolidation blocker 1.)
+        if error:
+            logger.info("[%d/%d] -> %s (%s) in %.0fs  rate unavailable%s",
+                        scanned + 1, len(work), layer, evidence, secs,
+                        "" if layer != "unknown" else "  FAILED")
+        else:
+            logger.info("[%d/%d] -> %s (%s) in %.0fs  %.0f MB/s effective scan rate",
+                        scanned + 1, len(work), layer, evidence, secs,
+                        (st.st_size / 1e6) / secs)
+        attempts = (row or {}).get("attempts") or 0
+        _upsert(conn, classify_to_row(path, layer, st, attempts=attempts,
+                                      error=result.get("error"), now=time.time()))
         scanned += 1
         if tagging and _tag_file(path, layer):
             st2 = os.stat(path)  # header rewrite bumped mtime/size
-            _upsert(conn, classify_to_row(path, layer, st2))
+            _upsert(conn, classify_to_row(path, layer, st2, attempts=attempts,
+                                          error=result.get("error"),
+                                          now=time.time()))
+        if args.import_every > 0 and scanned % args.import_every == 0:
+            # NO close/reopen. The container never reads dv_host.db now — we send
+            # the rows in the request body — so the WAL/bind-mount handoff (and
+            # its whole failure class) is gone. Read our own rows (a local
+            # same-OS read) and POST them; the connection stays open for the
+            # next file. Interim failures stay non-fatal: the host DB is the
+            # durable producer and the snapshot is cumulative, so the next
+            # successful POST carries whatever this one missed.
+            _post_rows(args.api, _read_host_rows(conn))
+
+    # Read the final snapshot BEFORE closing, then hand it off.
+    final_rows = _read_host_rows(conn)
     conn.close()
-    logger.info("scanned %d file(s); posting dv-import", scanned)
-    _post_import(args.api)
-    return 0
+    logger.info("scanned %d file(s)%s; posting %d row(s)", scanned,
+                " (stopped on budget)" if stopped_early else "", len(final_rows))
+    # The final POST is the run's last chance to complete the handoff, so it
+    # belongs in the exit status. (Consolidation blocker 2.)
+    ok = _post_rows(args.api, final_rows)
+    if not ok:
+        logger.error(FINAL_POST_FAILED_MSG)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, PlexStatus, PlexMetadataScanStatus, MediaInventoryResponse, MediaInventoryFacets, MetadataScanRun, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, DownloadQueueItem, BrowserStatus, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, TrashDeleteResponse, TrashEmptyResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult } from './types';
+import type { ResultsResponse, CachedResultsResponse, BackgroundStatus, RenameJob, RenameStatus, RenameStats, DvScan, DvConflictStatus, PlexStatus, PlexMetadataScanStatus, MediaInventoryResponse, MediaInventoryFacets, MetadataScanRun, AnalyticsSummary, LibraryStats, TrendData, WatchlistItem, WatchlistStats, WatchlistExport, Settings, JdStatus, JdRunState, DownloadResult, DownloadHistoryEntry, DownloadQueueItem, BrowserStatus, BulkApplyResponse, BulkReidentifyResponse, BulkDeleteResponse, BulkSetDestResponse, ApplyConfidentResponse, TmdbSearchResult, RematchPreviewResponse, RematchConfirmResponse, TrashListResponse, TrashRestoreResponse, TrashDeleteResponse, TrashEmptyResponse, RenameHealthResponse, ConflictComparison, PipelineItem, PipelineCounts, AlternativeRelease, SearchSourcesResponse, ScanResult, VerificationHold } from './types';
 import { apiBase, getStoredToken } from './endpoint';
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -341,7 +341,8 @@ export const api = {
     }),
   browserStatus: () => request<BrowserStatus>('/download/browser-status'),
   downloadRetries: (limit = 250) =>
-    request<{ items: DownloadQueueItem[]; count: number; status: Record<string, unknown> }>(`/download/retries?limit=${limit}`),
+    request<{ items: DownloadQueueItem[]; count: number; status: Record<string, unknown>;
+             holds?: VerificationHold[] }>(`/download/retries?limit=${limit}`),
   retryDownloadItem: (itemUuid: string) =>
     request<DownloadQueueItem>(`/download/retries/${encodeURIComponent(itemUuid)}/retry`, { method: 'POST' }),
   retryReadyDownloads: (intervalMinutes = 10) =>
@@ -403,11 +404,36 @@ export const api = {
     request<DownloadResult[]>(`/download/results?limit=${limit}`),
   clearDownloadResults: () =>
     request<{ status: string }>('/download/results', { method: 'DELETE' }),
+  /** Release a source-level verification hold.
+   *
+   *  Takes the source rather than assuming one: the hold marker names its own
+   *  source, and a hold can be armed for any of them. */
+  clearVerificationHold: (source: string) =>
+    request<{ source: string; cleared: number; remaining_triggers: number;
+              next_action: string }>(
+      '/download/verification-hold/clear',
+      { method: 'POST', body: JSON.stringify({ source }) }
+    ),
+
   removeDownloadResult: (id: number) =>
     request<{ ok: boolean; removed: number }>('/download/results/remove', {
       method: 'POST',
       body: JSON.stringify({ id })
     }),
+
+  /** Remove many tracked packages in ONE request.
+   *
+   * Not `DELETE /download/results` — that empties our table without telling
+   * JDownloader, so the next poll re-inserts everything and the list comes
+   * straight back. This removes them from JD too, which is what makes them
+   * stay gone. */
+  removeDownloadResults: (ids: number[]) =>
+    request<{ ok: boolean; removed: number; requested: number;
+             jd_removed: boolean; durable: boolean; kept?: number;
+             errors?: string[] }>(
+      '/download/results/remove-many',
+      { method: 'POST', body: JSON.stringify({ ids }) }
+    ),
 
   // Settings
   getSettings: () => request<Settings>('/settings'),
@@ -623,9 +649,19 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ folder, force })
     }),
+  // Narrow current-state read. Used on reconnect and DV-panel open so attention
+  // state refreshes without pulling the whole inventory each time.
+  getDvConflicts: () => request<DvConflictStatus>('/rename/dv-conflicts'),
   getDvScans: (layer?: string) => {
     const qs = layer ? `?layer=${encodeURIComponent(layer)}` : '';
-    return request<{ scans: DvScan[]; counts: Record<string, number> }>(`/rename/dv-scans${qs}`);
+    // `conflicts` is CURRENT state, recomputed server-side on every call, not a
+    // record of whether a notification was ever delivered. Optional so an older
+    // backend still type-checks.
+    return request<{
+      scans: DvScan[];
+      counts: Record<string, number>;
+      conflicts?: DvConflictStatus;
+    }>(`/rename/dv-scans${qs}`);
   },
   dvImport: () =>
     request<{ imported: number; updated: number }>('/rename/dv-import', {

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
 
@@ -15,15 +15,52 @@ _FAILURE_TITLES = {
     ScrapeCode.BROWSER_NETWORK_ERROR.value: "HDEncode could not be reached",
     ScrapeCode.BROWSER_NAVIGATION_FAILED.value: "Page navigation failed",
     ScrapeCode.LAYOUT_CHANGED.value: "HDEncode page changed",
+    # CAUGHT BY THE EXHAUSTIVENESS TEST, exactly as its docstring predicted -- I
+    # added the code with a message and forgot this map, so it would have
+    # rendered as the generic "Download Failed".
+    # Observation only, per the sibling neutrality test: the control was not
+    # found. NOT "page changed" -- that is the claim this code exists to stop
+    # making, since absence is equally consistent with a gate, a pulled release,
+    # an error page or a different template.
+    ScrapeCode.REVEAL_CONTROL_ABSENT.value: "Download links not found on the page",
     ScrapeCode.REQUESTED_HOST_MISSING.value: "Requested host unavailable",
     ScrapeCode.NO_FILE_HOST_LINKS.value: "No supported links found",
     ScrapeCode.SCRAPE_EXCEPTION.value: "Link retrieval failed",
+    # FOUND BY THE NEW EXHAUSTIVENESS TEST, not by review. I added
+    # REVEAL_VERIFICATION_STALLED earlier this session precisely so a source
+    # throttle would stop being reported as a broken scraper -- and then left it
+    # out of this map, so `.get(reason, "Download Failed")` rendered it as
+    # "Download Failed". The item's own message said "nothing is wrong with this
+    # release" underneath a title that said the opposite, on the exact code behind
+    # the 45 items currently parked in cooldown. The fix I shipped was undone in
+    # the UI by the omission.
+    # NO CAUSAL CLAIM. This said "HDEncode is throttling" until 2026-08-09, when
+    # the throttle attribution was refuted: the user opened the exact stalled URL
+    # on a phone browser and the links appeared with almost no wait, so the source
+    # was serving that page fine. The reason CODE was always neutral; only the
+    # rendered title asserted a cause, and it is the title the user actually reads.
+    # What is observed is that the countdown placeholder never cleared within our
+    # window -- not why. See docs/reviews/peer-rounds/hdencode-reveal-stall-investigation.md.
+    ScrapeCode.REVEAL_VERIFICATION_STALLED.value: "HDEncode links did not unlock in time",
+    # Reached only when the link IS a direct file host we identify but cannot hand
+    # off; the ordinary direct-host path clears this diagnostic before it is ever
+    # rendered. Titled without "HDEncode" on purpose -- these two codes are for
+    # URLs that are not HDEncode, which is the whole reason they exist.
+    ScrapeCode.DIRECT_LINK_NO_SOURCE_PAGE.value: "Direct link not supported",
+    ScrapeCode.UNSUPPORTED_SOURCE.value: "Website not supported",
 }
 
 _SOURCE_WIDE_REASONS = {
     ScrapeCode.SOURCE_DISABLED.value,
     ScrapeCode.SOURCE_TEMPORARILY_BLOCKED.value,
     ScrapeCode.INTERACTIVE_CHALLENGE.value,
+    # A stalled link-reveal verification throttles the whole source, not one
+    # item: once HDEncode stops clearing the countdown, every subsequent item in
+    # the queue meets the same closed door. Without membership here,
+    # is_source_wide_denial returns False, the outcome routes to _fail instead of
+    # _pause_for_source, and the batch grinds on converting the rest of the queue
+    # into permanent failures -- which is exactly how 78 items accumulated.
+    ScrapeCode.REVEAL_VERIFICATION_STALLED.value,
 }
 
 
@@ -197,6 +234,128 @@ def challenge_iframe_srcs(html: str) -> tuple[str, ...]:
     return tuple(hits)
 
 
+# The mechanism recorded in cause_code when active Turnstile evidence, not a
+# generic challenge marker, is what proved the challenge. 600* is Cloudflare's
+# generic challenge-failure FAMILY, so detection matches the family — 600010 is
+# what production logged on 2026-08-09 but it is an observation, not a contract.
+TURNSTILE_CAUSE_CODE = "turnstile_challenge_failed"
+
+_TURNSTILE_CONSOLE_HOST = "challenges.cloudflare.com/turnstile"
+_TURNSTILE_CONSOLE_ERROR = re.compile(r"error:?\s*['\"]?600\d+", re.IGNORECASE)
+
+
+def is_turnstile_console_failure(line: str) -> bool:
+    """Does one browser-console line record a Turnstile 600*-family failure?
+
+    Requires BOTH the Turnstile script origin and a 600-family error number in
+    the same entry, so an unrelated site error mentioning "600123" or a dormant
+    reference to the script URL alone is never evidence. The CALLER owns the
+    navigation scoping: console entries must be drained at navigation start so
+    an old page's error cannot classify the next page.
+    """
+    low = (line or "").lower()
+    return (_TURNSTILE_CONSOLE_HOST in low
+            and bool(_TURNSTILE_CONSOLE_ERROR.search(low)))
+
+
+def _form_posts_unlock(form, unlock_target: Callable[[str], bool]) -> bool:
+    """True when a form's EFFECTIVE destination is this page's unlock endpoint.
+
+    Mirrors the reveal-control rule: a submit may override its form's
+    destination via ``formaction``, so the effective target is the submit's
+    ``formaction`` when present, else the form's ``action``. Ported from
+    agent/turnstile-classification — checking ``form.action`` alone is wrong in
+    both directions (a form whose action looks safe while its submit posts the
+    unlock endpoint, and the reverse).
+    """
+    action = form.get("action") or ""
+
+    def _is_submit(el) -> bool:
+        # Only a SUBMITTING control's formaction is the effective destination.
+        # A <button> defaults to type=submit, so a missing/empty type counts;
+        # but button[type=button] and button[type=reset] cannot submit and must
+        # not be read as (or suppress) the form's post target — re-review round.
+        t = str(el.get("type") or "").lower()
+        if el.name == "button":
+            return t in ("", "submit")
+        return t == "submit"
+
+    submits = [el for el in form.find_all(["input", "button"]) if _is_submit(el)]
+    targets = [(el.get("formaction") or action) for el in submits] or [action]
+    return any(unlock_target(target) for target in targets)
+
+
+def turnstile_challenge_evidence(
+    html: str,
+    console_lines: Sequence[str] = (),
+    *,
+    unlock_target: Optional[Callable[[str], bool]] = None,
+) -> tuple[str, ...]:
+    """Active, UNSOLVED Turnstile evidence markers, or ``()`` for none.
+
+    HDEncode embeds Turnstile INSIDE the reveal widget rather than replacing
+    the page, so the interstitial-shaped checks (challenge page title, visible
+    challenge text, cf-mitigated header) all miss it — that is how a failing
+    challenge was classified as a source throttle for two weeks. Accepted
+    evidence, in order of preference:
+
+    1. a rendered ``input[name="cf-turnstile-response"]`` that is UNSOLVED (empty
+       value) and — when ``unlock_target`` is supplied — belongs to a form that
+       posts THIS page's unlock endpoint;
+    2. a rendered ``.cf-turnstile`` container element;
+    3. a rendered iframe whose ``src`` names ``challenges.cloudflare.com``;
+    4. a NAVIGATION-SCOPED console error in the 600* family from the Turnstile
+       script (see is_turnstile_console_failure for what the caller must
+       guarantee about scoping).
+
+    THE RESPONSE-FIELD DISCRIMINATION (ported from agent/turnstile-classification
+    on peer + ChatGPT review): a POPULATED token is a challenge that SUCCEEDED,
+    not failure evidence; and a response field belonging to the page's COMMENT or
+    report form is not evidence about the reveal. Without ``unlock_target`` the
+    field is accepted on presence alone (back-compat for callers that cannot
+    resolve the endpoint), but the production caller always supplies it.
+
+    Deliberately NOT evidence: the word "cloudflare" anywhere in raw HTML, a
+    dormant ``<script src=...turnstile...>`` reference alone, the English
+    "Verifying… Please wait" label (localizable, and the site also uses it for
+    its own states), or generic access/show/download/link control text — the
+    existing detector once matched "show" inside a "TV Shows" navigation link.
+    """
+    markers: list[str] = []
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html or "", "html.parser")
+        for field in soup.find_all(
+            "input", attrs={"name": "cf-turnstile-response"}
+        ):
+            if (field.get("value") or "").strip():
+                continue  # solved — not failure evidence
+            if unlock_target is not None:
+                # Form ownership by nesting OR a ``form="<id>"`` attribute
+                # pointing elsewhere in the document. Checking only the parent
+                # would let a cosmetic markup change silently disable detection.
+                owner = field.get("form")
+                form = soup.find("form", id=owner) if owner else None
+                if form is None:
+                    form = field.find_parent("form")
+                if form is None or not _form_posts_unlock(form, unlock_target):
+                    continue
+            markers.append("turnstile:response-field")
+            break
+        if soup.find(class_="cf-turnstile") is not None:
+            markers.append("turnstile:container")
+        for frame in soup.find_all("iframe"):
+            if "challenges.cloudflare.com" in (frame.get("src") or "").lower():
+                markers.append("turnstile:iframe")
+                break
+    except Exception:
+        pass
+    if any(is_turnstile_console_failure(line) for line in console_lines or ()):
+        markers.append("turnstile:console-600")
+    return tuple(dict.fromkeys(markers))
+
+
 def strong_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:
     """Return active interactive-challenge evidence markers, or ``()`` for none.
 
@@ -261,6 +420,15 @@ def strong_challenge_markers(html: str, title: str = "") -> tuple[str, ...]:
     markers.extend(
         marker for marker in _CHALLENGE_VISIBLE_MARKERS if marker in visible
     )
+    # NOTE: a body-only page-replacing interstitial (its phrase in the BODY, no
+    # <title>, no captured cf-mitigated header) is NOT recognised here — keying
+    # on the body phrase is unsafe, because release pages carry those phrases as
+    # related-release names and the invisible-Turnstile widget renders a
+    # transient iframe on otherwise-working pages (~11s build/teardown). That
+    # case is handled STRUCTURALLY in _log_page_diagnostics instead: a rendered
+    # challenge iframe on a page with NO access/download/link controls is the
+    # interstitial shape, phrase- and lifecycle-independent. See the fold's
+    # round-1 finding from agent/turnstile-classification.
     return tuple(dict.fromkeys(markers))
 
 
@@ -326,6 +494,13 @@ def public_download_result(
         "retry_mode": source.get("retry_mode"),
         "cooldown_until": source.get("cooldown_until"),
         "transport_attempted": source.get("transport_attempted"),
+        # Carried through so the queue can tell a real source delivery from a
+        # pre-scrape duplicate. Dropping it here would make the producer's signal
+        # invisible to its only consumer.
+        "source_progress": bool(source.get("source_progress")),
+        # Carried through so the queue can release a verification hold the moment
+        # the source served its reveal, even if downstream delivery then failed.
+        "source_reveal_succeeded": bool(source.get("source_reveal_succeeded")),
         "affected_scope": source.get("affected_scope") or "item",
         "action_code": source.get("action_code"),
         "signals": signals,

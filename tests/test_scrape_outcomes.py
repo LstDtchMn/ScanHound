@@ -48,8 +48,15 @@ def test_download_item_surfaces_structured_failure_message():
 def test_page_diagnostics_classifies_interactive_challenge():
     service = _service()
     driver = MagicMock()
+    # A real Cloudflare interstitial REPLACES the page: the challenge phrase is
+    # in the <title>, which is authoritative regardless of reveal state. (Before
+    # the round-2 review this test relied on a bare iframe classifying on its
+    # own; that path is now gated on a not-ready reveal, so the test uses the
+    # interstitial evidence a genuine challenge page actually carries.)
+    driver.title = "Just a moment..."
     driver.page_source = """
-        <html><body><h1>Just a moment</h1>
+        <html><head><title>Just a moment...</title></head>
+        <body><h1>Just a moment</h1>
         <iframe src="https://challenges.cloudflare.com/turnstile"></iframe>
         </body></html>
     """
@@ -114,9 +121,11 @@ def test_dormant_cloudflare_assets_stay_item_level(monkeypatch):
     coordinator.observe_challenge.assert_not_called()
 
 
-def test_real_interactive_challenge_still_creates_source_wide_outcome(monkeypatch):
-    # 8. A rendered challenge iframe still produces the typed source-wide
-    #    interactive-challenge outcome and invokes the coordinator.
+def test_embedded_challenge_iframe_on_a_stuck_reveal_is_source_wide(monkeypatch):
+    # 8. An embedded challenge iframe on a NOT-READY reveal produces the typed
+    #    source-wide interactive-challenge outcome and invokes the coordinator.
+    #    (Round-2 review, finding 4: the iframe no longer classifies on its own;
+    #    it is the reveal-stuck conjunction that makes it a source-wide event.)
     service = _service()
     coordinator = MagicMock()
     coordinator.observe_challenge.return_value = SimpleNamespace(
@@ -133,7 +142,8 @@ def test_real_interactive_challenge_still_creates_source_wide_outcome(monkeypatc
     """
 
     diagnostic = service._log_page_diagnostics(
-        driver, stage="access_control", source_kind="hdencode"
+        driver, stage="access_control", source_kind="hdencode",
+        reveal_tier="not-ready",
     )
 
     assert diagnostic.code is ScrapeCode.INTERACTIVE_CHALLENGE
@@ -141,6 +151,149 @@ def test_real_interactive_challenge_still_creates_source_wide_outcome(monkeypatc
     assert diagnostic.affected_scope == "source"
     assert diagnostic.cooldown_until == "2099-01-01T00:00:00+00:00"
     coordinator.observe_challenge.assert_called_once()
+
+
+def test_embedded_challenge_iframe_on_a_working_reveal_is_not_a_challenge(monkeypatch):
+    # Round-2 review, finding 4: the negative control. A rendered Turnstile
+    # iframe on a page whose reveal is READY (or not evaluated) must NOT classify
+    # as a source-wide challenge — otherwise a dormant/unrelated widget would
+    # strand the source under a verification hold a timer cannot release.
+    service = _service()
+    coordinator = MagicMock()
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator
+    )
+    driver = MagicMock()
+    driver.page_source = """
+        <html><body>
+        <iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if"></iframe>
+        </body></html>
+    """
+
+    diagnostic = service._log_page_diagnostics(
+        driver, stage="access_control", source_kind="hdencode",
+        reveal_tier="links-control",
+    )
+
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE
+    coordinator.observe_challenge.assert_not_called()
+
+
+def test_body_only_interstitial_no_title_still_classifies(monkeypatch):
+    # FOLD regression guard (both branches' partitions had this shape): a genuine
+    # page-replacing Cloudflare interstitial — no <title>, no captured
+    # cf-mitigated header, a challenge iframe, and NO access/download/link
+    # controls — must still be INTERACTIVE_CHALLENGE, not demoted to
+    # LAYOUT_CHANGED. Recognised STRUCTURALLY (iframe + no controls = the
+    # interstitial shape), not by the body phrase — see the peer-review finding
+    # that keying on the phrase or the iframe alone false-positives on working
+    # release pages.
+    service = _service()
+    coordinator = MagicMock()
+    coordinator.observe_challenge.return_value = SimpleNamespace(cooldown_until=None)
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator)
+    driver = MagicMock()
+    driver.title = ""                    # NO <title>
+    # A bare interstitial: a spinner, its copy, the challenge iframe — and NO
+    # download/access/link controls (that absence is the structural signal).
+    driver.page_source = """
+        <html><body>
+        <h1>Just a moment…</h1>
+        <p>Please wait while your request is reviewed.</p>
+        <iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if"></iframe>
+        </body></html>
+    """
+    # No reveal_tier passed — a genuine interstitial has no reveal control.
+    diagnostic = service._log_page_diagnostics(
+        driver, stage="access_control", source_kind="hdencode")
+    assert diagnostic.code is ScrapeCode.INTERACTIVE_CHALLENGE
+    assert diagnostic.affected_scope == "source"
+
+
+def test_challenge_iframe_on_a_working_page_with_controls_is_not_a_challenge(monkeypatch):
+    # PEER-REVIEW COUNTEREXAMPLE (agent/turnstile-classification). The invisible
+    # Turnstile widget renders a TRANSIENT iframe (~11s build/teardown) on
+    # otherwise-working pages, and a release page carries phrases like "Access
+    # Denied" as related-release NAMES. A working release page — reveal control
+    # READY, access/download/link controls present, an "Access Denied (2021)"
+    # related title in the body, and a transient challenge iframe — must NOT be
+    # a source-wide interstitial. The structural guard (controls present) is what
+    # prevents arming a hold on a healthy source; keying on the iframe or the
+    # body phrase would not.
+    service = _service()
+    coordinator = MagicMock()
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator)
+    driver = MagicMock()
+    driver.title = "Some.Release.2026.2160p.WEB-DL"
+    driver.page_source = """
+        <html><body>
+        <form action="/some-release/#unlocked">
+          <input type="submit" value="View links">
+        </form>
+        <a href="https://rapidgator.net/file/abc">Rapidgator download</a>
+        <aside>Related: <a href="/access-denied-2021/">Access Denied (2021)</a></aside>
+        <iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if"></iframe>
+        </body></html>
+    """
+    diagnostic = service._log_page_diagnostics(
+        driver, stage="access_control", source_kind="hdencode",
+        reveal_tier="links-control")
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE, (
+        "a working page with controls must not be held on a transient iframe")
+    coordinator.observe_challenge.assert_not_called()
+
+
+def test_a_control_less_page_with_a_host_link_is_not_an_interstitial(monkeypatch):
+    # FOLD review counterexample (ChatGPT): a post-click page for a DIFFERENT
+    # requested host exposes a real file-host link whose visible label is just
+    # "Rapidgator" — no lexical access/download/link keyword, so `candidates` is
+    # empty — while the invisible-Turnstile iframe is transiently present and the
+    # reveal tier is None. `host_links` (the actual host URL) is the stronger
+    # signal that the page is working; without requiring its absence, the
+    # structural guard would arm a source-wide hold on a healthy page.
+    service = _service()
+    coordinator = MagicMock()
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator)
+    driver = MagicMock()
+    driver.title = "Some.Release.2026.2160p.WEB-DL"
+    driver.page_source = """
+        <html><body>
+        <a href="https://rapidgator.net/file/abc">Rapidgator</a>
+        <iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/if"></iframe>
+        </body></html>
+    """
+    diagnostic = service._log_page_diagnostics(
+        driver, keyword="nitroflare", stage="requested_host",
+        source_kind="hdencode")
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE, (
+        "a page exposing a real host link must not be held on a transient iframe")
+    coordinator.observe_challenge.assert_not_called()
+
+
+def test_body_title_phrase_without_an_iframe_is_not_a_challenge(monkeypatch):
+    # The broader ambiguous title phrases ("just a moment", "access denied") in
+    # a release body, with NO challenge iframe, must NOT classify — they are not
+    # standalone evidence. (The narrow phrases "checking your browser" / "verify
+    # you are human" remain standalone, pre-existing base behaviour.)
+    service = _service()
+    coordinator = MagicMock()
+    monkeypatch.setattr(
+        "backend.download_service.get_hdencode_coordinator", lambda: coordinator)
+    driver = MagicMock()
+    driver.title = "Some.Release.2026.2160p.WEB-DL"
+    driver.page_source = """
+        <html><body>
+        <article>Just a moment of your time — a great 2160p release. No
+        access denied here, just links.</article>
+        </body></html>
+    """
+    diagnostic = service._log_page_diagnostics(
+        driver, stage="access_control", source_kind="hdencode")
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE
+    coordinator.observe_challenge.assert_not_called()
 
 
 def _perf_entry(url, headers, *, rtype="Document"):
@@ -308,14 +461,22 @@ def test_page_diagnostics_distinguishes_requested_host_missing():
     assert diagnostic.affects_source_health is False
 
 
-def test_page_diagnostics_distinguishes_layout_change():
+def test_page_diagnostics_classifies_an_access_control_failure():
+    """An access-control failure is classified and counts toward source health.
+
+    The expected CODE changed on 2026-08-12: with no reveal tier supplied the
+    tier is unknown, which proves nothing about the layout, so this reports the
+    neutral REVEAL_CONTROL_ABSENT rather than asserting LAYOUT_CHANGED. What this
+    test protects — that the stage is classified at all, and that it still
+    affects source health — is unchanged.
+    """
     service = _service()
     driver = MagicMock()
     driver.page_source = "<html><body><article>Release text only</article></body></html>"
 
     diagnostic = service._log_page_diagnostics(driver, stage="access_control")
 
-    assert diagnostic.code is ScrapeCode.LAYOUT_CHANGED
+    assert diagnostic.code is ScrapeCode.REVEAL_CONTROL_ABSENT
     assert diagnostic.affects_source_health is True
 
 
@@ -408,7 +569,14 @@ def test_release_text_named_captcha_is_not_a_challenge():
         stage="access_control",
     )
 
-    assert diagnostic.code is ScrapeCode.LAYOUT_CHANGED
+    # THE POINT OF THIS TEST is the negative: a release whose TITLE contains
+    # "Captcha" must not be mistaken for an interactive challenge. Assert that
+    # directly rather than only implying it via the fallback code.
+    assert diagnostic.code is not ScrapeCode.INTERACTIVE_CHALLENGE
+    # The fallback code changed on 2026-08-12: with no reveal tier supplied the
+    # tier is unknown, so this is the neutral REVEAL_CONTROL_ABSENT rather than
+    # an unproven LAYOUT_CHANGED claim.
+    assert diagnostic.code is ScrapeCode.REVEAL_CONTROL_ABSENT
     assert diagnostic.affects_source_health is True
 
 

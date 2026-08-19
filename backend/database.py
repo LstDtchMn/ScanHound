@@ -34,6 +34,50 @@ class RenameJobDBError(Exception):
     DB problem" apart from "legitimately skipped" should catch this."""
 
 
+#: Diagnostic buckets in the shadow-miss integrity check that must never hold a
+#: row without a matching explanation.
+_MISS_DIAGNOSTIC_BUCKETS = ("unsupported", "corrupt")
+
+
+def reconcile_bucket_reporting(per_cycle):
+    """Every row counted as bad must have produced its own finding.
+
+    Returns the findings for any cycle whose bucket count and reported count
+    disagree. Empty means the accounting is consistent.
+
+    WHY THIS IS A MODULE-LEVEL FUNCTION AND NOT AN INLINE LOOP. Round 5's version
+    of this check lived inline and asked whether ANY integrity finding mentioned
+    the cycle, which one unrelated finding satisfied for any number of unreported
+    rows in the same cycle. Its test passed with the check deleted -- the test
+    could not construct the state that reaches it, because production code always
+    reports correctly, so there was nothing to detect. I recorded that rather than
+    reword it.
+
+    Pulling it out makes the state constructible: the reviewer's case
+    (unsupported=2 with one reported, corrupt=1 with one reported) is now three
+    lines of a dict, and the assertion is that exactly ONE finding appears --
+    naming the unsupported bucket -- despite a corrupt finding already existing
+    for that same cycle. That is the case the string match got wrong.
+
+    A shortfall can only arise if a branch increments a bucket without going
+    through the reporting helper, which is exactly the mistake being guarded.
+    """
+    findings = []
+    for cycle, slot in per_cycle.items():
+        for bucket in _MISS_DIAGNOSTIC_BUCKETS:
+            counted = int(slot.get(bucket) or 0)
+            reported = int(slot.get("reported_" + bucket) or 0)
+            shortfall = counted - reported
+            if shortfall > 0:
+                findings.append(f"unreported_{bucket}_rows:{cycle}:{shortfall}")
+            elif shortfall < 0:
+                # More explanations than bad rows means this accounting is itself
+                # wrong, which is no better than the bug it looks for.
+                findings.append(
+                    f"overreported_{bucket}_rows:{cycle}:{-shortfall}")
+    return findings
+
+
 class DatabaseManager:
     """Thread-safe SQLite database manager with connection pooling and auto-recovery."""
 
@@ -223,6 +267,54 @@ class DatabaseManager:
 
     # Schema version — increment when migrations are added.
     SCHEMA_VERSION = 9
+
+    @staticmethod
+    def _mark_existing_challenge_pauses_held(cursor):
+        """v9: put pre-existing INTERACTIVE-CHALLENGE pauses under the hold.
+
+        NARROWED on round-2 review (finding 3). The first version also swept
+        `reveal_verification_stalled` batches and took the held source from the
+        first deferred child by sequence. Both were wrong:
+
+          * `reveal_verification_stalled` is explicitly NOT Turnstile evidence —
+            it is the runtime classifier's fallback for a not-ready reveal with
+            NO active challenge — so retro-labelling it a human challenge
+            contradicts the very rule this change adds. A `user_version` gate
+            bounds how OFTEN the inference runs, not WHICH rows it is valid for.
+          * the first deferred child can be a different source than the one that
+            hit the challenge (a mixed batch: seq0 DDLBase, seq1 HDEncode), so
+            the wrong source could be held.
+
+        So this migrates ONLY a batch that carries a genuine challenge TRIGGER
+        row — an item in `verification_required` with
+        `queue_reason='interactive_challenge'` — and takes the held source from
+        THAT row, which is by construction the source that hit the challenge.
+        A batch without such a row is left alone; if its reveal later stalls on
+        a live Turnstile, the runtime classifier holds it then, on real
+        evidence. This is the schema migration doing only what the schema can
+        prove. It is written at the batch (the level the resume machinery reads)
+        so old item cooldowns and auto-resume flags cannot reschedule the rows.
+        """
+        cursor.execute(
+            """
+            UPDATE download_queue_batches
+            SET verification_hold_source = (
+                SELECT i.source FROM download_queue_items i
+                WHERE i.batch_uuid = download_queue_batches.batch_uuid
+                  AND i.state = 'verification_required'
+                  AND i.queue_reason = 'interactive_challenge'
+                ORDER BY i.sequence_number LIMIT 1
+            )
+            WHERE state = 'paused_source'
+              AND verification_hold_source IS NULL
+              AND EXISTS (
+                SELECT 1 FROM download_queue_items i
+                WHERE i.batch_uuid = download_queue_batches.batch_uuid
+                  AND i.state = 'verification_required'
+                  AND i.queue_reason = 'interactive_challenge'
+              )
+            """
+        )
 
     def init_db(self):
         """Initialize database tables and run schema migrations.
@@ -691,6 +783,19 @@ class DatabaseManager:
                                'ON download_results(package_uuid) WHERE package_uuid IS NOT NULL')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_download_results_name '
                                'ON download_results(name)')
+                # PACKAGE PROVENANCE, PERSISTED (peer review Finding 1, part 2).
+                # The release a live package was PROVEN to belong to, by matching
+                # the file-host links ScanHound recorded submitting. Persisted
+                # rather than recomputed per request because the REST endpoint
+                # reads this table, not the live JD poll -- only the poller holds
+                # the child links, so without a column the two transports could
+                # not agree. NULL means unproven, which renders as no link.
+                try:
+                    cursor.execute('ALTER TABLE download_results '
+                                   'ADD COLUMN provenance_url TEXT')
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp DESC)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_bg_cache_last_seen ON background_scan_cache(last_seen_at)')
@@ -840,6 +945,41 @@ class DatabaseManager:
                     if "duplicate column" not in str(e).lower():
                         raise
 
+                # Must come AFTER the package_name / jd_confirmed_name column
+                # migrations above — on a fresh database `downloads` is created
+                # with only (url, title, date_added), so indexing these columns
+                # any earlier fails with "no such column" and takes startup with
+                # it. The live source-link resolver that first needed these was
+                # retired in favour of recorded link provenance; they stay for
+                # the remaining name queries, chiefly the jd_confirmed_name
+                # backfill, which scans package_name on every startup.
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_package_name '
+                               'ON downloads(package_name) WHERE package_name IS NOT NULL')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_downloads_jd_confirmed_name '
+                               'ON downloads(jd_confirmed_name) WHERE jd_confirmed_name IS NOT NULL')
+
+                # PACKAGE PROVENANCE (peer review Finding 1, 2026-08-12).
+                # The file-host links ScanHound actually submitted for a release.
+                # poll_results() enumerates JDownloader's ENTIRE package list, so
+                # a package added by hand is in scope; matching it to a release by
+                # display name is a coincidence, not evidence, and produced a
+                # confident link to the wrong release page. A link IS the release,
+                # so this is provenance by construction — and both send paths (API
+                # and .crawljob) know the links, which a package-uuid scheme could
+                # not say (JD assigns uuids asynchronously, and the folder path has
+                # nothing to ask).
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS download_package_links (
+                        url TEXT NOT NULL,
+                        link TEXT NOT NULL,
+                        recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (url, link)
+                    )
+                ''')
+                # Resolution goes link -> release, so `link` is the lookup key.
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_package_links_link '
+                               'ON download_package_links(link)')
+
                 # HDEncode RSS evidence tables (v3, additive-only).
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS hdencode_feed_state (
@@ -988,7 +1128,14 @@ class DatabaseManager:
                         catchup_used INTEGER NOT NULL DEFAULT 0,
                         restart_recovery INTEGER NOT NULL DEFAULT 0,
                         outcome TEXT NOT NULL,
-                        details_json TEXT NOT NULL DEFAULT '{}'
+                        details_json TEXT NOT NULL DEFAULT '{}',
+                        normal_feed_outcomes TEXT,
+                        -- Listing-arm trustworthiness, recorded SEPARATELY from
+                        -- feed health. NULL on cycles written before 2026-08-07.
+                        -- normal_feeds_complete conflates a failed feed with a
+                        -- failed listing crawl, so resolution cannot tell them
+                        -- apart from it; see cycle_is_valid_evidence_for().
+                        listing_complete INTEGER
                     )
                 """)
                 cursor.execute("""
@@ -997,12 +1144,44 @@ class DatabaseManager:
                         canonical_url TEXT NOT NULL,
                         title TEXT,
                         status TEXT,
+                        media_type TEXT,
+                        attribution_basis TEXT,
                         PRIMARY KEY (cycle_uuid, canonical_url),
                         FOREIGN KEY (cycle_uuid)
                             REFERENCES hdencode_shadow_cycles(cycle_uuid)
                             ON DELETE CASCADE
                     )
                 """)
+                # Additive migrations for the two tables above, kept HERE rather
+                # than in the shared _column_migrations list several hundred
+                # lines earlier. That list runs before these CREATE statements,
+                # so an ALTER placed there fails with "no such table", and the
+                # guard only swallows "duplicate column" -- it logs the failure
+                # and carries on, leaving the column absent. Which is exactly
+                # what happened on the first attempt: every new test failed with
+                # "table hdencode_shadow_cycles has no column named
+                # normal_feed_outcomes" while the migration warning scrolled past
+                # in the log.
+                for _shadow_alter in (
+                    "ALTER TABLE hdencode_shadow_cycles "
+                    "ADD COLUMN normal_feed_outcomes TEXT",
+                    "ALTER TABLE hdencode_shadow_misses ADD COLUMN media_type TEXT",
+                    # The signals that decided the attribution, so a counted
+                    # miss can be audited rather than re-derived by guesswork.
+                    "ALTER TABLE hdencode_shadow_misses "
+                    "ADD COLUMN attribution_basis TEXT",
+                    # Listing-arm authority, so a mixed-feed cycle can resolve a
+                    # miss for the feed that DID succeed without also trusting a
+                    # listing crawl that failed.
+                    "ALTER TABLE hdencode_shadow_cycles "
+                    "ADD COLUMN listing_complete INTEGER",
+                ):
+                    try:
+                        cursor.execute(_shadow_alter)
+                    except sqlite3.OperationalError as _e:
+                        if "duplicate column" not in str(_e).lower():
+                            logger.warning("Shadow migration failed: %s — %s",
+                                           _shadow_alter, _e)
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_hdencode_shadow_completed
                     ON hdencode_shadow_cycles(completed_at, outcome)
@@ -1149,14 +1328,58 @@ class DatabaseManager:
                         deferred_items INTEGER NOT NULL DEFAULT 0,
                         auto_resume_after_cooldown INTEGER NOT NULL DEFAULT 0,
                         auto_resume_used INTEGER NOT NULL DEFAULT 0,
+                        -- Completed-item count at the moment of the last
+                        -- automatic resume. Lets the retry budget be REFUNDED
+                        -- when a resume actually delivered something, so a batch
+                        -- that keeps making progress is not cut off after N
+                        -- attempts. See _maybe_auto_resume.
+                        auto_resume_progress_mark INTEGER NOT NULL DEFAULT 0,
+                        source_delivery_count INTEGER NOT NULL DEFAULT 0,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
                         paused_at TEXT,
                         cooldown_until TEXT,
                         last_reason_code TEXT,
-                        last_cause_code TEXT
+                        last_cause_code TEXT,
+                        -- Non-NULL = this batch is under a human-verification
+                        -- hold for that source: an interactive challenge our
+                        -- automated browser could not complete. A timer never
+                        -- clears it; only a probe that genuinely delivers from
+                        -- this source does (DownloadQueueService._complete).
+                        verification_hold_source TEXT
                     )
                 """)
+                # Additive migration for the table above, placed HERE and not in
+                # the shared _column_migrations list several hundred lines
+                # earlier. That list runs BEFORE this CREATE, so an ALTER there
+                # fails with "no such table", and the guard only swallows
+                # "duplicate column" -- it logs the failure and carries on,
+                # leaving the column absent. That exact mistake cost a round of
+                # confusing test failures on the shadow tables; see the note
+                # beside their migrations.
+                for _batch_alter in (
+                    "ALTER TABLE download_queue_batches "
+                    "ADD COLUMN auto_resume_progress_mark INTEGER "
+                    "NOT NULL DEFAULT 0",
+                    # Incremented ONLY when a completion genuinely crossed the
+                    # source boundary -- see DownloadQueueService._complete.
+                    # Generic 'completed' cannot be used: download_item() returns
+                    # success with method='duplicate' BEFORE scraping when the
+                    # release was already grabbed, so counting completions would
+                    # refund retry budget for work the source never did.
+                    "ALTER TABLE download_queue_batches "
+                    "ADD COLUMN source_delivery_count INTEGER "
+                    "NOT NULL DEFAULT 0",
+                    # See the column comment in the CREATE above (v9).
+                    "ALTER TABLE download_queue_batches "
+                    "ADD COLUMN verification_hold_source TEXT",
+                ):
+                    try:
+                        cursor.execute(_batch_alter)
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
+
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS download_queue_items (
                         item_uuid TEXT PRIMARY KEY,
@@ -1199,6 +1422,48 @@ class DatabaseManager:
                         cancelled_at TEXT
                     )
                 """)
+                # APPEND-ONLY attempt history. The queue's item/batch rows carry
+                # only CURRENT state, which is why the 2026-08-13 incident could
+                # not be diagnosed: after a container restart there was no way
+                # to tell "the source was attempted repeatedly and every attempt
+                # failed" from "nothing was ever attempted". Both look identical
+                # in a durable row that just says waiting_source.
+                #
+                # transport_attempted is the load-bearing column. _pause_for_source
+                # rewrites every same-source sibling with a source_temporarily_blocked
+                # reason and transport_attempted=0, so a COUNT of reason codes
+                # measures policy consequences, not observations. Of 62 such rows
+                # in that incident exactly ONE had transport_attempted=1. Any
+                # source-health decision must read observations only.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS download_queue_attempts (
+                        attempt_id TEXT PRIMARY KEY,
+                        item_uuid TEXT NOT NULL,
+                        batch_uuid TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        finished_at TEXT,
+                        -- IN_PROGRESS until closed. An attempt that outlives its
+                        -- deadline while still IN_PROGRESS is STALE, which is the
+                        -- signal a blocked worker cannot otherwise produce.
+                        terminal_status TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+                        reason_code TEXT,
+                        affected_scope TEXT,
+                        -- 1 only when a request actually reached the source.
+                        transport_attempted INTEGER NOT NULL DEFAULT 0,
+                        -- 1 when the source affirmatively delivered. This, not
+                        -- item completion, is the source-liveness signal.
+                        source_progress INTEGER NOT NULL DEFAULT 0
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_queue_attempts_source_time
+                    ON download_queue_attempts(source, started_at)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_queue_attempts_open
+                    ON download_queue_attempts(terminal_status, started_at)
+                """)
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_download_queue_due
                     ON download_queue_items(state, scheduled_for, sequence_number)
@@ -1216,6 +1481,15 @@ class DatabaseManager:
                     )
                 """)
 
+                if current_version < 9:
+                    # v9 ONE-TIME DATA MIGRATION: place the challenge episode
+                    # that predates the verification-hold column under the
+                    # hold. AFTER both queue tables exist — the UPDATE's
+                    # subqueries read download_queue_items, and on a fresh
+                    # database (current_version=0) that table is only created
+                    # a few statements above; running earlier broke every
+                    # fresh init with "no such table".
+                    self._mark_existing_challenge_pauses_held(cursor)
                 # ── Hybrid listing sweep (v9) ────────────────────────────
                 # Three tables, deliberately separate, because conflating them
                 # is what broke the earlier design:
@@ -2627,8 +2901,9 @@ class DatabaseManager:
                     rss_requests, listing_requests, rss_count, listing_count,
                     duplicate_count, feed_only_count, listing_only_count,
                     relevant_miss_count, request_reduction_pct, catchup_used,
-                    restart_recovery, outcome, details_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    restart_recovery, outcome, details_json, normal_feed_outcomes,
+                    listing_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (cycle_uuid,started_at,completed_at,1 if metrics.get("normal_feeds_complete") else 0,
                  int(metrics.get("rss_requests") or 0),int(metrics.get("listing_requests") or 0),
                  int(metrics.get("rss_count") or 0),int(metrics.get("listing_count") or 0),
@@ -2636,13 +2911,25 @@ class DatabaseManager:
                  int(metrics.get("listing_only_count") or 0),int(metrics.get("relevant_miss_count") or 0),
                  float(metrics.get("request_reduction_pct") or 0),1 if catchup_used else 0,
                  1 if restart_recovery else 0,str(metrics.get("outcome") or "unknown"),
-                 json.dumps(details,default=str)),
+                 json.dumps(details,default=str),
+                 # Written NON-NULL by every attribution-aware caller, including
+                 # the empty-dict case. Only pre-attribution rows are NULL, and
+                 # get_hdencode_shadow_summary depends on that distinction.
+                 json.dumps(dict(metrics.get("normal_feed_outcomes") or {}),default=str),
+                 # Three-state, matching the column: None when the caller did not
+                 # record it (so resolution falls back to the aggregate rule), else
+                 # an explicit 0/1.
+                 (None if metrics.get("listing_complete") is None
+                  else (1 if metrics.get("listing_complete") else 0))),
             )
             for miss in misses:
                 conn.execute(
                     "INSERT OR REPLACE INTO hdencode_shadow_misses "
-                    "(cycle_uuid, canonical_url, title, status) VALUES (?, ?, ?, ?)",
-                    (cycle_uuid,miss.get("canonical_url"),miss.get("title"),miss.get("status")),
+                    "(cycle_uuid, canonical_url, title, status, media_type, "
+                    " attribution_basis) VALUES (?, ?, ?, ?, ?, ?)",
+                    (cycle_uuid,miss.get("canonical_url"),miss.get("title"),
+                     miss.get("status"),miss.get("media_type"),
+                     miss.get("attribution_basis")),
                 )
 
     def get_hdencode_rss_dashboard_counts(self):
@@ -2688,9 +2975,24 @@ class DatabaseManager:
             scope = " AND completed_at >= ?"
             params = [str(window_start_at)]
         # Readiness evidence is derived only from structurally eligible cycles:
-        # both normal feeds completed and both comparison sides made at least
-        # one request.  Incomplete/degenerate rows must not stretch the
-        # observation window or improve the request-reduction percentage.
+        # both normal feeds completed, listing membership uncontradicted, and both
+        # comparison sides made at least one request.  Incomplete/degenerate rows
+        # must not stretch the observation window or improve the request-reduction
+        # percentage.
+        #
+        # LISTING AUTHORITY WAS MISSING FROM THIS WINDOW UNTIL ROUND 7.
+        # compare_shadow() withholds `listing_complete` when detail attribution
+        # contradicts raw membership, and the per-release resolver honours that --
+        # but this query did not, so a cycle the resolver refused to trust still
+        # incremented `cycles`, stretched first/last_completed_at, improved the
+        # request-reduction figure and counted as restart/catch-up recovery
+        # evidence. The top-level qualification claim was therefore calling cycles
+        # successful on evidence its own resolver had rejected.
+        #
+        # NULL is admitted for cycles written before the column existed; those
+        # fall back to the aggregate rule, the same legacy compatibility used by
+        # cycle_is_valid_evidence_for(). A cycle recorded SINCE the column exists
+        # must be an explicit 1.
         eligible=self._query(
             """SELECT COUNT(*) AS cycles,
                       MIN(completed_at) AS first_completed_at,
@@ -2701,17 +3003,247 @@ class DatabaseManager:
                FROM hdencode_shadow_cycles
                WHERE outcome IN ('success','relevant_miss')
                  AND normal_feeds_complete=1
+                 AND (listing_complete IS NULL OR listing_complete=1)
                  AND rss_requests>0
-                 AND listing_requests>0""" + scope,
-            tuple(params),one=True,default=None)
-        # A relevant miss is a mandatory stop condition even when the cycle was
-        # otherwise incomplete, so miss accounting deliberately spans every row
-        # IN THE WINDOW — the eligibility filter above is deliberately not
-        # applied, but the window boundary is.
-        misses=self._query(
-            "SELECT SUM(relevant_miss_count) AS relevant_misses "
-            "FROM hdencode_shadow_cycles WHERE 1=1" + scope,
-            tuple(params),one=True,default=None)
+                 AND listing_requests>0""",
+            one=True,default=None)
+        # MISS ACCOUNTING. The 2026-07-21 adversarial audit (f5e3c6e) established
+        # that a degraded cycle must not be able to HIDE a real gap. That rule is
+        # preserved by ATTRIBUTION rather than any cycle-level proxy: a real movie
+        # miss still blocks when tv_all failed, and vice versa.
+        #
+        # An earlier attempt used `WHERE rss_requests>0`. Peer review refuted it:
+        # that count spans catch-up feeds and counts attempted-but-failed
+        # requests, so it admitted the stale comparisons it was meant to exclude.
+        # Do not reintroduce a request-count proxy here.
+        #
+        # WHAT THIS CHECK IS, precisely. It is a COUNT- AND EVIDENCE-INTEGRITY
+        # check, not independent validation of the producer. A 2026-08-06 review
+        # corrected an overstatement on exactly this point: recomputing from the
+        # stored rows catches a lying aggregate count, but it reads only the rows
+        # the writer chose to insert and trusts the media_type the writer stored.
+        # It therefore CANNOT detect a classifier bug, a wrong stored media_type,
+        # or a suppressed row -- semantic correctness is established by the
+        # adversarial tests over real MediaItem inputs, not here.
+        #
+        # What it must do is FAIL CLOSED. The first version silently converted
+        # malformed provenance to {} and counted zero, and the writer stores a
+        # missing normal_feed_outcomes as {} rather than NULL -- so a forgetful
+        # caller could file misses that this reader then suppressed. Both
+        # deflated the gate, the opposite of the claim made for it. Impossible
+        # states are now integrity blockers surfaced in readiness reasons.
+        from backend.hdencode_shadow import feed_observation_valid
+        integrity=[]
+        # EVERY ROW IS ACCOUNTED FOR. The Round 3 version incremented on a valid
+        # observation and did nothing otherwise, and reconciled counts only where
+        # relevant_miss_count > 0. So a row unsupported by its own provenance was
+        # silently dropped whenever the stored count happened to equal the row
+        # count -- another route from contradictory evidence to ready=true. My own
+        # test asserted that behaviour was correct, which is how it survived.
+        #
+        # Now each row is sorted into supported / unsupported / corrupt, and
+        # anything that is not supported is either counted or flagged. Nothing
+        # falls off the end.
+        _VALID_MEDIA_TYPES={"movie","tv","unknown"}
+        attributed=0
+        per_cycle={}
+
+        def _flag(slot,bucket,finding):
+            """Count a bad row AND explain it, in one action that cannot split.
+
+            ROUND 6, replacing a backstop that matched strings. Every branch below
+            used to do `integrity.append(...)` and `slot[bucket]+=1` as two
+            separate statements, and twice a branch did the second without the
+            first -- a row counted as bad while the gate reported nothing. The old
+            backstop caught that by asking whether ANY finding mentioned the
+            cycle, which one unrelated finding satisfies for any number of
+            unreported rows in that same cycle. I recorded that limitation rather
+            than claiming it closed.
+
+            Now the two are inseparable here, and the reported_* counters make the
+            invariant checkable: a future branch that increments a bucket directly
+            leaves reported_* behind, and the reconciliation at the end names the
+            bucket, the cycle, and the exact shortfall.
+            """
+            slot[bucket]+=1
+            slot["reported_"+bucket]+=1
+            integrity.append(finding)
+
+        rows=self._query_dicts(
+            "SELECT m.cycle_uuid AS cycle_uuid, m.canonical_url AS url, "
+            "       m.media_type AS media_type, "
+            "       c.normal_feed_outcomes AS provenance, "
+            "       c.normal_feeds_complete AS complete, "
+            "       c.relevant_miss_count AS stored_count "
+            "FROM hdencode_shadow_misses m "
+            "JOIN hdencode_shadow_cycles c ON c.cycle_uuid=m.cycle_uuid "
+            "WHERE c.normal_feed_outcomes IS NOT NULL",default=[])
+        for row in rows:
+            cycle=str(row.get("cycle_uuid") or "")
+            slot=per_cycle.setdefault(cycle,{"total":0,"supported":0,
+                                             "unsupported":0,"corrupt":0,
+                                             "reported_unsupported":0,
+                                             "reported_corrupt":0})
+            slot["total"]+=1
+            media_type=row.get("media_type")
+            # A persisted media_type outside the vocabulary is corrupt evidence.
+            # "unknown" is a legitimate classifier result; NULL or arbitrary text
+            # is not, and must not be silently coerced into it.
+            if media_type is None or str(media_type) not in _VALID_MEDIA_TYPES:
+                _flag(slot,"corrupt",
+                      f"media_type_invalid:{cycle}:{media_type!r}")
+                continue
+            raw=row.get("provenance")
+            try:
+                provenance=json.loads(raw or "{}")
+            except (TypeError,ValueError):
+                _flag(slot,"corrupt",f"provenance_unparseable:{cycle}")
+                continue
+            if not isinstance(provenance,dict):
+                _flag(slot,"corrupt",f"provenance_not_an_object:{cycle}")
+                continue
+            if "_derived_from" in provenance:
+                # Written by a caller that supplied no per-feed provenance. The
+                # marker deliberately does not fabricate feed outcomes, so the
+                # decision falls back to the cycle-level rule it came from.
+                #
+                # EXACT SCHEMA. Round 4 checked only the marker value and a
+                # truthiness comparison, which a 2026-08-06 review showed accepts
+                # a missing normal_feeds_complete key, arbitrary extra keys, and
+                # pseudo-booleans -- the string "false" is truthy in Python, so a
+                # contradictory marker could pass the consistency check and then
+                # take the silent-discard path below.
+                if set(provenance) != {"_derived_from", "normal_feeds_complete"}:
+                    _flag(slot,"corrupt",
+                          f"derived_marker_schema:{cycle}:"
+                          f"{sorted(provenance)!r}")
+                    continue
+                if provenance.get("_derived_from")!="cycle_level_completeness":
+                    _flag(slot,"corrupt",
+                          f"derived_marker_unknown:{cycle}:"
+                          f"{provenance.get('_derived_from')!r}")
+                    continue
+                recorded=provenance.get("normal_feeds_complete")
+                if not isinstance(recorded,bool):
+                    # bool() would accept "false", 0.0, [] and friends.
+                    _flag(slot,"corrupt",
+                          f"derived_marker_not_a_boolean:{cycle}:{recorded!r}")
+                    continue
+                if recorded!=bool(row.get("complete")):
+                    _flag(slot,"corrupt",
+                          f"derived_marker_contradicts_cycle:{cycle}")
+                    continue
+                if row.get("complete"):
+                    attributed+=1
+                    slot["supported"]+=1
+                    continue
+                # THE ROUND 4 HOLE, one branch over from the one Round 4 closed.
+                #
+                # This previously incremented "unsupported" and continued with no
+                # integrity finding, and the reconciliation below compares the
+                # stored count against TOTAL rows rather than SUPPORTED rows -- so
+                # stored=1, total=1, supported=0 went completely silent. A comment
+                # here claimed "the reconciliation below sees it". It did not.
+                #
+                # compare_shadow cannot legitimately produce this store: with no
+                # per-feed provenance and cycle completeness false, its derived
+                # observation set is empty and it cannot emit a miss row at all. A
+                # row attached to this marker is therefore writer drift, direct
+                # insertion, or corruption -- exactly what this layer exists for.
+                _flag(slot,"unsupported",
+                      f"miss_row_unsupported_by_derived_completeness:{cycle}")
+                continue
+            if not provenance:
+                # Supplied-empty provenance with a miss row attached is
+                # contradictory: compare_shadow cannot attribute anything with no
+                # observed feed, so it would never have written this row.
+                _flag(slot,"corrupt",f"miss_row_with_empty_provenance:{cycle}")
+                continue
+            if feed_observation_valid(str(media_type),provenance):
+                attributed+=1
+                slot["supported"]+=1
+            else:
+                # THE ROUND 3 HOLE. compare_shadow would never persist a row
+                # whose own feed was not observed, so this row should not exist.
+                # Dropping it quietly is exactly the fail-open that was supposed
+                # to have been removed.
+                _flag(slot,"unsupported",
+                      f"miss_row_unsupported_by_provenance:{cycle}:{media_type}")
+        # Orphan rows are invisible to the join above, and the declared foreign
+        # key is not proof they cannot exist: this connection does not enable
+        # PRAGMA foreign_keys, so it is not enforced.
+        orphans=self._query(
+            "SELECT COUNT(*) AS n FROM hdencode_shadow_misses m "
+            "WHERE NOT EXISTS (SELECT 1 FROM hdencode_shadow_cycles c "
+            "                  WHERE c.cycle_uuid=m.cycle_uuid)",
+            one=True,default=None)
+        orphan_count=int((orphans["n"] if orphans else 0) or 0)
+        if orphan_count:
+            integrity.append(f"orphan_miss_rows:{orphan_count}")
+        # Reconcile EVERY provenance-aware cycle, including stored zero. The
+        # previous query filtered relevant_miss_count > 0, so a cycle claiming
+        # zero while carrying rows was never checked -- and would either invent a
+        # count or discard the rows, depending on whether they validated.
+        for claim in self._query_dicts(
+                "SELECT cycle_uuid, relevant_miss_count AS n "
+                "FROM hdencode_shadow_cycles "
+                "WHERE normal_feed_outcomes IS NOT NULL",default=[]):
+            cycle=str(claim.get("cycle_uuid") or "")
+            stored=int(claim.get("n") or 0)
+            slot=per_cycle.get(cycle)
+            total=slot["total"] if slot else 0
+            if stored==0 and total==0:
+                continue
+            if total==0:
+                integrity.append(f"count_without_rows:{cycle}:{stored}")
+            elif stored!=total:
+                integrity.append(
+                    f"count_row_disagreement:{cycle}:{stored}!={total}")
+        # RECONCILIATION, round 6. Every row counted into a diagnostic bucket must
+        # have produced its own finding. Twice a branch incremented a bucket and
+        # fell off the end reporting nothing, and both times a test certified the
+        # silence as correct.
+        #
+        # WHAT CHANGED FROM ROUND 5. The previous version asked whether ANY
+        # integrity finding mentioned the cycle. That is string association, not
+        # accounting: one finding satisfied the check for any number of unreported
+        # bad rows in the same cycle, and a test could pass with the backstop
+        # deleted. Now each bucket is compared against its own reported counter,
+        # so the check is per bucket, per cycle, and reports the exact shortfall.
+        #
+        # This can only fire if a future branch increments a bucket without going
+        # through _flag, which is precisely the mistake being guarded. Readiness
+        # stays fail-closed: any finding here is in the blocking list.
+        integrity.extend(reconcile_bucket_reporting(per_cycle))
+        # Pre-attribution rows cannot be re-derived at all: nothing recorded
+        # which feed succeeded, and they carry no media_type to attribute. They
+        # are bounded CONSERVATIVELY -- counted only when both normal feeds
+        # completed.
+        #
+        # DIRECTION OF THAT BOUND, corrected 2026-08-06. Because
+        # conservative_admitted is a SUBSET of attribution_admitted, it follows
+        # that blocking(conservative) <= blocking(attribution). So this bound is
+        # safe against FALSELY ACCUSING the feed of a miss, and NOT safe as
+        # evidence of overall health: finding zero blockers in the smaller set
+        # does not establish zero in the larger one, because an omitted
+        # mixed-cycle row could itself be permanently missing. Earlier revisions
+        # of this comment claimed it "cannot overstate health", which is
+        # backwards. It supports only the admitted-record claim.
+        legacy=self._query(
+            "SELECT SUM(relevant_miss_count) AS n "
+            "FROM hdencode_shadow_cycles "
+            "WHERE normal_feed_outcomes IS NULL AND normal_feeds_complete=1",
+            one=True,default=None)
+        # Categorised so an operator can tell "coverage miss" from "evidence
+        # store corrupt" without the gate ever reporting ready.
+        findings=sorted(set(integrity))
+        by_category={}
+        for finding in findings:
+            by_category[finding.split(":",1)[0]]=by_category.get(
+                finding.split(":",1)[0],0)+1
+        misses={"relevant_misses":attributed+int((legacy["n"] if legacy else 0) or 0),
+                "miss_evidence_integrity":findings,
+                "miss_evidence_integrity_by_category":by_category}
         latest=self._query(
             "SELECT * FROM hdencode_shadow_cycles WHERE 1=1" + scope +
             " ORDER BY completed_at DESC LIMIT 1",
@@ -2724,6 +3256,12 @@ class DatabaseManager:
             "first_completed_at":eligible["first_completed_at"] if eligible else None,
             "last_completed_at":eligible["last_completed_at"] if eligible else None,
             "relevant_misses":int((misses["relevant_misses"] if misses else 0) or 0),
+            # Impossible states found while re-deriving the miss count. Non-empty
+            # means the stored evidence contradicts itself, which blocks
+            # readiness rather than being silently resolved to zero.
+            "miss_evidence_integrity":list((misses or {}).get("miss_evidence_integrity") or []),
+            "miss_evidence_integrity_by_category":dict(
+                (misses or {}).get("miss_evidence_integrity_by_category") or {}),
             "rss_requests":rss,
             "listing_requests":listing,
             "request_reduction_pct":round(reduction,2),
@@ -2732,7 +3270,305 @@ class DatabaseManager:
             "window_start_at":str(window_start_at) if window_start_at else None,
         }
 
-    # ── qualification window (durable safety state) ─────────────────────
+    def get_hdencode_miss_resolution(self):
+        """Classify every recorded miss as acquired / never acquired / unresolved.
+
+        PER-FEED AUTHORITY, restored 2026-08-07 on peer review. The first version
+        sourced misses with `WHERE c.normal_feeds_complete = 1` and admitted
+        observation cycles on the same condition. That is the CYCLE-LEVEL rule
+        this project spent five review rounds replacing. compare_shadow emits a
+        miss when the feed responsible for THAT release was observed -- so a movie
+        miss is legitimately recorded in a cycle where movies_all validated and
+        tv_all failed, i.e. with normal_feeds_complete = 0. My filter dropped
+        exactly those rows out of the gate: a real movie gap stopped blocking
+        because an unrelated TV feed had failed. That was a false-ready path.
+
+        Now both halves use `feed_observation_valid`, the same predicate that
+        governs miss creation:
+
+          * a miss is ADMITTED if its own feed was observed in its source cycle;
+          * a later cycle may RESOLVE it only if that cycle observed its feed.
+
+        Rows whose source cycle predates per-feed provenance keep the older,
+        conservative cycle-complete rule -- there is nothing finer to use.
+
+        Malformed evidence is reported, never silently skipped: dropping a cycle
+        because its JSON will not parse can remove the only observation after a
+        miss, which would quietly turn a decidable row into an unresolved one.
+        """
+        from backend.hdencode_shadow import (
+            feed_observation_valid, summarise_miss_resolutions,
+        )
+
+        def _at(value):
+            """ISO -> aware UTC datetime, or None. Never raises."""
+            try:
+                parsed=datetime.datetime.fromisoformat(str(value))
+            except (TypeError,ValueError):
+                return None
+            if parsed.tzinfo is None:
+                parsed=parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
+
+        def _urlset(value,label,cycle,problems):
+            """A URL container, or a recorded problem. `set(5)` would raise."""
+            if value is None:
+                return set()
+            if isinstance(value,(str,bytes)) or not isinstance(value,(list,tuple,set)):
+                problems.append(f"{label}_not_a_list:{cycle}:{type(value).__name__}")
+                return None
+            return {str(v) for v in value}
+
+        problems=[]
+        cycles=[]
+        # UNRESOLVED LISTING-ONLY CANDIDATES, keyed by URL. Replaces a running
+        # total of every historical detail failure, which round 7 showed was the
+        # wrong granularity in two directions:
+        #
+        #   * A URL present in BOTH the RSS feed and the raw listing whose detail
+        #     scrape failed is a DUPLICATE -- the thing RSS is supposed to find,
+        #     found. It cannot be an RSS miss, and it was blocking readiness.
+        #   * A genuinely listing-only URL that failed detail once and was
+        #     attributed fine on the next cycle blocked FOREVER, because a sum over
+        #     history has no way to subtract. Readiness could never recover from a
+        #     single transient scrape failure, which is not a property anyone chose.
+        #
+        # So candidacy is `detail_failed & listing_only` -- a listing row we could
+        # not attribute AND that RSS did not carry -- and later evidence clears it.
+        # The dict is keyed by URL rather than counted so that the same URL failing
+        # in three cycles is one unresolved candidate, not three.
+        candidate_state={}
+        for row in self._query_dicts(
+                "SELECT cycle_uuid, completed_at, outcome, normal_feeds_complete, "
+                "       rss_requests, listing_requests, details_json, "
+                "       normal_feed_outcomes, listing_complete "
+                "FROM hdencode_shadow_cycles "
+                "WHERE details_json IS NOT NULL ORDER BY completed_at",
+                default=[]):
+            cycle=str(row.get("cycle_uuid") or "")
+            # ADMIT incomplete_feeds, corrected 2026-08-07 on peer review.
+            #
+            # This filter used to require outcome in ("success","relevant_miss"),
+            # and compare_shadow writes "incomplete_feeds" whenever
+            # normal_feeds_complete is false -- which is exactly the mixed-feed
+            # case the per-feed rule exists to handle. So a cycle with
+            # movies_all=changed and tv_all=failed was discarded HERE, before
+            # cycle_is_valid_evidence_for() could ever see it. The helper was
+            # right and unreachable.
+            #
+            # Admitting it is only safe because listing trustworthiness is now a
+            # separate authority: cycle_is_valid_evidence_for() requires the
+            # listing arm AND the relevant feed, so an "incomplete_feeds" cycle
+            # whose LISTING failed still cannot resolve anything.
+            if not (row.get("outcome") in ("success","relevant_miss",
+                                           "incomplete_feeds")
+                    and int(row.get("rss_requests") or 0)>0
+                    and int(row.get("listing_requests") or 0)>0):
+                continue
+            at=_at(row.get("completed_at"))
+            if at is None:
+                problems.append(f"cycle_completed_at_unparseable:{cycle}")
+                continue
+            try:
+                details=json.loads(row.get("details_json") or "{}")
+            except (TypeError,ValueError):
+                problems.append(f"details_json_unparseable:{cycle}")
+                continue
+            if not isinstance(details,dict):
+                problems.append(f"details_json_not_an_object:{cycle}")
+                continue
+            # Genuine attribution failures recorded by the crawl. Distinct from
+            # detail_dropped, which mixes in cached skips and policy exclusions.
+            failed=details.get("detail_failed")
+            if isinstance(failed,(list,tuple)):
+                failed_urls={str(u) for u in failed if u}
+            else:
+                if failed:
+                    problems.append(f"detail_failed_not_a_list:{cycle}")
+                failed_urls=set()
+            listing=_urlset(details.get("listing_only"),"listing_only",cycle,problems)
+            feed=_urlset(details.get("feed_only"),"feed_only",cycle,problems)
+            # Cycles written before round 8 have no duplicate_urls; _urlset returns
+            # an empty set for a missing key, which is the conservative reading --
+            # absent evidence clears nothing.
+            duplicates=_urlset(
+                details.get("duplicate_urls"),"duplicate_urls",cycle,problems)
+            if listing is None or feed is None or duplicates is None:
+                continue
+            outcomes=self._normal_feed_outcomes(row, cycle, problems)
+            # STRICTLY NULL/0/1. The column is an unconstrained INTEGER, and
+            # bool() would turn 2 or -1 into True -- i.e. corrupt data would grant
+            # listing authority. Anything else is an evidence problem.
+            raw_listing_ok=row.get("listing_complete")
+            if raw_listing_ok is None:
+                listing_ok=None
+            elif raw_listing_ok in (0,1,True,False):
+                # Identity against the allowed values, NOT int() coercion. Round 5
+                # pointed out that int() accepts "1" and RAISES on "garbage" --
+                # taking readiness down with a ValueError instead of recording an
+                # evidence problem. SQLite affinity does not prevent stored text.
+                listing_ok=bool(raw_listing_ok)
+            else:
+                problems.append(
+                    f"listing_complete_invalid:{cycle}:{raw_listing_ok!r}")
+                listing_ok=None
+            # CANDIDATE BOOKKEEPING. Chronological -- the query above is
+            # ORDER BY completed_at -- so a later cycle's evidence overwrites an
+            # earlier cycle's verdict for the same URL.
+            #
+            # The asymmetry is deliberate. CREATING a candidate is conservative
+            # (it blocks), so an untrusted cycle may still raise one. CLEARING is
+            # permissive, so a cycle whose listing membership is contradicted
+            # (listing_complete=False) must not clear anything -- otherwise a
+            # cycle the resolver refuses to trust could still be the thing that
+            # unblocks readiness, which is the same fail-open shape as HIGH 2.
+            # Legacy NULL is allowed to clear: those cycles predate the column and
+            # are governed by the aggregate rule everywhere else.
+            for url in failed_urls & listing:
+                candidate_state[url]=True
+            # CLEARING REQUIRES AFFIRMATIVE RSS CARRIAGE. Corrected on peer review
+            # round 8, which found the previous rule fail-open -- and it was worse
+            # than the review described. It cleared on
+            #
+            #     (listing_only | feed_only) - detail_failed
+            #
+            # but `listing_only` MEANS RSS DID NOT CARRY THE URL. That is the
+            # miss-candidate set. So a later cycle where the release was still
+            # missing from RSS -- and merely had a working detail scrape -- deleted
+            # the blocker. I was clearing an RSS-coverage blocker using evidence of
+            # an RSS coverage gap, and if the relevant feed had not been validly
+            # observed that cycle, no graded miss row was created to take over. The
+            # blocker vanished and nothing replaced it.
+            #
+            # The only affirmative evidence that RSS carried a URL is:
+            #   feed_only      -- in RSS, not in the listing
+            #   duplicate_urls -- in RSS AND in the listing  <-- see Finding 2
+            # Their union is exactly "this cycle's RSS set, as far as it concerns
+            # URLs we know about". Nothing else in a persisted cycle establishes it.
+            #
+            # The second legitimate exit is OWNERSHIP TRANSFER to a graded miss row,
+            # applied after the miss loop below, since that is where admission by
+            # feed validity is decided.
+            rss_carried=feed | duplicates
+            if listing_ok is not False:
+                for url in rss_carried:
+                    if url in candidate_state:
+                        candidate_state[url]=False
+            cycles.append({"at":at,"listing_only":listing,"feed_only":feed,
+                           # CARRIED TO THE RESOLVER TOO, added on peer review
+                           # round 9. I parsed `duplicates` above, used it for
+                           # candidate clearing, and then did not put it in the
+                           # records the miss resolver reads -- so the resolver
+                           # could not see the evidence even in principle. Sixth
+                           # time in this effort that I have wired new evidence to
+                           # ONE consumer and left another consumer of the SAME
+                           # function blind to it.
+                           "duplicate_urls":duplicates,
+                           "outcomes":outcomes,
+                           "listing_complete":listing_ok,
+                           "cycle_complete":bool(row.get("normal_feeds_complete"))})
+
+        misses=[]
+        for row in self._query_dicts(
+                "SELECT m.canonical_url AS url, m.media_type AS media_type, "
+                "       c.cycle_uuid AS cycle_uuid, c.completed_at AS at, "
+                "       c.normal_feeds_complete AS complete, "
+                "       c.normal_feed_outcomes AS provenance "
+                "FROM hdencode_shadow_misses m "
+                "JOIN hdencode_shadow_cycles c ON c.cycle_uuid=m.cycle_uuid",
+                default=[]):
+            cycle=str(row.get("cycle_uuid") or "")
+            media_type=row.get("media_type")
+            source_outcomes=self._normal_feed_outcomes(row, cycle, problems)
+            if source_outcomes is None:
+                # Pre-provenance row: fall back to the conservative cycle rule.
+                admitted=bool(row.get("complete"))
+            else:
+                # NULL media_type is a pre-attribution legacy row, not a
+                # movie: read it as "unknown", which requires both feeds.
+                admitted=feed_observation_valid(
+                    str(media_type) if media_type is not None else "unknown",
+                    source_outcomes)
+            if not admitted:
+                continue
+            misses.append({"url":row.get("url"),"media_type":media_type,
+                           "at":_at(row.get("at"))})
+        # OWNERSHIP TRANSFER, the second and only other legitimate way out of
+        # candidate state. Applied HERE and not in the cycles loop because this is
+        # where admission is decided: a miss row only lands in `misses` if its
+        # relevant feed observation was valid (or, for a pre-provenance row, the
+        # conservative cycle rule held).
+        #
+        # The distinction round 8 required: a later detail success must not merely
+        # DELETE the blocker, it must hand the URL over to something that still
+        # blocks. Once an admitted miss row exists, the normal miss-resolution
+        # machinery owns that URL -- it will be graded acquired / never_acquired /
+        # undetermined / not_yet_assessable, and every one of those states except
+        # `acquired` blocks readiness on its own. So dropping it from the
+        # unattributed set is a genuine transfer of responsibility rather than an
+        # erasure.
+        #
+        # Note this deliberately does NOT check whether the miss row's own verdict
+        # is favourable. That is not this function's job, and making candidacy
+        # depend on the outcome would double-count the same URL in two blockers.
+        for url in {str(m.get("url") or "") for m in misses}:
+            if url in candidate_state:
+                candidate_state[url]=False
+        summary=summarise_miss_resolutions(misses,cycles)
+        summary["evidence_problems"]=problems
+        unresolved=sorted(u for u,pending in candidate_state.items() if pending)
+        summary["unattributed_candidates"]=len(unresolved)
+        # The URLs themselves, so the readiness reason can be acted on instead of
+        # only counted. A bare "3 candidates" cannot be investigated.
+        summary["unattributed_candidate_urls"]=unresolved
+        return summary
+
+    def _normal_feed_outcomes(self, row, cycle, problems):
+        """Parse a cycle's per-feed outcome map. None means 'not recorded'.
+
+        Distinguishes "this cycle predates provenance" (None -> caller falls back
+        to the cycle-level rule) from "provenance is present but unreadable"
+        (recorded as a problem, treated as no observation) -- because silently
+        reading corrupt provenance as an empty map would make every miss look
+        unobservable, which is not the same thing as absent.
+        """
+        raw=row.get("provenance") if "provenance" in row else row.get("normal_feed_outcomes")
+        if raw is None:
+            return None
+        try:
+            parsed=json.loads(raw or "{}")
+        except (TypeError,ValueError):
+            problems.append(f"normal_feed_outcomes_unparseable:{cycle}")
+            return {}
+        if not isinstance(parsed,dict):
+            problems.append(f"normal_feed_outcomes_not_an_object:{cycle}")
+            return {}
+        if "_derived_from" in parsed:
+            # A CYCLE-LEVEL FALLBACK MARKER. Corrected 2026-08-07 on peer review.
+            #
+            # This returned {} -- an explicit "no feed observed" -- which meant a
+            # miss recorded under such a marker was never ADMITTED (admission tests
+            # `is None` to decide the legacy fallback, and {} is not None). But the
+            # marker's whole purpose is to say "no per-feed data was recorded here,
+            # use the cycle-level rule", which is exactly the legacy case. So it
+            # must read as None, not as an empty observation.
+            #
+            # Validate the schema before granting that fallback: an unrecognised or
+            # malformed marker is corrupt evidence, not a licence to fall back.
+            if (set(parsed) == {"_derived_from", "normal_feeds_complete"}
+                    and parsed.get("_derived_from") == "cycle_level_completeness"
+                    and isinstance(parsed.get("normal_feeds_complete"), bool)):
+                return None
+            problems.append(f"derived_marker_invalid:{cycle}:{sorted(parsed)!r}")
+            return {}
+        return {str(k):str(v) for k,v in parsed.items()}
+
+    def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180):
+        required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days)); summary=self.get_hdencode_shadow_summary()
+
+    # -- durable qualification window (carried from the hybrid sweep) ----
+    # The persisted boundary, NOT configuration, is the authority. Absent
+    # from main entirely; it is what contract row R-13 measures against.
     def get_active_qualification_window(self):
         """The persisted boundary, or None if no window has been started.
 
@@ -2842,72 +3678,6 @@ class DatabaseManager:
             return None
         return parsed.isoformat()
 
-    def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180,
-                                   window_start_at=None):
-        required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days))
-        # The PERSISTED boundary is the authority; `window_start_at` is what
-        # configuration currently claims. They must agree exactly. Without this
-        # the zero-miss requirement could be defeated by editing a file to slide
-        # the boundary past an observed miss.
-        active = self.get_active_qualification_window()
-        configured = self.normalize_window_start(window_start_at)
-        boundary_changed = False
-        if active:
-            if configured and configured != active["window_start_at"]:
-                boundary_changed = True
-            elif not configured:
-                # Configuration cleared while a window is live — treat as a
-                # change, not as "fall back to the persisted value".
-                boundary_changed = True
-        window_start_at = active["window_start_at"] if active else None
-        if window_start_at and boundary_changed:
-            summary = self.get_hdencode_shadow_summary(window_start_at=window_start_at)
-            return {
-                "ready": False, "window_start_at": window_start_at,
-                "required_cycles": required_cycles,
-                "successful_cycles": summary["successful_cycles"],
-                "required_days": required_days, "observed_days": 0.0,
-                "normal_feeds_healthy": False,
-                "relevant_misses": summary["relevant_misses"],
-                "request_reduction_pct": summary["request_reduction_pct"],
-                "recovery_cycles": summary["recovery_cycles"],
-                "first_completed_at": summary["first_completed_at"],
-                "last_completed_at": summary["last_completed_at"],
-                "reasons": ["qualification_window_boundary_changed"],
-                "configured_window_start_at": configured,
-            }
-        if not window_start_at:
-            # NO WINDOW: return an EMPTY current-window summary.
-            #
-            # Returning the unscoped historical totals here — even alongside a
-            # blocking reason — is not merely untidy, it is actively dangerous.
-            # The qualification collector reads `relevant_misses` on its own and
-            # converts any nonzero value into a MANDATORY STOP with a priority-8
-            # push alert and a "stop and roll back" instruction. With 102 void
-            # misses in the table, that alert would fire from the previous
-            # window's evidence before the new one had even started.
-            #
-            # Historical totals are still available, but under an explicitly
-            # named diagnostic key that no gate consumes. Caught in review.
-            historical = self.get_hdencode_shadow_summary()
-            return {
-                "ready": False,
-                "window_start_at": None,
-                "required_cycles": required_cycles, "successful_cycles": 0,
-                "required_days": required_days, "observed_days": 0.0,
-                "normal_feeds_healthy": False,
-                "relevant_misses": 0, "request_reduction_pct": 0.0,
-                "recovery_cycles": 0,
-                "first_completed_at": None, "last_completed_at": None,
-                "reasons": ["qualification_window_not_started"],
-                "historical_evidence_not_counted": {
-                    "successful_cycles": historical["successful_cycles"],
-                    "relevant_misses": historical["relevant_misses"],
-                    "first_completed_at": historical["first_completed_at"],
-                    "last_completed_at": historical["last_completed_at"],
-                },
-            }
-        summary=self.get_hdencode_shadow_summary(window_start_at=window_start_at)
         first=summary.get("first_completed_at"); last=summary.get("last_completed_at"); observed_days=0.0
         try:
             first_dt=datetime.datetime.fromisoformat(first); last_dt=datetime.datetime.fromisoformat(last)
@@ -2929,11 +3699,61 @@ class DatabaseManager:
         reasons=[]
         if summary["successful_cycles"]<required_cycles: reasons.append("insufficient_comparison_cycles")
         if observed_days<required_days: reasons.append("insufficient_observation_days")
-        if summary["relevant_misses"]>0: reasons.append("relevant_misses_detected")
+        # THE MISS RULE, changed 2026-08-07 on Jesse's decision. This used to be
+        # `if summary["relevant_misses"] > 0`, which blocked on ANY listing-only
+        # observation ever recorded. That could never pass: 99 of 100 such
+        # releases were acquired anyway, median about an hour, all via the normal
+        # feeds, so the gate treated ordinary polling latency as permanent
+        # coverage loss and RSS would have stayed in shadow mode indefinitely.
+        #
+        # Now only a release that was NEVER acquired counts, with no deadline.
+        # UNDETERMINED rows -- ones that left the listing without ever appearing
+        # in the feed -- still block, because "cannot be proven either way" is not
+        # evidence of health, and calling it health is the fail-open shape that
+        # produced two HIGH findings in this same subsystem.
+        resolution=self.get_hdencode_miss_resolution()
+        if int(resolution.get("never_acquired") or 0)>0:
+            reasons.append("unacquired_misses_detected")
+        if int(resolution.get("undetermined") or 0)>0:
+            reasons.append("miss_resolution_undetermined")
+        # PENDING BLOCKS, reversed 2026-08-07 on peer review. I had excluded
+        # not_yet_assessable so the gate could pass. The review showed why that is
+        # unsafe rather than merely optimistic: the shadow comparison is recorded
+        # only while discovery_mode == "rss_shadow", so promoting to rss_primary
+        # stops producing the very observations a pending row needs. The gate
+        # would open on evidence its own promoted mode destroys.
+        if int(resolution.get("not_yet_assessable") or 0)>0:
+            reasons.append("miss_resolution_pending")
+        # Unreadable evidence is not the same as clean evidence. Skipping a
+        # malformed cycle can remove the only observation after a miss, so it is
+        # reported rather than absorbed.
+        if resolution.get("evidence_problems"):
+            reasons.append("miss_resolution_evidence_unreadable")
+        # UNATTRIBUTED IN-SCOPE CANDIDATES BLOCK. Round 6: a listing-only release
+        # whose detail scrape failed is not booked as a miss (it has no media type,
+        # so it cannot be attributed to a feed) -- and it was therefore vanishing
+        # from readiness entirely. A false-health under-count. It must block the
+        # claim that no unacquired misses exist, without invalidating the cycle's
+        # membership evidence for resolving OTHER misses.
+        # Counted STRUCTURALLY by the loader, which already parses details_json.
+        # My first attempt here used `details_json LIKE '%detail_failed%'` -- string
+        # matching against JSON, which is the exact anti-pattern the RSS
+        # round-6 work removed from this same file. A schema change or a key
+        # appearing inside a URL would break it silently.
+        if int(resolution.get("unattributed_candidates") or 0) > 0:
+            reasons.append("unattributed_listing_candidates")
+        # An integrity failure is not "zero misses". Malformed provenance, a
+        # count that disagrees with the rows on disk, a nonzero count with no
+        # rows, or a miss row filed against supplied-empty provenance all mean
+        # the evidence contradicts itself. Before 2026-08-06 each of these
+        # silently contributed zero, which DEFLATED the gate -- the opposite of
+        # the protection claimed for it. They must block instead.
+        if summary.get("miss_evidence_integrity"):
+            reasons.append("miss_evidence_integrity_failed")
         if summary["request_reduction_pct"]<=0: reasons.append("request_reduction_not_proven")
         if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
         if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")
-        return {"ready":not reasons,"window_start_at":summary.get("window_start_at"),"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
+        return {"ready":not reasons,"window_start_at":summary.get("window_start_at"),"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"misses_acquired":int(resolution.get("acquired") or 0),"misses_never_acquired":int(resolution.get("never_acquired") or 0),"misses_undetermined":int(resolution.get("undetermined") or 0),"misses_not_yet_assessable":int(resolution.get("not_yet_assessable") or 0),"miss_evidence_problems":list(resolution.get("evidence_problems") or []),"worst_acquisition_lag_hours":resolution.get("worst_acquisition_lag_hours"),"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
 
     # ── HDEncode candidate actions ─────────────────────────────────────
 
@@ -3425,13 +4245,52 @@ class DatabaseManager:
                 logger.debug("Rollback failed: %s", rb_err)
             logger.error("DB Error (save_cache): %s", e)
 
+    #: ONE projection, two error contracts. Shared so the strict reader's claim
+    #: to return "the same rows" cannot quietly stop being true: `media_id`
+    #: became load-bearing for the version badges, and a column added to one
+    #: SELECT but not the other is the kind of schema/consumer drift that
+    #: could RECREATE H1's failure class. It is not what caused H1 -- that was
+    #: count_versions() counting rows instead of distinct media_id, with the
+    #: column already present in both readers.
+    _PLEX_CACHE_MOVIES_SQL = (
+        "SELECT key, title, original_title, year, res, size, imdb_id, "
+        "rating_key, media_id, is_tv, dovi, hdr, library_name, file_path "
+        "FROM plex_cache WHERE content_type = 'Movies'"
+    )
+
     def list_plex_cache_movies(self):
         """Return every plex_cache row for content_type='Movies' (dicts) — the
-        candidate pool for find_library_duplicate()."""
-        return self._query_dicts(
-            "SELECT key, title, original_title, year, res, size, imdb_id, "
-            "rating_key, media_id, is_tv, dovi, hdr, library_name, file_path "
-            "FROM plex_cache WHERE content_type = 'Movies'", default=[])
+        candidate pool for find_library_duplicate().
+
+        FAIL-SOFT: a read error becomes []. Correct for a best-effort/display
+        caller; see `list_plex_cache_movies_strict` for callers that need to
+        tell an empty table from a failed read."""
+        return self._query_dicts(self._PLEX_CACHE_MOVIES_SQL, default=[])
+
+    def list_plex_cache_movies_strict(self):
+        """Same rows as ``list_plex_cache_movies``, but RAISES on a read
+        failure instead of returning ``[]``.
+
+        WHY A SECOND METHOD. `_query_dicts(default=[])` converts a database
+        error into an empty list, which is the right call for a display query
+        and the wrong one for evidence. The version-badge sync derives its
+        counts from these rows: an empty result makes every live movie
+        "unknown", the reconciler correctly touches nothing, no counter records
+        a failure, and the pass reports COMPLETE -- so the scheduler marks that
+        cache generation reconciled and never retries it. The badges are then
+        stale until an unrelated refresh (peer review 2026-08-19, M2/B --
+        M2/A was the separate library-returns-None path).
+
+        An empty table is still a valid empty answer here; only a failed READ
+        raises. The caller must not try to tell those apart by inspecting the
+        result, which is exactly the inference this method exists to remove.
+        """
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError("plex_cache read failed: no database connection")
+            cur = conn.execute(self._PLEX_CACHE_MOVIES_SQL)
+            return [dict(r) for r in cur.fetchall()]
 
     def load_plex_cache(self, mode):
         """Load cached Plex items for the given content type.
@@ -3866,11 +4725,28 @@ class DatabaseManager:
 
     def upsert_download_result(self, name, package_uuid=None, title=None, host=None,
                                bytes_total=0, bytes_loaded=0, downloaded=0,
-                               extraction="na", state="queued", error=None):
+                               extraction="na", state="queued", error=None,
+                               provenance_url=None, provenance_observed=False):
         """Insert/update a JD package's download outcome; returns the row id (int)
         or None on failure. Identity is package_uuid when present, else the row is
         adopted-by-name (a legacy NULL-uuid row) or inserted. Runs the whole
-        lookup-then-write under one lock hold to avoid poller-vs-remove races."""
+        lookup-then-write under one lock hold to avoid poller-vs-remove races.
+
+        ``provenance_url`` is written under ``provenance_observed``, which is the
+        difference between an absence of observation and an observation of
+        absence (peer review 2026-08-13):
+
+            observed=True   write the value AS GIVEN, including NULL. The caller
+                            looked, and either proved one release or proved there
+                            is no honest unique answer. The second RETRACTS.
+            observed=False  COALESCE. The caller could not look -- JDownloader's
+                            link query failed, or the lookup threw -- so whatever
+                            was proven earlier stands.
+
+        Unconditional COALESCE was the earlier behaviour and it let a stale proof
+        outlive its evidence: once a second release recorded the same host link,
+        the resolver correctly said "ambiguous", and that None was read as
+        "nothing to say" rather than "this is no longer authorised"."""
         try:
             with self._lock:
                 conn = self.get_connection()
@@ -3878,6 +4754,7 @@ class DatabaseManager:
                     return None
                 cur = conn.cursor()
                 row = None
+                adopted_by_name = False
                 if package_uuid is not None:
                     cur.execute("SELECT id FROM download_results WHERE package_uuid = ?",
                                 (package_uuid,))
@@ -3887,6 +4764,9 @@ class DatabaseManager:
                                     "WHERE package_uuid IS NULL AND name = ? "
                                     "ORDER BY updated_at DESC LIMIT 1", (name,))
                         row = cur.fetchone()
+                        # ADOPTION: this row was matched by NAME, so the
+                        # package it belongs to is about to CHANGE.
+                        adopted_by_name = row is not None
                 else:
                     cur.execute("SELECT id FROM download_results WHERE name = ? "
                                 "ORDER BY (package_uuid IS NULL) DESC, updated_at DESC LIMIT 1",
@@ -3898,18 +4778,59 @@ class DatabaseManager:
                         "UPDATE download_results SET "
                         "package_uuid = COALESCE(?, package_uuid), name = ?, title = ?, "
                         "host = ?, bytes_total = ?, bytes_loaded = ?, downloaded = ?, "
-                        "extraction = ?, state = ?, error = ?, updated_at = CURRENT_TIMESTAMP "
+                        "extraction = ?, state = ?, error = ?, "
+                        # Observed -> take the value as given (NULL retracts).
+                        # Unobserved -> keep what is stored, MECHANICALLY.
+                        #
+                        # The unobserved branch ignores the passed value entirely
+                        # rather than COALESCEing it (peer review follow-up 2).
+                        # With COALESCE, a caller passing observed=False WITH a
+                        # url would still overwrite the stored one -- so the
+                        # docstring's promise ("the previous proof stands") held
+                        # only because the production caller never emits that
+                        # combination. An invariant that depends on callers
+                        # behaving is not an invariant; this makes it structural.
+                        # ...UNLESS this update also changes which package
+                        # the row belongs to. A legacy NULL-uuid row adopted
+                        # by NAME keeps its id, so "the previous proof stands"
+                        # would hand the OLD package's proof to the NEW one --
+                        # and identical names across releases are the exact
+                        # collision this whole feature exists to remove. Proof
+                        # does not transfer across a name-based ownership change
+                        # without current evidence (peer review round 3).
+                        #
+                        # ...NOR when the current package has no uuid at all.
+                        # That row was selected BY NAME too, so which package
+                        # it refers to cannot be identified stably across
+                        # polls. Kept as a SEPARATE flag from adoption because
+                        # the reasons differ: adoption is "ownership changed
+                        # based on a name", this is "ownership cannot be pinned
+                        # at all". Enforcing it HERE rather than only in the
+                        # annotator is the point -- REST reads this column
+                        # directly and never reaches the annotator's recovery
+                        # gate, so a caller-side rule left the two transports
+                        # disagreeing exactly as before (peer review round 4).
+                        "provenance_url = CASE WHEN ? = 1 THEN ? "
+                        "                      WHEN ? = 1 THEN NULL "
+                        "                      WHEN ? = 1 THEN NULL "
+                        "                      ELSE provenance_url END, "
+                        "updated_at = CURRENT_TIMESTAMP "
                         "WHERE id = ?",
                         (package_uuid, name, title, host, bytes_total, bytes_loaded,
-                         downloaded, extraction, state, error, rid))
+                         downloaded, extraction, state, error,
+                         1 if provenance_observed else 0, provenance_url,
+                         1 if (adopted_by_name and not provenance_observed) else 0,
+                         1 if (package_uuid is None and not provenance_observed) else 0,
+                         rid))
                     conn.commit()
                     return rid
                 cur.execute(
                     "INSERT INTO download_results (package_uuid, name, title, host, "
-                    "bytes_total, bytes_loaded, downloaded, extraction, state, error, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    "bytes_total, bytes_loaded, downloaded, extraction, state, error, "
+                    "provenance_url, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     (package_uuid, name, title, host, bytes_total, bytes_loaded,
-                     downloaded, extraction, state, error))
+                     downloaded, extraction, state, error, provenance_url))
                 conn.commit()
                 return cur.lastrowid
         except Exception as e:
@@ -3920,10 +4841,171 @@ class DatabaseManager:
         """Return tracked download/extraction outcomes, most recent first."""
         return self._query_dicts(
             "SELECT id, package_uuid, name, title, host, bytes_total, bytes_loaded, "
-            "downloaded, extraction, state, error, updated_at "
+            "downloaded, extraction, state, error, updated_at, provenance_url "
             "FROM download_results ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         )
+
+    def record_submitted_links(self, url, links):
+        """Remember the file-host links submitted to JDownloader for `url`.
+
+        Called for BOTH send paths. The folder/.crawljob path is the one that
+        matters most here: it has no API to read a package back from, so any
+        scheme that depended on asking JDownloader what it created would leave
+        that path with no provenance at all.
+
+        Idempotent (INSERT OR IGNORE on the natural key), so a regrab of the
+        same release re-affirms the same rows rather than duplicating them, and
+        a partial failure can be retried. Never raises: failing to record
+        provenance must not fail the grab itself -- the cost is a link that
+        stays unresolved, which is the safe direction.
+        """
+        rows = [(str(url), str(link)) for link in (links or []) if link]
+        if not url or not rows:
+            return 0
+        try:
+            with self.transaction() as conn:
+                if conn is None:
+                    return 0
+                conn.executemany(
+                    "INSERT OR IGNORE INTO download_package_links (url, link) "
+                    "VALUES (?, ?)", rows)
+            return len(rows)
+        except Exception:
+            logger.exception("failed to record submitted links for %s", url)
+            return 0
+
+    def resolve_release_by_links(self, link_urls):
+        """The release these live JDownloader links provably belong to, or None.
+
+        Provenance, not inference: a link resolves only because ScanHound
+        recorded submitting it. A package JDownloader shows that ScanHound never
+        sent contributes no rows and therefore resolves to nothing, which is the
+        whole point of Finding 1.
+
+        Returns None when the links map to more than one release, too. That is a
+        real possibility -- a hand-built package can mix links from two releases,
+        and a regrab at a different URL can reuse a host link -- and there is no
+        honest answer to "which release is this?" in that case.
+        """
+        wanted = [str(u) for u in dict.fromkeys(link_urls or []) if u]
+        if not wanted:
+            return None
+        found = set()
+        for start in range(0, len(wanted), 300):
+            chunk = wanted[start:start + 300]
+            rows = self._query_dicts(
+                "SELECT DISTINCT url FROM download_package_links WHERE link IN (%s)"
+                % ",".join("?" * len(chunk)),
+                tuple(chunk), default=[]) or []
+            found.update(r["url"] for r in rows)
+            if len(found) > 1:
+                return None   # ambiguous; no honest answer
+        return next(iter(found)) if len(found) == 1 else None
+
+    def get_release_identity(self, urls):
+        """Map release url -> the SEMANTIC identity recorded when it was grabbed:
+        ``{"date_added", "title", "year", "season"}``.
+
+        `date_added` is NOT "first grabbed": download_item() writes a history row
+        for FAILED attempts too, so this can be the moment a grab was first tried
+        rather than the moment one succeeded. The UI labels it "first seen" for
+        exactly that reason (peer review Finding 2).
+
+        WHY TITLE/YEAR/SEASON BELONG HERE RATHER THAN IN A NAME PARSER. These
+        columns are what the caller PASSED to download_item() from the scraped
+        listing, so they are the identity itself, not a reading of a display
+        string. The JDownloader package name cannot substitute for them: it is
+        capped at 50 characters, and 17 live rows carry a name that spans more
+        than one season -- `Law & Order: LA (2010) [1080p]` alone covers 13
+        distinct seasons (8, 9, and 11 through 21). No parser can recover a
+        season from a string that does not contain it.
+
+        Returns only urls that matched a row. A caller must treat a missing key
+        as UNKNOWN identity, never as "no season" -- the difference is what
+        stops a whole-series pack being cancelled against one season.
+        """
+        wanted = [str(u) for u in dict.fromkeys(urls or []) if u]
+        if not wanted:
+            return {}
+        out = {}
+        for start in range(0, len(wanted), 300):
+            chunk = wanted[start:start + 300]
+            rows = self._query_dicts(
+                "SELECT url, date_added, title, year, season FROM downloads "
+                "WHERE url IN (%s)" % ",".join("?" * len(chunk)),
+                tuple(chunk), default=[]) or []
+            for row in rows:
+                out[row["url"]] = {
+                    "date_added": row.get("date_added"),
+                    "title": row.get("title"),
+                    "year": row.get("year"),
+                    "season": row.get("season"),
+                }
+        return out
+
+    def get_persisted_provenance(self, ids):
+        """Map ``download_results.id`` -> its PERSISTED ``provenance_url``.
+
+        KEYED BY THE DURABLE ROW ID, not by package name. An earlier version
+        also matched on ``name`` for rows without a uuid, and that was wrong in
+        the one way this whole feature exists to prevent: the query carried no
+        ``package_uuid IS NULL`` predicate and no ``ORDER BY``, so a DIFFERENT
+        same-named row -- including a uuid-backed one -- could donate its
+        provenance, and the "last-write-wins" the comment claimed was really
+        whichever row SQLite happened to return last. Identical package names
+        across distinct seasons are precisely why identity is being moved off
+        names, so recovering by name reintroduced the collision through the back
+        door, for both `source_url` and identity (peer review round 2).
+
+        ``poll_results()`` attaches this id to every row it emits -- from its
+        uuid->id cache, else via ``get_download_result_id()``, writing the row
+        first if need be, explicitly so it never emits an id-less row -- and
+        REST rows carry the same persisted id. A row that still has no id is
+        left unrecovered, which is the safe direction.
+
+        WHY THIS EXISTS. The poller's in-memory row carries
+        ``provenance_url=None`` whenever it could not observe a package's links,
+        while this table deliberately KEEPS the previous proof in that case --
+        ``upsert_download_result`` writes the new value only when
+        ``provenance_observed`` is true, because "could not look" is not
+        "no longer ours". So the WebSocket row and the persisted row disagree
+        for the length of an unobserved poll. That was accepted while the only
+        consequence was a source link blinking; it is not acceptable for
+        identity, which is meant to authorise cancelling other downloads
+        (peer review 2026-08-18, M2).
+
+        ONE batched query, and only for the rows that need it -- the caller
+        filters to unobserved-and-urlless rows first, which is normally none.
+        """
+        wanted = []
+        for value in (ids or []):
+            # STRICT, not coercive. Production ids are SQLite integers, so
+            # int() bought nothing and quietly widened the contract -- True
+            # became 1 and 1.0 became 1, either of which would look up a real
+            # row. `type(value) is int` rather than isinstance() because bool
+            # IS an int subclass. Fail closed and log: annotation is
+            # deliberately non-fatal, so a malformed id must not take down the
+            # downloads view, but it should not pass silently either.
+            if type(value) is int and value > 0:
+                wanted.append(value)
+            elif value is not None:
+                logger.warning(
+                    "download results: ignoring malformed row id %r (%s) in "
+                    "provenance recovery", value, type(value).__name__)
+        wanted = list(dict.fromkeys(wanted))
+        if not wanted:
+            return {}
+        out = {}
+        for start in range(0, len(wanted), 300):
+            chunk = wanted[start:start + 300]
+            rows = self._query_dicts(
+                "SELECT id, provenance_url FROM download_results WHERE id IN (%s)"
+                % ",".join("?" * len(chunk)),
+                tuple(chunk), default=[]) or []
+            for row in rows:
+                out[row["id"]] = row.get("provenance_url")
+        return out
 
     def get_download_result_id(self, package_uuid, name):
         """Resolve a download_results row id for a package: by ``package_uuid``
@@ -4851,11 +5933,16 @@ class DatabaseManager:
             return 0
 
     def prepare_metadata_scan_resume(self, run_uuid, *, retry_failed=False):
-        """Reset only resumable manifest rows and queue an existing run.
+        """Reset repairable manifest rows and queue an existing run.
 
         Successfully scanned items are immutable for the resumed attempt. A
         normal resume retries interrupted/cancelled work; ``retry_failed`` also
         includes terminal probe failures selected by the operator.
+
+        Returns the count of PENDING work the resumed run has to do — which
+        includes rows a pause left pending and never needed repairing, not just
+        the rows this call reset. The caller treats <= 0 as "nothing to resume",
+        so counting only repaired rows made a paused run unresumable.
         """
         if not run_uuid:
             return 0
@@ -4872,14 +5959,34 @@ class DatabaseManager:
                 ).fetchone()
                 if not run or run[0] == "running":
                     return 0
-                cursor = conn.execute(f'''
+                conn.execute(f'''
                     UPDATE metadata_scan_items
                     SET status = 'pending', failure_stage = NULL, error_code = NULL,
                         error_message = NULL, completed_at = NULL, updated_at = CURRENT_TIMESTAMP
                     WHERE run_uuid = ? AND status IN ({placeholders})
                 ''', (run_uuid, *statuses))
-                reset_count = max(cursor.rowcount, 0)
-                if reset_count == 0:
+                # RESUMABILITY IS "IS THERE PENDING WORK", NOT "DID THIS UPDATE
+                # CHANGE ROWS". Gating on the UPDATE's rowcount was the bug: a
+                # user PAUSE leaves every unprocessed row in 'pending' (the
+                # worker writes that state deliberately — see
+                # plex_metadata_scan._run_durable), and 'pending' is not in the
+                # reset set because such a row needs no repair. So a paused run
+                # reset 0 rows, returned 0 here, and the caller raised "metadata
+                # scan has no retryable items" — the Resume button was dead for
+                # exactly the state it exists to serve, and the only way forward
+                # was discarding a multi-hour manifest and rescanning from
+                # scratch with no cached reuse.
+                #
+                # Count the pending work instead: it covers both the rows just
+                # reset and the ones a pause left already pending, so the run is
+                # requeued whenever real work remains and left alone when it
+                # genuinely has none (e.g. a fully completed run).
+                pending_row = conn.execute('''
+                    SELECT COUNT(*) FROM metadata_scan_items
+                    WHERE run_uuid = ? AND status = 'pending'
+                ''', (run_uuid,)).fetchone()
+                pending_count = int(pending_row[0]) if pending_row else 0
+                if pending_count == 0:
                     return 0
                 conn.execute('''
                     UPDATE metadata_scan_runs
@@ -4887,7 +5994,7 @@ class DatabaseManager:
                         error_code = NULL, error_message = NULL
                     WHERE run_uuid = ?
                 ''', (run_uuid,))
-                return reset_count
+                return pending_count
         except Exception as exc:
             logger.error("DB Error (prepare_metadata_scan_resume): %s", exc)
             return 0
@@ -4936,7 +6043,7 @@ class DatabaseManager:
             item.get("dv_layer"), item.get("dv_profile"), scan_state,
             item.get("sig_mtime"), item.get("sig_size"), item.get("scan_run_uuid"),
             item.get("probe_json"), scan_state,
-        ), label="upsert_media_inventory") is not None
+        ), label="upsert_media_inventory")
 
     _MEDIA_INVENTORY_EVIDENCE_CTE = '''
         WITH cached_unscanned_4k AS (
@@ -5127,11 +6234,40 @@ class DatabaseManager:
         return facets
 
     def upsert_dv_scan(self, path, dv_layer, *, title=None, sig_mtime=None,
-                       sig_size=None, source="scan", rating_key=None, imdb_id=None):
+                       sig_size=None, source="scan", rating_key=None, imdb_id=None,
+                       observed=True):
         """Insert/update a DV-layer record for ``path``. Refreshes last_seen_at;
-        preserves scanned_at on update. Returns True on success."""
+        preserves scanned_at on update. Returns True on success.
+
+        A dv_layer of 'unknown' records that detection FAILED (dv_detect
+        resolves every error to it). It must not destroy a known-good layer:
+        the sig columns still take the incoming values, so the NULL signature
+        a failed host scan writes keeps forcing a retry on the next run, but
+        the last real finding survives to keep the Kometa labels correct in
+        the meantime. Same preserve-on-worse rule the title/rating_key/imdb_id
+        COALESCEs in this statement already apply.
+
+        ``observed=False`` marks a write that LOOKED AT NO FILE — currently the
+        label sync's rating_key back-write, which annotates a row from Plex and
+        never touches the media. Such a write must not claim freshness:
+
+        * ``last_seen_at`` means "when a scanner last saw this file". The
+          scheduled sync gates itself on MAX(last_seen_at) for source='scan'
+          (see get_latest_dv_scan_at) and records a PRE-sync watermark, so a
+          sync that bumped this column re-armed its own trigger and ran a full
+          library pass EVERY hour forever — 11 runs in 14 hours against a
+          detector that produces new rows about twice a day, which is exactly
+          the "pure waste" the gate exists to prevent.
+        * the sig columns are the change-signal. Taking a caller's NULLs here
+          is deliberate for a FAILED host scan (above), but the back-write
+          passes no signature at all and would blank a healthy row, making
+          dv_scan_is_current permanently False for it.
+
+        Both are preserved when observed is False; everything the caller
+        genuinely supplies (rating_key, layer, title) still applies."""
         if not path:
             return False
+        obs = 1 if observed else 0
         return self._mutate('''
             INSERT INTO dv_scan
                 (path, title, dv_layer, sig_mtime, sig_size, source,
@@ -5139,15 +6275,567 @@ class DatabaseManager:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(path) DO UPDATE SET
                 title = COALESCE(excluded.title, dv_scan.title),
-                dv_layer = excluded.dv_layer,
-                sig_mtime = excluded.sig_mtime,
-                sig_size = excluded.sig_size,
+                dv_layer = CASE
+                    WHEN excluded.dv_layer = 'unknown'
+                     AND dv_scan.dv_layer IS NOT NULL
+                     AND dv_scan.dv_layer != 'unknown'
+                    THEN dv_scan.dv_layer
+                    ELSE excluded.dv_layer
+                END,
+                sig_mtime = CASE WHEN ? = 1 THEN excluded.sig_mtime
+                                 ELSE dv_scan.sig_mtime END,
+                sig_size = CASE WHEN ? = 1 THEN excluded.sig_size
+                                ELSE dv_scan.sig_size END,
                 source = excluded.source,
                 rating_key = COALESCE(excluded.rating_key, dv_scan.rating_key),
                 imdb_id = COALESCE(excluded.imdb_id, dv_scan.imdb_id),
-                last_seen_at = CURRENT_TIMESTAMP
+                last_seen_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP
+                                    ELSE dv_scan.last_seen_at END
         ''', (path, title, dv_layer, sig_mtime, sig_size, source,
-              rating_key, imdb_id), label="upsert_dv_scan") is not None
+              rating_key, imdb_id, obs, obs, obs), label="upsert_dv_scan")
+
+    def annotate_dv_scan_rating_key(self, path, rating_key):
+        """Attach a Plex rating_key to an EXISTING dv_scan row. Nothing else.
+
+        The label sync is a CONSUMER of scan observations, not a producer of
+        them, and this is the only write it is entitled to make. Authority
+        splits cleanly:
+
+            detector / import : dv_layer, signature, observation freshness
+            Plex labeler      : Plex identity, i.e. this column
+
+        Using upsert_dv_scan for this was wrong even with observed=False. The
+        sync snapshots path->layer once at the start and back-writes that
+        SNAPSHOT later, so a detector import landing in between was partially
+        overwritten (peer review 2026-08-15):
+
+            T0  sync snapshots  P = FEL / sig1 / t0
+            T1  detector writes P = MEL / sig2 / t1
+            T2  sync annotates  P with the stale FEL
+
+        leaving dv_layer=FEL beside signature=sig2 and last_seen_at=t1 --
+        contradictory evidence, with a consumer having erased part of a newer
+        producer observation. Preserving the timestamp and signature actually
+        SHARPENED that contradiction, which is why the annotation had to become
+        UPDATE-only rather than merely gentler.
+
+        UPDATE-only also means it never inserts: a row that no producer has
+        written is not something the labeler may create, and silently inserting
+        one would invent an observation with no layer and no signature.
+
+        Returns True only if a row was ACTUALLY updated. _mutate reports
+        statement success, which an UPDATE matching zero rows also satisfies --
+        so it cannot answer "did this path exist", and callers that need to know
+        an annotation landed would silently believe it had.
+        """
+        if not path or rating_key is None:
+            return False
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return False
+                cur = conn.execute(
+                    'UPDATE dv_scan SET rating_key = ? WHERE path = ?',
+                    (str(rating_key), path))
+                conn.commit()
+                return cur.rowcount > 0
+        except Exception as e:  # noqa: BLE001
+            logger.error("DB Error (annotate_dv_scan_rating_key): %s", e)
+            return False
+
+    # --- queue attempt history (append-only) ---------------------------------
+
+    @staticmethod
+    def _attempt_stamp(when=None):
+        """The ONE timestamp format the attempts table may hold.
+
+        `datetime.now()` -- what this table used until 2026-08-16 -- is naive
+        LOCAL time, and every window over this table compares it against
+        sqlite's `datetime('now')`, which is UTC. On the production host that is
+        a 4-hour skew, and the separator differs too ('T' vs ' '), so the
+        comparison does not even fail in one consistent direction: a same-day
+        row sorts AFTER any same-day UTC cutoff because 'T' > ' '.
+
+        What it cost: _scope_is_earned asks distinct_items_failing for the same
+        failure on 2 distinct items within 3600s. A row written seconds earlier
+        never matched that window, so the answer was permanently 0, so an
+        ambiguous reveal stall was ALWAYS treated as item-local -- and the
+        item-local path was itself raising on a CHECK constraint. Two bugs, each
+        of which hid the other.
+
+        Format is sqlite's own so the existing `datetime('now', ?)` comparisons
+        are correct as written. Rows from before this fix stay in the old shape;
+        they carry reason_code 'attempt_not_closed', match no structural or
+        source reason, and age out of every window within 24h.
+        """
+        when = when or datetime.datetime.now(datetime.timezone.utc)
+        if isinstance(when, str):
+            return when
+        if when.tzinfo is not None:
+            when = when.astimezone(datetime.timezone.utc)
+        return when.strftime("%Y-%m-%d %H:%M:%S")
+
+    def begin_queue_attempt(self, attempt_id, item_uuid, batch_uuid, source,
+                            started_at=None):
+        """Open an attempt row BEFORE the work starts. Returns True on success.
+
+        ``started_at`` lets the caller supply its OWN clock. The queue's clock
+        is injectable and its integration tests advance it; if this row were
+        stamped from the real clock while the pacing window was computed from
+        the injected one, the gate would be unfalsifiable in exactly the tests
+        written to falsify it.
+
+        Opened first and closed in a finally, so an attempt that never returns
+        leaves an IN_PROGRESS row behind. That row IS the evidence a blocked
+        worker cannot otherwise produce: the 2026-08-13 incident could not
+        distinguish "attempted repeatedly, all failed" from "never attempted",
+        because only current state was durable and both look like
+        waiting_source after a restart.
+        """
+        if not attempt_id or not item_uuid:
+            return False
+        return self._mutate(
+            "INSERT INTO download_queue_attempts "
+            "(attempt_id, item_uuid, batch_uuid, source, started_at, terminal_status) "
+            "VALUES (?, ?, ?, ?, ?, 'IN_PROGRESS')",
+            (str(attempt_id), str(item_uuid), str(batch_uuid or ""),
+             str(source or ""), self._attempt_stamp(started_at)),
+            label="begin_queue_attempt")
+
+    def close_queue_attempt(self, attempt_id, terminal_status, *, reason_code=None,
+                            affected_scope=None, transport_attempted=False,
+                            source_progress=False, only_if_open=False):
+        """Close an attempt with a POSITIVELY evidenced terminal state.
+
+        terminal_status is one of SUCCESS / EXPECTED_EMPTY / FAILED /
+        INTENTIONALLY_SKIPPED. Silence is never success: an attempt left open
+        stays IN_PROGRESS and ages into stale_queue_attempts().
+
+        ``transport_attempted`` must reflect whether a request actually reached
+        the source. A policy deferral -- a sibling parked because some OTHER
+        item hit a source-wide outcome -- is INTENTIONALLY_SKIPPED with
+        transport_attempted False, and must never be counted as an observed
+        source failure.
+
+        ``only_if_open`` is for the caller's finally-backstop: it closes an
+        attempt ONLY if it is still IN_PROGRESS, so a backstop that always runs
+        cannot overwrite the real outcome recorded moments earlier. Without it
+        every successful attempt would be rewritten to FAILED by its own
+        cleanup.
+        """
+        allowed = ("SUCCESS", "EXPECTED_EMPTY", "FAILED", "INTENTIONALLY_SKIPPED")
+        if terminal_status not in allowed:
+            logger.error("close_queue_attempt: refusing unknown terminal status %r "
+                         "(expected one of %s)", terminal_status, allowed)
+            return False
+        sql = ("UPDATE download_queue_attempts SET finished_at = ?, terminal_status = ?, "
+               "reason_code = ?, affected_scope = ?, transport_attempted = ?, "
+               "source_progress = ? WHERE attempt_id = ?")
+        if only_if_open:
+            sql += " AND terminal_status = 'IN_PROGRESS'"
+        return self._mutate(
+            sql,
+            (self._attempt_stamp(), terminal_status,
+             reason_code, affected_scope, 1 if transport_attempted else 0,
+             1 if source_progress else 0, str(attempt_id)),
+            label="close_queue_attempt")
+
+    def stale_queue_attempts(self, older_than_seconds=1800):
+        """Attempts still IN_PROGRESS past their deadline.
+
+        A non-empty result means a worker started something and never finished
+        it -- blocked, killed, or crashed. That is the state no amount of
+        current-state inspection reveals, and the one the 48-hour gap needed.
+        """
+        return self._query_dicts(
+            "SELECT attempt_id, item_uuid, batch_uuid, source, started_at "
+            "FROM download_queue_attempts WHERE terminal_status = 'IN_PROGRESS' "
+            "AND started_at < datetime('now', ?) ORDER BY started_at",
+            ("-%d seconds" % int(older_than_seconds),), default=[])
+
+    def distinct_items_failing(self, source, reason_code, within_seconds=3600,
+                               now=None, including_item=None):
+        """How many DISTINCT items hit `reason_code` on `source` recently.
+
+        The promotion evidence for source-wide scope. "Scope must be earned by
+        evidence" (design review): one item failing proves something about that
+        item; several DIFFERENT items failing the same way in a window is what
+        suggests the source itself is the problem.
+
+        DISTINCT is the load-bearing word. Retrying one stubborn page ten times
+        must not manufacture ten pieces of evidence -- that is how a single bad
+        release convinces the system an entire source is refusing.
+
+        Counts only transport_attempted=1: a sibling parked by policy never
+        asked the source anything and is not evidence about it.
+
+        ``now`` is the CALLER'S clock. The queue stamps these rows from its own
+        injectable clock, so a cutoff taken from sqlite's `datetime('now')`
+        here would be comparing two different clocks -- which is precisely the
+        defect this window already suffered in the other direction. Defaults to
+        real UTC for the monitoring callers, which have no injected clock.
+
+        ``including_item`` is the item being classified RIGHT NOW. Its attempt
+        is still open -- it has no reason_code yet, because the reason is what
+        the caller is currently deciding about -- so without this it is invisible
+        to its own promotion check and the constant means N+1 items, not N. That
+        made AMBIGUOUS_PROMOTION_DISTINCT_ITEMS = 2 require three stalls.
+        """
+        cutoff = self._attempt_stamp(
+            (now or datetime.datetime.now(datetime.timezone.utc))
+            - datetime.timedelta(seconds=int(within_seconds)))
+        rows = self._query_dicts(
+            "SELECT DISTINCT item_uuid FROM download_queue_attempts "
+            "WHERE source = ? AND reason_code = ? AND transport_attempted = 1 "
+            "  AND started_at > ?",
+            (str(source), str(reason_code), cutoff),
+            default=[])
+        seen = {str(r.get("item_uuid")) for r in rows}
+        if including_item:
+            seen.add(str(including_item))
+        return len(seen)
+
+    #: Distinct items failing structurally within the window before it reads as
+    #: scraper drift rather than bad individual releases. Three, because one or
+    #: two pulled releases are ordinary and a genuine template change breaks
+    #: everything at once.
+    SCRAPER_DRIFT_DISTINCT_ITEMS = 3
+    #: Structural failures: the page did not look the way the scraper expects.
+    #: Explicitly NOT source gating -- a changed template and a blocked source
+    #: need opposite responses (fix the selector vs. back off), and today they
+    #: are indistinguishable in the UI.
+    _STRUCTURAL_REASONS = ("layout_changed", "reveal_control_absent")
+
+    def scraper_drift_report(self, within_seconds=86400):
+        """Structural scrape failures, surfaced APART from source gating.
+
+        Design review F10. Seven items were cancelled for `layout_changed` and
+        sat in the same bucket as "the source blocked us" -- but a broken
+        selector and a hostile source want opposite responses, and drift
+        absorbed into a gating bucket is how a scraper stays broken for weeks.
+
+        Counts DISTINCT items with transport_attempted = 1: a page we never
+        fetched says nothing about the template, and one stubborn release must
+        not look like a site-wide redesign.
+        """
+        out = {"drifting": False, "by_reason": {}, "distinct_items": 0}
+        try:
+            # One canonical cutoff string, in the attempts table's own shape --
+            # never a bare datetime('now', ?), which is a DIFFERENT shape from
+            # what _attempt_stamp writes and compares wrong on the same day.
+            cutoff = self._attempt_stamp(
+                datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(seconds=int(within_seconds)))
+            rows = self._query_dicts(
+                "SELECT reason_code, COUNT(DISTINCT item_uuid) AS n "
+                "FROM download_queue_attempts "
+                "WHERE reason_code IN (%s) AND transport_attempted = 1 "
+                "  AND started_at > ? "
+                "GROUP BY reason_code"
+                % ",".join("?" for _ in self._STRUCTURAL_REASONS),
+                tuple(self._STRUCTURAL_REASONS) + (cutoff,),
+                default=[])
+            for r in rows:
+                out["by_reason"][str(r.get("reason_code"))] = int(r.get("n") or 0)
+            # GLOBALLY distinct, not the sum of the per-reason counts. Summing
+            # them double-counts an item that failed once with layout_changed
+            # and once with reveal_control_absent, so ONE stubborn release could
+            # contribute 2 toward a threshold documented as three DISTINCT items
+            # -- the exact "one page manufactures its own evidence" failure the
+            # DISTINCT was there to prevent. by_reason stays per-reason; only the
+            # threshold input changes.
+            total = self._query_dicts(
+                "SELECT COUNT(DISTINCT item_uuid) AS n "
+                "FROM download_queue_attempts "
+                "WHERE reason_code IN (%s) AND transport_attempted = 1 "
+                "  AND started_at > ?"
+                % ",".join("?" for _ in self._STRUCTURAL_REASONS),
+                tuple(self._STRUCTURAL_REASONS) + (cutoff,),
+                default=[])
+            out["distinct_items"] = int((total[0] if total else {}).get("n") or 0)
+            out["drifting"] = out["distinct_items"] >= self.SCRAPER_DRIFT_DISTINCT_ITEMS
+        except Exception as e:  # noqa: BLE001
+            logger.error("scraper_drift_report failed: %s", e)
+            out["error"] = str(e)[:120]
+        return out
+
+    def queue_source_observations(self, source, within_seconds=86400):
+        """OBSERVED source outcomes only -- never policy deferrals.
+
+        Returns {attempted, failed, progressed, last_attempt_at,
+        last_progress_at}. Only rows with transport_attempted = 1 count, because
+        a source-health classifier that consumes synthetic sibling deferrals
+        will conclude a source is refusing when it was asked exactly once.
+        """
+        row = self._query_dicts(
+            "SELECT COUNT(*) AS attempted, "
+            "       SUM(CASE WHEN terminal_status = 'FAILED' THEN 1 ELSE 0 END) AS failed, "
+            "       SUM(source_progress) AS progressed, "
+            "       MAX(started_at) AS last_attempt_at, "
+            "       MAX(CASE WHEN source_progress = 1 THEN started_at END) AS last_progress_at "
+            "FROM download_queue_attempts "
+            "WHERE source = ? AND transport_attempted = 1 "
+            "  AND started_at > datetime('now', ?)",
+            (str(source), "-%d seconds" % int(within_seconds)), default=[])
+        out = row[0] if row else {}
+        return {
+            "attempted": int(out.get("attempted") or 0),
+            "failed": int(out.get("failed") or 0),
+            "progressed": int(out.get("progressed") or 0),
+            "last_attempt_at": out.get("last_attempt_at"),
+            "last_progress_at": out.get("last_progress_at"),
+        }
+
+    #: Grace after an item becomes due before "nothing started" is a fault.
+    #: Generous: the worker polls every couple of seconds, so 15 minutes of a
+    #: due item with no attempt is not scheduling jitter.
+    QUEUE_EXECUTOR_GRACE_SECONDS = 900
+    #: Floor for the no-progress deadline, and the multiple of the pacing
+    #: interval above it. At 600s pacing this is 2h; at 3600s it is 6h. The
+    #: multiplier means the deadline scales with how slowly we deliberately
+    #: chose to go, instead of a hardcoded number that is wrong at both ends.
+    QUEUE_PROGRESS_FLOOR_SECONDS = 7200
+    QUEUE_PROGRESS_INTERVAL_MULTIPLE = 6
+
+    def queue_stall_report(self):
+        """Three DISTINCT stall conditions, because one timer cannot separate
+        the two histories the 2026-08-13 incident could not distinguish.
+
+        "No completion in N hours" conflates "nothing was attempted" with
+        "everything attempted failed" -- and those want different diagnoses.
+        So this reports:
+
+          executor_starved   work is due, and nothing has even STARTED.
+                             A scheduler/ownership/liveness fault.
+          source_no_progress attempts are happening, but the source has
+                             delivered nothing for longer than the pacing
+                             justifies. A source fault.
+          human_required     a state no automatic action can leave:
+                             verification hold, or deferred work with
+                             auto-resume switched off.
+
+        A verification hold is reported as human_required and NEVER as a
+        scheduler stall -- mislabelling it would send someone hunting a worker
+        bug when the truth is that a person must complete a challenge.
+
+        Completion is deliberately NOT the progress signal: a queue can make
+        real source progress without an item completing, and an item can
+        complete without any new source reveal.
+        """
+        now_expr = "datetime('now')"
+        report = {"executor_starved": False, "source_no_progress": False,
+                  "human_required": False, "evidence": {}}
+        try:
+            # EVERY TIMESTAMP PREDICATE IN THIS REPORT GOES THROUGH julianday().
+            #
+            # This one decided whether ANY work is due, and it gates the whole
+            # starvation branch below. scheduled_for is written by
+            # download_queue._iso() as "2026-08-16T09:00:00+00:00"; datetime('now')
+            # is "2026-08-16 14:00:00". 'T' (0x54) sorts after ' ' (0x20), so on
+            # the same calendar day the ISO string is always the larger and
+            # `scheduled_for <= now` is FALSE for everything. due_now has
+            # therefore read 0 for every same-day item since this report was
+            # written, which is why the stall detector it was built for could
+            # never fire -- three separate predicates here had the same defect.
+            #
+            # julianday() parses both shapes to a number. The rule for this file:
+            # if two timestamps meet in SQL and they might not share a shape,
+            # they meet inside julianday().
+            due = self._query_dicts(
+                "SELECT COUNT(*) AS n, "
+                "       (SELECT scheduled_for FROM download_queue_items "
+                "        WHERE state IN ('scheduled','ready') "
+                "          AND scheduled_for IS NOT NULL "
+                f"          AND julianday(scheduled_for) <= julianday({now_expr}) "
+                "        ORDER BY julianday(scheduled_for) LIMIT 1) AS oldest "
+                "FROM download_queue_items "
+                "WHERE state IN ('scheduled','ready') AND scheduled_for IS NOT NULL "
+                f"  AND julianday(scheduled_for) <= julianday({now_expr})",
+                default=[])
+            due_n = int((due[0] if due else {}).get("n") or 0)
+            oldest_due = (due[0] if due else {}).get("oldest")
+
+            # By TIME, not by spelling: this column still holds pre-2026-08-16
+            # rows in the old ISO shape beside the canonical one, and a lexical
+            # MAX() would hand back a stale legacy row as "most recent".
+            last_attempt = self._query_dicts(
+                "SELECT started_at AS t FROM download_queue_attempts "
+                "ORDER BY julianday(started_at) DESC LIMIT 1", default=[])
+            last_attempt_at = (last_attempt[0] if last_attempt else {}).get("t")
+
+            held = self._query_dicts(
+                "SELECT COUNT(*) AS n FROM download_queue_batches "
+                "WHERE verification_hold_source IS NOT NULL "
+                "  AND verification_hold_source <> ''", default=[])
+            held_n = int((held[0] if held else {}).get("n") or 0)
+
+            stuck = self._query_dicts(
+                "SELECT COUNT(*) AS n FROM download_queue_batches b "
+                "WHERE b.auto_resume_after_cooldown = 0 AND EXISTS ("
+                "  SELECT 1 FROM download_queue_items i WHERE i.batch_uuid = b.batch_uuid"
+                "    AND i.state IN ('waiting_source','verification_required'))",
+                default=[])
+            stuck_n = int((stuck[0] if stuck else {}).get("n") or 0)
+
+            # Scraper drift is reported ALONGSIDE, never folded into the
+            # source buckets: a broken selector and a hostile source need
+            # opposite responses (design review F10).
+            drift = self.scraper_drift_report()
+            report["scraper_drift"] = drift
+            report["human_required"] = bool(held_n or stuck_n or drift.get("drifting"))
+            report["evidence"] = {
+                "due_now": due_n, "oldest_due_at": oldest_due,
+                "last_attempt_at": last_attempt_at,
+                "verification_holds": held_n,
+                "batches_deferred_without_auto_resume": stuck_n,
+            }
+
+            # 1. EXECUTOR STARVATION -- work is due and nothing has started.
+            #    Suppressed while a verification hold is active: not attempting
+            #    is then CORRECT, and calling it a scheduler fault would send
+            #    someone after the wrong bug.
+            if due_n and not held_n and oldest_due:
+                # julianday() ON BOTH SIDES, and it is not a style preference.
+                #
+                # This compared timestamp STRINGS in two different shapes:
+                # `oldest_due` comes from download_queue_items.scheduled_for,
+                # written by download_queue._iso() as "2026-08-16T09:00:00+00:00",
+                # while datetime('now') and download_queue_attempts.started_at are
+                # "2026-08-16 14:00:00". 'T' (0x54) sorts after ' ' (0x20), so on
+                # the SAME calendar day the ISO string always compares as the
+                # larger one whatever the real times are.
+                #
+                # Both halves were therefore wrong. `oldest_due < cutoff` was
+                # false all day, so THIS ALERT COULD NEVER FIRE -- present on main
+                # since the alert was written, which is why the 2026-08-13
+                # starvation it was built for stayed invisible. And an attempt
+                # that really did start hours after the item came due compared as
+                # "has not started", so once the first half was fixed the second
+                # would have reported starvation while work was running.
+                #
+                # julianday() parses both shapes to a number, so the comparison is
+                # about time again rather than about ASCII.
+                starved = self._query_dicts(
+                    "SELECT 1 AS x WHERE julianday(?) < julianday(datetime('now', ?)) "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM download_queue_attempts "
+                    "  WHERE julianday(started_at) > julianday(?))",
+                    (oldest_due, "-%d seconds" % self.QUEUE_EXECUTOR_GRACE_SECONDS,
+                     oldest_due), default=[])
+                report["executor_starved"] = bool(starved)
+
+            # 2. SOURCE NO PROGRESS -- attempts happen, nothing comes back.
+            eligible = self._query_dicts(
+                "SELECT COUNT(*) AS n FROM download_queue_items "
+                "WHERE state IN ('scheduled','ready','claimed','waiting_source')",
+                default=[])
+            if int((eligible[0] if eligible else {}).get("n") or 0) and not held_n:
+                pace = self._query_dicts(
+                    "SELECT MAX(interval_seconds) AS s FROM download_queue_batches "
+                    "WHERE state NOT IN ('completed','cancelled')", default=[])
+                interval = int((pace[0] if pace else {}).get("s") or 600)
+                deadline = max(self.QUEUE_PROGRESS_FLOOR_SECONDS,
+                               interval * self.QUEUE_PROGRESS_INTERVAL_MULTIPLE)
+                # MAX() BY TIME, NOT BY SPELLING. A bare MAX(started_at) is a
+                # lexical max, and this column still holds rows written before
+                # 2026-08-16 in the old "2026-08-16T03:51:41" shape alongside the
+                # canonical "2026-08-16 03:51:41". 'T' sorts after ' ', so a
+                # stale legacy row wins MAX() against every same-day real one --
+                # and this value is what decides whether the source is declared
+                # dead. Ordering by julianday picks the genuinely newest whatever
+                # shape it is, so the legacy rows are harmless rather than
+                # actively misleading.
+                prog = self._query_dicts(
+                    "SELECT started_at AS t FROM download_queue_attempts "
+                    "WHERE source_progress = 1 "
+                    "ORDER BY julianday(started_at) DESC LIMIT 1", default=[])
+                last_progress = (prog[0] if prog else {}).get("t")
+                report["evidence"]["last_source_progress_at"] = last_progress
+                report["evidence"]["progress_deadline_seconds"] = deadline
+
+                # A NO-PROGRESS EPISODE, NOT "ANY ATTEMPT EVER PLUS THE EPOCH".
+                #
+                # This used to read: if any attempt row exists at all, is
+                # COALESCE(last_progress, '1970-01-01') older than the deadline?
+                # With no progress ever recorded the fallback is the epoch, which
+                # is older than every conceivable deadline -- so THE FIRST FAILED
+                # ATTEMPT IN A FRESH HISTORY set source_no_progress immediately,
+                # flatly contradicting the contract this key states ("attempts
+                # are happening, but the source has delivered nothing for longer
+                # than the pacing justifies"). And because `last_attempt_at` was
+                # tested only for EXISTENCE, a months-old attempt satisfied it
+                # during a current starvation, so executor_starved and
+                # source_no_progress could both be true at once -- the two
+                # diagnoses this report exists to keep apart. (2026-08-16 peer
+                # review round 2.)
+                #
+                # The episode is defined positively instead:
+                #   start   the EARLIEST source-spending attempt since the last
+                #           delivery (or ever, if the source has never delivered)
+                #   open    that start is older than the deadline
+                #   live    we are still ASKING -- a source-spending attempt
+                #           inside the deadline window. Without this, "we gave up
+                #           hours ago" would read as a source fault when it is a
+                #           scheduler one.
+                # Only transport_attempted = 1 counts: a policy deferral never
+                # asked the source anything and is not evidence about it.
+                window = "-%d seconds" % deadline
+                episode = self._query_dicts(
+                    "SELECT started_at AS t FROM download_queue_attempts "
+                    "WHERE transport_attempted = 1 "
+                    "  AND (? IS NULL OR julianday(started_at) > julianday(?)) "
+                    "ORDER BY julianday(started_at) ASC LIMIT 1",
+                    (last_progress, last_progress), default=[])
+                episode_start = (episode[0] if episode else {}).get("t")
+                recent = self._query_dicts(
+                    "SELECT 1 AS x FROM download_queue_attempts "
+                    "WHERE transport_attempted = 1 "
+                    "  AND julianday(started_at) >= julianday(datetime('now', ?)) "
+                    "LIMIT 1", (window,), default=[])
+                report["evidence"]["no_progress_episode_since"] = episode_start
+                if episode_start and recent:
+                    open_long_enough = self._query_dicts(
+                        "SELECT 1 AS x WHERE julianday(?) "
+                        "  < julianday(datetime('now', ?))",
+                        (episode_start, window), default=[])
+                    report["source_no_progress"] = bool(open_long_enough)
+        except Exception as e:  # noqa: BLE001
+            # A health report that throws must not take its caller down, but it
+            # must not read as healthy either.
+            logger.error("queue_stall_report failed: %s", e)
+            report["evidence"]["error"] = str(e)[:120]
+            report["human_required"] = True
+        return report
+
+    def get_latest_plex_cache_at(self, content_type="Movies"):
+        """Newest ``last_updated`` among plex_cache rows for *content_type*,
+        else None.
+        
+        Change-detector for the scheduled version-label sync, mirroring
+        ``get_latest_dv_scan_at``. A higher value means the Plex cache was
+        rewritten, so the per-title file counts the badges are derived from may
+        have moved.
+        
+        SAFE TO ``MAX()`` HERE, which is not true of every timestamp in this
+        schema: ``plex_cache.last_updated`` is a FLOAT epoch, so the comparison
+        is numeric. The string-shaped columns elsewhere mix `T`-separated and
+        space-separated forms, where `MAX()` compares lexically and can order
+        same-day values backwards. Measured: all 16,332 Movies rows carry one
+        identical float, because the cache is rewritten wholesale each refresh --
+        so this advances exactly once per refresh rather than per row.
+        
+        Fail-safe: any error returns None, which the caller reads as "nothing
+        new", so a DB hiccup can never trigger a spurious full-library pass.
+        """
+        try:
+            rows = self._query_dicts(
+                "SELECT MAX(last_updated) AS latest FROM plex_cache "
+                "WHERE content_type = ?", (content_type,))
+            return (rows[0].get("latest") if rows else None) or None
+        except Exception as e:
+            logger.error("DB Error (get_latest_plex_cache_at): %s", e)
+            return None
 
     def get_latest_dv_scan_at(self, source="scan"):
         """Newest ``last_seen_at`` among dv_scan rows for *source*, else None.
@@ -5218,6 +6906,62 @@ class DatabaseManager:
             'scanned_at, last_seen_at FROM dv_scan'
             f'{where} ORDER BY last_seen_at DESC LIMIT ?', tuple(params), default=[])
 
+    def get_dv_layer_rows(self, source="scan"):
+        """Just ``path`` + ``dv_layer`` for every row of *source*. No limit.
+
+        The DV conflict state is a property of ALL scan rows -- a page cannot
+        answer it -- but computing it needs only these two columns. get_dv_scans
+        returns seven and is paged for the inventory view, so this exists to let
+        the conflict endpoint be refreshed cheaply on reconnect and panel-open
+        without dragging the inventory payload along (peer review round 3:
+        prefer query shape over caching, because a cache would put an
+        invalidation problem into state whose best property is that it can
+        always be recomputed).
+        """
+        return self._query_dicts(
+            "SELECT path, dv_layer FROM dv_scan WHERE source = ?",
+            (source,), default=[])
+
+    def get_plex_hdr_by_rating_key(self):
+        """``{rating_key: bool}`` — whether Plex sees wide-gamut video.
+
+        The HDR10 label needs an HDR axis, and dv_scan has none: 'none' means
+        "dovi_tool found no Dolby Vision", which is equally true of an HDR10
+        remux and a plain SDR 4K file. Plex already records the distinction
+        (plex_service sets ``hdr`` when a video stream's colorPrimaries carry
+        bt2020), so the labeler joins on that rather than inventing a second
+        detector.
+
+        A rating_key ABSENT from this map is UNKNOWN, not False. The two must
+        stay distinguishable: treating "no cached row" as "not HDR" would let a
+        cache gap strip a correct HDR10 label, which is the same shape as every
+        other silent-removal bug in this module. Callers get a plain dict, so
+        ``.get(rk)`` returns None for unknown.
+
+        Note plex_service stops scanning streams at the first Dolby Vision hit,
+        so a DV title records hdr=0. That is correct for this consumer: HDR10
+        here means "HDR and no DV", which is exactly what the label says.
+
+        AGGREGATION IS EXPLICIT, and it has to be. plex_cache holds one row per
+        media PART/version, so a title with several versions has several rows:
+        1,032 rating_keys have more than one row here, and 225 of those have
+        rows that DISAGREE about hdr (a 4K HDR version beside a 4K SDR one).
+        A plain dict comprehension over the rows lets whichever duplicate SQLite
+        happened to return last decide the title, which is nondeterministic --
+        and a False is destructive, because it authorises removing HDR10.
+
+        MAX(hdr) encodes the intended rule: **any served version being HDR makes
+        the title HDR**. That matches the label's meaning ("this title is
+        available in HDR") and fails in the safe direction, since the failure
+        mode that matters is wrongly concluding "not HDR" and stripping a
+        correct label. Found in peer review 2026-08-15.
+        """
+        rows = self._query_dicts(
+            'SELECT rating_key, MAX(hdr) AS hdr FROM plex_cache '
+            'WHERE rating_key IS NOT NULL AND hdr IS NOT NULL '
+            'GROUP BY rating_key', default=[])
+        return {str(r["rating_key"]): bool(r["hdr"]) for r in rows}
+
     def count_dv_scans_by_layer(self, source=None):
         """Return ``{layer: count}`` over the dv_scan table.
 
@@ -5270,7 +7014,7 @@ class DatabaseManager:
                 sig_size = excluded.sig_size,
                 probe_json = excluded.probe_json,
                 probed_at = CURRENT_TIMESTAMP
-        ''', (path, sig_mtime, sig_size, probe_json), label="upsert_media_probe") is not None
+        ''', (path, sig_mtime, sig_size, probe_json), label="upsert_media_probe")
 
     def get_media_probe(self, path):
         """Return the cached probe row for ``path`` (dict, probe_json still a raw
@@ -5538,10 +7282,21 @@ class DatabaseManager:
                 label="reset_applying_rename_jobs")
         return count
 
-    def count_rename_jobs_by_status(self):
-        """Return a ``{status: count}`` map over all rename jobs."""
-        rows = self._query(
-            "SELECT status, COUNT(*) FROM rename_jobs GROUP BY status", default=[])
+    def count_rename_jobs_by_status(self, include_archived=False):
+        """Return a ``{status: count}`` map over rename jobs.
+
+        Excludes archived jobs by DEFAULT, because list_rename_jobs excludes
+        them by default too, and these counts label the cards above that very
+        list. Counting archived rows here made every card disagree with what
+        clicking it showed -- "Applied 89" opening a list of 78 -- while the
+        separate Archived card counted those same jobs a second time. A
+        number you cannot reconcile with the screen teaches you to distrust
+        the screen.
+        """
+        sql = "SELECT status, COUNT(*) FROM rename_jobs"
+        if not include_archived:
+            sql += " WHERE archived_at IS NULL"
+        rows = self._query(sql + " GROUP BY status", default=[])
         return {r[0]: r[1] for r in (rows or [])}
 
     def package_has_rename_job(self, package_name):

@@ -1,0 +1,185 @@
+UNFINISHED WORK AUDIT - 2026-08-16
+(RAW SWEEP - SCOPE TOO WIDE, SEE NOTE)
+
+SCOPE ERROR, recorded 2026-08-16: this raw sweep covers ScanHound AND the whole
+homelab (Frigate, Immich, Procare, VLANs, UniFi, the MedSpa site, TL-* items).
+The request was about recent CODING work; widening it to the house was a mistake
+in how the sweep was commissioned, not a finding.
+
+For the ScanHound-only view -- which is the actionable one -- read
+PRIORITY-PLAN-2026-08-16.md. Infrastructure items belong in
+C:\DockerData\infra-ops\BACKLOG.md and are already tracked there as TL-numbers.
+This file is kept only as the raw evidence dump behind the plan.
+=================================
+
+HOW THIS WAS PRODUCED. A parallel sweep of: the memory directory, git branches and
+open PRs, C:/DockerData/infra-ops/BACKLOG.md, docs/reviews/, and code markers
+(TODO/FIXME/skipped tests). 138 unique items.
+
+STATUS OF THIS LIST: THE VERIFICATION PASS DID NOT RUN (session limit). Every item
+below is a CLAIM extracted from notes, branches and docs -- NOT confirmed against
+live state. Memory goes stale in both directions: things recorded as pending may
+have shipped, and things recorded as done may not be deployed. Verify before acting.
+
+VERIFIED BY HAND on 2026-08-16 (these four only):
+  * ScanHound-MountNASShares scheduled task    LastTaskResult = 2   FAILING
+  * ScanHound Qualification Evidence task      LastTaskResult = 3   FAILING
+  * db-snapshot-backup.ps1 mentions crawler.db/scanhound ZERO times
+    -> ScanHound's database is not covered by the DB snapshot backup
+  * The four feat/* branches from today are pushed; none has a PR
+
+EXPLICITLY OUT OF SCOPE (owner decisions, do NOT resurrect):
+  * The failing WD180EDGZ in the X: mirror - Jesse's call 2026-08-05, do not raise
+  * The Backblaze red X / stale date - expected until ~Dec 2026
+  * The three legacy attempt rows - Jesse chose to keep them 2026-08-16
+
+===== STARTED_INCOMPLETE (60) =====
+ * feat/queue-declared-semantics is a competing design that was never pushed anywhere
+ * The 'Completion Contract' program (agent/hybrid-sweep-rebased) stalled 11 days ago with 118 commits and 43 new files tha
+ * The canonical list of unresolved questions (13 items from 2026-08-15) lives only on an unmerged branch
+ * The NAS mount readiness gate was left at an explicit 'wip' commit and three competing specs
+ * The docker-compose.yml changes the live deployment depends on have never been committed
+ * TL-026 — Medspa site (sister): 2 stock placeholder images, mobile layout never swept, footer email not a mailto: link
+ * TL-004 — immich-enhance is dead; everything is rebuilt except the Immich API key
+ * TL-032 — NAS mount Stage 0: installed, but rollback is BLOCKED and two defects are queued behind a branch that never mer
+ * TL-034 / TL-035 — the two 2026-07-28 Frigate measurement follow-ups were never performed
+ * TL-016 — Frigate WUD tag filter: deferred to "the next planned Frigate recreate", which happened on 2026-08-09 without i
+ * TL-038 — the VLANs do not segment anything: seven VLANs in one firewall zone with Allow-All, plus UniFi controller auto-
+ * TL-043 — IoT VLAN regression: 61 devices fell onto the trusted network, and it silently invalidates segmentation Stage 1
+ * TL-037 — `WUD_WATCHER_LOCAL_WATCHEVENTS=false` is staged and never applied; Docker Hub 429 residual risk still VERIFYING
+ * TL-044 — Five MEDIUM findings from ChatGPT's monitoring review deferred, and the reviewed snapshot is now stale
+ * ScanHound completion contract rev3 — the whole RSS-promotion / rename-safety programme has been dormant since 2026-08-05
+ * audit/dv-deployment F2 — a RunLevel=Highest task running a wrapper from a user-writable path, awaiting Jesse's decision;
+ * The 711-title FEL mass write is staged, gate-approved and never executed — and may now be superseded
+ * `feat/queue-declared-semantics` exists ONLY on this machine — never pushed, and it sits on the at-risk X: mirror
+ * feat/queue-declared-semantics is LOCAL-ONLY — never pushed to any remote
+ * PR #84 (clear-hold button) is OPEN with FAILING CI
+ * Per-item history: backend built, Svelte sheet explicitly not built
+ * ATTEMPT_HISTORY_TRUSTED_FROM must be repointed at the deploy timestamp before item-history ships
+ * Kometa DV badge overlays were never installed — ScanHound writes DV8/DV5/DV7/DV/HDR10 labels nothing renders
+ * ScanHound's database has NO backup — script staged 11 days ago, never scheduled, never run
+ * ScanHound-MountNASShares scheduled task is FAILING right now (LastTaskResult=2)
+ * ScanHound Qualification Evidence scheduled task is FAILING (LastTaskResult=3)
+ * PR #59 (DV detector enable runbook) is open on a premise that has since been satisfied
+ * STATE-OF-PLAY.md on main is 6 days stale and materially wrong
+ * JDownloader ~15-hour stall: root cause still unproven, telemetry deployed to catch a recurrence
+ * Reveal per-session warm-up hypothesis: documented, no experiment run, no PR
+ * agent/hybrid-sweep-rebased: 118 unmerged commits, abandoned mid-closure 11 days ago
+ * TL-043 — IoT VLAN regression: 61 devices on the trusted network, diagnosed and unfixed
+ * TL-044 — five medium monitoring findings deferred, and the reviewed snapshot is now stale
+ * Three legacy local-time attempt rows left in production, against the reviewer's recommendation
+ * C:\Tools ACL incident: per-file ACEs left as recovery, and auditing still off
+ * Stale dv_label_vocab default in config.py and the settings UI placeholder, after the DV8/DV5 rename
+ * feat/item-history-sheet — per-item history sheet, only the data half built, and one commit never pushed
+ * Track 3 — the two shutdown/thread-leak branches were never combined or merged
+ * Track 5 product items D-1, D-2, D-3, D-4, D-6, D-7
+ * O-1 — the mount installer's MANIFEST.json is missing, so rollback is BLOCKED
+ * reveal_verification_stalled — the per-session warm-up lead, never tested
+ * docker-compose.yml carries required mods that have never been committed
+ * Open question: what recreates the scanhound container without reading the compose file
+ * dovi_tool extract-rpu hang — upstream report drafted but never filed
+ * DV coverage — ~2,900 4K titles have never had a real detection
+ * ~15 throwaway test containers still running; the --rm root fix never landed
+ * Memory index and topic files carry several claims that are now false
+ * ai.turtleland.us is still a live, enumerable, empty public hostname
+ * TL-004 / Immich Enhance — blocker cleared, supervised first run never happened
+ * TL-043 — 61 IoT devices fell onto the trusted network; blocks all segmentation
+ * TL-041 — DB snapshots are written at 02:30 but the Backblaze queue is built at ~01:04
+ * Frigate GenAI descriptions are STILL failing — verified live today
+ * TL-042 — the Frigate blackout's Phase-1 mechanism is still unexplained
+ * Four monitoring/backup jobs added 8/08–8/12 do not run when signed out
+ * PTZ425DB-AT — every network recovery route tested and dead; RMA or serial only
+ * Plex Live TV LanNetworksBandwidth fix applied but never verified
+ * Frigate 0.18 beta — breaking changes never exercised, still on beta3
+ * Immich — photo FILE restore from Backblaze never tested; version pin declined
+ * MedSpa website (sister) — seven launch items, all needing a person
+ * AM6B+ / PM4K — Android SmartTube switch and the eMMC migration never live-tested
+
+===== DONE_NOT_DEPLOYED (3) =====
+ * Kometa `dv_badges.yml` was never copied — PR #76 is deployed and stripping labels the Kometa config cannot render
+ * Kometa dv_badges.yml must be hand-copied into Jesse's Kometa config
+ * ScanHound audit remediation — 10 findings fixed and pushed, never deployed; H-series never started
+
+===== DONE_NOT_MERGED (25) =====
+ * Today's queue-fix stack (3 branches, 10 commits) is pushed but has no PR and cannot merge
+ * PR #84 (verification-hold clear button) is open and is the single blocker under today's entire stack
+ * agent/audit-fixes-pass2: 16 commits of security/audit fixes, several labelled CRITICAL, never merged
+ * Scan-failure visibility / scan metrics (backend/scan_metrics.py) built twice, landed neither time
+ * Rename safety ledger (backend/rename/ledger.py, failure.py) finished its review round and stopped
+ * CI secret scanning was built and never turned on
+ * Two cloud-session branches from 2026-08-03 (scan publication fence, notification bounds) were never merged and are easy 
+ * PR #59 (DV detector enable runbook) is open but the thing it documents was retired
+ * Four investigation/audit doc branches from 2026-08-11 and 2026-08-12 were never merged
+ * A one-commit installer safety fix from 2026-08-03 was never merged
+ * PR #59 — DV detector enable runbook, open 6 days after the thing it documents was already turned on
+ * `feat/queue-review-followups` — three review rounds complete, no PR ever opened, and four live bugs remain in the deploy
+ * `feat/bulk-clear-download-results` — two review rounds complete, no PR, and it is stacked on an unmerged base
+ * PR #84 — verification-hold clear button, open and not type-checked locally
+ * Six review documents from 2026-08-15/16 exist only on unmerged `docs/*` branches, including 13 unanswered questions
+ * Four live queue bugs (B1–B4) are fixed on a branch but STILL RUNNING in production
+ * executor_starved alert has never been capable of firing — three dead predicates
+ * Three stacked queue branches are review-complete but no PR was ever opened
+ * Four doc-only branches pushed with no PR, holding the only record of 2026-08-15/16 findings
+ * feat/queue-review-followups — F4/F5/F10 review findings + 8 live queue bug fixes
+ * PR #84 — verification-hold clear button (the escape hatch had no UI)
+ * agent/hybrid-sweep-rebased — the entire RSS/identity programme, 106 commits, never merged
+ * Track 4 security — agent/security-track-c unmerged, plus three Jesse-side items
+ * O-2 — installer preflight-assert runs AFTER task registration
+ * PR #59 — DV detector enable runbook, open and unmerged
+
+===== DECIDED_NEVER_STARTED (39) =====
+ * RSS coverage-canary hybrid: agreed by both peers, spec'd twice, never built
+ * TL-003 — Apex turtleland.us is publicly ungated, plus a dead-but-enumerable ai.turtleland.us hostname
+ * TL-008 — SMART monitoring: still no automated collection, and CrystalDiskInfo is not running persistently
+ * TL-029 — External LAN probe: full design done, two questions to Jesse never answered
+ * TL-036 — ScanHound LLM identification failures write nothing to any log; spec is ready, nothing built
+ * TL-038 — Five "exact next actions" from the 2026-08-05 overnight audit, all BLOCKED-AUTHORIZATION on Jesse
+ * TL-047 — Five audit findings recorded with "nothing applied"
+ * PR #61 — RSS coverage-canary hybrid: decision + design approved, build kicked off 2026-08-14, nothing built
+ * `.mp4` is declared supported but dovi_tool cannot demux it — 2 files retried forever, never converging
+ * JD reconnect backoff and call timeouts: designed twice, corrected once, never built — and PR #79 shipped the heartbeat a
+ * Three DV correctness findings confirmed on 2026-08-15 and deliberately left unfixed
+ * Reveal-stall per-session warm-up hypothesis: five questions raised, nothing tested, and the cheap test is already identi
+ * Architectural programme: recommendations #1, #2, #4, #5, #6 and F5's `last_exhausted_probe_at` staged for later rounds
+ * RSS coverage-canary hybrid: designed twice, build plan pinned, never built
+ * Architectural programme: 5 of 6 recommendations plus F5's dedicated column staged for later rounds
+ * TL-036 — ScanHound LLM identification observability: spec-ready since 2026-07-27, never built
+ * TL-008 — SMART monitoring: READY, offered to Jesse, not selected
+ * Threshold asymmetry from the PR #77 round: documented or unified — neither done
+ * Two orphaned download_results rows: pruning decision never made
+ * The five remaining architectural restructuring recommendations Jesse authorised
+ * PR #61 — RSS coverage-canary hybrid: designed, deliberately not built
+ * Track A closeout — ChatGPT's 12-step sequence, scope never confirmed
+ * Track 2 rename safety — N-2 through N-7, auto-rename still frozen
+ * F2 hardening — DV scan still runs as NLSur off a user-writable wrapper chain
+ * Plex must add \\TURTLELANDSRV2\k\TV Shows 1 or renamed episodes stay invisible
+ * HDEncode PR #3 off-switch re-cut and PR #21 cancellation corrected package
+ * HDEncode live end-to-end proof never exercised
+ * TL-036 — ScanHound LLM identification writes nothing to any log when it fails
+ * Dupe-compare: analyze_job_conflict ignores filename-borne quality tiers
+ * TL-008 — no SMART monitoring at all; offered to Jesse and not selected
+ * UniFi — seven VLANs in one firewall zone with an explicit allow-all policy
+ * UniFi auto-backup is OFF, stale Blue Iris port-891 forward, 2.4 GHz channel collision
+ * NVIDIA driver swap and Amyuni virtual-display removal — script written, never run
+ * UAC is at its weakest setting and Claude can silently self-elevate
+ * Vaultwarden admin password in plaintext, and ebooks.turtleland.us unauthenticated
+ * Plex housekeeping — dead L:\TV Shows 2 folder and maintenance drifting into the afternoon
+ * Maintenance-window leftovers: Frigate WUD filter, the 80/443 interface audit, classifier tick
+ * TL-029 — external LAN probe designed, waiting on two answers from Jesse
+ * Procare Downloader — per-child and EXIF expansion
+
+===== UNKNOWN (3) =====
+ * The DV mass write of ~694 staged FEL rows — status genuinely unclear
+ * Uptime Kuma retention shrink and the WUD Immich false-positive filter
+ * Beszel appears to have been re-paired, but the backlog still lists it as dead
+
+===== EXPLICITLY_DROPPED (8) =====
+ * Branches that LOOK abandoned but whose content is already on main -- do not resurrect
+ * TL-001 — Replace Disk 9 (failing WD180EDGZ in the X: mirror) — CONFLICT: backlog says P0 open, memory says Jesse closed 
+ * backend/sources/hdencode.py — dead adapter with six 404 URLs, kept deliberately
+ * Per-host source identity (filehost:rapidgator.net) — reviewer suggestion declined with rationale
+ * TL-001 Disk 9 replacement — backlog says P0, memory says Jesse closed it
+ * The three legacy download_queue_attempts rows ChatGPT wanted deleted
+ * TL-001 — replace the failing Disk 9 in the X: mirror
+ * Home Assistant is offline (homeassistant.turtleland.us → 530)
+

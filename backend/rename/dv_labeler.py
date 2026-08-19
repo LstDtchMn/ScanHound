@@ -12,7 +12,53 @@ from backend.rename.dv_paths import normalize_path
 
 logger = logging.getLogger(__name__)
 
-MANAGED = {"DV FEL", "DV MEL", "DV P8", "DV P5"}
+#: Labels the layer tags map to — one per layer, renameable via dv_label_vocab.
+_LAYER_LABELS = {"DV FEL", "DV MEL", "DV8", "DV5"}
+
+#: Labels this module used to apply and no longer wants. They stay in MANAGED
+#: so the next sync REMOVES them; dropping them from MANAGED instead would make
+#: the labeler blind to them and leave a stale 'DV P8' on every Profile 8 title
+#: forever, unmanaged and indistinguishable from a label the user applied.
+#:
+#: A rename is only finished when the old name is cleaned up, so this set is
+#: the migration. It can be emptied once a full sync has run against the live
+#: library and the old labels are gone.
+RETIRED_LABELS = {"DV P8", "DV P5"}
+
+#: Broader tags DERIVED from the same verdict, so Kometa can key an overlay on
+#: "any Profile 7" or "any Dolby Vision" without enumerating layers. A FEL title
+#: carries DV FEL *and* DV7 *and* DV: they describe the same fact at three
+#: widths, they are not alternatives.
+#:
+#: A group tag is only worth having when it spans MORE THAN ONE badge. Profile
+#: 7 does (FEL and MEL), so DV7 earns its place; profiles 8 and 5 are each a
+#: single badge already, so a 'DV8' group tag beside a 'DV8' badge would be a
+#: pure alias — identical set of titles, no expressive gain, one more label to
+#: write and to get wrong. That rule is why this map is asymmetric.
+_GROUP_LABELS = {
+    "fel": ("DV7", "DV"),
+    "mel": ("DV7", "DV"),
+    "profile8": ("DV",),
+    "profile5": ("DV",),
+}
+
+#: The one tag that is NOT derived from a DV verdict alone. dv_scan has no HDR
+#: axis: 'none' means "dovi_tool found no Dolby Vision", equally true of an
+#: HDR10 remux and a plain SDR 4K file. HDR10 therefore requires BOTH an
+#: authoritative 'none' AND Plex's own wide-gamut flag, and is withheld when
+#: either is missing.
+HDR10_LABEL = "HDR10"
+
+#: THE CLOSED SET this module may remove. Everything reconcile_movie strips
+#: comes from here, so a user's own label ('DV Cut' is the historical example)
+#: is never touched. RETIRED_LABELS are included precisely so they CAN be
+#: removed — see that constant.
+#:
+#: CAUTION when extending: adding a label here hands it to the labeler, which
+#: will REMOVE it from any title whose verdict does not call for it. 'DV' is
+#: the broadest and therefore the most likely to collide with a hand-applied
+#: label of the same name.
+MANAGED = _LAYER_LABELS | {"DV7", "DV", HDR10_LABEL} | RETIRED_LABELS
 
 # highest-first preference when a title's parts disagree
 _LAYER_RANK = ["fel", "mel", "profile8", "profile5"]
@@ -20,31 +66,283 @@ _LAYER_RANK = ["fel", "mel", "profile8", "profile5"]
 _THROTTLE_S = 0.05  # inter-write pause so a big library can't hammer Plex
 
 
+#: A layer value that records a FAILED detection rather than a finding.
+#: dv_detect resolves any error — no dovi_tool, unreadable file, timeout,
+#: subprocess failure — to this, and dv_host_scan.classify_to_row stores it.
+#: It is NOT evidence, and must never be treated as an authoritative answer
+#: about a file. 'none' IS authoritative: it means the tool ran and found no
+#: Dolby Vision.
+LAYER_DETECTION_FAILED = "unknown"
+
+#: A verdict for a normalized file whose OWN rows make DIFFERENT authoritative
+#: claims — one spelling says fel, another says mel.
+#:
+#: Distinct from 'unknown' deliberately. 'unknown' means "no evidence for this
+#: part", and pick_layer is built so a sibling part's positive finding outranks
+#: it: one part proving Dolby Vision proves it for the title. A contradiction
+#: is the opposite situation — there IS evidence and it disagrees with itself,
+#: so the file could be any of the claimed layers, possibly one that OUTRANKS
+#: the sibling. Collapsing it onto 'unknown' therefore let a clean sibling part
+#: re-authorise destructive reconciliation for the whole title and re-open the
+#: rating_key back-write, which is exactly what the single-part reasoning
+#: missed (peer review 2026-08-17).
+LAYER_CONFLICT = "conflict"
+
+#: Layer values that are NOT evidence and may never authorise a destructive
+#: action. One set, because the guards that consume it are spread across
+#: is_authoritative, desired_label(s), pick_layer and reconcile_movie — adding a
+#: third such state to four of the five is how the conflict hole was created.
+_NON_EVIDENCE = frozenset({LAYER_DETECTION_FAILED, LAYER_CONFLICT})
+
+
+def is_authoritative(layer):
+    """Whether a dv_layer is a real finding we may act on destructively.
+
+    The distinction dv_detect documents — "could not run" vs "confirmed no
+    DV" — is only meaningful if it is enforced where labels are removed. A
+    self-contradicting file is likewise not something to act on.
+    """
+    return layer is not None and layer not in _NON_EVIDENCE
+
+
 def desired_label(layer, vocab):
-    """Map a dv_layer to its managed label, or None for none/unknown/NULL."""
-    if not layer or layer in ("none", "unknown"):
+    """The single LAYER label for a dv_layer, or None for none/unknown/NULL.
+
+    The specific badge only ('DV FEL'), never the derived group tags. Callers
+    deciding what a title should carry want desired_labels(); this remains for
+    reporting the one label that names the layer itself.
+    """
+    if not layer or layer == "none" or layer in _NON_EVIDENCE:
         return None
     label = vocab.get(layer)
-    return label if label in MANAGED else None
+    return label if label in _LAYER_LABELS else None
+
+
+def desired_labels(layer, vocab):
+    """EVERY managed label a title with this layer should carry, as a set.
+
+    One verdict yields several tags at different widths — 'fel' means the title
+    is FEL, is Profile 7, and is Dolby Vision, all true at once. Returning a set
+    is what lets reconcile_movie compute removals as "managed labels this title
+    should not have", instead of the old "everything managed except THE label",
+    which could only ever express one tag per title.
+
+    An empty set means "carry no managed label": correct for 'none' (the tool
+    ran and found no DV) and for 'unknown'/NULL — but at the removal step an
+    empty set from a POSITIVE layer means a configuration gap, which
+    reconcile_movie must distinguish. See its may_remove rules.
+    """
+    if not layer or layer == "none" or layer in _NON_EVIDENCE:
+        return set()
+    out = set()
+    primary = vocab.get(layer)
+    if primary in _LAYER_LABELS:
+        out.add(primary)
+    out.update(g for g in _GROUP_LABELS.get(layer, ()) if g in MANAGED)
+    return out
 
 
 def pick_layer(norm_paths, index):
-    """Best layer among a movie's candidate normalized paths (rank fel>mel>p8>p5)."""
+    """Aggregate one verdict for a title from ALL its parts.
+
+    The contract, in order:
+
+    0. any part that CONTRADICTS ITSELF poisons the title -- see below;
+    1. any positive DV finding wins, by the documented rank (fel > mel > p8 > p5)
+       -- one part proving Dolby Vision proves it for the title;
+    2. otherwise, if ANY part is unclassified ('unknown') or has no row at all,
+       the aggregate is 'unknown' -- absence has not been established;
+    3. only when EVERY part is matched and authoritatively 'none' is the
+       aggregate 'none'.
+
+    Rule 0 has to precede rule 1, and that ordering is the whole point. A
+    LAYER_CONFLICT part is a file whose own rows claim two DIFFERENT layers, so
+    its true layer is unknown but is definitely one of them -- possibly one that
+    OUTRANKS a clean sibling. Running the rank loop first would let a sibling's
+    'profile5' become the title's verdict and authorise REMOVING a DV FEL label
+    that the contradicting part may well justify. "One part proves DV for the
+    title" is sound for evidence; it is not sound for evidence that disagrees
+    with itself. Found by peer review after the single-part case was traced
+    through the consumer and the multi-part case was not.
+
+    Rules 2 and 3 are the fix for two unsafe behaviours. The old
+    ``found[0] if found else None`` made a mixed ['none','unknown'] title
+    depend on part ORDER -- filesystem/Plex ordering decided whether labels
+    were deleted -- and it returned 'none' for a title whose other part had no
+    row, treating an unproven part as proof of absence. Removal is destructive
+    and Kometa's overlays key off these labels, so incomplete coverage must
+    read as "don't know", never as "no".
+    """
     found = [index[p] for p in norm_paths if p in index]
+    if LAYER_CONFLICT in found:
+        return LAYER_CONFLICT            # rule 0: before the rank loop
     for rank in _LAYER_RANK:
         if rank in found:
             return rank
-    return found[0] if found else None
+    if not found:
+        return None                      # nothing matched: not our title
+    if len(found) != len(norm_paths):
+        return LAYER_DETECTION_FAILED    # a part has no row -> incomplete
+    if any(layer != "none" for layer in found):
+        return LAYER_DETECTION_FAILED    # 'unknown' (or anything unranked)
+    return "none"                        # every part authoritatively no-DV
+
+
+def _collapse_observations(observations):
+    """One (layer, row_path, conflict) verdict from every row naming ONE file.
+
+    Several rows can normalize onto a single key: the same file recorded under
+    a drive letter and its UNC share, under different separators or case, or
+    simply stored twice under two spellings. Every index here used to be built
+    with ``idx[p] = row[layer]`` inside a loop, so the LAST row silently won.
+
+    ``get_dv_scans()`` orders ``last_seen_at DESC``, which LOOKS like a
+    tie-break and is not one. A bulk rescan stamps thousands of rows inside the
+    same second: the live table holds 6,948 scan rows across FIVE distinct
+    timestamps, 5,975 of them sharing a single value. The winner is therefore
+    whichever row the sorter happens to emit first among equals, and that
+    shifts as rows are added.
+
+    346 keys carry a real layer on one row and a failed scan on the other (180
+    of them a layer that produces a badge). Measured twice against the same
+    database twenty minutes apart, the count resolving WRONGLY was 335, then 0.
+    Both the original "they all happen to be right" reading and the later "335
+    are wrong" reading were snapshots of a coin toss, which is the actual
+    defect: not a wrong answer, an arbitrary one.
+
+    The rule depends only on the SET of layers observed, never on row order:
+
+        exactly one distinct authoritative layer -> that layer
+        no authoritative layer at all            -> the failure value
+        two or more DIFFERENT authoritative      -> CONFLICT
+
+    ``none`` is authoritative — the detector ran and found no Dolby Vision.
+    ``unknown``/NULL records that detection FAILED, so it is not evidence and
+    can never outvote or contradict a real finding; that is what makes the
+    common ``<real layer> vs unknown`` collision resolve cleanly either way
+    round.
+
+    Two tempting tie-breakers are deliberately NOT used:
+
+    * ``last_seen_at``. upsert_dv_scan lets a failed 'unknown' scan keep the
+      previous layer while still refreshing last_seen_at, so that column dates
+      the OBSERVATION and not the LAYER. Ranking by it would let a file whose
+      last real finding is older lose to a newer failure. Dating the layer
+      would need its own column first.
+    * ``_LAYER_RANK``. That ranks the PARTS of one Plex title, where "any part
+      proving DV proves it for the title" is sound. Two observations of one
+      file making different positive claims is a contradiction, not a union;
+      taking the higher would launder a disagreement into a confident answer.
+
+    A CONFLICT reports ``LAYER_CONFLICT`` — its own value, not a reuse of
+    ``unknown``. Reusing 'unknown' was the first attempt and it was wrong: the
+    two states are non-authoritative in DIFFERENT ways. pick_layer is built to
+    let a sibling part's positive finding beat an 'unknown', which is right for
+    a failed scan and wrong for a contradiction, so on a multi-part title the
+    conflict silently vanished and destructive reconciliation was re-enabled.
+    See LAYER_CONFLICT and pick_layer's rule 0.
+
+    Returning the layers alongside is what keeps the disagreement EXPLICIT
+    rather than silent — sync_labels logs them and counts them in its summary.
+    """
+    authoritative = sorted({lay for lay, _ in observations if is_authoritative(lay)})
+    conflict = None
+    if len(authoritative) == 1:
+        layer = authoritative[0]
+    elif not authoritative:
+        # Every row failed. Preserve the distinction the rows themselves draw:
+        # an explicit 'unknown' stays 'unknown' and an absent layer stays None,
+        # so a key with no collision still yields exactly what it did before.
+        layer = (LAYER_DETECTION_FAILED
+                 if any(lay == LAYER_DETECTION_FAILED for lay, _ in observations)
+                 else None)
+    else:
+        layer = LAYER_CONFLICT
+        conflict = authoritative
+
+    # The path must come from a row that CARRIES the winning layer. Taking the
+    # layer from one row and the raw path from another would annotate a
+    # different row's rating_key than the one the verdict came from. min()
+    # rather than "first seen" so the choice is order-independent as well; for
+    # the overwhelming majority of keys there is one candidate and it is a
+    # no-op. A conflict has no winning row, so every path stays eligible —
+    # nothing consumes it in that case, but it must still be deterministic.
+    if conflict is None:
+        candidates = [raw for lay, raw in observations if lay == layer]
+    else:
+        candidates = [raw for _, raw in observations]
+    return layer, min(candidates), conflict
+
+
+def _index_by_normalized_path(rows, mappings=None, *, layer_key="dv_layer"):
+    """({norm -> layer}, {norm -> row path}, {norm -> conflicting layers}).
+
+    Groups rows by normalized path in one pass, then collapses each group —
+    see _collapse_observations for why the collapse cannot be a plain
+    last-write-wins assignment. EVERY index this module builds goes through
+    here, including the seed baseline (``layer_key='seed_layer'``), so the
+    call sites cannot drift apart and be fixed one at a time again.
+    """
+    grouped = {}
+    for r in rows or ():
+        raw = r.get("path")
+        p = normalize_path(raw, mappings)
+        if not p:
+            continue
+        grouped.setdefault(p, []).append((r.get(layer_key), raw))
+
+    index = {}
+    norm_to_path = {}
+    conflicts = {}
+    for p, observations in grouped.items():
+        layer, raw, conflict = _collapse_observations(observations)
+        index[p] = layer
+        norm_to_path[p] = raw
+        if conflict:
+            conflicts[p] = conflict
+    return index, norm_to_path, conflicts
 
 
 def build_index(rows, mappings=None):
     """{normalize_path(path) -> dv_layer} from scan-source rows."""
-    idx = {}
-    for r in rows:
-        p = normalize_path(r.get("path"), mappings)
-        if p:
-            idx[p] = r.get("dv_layer")
-    return idx
+    index, _, _ = _index_by_normalized_path(rows, mappings)
+    return index
+
+
+#: How many conflicting paths a status payload carries. The full set stays
+#: server-side for exact dedup; the wire gets a bounded sample (review L1).
+CONFLICT_SAMPLE = 25
+
+
+def current_conflicts(rows, mappings=None, *, sample=CONFLICT_SAMPLE):
+    """Unresolved DV-layer conflicts RIGHT NOW, derived from *rows*.
+
+    Deliberately a pure function of the scan rows rather than stored state.
+    A conflict is not an event that happened, it is a property the data
+    currently has: two rows naming one file and claiming different layers. So
+    it can always be recomputed and there is nothing to persist, replay, or let
+    drift out of sync with the rows themselves.
+
+    That property is what makes the alert safe. `_alert_dv_layer_conflicts`
+    fires once per distinct set, and its delivery is best-effort — the in-app
+    broadcast reaches whoever is connected AT THAT MOMENT and raises nothing if
+    that is nobody, so a conflict appearing while no client is open would
+    otherwise be marked "seen", never re-announced, and lost (peer review round
+    2). Because this recomputes from the rows, an unresolved conflict stays
+    discoverable whenever someone next looks, independent of whether any
+    notification was ever delivered. Event for the change, current state for
+    the truth.
+
+    Bounded on purpose: `count` is exact, `sample` is capped, `truncated` says
+    so. Callers that need every path can build the index themselves.
+    """
+    _, _, conflicts = _index_by_normalized_path(rows, mappings)
+    paths = sorted(conflicts)
+    return {
+        "count": len(paths),
+        "sample": [{"path": p, "layers": conflicts[p]} for p in paths[:sample]],
+        "truncated": len(paths) > sample,
+    }
 
 
 def build_index_and_paths(rows, mappings=None):
@@ -52,16 +350,12 @@ def build_index_and_paths(rows, mappings=None):
 
     Same normalization semantics as build_index, but also captures the
     original (un-normalized) row path so callers can recover it in O(1)
-    instead of re-scanning all rows per lookup.
+    instead of re-scanning all rows per lookup. A caller that wants to REPORT
+    collisions rather than just survive them wants _index_by_normalized_path,
+    which returns them as a third value.
     """
-    idx = {}
-    norm_to_path = {}
-    for r in rows:
-        p = normalize_path(r.get("path"), mappings)
-        if p:
-            idx[p] = r.get("dv_layer")
-            norm_to_path[p] = r.get("path")
-    return idx, norm_to_path
+    index, norm_to_path, _ = _index_by_normalized_path(rows, mappings)
+    return index, norm_to_path
 
 
 def _movie_norm_paths(movie, mappings):
@@ -84,25 +378,94 @@ def _existing_labels(movie):
 
 
 def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
-                    additive_only=False):
-    """Reconcile one movie's managed label. Returns {added, removed, matched}.
+                    additive_only=False, hdr_index=None):
+    """Reconcile one movie's managed labels. Returns {added, removed, matched}.
+
+    ``hdr_index`` is ``{rating_key: bool}`` from Plex (see
+    ``get_plex_hdr_by_rating_key``). A key that is ABSENT means UNKNOWN, and
+    unknown is not False: HDR10 is then neither added NOR removed, because a
+    cache gap must not be read as "this title is not HDR" and strip a correct
+    label. Passing None disables HDR10 handling entirely, which is what every
+    caller that has no Plex cache to consult should do.
 
     ``additive_only`` leaves an unmatched movie untouched. A positive path
     match may still replace a stale managed label so unattended reconciliation
     converges after an authoritative rescan. A transient matching failure must
     never strip the labels that Kometa's FEL/MEL overlays depend on.
+
+    "Matched" therefore means matched to a REAL finding: a row whose layer is
+    'unknown' records that detection FAILED, and under additive_only it is
+    treated exactly like no row at all. Reading it as a match was a
+    label-stripping bug — desired_label('unknown') is None, so the removal
+    loop subtracted nothing and stripped every managed DV label from the
+    title during the unattended hourly sync. Any detection failure (an
+    unreadable file on a network mount is the common one) could silently
+    undo the FEL/MEL overlays.
     """
     norm_paths = _movie_norm_paths(movie, mappings)
     layer = pick_layer(norm_paths, index)
-    desired = desired_label(layer, vocab)
+    desired_set = desired_labels(layer, vocab)
+    desired = desired_label(layer, vocab)      # the layer badge, for reporting
     existing_managed = _existing_labels(movie) & MANAGED
+    authoritative = is_authoritative(layer)
 
-    added, removed = [], []
-    if desired and desired not in existing_managed:
-        added.append(desired)
-    if not additive_only or layer is not None:
-        for stale in existing_managed - ({desired} if desired else set()):
-            removed.append(stale)
+    # HDR10 needs BOTH halves: the tool ran and found no Dolby Vision, AND Plex
+    # sees wide-gamut video. Either half missing means the label is withheld.
+    # `hdr_state is None` is UNKNOWN — no cached Plex row, or no index supplied
+    # — and unknown must not authorise removal, so HDR10 is exempted from the
+    # removal set entirely in that case. Reading absent-from-cache as "not HDR"
+    # is the same silent-strip shape as the vocab gap.
+    hdr_state = None
+    if hdr_index is not None:
+        hdr_state = hdr_index.get(str(getattr(movie, "ratingKey", "")))
+    if layer == "none" and hdr_state is True:
+        desired_set = desired_set | {HDR10_LABEL}
+    exempt = {HDR10_LABEL} if hdr_state is None else set()
+
+    # Removal is the destructive half, so it needs its own rule per case:
+    #   'unknown'      -> NEVER remove, in any mode. Classification failed;
+    #                     a manual full reconcile may ask to reconcile known
+    #                     evidence, but it cannot convert failed evidence into
+    #                     proof of absence.
+    #   'conflict'     -> NEVER remove, in any mode, for the same reason and
+    #                     one more: the file's own rows disagree, so the layer
+    #                     that would justify the existing label may be the
+    #                     correct one. Both live in _NON_EVIDENCE so this guard
+    #                     cannot be updated for one and forgotten for the other.
+    #   authoritative  -> remove stale labels, in any mode (that is what makes
+    #                     unattended reconciliation converge after a rescan).
+    #   no match       -> the pre-existing policy: full reconcile removes,
+    #                     additive_only leaves the title alone.
+    #   unmapped layer -> NEVER remove. A POSITIVE finding with no label in the
+    #                     vocab is a CONFIGURATION gap, not evidence that the
+    #                     title should carry nothing. Without this, an unmapped
+    #                     layer looks identical to 'none' at the removal step
+    #                     (both give desired=None) and strips the correct badge.
+    #                     _vocab_from_config now merges over the defaults so the
+    #                     four known layers cannot go unmapped -- but a NEW
+    #                     layer value (the planned DV7/DV8/HDR10-only work adds
+    #                     some) would reintroduce it the moment a layer reaches
+    #                     this code before its vocab entry does.
+    # "Unmapped" means the LAYER BADGE is missing, not that the whole set is
+    # empty. Once group tags exist a positive layer almost always yields DV7/DV,
+    # so testing the set would have made this guard unreachable for the four
+    # known layers -- and a vocab gap would once again strip the correct badge
+    # while quietly adding the group tags. Test the badge itself.
+    positive = (layer is not None and layer != "none"
+                and layer not in _NON_EVIDENCE)
+    unmapped = positive and desired is None
+    if layer in _NON_EVIDENCE or unmapped:
+        may_remove = False
+    else:
+        may_remove = authoritative or not additive_only
+
+    # Set arithmetic, not "everything except THE label". The old form could
+    # only ever express one managed tag per title, so a second correct tag
+    # (DV7 beside DV FEL) was computed as stale and removed on the next pass —
+    # the two writers would have fought forever. Sorted for deterministic
+    # output, which the summaries and tests both rely on.
+    added = sorted(desired_set - existing_managed)
+    removed = sorted(existing_managed - desired_set - exempt) if may_remove else []
 
     if not dry_run:
         for lbl in added:
@@ -121,25 +484,69 @@ def reconcile_movie(movie, index, vocab, pm, *, dry_run=False, mappings=None,
     return {
         "added": added,
         "removed": removed,
-        "matched": layer is not None,
+        # A failed detection is not a match. Besides the summary count, this
+        # gates sync_labels' rating_key back-write -- re-persisting an
+        # 'unknown' row (as source='scan') on every pass is what made a
+        # single detection failure sticky instead of self-healing on the
+        # next host run.
+        "matched": authoritative,
         "layer": layer,
         "desired_label": desired,
         "existing_labels": sorted(existing_managed),
     }
 
 
-_DEFAULT_VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}
+#: The live config still stores the OLD names for profile8/profile5. Those
+#: values are no longer layer labels, so _vocab_from_config filters them out
+#: and the merge-over-defaults added earlier supplies these instead — the
+#: rename needs no settings edit to take effect, and logs which entries it
+#: ignored. That fallback existing is the only reason this rename is a
+#: one-file change.
+_DEFAULT_VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}
 
 
 def _vocab_from_config(config):
+    """Build the layer -> label map, MERGED OVER the defaults.
+
+    A partial or partly-invalid vocab must never leave a layer unmapped. It
+    used to: entries whose value was not in MANAGED were filtered out, and the
+    default was restored only when NOTHING survived. So one typo -- 'DV-FEL'
+    for 'DV FEL' -- silently dropped the fel mapping while the other three
+    stayed, and dv_label_vocab is stored as a free-text string with no
+    validation at the settings boundary.
+
+    That is not a cosmetic gap. desired_label() then returns None for a layer
+    that is still AUTHORITATIVE, so reconcile_movie treats it as "this title
+    should carry no managed label" and REMOVES the correct badge, in every
+    mode including the unattended additive-only hourly sync, with nothing added
+    back. One character in a settings field could strip DV FEL from every FEL
+    title in the library.
+
+    Merging over the defaults means an unmapped layer is impossible for the
+    four known layers: a caller can rename labels, but cannot accidentally
+    delete a mapping. Dropped entries are logged, because silently ignoring
+    what someone typed is how the typo stayed invisible.
+    """
+    vocab = dict(_DEFAULT_VOCAB)
     raw = config.get("dv_label_vocab")
     if not raw:
-        return dict(_DEFAULT_VOCAB)
+        return vocab
     try:
+        # Only LAYER labels are renameable. Mapping a layer onto a derived tag
+        # ('fel' -> 'DV7') would make the group tag the layer badge as well, so
+        # the two could no longer be told apart at the removal step.
         v = json.loads(raw)
-        parsed = {k: val for k, val in v.items() if val in MANAGED}
-        return parsed or dict(_DEFAULT_VOCAB)
+        parsed = {k: val for k, val in v.items() if val in _LAYER_LABELS}
+        dropped = sorted(set(v) - set(parsed)) if isinstance(v, dict) else []
+        if dropped:
+            logger.warning(
+                "dv_label_vocab: ignoring %d entr(y/ies) whose label is not a "
+                "layer label %s: %s — the default label is used for those "
+                "layers instead", len(dropped), sorted(_LAYER_LABELS), dropped)
+        vocab.update(parsed)
+        return vocab
     except (ValueError, TypeError):
+        logger.warning("dv_label_vocab is not valid JSON; using defaults")
         return dict(_DEFAULT_VOCAB)
 
 
@@ -148,20 +555,67 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     """Reconcile every movie against dv_scan (source='scan'). Returns a summary.
 
     ``additive_only`` never removes labels from an unmatched movie — see
-    reconcile_movie. The scheduled auto-sync passes it; the manual button does
-    not.
+    reconcile_movie. BOTH callers now pass it: the scheduled auto-sync always,
+    and the manual endpoint by default (``DvSyncRequest.additive_only``, which
+    a caller may set False to ask for destructive reconciliation explicitly).
+
+    This function's own default stays False so the parameter keeps meaning
+    "opt IN to protection" at this layer; the safe choice is made at the API
+    boundary, where the request that triggers it is visible.
     """
     vocab = _vocab_from_config(config)
     rows = db.get_dv_scans(source="scan", limit=1000000)
-    index, norm_to_path = build_index_and_paths(rows, mappings)
+    index, norm_to_path, layer_conflicts = _index_by_normalized_path(rows, mappings)
+    if layer_conflicts:
+        # Loud, because a contradiction is otherwise invisible in this sync's
+        # own numbers: the title is left strictly alone, so it moves none of
+        # matched/added/removed. Neither this log NOR the alert is the record --
+        # current_conflicts() recomputes the set on demand and is what the UI
+        # reads, so a missed line here costs nothing. Capped sample: 2,223 keys
+        # collide in live data (0 of them true conflicts today) and a line per
+        # key would bury the count.
+        sample = sorted(layer_conflicts.items())[:5]
+        logger.warning(
+            "dv sync: %d file(s) have dv_scan rows claiming DIFFERENT DV "
+            "layers. Each is treated as an unverified detection — no label "
+            "added or removed, no rating_key written — until the rows agree. "
+            "First %d: %s", len(layer_conflicts), len(sample),
+            [f"{p} ({' vs '.join(lays)})" for p, lays in sample])
+
+    # Built ONCE for the whole sync, like the dv index — asking Plex per movie
+    # would add an API round trip per title across the entire library. A db
+    # without the method (older stubs, and every test double that predates it)
+    # leaves this None, which disables HDR10 rather than guessing.
+    hdr_index = None
+    get_hdr = getattr(db, "get_plex_hdr_by_rating_key", None)
+    if callable(get_hdr):
+        try:
+            hdr_index = get_hdr()
+        except Exception as e:  # noqa: BLE001
+            # Degrade to "unknown for every title": HDR10 is then neither added
+            # nor removed. A cache read failure must not strip labels.
+            logger.warning("HDR index unavailable; HDR10 labels left untouched: %s", e)
+            hdr_index = None
     seed_rows = []
     list_seed = getattr(db, "list_dv_seed_baseline", None)
     if callable(list_seed):
         seed_rows = list_seed(limit=1000000)
-    seed_index = {
-        normalize_path(row.get("path"), mappings): row.get("seed_layer")
-        for row in seed_rows if normalize_path(row.get("path"), mappings)
-    }
+    # Same collapse as the scan index. The seed baseline can carry two rows for
+    # one file just as dv_scan can, and its only consumer is the dry-run
+    # discrepancy report — so an order-dependent pick here would make that
+    # report disagree with itself between two runs over unchanged data.
+    seed_index, _, seed_conflicts = _index_by_normalized_path(
+        seed_rows, mappings, layer_key="seed_layer")
+    if seed_conflicts:
+        # Says what the report ACTUALLY renders rather than "unverified": the
+        # discrepancy string is built from the seed value verbatim, so a
+        # conflicted seed shows up as seed_conflict_live_<layer>, not as a
+        # generic unverified state.
+        logger.warning(
+            "dv sync: %d seed-baseline path(s) carry conflicting seed layers; "
+            "each collapses to %r and appears in the dry-run discrepancy "
+            "report as seed_%s_live_<layer>",
+            len(seed_conflicts), LAYER_CONFLICT, LAYER_CONFLICT)
 
     movie_libs = (config.get("movie_libs")
                   or config.get("known_movie_libraries") or [])
@@ -187,19 +641,36 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
         try:
             res = reconcile_movie(mv, index, vocab, pm,
                                   dry_run=dry_run, mappings=mappings,
-                                  additive_only=additive_only)
+                                  additive_only=additive_only,
+                                  hdr_index=hdr_index)
             added_n += len(res["added"])
             removed_n += len(res["removed"])
             if res["matched"]:
                 matched_n += 1
                 if not dry_run:
-                    # O(1) rating_key back-write for the matched copy
+                    # O(1) rating_key annotation for the matched copy.
+                    #
+                    # UPDATE-only, and it passes NO layer. `index` is a snapshot
+                    # taken at the start of the sync, so writing index[p] back
+                    # would let a stale layer overwrite a detector import that
+                    # landed while the sync was running -- leaving a stale layer
+                    # beside a fresh signature. The labeler consumes scan
+                    # observations; it does not produce them, and the only
+                    # column it owns here is the Plex identity.
+                    #
+                    # Skips a CONFLICTED path. pick_layer's rule 0 already
+                    # means a title with a conflicting part is never matched,
+                    # so this branch should be unreachable for one -- but the
+                    # loop annotates the first path merely PRESENT in the
+                    # index, without asking whether that path produced the
+                    # title's verdict. That gap is what let a clean sibling
+                    # carry a contradicting path's rating_key. Keeping the
+                    # guard local means the invariant does not depend on
+                    # pick_layer continuing to hold the line.
                     for p in _movie_norm_paths(mv, mappings):
-                        if p in index:
-                            db.upsert_dv_scan(
-                                norm_to_path.get(p, p),
-                                index[p], rating_key=str(mv.ratingKey),
-                                source="scan")
+                        if p in index and p not in layer_conflicts:
+                            db.annotate_dv_scan_rating_key(
+                                norm_to_path.get(p, p), str(mv.ratingKey))
                             break
             if dry_run:
                 movie_paths = _movie_norm_paths(mv, mappings)
@@ -238,4 +709,17 @@ def sync_labels(db, pm, config, *, dry_run=False, progress_cb=None, mappings=Non
     return {"total": total, "added": added_n, "removed": removed_n,
             "matched": matched_n, "dry_run": dry_run,
             "writes": 0 if dry_run else added_n + removed_n,
+            # Files whose dv_scan rows contradict each other. Counted rather
+            # than left to the log because it is the one number that says "some
+            # titles were skipped on purpose"; without it a conflict is
+            # arithmetically identical to an unscanned file in this summary.
+            "layer_conflicts": len(layer_conflicts),
+            # The PATHS as well as the count, because the alert that consumes
+            # this dedups on the SET. A conflict does not self-heal -- the two
+            # rows keep disagreeing until a rescan resolves them -- so an
+            # unconditional alert fires on every pass forever, and a
+            # count-based guard goes quiet on exactly the pass where one file
+            # resolves and a different one appears. Bounded by the number of
+            # colliding keys, which cannot exceed the row count.
+            "layer_conflict_paths": sorted(layer_conflicts),
             "details": details}

@@ -1,13 +1,17 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { connection } from './connection';
 import { addToast } from './notifications';
-import { clearResults, type ScanSource } from '$lib/stores/results';
+import { clearResults, setScanActive, type ScanSource } from '$lib/stores/results';
 
 export type ScanState = 'idle' | 'running' | 'stopping';
 export type ScanType = 'deep' | 'incremental' | 'loaded' | 'search';
 
 export const scanState = writable<ScanState>('idle');
+// Mirror scan activity into results.ts (see setScanActive's doc comment for
+// why the dependency points this way): every scanState writer — startScan,
+// scan:complete/error, the idle-reconcile poll — flows through here.
+scanState.subscribe((s) => setScanActive(s !== 'idle'));
 export const scanProgress = writable<number>(0);
 export const scanPhase = writable<string>('');
 export const scanItemCount = writable<number>(0);
@@ -19,6 +23,13 @@ export const scanItemCount = writable<number>(0);
 export const selectedScanSource = writable<ScanSource>('HDEncode');
 
 connection.on('scan:progress', (data) => {
+  // Progress events arrive for EVERY scan the backend runs — including
+  // scheduled scans and scans started by another client — while startScan()
+  // only covers this session's Start button. Adopting 'running' here keeps
+  // scanState (and the scanActive mirror gating the category-toggle
+  // live-mode exit) truthful for backend-originated scans. Never overrides
+  // 'stopping': that state is this session's in-flight stop request.
+  if (get(scanState) === 'idle') scanState.set('running');
   scanProgress.set(data.progress as number);
   if (data.phase) scanPhase.set(data.phase as string);
   if (data.item_count != null) scanItemCount.set(data.item_count as number);
@@ -26,6 +37,10 @@ connection.on('scan:progress', (data) => {
 
 connection.on('scan:complete', (data) => {
   scanState.set('idle');
+  // Explicit, not only via the scanState mirror: a remote scan that only
+  // ever STREAMED results (scanState never left 'idle', so setting 'idle'
+  // again notifies nobody) still set the flag in handleScanResult.
+  setScanActive(false);
   scanProgress.set(0);
   scanPhase.set('');
   const count =
@@ -36,11 +51,38 @@ connection.on('scan:complete', (data) => {
 
 connection.on('scan:error', (data) => {
   scanState.set('idle');
+  setScanActive(false); // same streamed-only case as scan:complete above
   scanProgress.set(0);
   scanPhase.set('');
   const msg = (data.message as string) || 'Scan failed unexpectedly.';
   addToast('Scan Error', msg, 'error');
 });
+
+/** Reconcile scan activity with the backend — a session that (re)connects
+ *  while a scheduled/remote scan is already mid-flight has seen none of that
+ *  scan's WS events and would otherwise sit falsely idle (and, conversely, a
+ *  session that missed a scan's completion while disconnected could keep the
+ *  streamed-activity flag stuck on). Exported for direct testing; registered
+ *  below for reconnects and run once at startup. */
+export async function reconcileScanActivity(): Promise<void> {
+  try {
+    const st = await api.scanStatus?.();
+    if (!st) return;
+    if (st.state === 'running' && get(scanState) === 'idle') {
+      scanState.set('running');
+    } else if (st.state === 'idle' && get(scanState) === 'idle') {
+      // scanState was already idle so its mirror won't fire — clear the
+      // stream-set flag directly (missed-completion case).
+      setScanActive(false);
+    }
+    // scanState 'running' with a backend gone idle is reconciled by the
+    // polling safety net below.
+  } catch {
+    /* transient — the running-state poll and the next reconnect retry */
+  }
+}
+connection.onReconnect(reconcileScanActivity);
+reconcileScanActivity();
 
 // Safety net: the backend resets to idle when a scan finishes, but if the
 // frontend misses the scan:complete event (e.g. the WebSocket reconnected

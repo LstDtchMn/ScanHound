@@ -2,7 +2,7 @@ from unittest.mock import MagicMock
 from backend.rename.dv_labeler import (
     MANAGED, desired_label, pick_layer, reconcile_movie, build_index)
 
-VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}
+VOCAB = {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}
 
 
 def _movie(rk, files, labels):
@@ -40,8 +40,8 @@ def test_reconcile_add_when_none():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], [])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
-    assert res["added"] == ["DV FEL"] and res["removed"] == []
-    pm.add_label.assert_called_once_with(1, "DV FEL")
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"} and res["removed"] == []
+    assert pm.add_label.call_count == 3  # layer badge + DV7 + DV
 
 
 def test_reconcile_swaps_stale_managed():
@@ -49,7 +49,7 @@ def test_reconcile_swaps_stale_managed():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], ["DV MEL"])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
-    assert res["added"] == ["DV FEL"] and res["removed"] == ["DV MEL"]
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"} and res["removed"] == ["DV MEL"]
 
 
 def test_reconcile_never_touches_non_managed():
@@ -57,7 +57,8 @@ def test_reconcile_never_touches_non_managed():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], ["DV Cut", "DV FEL"])  # already correct
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
-    assert res["added"] == [] and res["removed"] == []   # idempotent
+    # The layer badge is already right; the derived group tags are added.
+    assert set(res["added"]) == {"DV7", "DV"} and res["removed"] == []
     pm.remove_label.assert_not_called()                  # DV Cut survives
 
 
@@ -75,7 +76,7 @@ def test_reconcile_multipart_tie_break():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv", "Y:/b.mkv"], [])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
-    assert res["added"] == ["DV FEL"]  # fel outranks mel
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"}  # fel outranks mel
 
 
 def test_dry_run_writes_nothing():
@@ -83,7 +84,7 @@ def test_dry_run_writes_nothing():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], ["DV MEL"])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=True)
-    assert res["added"] == ["DV FEL"] and res["removed"] == ["DV MEL"]
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"} and res["removed"] == ["DV MEL"]
     pm.add_label.assert_not_called()
     pm.remove_label.assert_not_called()
 
@@ -100,6 +101,7 @@ def test_sync_labels_finally_emits_done_on_plex_failure(monkeypatch):
     class _DB:
         def get_dv_scans(self, **kw): return [{"path": "Y:/a.mkv", "dv_layer": "fel"}]
         def upsert_dv_scan(self, *a, **k): return True
+        def annotate_dv_scan_rating_key(self, *a, **k): return True
 
     class _PM:
         def get_library_section(self, name):
@@ -117,6 +119,7 @@ def test_sync_labels_dry_run_no_writes():
     class _DB:
         def get_dv_scans(self, **kw): return [{"path": "Y:/a.mkv", "dv_layer": "fel"}]
         upsert_dv_scan = MagicMock(return_value=True)
+        annotate_dv_scan_rating_key = MagicMock(return_value=True)
 
     pm = MagicMock()
     lib = MagicMock()
@@ -125,7 +128,7 @@ def test_sync_labels_dry_run_no_writes():
     pm.get_library_section.return_value = lib
     db = _DB()
     res = L.sync_labels(db, pm, {"movie_libs": ["Movies"]}, dry_run=True)
-    assert res["added"] == 1 and res["removed"] == 1
+    assert res["added"] == 3 and res["removed"] == 1  # badge + DV7 + DV
     pm.add_label.assert_not_called()
     db.upsert_dv_scan.assert_not_called()  # no back-write in dry_run
 
@@ -142,6 +145,7 @@ def test_sync_labels_backwrite_uses_original_row_path(monkeypatch):
         def get_dv_scans(self, **kw):
             return rows
         upsert_dv_scan = MagicMock(return_value=True)
+        annotate_dv_scan_rating_key = MagicMock(return_value=True)
 
     pm = MagicMock()
     lib = MagicMock()
@@ -153,8 +157,11 @@ def test_sync_labels_backwrite_uses_original_row_path(monkeypatch):
     res = L.sync_labels(db, pm, {"movie_libs": ["Movies"]}, dry_run=False)
 
     assert res["matched"] == 1
-    db.upsert_dv_scan.assert_called_once_with(
-        r"Y:\Movies\A\f.mkv", "fel", rating_key="42", source="scan")
+    # UPDATE-only annotation carrying NO layer. The sync's index is a snapshot,
+    # so writing a layer back could restore a stale one over a newer import.
+    db.annotate_dv_scan_rating_key.assert_called_once_with(
+        r"Y:\Movies\A\f.mkv", "42")
+    db.upsert_dv_scan.assert_not_called()
 
 
 def test_sync_labels_normalize_path_is_on_o_rows_not_o_movies_x_rows(monkeypatch):
@@ -182,6 +189,8 @@ def test_sync_labels_normalize_path_is_on_o_rows_not_o_movies_x_rows(monkeypatch
         def get_dv_scans(self, **kw):
             return rows
         def upsert_dv_scan(self, *a, **k):
+            return True
+        def annotate_dv_scan_rating_key(self, *a, **k):
             return True
 
     pm = MagicMock()
@@ -230,6 +239,8 @@ def test_sync_labels_normalize_calls_dont_scale_with_movie_count(monkeypatch):
         def get_dv_scans(self, **kw):
             return rows
         def upsert_dv_scan(self, *a, **k):
+            return True
+        def annotate_dv_scan_rating_key(self, *a, **k):
             return True
 
     def _make_movies(n):
@@ -290,8 +301,8 @@ def test_additive_only_still_adds_missing_label():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], [])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
-    assert res["added"] == ["DV FEL"]
-    pm.add_label.assert_called_once_with(1, "DV FEL")
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"}
+    assert pm.add_label.call_count == 3
 
 
 def test_additive_only_converges_conflicting_label_when_path_is_matched():
@@ -304,7 +315,7 @@ def test_additive_only_converges_conflicting_label_when_path_is_matched():
     pm = MagicMock()
     mv = _movie(1, ["Y:/a.mkv"], ["DV MEL"])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
-    assert res["added"] == ["DV FEL"]
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"}
     assert res["removed"] == ["DV MEL"]
     pm.remove_label.assert_called_once_with(1, "DV MEL")
 
@@ -330,3 +341,250 @@ def test_full_reconcile_still_removes_by_default():
     mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
     res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
     assert res["removed"] == ["DV FEL"]
+
+
+# ── 'unknown' is a FAILED detection, not a finding ──────────────────────────
+# The suite already pinned the authoritative cases ('fel' converges a stale
+# label, 'none' removes one, no match preserves). It never pinned the failure
+# case -- and that was the one that stripped labels: desired_label('unknown')
+# is None, so the removal loop subtracted nothing and took every managed DV
+# label off the title during the unattended hourly sync. A single unreadable
+# file on a network mount was enough.
+
+def test_additive_only_keeps_label_when_layer_is_unknown():
+    idx = {"y:/a.mkv": "unknown"}  # detection FAILED for this file
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
+
+    assert res["removed"] == []
+    assert res["added"] == []
+    pm.remove_label.assert_not_called()
+
+
+def test_unknown_is_not_reported_as_a_match():
+    """sync_labels gates its rating_key back-write on `matched`; re-persisting
+    an 'unknown' row on every pass is what made one failure sticky instead of
+    letting the next host run retry it."""
+    idx = {"y:/a.mkv": "unknown"}
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
+
+    assert res["matched"] is False
+    assert res["layer"] == "unknown"  # still reported for diagnostics
+
+
+def test_unknown_never_removes_even_in_a_full_reconcile():
+    """REVERSED after peer review, and the reviewer was right.
+
+    The first cut kept 'unknown' destructive outside additive_only and pinned
+    that as a "negative control" -- which contradicted this module's own
+    stated invariant that a failed detection is not evidence. A manual full
+    reconcile may reconcile KNOWN evidence; it cannot convert a failed
+    classification into proof of absence.
+    """
+    idx = {"y:/a.mkv": "unknown"}
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=False)
+
+    assert res["removed"] == []
+    pm.remove_label.assert_not_called()
+
+
+def test_full_reconcile_still_removes_for_an_authoritative_none():
+    """The behaviour the guard above must NOT break: a real 'no DV' finding
+    still strips a stale label in either mode."""
+    idx = {"y:/a.mkv": "none"}
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=False)
+
+    assert res["removed"] == ["DV FEL"]
+
+
+def test_full_reconcile_still_removes_for_an_unmatched_movie():
+    """And the pre-existing full-reconcile policy for a title with no scan row
+    at all is unchanged -- that is a coverage decision, not a failed one."""
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+
+    res = reconcile_movie(mv, {}, VOCAB, pm, dry_run=False, additive_only=False)
+
+    assert res["removed"] == ["DV FEL"]
+
+
+# ── multipart aggregation: incomplete coverage is never proof of absence ────
+
+class TestMultipartAggregate:
+    """A title with several parts must not have its labels deleted because of
+    filesystem ordering or a part nobody scanned."""
+
+    def test_none_plus_unknown_is_unknown_in_both_orders(self):
+        idx = {"y:/a.mkv": "none", "y:/b.mkv": "unknown"}
+        assert pick_layer(["y:/a.mkv", "y:/b.mkv"], idx) == "unknown"
+        assert pick_layer(["y:/b.mkv", "y:/a.mkv"], idx) == "unknown"
+
+    def test_none_plus_an_unscanned_part_is_unknown(self):
+        idx = {"y:/a.mkv": "none"}
+        assert pick_layer(["y:/a.mkv", "y:/missing.mkv"], idx) == "unknown"
+
+    def test_every_part_none_is_authoritative_none(self):
+        idx = {"y:/a.mkv": "none", "y:/b.mkv": "none"}
+        assert pick_layer(["y:/a.mkv", "y:/b.mkv"], idx) == "none"
+
+    def test_a_positive_finding_wins_over_an_unknown_sibling(self):
+        idx = {"y:/a.mkv": "fel", "y:/b.mkv": "unknown"}
+        assert pick_layer(["y:/a.mkv", "y:/b.mkv"], idx) == "fel"
+
+    def test_no_matched_part_at_all_is_still_no_match(self):
+        assert pick_layer(["y:/a.mkv", "y:/b.mkv"], {}) is None
+
+    def test_a_mixed_title_keeps_its_label_end_to_end(self):
+        # the consequence that matters: ordering must not delete a badge
+        idx = {"y:/a.mkv": "none", "y:/b.mkv": "unknown"}
+        pm = MagicMock()
+        mv = _movie(1, ["Y:/a.mkv", "Y:/b.mkv"], ["DV FEL"])
+        res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False,
+                              additive_only=False)
+        assert res["removed"] == []
+        pm.remove_label.assert_not_called()
+
+
+# --- disaster recovery: rebuilt Plex database -------------------------------
+#
+# Jesse asked (2026-08-09) what happens to the DV labels if he loses his Plex
+# database. Labels live ONLY in Plex -- dv_file_tagging is false, so nothing is
+# written into the video files -- so a fresh Plex starts with zero DV labels.
+#
+# The answer that matters is whether they can be REBUILT from dv_scan without
+# re-reading 730 video files. That rests entirely on the labeler matching by
+# normalized PATH rather than by Plex's internal ids, because a rebuilt database
+# assigns brand-new ratingKeys to everything.
+#
+# These tests are written so they FAIL if that ever stops being true: the
+# dv_scan rows carry rating_key values that deliberately DISAGREE with the
+# movies' new ratingKeys. Under path matching the labels are restored anyway;
+# under any id-based matching nothing would match at all.
+
+def test_rebuilt_plex_restores_labels_from_dv_scan_by_path():
+    # dv_scan rows as they survive in ScanHound's own database. The stale
+    # rating_key column is the point: these are the ids from BEFORE the loss.
+    rows = [
+        {"path": "Y:/Movie 1 (14TB)/4K DV/Alpha (2001).mkv", "dv_layer": "fel",
+         "rating_key": 111},
+        {"path": "Y:/Movie 1 (14TB)/4K DV/Beta (2002).mkv", "dv_layer": "mel",
+         "rating_key": 222},
+    ]
+    idx = build_index(rows, None)
+
+    # The rebuilt library: same files on disk, BRAND-NEW ratingKeys, and no
+    # labels at all -- the state a fresh Plex scan produces.
+    pm = MagicMock()
+    alpha = _movie(90001, ["Y:/Movie 1 (14TB)/4K DV/Alpha (2001).mkv"], [])
+    beta = _movie(90002, ["Y:/Movie 1 (14TB)/4K DV/Beta (2002).mkv"], [])
+
+    r1 = reconcile_movie(alpha, idx, VOCAB, pm, dry_run=False)
+    r2 = reconcile_movie(beta, idx, VOCAB, pm, dry_run=False)
+
+    assert set(r1["added"]) == {"DV FEL", "DV7", "DV"}, \
+        "FEL tag set not restored after a Plex rebuild"
+    assert set(r2["added"]) == {"DV MEL", "DV7", "DV"}, \
+        "MEL tag set not restored after a Plex rebuild"
+    # Written against the NEW ids, proving the stale rating_key column is unused
+    # for both matching and writing.
+    pm.add_label.assert_any_call(90001, "DV FEL")
+    pm.add_label.assert_any_call(90002, "DV MEL")
+    assert r1["removed"] == [] and r2["removed"] == []
+
+
+def test_rebuilt_plex_recovery_works_under_additive_only():
+    # The AUTOMATIC sync path runs additive_only=True. Recovery must work there
+    # too, not only under the manual full reconcile -- otherwise the documented
+    # recovery would need a mode Jesse has to know to select.
+    rows = [{"path": "Y:/Movie 2 (8TB)/4K DV/Gamma (2003).mkv", "dv_layer": "profile8",
+             "rating_key": 333}]
+    idx = build_index(rows, None)
+    pm = MagicMock()
+    mv = _movie(90003, ["Y:/Movie 2 (8TB)/4K DV/Gamma (2003).mkv"], [])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False, additive_only=True)
+
+    assert set(res["added"]) == {"DV8", "DV"}
+    assert {c.args for c in pm.add_label.call_args_list} == {
+        (90003, "DV8"), (90003, "DV")}
+
+
+def test_rebuilt_plex_does_not_touch_unmanaged_user_labels():
+    # A restored library may already carry the user's OWN labels (collections,
+    # favourites, and the 'DV Cut'-style names a prefix wildcard once deleted).
+    # Recovery must add the managed label WITHOUT disturbing any of them.
+    rows = [{"path": "Y:/Movie 1 (14TB)/4K DV/Delta (2004).mkv", "dv_layer": "fel"}]
+    idx = build_index(rows, None)
+    pm = MagicMock()
+    mv = _movie(90004, ["Y:/Movie 1 (14TB)/4K DV/Delta (2004).mkv"],
+                ["DV Cut", "Christmas", "Favorites"])
+
+    res = reconcile_movie(mv, idx, VOCAB, pm, dry_run=False)
+
+    assert set(res["added"]) == {"DV FEL", "DV7", "DV"}
+    assert res["removed"] == [], "recovery removed a label it does not manage"
+    pm.remove_label.assert_not_called()
+
+
+def test_recovery_cannot_invent_labels_for_unscanned_movies():
+    # The negative control. If a movie has no dv_scan row -- e.g. it was added
+    # after the last scan -- recovery must leave it unlabelled rather than
+    # guessing. Without this, the three tests above would pass even if
+    # reconcile_movie labelled everything it saw.
+    idx = build_index([{"path": "Y:/Movie 1 (14TB)/4K DV/Alpha (2001).mkv",
+                        "dv_layer": "fel"}], None)
+    pm = MagicMock()
+    stranger = _movie(90005, ["Y:/Movie 9 (1TB)/4K DV/Unscanned (2026).mkv"], [])
+
+    res = reconcile_movie(stranger, idx, VOCAB, pm, dry_run=False,
+                          additive_only=True)
+
+    assert res["added"] == [] and res["removed"] == []
+    pm.add_label.assert_not_called()
+
+
+# --- the manual endpoint's default (2026-08-10) -----------------------------
+# The endpoint used to accept sync_labels' additive_only=False by omission, so
+# pressing "sync labels" ran a DESTRUCTIVE full reconciliation over every movie
+# in the configured libraries. Measured at the time: 444 titles carried a
+# managed DV label and all 444 happened to match an authoritative row, so the
+# realised damage was zero -- arithmetic that held, not a property anything
+# enforced. These pin the behaviour rather than the flag: they assert on what
+# reaches Plex, so flipping the default back fails them.
+
+def test_full_reconcile_DOES_strip_an_unmatched_label():
+    """The hazard, stated positively. If this ever stops removing, the
+    contrast the next test draws is meaningless and both are vacuous."""
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+    res = reconcile_movie(mv, {}, VOCAB, pm, dry_run=False, additive_only=False)
+    assert res["removed"] == ["DV FEL"]
+    pm.remove_label.assert_called_once_with(1, "DV FEL")
+
+
+def test_manual_sync_request_defaults_to_additive_only():
+    from backend.api.routes.rename import DvSyncRequest
+    assert DvSyncRequest().additive_only is True
+    assert DvSyncRequest(additive_only=False).additive_only is False
+
+
+def test_manual_sync_default_would_not_strip_that_same_label():
+    """Same movie, same empty index, but through the endpoint's default."""
+    from backend.api.routes.rename import DvSyncRequest
+    pm = MagicMock()
+    mv = _movie(1, ["Y:/a.mkv"], ["DV FEL"])
+    res = reconcile_movie(mv, {}, VOCAB, pm, dry_run=False,
+                          additive_only=DvSyncRequest().additive_only)
+    assert res["removed"] == []
+    pm.remove_label.assert_not_called()

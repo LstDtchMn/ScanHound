@@ -122,3 +122,72 @@ describe('connection reconnect hook', () => {
     expect(cb).not.toHaveBeenCalled();
   });
 });
+
+describe('a superseded socket cannot orphan the live one', () => {
+  // saveServerConfig does `connection.disconnect(); connection.connect();`
+  // back to back. A real browser delivers the old socket's close event
+  // ASYNCHRONOUSLY, so the old handlers used to run against the new socket's
+  // world: onclose nulled the shared `ws` — orphaning the socket just
+  // created — and, because connect() had already reset manualDisconnect,
+  // scheduled a reconnect that opened a SECOND live socket. Every broadcast
+  // was then dispatched twice for the life of the tab. Deterministic, not a
+  // rare race.
+  let originalWebSocket: unknown;
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    FakeWebSocket.instances = [];
+    originalWebSocket = (globalThis as any).WebSocket;
+    (globalThis as any).WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    (globalThis as any).WebSocket = originalWebSocket;
+  });
+
+  it('a late close from the OLD socket does not spawn a second connection', async () => {
+    const { connection } = await import('./connection');
+    connection.connect();
+    const first = FakeWebSocket.instances[0];
+    first.open();
+
+    // the reconnect cycle: disconnect() then an immediate connect()
+    connection.disconnect();
+    connection.connect();
+    const second = FakeWebSocket.instances[1];
+    expect(second).toBeDefined();
+
+    // NOW the old socket's close finally arrives (async in a real browser)
+    first.onclose?.();
+    // let any scheduled reconnect fire
+    vi.advanceTimersByTime(10_000);
+
+    expect(FakeWebSocket.instances.length).toBe(2);
+    connection.disconnect();
+  });
+
+  it('a message from the superseded socket is not dispatched', async () => {
+    const { connection } = await import('./connection');
+    const seen: unknown[] = [];
+    connection.on('scan:result', (d) => seen.push(d));
+    connection.connect();
+    const first = FakeWebSocket.instances[0];
+    first.open();
+
+    connection.disconnect();
+    connection.connect();
+    const second = FakeWebSocket.instances[1];
+    second.open();
+
+    // the orphan is still physically open and the server pushes to it
+    first.onmessage?.({ data: JSON.stringify({ type: 'scan:result', data: { url: 'ghost' } }) });
+    // the live socket delivers the real one
+    second.onmessage?.({ data: JSON.stringify({ type: 'scan:result', data: { url: 'real' } }) });
+
+    expect(seen).toHaveLength(1);
+    expect((seen[0] as { url: string }).url).toBe('real');
+    connection.disconnect();
+  });
+});

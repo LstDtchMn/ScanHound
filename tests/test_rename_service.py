@@ -6,6 +6,17 @@ these run fully offline.
 import os
 import pytest
 
+
+def _all_files(root):
+    """Every file under root as (relpath, size) — the on-disk state a
+    destructive-operation test must assert, not just a return value."""
+    out = []
+    for dirpath, _dirs, names in os.walk(root):
+        for n in names:
+            full = os.path.join(dirpath, n)
+            out.append((os.path.relpath(full, root), os.path.getsize(full)))
+    return out
+
 from backend.database import DatabaseManager
 from backend.rename import fileops as _fileops
 from backend.rename import llm_identify
@@ -698,6 +709,49 @@ class TestConflictSignal:
         assert job["status"] == "applied"
         assert job["conflict_kind"] is None
         assert job["conflict_same_size"] is None
+
+    def test_keep_both_bails_out_when_the_filename_cannot_be_persisted(
+            self, db, tmp_path):
+        """A failed keep-both bookkeeping write must place NOTHING.
+
+        update_rename_job returns False on a failed write instead of
+        raising. Unchecked, the row kept naming the ORIGINAL destination
+        while the file was placed at the deduped sibling -- and undo()
+        REMOVES (not trashes) whatever the row names, so the pre-existing
+        library file the user chose to KEEP was the thing deleted.
+        Assert the on-disk outcome, not just the return value.
+        """
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        save_to1, _ = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv", content="x")
+        save_to2, _ = _extracted(
+            second_root, "The.Matrix.1999.1080p.Alt.Release.mkv", content="yy")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid1 = svc.process_package("pkg1", save_to1)[0]
+        jid2 = svc.process_package("pkg2", save_to2)[0]
+        assert svc.apply(jid1)["ok"] is True
+        svc.apply(jid2)  # -> needs_review + conflict signal
+
+        before = sorted(_all_files(lib))
+
+        real_update = db.update_rename_job
+
+        def _fail_new_filename(job_id, **kw):
+            if "new_filename" in kw:
+                return False          # the exact write the bug ignored
+            return real_update(job_id, **kw)
+
+        db.update_rename_job = _fail_new_filename
+        try:
+            out = svc.apply(jid2, conflict_strategy="keep_both")
+        finally:
+            db.update_rename_job = real_update
+
+        assert out["ok"] is False
+        # the library is byte-for-byte unchanged: nothing placed, nothing lost
+        assert sorted(_all_files(lib)) == before
+        assert db.get_rename_job(jid2)["status"] == "needs_review"
 
     def test_samefile_reapply_clears_conflict_signal(self, db, tmp_path):
         """Re-applying a job whose source is already hardlinked at dst is a
@@ -2957,3 +3011,129 @@ class TestDetectMovedSourceFiles:
         assert result["checked"] >= 1  # job_bad (empty path) still got processed
         job_good_row = db.get_rename_job(job_good)
         assert job_good_row["status"] == "needs_review"  # untouched by the raise, not crashed
+
+
+class TestPauseGatesTheManualApplyPath:
+    """Nothing used to gate the manual path: `auto_rename_enabled` covers
+    only the JDownloader post-extract hook, so with renaming nominally
+    "paused" a Process-then-Apply click still performed a real,
+    source-consuming move on real storage -- and fileops' move->hardlink
+    downgrade never softened it, because that fires only for UNATTENDED
+    applies and confirmation is required.
+
+    `rename_manual_apply_enabled` is a SEPARATE switch on purpose: gating on
+    auto_rename_enabled would mean renaming one file by hand also re-arms the
+    automatic pipeline, the wrong trade during a safety review.
+
+    Applying is the single irreversible step in this feature, and all three
+    apply routes (single, bulk, apply-all-confident) funnel through
+    queue_apply, so gating it there covers every one. undo() and
+    resolve_keep_plex() are deliberately NOT gated: undo is a recovery
+    action you may well need while paused, and keep-plex only moves the
+    DOWNLOAD to recoverable trash without touching the library.
+    """
+
+    def test_apply_refuses_and_moves_nothing_while_paused(self, db, tmp_path):
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+
+        svc._reg.config["rename_manual_apply_enabled"] = False  # the freeze switch
+        out = svc.queue_apply([jid])
+
+        assert out["ok"] is False
+        assert out.get("paused") is True
+        # the message must name the setting to change, not just say "no"
+        assert "allow manual renames" in out["error"].lower()
+        assert os.path.exists(src)                        # source untouched
+        assert not os.path.isdir(lib) or _all_files(lib) == []  # nothing placed
+        assert db.get_rename_job(jid)["status"] != "applied"
+
+    def test_apply_works_again_once_unpaused(self, db, tmp_path):
+        # Negative control: the gate must not be a one-way door.
+        save_to, _src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+
+        svc._reg.config["rename_manual_apply_enabled"] = False
+        assert svc.queue_apply([jid])["ok"] is False
+        svc._reg.config["rename_manual_apply_enabled"] = True
+        out = svc.queue_apply([jid])
+
+        assert out["ok"] is True
+        assert out["queued"] == 1
+
+    def test_the_two_switches_are_independent(self, db, tmp_path):
+        """The whole point of the separate setting: automation off must NOT
+        block a deliberate manual apply, and vice versa."""
+        save_to, _src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+
+        svc._reg.config["auto_rename_enabled"] = False        # automation off
+        svc._reg.config["rename_manual_apply_enabled"] = True  # manual allowed
+
+        assert svc.queue_apply([jid])["ok"] is True
+
+    def test_direct_apply_is_gated_too_not_just_the_queue(self, db, tmp_path):
+        """Peer review caught the placement: the gate was in queue_apply(),
+        one layer ABOVE the operation with the side effect. apply() is
+        callable directly, so the authoritative check belongs there."""
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+
+        svc._reg.config["rename_manual_apply_enabled"] = False
+        out = svc.apply(jid)
+
+        assert out["ok"] is False and out.get("paused") is True
+        assert os.path.exists(src)
+        assert not os.path.isdir(lib) or _all_files(lib) == []
+
+    def test_the_unattended_process_package_path_is_gated(self, db, tmp_path):
+        """The real bypass: process_package() calls apply(automatic=True)
+        itself when a job matches and confirmation is off -- never touching
+        queue_apply. That is the UNATTENDED case, so a pause that missed it
+        would be false exactly where it matters most."""
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_require_confirmation=False,
+                       rename_manual_apply_enabled=False)
+
+        ids = svc.process_package("pkg", save_to)
+
+        assert ids                      # the job is still created...
+        assert os.path.exists(src)      # ...but nothing was placed
+        assert not os.path.isdir(lib) or _all_files(lib) == []
+        assert db.get_rename_job(ids[0])["status"] != "applied"
+
+    def test_the_unattended_path_still_applies_when_allowed(self, db, tmp_path):
+        """Negative control for the test above: with the switch on, the
+        confirmation-off auto-apply behaves exactly as before."""
+        save_to, _src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib,
+                       auto_rename_require_confirmation=False,
+                       rename_manual_apply_enabled=True)
+
+        ids = svc.process_package("pkg", save_to)
+
+        assert db.get_rename_job(ids[0])["status"] == "applied"
+
+    def test_undo_is_not_gated_by_the_pause(self, db, tmp_path):
+        # Recovery must stay reachable while paused.
+        save_to, _src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib)
+        jid = svc.process_package("pkg", save_to)[0]
+        assert svc.apply(jid)["ok"] is True
+
+        svc._reg.config["rename_manual_apply_enabled"] = False
+        out = svc.undo(jid)
+
+        assert out["ok"] is True

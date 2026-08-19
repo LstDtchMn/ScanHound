@@ -2,10 +2,10 @@
 import logging
 import os
 import threading
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.public_errors import capture_public_exception
@@ -14,7 +14,8 @@ from backend.api.ws import ws_manager
 from backend.rename import dv_detect, dv_labeler, fileops, llm_identify
 from backend.rename.conflict_analyzer import analyze_job_conflict, has_active_duplicate
 from backend.rename.conflicts import conflict_annotations, find_library_duplicate
-from backend.rename.dv_import import import_dv_host_db
+from backend.rename.dv_import import (
+    DvHostReadError, import_dv_host_db, import_dv_rows)
 
 
 def _poster_url(poster_path):
@@ -109,8 +110,71 @@ class DvImportRequest(BaseModel):
     host_db_path: Optional[str] = None
 
 
+class DvHostRow(BaseModel):
+    path: str
+    dv_layer: Optional[str] = None
+    sig_mtime: Optional[float] = None
+    sig_size: Optional[int] = None
+    title: Optional[str] = None
+
+    @field_validator("path")
+    @classmethod
+    def _path_not_blank(cls, v: str) -> str:
+        # A blank/whitespace path is not an importable row. Reject at the request
+        # boundary (422) so the server's success invariant — every accepted row is
+        # processed exactly once — holds without a skipped-row fudge (re-review F2).
+        if not (v or "").strip():
+            raise ValueError("path must not be blank")
+        return v
+
+
+#: The only row schema this container understands. The detector's
+#: DV_ROWS_SCHEMA_VERSION must match; a bump on either side without the other is
+#: rejected at the request boundary rather than silently mis-parsed.
+DV_ROWS_SCHEMA_VERSION = 1
+
+
+class DvHostRowsRequest(BaseModel):
+    """The detector POSTs its dv_host rows here. `source_rows` is the count the
+    detector believes it sent; the server rejects a mismatch so a truncated or
+    duplicated body cannot pass as success."""
+    rows: List[DvHostRow]
+    source_rows: int
+    #: Forward-compat: the producer's row schema version. Bump on a shape change.
+    schema_version: int = 1
+
+    @field_validator("schema_version")
+    @classmethod
+    def _schema_supported(cls, v: int) -> int:
+        # Reject an unrecognised producer version at the boundary (422) so a
+        # future shape change can never be half-applied (re-review cleanup).
+        if v != DV_ROWS_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported schema_version {v}; expected {DV_ROWS_SCHEMA_VERSION}")
+        return v
+
+
 class DvSyncRequest(BaseModel):
     dry_run: bool = False
+    #: Default TRUE, which INVERTS the previous behaviour of this endpoint.
+    #:
+    #: sync_labels' own default is additive_only=False, and this endpoint used
+    #: to accept it by omission — so pressing the manual button ran a full
+    #: reconciliation over every movie in the configured Plex libraries, and
+    #: reconcile_movie grants removal on an unmatched title (`may_remove =
+    #: authoritative or not additive_only`). A title whose row had not yet been
+    #: imported was therefore not merely skipped: its managed DV label was
+    #: REMOVED, and Kometa's overlays key off those labels.
+    #:
+    #: Measured 2026-08-10 against the live library: 444 titles carry a managed
+    #: DV label and all 444 currently match an authoritative dv_scan row, so
+    #: today's exposure is zero. But that is arithmetic that happens to hold,
+    #: not a property anything enforces — it survives only while labels and
+    #: scan rows stay in step, and the whole point of the import backlog work
+    #: is that they had already drifted for two weeks.
+    #:
+    #: Destructive reconciliation is still reachable, by asking for it.
+    additive_only: bool = True
 
 
 class BulkIdsRequest(BaseModel):
@@ -686,9 +750,60 @@ _DEFAULT_DV_HOST_DB = os.environ.get(
     "SCANHOUND_DV_HOST_DB", "/data/dv_host.db")
 
 
+@router.post("/dv-host-rows")
+def dv_host_rows(
+    req: DvHostRowsRequest, reg: ServiceRegistry = Depends(get_registry)
+):
+    """Ingest DV rows POSTed by the host detector — the durable transport.
+
+    The container never reads the host file, so there is no cross-OS SQLite /
+    WAL / bind-mount handoff to get wrong. The response is mechanically
+    checkable: the detector accepts it only when ``ok`` is true, ``processed``
+    equals ``source_rows``, and ``failed`` is zero (round-4 review). Any
+    shortfall is a NON-2xx so it can never read as success.
+    """
+    if reg.db is None:
+        raise HTTPException(status_code=503, detail="DB not initialized")
+    rows = [r.model_dump() for r in req.rows]
+    if req.source_rows != len(rows):
+        # A truncated or duplicated body. Refuse rather than import a partial set.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "error": "source_rows_mismatch",
+                "source_rows": req.source_rows,
+                "received_rows": len(rows),
+            },
+        )
+    return _import_response(import_dv_rows(reg.db, rows))
+
+
+def _import_response(result: dict) -> dict:
+    """Validate an import_dv_rows result into a response body, or raise 500.
+
+    ONE invariant, shared by both endpoints (re-review F2/F3): every source row
+    must be processed exactly once with zero failures. `processed == source_rows`
+    (not `processed + skipped`) — blank-path rows are rejected at validation, so a
+    processed shortfall now means a real failure, and a partial or failed import
+    can never read as an HTTP-200 success.
+    """
+    ok = result["failed"] == 0 and result["processed"] == result["source_rows"]
+    body = {"ok": ok, **result}
+    if not ok:
+        raise HTTPException(status_code=500, detail=body)
+    return body
+
+
 @router.post("/dv-import")
 def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)):
-    """Ingest the host detector's dv_host.db into dv_scan (source='scan')."""
+    """Ingest the host detector's dv_host.db into dv_scan (source='scan').
+
+    LEGACY file path (superseded by /dv-host-rows). Retained for compatibility,
+    but a read/open failure is now a 503 rather than a silent zero-row success —
+    an unreadable host DB and a successfully-read empty one are different states
+    (round-4 finding 2).
+    """
     if reg.db is None:
         raise HTTPException(status_code=503, detail="DB not initialized")
     path = (req.host_db_path or _DEFAULT_DV_HOST_DB)
@@ -697,7 +812,59 @@ def dv_import(req: DvImportRequest, reg: ServiceRegistry = Depends(get_registry)
     # the host detector is ever configured to drop dv_host.db. Rejects an
     # explicit host_db_path pointed anywhere else (`..` escape, another mount).
     path = _require_within_roots(path, [_dv_host_db_root()], "host_db_path")
-    return import_dv_host_db(reg.db, path)
+    try:
+        result = import_dv_host_db(reg.db, path)
+    except DvHostReadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    # Same validator as /dv-host-rows: a partial destination upsert is a 500, not
+    # a silent 200 (re-review F3).
+    return _import_response(result)
+
+
+def wire_safe_sync_result(result):
+    """A copy of the sync summary that is safe to put on the WebSocket.
+
+    ``layer_conflict_paths`` is unbounded in principle — capped only by the
+    number of colliding keys — and the completion event goes to every connected
+    client on every manual sync, dry runs included. The EXACT set is wanted
+    server-side, because the unattended alert dedups on it, so it stays in the
+    returned summary and is trimmed here instead: at the boundary that actually
+    transmits it (peer review round 2, L1).
+
+    ``layer_conflicts`` remains the exact count either way, so a client can
+    always tell how many there are even when it only receives a sample.
+    """
+    if not isinstance(result, dict):
+        return result
+    paths = result.get("layer_conflict_paths")
+    if not isinstance(paths, list):
+        return result
+    trimmed = dict(result)
+    trimmed["layer_conflict_paths"] = paths[:dv_labeler.CONFLICT_SAMPLE]
+    trimmed["layer_conflict_paths_truncated"] = (
+        len(paths) > dv_labeler.CONFLICT_SAMPLE)
+    return trimmed
+
+
+def dv_sync_summary_body(result, dry_run):
+    """The one-line summary the manual DV sync reports when it finishes.
+
+    Module-level and pure so it can be tested without driving the route's
+    background thread — the counts are the only thing worth asserting and a
+    threaded end-to-end test for a display string would be flaky for no gain.
+
+    Mentions conflicts because this summary is the ONLY place a manual run
+    reports them. A file whose two scan rows claim different DV layers is left
+    strictly alone, so it moves none of matched/added/removed: without this,
+    a sync that skipped titles is indistinguishable from one that had nothing
+    to do. The scheduled sync has its own alert; a manual run has only this.
+    """
+    conflicts = result.get("layer_conflicts", 0)
+    return (f"{result['matched']} matched, {result['added']} added, "
+            f"{result['removed']} removed"
+            + (f", {conflicts} file(s) skipped — contradicting scan records"
+               if conflicts else "")
+            + (" (dry run)" if dry_run else ""))
 
 
 @router.post("/dv-sync-labels")
@@ -705,6 +872,7 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
     """Reconcile managed DV labels on every movie against dv_scan (source='scan').
     Runs in the background; streams dv:sync_progress and ALWAYS emits dv:sync_done."""
     dry_run = bool(req.dry_run)
+    additive_only = bool(req.additive_only)
     if reg.db is None:
         raise HTTPException(status_code=503, detail="DB not initialized")
     plex_manager = getattr(reg._plex_service, "plex_manager", None) if reg._plex_service else None
@@ -719,13 +887,13 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
                     "done": done, "total": total}})
             result = dv_labeler.sync_labels(
                 reg.db, plex_manager, reg.config,
-                dry_run=dry_run, progress_cb=_progress)
+                dry_run=dry_run, progress_cb=_progress,
+                additive_only=additive_only)
             ws_manager.broadcast_sync({"type": "notification", "data": {
                 "title": "Dolby Vision label sync",
-                "body": (f"{result['matched']} matched, "
-                         f"{result['added']} added, {result['removed']} removed"
-                         f"{' (dry run)' if dry_run else ''}"),
-                "priority": "normal"}})
+                "body": dv_sync_summary_body(result, dry_run),
+                "priority": ("high" if result.get("layer_conflicts")
+                             else "normal")}})
         except Exception as e:
             public = capture_public_exception(
                 logger, e, code="dv_label_sync_failed",
@@ -737,7 +905,8 @@ def dv_sync_labels(req: DvSyncRequest, reg: ServiceRegistry = Depends(get_regist
                                            title="Dolby Vision label sync failed")})
             result = {"error": public.message, **public.as_detail()}
         finally:
-            ws_manager.broadcast_sync({"type": "dv:sync_done", "data": result})
+            ws_manager.broadcast_sync({"type": "dv:sync_done",
+                                       "data": wire_safe_sync_result(result)})
 
     threading.Thread(target=_run, name="dv-sync-labels", daemon=True).start()
     return {"status": "started", "dry_run": dry_run}
@@ -753,14 +922,45 @@ def search_tmdb(query: str = "", media_type: str = "movie",
     return {"results": results}
 
 
+@router.get("/dv-conflicts")
+def dv_conflicts(reg: ServiceRegistry = Depends(get_registry)):
+    """Files whose scan rows contradict each other — CURRENT state, derived.
+
+    Narrow on purpose. The frontend refreshes attention state on mount, on
+    WebSocket reconnect, and when the DV panel is opened; making that hit
+    /dv-scans would drag the 500-row inventory along every time. Reads two
+    columns and recomputes, so there is no cached value to invalidate — the
+    conflict set is a pure function of the rows and should stay that way.
+    """
+    if reg.db is None:
+        return {"count": 0, "sample": [], "truncated": False}
+    return dv_labeler.current_conflicts(reg.db.get_dv_layer_rows(source="scan"))
+
+
 @router.get("/dv-scans")
 def dv_scans(layer: Optional[str] = None, limit: int = 500,
              reg: ServiceRegistry = Depends(get_registry)):
-    """The Dolby Vision inventory: scanned files + per-layer counts."""
+    """The Dolby Vision inventory: scanned files, per-layer counts, conflicts.
+
+    ``conflicts`` is CURRENT STATE, recomputed from the rows on every call, not
+    a record of whether anyone was ever told. The unattended conflict alert
+    broadcasts to whoever is connected at that instant and raises nothing if
+    that is nobody, so a conflict that appeared while no client was open would
+    be marked "seen" and never re-announced. Deriving it here means an
+    unresolved conflict is discoverable whenever someone next opens the panel,
+    regardless of what happened to the notification (peer review round 2, M1).
+    """
     if reg.db is None:
-        return {"scans": [], "counts": {}}
+        return {"scans": [], "counts": {}, "conflicts": {"count": 0, "sample": [],
+                                                         "truncated": False}}
     limit = max(1, min(int(limit), 2000))  # clamp: never let a client OOM the box
+    # Separate, NARROW read: the conflict set is a property of ALL scan rows, so
+    # the paged `scans` above cannot answer it — but it only needs two columns,
+    # not the seven the inventory returns. Same computation as /dv-conflicts,
+    # which the frontend uses for cheap refreshes.
     return {
         "scans": reg.db.get_dv_scans(dv_layer=layer, limit=limit, source="scan"),
         "counts": reg.db.count_dv_scans_by_layer(source="scan"),
+        "conflicts": dv_labeler.current_conflicts(
+            reg.db.get_dv_layer_rows(source="scan")),
     }

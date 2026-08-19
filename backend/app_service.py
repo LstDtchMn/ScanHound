@@ -394,6 +394,11 @@ class AppService:
         self._scheduler_thread: Optional[threading.Thread] = None
         self._scheduler_stop = threading.Event()
         self._scan_trigger: Optional[Callable] = None
+        #: When the scheduler last FIRED, in memory only. The interval gate
+        #: below reads the later of this and config['last_scan_time'] so a
+        #: past-due interval cannot re-fire every 60s on a build where
+        #: nothing stamps last_scan_time at completion.
+        self._last_scheduler_fire: float = 0.0
         self._config_lock = threading.RLock()
 
         # Maintenance loop — trash retention sweep + periodic WAL checkpoint.
@@ -692,23 +697,210 @@ class AppService:
                     self._last_dv_scan_at = latest  # baseline only
                 elif latest and (self._last_dv_scan_at is None
                                  or latest > self._last_dv_scan_at):
-                    self._last_dv_scan_at = latest
+                    # THE WATERMARK IS ADVANCED ONLY AFTER sync_labels() RETURNS.
+                    #
+                    # It used to be assigned here, before the sync was even
+                    # attempted, which silently consumed the scan generation on
+                    # BOTH failure paths below:
+                    #
+                    #  1. pm is None -- Plex not initialized yet. Entirely
+                    #     plausible when the maintenance pass runs shortly after
+                    #     a container start. The old code logged "skipping this
+                    #     pass" having ALREADY moved the watermark, so those
+                    #     labels were never applied until some LATER scan
+                    #     advanced it again.
+                    #  2. sync_labels() raising -- caught by the outer handler,
+                    #     which logs "non-fatal" and returns. Same outcome.
+                    #
+                    # In both cases the DV data was correct, the labels simply
+                    # never reached Plex, and nothing retried. Leaving the
+                    # watermark where it is makes the next pass see the same
+                    # pending work, so a transient failure self-heals.
                     from backend.api.dependencies import registry
                     from backend.rename import dv_labeler
                     plex_service = getattr(registry, "_plex_service", None)
                     pm = getattr(plex_service, "plex_manager", None) if plex_service else None
                     if pm is None:
                         logger.info("DV auto-sync: new DV data but Plex not "
-                                    "initialized — skipping this pass")
+                                    "initialized — watermark NOT advanced, "
+                                    "will retry next pass")
                     else:
                         result = dv_labeler.sync_labels(
                             self.db, pm, self.config, additive_only=True)
+                        # Success only. A raise here skips this assignment and
+                        # the outer handler logs it, leaving the work pending.
+                        self._last_dv_scan_at = latest
                         logger.info(
                             "DV auto-sync: %d matched, %d label(s) added "
-                            "(additive-only)",
-                            result.get("matched", 0), result.get("added", 0))
+                            "(additive-only), %d file(s) with contradicting "
+                            "scan records",
+                            result.get("matched", 0), result.get("added", 0),
+                            result.get("layer_conflicts", 0))
+                        self._alert_dv_layer_conflicts(result)
         except Exception:
             logger.exception("DV auto label sync failed (non-fatal)")
+
+        # ── Version-count badges ──────────────────────────────────────────
+        # Same shape as the DV sync above, and deliberately so: the failure it
+        # is built to avoid is the one that block's comment documents at
+        # length -- advancing a watermark before the work succeeded, which
+        # silently consumes a generation and leaves the labels unapplied until
+        # something unrelated moves it again.
+        #
+        # TRIGGER: plex_cache.last_updated. The counts are derived from that
+        # cache, so a rewrite is exactly when a title's file count can change.
+        # A separate watermark from the DV one because they move independently:
+        # a DV scan does not change how many files a movie has, and a Plex
+        # refresh does not change what layer they are.
+        try:
+            if self.db is not None and self.config.get("plex_enabled", True):
+                # NO BASELINE-ONLY FIRST PASS, unlike the DV block above. That
+                # pattern exists there so restarting never kicks off a full
+                # relabel; here it would mean the badges stay at zero until the
+                # Plex cache happens to be rewritten -- which is the exact
+                # "built but unreachable" failure this wiring exists to fix, just
+                # moved one step later (peer review 2026-08-19, M1).
+                #
+                # The existing cache generation IS pending work on first pass.
+                # Re-running it on restart is cheap and safe: reconciliation only
+                # writes where a label differs, so a repeat pass over an
+                # already-badged library issues reads and almost no writes.
+                if not hasattr(self, "_last_version_cache_at"):
+                    self._last_version_cache_at = None
+                latest = self.db.get_latest_plex_cache_at(content_type="Movies")
+                if latest and (self._last_version_cache_at is None
+                               or latest > self._last_version_cache_at):
+                    from backend.api.dependencies import registry
+                    from backend.rename import version_labeler
+                    plex_service = getattr(registry, "_plex_service", None)
+                    pm = getattr(plex_service, "plex_manager", None) if plex_service else None
+                    if pm is None:
+                        logger.info("Version-badge sync: cache refreshed but Plex "
+                                    "not initialized — watermark NOT advanced, "
+                                    "will retry next pass")
+                    else:
+                        result = version_labeler.sync_version_labels(
+                            self.db, pm, self.config)
+                        # COMPLETE, not merely returned. The sync catches every
+                        # failure so one bad title cannot abandon the rest, which
+                        # means a normal return is compatible with a library that
+                        # would not enumerate or a hundred label writes Plex
+                        # rejected. Advancing on that marks the generation
+                        # reconciled and never retries it (peer review M2).
+                        if result.get("complete"):
+                            self._last_version_cache_at = latest
+                        else:
+                            logger.warning(
+                                "Version-badge sync INCOMPLETE — watermark NOT "
+                                "advanced, will retry next pass "
+                                "(%d cache, %d library, %d title, %d write "
+                                "failure(s))",
+                                result.get("cache_failures", 0),
+                                result.get("lib_failures", 0),
+                                result.get("title_failures", 0),
+                                result.get("write_failures", 0))
+                        logger.info(
+                            "Version-badge sync: %d title(s) seen, %d label "
+                            "add(s) and %d removal(s) ATTEMPTED (%d write "
+                            "failure(s)), %d multi-version, %d uncached",
+                            result.get("total", 0),
+                            result.get("added_attempted", 0),
+                            result.get("removed_attempted", 0),
+                            result.get("write_failures", 0),
+                            result.get("multi_version", 0),
+                            result.get("unknown", 0))
+        except Exception:
+            logger.exception("Version-badge sync failed (non-fatal)")
+
+    def _alert_dv_layer_conflicts(self, result):
+        """Alert ONCE per distinct set of self-contradicting DV files.
+
+        A file whose two dv_scan rows claim different layers is deliberately
+        left alone by the labeler -- no badge added, none removed -- so nothing
+        about it is visible in the ordinary counts.
+
+        This is the CHANGE notification, not the record. The authoritative
+        answer is dv_labeler.current_conflicts(), recomputed from the rows by
+        GET /rename/dv-conflicts whenever the UI asks. The split is deliberate:
+        this alert is best-effort by nature -- it reaches whoever is connected
+        at that instant, and the dedup below means it says a given thing once --
+        so it must never be the only way to find out. Deliver the change here;
+        let the state be re-read there.
+
+        Dedups on the SET of paths, not the count. A conflict does not
+        self-heal: the rows keep disagreeing until a rescan resolves them, so
+        an unconditional alert would fire every hour forever. A count-based
+        guard has the opposite failure -- it stays silent on precisely the pass
+        where one file resolves and a different one starts conflicting.
+
+        Goes out on TWO channels, and the in-app websocket is the one that
+        actually delivers today. Probing the live deployment rather than
+        assuming: every outbound channel is unconfigured —
+        `desktop_notifications` is on but plyer's Linux backend is disabled in
+        a headless container (no gdbus/notify-send), and Discord, Slack,
+        Pushover and the generic webhook are all unset — so the channel list is
+        empty and any notifier send is a no-op. An alert that reaches nobody
+        while reading as coverage is worse than no alert.
+
+        So the websocket carries it: the same path the unmapped-Plex-path check
+        above uses, which needs no configuration and surfaces in the ScanHound
+        UI. The bridge send is the forward-looking half, so that configuring a
+        webhook later starts carrying this with no code change.
+
+        Never lets a notification failure reach the caller, on either channel.
+        The label work has already succeeded by this point; a dead channel must
+        not undo it or stop the watermark advancing (the
+        logging-as-hard-dependency outage, 2026-08-12).
+        """
+        try:
+            paths = frozenset(result.get("layer_conflict_paths") or ())
+            previous = getattr(self, "_dv_conflict_paths", None)
+            if paths == previous:
+                return
+            self._dv_conflict_paths = paths
+            if not paths:
+                if previous:
+                    logger.info("DV auto-sync: all contradicting scan records "
+                                "have resolved")
+                return
+            sample = sorted(paths)[:5]
+            body = (f"{len(paths)} file(s) have two scan records claiming "
+                    f"different Dolby Vision layers. Those titles are left "
+                    f"untouched — no badge added or removed — until the "
+                    f"records agree. First {len(sample)}: "
+                    + "; ".join(sample))
+            logger.warning("DV auto-sync: %s", body)
+
+            try:
+                from backend.api.ws import ws_manager
+                ws_manager.broadcast_sync({"type": "notification", "data": {
+                    "title": "Dolby Vision: contradicting scan records",
+                    "body": body, "priority": "high"}})
+            except Exception:
+                logger.exception("DV conflict alert: websocket broadcast failed")
+
+            # The registry's NotificationBridge, NOT self.notification_manager.
+            # This service's own NotificationManager is constructed bare and
+            # nothing ever calls configure_from_dict on it, so its channel list
+            # is permanently empty and sending through it could never deliver
+            # no matter what anyone configured. The bridge is the instance that
+            # IS configured from config (NotificationBridge.configure), so a
+            # webhook added later starts carrying this alert with no code
+            # change. Verified rather than assumed: the live manager reported
+            # zero channels.
+            try:
+                from backend.api.dependencies import registry
+                bridge = getattr(registry, "notifications", None)
+                if bridge is not None:
+                    bridge.send(
+                        "error",
+                        "Dolby Vision: contradicting scan records",
+                        body,
+                        {"count": len(paths), "paths": sorted(paths)[:50]})
+            except Exception:
+                logger.exception("DV conflict alert: notifier failed")
+        except Exception:
+            logger.exception("DV conflict alert failed (non-fatal)")
 
     def _start_maintenance_loop(self, interval_seconds: float = 3600.0):
         """Start the hourly trash-sweep + WAL-checkpoint background thread."""
@@ -749,7 +941,8 @@ class AppService:
                 interval_seconds = interval_hours * 3600
                 only_when_idle = self.config.get("scheduler_only_when_idle", False)
 
-                last = self.config.get("last_scan_time", 0)
+                last = max(self.config.get("last_scan_time", 0) or 0,
+                           self._last_scheduler_fire)
                 now = time.time()
                 if now - last < interval_seconds:
                     continue
@@ -760,11 +953,26 @@ class AppService:
                     if idle_secs < idle_threshold:
                         continue
 
-                with self._config_lock:
-                    self.config["last_scan_time"] = now
-                    self.save_config()
+                # Stamp the IN-MEMORY fire time unconditionally -- that is
+                # what stops a past-due interval re-firing every 60s -- but
+                # only write last_scan_time when a scan was really handed
+                # off. Stamping it here regardless was a lie: nothing under
+                # backend/ registers a scan trigger (set_scan_trigger's only
+                # caller is the legacy desktop controller), so on the server
+                # the scheduler recorded "a scan ran" for a scan that never
+                # started. routes/scanner.py already stamps it at scan
+                # COMPLETION, which is the honest place.
+                #
+                # NOT simply deleting the stamp: on the desktop build, where
+                # a trigger IS registered, nothing stamps at completion, so
+                # deleting it outright makes the gate re-fire every loop --
+                # a scan storm. The in-memory clock covers both builds.
+                self._last_scheduler_fire = now
                 logger.info("Scheduled scan triggered")
                 if self._scan_trigger:
+                    with self._config_lock:
+                        self.config["last_scan_time"] = now
+                        self.save_config()
                     try:
                         self._scan_trigger()
                     except Exception as e:

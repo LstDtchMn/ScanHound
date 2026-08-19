@@ -35,3 +35,14 @@ docs/
 *.spec
 build/
 dist/
+
+# Runtime state -- NEVER part of the image, and by far the biggest thing in
+# the repo (34 GB as of 2026-08-04). ./data is a runtime BIND MOUNT
+# (docker-compose.yml: `- ./data:/data`) and no COPY in the Dockerfile
+# references it, so shipping it to the daemon achieves nothing except a
+# 13-minute wait: a deploy on 2026-08-04 spent 798s of its 863s transferring
+# 13.68 GB of context before a single build step ran.
+data/
+
+# Agent/session scratch -- 125 MB, likewise never copied into the image.
+.claude/

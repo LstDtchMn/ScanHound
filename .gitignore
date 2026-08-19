@@ -71,3 +71,6 @@ backend/frontend/
 
 # Project-local Git worktrees
 .worktrees/
+
+# verify-deploy.py's local before/after snapshot -- machine-specific
+scripts/.deploy-state.json

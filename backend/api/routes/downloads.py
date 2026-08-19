@@ -16,7 +16,6 @@ from backend.download_queue import (
     DownloadQueueItemClaimed,
     DownloadQueueUnavailable,
 )
-from backend.download_service import _source_page_kind
 from backend.source_health import record_scrape_outcome
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 from backend.download_outcome import (
@@ -73,6 +72,10 @@ class RetryReadyRequest(BaseModel):
 
 class ResumeBatchRequest(BaseModel):
     interval_minutes: int = 10
+
+
+class ClearVerificationHoldRequest(BaseModel):
+    source: str = "hdencode"
 
 
 class ScrapeRequest(BaseModel):
@@ -250,7 +253,39 @@ def list_download_retries(
     if queue is None:
         raise HTTPException(status_code=503, detail="Download queue not available")
     items = queue.list_retries(limit=limit)
-    return {"items": items, "count": len(items), "status": queue.status()}
+    # Source-level holds travel BESIDE the items, not inferred from them. A hold
+    # is a property of the source, and deriving it from item state gets it wrong
+    # in both directions -- see active_verification_holds() for the specifics.
+    holds = queue.active_verification_holds()
+
+    # EACH ITEM CARRIES ITS OWN VERDICT. The UI must be able to show a held row
+    # under its source's card while leaving unrelated retries visible, and it
+    # must not re-derive "is this held?" from state and source in Svelte -- that
+    # would recreate the drift this surface exists to remove. One classification,
+    # computed once, by the layer that owns the policy.
+    held_by_uuid = {}
+    for h in holds:
+        for uuid_ in h.get("item_uuids") or []:
+            held_by_uuid[uuid_] = h["source"]
+    for item in items:
+        source = held_by_uuid.get(item.get("item_uuid"))
+        item["verification_held"] = source is not None
+        item["verification_hold_source"] = source
+
+    # HOW MANY OF THE HELD ROWS ARE ACTUALLY ON THIS PAGE.
+    #
+    # active_verification_holds() counts every effectively-held row for the
+    # source; list_retries() is capped by `limit`. Above the cap the card would
+    # promise "400 requests paused", the operator would expand it, and fewer
+    # would render -- a UI that overstates what it can show, which is the same
+    # class of defect as the timestamp that implied a retry would happen.
+    # Latent at today's 40; deterministic once the queue crosses the limit.
+    returned = {i.get("item_uuid") for i in items}
+    for h in holds:
+        h["shown"] = sum(1 for u in (h.get("item_uuids") or []) if u in returned)
+
+    return {"items": items, "count": len(items), "status": queue.status(),
+            "holds": holds}
 
 
 @router.post("/retries/retry-ready")
@@ -326,6 +361,23 @@ def resume_download_batch(
         raise HTTPException(status_code=409, detail=detail)
 
 
+@router.post("/verification-hold/clear")
+def clear_verification_hold(
+    req: ClearVerificationHoldRequest,
+    reg: ServiceRegistry = Depends(get_registry),
+):
+    """Operator escape hatch: abandon an open verification hold for a source.
+
+    Wired here because the fold's source branch had the service method but no
+    route, so an operator had no way to reach it. See
+    DownloadQueueService.clear_verification_hold.
+    """
+    queue = reg.download_queue
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Download queue not available")
+    return queue.clear_verification_hold(req.source)
+
+
 @router.delete("/batches/{batch_uuid}")
 def cancel_download_batch(
     batch_uuid: str,
@@ -367,7 +419,12 @@ def scrape_links(
         )
         raise HTTPException(status_code=502, detail=public.as_detail())
     diagnostic = getattr(links, "diagnostic", None)
-    if _source_page_kind(req.url) == "hdencode":
+    # OWNERSHIP VIA THE SERVICE, not a route-local classifier. This route used
+    # the module-level `_source_page_kind(url)` with its default host, so with a
+    # configured mirror the service treated the URL as HDEncode (coordinator,
+    # off switch) while this line did not -- the mirror's scrape health was never
+    # persisted as HDEncode, and a stale `hdencode.org` still was.
+    if dl.owns_source_health(req.url, "hdencode"):
         record_scrape_outcome(reg.db, "hdencode", links)
     if links and req.title and reg.db:
         try:
@@ -418,7 +475,8 @@ def copy_links_batch(
             try:
                 links = dl.scrape_links(it.url, it.service_type)
                 diagnostic = getattr(links, "diagnostic", None)
-                if _source_page_kind(it.url) == "hdencode":
+                # Same config-aware ownership test as /download/scrape above.
+                if dl.owns_source_health(it.url, "hdencode"):
                     record_scrape_outcome(reg.db, "hdencode", links)
             except Exception as exc:
                 logger.exception("Batch scrape failed for %s", it.url)
@@ -585,10 +643,28 @@ def jd_control(req: JdControlRequest, reg: ServiceRegistry = Depends(get_registr
 
 @router.get("/results")
 def download_results(limit: int = 200, reg: ServiceRegistry = Depends(get_registry)):
-    """Persisted per-item download + extraction outcomes (polled from JDownloader)."""
-    if reg.db:
-        return reg.db.get_download_results(limit=limit)
-    return []
+    """Persisted per-item download + extraction outcomes (polled from JDownloader).
+
+    Rows are annotated with `source_url` / `first_seen_at` and the SEMANTIC
+    IDENTITY (`identity_kind` / `identity_title` / `identity_year` /
+    `identity_season` / `identity_source`) where the package has RECORDED
+    PROVENANCE -- its file-host links match links ScanHound recorded submitting
+    (see download_links.annotate_source_links). All stay None/"unknown" for a
+    package we cannot prove we sent, so the UI renders no link rather than a
+    confident wrong one. Enrichment failure must never take down the live
+    download list, which is this view's actual job.
+
+    NOTHING CONSUMES THE IDENTITY FIELDS YET. They are carried so the Downloads
+    page can stop deciding whether two rows are the same release by parsing the
+    JDownloader package name -- a string that provably cannot answer it, since
+    one name in the live table is recorded against 13 distinct seasons. The
+    frontend half is a separate change; until it lands these keys are inert, and
+    this docstring should not be read as describing behaviour the UI has.
+    """
+    if not reg.db:
+        return []
+    from backend.download_links import annotate_source_links
+    return annotate_source_links(reg.db, reg.db.get_download_results(limit=limit))
 
 
 @router.delete("/results")
@@ -610,3 +686,26 @@ def remove_download_result(req: RemoveResultRequest, reg: ServiceRegistry = Depe
     if not dl:
         raise HTTPException(status_code=503, detail="Download service not available")
     return dl.remove_package(req.id)
+
+
+class RemoveResultsRequest(BaseModel):
+    ids: List[int]
+
+
+@router.post("/results/remove-many")
+def remove_download_results(req: RemoveResultsRequest,
+                            reg: ServiceRegistry = Depends(get_registry)):
+    """Remove MANY tracked download packages in ONE request.
+
+    Distinct from `DELETE /results`, which only empties our own table and tells
+    JDownloader nothing -- so the next poll re-inserts every package JD still
+    holds. This removes them from JD as well, which is the part that makes them
+    stay gone.
+
+    The caller sends the ids it means, so the client keeps ownership of what
+    "done" means; the server does not re-derive that policy.
+    """
+    dl = reg.download
+    if not dl:
+        raise HTTPException(status_code=503, detail="Download service not available")
+    return dl.remove_packages(req.ids)

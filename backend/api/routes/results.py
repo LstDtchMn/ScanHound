@@ -22,6 +22,15 @@ router = APIRouter(prefix="/results", tags=["results"])
 # Filter and sort helpers (Task 1: server-side filtering/sorting for pagination)
 _KNOWN_CATEGORIES = {"4k", "remux", "tv"}
 
+# The frontend's "every known category deselected" sentinel. An empty category
+# selection cannot be expressed by omitting the parameter -- omission means
+# "no category filter" (show everything) -- so buildResultParams (frontend
+# stores/results.ts) sends this value instead. Contract: hide every
+# _KNOWN_CATEGORIES item; items with an unknown/'search' effective category
+# keep their always-show behavior. Pinned by
+# tests/test_results_category_sentinel.py.
+CATEGORY_NONE_SENTINEL = "__none__"
+
 
 def _effective_category(item: Dict[str, Any]) -> str:
     """Effective facet category, in INTENTIONAL precedence order (round-11):
@@ -332,7 +341,10 @@ def _filter_and_sort(items, *, filter=None, search=None, category=None,
         result = [i for i in result if sl in str(i.get("title", "")).lower()]
 
     if category:
-        enabled = set(category)
+        # CATEGORY_NONE_SENTINEL contributes nothing to the enabled set, so
+        # ['__none__'] filters against the EMPTY set: all knowns hidden,
+        # unknowns still pass below.
+        enabled = set(category) - {CATEGORY_NONE_SENTINEL}
         result = [i for i in result
                   if _effective_category(i) not in _KNOWN_CATEGORIES
                   or _effective_category(i) in enabled]

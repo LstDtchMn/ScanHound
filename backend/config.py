@@ -97,6 +97,7 @@ class AppConfig(TypedDict, total=False):
     hdencode_browser_profile_dir: str
     download_batch_interval_minutes: int
     download_queue_auto_resume_after_cooldown: bool
+    download_queue_auto_resume_max_attempts: int
     download_queue_claim_lease_seconds: int
 
     # DDLBase / Cuty.io
@@ -139,6 +140,12 @@ class AppConfig(TypedDict, total=False):
 
     # Auto-rename (post-extraction) + Plex sort + optional Ollama assist
     auto_rename_enabled: bool
+    #: Whether the Renames page's Apply button may place files. Independent of
+    #: auto_rename_enabled ON PURPOSE: that switch arms the automatic
+    #: JDownloader hook, and pausing automation should not force you to give
+    #: up manual renaming (nor should re-enabling one silently re-arm the
+    #: other). Applying is the single irreversible step in this feature.
+    rename_manual_apply_enabled: bool
     auto_rename_confidence_threshold: int
     auto_rename_require_confirmation: bool
     auto_rename_move_method: str
@@ -472,6 +479,10 @@ _DEFAULT_CONFIG: AppConfig = {
     # Multi-title grabs are deliberately spaced by default. Set 0 for immediate.
     "download_batch_interval_minutes": 10,
     "download_queue_auto_resume_after_cooldown": False,
+    # Consecutive FRUITLESS automatic resumes a batch may make. Resumes that
+    # deliver something refund the budget, so this only limits repeated futile
+    # retries. 1 restores the old single-shot behaviour.
+    "download_queue_auto_resume_max_attempts": 3,
     # Fail-stop lease for the single durable queue worker. Tunable without code.
     "download_queue_claim_lease_seconds": 600,
     "ddlbase_enabled": True,
@@ -513,6 +524,11 @@ _DEFAULT_CONFIG: AppConfig = {
     "background_scan_retain_days": 7,
     "background_scan_last_run": 0,
     "auto_rename_enabled": False,
+    #: Default True: manual renaming has always worked out of the box and the
+    #: Apply button is behind an explicit user click plus (by default) a
+    #: confirmation. Set False to freeze the manual path -- e.g. during a
+    #: file-operation safety review -- without touching the automatic hook.
+    "rename_manual_apply_enabled": True,
     "auto_rename_confidence_threshold": 70,
     "auto_rename_require_confirmation": True,
     "auto_rename_move_method": "hardlink",

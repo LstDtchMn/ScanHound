@@ -3,15 +3,41 @@
   import { api } from '$lib/api/client';
   import { connection } from '$lib/stores/connection';
   import { addToast } from '$lib/stores/notifications';
-  import type { BrowserStatus, DownloadQueueItem } from '$lib/api/types';
+  import type { BrowserStatus, DownloadQueueItem, VerificationHold } from '$lib/api/types';
+  import { checkedAgo } from '$lib/components/pipeline/pipelineDisplay';
+
+  /** How long this item has been queued, e.g. "3d". '' when the timestamp is
+   *  missing or unparsable, so the row simply omits it rather than rendering
+   *  "NaNd". checkedAgo handles both timestamp shapes the API emits — sqlite's
+   *  naive UTC and Python's offset-carrying isoformat — which is why it is
+   *  reused here instead of a local Date.parse. */
+  function waitingFor(item: DownloadQueueItem): string {
+    return checkedAgo(item.created_at ?? '').replace(/ ago$/, '');
+  }
 
   let items = $state<DownloadQueueItem[]>([]);
+  let holds = $state<VerificationHold[]>([]);
+  /** Which source cards are expanded. A single global flag hid the ENTIRE
+   *  retry list whenever any hold existed -- unrelated ready retries and failed
+   *  items vanished by default, and expanding one card revealed all of them
+   *  rather than that card's rows. Keyed by source so two held sources behave
+   *  independently. */
+  let expanded = $state<Record<string, boolean>>({});
+  let releasing = $state('');
   let browser = $state<BrowserStatus | null>(null);
   let loading = $state(false);
   let busy = $state('');
   let intervalMinutes = $state(10);
   let timer: ReturnType<typeof setTimeout> | null = null;
   let alive = true;
+
+  /** Rows the backend classified as held, per source. Never re-derived from
+   *  state/source here: one classification, computed by the layer that owns the
+   *  policy. */
+  const heldFor = $derived((source: string) =>
+    items.filter((i) => i.verification_held && i.verification_hold_source === source));
+  /** Everything NOT behind a hold stays visible, always. */
+  const unheld = $derived(items.filter((i) => !i.verification_held));
 
   function localTime(value?: string | null): string {
     if (!value) return '';
@@ -21,7 +47,11 @@
 
   function stateLabel(state: string): string {
     return ({
-      verification_required: 'Verification required',
+      // Not "verification required" — that read as something the user could go
+      // and complete. The challenge runs inside ScanHound's own automated
+      // browser, which this UI has no way to interact with; retrying only
+      // probes whether the source still presents it.
+      verification_required: 'Manual attention required',
       waiting_source: 'Waiting for HDEncode',
       ready: 'Ready to retry',
       scheduled: 'Scheduled',
@@ -46,6 +76,7 @@
         api.browserStatus()
       ]);
       items = retryResponse.items;
+      holds = retryResponse.holds ?? [];
       browser = browserResponse;
     } catch {
       // Retain the last useful snapshot.
@@ -81,6 +112,29 @@
     if (timer) clearTimeout(timer);
   });
 
+  /** Release a hold, using the source the BACKEND reported.
+   *
+   *  Not a hardcoded 'hdencode': the hold marker names its own source, and
+   *  hardcoding one is why the earlier attempt at this could only ever clear a
+   *  single source. */
+  async function releaseHold(hold: VerificationHold) {
+    releasing = hold.source;
+    try {
+      const r = await api.clearVerificationHold(hold.source);
+      // Show what the backend says to do next rather than inventing our own
+      // wording -- it knows whether a trigger item is left to probe.
+      addToast(
+        'Hold released',
+        `${hold.affected} request(s) for ${hold.source} can be tried again. ${r.next_action ?? ''}`.trim()
+      );
+      await load();
+    } catch (e) {
+      addToast('Could not release', e instanceof Error ? e.message : 'Please try again.', 'error');
+    } finally {
+      releasing = '';
+    }
+  }
+
   async function retry(item: DownloadQueueItem) {
     busy = item.item_uuid;
     try {
@@ -98,7 +152,16 @@
     busy = 'all';
     try {
       const result = await api.retryReadyDownloads(intervalMinutes);
-      addToast('Retries scheduled', `${result.scheduled} item(s), ${intervalMinutes}-minute spacing`);
+      const held = (result as { held?: number }).held ?? 0;
+      const base = `${result.scheduled} item(s), ${intervalMinutes}-minute spacing`;
+      // Verification-held items are skipped by the backend on purpose: a bulk
+      // retry cannot probe a challenge for you. They need 'Retry now' one at a time.
+      addToast(
+        'Retries scheduled',
+        held > 0
+          ? `${base}. ${held} held for manual attention — use 'Retry now' one at a time.`
+          : base
+      );
       await load();
     } catch (e) {
       addToast('Retry unavailable', e instanceof Error ? e.message : 'The source is still paused.', 'warning');
@@ -126,6 +189,8 @@
       <h2 class="text-sm font-semibold">Verification Retries</h2>
       <p class="text-xs text-[var(--text-secondary)]">
         Challenged and source-deferred link grabs are retained across restarts.
+        When automated verification did not complete, retrying sends a single
+        probe — the verification itself cannot be completed inside ScanHound.
       </p>
     </div>
     {#if browser}
@@ -159,9 +224,90 @@
     </div>
   </div>
 
-  {#if items.length > 0}
+  {#each holds as hold (hold.source)}
+    <!-- ONE condition, not N stuck downloads. Held item cards deliberately
+         suppress their own "Retry after <time>" (see the item card below): the
+         timestamp is real but has no authority, because decide() returns
+         VERIFICATION_HOLD before it looks at any cooldown. This card states the
+         condition once instead of leaving forty rows to imply it will heal. -->
+    <div class="mx-4 mb-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
+      <div class="flex items-start gap-2 flex-wrap">
+        <span class="text-sm font-semibold text-amber-300">
+          {hold.source} — waiting for verification
+        </span>
+        <span class="text-[11px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-200">
+          {#if hold.affected > 0}
+            {hold.affected} request{hold.affected === 1 ? '' : 's'} paused
+          {:else}
+            nothing waiting on it
+          {/if}
+        </span>
+      </div>
+      <p class="mt-2 text-xs text-[var(--text-secondary)]">
+        {#if hold.affected > 0}
+          ScanHound met a verification challenge it cannot complete on its own, so
+          it stopped sending requests to {hold.source}.
+        {:else}
+          No current retry is blocked by this hold, but the marker on
+          {hold.source} is still armed. Releasing it stops the stale hold
+          blocking later recovery attempts.
+        {/if}
+        <strong class="text-amber-300">This will not clear on its own</strong> —
+        not when the retry times below run out. It clears when
+        {hold.clears_when}.
+      </p>
+      <div class="mt-3 flex gap-2 flex-wrap">
+        <button
+          class="px-2.5 py-1 rounded bg-[var(--accent)] text-white text-xs disabled:opacity-40"
+          disabled={releasing !== ''}
+          title="Stop holding these back and let them try {hold.source} again"
+          onclick={() => releaseHold(hold)}
+        >
+          {releasing === hold.source ? 'Releasing…' : 'Try again anyway'}
+        </button>
+        {#if hold.affected > 0}
+          <button class="px-2.5 py-1 rounded bg-[var(--bg-tertiary)] text-xs"
+                  onclick={() => (expanded = { ...expanded, [hold.source]: !expanded[hold.source] })}>
+            <!-- Promise only what can be rendered. `affected` counts every held
+                 row; the retries list is capped, so above the cap the two differ
+                 and the button must say so rather than expand to fewer. -->
+            {expanded[hold.source] ? 'Hide' : 'Show'}
+            {#if (hold.shown ?? hold.affected) < hold.affected}
+              {hold.shown} of the {hold.affected} paused
+            {:else}
+              the {hold.affected} paused
+            {/if}
+          </button>
+        {/if}
+      </div>
+    </div>
+  {/each}
+
+  <!-- Held rows expand UNDER their own source card, above. Unrelated retry work
+       is never hidden by a hold: the previous version's single flag made ready
+       retries and failed items disappear the moment any hold existed. -->
+  {#each holds as hold (hold.source + '-rows')}
+    {#if expanded[hold.source]}
+      <div class="px-4 pb-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+        {#each heldFor(hold.source) as item (item.item_uuid)}
+          {@render itemCard(item)}
+        {/each}
+      </div>
+    {/if}
+  {/each}
+
+  {#if unheld.length > 0}
     <div class="px-4 pb-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-      {#each items as item (item.item_uuid)}
+      {#each unheld as item (item.item_uuid)}
+        {@render itemCard(item)}
+      {/each}
+    </div>
+  {:else if holds.length === 0}
+    <p class="px-4 pb-3 text-xs text-[var(--text-secondary)]">No verification retries or scheduled link grabs.</p>
+  {/if}
+</section>
+
+{#snippet itemCard(item: DownloadQueueItem)}
         <article class="rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] p-3">
           <div class="flex items-start gap-2">
             <div class="min-w-0 flex-1">
@@ -169,15 +315,26 @@
               <div class="text-[11px] text-[var(--text-secondary)]">
                 {item.service_type} · attempt {item.attempt_count}
                 {#if item.transport_attempted === 0} · no page opened{/if}
+                {#if waitingFor(item)} · <span title={localTime(item.created_at)}>waiting {waitingFor(item)}</span>{/if}
               </div>
             </div>
+            {#if item.manual_recovery_required}
+              <span class="text-[10px] px-2 py-0.5 rounded text-red-300 bg-red-500/15 whitespace-nowrap"
+                    title="Automatic retry is switched off for this batch and its cooldown has passed, so nothing will promote it on its own.">Needs you</span>
+            {/if}
             <span class="text-[10px] px-2 py-0.5 rounded {stateClass(item.state)}">{stateLabel(item.state)}</span>
           </div>
 
           {#if item.last_message}
             <p class="mt-2 text-xs text-[var(--text-secondary)]">{item.last_message}</p>
           {/if}
-          {#if item.source_cooldown_until || item.cooldown_until}
+          {#if item.verification_held}
+            <!-- Do NOT show a retry time on a held row. That timestamp is real
+                 but irrelevant: the hold outranks every clock in decide(), and
+                 showing it is what made 40 rows look like they would fix
+                 themselves at 8:57 PM. -->
+            <p class="mt-1 text-[11px] text-amber-300">Waiting on verification — no retry time applies</p>
+          {:else if item.source_cooldown_until || item.cooldown_until}
             <p class="mt-1 text-[11px] text-amber-300">
               Retry after {localTime(item.source_cooldown_until || item.cooldown_until)}
             </p>
@@ -189,7 +346,9 @@
             <button
               class="px-2.5 py-1 rounded bg-[var(--accent)] text-white text-xs disabled:opacity-40"
               disabled={!item.retry_available || busy !== ''}
-              title={item.retry_available ? 'Retry this item' : 'HDEncode is still paused'}
+              title={item.retry_available
+                ? 'Send one probe retry for this item'
+                : 'HDEncode is still paused'}
               onclick={() => retry(item)}
             >
               {busy === item.item_uuid ? 'Working…' : 'Retry now'}
@@ -204,9 +363,4 @@
             </button>
           </div>
         </article>
-      {/each}
-    </div>
-  {:else}
-    <p class="px-4 pb-3 text-xs text-[var(--text-secondary)]">No verification retries or scheduled link grabs.</p>
-  {/if}
-</section>
+{/snippet}

@@ -21,6 +21,9 @@ def _reset_jobs():
 
 @pytest.fixture
 def client():
+    # Applying is gated on rename_manual_apply_enabled, which defaults True,
+    # so no override is needed here -- stated because the gate exists and a
+    # future default flip would otherwise break these tests silently.
     app = create_app(config_override={"plex_url": "", "plex_token": ""})
     with TestClient(app) as c:
         yield c
@@ -851,8 +854,14 @@ class TestPathConfinement:
         # data-dir path, which must always be in-allowlist by construction.
         import backend.api.routes.rename as rename_routes
         calls = []
-        monkeypatch.setattr(rename_routes, "import_dv_host_db",
-                            lambda db, path: calls.append(path) or {"ok": True})
+        # A confinement test, not an import-contract test: return a full,
+        # valid import result so the route's shared _import_response() validator
+        # (which requires processed == source_rows and failed == 0) is satisfied.
+        monkeypatch.setattr(
+            rename_routes, "import_dv_host_db",
+            lambda db, path: calls.append(path) or {
+                "source_rows": 0, "processed": 0, "imported": 0,
+                "updated": 0, "failed": 0})
         resp = client.post("/rename/dv-import", json={})
         assert resp.status_code == 200
         # The route normalizes the path (os.path.normpath) before passing it
@@ -871,8 +880,11 @@ class TestPathConfinement:
         db_path = str(data_dir / "dv_host.db")
         monkeypatch.setattr(rename_routes, "_DEFAULT_DV_HOST_DB", str(data_dir / "default.db"))
         calls = []
-        monkeypatch.setattr(rename_routes, "import_dv_host_db",
-                            lambda db, path: calls.append(path) or {"ok": True})
+        monkeypatch.setattr(
+            rename_routes, "import_dv_host_db",
+            lambda db, path: calls.append(path) or {
+                "source_rows": 0, "processed": 0, "imported": 0,
+                "updated": 0, "failed": 0})
         resp = client.post("/rename/dv-import", json={"host_db_path": db_path})
         assert resp.status_code == 200
         assert calls == [db_path]
@@ -967,3 +979,34 @@ class TestStartupCorruptionNotify:
         db_path, bridge = calls[0]
         assert db_path  # a real path was passed, not None
         assert bridge is not None  # the notification bridge, not a stub
+
+
+class TestStatCardsAgreeWithTheList:
+    """The cards above the rename list are labelled with these counts, so a
+    count that includes archived jobs while the list excludes them can never
+    be reconciled with the screen -- "Applied 89" opening a list of 78, and
+    the Archived card counting those same jobs again.
+    """
+
+    def test_counts_exclude_archived_like_the_list_does(self, client):
+        from backend.api.dependencies import registry
+        db = registry.db
+        active = _seed_job(status="applied", title="Active")
+        archived = _seed_job(status="applied", title="Archived")
+        db.update_rename_job(archived, archived_at="2026-08-01T00:00:00Z")
+
+        counts = client.get("/rename/status").json()["counts"]
+        listed = client.get("/rename/jobs").json()["jobs"]
+
+        applied_listed = len([j for j in listed if j["status"] == "applied"])
+        assert counts.get("applied", 0) == applied_listed, (
+            "the card count must equal what clicking it shows")
+
+    def test_archived_jobs_are_still_counted_separately(self, client):
+        from backend.api.dependencies import registry
+        db = registry.db
+        jid = _seed_job(status="applied", title="Archived")
+        db.update_rename_job(jid, archived_at="2026-08-01T00:00:00Z")
+
+        body = client.get("/rename/status").json()
+        assert body["archived"] >= 1  # not lost, just not double-counted

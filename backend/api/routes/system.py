@@ -16,13 +16,48 @@ TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w300"
 
 @router.get("/health")
 def health(reg: ServiceRegistry = Depends(get_registry)):
-    return {
+    """Liveness, plus the facts an external watchdog needs to spot a stall.
+
+    ``jd_poll`` is reported because a stalled JDownloader poller is otherwise
+    INVISIBLE: the downloads list simply stops changing, and on 2026-08-15 that
+    went unnoticed for ~15 hours. It is deliberately exposed on the unauthenticated
+    health route so the scheduled host-side checker can read it without holding a
+    credential — it contains no secrets, only "how long since JD last answered".
+
+    ``jd_enabled`` is included so a watcher can tell "JD is off, silence is
+    correct" from "JD is on and has gone quiet", which are the same absence of
+    data and opposite conclusions.
+    """
+    cfg = reg.config or {}
+    body = {
         "status": "ok",
         "version": __version__,
         "plex_connected": bool(
             reg.plex and getattr(reg.plex, "plex_movies", None)
         ),
+        "jd_enabled": bool(cfg.get("jd_enabled") and cfg.get("jd_method") == "api"),
     }
+    # Queue stall conditions, on the same unauthenticated health route and for
+    # the same reason as jd_poll: the scheduled host checker must be able to see
+    # a stalled queue without holding a credential. Three separate conditions,
+    # because one timer cannot tell "nothing was attempted" from "everything
+    # attempted failed" -- the ambiguity that made the 2026-08-13 incident
+    # unresolvable.
+    if reg.db is not None and hasattr(reg.db, "queue_stall_report"):
+        try:
+            body["queue"] = reg.db.queue_stall_report()
+        except Exception:  # noqa: BLE001
+            body["queue"] = None
+
+    health_fn = getattr(reg.download, "jd_poll_health", None) if reg.download else None
+    if callable(health_fn):
+        try:
+            body["jd_poll"] = health_fn()
+        except Exception:  # noqa: BLE001
+            # Health must never fail because a sub-report failed; an absent key
+            # is itself informative and the watcher treats it as unknown.
+            body["jd_poll"] = None
+    return body
 
 
 @router.get("/discover")

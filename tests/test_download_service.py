@@ -792,7 +792,21 @@ class TestScrapeLinksRouting:
 
 
 class TestScrapeLinksHDEncode:
-    """Test the default HDEncode scraping path."""
+    """Test the HDEncode scraping path.
+
+    THE URLS HERE WERE `hdencode.com`, WHICH IS NOT A REAL HOST -- production code
+    never mentions it. These tests reached the HDEncode scraper only through the
+    default-to-HDEncode fall-through that peer review round 7 required be removed,
+    so they were asserting HDEncode behaviour for a URL HDEncode does not own.
+
+    Two of the three did not even fail when the fall-through went away: they assert
+    `result == []`, and the new `unsupported_source` outcome is also empty, so they
+    passed for an entirely different reason than the one they were written for. Only
+    the third -- the one that asserts links are actually found -- broke, which is how
+    the wrong host was noticed at all.
+
+    Corrected to `hdencode.org`, the configured default.
+    """
 
     @patch("backend.download_service._ensure_selenium")
     @patch("backend.download_service._WebDriverWait")
@@ -823,7 +837,7 @@ class TestScrapeLinksHDEncode:
 
         from bs4 import BeautifulSoup as RealBS
         with patch("bs4.BeautifulSoup", side_effect=lambda html, parser: RealBS(html, parser)):
-            result = svc.scrape_links("http://hdencode.com/movie123", "Rapidgator")
+            result = svc.scrape_links("http://hdencode.org/movie123", "Rapidgator")
 
         assert len(result) == 2
         assert all("rapidgator" in link for link in result)
@@ -845,7 +859,7 @@ class TestScrapeLinksHDEncode:
         # CSS fallback also fails
         mock_driver.find_element.side_effect = Exception("not found")
 
-        result = svc.scrape_links("http://hdencode.com/movie123", "Rapidgator")
+        result = svc.scrape_links("http://hdencode.org/movie123", "Rapidgator")
         assert result == []
 
     @patch("backend.download_service._ensure_selenium")
@@ -859,7 +873,7 @@ class TestScrapeLinksHDEncode:
         mock_driver.title = "ok"
         mock_driver.get.side_effect = RuntimeError("nav fail")
 
-        result = svc.scrape_links("http://hdencode.com/movie123", "Rapidgator")
+        result = svc.scrape_links("http://hdencode.org/movie123", "Rapidgator")
         assert result == []
 
 
@@ -1841,6 +1855,11 @@ class TestPollResults:
         if db is None:
             db = MagicMock()
             db.get_scraped_link_titles.return_value = {}
+            # A stub package has no recorded link provenance, which is the
+            # realistic default. Without this the MagicMock returns a MagicMock,
+            # so rows would carry a mock object as their provenance_url and any
+            # exact-row assertion would compare against one.
+            db.resolve_release_by_links.return_value = None
         return _make_service(config={"jd_method": "api"}, db=db), db
 
     def test_jd_unreachable_returns_empty(self):
@@ -1855,11 +1874,97 @@ class TestPollResults:
         with patch.object(svc, "_connect_jd_device", return_value=device):
             results = svc.poll_results(record=False)
         assert results == [{
-            "id": None, "name": "Pkg.Queued", "title": "Pkg.Queued", "host": "",
+            "id": None, "provenance_url": None, "provenance_observed": True,
+            "name": "Pkg.Queued", "title": "Pkg.Queued", "host": "",
             "bytes_total": 1000, "bytes_loaded": 0, "downloaded": 0,
             "extraction": "na", "state": "queued", "error": None,
             "package_uuid": "1", "save_to": "",
         }]
+
+    def test_unobserved_then_ambiguous_retracts_through_the_cache_gate(self, tmp_path):
+        """END TO END through poll_results(record=True), on a real database.
+
+        The two DB-level tests prove the writer can retract, and the producer
+        tests prove observation is tracked. Neither proves the CACHE GATE lets a
+        retraction reach the writer -- and that gate is where it would silently
+        die: `change_key` short-circuits the write when nothing appears to have
+        changed, and UNOBSERVED and UNPROVEN both carry provenance_url=None.
+
+        Sequence (peer review follow-up 1):
+            1. links prove release A            -> persist A
+            2. link query FAILS                 -> None/False -> A preserved
+            3. link query succeeds, now ambiguous -> None/True -> A retracted
+        Nothing else about the package changes across 2 and 3, so only
+        provenance_observed distinguishes them. Drop it from change_key and step
+        3 is skipped as a no-op, leaving a stale link forever.
+        """
+        from backend.database import DatabaseManager
+        db = DatabaseManager(str(tmp_path / "e2e.db"))
+        A = "https://source.example/release-A"
+        B = "https://source.example/release-B"
+        L = "https://host.example/link-L"
+        db.record_submitted_links(A, [L])
+
+        svc, _ = self._svc(db=db)
+        pkg = {"name": "Pkg.E2E", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000,
+               "finished": False, "status": ""}
+        link = {"packageUUID": 1, "url": L, "host": "host.example", "name": "f.mkv",
+                "finished": False, "status": "", "extractionStatus": None,
+                "bytesTotal": 1000, "bytesLoaded": 0}
+
+        def stored():
+            rows = db._query_dicts(
+                "SELECT provenance_url FROM download_results WHERE name = ?", ("Pkg.E2E",))
+            return rows[0]["provenance_url"] if rows else "<no row>"
+
+        # 1. proven
+        with patch.object(svc, "_connect_jd_device",
+                          return_value=self._device(packages=[pkg], links=[link])):
+            svc.poll_results(record=True)
+        assert stored() == A, "step 1: the proof was never persisted"
+
+        # 2. the link query fails -> unobserved -> preserve
+        db.record_submitted_links(B, [L])          # evidence is now ambiguous
+        with patch.object(svc, "_connect_jd_device",
+                          return_value=self._device(packages=[pkg], links=[link],
+                                                    raise_on_links=True)):
+            svc.poll_results(record=True)
+        assert stored() == A, "step 2: an unobserved poll erased a valid proof"
+
+        # 3. the query succeeds and the answer is now ambiguous -> retract
+        with patch.object(svc, "_connect_jd_device",
+                          return_value=self._device(packages=[pkg], links=[link])):
+            svc.poll_results(record=True)
+        assert stored() is None, "step 3: the retraction never reached the database"
+
+    def test_a_failed_link_query_does_not_claim_to_have_observed_provenance(self):
+        """The producer half of the retraction fix.
+
+        A failed query_links yields links=[], which is byte-identical to a
+        package that genuinely has none. Only this flag separates them, and the
+        write uses it to decide whether a None may retract a stored proof. If it
+        were True here, one transient JDownloader hiccup would erase every
+        package's source link.
+        """
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.NoLinks", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000,
+               "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[], raise_on_links=True)
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["provenance_observed"] is False
+        assert results[0]["provenance_url"] is None
+
+    def test_a_successful_link_query_DOES_claim_observation(self):
+        """Positive control. Without it the assertion above would also pass if
+        the flag were hardcoded False and no retraction could ever happen."""
+        svc, _db = self._svc()
+        pkg = {"name": "Pkg.Links", "uuid": 1, "bytesLoaded": 0, "bytesTotal": 1000,
+               "finished": False, "status": ""}
+        device = self._device(packages=[pkg], links=[])
+        with patch.object(svc, "_connect_jd_device", return_value=device):
+            results = svc.poll_results(record=False)
+        assert results[0]["provenance_observed"] is True
 
     def test_downloading_state(self):
         svc, _db = self._svc()

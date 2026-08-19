@@ -273,6 +273,38 @@ class ScannerService:
         # True when the last crawl stopped early at cached content — the scanner
         # then never saw deeper pages, so it must NOT purge against this crawl.
         self._last_crawl_early_stopped: bool = False
+        # LISTING AUTHORITY, owned by the crawler. Peer review found that callers
+        # were inferring "the listing arm completed" from whether run_scan() threw,
+        # which is not the same thing: run_scan CATCHES its own exception and still
+        # returns list(self.items), _crawl_pages swallows per-page errors, and a
+        # non-200 page simply continues. So a broken crawl looked complete.
+        #
+        # Only "complete" may be treated as listing authority by a consumer.
+        #   complete        every requested page fetched, nothing stopped it early
+        #   early_stopped   coordinator stop / blocked / cached frontier reached
+        #   scan_error      an exception was caught rather than propagated
+        #   page_errors     one or more pages failed but the crawl carried on
+        #   empty_untrusted finished with zero posts, which is not trustworthy
+        #   not_run         no crawl has happened on this instance yet
+        self._last_crawl_status: str = "not_run"
+        self._last_crawl_page_errors: int = 0
+        # EXPLICIT TERMINATION REASON. Round 6 found the decisive counterexample to
+        # deriving this from scattered booleans: `if self.stop_scan_flag: break`
+        # appears twice in the page/source loops and sets NOTHING, so an external
+        # stop left a PARTIAL raw listing set stamped "complete" -- and a miss
+        # sitting on an unvisited page then read as feed-only, i.e. as acquired.
+        # That is the same wrong answer Thread A exists to remove, by another route.
+        #
+        # So every exit now says why it stopped, and only "complete" grants
+        # membership authority.
+        self._last_crawl_termination: str = "not_run"
+        # THE DETAIL PIPELINE, tracked separately from membership. Cached skips and
+        # policy exclusions never reach all_posts, so scheduled-minus-completed is
+        # ONLY genuine attribution failures -- unlike the earlier
+        # `listing_only - detail_urls`, which conflated all three and was therefore
+        # unusable as a blocking signal.
+        self._last_crawl_detail_scheduled: set = set()
+        self._last_crawl_detail_completed: set = set()
         #: Full-disc releases excluded by policy this crawl: rows the caller
         #: persists, plus the total (new + already-known) for reporting.
         self._last_crawl_policy_excluded_observed: List[Dict] = []
@@ -406,6 +438,26 @@ class ScannerService:
             self._item_counter = 0
         self._last_crawl_seen_urls = set()
         self._last_crawl_request_count = 0
+        # RESET THE WHOLE CRAWL-AUTHORITY STATE HERE, at run entry, beside the
+        # resets above. Round 7 found the consequence of my having put this reset
+        # inside _crawl_pages() instead: any path that leaves run_scan() WITHOUT
+        # entering the crawl inherits the previous run's termination -- while the
+        # seen-set two lines above was already emptied. A stale "complete" beside
+        # an empty listing turns every RSS URL into `feed_only`, which the
+        # resolver reads as affirmative acquisition. Mass false acquisition: the
+        # exact wrong answer this machinery exists to prevent.
+        #
+        # And it is not only reachable by exception. `_run_scan_async` returns
+        # early at "No sources selected" and at "HDEncode is disabled in
+        # Settings" -- an ordinary configuration state, no error involved. So a
+        # disabled-source scan could publish the last good crawl's authority over
+        # an empty listing. The correct place was always three lines from where
+        # the other per-run resets already were.
+        self._last_crawl_termination = "not_run"
+        self._last_crawl_status = "not_run"
+        self._last_crawl_page_errors = 0
+        self._last_crawl_detail_scheduled = set()
+        self._last_crawl_detail_completed = set()
 
         # Load download history
         self.download_history = self._load_download_history()
@@ -424,6 +476,16 @@ class ScannerService:
                 loop.close()
         except Exception as e:
             self._log(f"Scan error: {e}", "error")
+            # RECORDED, not just logged. This handler returns list(self.items)
+            # anyway, so without this the caller cannot tell a failed scan from a
+            # successful one -- which is exactly how a broken listing came to be
+            # recorded as trustworthy evidence.
+            self._last_crawl_status = "scan_error"
+            # AND the termination, which is what listing authority is actually
+            # keyed on. Recording only the status left the termination free to
+            # hold whatever the previous run put there, so the consumer that
+            # matters was still reading a stale verdict.
+            self._last_crawl_termination = "scan_error"
         finally:
             self.is_scanning = False
 
@@ -578,7 +640,12 @@ class ScannerService:
 
         # ── Process posts (parallel) ──────────────────────────────────
         num_threads = self.config.get("scan_threads", 10)
-        await self._process_posts(all_posts, scraper, num_threads)
+        completed_urls = await self._process_posts(all_posts, scraper, num_threads)
+        # DETAIL COMPLETION, recorded so scheduled-minus-completed is available as a
+        # blocking signal. _process_posts already returns this; nothing was reading
+        # it for authority purposes.
+        self._last_crawl_detail_completed = {
+            str(u) for u in (completed_urls or ()) if u}
 
         if self.stop_scan_flag:
             return
@@ -586,8 +653,17 @@ class ScannerService:
         # Save scanned URLs only after all posts are processed — avoids
         # permanently marking unvisited URLs as "seen" if the scan is stopped.
         if track_urls and all_posts and scan_type != "Site Search":
-            urls_to_save = [{'url': p['url'], 'title': None, 'source': p.get('source')} for p in all_posts]
-            self.db.add_scanned_urls_batch(urls_to_save)
+            # Record ONLY the posts that actually completed. Recording every
+            # crawled URL meant a post whose detail scrape failed (three
+            # transient timeouts, or a worker exception) was marked scanned
+            # and then skipped by every future incremental scan -- so a
+            # transient network blip removed a release from the catalogue
+            # permanently. A URL left out here is simply retried next time.
+            urls_to_save = [{'url': p['url'], 'title': None,
+                             'source': p.get('source')}
+                            for p in all_posts if p['url'] in completed_urls]
+            if urls_to_save:
+                self.db.add_scanned_urls_batch(urls_to_save)
 
         # ── Sort by posted date (newest first) ────────────────────────
         self.items.sort(key=self._posted_date_sort_key, reverse=True)
@@ -684,6 +760,18 @@ class ScannerService:
 
     # ── Page crawling ─────────────────────────────────────────────────
 
+    def last_crawl_detail_failed(self) -> set:
+        """URLs the crawl INTENDED to attribute and could not.
+
+        `_process_posts()` drops a post when `scrape_details()` returns nothing or
+        raises, so a scheduled URL with no completion is a genuine attribution
+        failure. Cached skips and policy exclusions are excluded by construction --
+        they never enter `all_posts` -- which is what makes this usable as a
+        blocking signal where the earlier `listing_only - detail_urls` was not.
+        """
+        return set(self._last_crawl_detail_scheduled) - set(
+            self._last_crawl_detail_completed)
+
     async def _crawl_pages(
         self, sources: List[Dict], pages: int, base_url: str,
         scraper, loop, previously_scanned: Optional[Set[str]] = None,
@@ -713,6 +801,14 @@ class ScannerService:
         Returns:
             List of post dicts: [{"url": str, "type": "movie"|"tv", "source": str}, ...]
         """
+        # Reset the per-crawl authority counters here, with the rest of the
+        # crawl-local state, so a previous crawl's failures cannot leak into
+        # this one's verdict.
+        self._last_crawl_page_errors = 0
+        self._last_crawl_status = "not_run"
+        self._last_crawl_termination = "not_run"
+        self._last_crawl_detail_scheduled = set()
+        self._last_crawl_detail_completed = set()
         all_posts = []
         skip_urls = previously_scanned or set()
         # Explicit arguments win (tests pass them); otherwise read the live
@@ -765,6 +861,11 @@ class ScannerService:
 
         for source in sources:
             if self.stop_scan_flag:
+                # Externally cancelled (/scan/stop or BackgroundScanner.stop()).
+                # This MUST be recorded: it truncates membership traversal, and
+                # round 6 showed that leaving it silent stamps a partial listing
+                # set "complete".
+                self._last_crawl_termination = "cancelled"
                 break
 
             source_name = source["name"]
@@ -787,6 +888,7 @@ class ScannerService:
 
             for page_num in range(1, pages + 1):
                 if self.stop_scan_flag:
+                    self._last_crawl_termination = "cancelled"
                     break
 
                 current_page += 1
@@ -820,6 +922,7 @@ class ScannerService:
                         resp = await loop.run_in_executor(None, _fetch_page)
                     except (HDEncodeTrafficDenied, HDEncodeRequestCancelled):
                         early_stopped = True
+                        self._last_crawl_termination = "cancelled"
                         self.stop_scan_flag = True
                         self._log(
                             f"{source_name}: coordinator stopped remaining traffic",
@@ -853,6 +956,19 @@ class ScannerService:
                                     "warning",
                                 )
                                 break  # session can't clear the block this run
+                        else:
+                            # NOT a block: 500/502/504 and friends. Named in
+                            # round 4, still open in round 5, closed here. These
+                            # skip a page and used to leave the crawl reporting
+                            # "complete" -- so a partial listing could certify
+                            # itself as trustworthy resolution evidence. A page we
+                            # did not read is a page we cannot vouch for.
+                            self._last_crawl_page_errors += 1
+                            self._log(
+                                f"{source_name}: page returned "
+                                f"{resp.status_code}; listing is incomplete",
+                                "warning",
+                            )
                         continue
                     blocked_streak = 0  # coordinator reset the global streak
 
@@ -954,6 +1070,11 @@ class ScannerService:
                     await asyncio.sleep(0.3)
                 except Exception as e:
                     self._log(f"Crawl error: {e}", "error")
+                    # COUNTED, not only logged. This handler lets the crawl carry
+                    # on, so without counting it the caller cannot tell a partial
+                    # crawl from a clean one -- which is how a broken listing came
+                    # to be recorded as trustworthy resolution evidence.
+                    self._last_crawl_page_errors += 1
 
             if blocked_total:
                 # A blocked source's crawl is INCOMPLETE — treat it like an
@@ -996,6 +1117,29 @@ class ScannerService:
         # A crawl that stopped early never visited deeper pages, so its seen-set
         # is partial — the caller must not age out items it simply didn't revisit.
         self._last_crawl_early_stopped = early_stopped
+        # The crawl's own verdict on itself, in precedence order: a stop that cut
+        # it short, then pages that failed, then a suspicious empty result.
+        # A recorded cancellation WINS over everything below it. Previously the
+        # chain started at `early_stopped`, which the bare breaks never set, so a
+        # cancelled crawl could fall all the way through to "complete".
+        if self._last_crawl_termination == "cancelled":
+            self._last_crawl_status = "cancelled"
+        elif early_stopped:
+            self._last_crawl_termination = "early_stopped"
+            self._last_crawl_status = "early_stopped"
+        elif self._last_crawl_page_errors:
+            self._last_crawl_termination = "page_errors"
+            self._last_crawl_status = "page_errors"
+        elif not all_posts:
+            self._last_crawl_termination = "empty_untrusted"
+            self._last_crawl_status = "empty_untrusted"
+        else:
+            self._last_crawl_termination = "complete"
+            self._last_crawl_status = "complete"
+        # Everything the crawl intended to detail-process. Cached skips and policy
+        # exclusions are already absent: they `continue` before all_posts.append.
+        self._last_crawl_detail_scheduled = {
+            str(post.get("url")) for post in all_posts if post.get("url")}
 
         return all_posts
 
@@ -1040,12 +1184,22 @@ class ScannerService:
 
     # ── Post processing ───────────────────────────────────────────────
 
-    async def _process_posts(self, all_posts: List[Dict], scraper, num_threads: int):
-        # Media-type resolution lives in resolve_listing_media_type (module
-        # level, below this class) — THE one listing composition, executed
-        # directly by the R-5 cross-path suite. Do not inline a copy here.
+    async def _process_posts(self, all_posts: List[Dict], scraper,
+                             num_threads: int) -> Set[str]:
+        """Scrape each post's detail page and turn it into a MediaItem.
+
+        Returns the set of post URLs that completed END TO END -- the detail
+        scrape succeeded AND a MediaItem was created. Callers record only
+        these in ``scanned_urls``; a URL left out is retried on the next scan
+        instead of being skipped forever.
+
+        Media-type resolution lives in resolve_listing_media_type (module
+        level, below this class) -- THE one listing composition, executed
+        directly by the R-5 cross-path suite. Do not inline a copy here.
+        """
         processed = 0
         total_posts = len(all_posts)
+        completed_urls: Set[str] = set()
 
         def process_post(post_info):
             if self.stop_scan_flag:
@@ -1103,8 +1257,12 @@ class ScannerService:
                             item.id = f"item_{self._item_counter}"
                             self._item_counter += 1
                             self.items.append(item)
+                        # Only a post that produced an item counts as scanned.
+                        if result.get('url'):
+                            completed_urls.add(result['url'])
 
         self._log(f"Processing complete: {len(self.items)} items created from {total_posts} posts")
+        return completed_urls
 
     # ── Item creation ─────────────────────────────────────────────────
 
@@ -1371,21 +1529,56 @@ class ScannerService:
         if not items:
             return 0
 
-        # Run the same Plex matcher over the reconstructed items.
-        with self._items_lock:
-            saved_items = self.items
-            self.items = items
+        # Run the same Plex matcher over the reconstructed items -- passed in
+        # explicitly, NOT published into the shared self.items.
+        #
+        # This method is called from three places and only ONE of them holds
+        # the scan slot (background_scanner, right after its cycle). The other
+        # two -- downloads.py's post-grab annotation and main.py's
+        # queue-delivery hook -- fire from request and download-queue threads
+        # while a scan may be mid-flight. The old code swapped these cache
+        # rows into self.items and restored them in a finally, so a
+        # concurrent scan matched and published the WRONG item list.
+        #
+        # The fix deliberately adds no lock. Taking the scan slot here would
+        # deadlock: it is a non-reentrant threading.Lock that
+        # background_scanner already holds when it calls in, and a
+        # try_acquire would silently make its rematch a permanent no-op.
+        # Removing the shared-state mutation removes the race outright.
+        #
+        # matched is initialised BEFORE the try: an exception inside must leave
+        # it False so the abandonment check below refuses to persist.
+        matched = False
         try:
             loop = asyncio.new_event_loop()
             try:
-                loop.run_until_complete(self._match_against_plex("Deep Scan"))
+                matched = loop.run_until_complete(
+                    self._match_against_plex("Deep Scan", items=items))
             finally:
                 loop.close()
         except Exception:
             logger.exception("Cache re-match: Plex matching failed")
-        finally:
-            with self._items_lock:
-                self.items = saved_items
+
+        # The blanking above is only safe because the match was expected to put
+        # the Plex state back. If it did not run to completion, every item is
+        # sitting in the cleared state and persisting that would rewrite the
+        # whole cache as "missing" with no Plex match -- silently, and logged as
+        # a successful re-match.
+        #
+        # The realistic trigger is not someone pressing Stop during a re-match:
+        # stop_scan_flag is set internally when the traffic coordinator reports
+        # a Cloudflare block (an ordinary, expected event), and is cleared ONLY
+        # at the top of the next run_scan. Any re-match in between -- the one
+        # after a completed download, or at startup -- inherits it.
+        if have_plex and not matched:
+            self._log(
+                "Cache re-match abandoned: the Plex match did not finish, so "
+                "the cached library state was left as it was.", "warning")
+            logger.warning(
+                "Cache re-match abandoned before persisting: matched=%s "
+                "stop_scan_flag=%s items=%d",
+                matched, self.stop_scan_flag, len(items))
+            return 0
 
         # Persist only rows whose status/info changed (preserve last_seen).
         updates = []
@@ -1414,23 +1607,44 @@ class ScannerService:
 
     # ── Plex matching ─────────────────────────────────────────────────
 
-    async def _match_against_plex(self, scan_type: str = "Deep Scan"):
-        """Compare all scan results against the Plex library index.
+    async def _match_against_plex(self, scan_type: str = "Deep Scan",
+                                  items: Optional[List[MediaItem]] = None) -> bool:
+        """Compare scan results against the Plex library index.
 
         Updates each MediaItem's status (IN_LIBRARY, UPGRADE, DV_UPGRADE)
         and plex_info field based on matching results.
+
+        Returns True only when EVERY item was matched. False means the results
+        are partial -- no Plex index, or a Stop cut the loop short -- and any
+        caller that cleared state in anticipation of this filling it back in
+        must not persist what it has. Callers used to have no way to tell a
+        completed match from an abandoned one, and treating the second as the
+        first rewrote an entire cache as "missing".
+
+        ``items`` lets a caller match a list it OWNS instead of the shared
+        ``self.items``. rematch_cache uses it: it previously published its
+        reconstructed cache rows into self.items and restored them in a
+        finally, which corrupted a concurrent scan's results -- and two of its
+        callers (downloads.py's grab annotation, main.py's queue-delivery
+        hook) run with no scan slot held. Passing the list is the fix that
+        does NOT introduce a lock: acquiring the scan slot here would
+        deadlock, because background_scanner already holds that
+        non-reentrant lock when it calls in.
         """
         plex_index = self.plex.plex_index
         if not plex_index["all_items"]:
             self._log("No Plex data available, skipping matching", "warning")
-            return
+            return False
 
-        with self._items_lock:
-            items_snapshot = list(self.items)
+        if items is not None:
+            items_snapshot = list(items)
+        else:
+            with self._items_lock:
+                items_snapshot = list(self.items)
         total = len(items_snapshot)
         for idx, item in enumerate(items_snapshot):
             if self.stop_scan_flag:
-                break
+                return False
             self._progress(idx / total, f"Matching {idx}/{total}")
 
             if item.status in (ScanStatus.DOWNLOADED, ScanStatus.DOWNLOADED_SIMILAR):
@@ -1593,6 +1807,8 @@ class ScannerService:
 
             except Exception as e:
                 logger.debug(f"Match error for '{item.title}': {e}")
+
+        return True
 
     # ── Missing-season detection (post-Plex) ────────────────────────
 

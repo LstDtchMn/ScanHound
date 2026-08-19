@@ -98,9 +98,16 @@ The nightly run must happen in this exact order:
 
 ## Rollout gate — clear this BEFORE the first real label sync
 
+> **STATUS 2026-08-04 -- this gate is CLEARED.** The mapping table below was
+> populated on 2026-07-11 (`Y:` -> the 4K HDR Geronimo share) after a dry run
+> matched only 92 of 463 files without it, and the first real label sync ran on
+> 2026-07-26. The section is kept because it explains WHY the table matters and
+> what to do when a new root is added -- but the phrase "ships empty by design"
+> below describes the ORIGINAL state, not today's.
+
 `backend/rename/dv_paths.py`'s `DEFAULT_DV_MAPPINGS` (the drive-letter <-> UNC-path
 table `normalize_path()` uses to recognize that e.g. `Y:\Movies\A\f.mkv` and
-`\\SRV\Share\Movies\A\f.mkv` are the same physical file) ships **empty by design**:
+`\\SRV\Share\Movies\A\f.mkv` are the same physical file) originally shipped **empty by design**:
 
 ```python
 # (drive_root, unc_root) pairs, e.g. ("Y:", r"\\SRV\Share"). Both roots must

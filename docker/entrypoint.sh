@@ -4,8 +4,33 @@ set -e
 # Resolve the profile through backend.browser_adapter, the same authority the
 # browser launcher uses. This runs before ScanHound starts, so no live browser
 # can legitimately own these exact Singleton* artifacts.
-if ! python -m backend.browser_adapter --cleanup-stale-profile-locks; then
-  echo "[entrypoint] WARNING: browser profile lock cleanup failed" >&2
+#
+# TIME-LIMITED, AND NEVER A GATE ON STARTING. Observed 2026-08-16: this step sat
+# in uninterruptible I/O wait for ~4 minutes on a deploy -- the profile lives on
+# a 9p bind mount, where directory syscalls are slow. During that window the
+# container reports "Up", the port is published, `docker logs` is COMPLETELY
+# EMPTY, and nothing answers. That is indistinguishable from a crashed app, and
+# the owner reasonably reported it as one.
+#
+# Worse than the delay is the shape: a best-effort cleanup of stale browser
+# locks was a HARD PREREQUISITE for the application starting. If that path ever
+# genuinely wedges rather than merely being slow, ScanHound never starts and
+# says nothing about why. This codebase already learned that rule when a log
+# write under fail-fast killed a job at line 1 and erased its own evidence:
+# a helper must never be able to prevent the work.
+#
+# So: announce it, cap it, and continue regardless. A stale lock left behind
+# costs one browser retry; a container that never starts costs everything.
+echo "[entrypoint] cleaning stale browser profile locks (max ${LOCK_CLEANUP_TIMEOUT:-60}s)..."
+if timeout "${LOCK_CLEANUP_TIMEOUT:-60}" python -m backend.browser_adapter --cleanup-stale-profile-locks; then
+  echo "[entrypoint] browser profile lock cleanup done"
+else
+  rc=$?
+  if [ "$rc" -eq 124 ]; then
+    echo "[entrypoint] WARNING: lock cleanup exceeded ${LOCK_CLEANUP_TIMEOUT:-60}s and was skipped; starting anyway" >&2
+  else
+    echo "[entrypoint] WARNING: browser profile lock cleanup failed (exit $rc); starting anyway" >&2
+  fi
 fi
 
 # Virtual display so undetected-chromedriver can run a headful Chromium

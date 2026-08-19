@@ -86,5 +86,7 @@ def test_label_dry_run_exposes_seed_live_and_desired_label_without_writes(tmp_pa
         "rating_key": "42", "title": "Example", "path": path,
         "seed_layer": "fel", "scan_layer": "mel",
         "discrepancy": "seed_fel_live_mel", "desired_label": "DV MEL",
-        "existing_labels": [], "added": ["DV MEL"], "removed": [],
+        # One verdict, three widths: the layer badge, its profile group, and
+        # the blanket DV tag. Sorted, as reconcile_movie returns them.
+        "existing_labels": [], "added": ["DV", "DV MEL", "DV7"], "removed": [],
     }]

@@ -1419,6 +1419,19 @@ class RenameService:
             deduped sibling name (:func:`fileops.dedupe_dest`); the existing
             file at ``dst`` is left untouched.
         """
+        # THE authoritative pause check, at the operation that performs the
+        # side effect rather than at one of its callers. queue_apply() has an
+        # early, friendlier copy for the HTTP routes, but this is the one that
+        # counts: apply() is reachable directly, and process_package() calls it
+        # (automatic=True) whenever a job matches and confirmation is off --
+        # a path that never goes through queue_apply at all. Gating only the
+        # queue would leave "renaming is paused" false for exactly the
+        # unattended case.
+        if not self._cfg.get("rename_manual_apply_enabled", True):
+            return {"ok": False, "paused": True,
+                    "error": ("Applying renames is turned off, so nothing was "
+                              "changed. Turn on \"Allow manual renames\" in "
+                              "Settings → Renaming to apply.")}
         db = self._db
         job = db.get_rename_job(job_id) if db else None
         if not job:
@@ -1565,8 +1578,26 @@ class RenameService:
                 # deduped sibling name; the existing file is never touched.
                 # Persist the rewritten filename so the job record (and any
                 # subsequent undo) reflects where the file actually landed.
+                #
+                # The write MUST be checked, like restore_key_ok above and
+                # applied_ok below: update_rename_job returns False on a
+                # failed write rather than raising. An unchecked failure left
+                # the row naming the ORIGINAL destination while the file was
+                # placed at the deduped sibling -- so a later undo would
+                # remove the pre-existing library file the user chose to
+                # KEEP, and undo removes rather than trashes. Nothing has
+                # been moved at this point, so bailing out is a clean
+                # on-disk no-op.
                 new_dst = _fileops.dedupe_dest(dst)
-                db.update_rename_job(job_id, new_filename=os.path.basename(new_dst))
+                if not db.update_rename_job(
+                        job_id, new_filename=os.path.basename(new_dst)):
+                    msg = ("The keep-both filename could not be saved, so "
+                           "nothing was changed. Retry once the database is "
+                           "healthy.")
+                    db.update_rename_job(
+                        job_id, status="needs_review", warning_message=msg)
+                    self._broadcast(job_id)
+                    return {"ok": False, "error": msg}
                 dst = new_dst
             else:
                 # None → hold for review (existing behavior); 'skip' → same,
@@ -2132,6 +2163,24 @@ class RenameService:
         if db is None:
             return {"ok": False, "queued": 0, "skipped": 0,
                     "error": "Database unavailable"}
+        # The manual path has its own freeze switch. Nothing used to gate it:
+        # `auto_rename_enabled` covers only the JDownloader post-extract hook,
+        # so with renaming nominally "paused" a Process-then-Apply click still
+        # performed a real, source-consuming move on real storage -- and the
+        # one guard that would have softened it (the move->hardlink downgrade
+        # in fileops.place_file) fires only for UNATTENDED applies, so with
+        # "require confirmation" on it never fires at all.
+        #
+        # Deliberately NOT keyed off auto_rename_enabled: that would mean
+        # renaming a single file by hand also re-arms the automatic pipeline,
+        # which is exactly the wrong trade during a file-operation safety
+        # review. Two independent switches, because they are two independent
+        # decisions. Applying is the single irreversible step in this feature.
+        if not self._cfg.get("rename_manual_apply_enabled", True):
+            return {"ok": False, "queued": 0, "skipped": 0, "paused": True,
+                    "error": ("Applying renames is turned off, so nothing was "
+                              "changed. Turn on \"Allow manual renames\" in "
+                              "Settings → Renaming to apply.")}
         if not self._bulk_lock.acquire(blocking=False):
             return {"ok": False, "queued": 0, "skipped": 0, "busy": True}
         release_lock = True

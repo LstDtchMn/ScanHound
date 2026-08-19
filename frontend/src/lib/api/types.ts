@@ -149,6 +149,18 @@ export interface DvScan {
   last_seen_at?: string | null;
 }
 
+/** Files whose scan rows contradict each other about the Dolby Vision layer.
+ *
+ *  Recomputed server-side from the scan rows on every request, so it reflects
+ *  what is true NOW rather than whether a notification was ever delivered.
+ *  `count` is exact; `sample` is capped and `truncated` says whether it was.
+ */
+export interface DvConflictStatus {
+  count: number;
+  sample: { path: string; layers: string[] }[];
+  truncated: boolean;
+}
+
 export interface RenameStats {
   applied: number;
   total_jobs: number;
@@ -182,7 +194,40 @@ export interface BrowserStatus {
   detected_browser_major?: number | null;
 }
 
+/** A SOURCE-LEVEL verification hold.
+ *
+ *  Reported beside the items, never inferred from them. The hold lives on the
+ *  source, so deriving it from `state === 'verification_required'` rows is a
+ *  different fact and wrong in both directions: the trigger row can be removed
+ *  while the hold stays armed (on 2026-08-16 ONE row held 40), and a trigger row
+ *  can outlive a cleared hold. */
+export interface VerificationHold {
+  source: string;
+  /** Queue rows this hold is stopping, across ALL batches for the source. */
+  affected: number;
+  /** How many actually met the challenge. Usually 1. */
+  triggers: number;
+  /** Reported so the UI can CONTRADICT it. Item cards show their own
+   *  "Retry after" time, and while a hold is armed that time means nothing. */
+  cooldown_until: string | null;
+  /** Always false. Named explicitly because the whole defect was a UI implying
+   *  a timer would fix this. */
+  clears_on_timer: boolean;
+  clears_when: string;
+  /** How many of `affected` are present in this response. The retries list is
+   *  capped, so above the cap the UI must not promise rows it cannot render. */
+  shown?: number;
+  holding_batches: number;
+}
+
 export interface DownloadQueueItem {
+  /** Set by the BACKEND, never derived here. True when this row's effective
+   *  recovery decision is VERIFICATION_HOLD -- which is NOT the same as "its
+   *  source has a hold armed": decide() ranks SAFETY_HOLD and UNOWNED_REASON
+   *  above it, so a deferred row on a held source may be stopped by something
+   *  else entirely. */
+  verification_held?: boolean;
+  verification_hold_source?: string | null;
   item_uuid: string;
   batch_uuid: string;
   sequence_number: number;
@@ -207,6 +252,11 @@ export interface DownloadQueueItem {
   last_cause_code?: string | null;
   last_message?: string | null;
   transport_attempted?: number | null;
+  created_at?: string | null;
+  // True when automatic recovery is disabled AND the cooldown is due, i.e.
+  // nothing will ever promote this group. Read from the same rule that writes
+  // the operator log warning, so the badge and the log cannot disagree.
+  manual_recovery_required?: boolean;
   retry_available: boolean;
   due: boolean;
   source_state?: string | null;
@@ -476,6 +526,14 @@ export interface Settings {
 
   // Auto-rename + Plex sort + Ollama assist
   auto_rename_enabled?: boolean;
+  /** Whether the Renames page's Apply button may place files. Independent of
+   *  auto_rename_enabled, which arms the automatic JDownloader hook. */
+  rename_manual_apply_enabled?: boolean;
+  /** The hourly additive-only DV label sync. Documented as a kill switch but
+   *  previously unreachable from the app: no UI, and the settings API did not
+   *  accept it, so the only way to use it was editing config.json AND
+   *  restarting (the value is read from the in-memory config). */
+  dv_auto_sync_enabled?: boolean;
   auto_rename_confidence_threshold?: number;
   auto_rename_require_confirmation?: boolean;
   auto_rename_move_method?: string;
@@ -636,6 +694,48 @@ export interface DownloadResult {
   error: string | null;
   updated_at?: string; // REST only
   save_to?: string; // WS only
+  // Null unless the package has RECORDED PROVENANCE: its file-host links match
+  // links ScanHound recorded submitting. A package added to JDownloader by hand
+  // resolves to nothing, so the UI shows no link rather than a confident wrong
+  // one. `first_seen_at` is when the release first entered history — which can
+  // be a FAILED attempt, hence "seen", not "grabbed".
+  source_url?: string | null;
+  first_seen_at?: string | null;
+  // The raw persisted association, carried on both transports. Declared because
+  // it IS on the wire; UI code should read `source_url`, which is the annotated
+  // answer and the only one guaranteed present on every row.
+  provenance_url?: string | null;
+  // WS only, and a SERVER-SIDE write decision, not a display value: whether this
+  // poll actually managed to observe the package's links. It distinguishes "no
+  // longer provable" from "could not look", which is what decides whether a
+  // stored association may be retracted. The UI has no use for it.
+  provenance_observed?: boolean;
+  // THE SEMANTIC IDENTITY, carried on both transports. This is what the grab
+  // RECORDED, not a reading of `name` — and the two are not interchangeable.
+  // `name` is capped at 50 characters and 17 live rows share a name spanning
+  // several seasons (`Law & Order: LA (2010) [1080p]` covers 13 of them), so no
+  // parser can recover a season that the string does not contain.
+  //
+  // `unknown` means UNKNOWN, never "no season": it is what a row without
+  // recorded provenance gets, and what every row gets if the lookup fails. Code
+  // deciding whether two rows are the same thing must treat it as a refusal,
+  // because the action it gates cancels downloads.
+  // `movie` is DECLARED BUT NOT CURRENTLY EMITTED. Nothing in `downloads`
+  // records a media type, so a row with no season is indistinguishable from a
+  // TV release whose season was never captured — ("Notting Hill", 1999, null)
+  // has the same shape as a 1999 show with a missing season. Seasonless rows
+  // are therefore `unknown`, and the value stays in the union only so a
+  // consumer written against it keeps compiling when ingest starts recording
+  // a kind. Treat anything that is not `tv_season` as unknown today.
+  identity_kind?: 'movie' | 'tv_season' | 'unknown';
+  // The CURRENT recorded metadata for that release url, not an immutable
+  // per-submission snapshot: `downloads.url` is the primary key and
+  // `add_to_history` updates title and season on conflict. Two grabs of the
+  // same url therefore share one identity by construction.
+  identity_title?: string | null;
+  identity_year?: number | null;
+  identity_season?: number | null;
+  identity_source?: 'provenance' | 'unknown';
 }
 
 export interface TmdbSearchResult {

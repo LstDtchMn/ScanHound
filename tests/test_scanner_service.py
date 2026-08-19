@@ -1,6 +1,8 @@
 """Tests for backend/scanner_service.py — data models, enums, and service logic."""
 
 import asyncio
+import json
+import threading
 import pytest
 from dataclasses import fields
 from unittest.mock import MagicMock, patch
@@ -615,3 +617,173 @@ class TestDetectDuplicateGroups:
                 break
         else:
             pytest.fail("No group with 2 items found")
+
+
+class TestRematchCacheDoesNotTouchSharedItems:
+    """rematch_cache used to publish its reconstructed cache rows into the
+    SHARED self.items and restore them in a finally. Two of its three callers
+    hold no scan slot -- downloads.py's post-grab annotation and main.py's
+    queue-delivery hook, both firing from other threads -- so a scan running
+    at the same time matched and published the wrong list.
+
+    The corruption is only observable DURING the match: the old code restored
+    self.items in a finally, so asserting after the call proves nothing. Both
+    tests below therefore inspect self.items at the moment the matcher runs.
+    (A first cut of these tests asserted afterwards and passed on the
+    defective code too -- no discriminatory power, which is worse than no
+    test.)
+
+    The fix deliberately adds NO lock: taking the scan slot here would
+    deadlock, since background_scanner already holds that non-reentrant lock
+    when it calls in.
+    """
+
+    def _svc(self, db):
+        from backend.scanner_service import ScannerService
+        svc = object.__new__(ScannerService)
+        svc.db = db
+        svc._items_lock = threading.Lock()
+        svc._stop_event = threading.Event()
+        svc.items = ["SCAN-IN-FLIGHT"]        # what a live scan owns
+        svc.download_history = set()
+        svc.plex = MagicMock()
+        svc.plex.plex_index = {"all_items": [1]}
+        svc.matching = MagicMock()
+        svc.matching.app = MagicMock()
+        svc._load_download_history = lambda: set()
+        svc._download_status_for = lambda *a, **k: (None, None)
+        svc._log = lambda *a, **k: None
+        svc._progress = lambda *a, **k: None
+        return svc
+
+    def _one_cached_row(self):
+        return [{"data": json.dumps(
+            {"url": "u1", "title": "Cached Title", "status": "missing"})}]
+
+    def test_shared_items_are_not_swapped_DURING_the_match(self):
+        db = MagicMock()
+        db.get_background_cache.return_value = self._one_cached_row()
+        db.update_background_cache_entry = MagicMock()
+        svc = self._svc(db)
+        svc._media_item_from_dict = lambda d: MediaItem(
+            id="c1", title="Cached Title", year=1994, url="u1")
+
+        observed = {}
+
+        async def _spy(scan_type="Deep Scan", items=None):
+            # what a concurrently-running scan would see right now
+            observed["shared"] = list(svc.items)
+        svc._match_against_plex = _spy
+
+        svc.rematch_cache()
+
+        assert observed["shared"] == ["SCAN-IN-FLIGHT"], (
+            "rematch published its own list into the shared self.items; a "
+            "concurrent scan would have matched and published these rows")
+
+    def test_the_matcher_receives_the_cache_rows_explicitly(self):
+        db = MagicMock()
+        db.get_background_cache.return_value = self._one_cached_row()
+        db.update_background_cache_entry = MagicMock()
+        svc = self._svc(db)
+        svc._media_item_from_dict = lambda d: MediaItem(
+            id="c1", title="Cached Title", year=1994, url="u1")
+
+        got = {}
+
+        async def _spy(scan_type="Deep Scan", items=None):
+            got["items"] = items
+        svc._match_against_plex = _spy
+
+        svc.rematch_cache()
+
+        assert got["items"] is not None, (
+            "the cache rows must be PASSED to the matcher, not published "
+            "into shared state for it to pick up")
+        assert [i.url for i in got["items"]] == ["u1"]
+
+    def test_match_against_plex_reads_self_items_when_none_is_passed(self):
+        """Negative control: the live-scan path is unchanged.
+
+        Asserted via the progress messages (which carry the snapshot SIZE)
+        rather than the matcher's own API, so this stays true regardless of
+        how matching is wired.
+        """
+        svc = self._svc(MagicMock())
+        svc.items = [MediaItem(id="l1", title="Live", year=2020, url="live"),
+                     MediaItem(id="l2", title="Live2", year=2021, url="live2")]
+        msgs = []
+        svc._progress = lambda frac, msg=None: msgs.append(msg)
+
+        # default (items=None) -> snapshot is self.items, so total == 2
+        try:
+            asyncio.run(svc._match_against_plex("Deep Scan"))
+        except Exception:
+            pass
+        assert any("/2" in (m or "") for m in msgs), msgs
+
+        # an explicit ONE-item list -> total == 1, proving the source switched
+        msgs.clear()
+        try:
+            asyncio.run(svc._match_against_plex(
+                "Deep Scan",
+                items=[MediaItem(id="x", title="X", year=2022, url="x")]))
+        except Exception:
+            pass
+        assert any("/1" in (m or "") for m in msgs), msgs
+
+
+class TestOnlyCompletedPostsAreMarkedScanned:
+    """Every crawled URL used to be written to scanned_urls regardless of
+    outcome. A post whose detail scrape failed -- three transient timeouts,
+    or a worker exception -- was therefore recorded as scanned and skipped by
+    every future incremental scan. A momentary network blip removed a release
+    from the catalogue permanently, and nothing ever retried it.
+    """
+
+    def _svc(self, db):
+        from backend.scanner_service import ScannerService
+        svc = object.__new__(ScannerService)
+        svc.db = db
+        svc._items_lock = threading.Lock()
+        svc._stop_event = threading.Event()
+        svc._item_counter = 0
+        svc.items = []
+        svc._log = lambda *a, **k: None
+        svc._progress = lambda *a, **k: None
+        svc.scrapers = MagicMock()
+        return svc
+
+    def _posts(self):
+        return [{"url": "https://x/ok", "type": "movie", "title": "OK",
+                 "source": "hdencode"},
+                {"url": "https://x/fails", "type": "movie", "title": "Fails",
+                 "source": "hdencode"}]
+
+    def test_a_failed_post_is_not_recorded_as_scanned(self):
+        db = MagicMock()
+        svc = self._svc(db)
+        # the scrape succeeds for one post and returns nothing for the other
+        svc.scrapers.scrape_details = lambda url, headers, scraper=None, **k: (
+            {"display_title": "OK", "is_tv": False} if url.endswith("/ok") else None)
+        svc._create_media_item = lambda r: (
+            MediaItem(id="i", title="OK", year=2020, url=r["url"])
+            if r.get("url", "").endswith("/ok") else None)
+
+        completed = asyncio.run(
+            svc._process_posts(self._posts(), MagicMock(), num_threads=1))
+
+        assert completed == {"https://x/ok"}, (
+            "a post whose detail scrape failed must not count as scanned")
+
+    def test_an_item_that_fails_to_build_is_not_recorded_either(self):
+        db = MagicMock()
+        svc = self._svc(db)
+        svc.scrapers.scrape_details = lambda url, headers, scraper=None, **k: {
+            "display_title": "x", "is_tv": False}
+        svc._create_media_item = lambda r: None      # scrape OK, item fails
+
+        completed = asyncio.run(
+            svc._process_posts(self._posts(), MagicMock(), num_threads=1))
+
+        assert completed == set()

@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import time
+import contextlib
 import threading
 import webbrowser
 from contextlib import nullcontext
@@ -18,6 +19,10 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 
 from backend.database import DatabaseManager
+from backend.source_identity import (
+    source_kind as _shared_source_kind,
+    url_matches_domain as _shared_url_matches_domain,
+)
 from backend.config import source_enabled
 from backend.hdencode_coordinator import (
     HDEncodeTrafficDenied,
@@ -31,10 +36,12 @@ from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 from backend.download_outcome import (
     CF_MITIGATED_CHALLENGE,
     CHALLENGE_IFRAME_MARKERS,
+    TURNSTILE_CAUSE_CODE,
     cf_mitigated_from_perf_log,
     challenge_iframe_srcs,
     diagnostic_from_traffic_denial,
     strong_challenge_markers,
+    turnstile_challenge_evidence,
 )
 from backend.browser_adapter import (
     browser_plan,
@@ -96,6 +103,11 @@ _DDLBASE_SHORTLINK_DOMAINS = (
 )
 # Only these domains go through the automated cuttlinks resolution flow
 _AUTOMATABLE_SHORTLINK_DOMAINS = ("cuty.io", "cuttlinks.com")
+#: The narrower question of which direct hosts the downloader can hand off, as
+#: distinct from identity. Kept separate on purpose -- "is this a direct file host"
+#: and "can we send it to JDownloader" are different questions -- but a test asserts
+#: this stays a SUBSET of source_identity.DIRECT_FILE_HOSTS so the two lists cannot
+#: drift apart again, which is what peer review found had already happened.
 _SUPPORTED_DOWNLOAD_HOSTS = (
     "1fichier.com",
     "rapidgator.net",
@@ -107,30 +119,33 @@ _SUPPORTED_DOWNLOAD_HOSTS = (
 def _url_matches_domain(url: str, domains: tuple) -> bool:
     """Check a URL's parsed hostname against one or more registrable domains.
 
-    Path and query text must never influence source routing.  ``hostname`` also
-    strips credentials and ports, unlike a raw ``netloc`` comparison.
+    Delegates to the shared implementation so hostname parsing cannot diverge
+    between the two modules that classify sources.
     """
-    try:
-        raw = (url or "").strip()
-        parsed = urlparse(raw if "://" in raw else "https://" + raw)
-        host = (parsed.hostname or "").lower().rstrip(".")
-        return any(host == d or host.endswith("." + d) for d in domains)
-    except Exception:
-        return False
+    return _shared_url_matches_domain(url, domains)
 
 
-def _source_page_kind(url: str) -> str:
-    """Classify a source-page URL using only its hostname.
+def _source_page_kind(url: str, hdencode_host: str = "hdencode.org") -> str:
+    """Classify a source-page URL. Delegates to the ONE shared classifier.
 
-    ``scrape_links`` historically treats every page that is not DDLBase or
-    Adit-HD as the HDEncode/default path.  Keep that compatibility while making
-    the decision once and reusing it for both gating and dispatch.
+    UNIFIED 2026-08-07 on peer review. This used to default every page that was not
+    DDLBase or Adit-HD to ``"hdencode"``. That decided three things:
+
+      * whether the request goes through the HDEncode traffic coordinator;
+      * whether the HDEncode off switch refuses it;
+      * whether its scrape outcome is recorded against HDEncode's health.
+
+    All three were therefore being applied to direct file-host URLs, which the batch
+    API accepts. Each is a CORRECTION rather than a regression: a Rapidgator link
+    should not consume HDEncode's rate budget, should not be refused when HDEncode is
+    switched off, and should not pollute HDEncode's scrape statistics. Direct hosts
+    already bypass ``scrape_links`` entirely, so dispatch is unaffected.
+
+    Returns a value from :data:`backend.source_identity.SOURCE_KINDS`, so callers
+    comparing against ``"hdencode"`` keep working and everything else is now named
+    instead of assumed.
     """
-    if _url_matches_domain(url, ("ddlbase.com",)):
-        return "ddlbase"
-    if _url_matches_domain(url, ("adit-hd.com",)):
-        return "adithd"
-    return "hdencode"
+    return _shared_source_kind(url, hdencode_host)
 
 
 def _challenge_iframe_signal(src: str) -> str:
@@ -357,6 +372,63 @@ def _ensure_selenium():
 class DownloadService:
     """Manages download operations, JDownloader, and WebDriver link scraping."""
 
+    def _source_kind_of(self, url: str) -> str:
+        """This service's source identity for a URL, under the CONFIGURED host.
+
+        WHY THIS EXISTS AS A METHOD. `_source_page_kind` grew an `hdencode_host`
+        parameter so identity could follow configuration, and then none of its
+        three call sites passed it -- a parameter added in the very commit whose
+        message said identity should follow configuration, which is the fourth
+        time a review has caught me adding a signal nothing consumes.
+
+        The consequence was a split brain with the queue, which does pass its
+        configured host. With `base_url = https://hdencode.example.net`:
+
+            download_queue:  hdencode
+            DownloadService: other
+
+        so a configured mirror skipped the HDEncode traffic coordinator, the
+        service-level off switch, and HDEncode scrape-outcome health ownership --
+        while still being paused, resumed and refunded as an HDEncode row. The
+        disagreement runs the other way too: once a mirror is configured, a
+        leftover `hdencode.org` URL is `hdencode` here and not in the queue.
+
+        Reading the config through one accessor is the point. Three call sites each
+        reaching for `base_url` themselves is how the two classifiers drifted in
+        the first place.
+        """
+        cfg = getattr(self, "config", None) or {}
+        return _source_page_kind(url, cfg.get("base_url") or "https://hdencode.org")
+
+    def source_kind(self, url: str) -> str:
+        """PUBLIC source identity under this service's configuration.
+
+        ADDED round 8. I claimed in the round-8 package that "no production call
+        site passes a URL alone any more". That was FALSE, and the way I got it
+        wrong matters more than the fact: I grepped `backend/download_service.py`
+        only, printed "remaining bare calls (should be only the def)", saw the def
+        plus my new private helper, and wrote a REPO-WIDE claim from a single-file
+        search. `backend/api/routes/downloads.py` imports the module-level
+        `_source_page_kind` and calls it bare at two sites, so a configured mirror's
+        scrape health was not persisted as HDEncode while a stale `hdencode.org`
+        still was.
+
+        This exists so routes never reclassify independently. Private helpers get
+        imported anyway -- that is exactly what happened -- so the config-aware
+        answer needs a public front door.
+        """
+        return self._source_kind_of(url)
+
+    def owns_source_health(self, url: str, source: str = "hdencode") -> bool:
+        """Whether a scrape outcome for ``url`` belongs to ``source``'s health.
+
+        The routes were each deciding two things: how to classify, and whether to
+        persist. Centralising the pair means a future caller cannot get the second
+        right while getting the first wrong, which is the drift this review has now
+        caught twice.
+        """
+        return self.source_kind(url) == source
+
     def __init__(self, config: Dict[str, Any], db: DatabaseManager, server_mode: bool = False):
         self.config = config
         self.db = db
@@ -392,6 +464,64 @@ class DownloadService:
         self._jd_device = None
         self._jd_conn_ts = 0.0
         self._JD_CONN_TTL = 90.0
+
+        # --- poll liveness ------------------------------------------------
+        # A stalled poller is INVISIBLE without this. When JDownloader restarts,
+        # the cached device handle goes stale; the failing poll invalidates the
+        # cache correctly, but every subsequent failed RECONNECT returned []
+        # with no log at all, and the surrounding loop logs at debug (off in
+        # production). The poller kept running, failing silently, until someone
+        # restarted the container -- observed 2026-08-15 after JD restarted at
+        # 21:36 the night before: ~15 hours of frozen downloads, one WARNING in
+        # the entire log.
+        #
+        # What is tracked is the ABSENCE OF SUCCESS, not any particular failure.
+        # Enumerating failure modes (stale handle, JD down, network, expired
+        # credentials, rate limit) guarantees missing the next one; "no
+        # successful poll in N minutes while enabled" catches all of them,
+        # including causes nobody has thought of yet.
+        # RESULTS EPOCH (peer review 2026-08-16, MEDIUM 1). A poll takes its
+        # JDownloader snapshot, then persists it. A removal that lands in
+        # between deletes rows the in-flight poll is about to write back from
+        # its PRE-removal snapshot -- and because the removal also evicts the
+        # caches, the stale poll takes the cache-miss branch and upserts. The
+        # package is gone from JD and back in our table, permanently, because
+        # the end-of-poll prune only trims the in-memory caches and never
+        # deletes rows for packages JD no longer has.
+        #
+        # The epoch makes the ordering decidable without holding a lock across
+        # a network call: a poll records the epoch before its snapshot and
+        # refuses to persist if it changed underneath.
+        self._results_epoch = 0
+        self._results_epoch_lock = threading.Lock()
+        self._jd_poll_lock = threading.Lock()
+        self._jd_last_poll_ok_ts: Optional[float] = None   # monotonic
+        self._jd_last_poll_ok_wall: Optional[str] = None   # human/UI
+        self._jd_poll_fail_streak = 0
+        self._jd_last_poll_error: Optional[str] = None
+        self._jd_last_log_ts = 0.0
+        #: Which step of the connect/poll sequence was last ATTEMPTED. Named
+        #: so a recurrence is attributable instead of guessed from one
+        #: generic exception (peer review 2026-08-15).
+        self._jd_phase = "idle"
+        #: PRIMARY heartbeat: the OUTER poller cycle. Design review P1-1 --
+        #: wrapping poll_results alone cannot answer "is the thread cycling?",
+        #: because a block AFTER it returns (the WebSocket broadcast, the rename
+        #: hand-off) leaves the inner counters equal and stationary, which reads
+        #: as "thread stopped" when the thread is alive and blocked.
+        self._cycles_started = 0
+        self._cycles_completed = 0
+        self._cycle_start_ts: Optional[float] = None
+        self._cycle_end_ts: Optional[float] = None
+        #: NESTED span: localises a block to JD polling specifically once the
+        #: outer heartbeat has established the thread is stuck at all.
+        self._poll_iters_started = 0
+        self._poll_iters_completed = 0
+        self._poll_iter_start_ts: Optional[float] = None
+        #: Seconds between repeats of the same connect-failure WARNING. The
+        #: poller runs every few seconds; logging each failure would bury the
+        #: log, and logging none is what hid this for 15 hours.
+        self._JD_LOG_EVERY = 300.0
         # Per-package last-recorded signature so the poller only writes rows
         # that actually changed (avoids re-upserting a large stable queue).
         # Keyed by cache_key = str(package uuid) when JD reports one, else the
@@ -621,9 +751,17 @@ class DownloadService:
             password = self.config.get("jd_password", "")
             if not email or not password:
                 raise RuntimeError("MyJDownloader email/password not configured")
+            # Which STEP failed, recorded as it is attempted. One generic
+            # exception cannot say whether MyJDownloader auth, the device
+            # listing, or the device lookup is what keeps failing -- and that
+            # was exactly the gap after the 2026-08-15 stall: the silence was
+            # fixed, but the cause stayed a guess. Peer review asked for this.
             jd = myjdapi.Myjdapi()
+            self._jd_phase = "connect"
             jd.connect(email, password)
+            self._jd_phase = "update_devices"
             jd.update_devices()
+            self._jd_phase = "get_device"
             device_name = self.config.get("jd_device", "")
             if device_name:
                 device = jd.get_device(device_name)
@@ -646,6 +784,142 @@ class DownloadService:
             self._jd = None
             self._jd_device = None
             self._jd_conn_ts = 0.0
+
+    # --- poll liveness ----------------------------------------------------
+
+    def _note_poll_failure(self, exc):
+        """Record a failed poll and log it, at most once per _JD_LOG_EVERY.
+
+        Rate limiting matters in both directions: the poller runs every few
+        seconds, so logging every failure buries the log, and logging none is
+        precisely what made a 15-hour stall invisible.
+        """
+        now = time.monotonic()
+        with self._jd_poll_lock:
+            self._jd_poll_fail_streak += 1
+            self._jd_last_poll_error = str(exc)[:200]
+            self._jd_fail_phase = getattr(self, "_jd_phase", "unknown")
+            streak = self._jd_poll_fail_streak
+            due = (now - self._jd_last_log_ts) >= self._JD_LOG_EVERY
+            if due:
+                self._jd_last_log_ts = now
+        if due:
+            logger.warning(
+                "JDownloader poll failing at phase '%s' (%d consecutive; "
+                "last success %s): %s",
+                getattr(self, "_jd_fail_phase", "unknown"), streak,
+                self._jd_last_poll_ok_wall or "never this run", exc)
+
+    def _note_poll_success(self):
+        """Record that JDownloader answered. This is the liveness signal."""
+        with self._jd_poll_lock:
+            recovered = self._jd_poll_fail_streak
+            self._jd_poll_fail_streak = 0
+            self._jd_last_poll_error = None
+            self._jd_last_poll_ok_ts = time.monotonic()
+            self._jd_last_poll_ok_wall = datetime.now().isoformat(timespec="seconds")
+        if recovered:
+            logger.info("JDownloader poll recovered after %d failure(s)", recovered)
+
+    def note_cycle_start(self):
+        """The poller thread is entering an OUTER cycle. PRIMARY heartbeat.
+
+        Design review P1-1: wrapping poll_results alone is the wrong authority
+        for "is the thread cycling?". The loop does more after poll_results
+        returns -- source-link annotation, the WebSocket broadcast, the rename
+        hand-off. A block in any of those leaves the INNER counters equal and
+        stationary, which the documented table read as "thread stopped" when
+        the thread is alive and blocked outside the measured span.
+
+        Closed BEFORE the sleep, so a healthy sleeping poller does not look
+        like an operation in flight.
+        """
+        with self._jd_poll_lock:
+            self._cycles_started += 1
+            self._cycle_start_ts = time.monotonic()
+
+    def note_cycle_end(self):
+        """The outer cycle finished, however it went."""
+        with self._jd_poll_lock:
+            self._cycles_completed += 1
+            self._cycle_start_ts = None
+            self._cycle_end_ts = time.monotonic()
+
+    def note_poll_iteration_start(self):
+        """The poller is entering an iteration. Half of the heartbeat.
+
+        Peer review 2026-08-15 identified this as THE unanswered question about
+        the 15-hour stall: *was the poller cycling at all?* Nothing recorded it,
+        so "one warning then silence" could equally mean
+
+          * cycling and failing silently (the rate-limit hypothesis), or
+          * blocked inside one iteration and never returning, or
+          * the thread stopped entirely.
+
+        Those want opposite fixes -- backoff helps only the first -- and the old
+        instrumentation could not tell them apart. `failure_phase` cannot either:
+        it is populated from an EXCEPTION, and a blocked call raises nothing.
+
+        started vs completed is what separates them:
+          started == completed, neither advancing  -> thread stopped
+          started  > completed, not advancing      -> BLOCKED inside an iteration
+          both advancing, no success               -> cycling and failing
+        """
+        with self._jd_poll_lock:
+            self._poll_iters_started += 1
+            self._poll_iter_start_ts = time.monotonic()
+
+    def note_poll_iteration_end(self):
+        """The poller finished an iteration -- however it went."""
+        with self._jd_poll_lock:
+            self._poll_iters_completed += 1
+            self._poll_iter_start_ts = None
+
+    def jd_poll_health(self) -> Dict[str, Any]:
+        """Liveness of the JDownloader poll, for the health surface and alerts.
+
+        ``stalled_seconds`` is time since the last SUCCESSFUL poll, or None when
+        no poll has succeeded since start. Callers decide the threshold; this
+        reports absence of success rather than any particular failure, so a
+        cause nobody anticipated still shows up here.
+        """
+        with self._jd_poll_lock:
+            ok_ts = self._jd_last_poll_ok_ts
+            return {
+                "last_success_at": self._jd_last_poll_ok_wall,
+                "stalled_seconds": (time.monotonic() - ok_ts) if ok_ts else None,
+                "consecutive_failures": self._jd_poll_fail_streak,
+                "last_error": self._jd_last_poll_error,
+                "failure_phase": getattr(self, "_jd_fail_phase", None)
+                                 if self._jd_poll_fail_streak else None,
+                # PRIMARY: the outer cycle. cycles_started > cycles_completed
+                # while current_cycle_seconds grows == the thread is BLOCKED.
+                # Both equal and seconds_since_cycle_completed growing == the
+                # thread has STOPPED. Equal counters alone carry no age, which
+                # is why the "since completed" clock is required rather than
+                # optional -- a single snapshot cannot otherwise tell a healthy
+                # idle poller from a dead one.
+                "cycles_started": self._cycles_started,
+                "cycles_completed": self._cycles_completed,
+                "current_cycle_seconds": (
+                    (time.monotonic() - self._cycle_start_ts)
+                    if self._cycle_start_ts else None),
+                "seconds_since_cycle_completed": (
+                    (time.monotonic() - self._cycle_end_ts)
+                    if self._cycle_end_ts else None),
+                # NESTED: localises a block to JD polling once the outer
+                # heartbeat has established the thread is stuck at all.
+                "iterations_started": self._poll_iters_started,
+                "iterations_completed": self._poll_iters_completed,
+                # Seconds the CURRENT iteration has been running. A value that
+                # keeps growing while iterations_completed stands still means
+                # the poller is BLOCKED inside one call, not failing fast --
+                # the distinction backoff cannot make and a stuck lock or a
+                # timeout-less network call would produce.
+                "current_iteration_seconds": (
+                    (time.monotonic() - self._poll_iter_start_ts)
+                    if self._poll_iter_start_ts else None),
+            }
 
     def test_jd_connection(self) -> dict:
         """Quick MyJDownloader connectivity check for the UI status indicator."""
@@ -890,6 +1164,86 @@ class DownloadService:
             self._invalidate_jd_cache()
             return {"ok": False, "error": str(e)}
 
+    def _epoch_lock(self) -> threading.Lock:
+        """The epoch lock, created on demand.
+
+        SELF-INITIALISING ON PURPOSE. The epoch is bookkeeping, and bookkeeping
+        must never be a hard dependency of the work it describes: reading it
+        from poll_results() meant any DownloadService not built through
+        __init__ turned every poll into a FAILURE, reported as "JDownloader poll
+        failing" -- a real liveness alarm raised by an accounting field. Caught
+        by a liveness test, not by the bulk-clear tests, because those build the
+        attribute themselves.
+        """
+        lock = getattr(self, "_results_epoch_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._results_epoch_lock = lock
+            if not hasattr(self, "_results_epoch"):
+                self._results_epoch = 0
+        return lock
+
+    def _current_epoch(self) -> int:
+        with self._epoch_lock():
+            return getattr(self, "_results_epoch", 0)
+
+    def _bump_epoch_locked(self) -> int:
+        """Advance the epoch for a caller ALREADY inside _results_state().
+
+        Exists so the removal paths do not each open-code the increment.
+        `_epoch_lock()` is a plain Lock, not an RLock, so a caller holding it
+        must NOT reach for _bump_epoch() — that deadlocks. Naming the two
+        variants apart makes the safe choice the visible one, which matters
+        because the unsafe one is the shorter name (peer review 2026-08-17).
+        """
+        self._results_epoch = getattr(self, "_results_epoch", 0) + 1
+        return self._results_epoch
+
+    def _bump_epoch(self) -> int:
+        """A local removal happened; any snapshot older than this is stale.
+
+        For callers NOT already holding the lock. Inside _results_state(), use
+        _bump_epoch_locked().
+        """
+        with self._epoch_lock():
+            return self._bump_epoch_locked()
+
+    @contextlib.contextmanager
+    def _results_state(self):
+        """The short critical section that orders local results state.
+
+        Everything that mutates our own view of the results -- the poll's
+        persistence, and the removal's deletes + cache eviction + epoch advance
+        -- happens inside this. JDownloader network calls stay OUTSIDE it, so a
+        wedged JD call can never block the API route.
+
+        WHY A CONTEXT MANAGER AND NOT JUST THE PREDICATE. The first version
+        checked the epoch, RELEASED the lock, and only then wrote. That leaves
+        the original race intact, just narrower: the poll passes its check, the
+        removal deletes and bumps, and the poll then writes the row back from
+        its pre-removal snapshot. Checking and acting must be one step, or the
+        check is only advice. (Peer review 2026-08-16, round 2.)
+        """
+        with self._epoch_lock():
+            yield
+
+    def _epoch_is_current_locked(self, captured: Optional[int]) -> bool:
+        """The epoch test, for a caller ALREADY inside _results_state()."""
+        if captured is None:
+            return True
+        return captured == getattr(self, "_results_epoch", 0)
+
+    def _epoch_is_current(self, captured: Optional[int]) -> bool:
+        """May a poll that started at `captured` still write what it saw?
+
+        None means the caller did not capture one, which is treated as current
+        so an unrelated caller cannot be silently prevented from persisting.
+        """
+        if captured is None:
+            return True
+        with self._epoch_lock():
+            return captured == getattr(self, "_results_epoch", 0)
+
     def remove_package(self, id_: int) -> dict:
         """Remove a single tracked download by its row id: remove ONLY that
         package from JD (by its uuid) and delete its result row. Idempotent:
@@ -912,24 +1266,178 @@ class DownloadService:
             except Exception as e:
                 logger.warning("remove_package JD step failed for id %s (uuid %s): %s", id_, uuid, e)
                 self._invalidate_jd_cache()
+        # ONE CRITICAL SECTION, matching remove_packages exactly. Delete, cache
+        # eviction and the epoch advance happen together, so a concurrent poll
+        # either persists BEFORE all of it (and the delete removes what it
+        # wrote) or arrives afterwards, sees a stale epoch, and declines.
+        #
+        # This path previously did the delete and eviction with NO lock and NO
+        # epoch advance, so it kept the exact race the bulk path was fixed for:
+        # a poll whose snapshot predates the delete writes the row straight back
+        # and the user watches a removed download reappear. Evicting the caches
+        # alone does not close it — eviction only stops the unchanged-state SKIP
+        # branch; a poll already holding a pre-delete snapshot still persists it.
+        #
+        # The JD network call above stays OUTSIDE this block on purpose: a
+        # wedged JDownloader must never hold the lock the poller needs.
         removed = 0
-        try:
-            removed = self.db.delete_download_result(id_) if self.db else 0
-        except Exception as e:
-            logger.warning("remove_package DB delete failed for id %s: %s", id_, e)
-        # Evict this package from the poller's in-memory caches (keyed by
-        # cache_key = package_uuid or name — pop both, since a legacy row may
-        # be name-keyed). Without this, an unchanged package still present in
-        # JD (e.g. the JD-side removal above failed) hits poll_results()'s
-        # unchanged-state skip branch on the next poll and re-emits the id we
-        # just deleted from the DB (ghost-id resurrection). Evicting forces
-        # that poll to treat it as a fresh row instead.
-        for key in (uuid, name):
-            if key:
-                self._results_cache.pop(key, None)
-                self._uuid_id.pop(key, None)
-                self._best_titles.pop(key, None)
+        with self._results_state():
+            try:
+                removed = self.db.delete_download_result(id_) if self.db else 0
+            except Exception as e:
+                logger.warning("remove_package DB delete failed for id %s: %s", id_, e)
+            # Keyed by cache_key = package_uuid or name — pop both, since a
+            # legacy row may be name-keyed. Without this, an unchanged package
+            # still present in JD (e.g. the JD-side removal above failed) hits
+            # poll_results()'s unchanged-state skip branch on the next poll and
+            # re-emits the id we just deleted (ghost-id resurrection).
+            for key in (uuid, name):
+                if key:
+                    self._results_cache.pop(key, None)
+                    self._uuid_id.pop(key, None)
+                    self._best_titles.pop(key, None)
+            # _bump_epoch_LOCKED — we already hold the lock, and _epoch_lock()
+            # is a plain Lock, so _bump_epoch() here would deadlock.
+            #
+            # State the guarantee narrowly, because it is narrow: no poll whose
+            # snapshot was captured BEFORE this successful local deletion may
+            # persist that snapshot afterwards. It does NOT stop a later, fresh
+            # poll from recreating the row when JDownloader still holds the
+            # package — the JD-removal-failed case — and that is correct, since
+            # the package really is still there (peer review 2026-08-17).
+            if removed:
+                self._bump_epoch_locked()
         return {"ok": True, "removed": removed}
+
+    def remove_packages(self, ids) -> dict:
+        """Remove MANY tracked downloads in one pass. Same semantics as
+        remove_package, done once instead of N times.
+
+        WHY THIS EXISTS. The mobile "Clear done" button looped remove_package
+        over every finished row, awaiting each: with 578 rows (563 finished)
+        that is 563 sequential HTTP requests, each of which re-read all 578 rows
+        server-side and made its own JDownloader round trip. The button has no
+        busy state and no completion message, so it reads as simply not working
+        -- and navigating away part-way leaves the job half done.
+
+        The pre-existing bulk route (DELETE /download/results) is NOT the fix:
+        it deletes the rows and never tells JDownloader, so the very next poll
+        re-upserts every package JD still holds and the list comes straight
+        back. Removing from the source of truth is the whole job; deleting our
+        copy of it is cosmetic.
+
+        JDownloader's remove_links takes a LIST of package uuids, so the entire
+        set goes in a single call.
+
+        Idempotent in the same way as the single version: the DB rows are always
+        cleared, even when JD is unreachable or the packages are already gone,
+        so the UI reflects the removal rather than silently keeping rows the
+        user asked to drop.
+        """
+        wanted = {int(i) for i in (ids or []) if str(i).strip().lstrip("-").isdigit()}
+        if not wanted:
+            return {"ok": True, "removed": 0, "requested": 0, "jd_removed": True,
+                    "durable": True, "errors": []}
+        errors = []
+        try:
+            rows = self.db.get_download_results(limit=100000) if self.db else []
+        except Exception as e:  # noqa: BLE001
+            # A read failure is NOT "they were already gone" -- reporting it as a
+            # clear would tell the user the rows are deleted when we never even
+            # saw them.
+            logger.warning("remove_packages could not read results: %s", e)
+            return {"ok": False, "removed": 0, "requested": len(wanted),
+                    "jd_removed": False, "durable": False,
+                    "errors": ["could not read the download list"]}
+        targets = [r for r in rows if r.get("id") in wanted]
+
+        with_uuid, orphans, uuids, keys = [], [], [], []
+        for row in targets:
+            uuid_ = row.get("package_uuid")
+            keys.append((uuid_, row.get("name")))
+            parsed = None
+            if uuid_:
+                try:
+                    parsed = int(uuid_)
+                except (TypeError, ValueError):
+                    logger.debug("skipping unparsable package uuid %r", uuid_)
+            if parsed is None:
+                orphans.append(row)      # JD does not know it; only ours to drop
+            else:
+                with_uuid.append(row)
+                uuids.append(parsed)
+
+        jd_removed = True
+        if uuids:
+            try:
+                self._jd_phase = "remove_links"
+                device = self._connect_jd_device()
+                resp = device.downloads.remove_links([], uuids)
+                # CHECK THE RETURN, not just for an exception. remove_links
+                # returns the API response; an explicit False is a rejection and
+                # was previously read as success, because the test double
+                # returned None and never constrained it. None stays success:
+                # removeLinks is a void action, so "no data" is its normal
+                # answer, and demanding truthiness would fail every real call.
+                if resp is False:
+                    jd_removed = False
+                    errors.append("JDownloader refused the removal")
+                else:
+                    self._log("JDownloader: removed %d package(s)" % len(uuids),
+                              "info")
+            except Exception as e:  # noqa: BLE001
+                jd_removed = False
+                errors.append("JDownloader could not be reached")
+                logger.warning("remove_packages JD step failed for %d package(s): %s",
+                               len(uuids), e)
+                self._invalidate_jd_cache()
+
+        # FAIL CLOSED. If JD still holds these packages, deleting our rows is not
+        # a removal -- it is a disappearing act the next poll undoes. Keeping the
+        # rows means the list still shows the truth and the user can retry, which
+        # is strictly better than a success message followed by their silent
+        # return. Orphans have no JD side, so they go regardless.
+        deletable = (with_uuid + orphans) if jd_removed else list(orphans)
+
+        # ONE CRITICAL SECTION, matching the poll's. Deletes, cache eviction and
+        # the epoch advance happen together, so a poll either persists BEFORE all
+        # of this (and the deletes below remove what it wrote) or arrives after
+        # and sees a stale epoch. The JD call above is deliberately outside it --
+        # a wedged JDownloader must never hold this lock.
+        removed = 0
+        with self._results_state():
+            for row in deletable:
+                try:
+                    removed += self.db.delete_download_result(row["id"]) or 0
+                except Exception as e:  # noqa: BLE001
+                    errors.append("one row could not be deleted")
+                    logger.warning("remove_packages DB delete failed for id %s: %s",
+                                   row.get("id"), e)
+            # Evict ONLY what we actually deleted. Evicting a row we deliberately
+            # kept would push the next poll into the cache-miss branch and have it
+            # rewrite the row -- doing the resurrection by hand.
+            deleted_ids = {r["id"] for r in deletable}
+            for row in targets:
+                if row.get("id") not in deleted_ids:
+                    continue
+                for key in (row.get("package_uuid"), row.get("name")):
+                    if key:
+                        self._results_cache.pop(key, None)
+                        self._uuid_id.pop(key, None)
+                        self._best_titles.pop(key, None)
+            if removed:
+                self._bump_epoch_locked()
+        return {
+            "ok": jd_removed and not errors,
+            "removed": removed,
+            "requested": len(wanted),
+            # Named for what the caller needs to decide: did the packages leave
+            # JDownloader, and will this stay cleared?
+            "jd_removed": jd_removed,
+            "durable": jd_removed,
+            "kept": len(with_uuid) if not jd_removed else 0,
+            "errors": errors,
+        }
 
     def poll_results(self, record: bool = True) -> List[Dict[str, Any]]:
         """Poll JDownloader's Downloads list, derive each package's download +
@@ -937,10 +1445,30 @@ class DownloadService:
 
         Returns a list of per-package result dicts. Safe to call when JD is
         unreachable (returns []).
+
+        Wrapped in the heartbeat so a stall is CLASSIFIABLE. See
+        note_poll_iteration_start: started-vs-completed is the only thing that
+        separates "cycling and failing" from "blocked inside one call" from
+        "thread stopped", and those want different fixes.
         """
+        self.note_poll_iteration_start()
+        try:
+            return self._poll_results_inner(record)
+        finally:
+            # ALWAYS, however the iteration ends. If this never runs, the
+            # iteration never returned -- which is precisely the state the
+            # heartbeat exists to make visible.
+            self.note_poll_iteration_end()
+
+    def _poll_results_inner(self, record: bool = True) -> List[Dict[str, Any]]:
         try:
             device = self._connect_jd_device()
-        except Exception:
+        except Exception as e:
+            # NEVER silent. This bare `return []` is exactly what hid a 15-hour
+            # download stall: a failed reconnect looked identical to "nothing to
+            # report". Rate-limited so a persistent outage leaves a periodic
+            # trail rather than either a flood or nothing.
+            self._note_poll_failure(e)
             return []
 
         # Title cross-reference: clipboard adds get JD's filename-based package
@@ -948,15 +1476,26 @@ class DownloadService:
         norm_titles = self._scraped_titles_normalized()
 
         try:
+            # Capture BEFORE the snapshot: everything below describes the
+            # world as of this moment, and a removal that lands while we
+            # are reading must invalidate it.
+            snapshot_epoch = self._current_epoch()
+            self._jd_phase = "query_packages"
             packages = device.downloads.query_packages([{
                 "name": True, "uuid": True, "bytesLoaded": True,
                 "bytesTotal": True, "finished": True, "status": True,
                 "saveTo": True,
             }]) or []
         except Exception as e:
-            logger.warning("JD package poll failed: %s", e)
+            self._note_poll_failure(e)
             self._invalidate_jd_cache()
             return []
+
+        # JD answered. Recorded HERE rather than at the end of the function so
+        # liveness means "JDownloader is reachable", not "the whole poll body
+        # ran without raising" -- a bug in the parsing below must not be able to
+        # masquerade as a connection outage, nor hide one.
+        self._note_poll_success()
 
         try:
             links = device.downloads.query_links([{
@@ -964,9 +1503,16 @@ class DownloadService:
                 "finished": True, "status": True, "extractionStatus": True,
                 "bytesTotal": True, "bytesLoaded": True,
             }]) or []
+            links_observed = True
         except Exception as e:
             logger.warning("JD link poll failed: %s", e)
             links = []
+            # NOT the same as "this package has no links" (peer review 2026-08-13).
+            # An empty list from a FAILED query is an absence of observation; an
+            # empty list from a successful one is an observation of absence. Only
+            # the second may retract a provenance already proven, so the
+            # distinction has to survive from here down to the write.
+            links_observed = False
 
         by_pkg: Dict[Any, List[dict]] = {}
         for link in links:
@@ -1039,8 +1585,43 @@ class DownloadService:
             else:
                 state = "queued"
 
+            # PROVENANCE (peer review Finding 1). The release these links PROVE
+            # this package belongs to, or None. Resolved here because this is the
+            # only place the child links exist: the REST endpoint reads the
+            # database, not JDownloader, so the association has to be persisted
+            # from the poll or the two transports could never agree.
+            #
+            # A package JDownloader shows that ScanHound never sent contributes
+            # no recorded links and resolves to None, which is the whole point --
+            # matching it by display name is what produced confident links to
+            # unrelated releases.
+            # THREE states, not two (peer review 2026-08-13):
+            #
+            #   PROVEN     observation succeeded and names exactly one release
+            #   UNPROVEN   observation succeeded, names zero or several -> RETRACT
+            #   UNOBSERVED could not look -> preserve whatever was already proven
+            #
+            # Collapsing the last two to None let a stale proof outlive the
+            # evidence for it: once release B also records link L, the resolver
+            # correctly answers "no honest answer", but a COALESCE that reads that
+            # None as "nothing to say" kept showing release A indefinitely.
+            provenance_url = None
+            provenance_observed = False
+            if self.db is not None and links_observed:
+                try:
+                    provenance_url = self.db.resolve_release_by_links(
+                        [link.get("url") for link in child_links])
+                    provenance_observed = True
+                except Exception:
+                    # A lookup that threw observed nothing either -- preserve.
+                    logger.debug("provenance lookup failed for %r", name, exc_info=True)
+                    provenance_url = None
+                    provenance_observed = False
+
             row = {
                 "id": None,
+                "provenance_url": provenance_url,
+                "provenance_observed": provenance_observed,
                 "name": name, "title": title, "host": host,
                 "bytes_total": bytes_total, "bytes_loaded": bytes_loaded,
                 "downloaded": 1 if downloaded else 0,
@@ -1052,12 +1633,46 @@ class DownloadService:
             }
             results.append(row)
 
-            if record and self.db:
+            # THE STALE-SNAPSHOT GUARD (peer review 2026-08-16, MEDIUM 1).
+            # A removal that landed since `snapshot_epoch` was captured deleted
+            # rows this poll is about to write back from its PRE-removal view --
+            # and since the removal also evicted the caches, the change-key
+            # check below takes the miss branch and upserts. The package would
+            # be gone from JDownloader and permanently back in our table,
+            # because the end-of-poll prune only trims the in-memory caches and
+            # never deletes rows for packages JD no longer has.
+            #
+            # Skipping persistence costs one cycle; the next poll re-reads JD
+            # and writes a snapshot that reflects the removal.
+            # ONE CRITICAL SECTION: verify the epoch AND persist inside it.
+            # Checking and then releasing before the write is what left the race
+            # open after round 1 -- the removal could land in the gap and this
+            # poll would write the row back from its pre-removal snapshot.
+            with self._results_state():
+              if record and self.db and not self._epoch_is_current_locked(snapshot_epoch):
+                logger.debug(
+                    "skipping persistence for %r: a removal landed while this "
+                    "poll was reading JDownloader", name)
+              elif record and self.db:
                 # 'save_to' is for the returned dict (auto-rename hook) and
                 # 'id' is derived, not stored — passing either would TypeError
                 # and the whole row would (silently) never persist.
                 db_fields = {k: v for k, v in row.items() if k not in ("save_to", "id")}
-                change_key = (state, bytes_loaded, extraction, row["downloaded"], error, title)
+                # BOTH provenance fields are part of the change key.
+                #
+                # provenance_url, because a package whose links only become
+                # resolvable on a later poll would otherwise find every other
+                # field unchanged, skip the write, and never persist what it just
+                # proved -- a link permanently missing for no visible reason.
+                #
+                # provenance_observed, because without it the two states that
+                # both carry url=None are indistinguishable here: "could not
+                # look" and "looked, and the answer is now ambiguous". A batch
+                # sitting unobserved and then becoming ambiguous would produce
+                # the same key twice, skip the write, and the retraction would
+                # never reach the database however correct the SQL was.
+                change_key = (state, bytes_loaded, extraction, row["downloaded"], error,
+                              title, provenance_url, provenance_observed)
                 if self._results_cache.get(cache_key) != change_key:
                     try:
                         rid = self.db.upsert_download_result(**db_fields)
@@ -1362,7 +1977,7 @@ class DownloadService:
     ):
         """Load a source page through the appropriate traffic policy."""
         last_diag: Optional[ScrapeDiagnostic] = None
-        hdencode_request = _source_page_kind(url) == "hdencode"
+        hdencode_request = self._source_kind_of(url) == "hdencode"
 
         for attempt in range(1, attempts + 1):
             try:
@@ -1391,6 +2006,15 @@ class DownloadService:
                         return None, diag
 
                     try:
+                        # NAVIGATION BOUNDARY for the console scope. Drain the
+                        # OLD page's console lines BEFORE this navigation begins,
+                        # so everything the console carries afterwards belongs to
+                        # THIS page. Draining after driver.get (the previous
+                        # placement, inside _wait_past_cloudflare) discarded the
+                        # current navigation's own Turnstile 600* error — the
+                        # exact evidence the detector needs. Each retry attempt
+                        # re-drains here.
+                        self._drain_browser_console(driver)
                         driver.get(url)
                     except Exception as exc:
                         if hdencode_request:
@@ -1455,6 +2079,12 @@ class DownloadService:
         *,
         stage: str = "page",
         source_kind: str = "hdencode",
+        # The reveal-control tier from _find_reveal_control. "not-ready" means the
+        # control existed but had not finished verifying when our 60s window
+        # expired. That rules OUT a changed page -- the control was there -- but it
+        # does not establish source rate limiting, which this comment used to
+        # assert. Cause is unresolved; see the note at the emission site.
+        reveal_tier: Optional[str] = None,
     ) -> ScrapeDiagnostic:
         """Log page evidence and return a structured operation classification."""
         try:
@@ -1553,6 +2183,52 @@ class DownloadService:
                     f"{challenge_markers}",
                     "warning",
                 )
+            # SPLIT the challenge evidence by whether it REPLACES the page.
+            # Round-2 review, finding 4: a rendered challenge iframe used to
+            # classify a source-wide challenge on its own, which bypassed the
+            # not-ready conjunction — and misclassifying a WORKING reveal page
+            # now arms a verification hold a timer cannot release, so the stakes
+            # of that false positive are higher than before. Title/visible-body
+            # markers only appear when the page itself is a Cloudflare
+            # interstitial, so they stay authoritative; iframe markers can sit
+            # on a normal release page, so they are treated as embedded evidence
+            # and gated on the reveal being stuck (below).
+            interstitial_markers = [
+                m for m in challenge_markers if not m.startswith("iframe:")]
+            iframe_markers = [
+                m for m in challenge_markers if m.startswith("iframe:")]
+
+            # Widget-embedded Turnstile evidence: the response field, the
+            # .cf-turnstile container, a challenges.cloudflare.com iframe, or a
+            # navigation-scoped 600*-family console error. Every check above is
+            # shaped for an interstitial that REPLACES the page; HDEncode embeds
+            # the challenge inside the reveal widget, which is how a failing
+            # challenge was read as a source throttle for two weeks.
+            # Supply the unlock-endpoint predicate so a cf-turnstile-response
+            # field only counts as reveal evidence when it belongs to a form
+            # that posts THIS page's unlock endpoint — a Turnstile widget on the
+            # page's comment/report form is not evidence about the reveal (fold
+            # review, ChatGPT + b087aa20). One copy of "does this post the unlock
+            # endpoint?" — _resolves_to_unlock_target — injected, not reimplemented.
+            try:
+                _page_url = driver.current_url or ""
+            except Exception:
+                _page_url = ""
+            _unlock_target = (
+                (lambda target: _resolves_to_unlock_target(target, _page_url))
+                if _page_url else None)
+            turnstile_markers = list(turnstile_challenge_evidence(
+                html, self._browser_console_lines(driver),
+                unlock_target=_unlock_target,
+            ))
+            if turnstile_markers:
+                signals.extend(
+                    m for m in turnstile_markers if m not in signals
+                )
+                self._log(
+                    f"[HDEncode][diag] Turnstile evidence: {turnstile_markers}",
+                    "warning",
+                )
 
             if keyword:
                 keyword_present = keyword.lower() in low
@@ -1576,17 +2252,85 @@ class DownloadService:
                     affects_source_health=False,
                     signals=tuple(signals),
                 )
-            if header_challenge or captcha_frames or challenge_markers:
+            reveal_not_ready = (
+                stage == "access_control" and reveal_tier == "not-ready")
+            # A PAGE-REPLACING INTERSTITIAL has NO access/download/link controls —
+            # `candidates` is empty. That STRUCTURAL property is what a genuine
+            # Cloudflare interstitial has and a working release page never does,
+            # and it is immune to two things the body-phrase approach was not
+            # (peer review of the fold, agent/turnstile-classification):
+            #   * release pages carry "access denied"/"just a moment" as
+            #     related-release NAMES, so keying on the phrase false-positives;
+            #   * invisible Turnstile renders a TRANSIENT iframe (~11s build/
+            #     teardown) on otherwise-working pages, so keying on the iframe
+            #     alone would arm a source-wide hold on a healthy source.
+            # So a rendered challenge iframe on a control-less page is the
+            # interstitial; the same iframe on a page WITH controls is the
+            # embedded case, gated on a not-ready reveal below.
+            #
+            # AND no reveal control was found. reveal_tier tells us directly: a
+            # working page yields "links-control" and an active reveal challenge
+            # yields "not-ready" — in both a control WAS found, so it is not a
+            # page-replacing interstitial. Only None/"none" (no reveal control at
+            # all) qualifies. This resolves the artificial-but-instructive case
+            # of a bare iframe reported as a ready reveal: the reveal tier, not
+            # just the absence of other controls, decides.
+            # ...and NO positive working-page evidence of any kind. `candidates`
+            # (lexical access/download/link labels) is necessary but NOT
+            # sufficient: a post-click page can expose a real file-host link
+            # whose visible label is just "Rapidgator" — no lexical keyword — so
+            # `candidates` is empty while the page is plainly working. `host_links`
+            # (actual Rapidgator/Nitroflare/1fichier/DDownload URLs) is the
+            # stronger signal, and the transient invisible-Turnstile iframe on a
+            # different-host post-click page is exactly the reviewers' reachable
+            # false positive. Require the absence of BOTH.
+            interstitial_shape = (
+                bool(captcha_frames or iframe_markers)
+                and not candidates
+                and not host_links
+                and reveal_tier in (None, "none"))
+            # TOP-LEVEL interstitial: the page IS the challenge — a cf-mitigated
+            # header, an interstitial <title>, or the control-less iframe shape.
+            # Reveal state is irrelevant; there is no working reveal to be in.
+            top_level_challenge = (
+                header_challenge or bool(interstitial_markers)
+                or interstitial_shape)
+            # EMBEDDED challenge widget on an otherwise-normal release page:
+            # Turnstile in the reveal, or a captcha iframe. This is a source-wide
+            # challenge ONLY when the reveal itself is stuck — the conjunction.
+            # captcha_frames and iframe_markers are the same rendered-iframe
+            # evidence surfaced two ways; turnstile_markers adds the response
+            # field / container / navigation-scoped 600* console line.
+            embedded_challenge = bool(
+                captcha_frames or iframe_markers or turnstile_markers)
+            if top_level_challenge or (embedded_challenge and reveal_not_ready):
+                # Measured on the live stall: Turnstile logged `Error: 600010.`
+                # while the reveal sat at "Verifying…" and the user's own
+                # browser passed the same challenge in under a second. Embedded
+                # evidence deliberately does NOT classify outside the not-ready
+                # reveal state — a dormant/unrelated widget on a working reveal
+                # page proves nothing, and (round-2 review) must not strand the
+                # source under a hold a timer cannot release.
                 decision = None
                 if source_kind == "hdencode":
                     decision = get_hdencode_coordinator().observe_challenge()
+                if reveal_not_ready:
+                    signals.append("reveal-tier:not-ready")
                 return ScrapeDiagnostic(
                     ScrapeCode.INTERACTIVE_CHALLENGE,
                     retryable=False,
                     affects_source_health=True,
                     signals=tuple(signals),
                     stage="verification",
-                    cause_code="interactive_challenge",
+                    # The MECHANISM, when proven; the generic label otherwise.
+                    # last_cause_code is one of only three fields the queue
+                    # persists, so this is where "it was Turnstile" survives
+                    # log rotation.
+                    cause_code=(
+                        TURNSTILE_CAUSE_CODE
+                        if turnstile_markers
+                        else "interactive_challenge"
+                    ),
                     cooldown_until=(
                         decision.cooldown_until if decision is not None else None
                     ),
@@ -1600,11 +2344,105 @@ class DownloadService:
                         else "outcome_recorder"
                     ),
                 )
-            if stage == "access_control":
+            if stage == "access_control" and reveal_tier == "not-ready":
+                # A STALLED VERIFY IS A THROTTLE, NOT A BROKEN PAGE.
+                #
+                # This previously fell through to LAYOUT_CHANGED: retryable=False,
+                # no cooldown, no coordinator notification. The consequence was
+                # not one lost item. The batch never paused, the queue kept
+                # marching at its configured spacing, and every remaining item
+                # hit the same closed door and became permanently terminal. 78
+                # items accumulated that way, with automated_retry_count 0 on
+                # every one.
+                #
+                # observe_challenge sets the shared cooldown and returns the
+                # cooldown_until the queue needs to pause the batch and later
+                # auto-resume.
+                decision = None
+                if source_kind == "hdencode":
+                    # observe_reveal_stall, not observe_challenge: the latter
+                    # hard-codes the 1h Cloudflare value, which measurement on
+                    # 2026-08-06 showed is far shorter than a real reveal
+                    # throttle (~5h and still active at the first probe).
+                    decision = get_hdencode_coordinator().observe_reveal_stall(
+                        "reveal_verification_stalled")
+                signals.append("reveal-tier:not-ready")
                 return ScrapeDiagnostic(
-                    ScrapeCode.LAYOUT_CHANGED,
+                    ScrapeCode.REVEAL_VERIFICATION_STALLED,
+                    # RETRYABLE: the release is fine, the source was busy.
+                    retryable=True,
+                    affects_source_health=True,
+                    signals=tuple(signals),
+                    stage="access_control",
+                    cause_code="reveal_verification_stalled",
+                    cooldown_until=(
+                        decision.cooldown_until if decision is not None else None
+                    ),
+                    transport_attempted=True,
+                    # The SOURCE is throttled, not this one item, so the batch
+                    # must pause rather than burn the rest of the queue.
+                    affected_scope="source",
+                    retry_mode="after_cooldown",
+                    action_code="wait_for_cooldown",
+                    health_owner=(
+                        "coordinator" if source_kind == "hdencode"
+                        else "outcome_recorder"
+                    ),
+                )
+            if stage == "access_control":
+                # CONSERVE THE TIER (peer review 2026-08-12). _find_reveal_control
+                # already distinguishes three materially different observations,
+                # and this collapsed all of them into LAYOUT_CHANGED — whose own
+                # comment asserted "A real layout change":
+                #   destination-rejected -> a links-labelled submit EXISTS but its
+                #       effective destination no longer matches the expected unlock
+                #       endpoint. Positive evidence the reveal contract changed.
+                #   ambiguous            -> several otherwise-valid reveal controls.
+                #       Also positive unexpected-structure evidence.
+                #   none                 -> nothing qualifying was proven. Equally
+                #       consistent with a page-specific restriction, a login or
+                #       region gate, a pulled release, an error page, an
+                #       unrecognised block, or an alternate template.
+                # Calling "none" a layout change picks one hypothesis without
+                # evidence — and because both feed source health, one unclassified
+                # page could read as a source regression. Splitting them is what
+                # makes a REAL source-wide change detectable: it can no longer be
+                # impersonated by a single gated page. Both still affect source
+                # health exactly as before; deciding health by aggregation rather
+                # than by one item is a follow-up that needs the aggregate first.
+                tier_signal = "reveal-tier:%s" % (reveal_tier or "unknown")
+                if tier_signal not in signals:
+                    signals.append(tier_signal)
+                # TWO LITERAL CALL SITES, not one conditional code. A ternary here
+                # made the reason code non-literal, which
+                # test_scrape_reason_policy_invariant flags because a static audit
+                # of reason codes can no longer see it. The invariant is worth more
+                # than the brevity.
+                # transport_attempted=True IS LOAD-BEARING, not decoration.
+                # Both of these are decided AFTER navigation -- we are looking at
+                # `reveal_tier`, which only exists because the page was fetched
+                # and inspected. ScrapeDiagnostic defaults the flag to None,
+                # which _close_attempt reduces to False, and
+                # scraper_drift_report() counts only transport_attempted = 1.
+                # So without this the drift detector could never see a single
+                # real structural failure: the feature shipped inert, and its
+                # own tests passed because they build attempt rows directly
+                # instead of going through this producer. (2026-08-16 peer
+                # review, and the same consumer-not-verified shape as the four
+                # bugs that review was about.)
+                if reveal_tier in ("ambiguous", "destination-rejected"):
+                    return ScrapeDiagnostic(
+                        ScrapeCode.LAYOUT_CHANGED,
+                        retryable=False,
+                        affects_source_health=True,
+                        transport_attempted=True,
+                        signals=tuple(signals),
+                    )
+                return ScrapeDiagnostic(
+                    ScrapeCode.REVEAL_CONTROL_ABSENT,
                     retryable=False,
                     affects_source_health=True,
+                    transport_attempted=True,
                     signals=tuple(signals),
                 )
             if stage == "requested_host":
@@ -1685,6 +2523,10 @@ class DownloadService:
         # not_ready_seen separates "countdown ran then finished" from "the page
         # was simply slow", so the real countdown duration can be measured and
         # the temporary 60s ceiling replaced with a tuned value.
+        # The tier IS the diagnosis and was previously logged then discarded, so
+        # the caller could only report "no button found". Stored on the instance,
+        # matching the existing _last_cf_mitigated pattern, so no signatures move.
+        self._last_reveal_tier = tier
         self._log(
             f"[HDEncode] reveal-control tier={tier} "
             f"elapsed={time.monotonic() - started:.1f}s "
@@ -1803,6 +2645,33 @@ class DownloadService:
             )
         return value
 
+    def _drain_browser_console(self, driver) -> None:
+        """Mark a navigation boundary in the browser (console) log.
+
+        ``get_log`` DRAINS, so whatever this call discards belonged to the
+        previous page. Called at the top of ``_wait_past_cloudflare``, which
+        runs once per navigation (including the post-click one), so a Turnstile
+        error the OLD page logged can never classify the next page — the
+        navigation scoping ``is_turnstile_console_failure`` requires of its
+        caller lives here.
+        """
+        try:
+            driver.get_log("browser")
+        except Exception:
+            pass
+
+    def _browser_console_lines(self, driver) -> list:
+        """Console messages logged since the last navigation boundary.
+
+        Empty on any failure — an adapter without console logging means "no
+        signal", never "no challenge", so page evidence still decides.
+        """
+        try:
+            entries = driver.get_log("browser")
+        except Exception:
+            return []
+        return [str(entry.get("message") or "") for entry in entries or ()]
+
     def _wait_past_cloudflare(
         self,
         driver,
@@ -1810,7 +2679,14 @@ class DownloadService:
         *,
         source_kind: str = "other",
     ) -> Optional[ScrapeDiagnostic]:
-        """Passively wait for a transient browser check without solving it."""
+        """Passively wait for a transient browser check without solving it.
+
+        Does NOT drain the browser console: draining here would run AFTER the
+        navigation that produced the challenge (this method is called after
+        driver.get and after the reveal click), discarding the current page's
+        own 600* error. The drain is a PRE-navigation boundary instead — see
+        _navigate_with_diagnostic and the reveal-click path.
+        """
         # Read the navigation's response headers once, before polling the page.
         # cf-mitigated is authoritative and language-independent, so a custom or
         # localized Challenge Page is recognised even with no English phrase and
@@ -1869,7 +2745,7 @@ class DownloadService:
         """
         # Classify once by parsed hostname. Query/path text such as
         # `?next=https://ddlbase.com` must not bypass the HDEncode off switch.
-        source_kind = _source_page_kind(url)
+        source_kind = self._source_kind_of(url)
         if source_kind == "hdencode" and not source_enabled(
             self.config,
             "hdencode_enabled",
@@ -1889,6 +2765,91 @@ class DownloadService:
             )
             self._log(f"[HDEncode] {diagnostic.message}", "warning")
             return ScrapedLinks(diagnostic=diagnostic)
+
+        # EXHAUSTIVE DISPATCH over source_identity.SOURCE_KINDS. Handled here,
+        # before the browser is started, because neither of these kinds has a
+        # source page to read and launching Chromium for them is pure waste.
+        #
+        # ROUND 7 CORRECTED A CLAIM I MADE TWICE. I wrote -- in a commit message
+        # and again in a review package -- that direct file hosts "already bypass
+        # scrape_links entirely", and used that to argue the classifier change was
+        # safe for dispatch. It is false. download_item() calls scrape_links()
+        # FIRST and only falls back to `links = [url]` after it returns nothing.
+        # So a pasted Rapidgator URL was being run through HDEncode reveal-page
+        # logic: it clicked for a reveal control that cannot exist, then reported
+        # layout_changed or a reveal stall -- attributing the failure to HDEncode's
+        # source health, and on the throttle path putting the whole source into a
+        # cooldown, because of a URL that has nothing to do with HDEncode.
+        #
+        # There is deliberately NO `else` here. When a sixth kind is added, the
+        # branch below raises on the unhandled value rather than silently treating
+        # it as HDEncode, which is how `other` came to mean `hdencode` in the first
+        # place.
+        if source_kind == "direct_file":
+            # THE URL IS THE LINK. Return it.
+            #
+            # CORRECTED ON ROUND 8. My first version returned an EMPTY result plus a
+            # diagnostic, designed so download_item()'s existing
+            # `if not links: ... links = [url]` fallback would fire. That works for
+            # exactly one caller, and I validated it against exactly that caller.
+            # There are FIVE production consumers of scrape_links():
+            #
+            #   api/routes/downloads.py:361   POST /download/scrape
+            #   api/routes/downloads.py:419   /download/copy-links
+            #   download_service.py           download_item()      <- the only one
+            #   hdencode_action_service.py    RSS action retrieval     with a
+            #   ui/controllers/download_controller.py  batch scrape     fallback
+            #
+            # The other four treat "no links" as failure, so a pasted Rapidgator URL
+            # returned nothing from /download/scrape, was filed as a FAILURE by
+            # copy-links, and silently produced nothing through the RSS action
+            # service and the UI batch scrape. A caller-level regression that no
+            # amount of dispatch testing inside this module could see.
+            #
+            # "Give me downloadable links" should return the downloadable link to
+            # every caller. A success-with-passthrough side channel would instead
+            # make all five learn a new convention, which is how this class of bug
+            # keeps happening.
+            #
+            # THE SUPPORTED-HOST GATE IS NOT OPTIONAL. Identity knows 13 direct
+            # hosts (source_identity.DIRECT_FILE_HOSTS); the downloader can only
+            # hand off 4 (_SUPPORTED_DOWNLOAD_HOSTS). Returning [url] for the other
+            # 9 would hand download_item a host it currently refuses -- a silent
+            # behaviour change smuggled in as a bug fix. For those, the diagnostic
+            # is the honest answer: we know exactly what this link is and cannot
+            # take it.
+            if self._is_supported_download_link(url):
+                return ScrapedLinks([url])
+            return ScrapedLinks(diagnostic=ScrapeDiagnostic(
+                ScrapeCode.DIRECT_LINK_NO_SOURCE_PAGE,
+                retryable=False,
+                affects_source_health=False,
+                stage="source_gate",
+                cause_code="direct_link_unsupported_host",
+                transport_attempted=False,
+                affected_scope="item",
+                retry_mode="none",
+                health_owner="none",
+            ))
+        if source_kind == "other":
+            return ScrapedLinks(diagnostic=ScrapeDiagnostic(
+                ScrapeCode.UNSUPPORTED_SOURCE,
+                retryable=False,
+                affects_source_health=False,
+                stage="source_gate",
+                cause_code="unsupported_source",
+                transport_attempted=False,
+                affected_scope="item",
+                retry_mode="none",
+                action_code="remove_item",
+                health_owner="none",
+            ))
+        if source_kind not in ("hdencode", "ddlbase", "adithd"):
+            raise AssertionError(
+                f"unhandled source kind {source_kind!r} in scrape_links dispatch; "
+                "add an explicit branch rather than letting it reach the HDEncode "
+                "implementation"
+            )
 
         try:
             if source_kind != "hdencode":
@@ -1923,7 +2884,11 @@ class DownloadService:
                         self._scrape_adithd_links(url, service_type)
                     )
 
-                # Default: HDEncode. Map the requested host to its link keyword.
+                # HDEncode -- reached only for source_kind == "hdencode" now that
+                # the four other kinds are dispatched explicitly above. This was
+                # the `default` branch, i.e. the semantic default-to-HDEncode the
+                # affirmative classifier was built to remove.
+                # Map the requested host to its link keyword.
                 # The old `== "Rapidgator" else "nitroflare"` silently searched
                 # nitroflare for ANY other value (1fichier/ddownload/lowercase).
                 _host_keywords = {"rapidgator": "rapidgator", "nitroflare": "nitroflare",
@@ -1966,19 +2931,72 @@ class DownloadService:
                             f"{service_type} link(s)",
                             "success",
                         )
+                        # SECOND success path, and I only found it because the
+                        # wiring test for the reset came back with the links
+                        # present and the coordinator never called. I had put the
+                        # reset on the post-click branch alone and would have
+                        # reported the reset "wired" on a diff read.
+                        #
+                        # It counts as success for the same reason the other one
+                        # does: HDEncode delivered file-host links. The rule is
+                        # deliberately "the source served links", not "the reveal
+                        # control worked" -- a page that needs no reveal is still
+                        # a page HDEncode is not throttling, and leaving the streak
+                        # inflated here would half-fix the escalation ratchet.
+                        if source_kind == "hdencode":
+                            get_hdencode_coordinator().observe_reveal_success()
                         return ScrapedLinks(visible_links)
 
                     self._log("[HDEncode] Looking for the 'View links' button...")
                     access_btn = self._find_reveal_control(driver)
 
                     if not access_btn:
-                        self._log(
-                            f"[HDEncode] No 'View links' button found (title: {page_title!r}). "
-                            "Page may be a Cloudflare wall, login gate, or changed layout.",
-                            "warning",
-                        )
+                        tier = getattr(self, "_last_reveal_tier", None)
+                        if tier == "not-ready":
+                            # Not a missing button. HDEncode served the unlock
+                            # form and never finished verifying it. Production
+                            # evidence 2026-08-06: three reveals succeeded in
+                            # 0.1-0.8s, then five consecutive attempts sat at
+                            # "Verifying... Please wait" for the full 60s
+                            # ceiling, with the page shape identical throughout
+                            # (6 forms, same #unlocked action, 92-94 links).
+                            #
+                            # THAT IS A STATE TRANSITION, NOT A PROVEN CAUSE.
+                            # Corrected 2026-08-08 on peer review round 9. This
+                            # comment used to end "That is rate-limiting." and the
+                            # log asserted it as fact. What is actually observed is
+                            # only: a not-ready reveal state was seen, and no usable
+                            # links control appeared before OUR 60-second deadline.
+                            #
+                            # Every 60s observation is RIGHT-CENSORED -- we stop
+                            # measuring at 60s, so the data cannot distinguish a
+                            # widget that would have finished at 62s from one that
+                            # never finishes. And source-side limiting is
+                            # indistinguishable here from browser/session state:
+                            # ScanHound reuses a PERSISTENT Chromium profile
+                            # (--user-data-dir=/data/browser-profiles/hdencode), so
+                            # cookies and site state survive process restarts.
+                            #
+                            # Naming an unproven cause in the log is not harmless:
+                            # it is what a reader (including me, for days) treats as
+                            # the finding, and it justified an expensive source-wide
+                            # cooldown. See docs/reviews/peer-rounds/
+                            # reveal-stall-root-cause.md.
+                            self._log(
+                                "[HDEncode] The reveal control did not finish "
+                                "verifying within the 60s observation window "
+                                f"(title: {page_title!r}); cause is not yet "
+                                "established. Cooling down.",
+                                "warning",
+                            )
+                        else:
+                            self._log(
+                                f"[HDEncode] No 'View links' button found (title: {page_title!r}). "
+                                "Page may be a Cloudflare wall, login gate, or changed layout.",
+                                "warning",
+                            )
                         diagnostic = self._log_page_diagnostics(
-                            driver, stage="access_control"
+                            driver, stage="access_control", reveal_tier=tier
                         )
                         return ScrapedLinks(diagnostic=diagnostic)
 
@@ -1988,6 +3006,11 @@ class DownloadService:
                         btn_desc = "?"
                     self._log(f"[HDEncode] Access control found ({btn_desc!r}) — clicking")
                     driver.execute_script("arguments[0].scrollIntoView();", access_btn)
+                    # NAVIGATION BOUNDARY: the click submits the unlock form, a new
+                    # top-level navigation that can present its own Turnstile. Drain
+                    # BEFORE it so the post-click _wait_past_cloudflare/diagnostics
+                    # read only this navigation's console (incl. its 600* error).
+                    self._drain_browser_console(driver)
                     try:
                         access_btn.click()
                     except Exception as click_exc:
@@ -2037,6 +3060,26 @@ class DownloadService:
 
                     if links:
                         self._log(f"[HDEncode] Found {len(links)} {service_type} link(s); first: {links[0]}", "success")
+                        # THE MIRROR OF observe_reveal_stall, wired 2026-08-07.
+                        #
+                        # observe_reveal_success() existed with NO production
+                        # caller -- the fifth "signal nothing consumes" of this
+                        # effort, and its own docstring named the consequence:
+                        # the stall streak ratchets up and every later stall draws
+                        # the maximum cooldown regardless of how healthy the source
+                        # had been in between. The streak is in-memory with no
+                        # persistence, so the only thing that cleared it was a
+                        # container restart -- a throttle dial reset by process
+                        # lifetime instead of by evidence.
+                        #
+                        # HERE, and not at tier == "links-control", because a
+                        # control being present is not proof the reveal completed:
+                        # the click can still be challenged, time out, or yield
+                        # nothing. Delivered file-host links are unambiguous. The
+                        # `source_kind` gate matches observe_reveal_stall's exactly
+                        # so the two cannot drift.
+                        if source_kind == "hdencode":
+                            get_hdencode_coordinator().observe_reveal_success()
                     else:
                         self._log(f"[HDEncode] 0 {service_type} links parsed from the page", "warning")
                         diagnostic = self._log_page_diagnostics(
@@ -2577,6 +3620,26 @@ class DownloadService:
             "retry_mode": "none",
             "cooldown_until": None,
             "transport_attempted": None,
+            # AFFIRMATIVE SOURCE-PROGRESS SIGNAL, added 2026-08-07 on peer review.
+            # Set to True ONLY by a path that genuinely crossed the source
+            # boundary. The pre-scrape dedup returns success without contacting
+            # the source and leaves this False, which is the distinction the
+            # queue's retry-budget refund depends on.
+            #
+            # A previous attempt inferred this from transport_attempted, which
+            # does not work: that field is initialised None here and NONE of the
+            # real success paths set it, so the inference silently never fired.
+            # Only an explicit signal, set where the delivery actually happens,
+            # is trustworthy.
+            "source_progress": False,
+            # AFFIRMATIVE SOURCE-REVEAL signal, added on round-2 review
+            # (finding 6). True once the SOURCE served its file-host links — the
+            # reveal/challenge demonstrably cleared for our session — regardless
+            # of whether the downstream JDownloader hand-off then succeeded. The
+            # verification hold owns source accessibility, not delivery, so this
+            # (not source_progress) is what releases it. A pre-scrape dedup and a
+            # pasted direct-link URL both leave it False: neither read the source.
+            "source_reveal_succeeded": False,
             "affected_scope": "item",
             "action_code": None,
             "deferred": False,
@@ -2640,7 +3703,7 @@ class DownloadService:
         try:
             links = self.scrape_links(url, service_type, progress_callback=_cb)
             diagnostic = getattr(links, "diagnostic", None)
-            if _source_page_kind(url) == "hdencode":
+            if self._source_kind_of(url) == "hdencode":
                 record_scrape_outcome(self.db, "hdencode", links)
         except Exception as e:
             links = []
@@ -2655,6 +3718,11 @@ class DownloadService:
                 },
                 _cb=_cb,
             )
+
+        # The source served its file-host links: the reveal/challenge cleared
+        # for our session. Captured BEFORE the direct-link fallback below, which
+        # sets links=[url] without ever reading a source page.
+        reveal_served = bool(links)
 
         if not links:
             # Only fall back to the URL itself if it is *already* a file-host
@@ -2689,6 +3757,7 @@ class DownloadService:
 
         self._progress("download:links_found", {"title": title, "link_count": len(links)}, _cb=_cb)
         result["link_count"] = len(links)
+        result["source_reveal_succeeded"] = reveal_served
         # Remember which movie/show these links belong to (for broken-link tracing)
         if self.db and title:
             try:
@@ -2716,8 +3785,17 @@ class DownloadService:
 
         if self.config.get("jd_enabled", False) and (jd_folder or jd_method == "api"):
             if self.send_to_jdownloader(links, package_name, destination=destination, progress_callback=_cb):
+                # Provenance for the live downloads view (peer review Finding 1):
+                # remember which links belong to this release, so a package can
+                # later be proven ours instead of matched by display name. After
+                # the send succeeded, so a failed send records nothing. Never
+                # raises — an unrecorded link only costs a missing source link,
+                # and must not fail a grab that actually went out.
+                if self.db is not None:
+                    self.db.record_submitted_links(url, links)
                 result["success"] = True
                 result["method"] = "jdownloader"
+                result["source_progress"] = True
                 result["message"] = f"Sent {len(links)} links to JDownloader"
                 result["history_saved"] = self.save_to_history(
                     url, title, season, resolution, size, status="completed",
@@ -2739,6 +3817,7 @@ class DownloadService:
         if not self.server_mode and self.copy_to_clipboard(links):
             result["success"] = True
             result["method"] = "clipboard"
+            result["source_progress"] = True
             result["message"] = f"Copied {len(links)} links to clipboard"
             result["history_saved"] = self.save_to_history(
                 url, title, season, resolution, size, status="clipboard",
@@ -2754,6 +3833,7 @@ class DownloadService:
         if not self.server_mode and self.open_url(url):
             result["success"] = True
             result["method"] = "browser"
+            result["source_progress"] = True
             result["message"] = "Opened URL in browser"
             result["history_saved"] = self.save_to_history(
                 url, title, season, resolution, size, status="browser",
