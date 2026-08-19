@@ -187,3 +187,72 @@ The original quoted ~84% fewer discovery requests. Measured across the 499
 cycles that completed normally: **64.3%** (1,034 RSS requests against 5,073
 listing requests). Still a large saving, but the smaller number is the one to
 decide on.
+
+---
+
+# This design already exists — 2026-08-19 (later the same day)
+
+A branch audit turned up `agent/hybrid-sweep-rebased`: 118 commits through
+sixteen peer-review rounds, stalled since **2026-08-05**, now integrated with
+`main` and open as draft **#94**.
+
+**It already implements the hybrid this document proposes.** This document was
+written 08-11, six days after that branch stalled, and does not reference it. I
+did not know it existed until today.
+
+## What `backend/sweep/gate.py` already has
+
+The canary is not a concept there, it is an enum:
+
+```text
+COVERED_BY_RSS               RSS surfaced it
+COVERED_BY_SWEEP             the sweep did
+RSS_RED_COVERED_BY_SWEEP     RSS failed, the sweep caught it -- still covered
+```
+
+with the governing rule stated as *"a RED RSS item recovered by a complete
+sweep is an RSS-health metric, not an uncovered release."* It degrades the
+feed's score and leaves coverage intact. That is precisely the hybrid proposed
+above, made executable.
+
+It also holds three things this document does not have at all:
+
+1. **A `pending` state.** An item younger than the acquisition band has no
+   coverage answer yet — *"an item that has existed for twenty minutes has not
+   been missed by a 6-hour band; declaring it missed is measuring the clock,
+   not the pipeline."*
+2. **Ambiguity resolved before scoring.** An item that cannot be identified is
+   never guessed onto either axis.
+3. **A request-cost floor.** `MIN_REQUEST_REDUCTION = 0.50`,
+   `TARGET_REQUEST_REDUCTION = 0.70`. Promotion fails below the floor
+   regardless of coverage. This document proposed no cost threshold at all.
+
+Its `gate.py` opens by describing the same measurement error the section above
+corrects — 100 recorded misses being 99 normal acquisitions with ~1h median lag
+— reached independently on 08-05 from 100 misses, and again on 08-19 from 201.
+
+## The 28-day evidence, restated as input to that gate
+
+| measure | value | against the sweep's own thresholds |
+|---|---|---|
+| Request reduction | **64.3%** | clears `MIN` 0.50, **misses `TARGET` 0.70** |
+| Misses that were lag | **189 / 201** (median 1.1h) | the `RSS_RED_COVERED_BY_SWEEP` case |
+| Never acquired | **12** | 11 of them back catalogue |
+| Days since last never-acquired | **9** | — |
+
+The 64.3% figure is the one to carry forward: it is a genuine gate input under
+`gate.py`'s cost rule, and it sits between the floor and the target.
+
+## What happens to the rolling 14-day rule proposed above
+
+**Treat it as provisional and check it against the sweep's model first.** The
+sweep's gate classifies *items*; a promotion decision is a separate layer, and
+the contract's row R-14 grades a window against predeclared thresholds. My rule
+may duplicate machinery that already exists there, or contradict it. It was
+written without knowledge of `gate.py` and should not be adopted over it by
+default.
+
+## Disposition
+
+This PR stays open as the **evidence record**, not as a competing design. The
+implementation question is settled: it lives in #94.
