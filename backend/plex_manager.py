@@ -466,7 +466,19 @@ class PlexManager:
         lock, so a read-modify-write on one movie cannot interleave -- and the
         same lock across every PlexManager instance, which is what makes it a
         guard on the Plex item rather than on one manager object."""
-        return _LABEL_LOCKS[hash(str(rating_key)) % _LABEL_LOCK_STRIPES]
+        # Keyed by the SAME int() the write itself uses, so the lock and the
+        # item can never disagree: `hash(str(key))` gave "00123" and 123
+        # different stripes while fetchItem() resolved them to one Plex item.
+        # Not a live race -- real rating keys are canonical -- but keying on the
+        # canonical form removes the alias and the PYTHONHASHSEED question at
+        # once. Sequential integer keys spread evenly across the stripes.
+        try:
+            canonical = int(rating_key)
+        except (TypeError, ValueError):
+            # Unparseable here means the write below will raise anyway; pick a
+            # stable stripe rather than crash inside the lock lookup.
+            canonical = hash(str(rating_key))
+        return _LABEL_LOCKS[canonical % _LABEL_LOCK_STRIPES]
 
     def add_label(self, rating_key, label):
         """Add a Plex label to the item with ``rating_key`` (TEXT-safe).

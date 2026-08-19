@@ -1,7 +1,9 @@
 """Badge a Plex movie with HOW MANY versions it has.
 
 The owner keeps multiple versions deliberately — 1,029 movies in this library
-have more than one file — and wants the poster to say so. Kometa overlays are
+have more than one PLEX VERSION — and wants the poster to say so. Versions, not
+files: a multipart rip is several files of ONE version, which is exactly the
+distinction that made the first implementation over-count. Kometa overlays are
 label-gated with fixed text, so a COUNT means one label per value rather than
 one label with a number in it.
 
@@ -44,7 +46,7 @@ def version_label(count):
     generating an unbounded label vocabulary. That bucket is not padding — Kometa
     needs one overlay block per label, so a count with no label produces no
     overlay, and the poster would silently lose its badge in a way that looks
-    exactly like "this movie has one version". Live data today: 983 twos, 48
+    exactly like "this movie has one version". Live data today: 983 twos, 45
     threes, 1 four, 0 fives.
     """
     if not isinstance(count, int) or count < 2:
@@ -175,16 +177,27 @@ def sync_version_labels(db, pm, config, *, dry_run=False, progress_cb=None):
     # records a failure, and the pass reports complete -- so the generation is
     # consumed and the badges stay stale (peer review M2/B). An empty table is
     # still a valid answer; only a failed read raises.
-    cache_failures = 0
     try:
-        if hasattr(db, "list_plex_cache_movies_strict"):
-            rows = db.list_plex_cache_movies_strict()
-        else:
-            rows = db.list_plex_cache_movies() if hasattr(db, "list_plex_cache_movies") else []
+        # MANDATORY, not best-effort. An earlier version fell back to the soft
+        # reader when the strict one was absent, which quietly restored the
+        # ambiguous "[] on failure" contract this whole round exists to remove.
+        # A db that cannot read strictly cannot supply evidence, so that is an
+        # incomplete sync (peer review round 3, INFO).
+        rows = db.list_plex_cache_movies_strict()
     except Exception as e:  # noqa: BLE001
-        cache_failures = 1
-        rows = []
         logger.warning("version labels: plex_cache read failed: %s", e)
+        # NOTHING BELOW CAN DO USEFUL WORK. Without counts every title
+        # reconciles as unknown and no write can happen, so enumerating the
+        # whole Plex library would be a pointless round trip. Return the
+        # incomplete result now; the caller retries the same generation.
+        return {
+            "total": 0, "added_attempted": 0, "removed_attempted": 0,
+            "multi_version": 0, "unknown": 0, "dry_run": dry_run,
+            "cache_failures": 1, "lib_failures": 0, "title_failures": 0,
+            "write_failures": 0, "complete": False,
+        }
+    # Zero by construction: the failure path above already returned.
+    cache_failures = 0
     counts = count_versions(rows)
     multi = sum(1 for c in counts.values() if c > 1)
     logger.info("version labels: %d cached movie rows -> %d titles, %d multi-version",

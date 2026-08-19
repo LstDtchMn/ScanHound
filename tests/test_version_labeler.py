@@ -551,3 +551,34 @@ class TestAnEmptyReadIsNotASuccessfulRead:
         sync_version_labels(db, self._pm([_movie(1)]), {"movie_libs": ["Movies"]})
         db.list_plex_cache_movies_strict.assert_called_once()
         db.list_plex_cache_movies.assert_not_called()
+
+    def test_a_db_WITHOUT_the_strict_reader_fails_closed(self):
+        """Catches the fallback coming back. The earlier version of this test
+        asserted `list_plex_cache_movies.assert_not_called()` on a MagicMock —
+        useless, because a MagicMock has EVERY attribute, so a `hasattr` check
+        always took the strict branch and the fallback was never exercised.
+
+        A db that genuinely lacks the strict method must make the pass
+        incomplete, not quietly read softly."""
+        class _OldDb:
+            def list_plex_cache_movies(self):
+                return []          # the ambiguous contract we refuse to trust
+
+        pm = MagicMock()
+        lib = MagicMock(); lib.all.return_value = [_movie(1)]
+        pm.get_library_section.return_value = lib
+        out = sync_version_labels(_OldDb(), pm, {"movie_libs": ["Movies"]})
+        assert out["cache_failures"] == 1
+        assert out["complete"] is False
+
+    def test_the_failed_read_returns_IMMEDIATELY_without_enumerating_plex(self):
+        """Efficiency, and evidence the early return is real: with no counts
+        every title would reconcile as unknown anyway, so the library must not
+        be walked at all."""
+        db = MagicMock()
+        db.list_plex_cache_movies_strict.side_effect = RuntimeError("db down")
+        pm = MagicMock()
+        out = sync_version_labels(db, pm, {"movie_libs": ["Movies"]})
+        assert out["complete"] is False
+        pm.get_library_section.assert_not_called()
+        assert out["total"] == 0

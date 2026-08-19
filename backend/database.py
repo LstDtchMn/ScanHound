@@ -3511,13 +3511,24 @@ class DatabaseManager:
                 logger.debug("Rollback failed: %s", rb_err)
             logger.error("DB Error (save_cache): %s", e)
 
+    #: ONE projection, two error contracts. Shared so the strict reader's claim
+    #: to return "the same rows" cannot quietly stop being true: `media_id`
+    #: became load-bearing for the version badges, and a column added to one
+    #: SELECT but not the other is precisely the drift that produced H1.
+    _PLEX_CACHE_MOVIES_SQL = (
+        "SELECT key, title, original_title, year, res, size, imdb_id, "
+        "rating_key, media_id, is_tv, dovi, hdr, library_name, file_path "
+        "FROM plex_cache WHERE content_type = 'Movies'"
+    )
+
     def list_plex_cache_movies(self):
         """Return every plex_cache row for content_type='Movies' (dicts) — the
-        candidate pool for find_library_duplicate()."""
-        return self._query_dicts(
-            "SELECT key, title, original_title, year, res, size, imdb_id, "
-            "rating_key, media_id, is_tv, dovi, hdr, library_name, file_path "
-            "FROM plex_cache WHERE content_type = 'Movies'", default=[])
+        candidate pool for find_library_duplicate().
+
+        FAIL-SOFT: a read error becomes []. Correct for a best-effort/display
+        caller; see `list_plex_cache_movies_strict` for callers that need to
+        tell an empty table from a failed read."""
+        return self._query_dicts(self._PLEX_CACHE_MOVIES_SQL, default=[])
 
     def list_plex_cache_movies_strict(self):
         """Same rows as ``list_plex_cache_movies``, but RAISES on a read
@@ -3540,10 +3551,7 @@ class DatabaseManager:
             conn = self.get_connection()
             if not conn:
                 raise RuntimeError("plex_cache read failed: no database connection")
-            cur = conn.execute(
-                "SELECT key, title, original_title, year, res, size, imdb_id, "
-                "rating_key, media_id, is_tv, dovi, hdr, library_name, file_path "
-                "FROM plex_cache WHERE content_type = 'Movies'")
+            cur = conn.execute(self._PLEX_CACHE_MOVIES_SQL)
             return [dict(r) for r in cur.fetchall()]
 
     def load_plex_cache(self, mode):

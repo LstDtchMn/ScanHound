@@ -151,3 +151,26 @@ def test_the_same_key_always_maps_to_the_same_stripe():
     pm = PlexManager.__new__(PlexManager)
     assert pm._label_lock("123") is pm._label_lock("123")
     assert pm._label_lock(123) is pm._label_lock("123"), "int and str keys must agree"
+
+
+def test_the_lock_key_matches_what_fetchItem_resolves():
+    """The stripe must be chosen by the SAME canonicalisation the write uses.
+
+    `hash(str(key))` gave "00123" and 123 different stripes while
+    `fetchItem(int(key))` resolved them to one Plex item — two writers on one
+    movie holding different locks. Not a live race, since real rating keys are
+    canonical, but the alias is removable so it is removed.
+    """
+    pm = PlexManager.__new__(PlexManager)
+    assert pm._label_lock("123") is pm._label_lock(123)
+    assert pm._label_lock("00123") is pm._label_lock(123), (
+        "a non-canonical spelling of the same key selected a different stripe")
+    assert pm._label_lock(" 123 ") is pm._label_lock(123)
+
+
+def test_an_unparseable_key_still_returns_a_lock_rather_than_raising():
+    """The write below will fail on its own; the lock lookup must not be the
+    thing that raises, or the failure surfaces in the wrong place."""
+    pm = PlexManager.__new__(PlexManager)
+    assert pm._label_lock("not-a-number") is not None
+    assert pm._label_lock(None) is not None
