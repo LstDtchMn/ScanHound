@@ -9,7 +9,7 @@ it, so each "Files changed" view shows only that PR's own delta.
 |----|--------|------|------|
 | #89 | `fix/rss-history-keyed-on-release-url` | `c0b874a` | `main @ 3013556` |
 | #90 | `feat/record-media-kind-at-ingest` | `81c6c68` | `fix/rss-history-keyed-on-release-url` |
-| #91 | `feat/consume-media-kind-in-ui` | `92bc88a` | `feat/record-media-kind-at-ingest` |
+| #91 | `feat/consume-media-kind-in-ui` | `dae52f7` | `feat/record-media-kind-at-ingest` |
 
 Merge order is forced: **#89, then #90, then #91.** (#90 originally declared
 `main` as its base, which made GitHub render #89's changes inside #90's diff and
