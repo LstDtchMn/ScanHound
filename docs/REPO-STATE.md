@@ -22,7 +22,7 @@ verify a row, delete the row rather than leave it guessed.
 
 | PR | Branch | Base | State | What it does |
 |---|---|---|---|---|
-| **#94** | `agent/hybrid-sweep-rebased` | `main` | **DRAFT** | Hybrid listing sweep. 118 commits, 16 review rounds, stalled 08-05 at contract row R-7, integrated with `main` on 08-19. **Evidence not re-attested** — every 🔨 row cites pre-merge SHAs. |
+| **#94** | `agent/hybrid-sweep-rebased` | `main` | **DRAFT** | Hybrid listing sweep. 118 commits, 16 review rounds, stalled 08-05 at contract row R-7. Integrated 08-19 (`b92ad92`) — **suite NOT clean, see below.** Evidence not re-attested either; every 🔨 row cites pre-merge SHAs. |
 | **#93** | `fix/carry-is-tv-not-rederive` | `main` | ready | Carry `is_tv` instead of re-deriving it from `season is not None`, which sent TV with no parsed season into the *movie* matcher. Suite clean. |
 | **#92** | `feat/queue-records-category` | #91 | ready | Records media kind for **batched** grabs. 398 completed queue items had none. Suite clean. |
 | **#91** | `feat/consume-media-kind-in-ui` | #90 | ready | Deletes `isCanonicalSeasonName`; authorizes destructive actions from the wire, not a filename regex. |
