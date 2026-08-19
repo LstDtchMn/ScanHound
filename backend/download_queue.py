@@ -349,6 +349,10 @@ class DownloadQueueService:
             "hdr": item.get("hdr") or "",
             "dovi": bool(item.get("dovi")),
             "service_type": item.get("service_type") or "Rapidgator",
+            # Carried so a QUEUED grab records the same media kind an
+            # interactive one does. Dropping it here is what left every
+            # batched download with no kind at all.
+            "category": item.get("category") or "",
         }
 
     def schedule_batch(
@@ -441,10 +445,10 @@ class DownloadQueueService:
                     INSERT OR IGNORE INTO download_queue_items (
                         item_uuid, batch_uuid, sequence_number, source,
                         canonical_url, title, year, season, resolution,
-                        size_text, hdr, dovi, service_type, queue_reason,
+                        size_text, hdr, dovi, service_type, category, queue_reason,
                         state, scheduled_for, created_at, updated_at
                     ) VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         'user_batch', 'scheduled', ?, ?, ?
                     )
                     """,
@@ -462,6 +466,7 @@ class DownloadQueueService:
                         item["hdr"],
                         1 if item["dovi"] else 0,
                         item["service_type"],
+                        item["category"],
                         _iso(scheduled),
                         _iso(now),
                         _iso(now),
@@ -557,12 +562,12 @@ class DownloadQueueService:
                 INSERT INTO download_queue_items (
                     item_uuid, batch_uuid, sequence_number, source,
                     canonical_url, title, year, season, resolution,
-                    size_text, hdr, dovi, service_type, queue_reason,
+                    size_text, hdr, dovi, service_type, category, queue_reason,
                     state, cooldown_until, attempt_count, last_attempt_at,
                     last_reason_code, last_cause_code, last_message,
                     transport_attempted, created_at, updated_at
                 ) VALUES (
-                    ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1,
+                    ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1,
                     ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
@@ -579,6 +584,7 @@ class DownloadQueueService:
                     item["hdr"],
                     1 if item["dovi"] else 0,
                     item["service_type"],
+                    item["category"],
                     queue_reason,
                     state,
                     outcome.get("cooldown_until"),
@@ -980,6 +986,7 @@ class DownloadQueueService:
                 hdr=item.get("hdr") or "",
                 dovi=bool(item.get("dovi")),
                 service_type=item.get("service_type") or "Rapidgator",
+                category=item.get("category") or "",
                 progress_callback=progress,
             )
             outcome = public_download_result(

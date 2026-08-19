@@ -1364,6 +1364,14 @@ class DatabaseManager:
                         hdr TEXT,
                         dovi INTEGER NOT NULL DEFAULT 0,
                         service_type TEXT NOT NULL,
+                        -- The scan source's category for this queued grab, carried so a
+                        -- BATCHED download records the same media kind an interactive one
+                        -- does. Without it every queued grab reached save_to_history with
+                        -- no category and its row got media_kind NULL, so the dupe-compare
+                        -- feature was dark for the 398 items that have completed this way.
+                        -- Nullable on purpose: an old row, or a client that does not send
+                        -- one, records NOTHING rather than a guess.
+                        category TEXT,
                         queue_reason TEXT NOT NULL CHECK(queue_reason IN (
                             'user_batch', 'interactive_challenge',
                             'source_deferred', 'manual_retry'
@@ -1390,6 +1398,15 @@ class DatabaseManager:
                         cancelled_at TEXT
                     )
                 """)
+                # Additive migration for the table above. It must live HERE, after
+                # the CREATE, for the reason documented beside the batches ALTERs.
+                try:
+                    cursor.execute(
+                        "ALTER TABLE download_queue_items ADD COLUMN category TEXT"
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
                 # APPEND-ONLY attempt history. The queue's item/batch rows carry
                 # only CURRENT state, which is why the 2026-08-13 incident could
                 # not be diagnosed: after a container restart there was no way

@@ -344,7 +344,7 @@ export const api = {
         items: items.map(i => ({
           url: i.url, title: i.title, year: i.year ?? null, season: i.season ?? null,
           resolution: i.resolution ?? '', size: i.size ?? '', hdr: i.hdr ?? '', dovi: i.dovi ?? false,
-          service_type: serviceType,
+          service_type: serviceType, category: i.category ?? '',
         })),
         execution: execution ?? null
       })
