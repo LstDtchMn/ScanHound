@@ -100,3 +100,82 @@ and the ref can be recreated from any SHA. For the rest, a deleted branch's
 commits survive in the remote's reflog for a limited window and in any local
 clone that still has the ref — so the recoverable window is real but not
 indefinite.
+
+---
+
+# The hybrid sweep, read properly — 2026-08-19
+
+`agent/hybrid-sweep-rebased` is not a stale experiment. It is **118 commits
+carried through sixteen peer-review rounds**, and none of it is on `main`.
+
+## What it is
+
+Its own governing document is `docs/reviews/2026-08-06-completion-contract-rev3.2.md`
+— a completion contract with five stated rules (anti-proxy evidence; builder
+never sole verifier; every claim bound to an exact SHA; a deferral must name
+reason, residual risk and revisit trigger; a documented "do-not-promote"
+completes a track) and two tracks of numbered exit criteria.
+
+**Track 1 is RSS promotion.** R-1 through R-16.
+
+| status | rows |
+|---|---|
+| ✅ done with evidence | R-2a |
+| 🔨 built, verdict pending | R-1, R-3, R-4, R-5, R-6 |
+| ⬜ open | R-2b, R-7 … R-16 |
+
+The open rows are almost entirely operational and Jesse-gated: formal sign-off
+(R-7), merge (R-8), one pinned build digest (R-9), deploy (R-11), a ~30h
+bootstrap (R-12), a 7-day window at a fixed digest (R-13), then grading (R-14,
+R-15) and a recorded decision (R-16).
+
+So the **engineering** is essentially built and reviewed; what never happened is
+the sign-off and everything downstream of it.
+
+## What it adds
+
+New subsystems, none of which exist on `main`:
+
+```text
+backend/release_grammar.py          529 lines changed
+backend/sweep/session.py            356
+backend/sweep/gate.py               355
+backend/database.py                 872
++ 38 test files
+```
+
+Confirmed absent from `main`: `release_grammar.py`, `sweep/session.py`,
+`sweep/gate.py`, `test_release_grammar.py`, `test_completed_row_feed_authority.py`.
+
+## The problem
+
+**Two independent RSS-promotion efforts exist and neither references the other.**
+
+- `agent/hybrid-sweep-rebased` — last commit **2026-08-05**, 118 commits, 16
+  review rounds, a full promotion contract with a gate module.
+- **#61** `design/rss-readiness-gate` — designed **2026-08-11**, six days later.
+  Searching its text for the sweep work returns nothing; the only "sweep" match
+  is the ordinary English word.
+
+#61 proposes a coverage-canary hybrid and states the hybrid is not built. The
+sweep branch contains `backend/sweep/gate.py` and a demotion path (R-6:
+"gate wired; demotion restores the safety net end-to-end"). Whether that is the
+same gate, a compatible one, or a competing design is the question, and it is
+not answerable from the documents alone.
+
+## Cost of the delay
+
+The branch is now **118 ahead / 347 behind `main`**. When the contract was
+written it was *0 behind*. Everything merged since — the DV work, the queue
+work, the media-kind stack — lands on top of it, and `backend/database.py` is
+the single most contended file in the repo.
+
+This does not expire, but it gets more expensive every week, and the review
+evidence is bound to SHAs whose surrounding code has moved.
+
+## Recommendation
+
+Do **not** delete it, and do not silently keep carrying it either. It needs one
+decision from Jesse: is RSS promotion proceeding via this contract, via #61's
+canary hybrid, or not at all? Every path is defensible; carrying both is the
+only option that is not.
