@@ -53,6 +53,15 @@ class DownloadRequest(BaseModel):
     hdr: str = ""
     dovi: bool = False
     service_type: str = "Rapidgator"
+    #: The scan source's category ('4k' | 'remux' | 'tv' | ...), forwarded from
+    #: the result the user clicked. It is how ScanHound RECORDS whether a grab
+    #: is a film or a show: its sources declare type movie/tv and MediaItem
+    #: already carries the resulting category all the way to the UI, but the
+    #: request dropped it here, so `downloads` had no media kind and the
+    #: annotator had to infer one from `season is None`. Optional and
+    #: unvalidated on purpose -- an unrecognised value records NOTHING rather
+    #: than guessing, so an older client simply gets today's behaviour.
+    category: str = ""
 
 
 class BatchExecution(BaseModel):
@@ -109,6 +118,7 @@ def _run_grab(dl, reg: ServiceRegistry, req: "DownloadRequest", force: bool = Fa
             hdr=req.hdr, dovi=req.dovi,
             progress_callback=_on_progress,
             force=force,
+            category=req.category,
         )
         outcome = public_download_result(result, title=req.title, url=req.url)
         ws_manager.broadcast_sync({"type": "download:result", "data": outcome})

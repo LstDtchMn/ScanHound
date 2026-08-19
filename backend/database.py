@@ -822,6 +822,17 @@ class DatabaseManager:
                     'ALTER TABLE rename_jobs ADD COLUMN suggested_correction TEXT',
                     'ALTER TABLE rename_jobs ADD COLUMN combined_episode TEXT',
                     'ALTER TABLE rename_jobs ADD COLUMN split_file TEXT',
+                    # WHAT KIND OF THING THIS RELEASE IS, as RECORDED at grab
+                    # time rather than inferred later. ScanHound already knows:
+                    # its scan sources declare type movie/tv and MediaItem
+                    # carries the resulting `category`. That fact was dropped at
+                    # the download request and the annotator had to guess from
+                    # `season is None`, which is not the same question -- a TV
+                    # grab whose season never parsed reads as a movie, and two
+                    # of its seasons then share one identity.
+                    # 'movie' | 'tv' | NULL, where NULL means NOT RECORDED and
+                    # must never be read as either.
+                    'ALTER TABLE downloads ADD COLUMN media_kind TEXT',
                     'ALTER TABLE downloads ADD COLUMN hdr TEXT',
                     'ALTER TABLE downloads ADD COLUMN dovi INTEGER DEFAULT 0',
                     'ALTER TABLE rename_jobs ADD COLUMN poster_path TEXT',
@@ -3696,7 +3707,7 @@ class DatabaseManager:
     def add_to_history(self, url, title, normalized_title=None, season=None,
                        resolution=None, size=None, status="completed",
                        hdr=None, dovi=False, year=None, package_name=None,
-                       service_type=None):
+                       service_type=None, media_kind=None):
         """Record a downloaded URL with optional metadata for title-based matching.
 
         Uses ON CONFLICT to preserve the original date_added when re-downloading.
@@ -3708,8 +3719,8 @@ class DatabaseManager:
         keys off for a regrab.
         """
         return self._mutate('''
-            INSERT INTO downloads (url, title, normalized_title, season, resolution, size, status, hdr, dovi, year, package_name, service_type, last_grabbed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO downloads (url, title, normalized_title, season, resolution, size, status, hdr, dovi, year, package_name, service_type, media_kind, last_grabbed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 normalized_title = excluded.normalized_title,
@@ -3722,9 +3733,16 @@ class DatabaseManager:
                 year = COALESCE(excluded.year, downloads.year),
                 package_name = COALESCE(excluded.package_name, downloads.package_name),
                 service_type = COALESCE(excluded.service_type, downloads.service_type),
+                -- COALESCEd like package_name/service_type, and for the same
+                -- reason: a later status-only update passes media_kind=None and
+                -- must not erase a kind an earlier grab recorded. NULL means
+                -- "not recorded", so overwriting a real value with it would
+                -- destroy evidence rather than update it.
+                media_kind = COALESCE(excluded.media_kind, downloads.media_kind),
                 last_grabbed_at = CURRENT_TIMESTAMP
         ''', (url, title, normalized_title, season, resolution, size, status,
-              hdr or None, 1 if dovi else 0, year, package_name, service_type),
+              hdr or None, 1 if dovi else 0, year, package_name, service_type,
+              media_kind),
             label="add_history")
 
     # ── Pipeline tracker verdicts ────────────────────────────────────
@@ -4198,8 +4216,8 @@ class DatabaseManager:
         for start in range(0, len(wanted), 300):
             chunk = wanted[start:start + 300]
             rows = self._query_dicts(
-                "SELECT url, date_added, title, year, season FROM downloads "
-                "WHERE url IN (%s)" % ",".join("?" * len(chunk)),
+                "SELECT url, date_added, title, year, season, media_kind "
+                "FROM downloads WHERE url IN (%s)" % ",".join("?" * len(chunk)),
                 tuple(chunk), default=[]) or []
             for row in rows:
                 out[row["url"]] = {
@@ -4207,6 +4225,7 @@ class DatabaseManager:
                     "title": row.get("title"),
                     "year": row.get("year"),
                     "season": row.get("season"),
+                    "media_kind": row.get("media_kind"),
                 }
         return out
 

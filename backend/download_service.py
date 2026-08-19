@@ -574,12 +574,25 @@ class DownloadService:
         except Exception:
             return set()
 
+    #: Scan-source categories -> the media kind they prove. ScanHound's sources
+    #: declare `type: movie` / `type: tv` and MediaItem carries the resulting
+    #: `category`, so this is a recorded fact rather than a reading of the title.
+    #: Anything not listed maps to None -- "not recorded" -- because a category
+    #: we do not recognise is not evidence of either kind.
+    _CATEGORY_MEDIA_KIND = {"tv": "tv", "4k": "movie", "remux": "movie"}
+
+    @classmethod
+    def media_kind_for_category(cls, category):
+        """The media kind a scan category proves, or None if it proves nothing."""
+        return cls._CATEGORY_MEDIA_KIND.get((category or "").strip().lower())
+
     def save_to_history(self, url: str, title: str, season: Optional[int],
                         resolution: str, size: str, status: str = "completed",
                         hdr: str = "", dovi: bool = False,
                         year: Optional[int] = None,
                         package_name: Optional[str] = None,
-                        service_type: Optional[str] = None):
+                        service_type: Optional[str] = None,
+                        media_kind: Optional[str] = None):
         """Save a downloaded item to history."""
         try:
             normalized = normalize_title(title)
@@ -592,6 +605,7 @@ class DownloadService:
                 url=url, title=title, normalized_title=normalized,
                 season=season, resolution=resolution, size=size,
                 status=status, hdr=hdr or None, dovi=dovi, year=year,
+                media_kind=media_kind,
                 **extra,
             )
             with self._history_lock:
@@ -3602,7 +3616,8 @@ class DownloadService:
                       resolution: str, size: str, service_type: str = "Rapidgator",
                       year: Optional[int] = None, hdr: str = "", dovi: bool = False,
                       progress_callback: Optional[Callable] = None,
-                      force: bool = False) -> Dict[str, Any]:
+                      force: bool = False,
+                      category: str = "") -> Dict[str, Any]:
         """Download a single item: scrape links, send to JD or clipboard.
 
         Returns dict with 'success', 'method', 'link_count', 'message'.
@@ -3800,7 +3815,8 @@ class DownloadService:
                 result["history_saved"] = self.save_to_history(
                     url, title, season, resolution, size, status="completed",
                     hdr=hdr, dovi=dovi, year=year,
-                    package_name=package_name, service_type=service_type
+                    package_name=package_name, service_type=service_type,
+                    media_kind=self.media_kind_for_category(category)
                 )
                 self._log(
                     f"[Download] {title}: delivered to JDownloader "
@@ -3822,7 +3838,8 @@ class DownloadService:
             result["history_saved"] = self.save_to_history(
                 url, title, season, resolution, size, status="clipboard",
                 hdr=hdr, dovi=dovi, year=year,
-                package_name=package_name, service_type=service_type
+                package_name=package_name, service_type=service_type,
+                media_kind=self.media_kind_for_category(category)
             )
             self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
             return result
@@ -3838,7 +3855,8 @@ class DownloadService:
             result["history_saved"] = self.save_to_history(
                 url, title, season, resolution, size, status="browser",
                 hdr=hdr, dovi=dovi, year=year,
-                package_name=package_name, service_type=service_type
+                package_name=package_name, service_type=service_type,
+                media_kind=self.media_kind_for_category(category)
             )
             self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
             return result
@@ -3852,7 +3870,8 @@ class DownloadService:
         try:
             self.save_to_history(url, title, season, resolution, size,
                                  status="failed", hdr=hdr, dovi=dovi, year=year,
-                                 package_name=package_name, service_type=service_type)
+                                 package_name=package_name, service_type=service_type,
+                                 media_kind=self.media_kind_for_category(category))
         except Exception:
             pass
         self._progress("download:failed", {"title": title, "url": url, "message": result["message"]}, _cb=_cb)
