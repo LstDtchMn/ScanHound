@@ -35,7 +35,7 @@
       try {
         await api.download(item.url, item.title, get(downloadHost), item.year,
                            item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false,
-                           item.season);
+                           item.season, item.category || '');
         // Don't optimistically mark grabbed: the POST only returns "started".
         // Each item flips to Downloaded via its download:complete
         // (method=jdownloader) WS event once it truly reaches JDownloader;

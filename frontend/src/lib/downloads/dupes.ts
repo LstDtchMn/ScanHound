@@ -154,11 +154,27 @@ export function seasonKey(name: string): string {
  *  separator cannot forge a different tuple. */
 export function semanticGroupKey(r: DownloadResult): string | null {
   if (r.identity_source !== 'provenance') return null;
-  if (r.identity_kind !== 'tv_season') return null;
+  // MOVIES ARE NOW POSSIBLE, where the backend RECORDED the kind. The wire
+  // used to declare `movie` and never emit it, because nothing stored whether
+  // a grab was a film or a show. It does now (downloads.media_kind, written
+  // from the scan source's own classification), so a proven movie can finally
+  // carry an identity -- and the de-duplicate action, withheld from every film
+  // until now, becomes possible for them.
+  const kind = r.identity_kind;
+  if (kind !== 'tv_season' && kind !== 'movie') return null;
   const title = (r.identity_title || '').trim();
   if (!title) return null;
   const season = r.identity_season;
-  if (typeof season !== 'number' || !Number.isInteger(season)) return null;
+  if (kind === 'tv_season') {
+    // A TV identity is which SEASON; without it two seasons of one show are
+    // indistinguishable.
+    if (typeof season !== 'number' || !Number.isInteger(season)) return null;
+  } else if (season !== null && season !== undefined) {
+    // Recorded as a film yet carrying a season: contradictory. The backend
+    // already refuses this, and refusing it here too means the UI cannot be
+    // talked into it by a stale or hand-built payload.
+    return null;
+  }
   // EXPLICITLY ABSENT is not the same as MALFORMED. `null` is a real answer --
   // the backend records TV rows whose year it never captured -- and those get
   // the partial class below. Anything else non-integer (a string, a float, NaN,
@@ -172,7 +188,9 @@ export function semanticGroupKey(r: DownloadResult): string | null {
   if (year !== null) {
     if (typeof year !== 'number' || !Number.isInteger(year)) return null;
   }
-  return JSON.stringify(['sem', title, year, season]);
+  // The KIND is part of the tuple, so a film and a show can never share an
+  // identity even if their titles and years match exactly.
+  return JSON.stringify(['sem', kind, title, year, kind === 'movie' ? null : season]);
 }
 
 /** THE AUTHORITATIVE IDENTITY — what may authorise cancelling other downloads.

@@ -121,7 +121,7 @@
     if (item.url) {
       api.download(item.url, item.title, effectiveHost, item.year,
                    item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false,
-                   item.season)
+                   item.season, item.category || '')
         .catch((e) => addToast('Error', e instanceof Error ? e.message : 'Download failed', 'error'));
     }
   }
