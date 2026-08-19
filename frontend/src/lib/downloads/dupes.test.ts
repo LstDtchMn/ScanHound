@@ -567,3 +567,37 @@ describe('three intentional key classes', () => {
     expect(g[0].canKeepBest).toBe(false);
   });
 });
+
+describe('an absent year and a malformed one are different things', () => {
+  const tv = (over: Partial<DownloadResult>): DownloadResult =>
+    r({ state: 'queued', identity_source: 'provenance', identity_kind: 'tv_season',
+        identity_title: 'Show', identity_year: 2020, identity_season: 1, ...over });
+
+  it('null year is a real answer and keeps the partial semantic class', () => {
+    const k = semanticGroupKey(tv({ identity_year: null }));
+    expect(k).not.toBeNull();
+    expect(JSON.parse(k as string)).toEqual(['sem', 'Show', null, 1]);
+    expect(semanticKey(tv({ identity_year: null }))).toBeNull();  // still refused
+  });
+
+  it('a malformed year gets NO semantic identity, not the null class', () => {
+    // Round-9 LOW. Collapsing these into the same bucket as a genuinely
+    // year-less row would let a malformed row display-group with it. Neither
+    // can authorise -- semanticKey demands an integer -- so this is
+    // exhaustiveness over the wire contract rather than a safety fix.
+    for (const bad of ['2020', 2020.5, NaN, Infinity, true, undefined] as unknown[]) {
+      const row = tv({ identity_year: bad as number });
+      expect(semanticGroupKey(row), String(bad)).toBeNull();
+      expect(semanticKey(row), String(bad)).toBeNull();
+    }
+  });
+
+  it('a malformed-year row does not share a card with a year-less one', () => {
+    const yearless = tv({ id: 1, identity_year: null, name: 'a.release' });
+    const malformed = tv({ id: 2, identity_year: '2020' as unknown as number,
+                            name: 'a.release' });
+    const g = groupDownloads([yearless, malformed]);
+    expect(g).toHaveLength(2);
+    expect(g.every((x) => !x.canKeepBest)).toBe(true);
+  });
+});

@@ -159,10 +159,19 @@ export function semanticGroupKey(r: DownloadResult): string | null {
   if (!title) return null;
   const season = r.identity_season;
   if (typeof season !== 'number' || !Number.isInteger(season)) return null;
-  const year =
-    typeof r.identity_year === 'number' && Number.isInteger(r.identity_year)
-      ? r.identity_year
-      : null;
+  // EXPLICITLY ABSENT is not the same as MALFORMED. `null` is a real answer --
+  // the backend records TV rows whose year it never captured -- and those get
+  // the partial class below. Anything else non-integer (a string, a float, NaN,
+  // or the key missing entirely) is a contract violation: #87 always emits
+  // `identity_year`, so its absence means the row never went through the
+  // annotator. Collapsing those into the same `null` bucket would let a
+  // malformed row display-group with a genuinely year-less one. Neither can
+  // authorise -- `semanticKey` demands an integer -- so this is exhaustiveness,
+  // not a safety fix (peer review round 9).
+  const year = r.identity_year;
+  if (year !== null) {
+    if (typeof year !== 'number' || !Number.isInteger(year)) return null;
+  }
   return JSON.stringify(['sem', title, year, season]);
 }
 
@@ -228,7 +237,9 @@ export interface DownloadGroup {
    *  not fix: `normalizeTitle` strips years, so
    *  `Battlestar Galactica (1978) S01` and `(2004) S01` collapsed to one
    *  identity. A `tv_season` row with no recorded year is therefore unproven
-   *  here and groups by display instead (peer review round 7). */
+   *  here, and groups on what WAS recorded -- title and season with an
+   *  explicit null year -- rather than falling back to the display name
+   *  (peer review rounds 7 and 8). */
   identityKnown: boolean;
 }
 
@@ -257,20 +268,15 @@ export function groupDownloads(results: DownloadResult[]): DownloadGroup[] {
     // The season comes from `name` because `title` has it stripped. Joined with
     // a separator that normalizeTitle cannot produce, so "show" + "S02" can
     // never collide with a differently-split pair.
-    // THE WIRE OUTRANKS THE STRING. A row the backend proved gets grouped by
-    // that identity; only a row it could not prove falls back to reading the
-    // display name. The two key shapes are disjoint, so a proven and an
-    // unproven row never share a card — which is what stops a known row
-    // vouching for an unknown one.
+    // THE WIRE OUTRANKS THE STRING. A row the backend identified groups by that
+    // identity; only a row it could not falls back to reading the display name.
+    // The key shapes are disjoint, so a proven and an unproven row never share a
+    // card — which is what stops a known row vouching for an unknown one.
     //
-    // `title` is resolved server-side and expected to always be set for real
-    // results; the `|| r.name` fallback is a defensive last resort and could
-    // in theory leak a resolution tag like "[1080p]" from a raw JD package
-    // name into the grouping key if `title` were ever falsy.
-    //
-    // The season comes from `name` because `title` has it stripped. Joined with
-    // a separator that normalizeTitle cannot produce, so "show" + "S02" can
-    // never collide with a differently-split pair.
+    // In the legacy half, `title` is resolved server-side and expected to be set
+    // for real results; `|| r.name` is a defensive last resort that could leak a
+    // tag like "[1080p]" into the key if it were ever falsy. The season comes
+    // from `name` because `title` has it stripped.
     const key =
       semanticGroupKey(r) ?? `legacy|${normalizeTitle(r.title || r.name)}|${seasonKey(r.name)}`;
     const arr = byKey.get(key);
