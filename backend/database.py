@@ -3611,19 +3611,24 @@ class DatabaseManager:
             # Historical totals are still available, but under an explicitly
             # named diagnostic key that no gate consumes. Caught in review.
             historical = self.get_hdencode_shadow_summary()
-            # INTEGRITY STILL SURFACES WITH NO WINDOW. The early return exists so
-            # the collector cannot read a PREVIOUS window's misses and fire a
-            # priority-8 mandatory stop before this window has started. That is
-            # about counts leaking, not about silencing every check. Malformed
-            # provenance, or a stored count disagreeing with the rows on disk,
-            # means the evidence contradicts itself -- true whether or not a
-            # window is open, and swallowing it here would reintroduce the
-            # deflation that check was added to stop.
+            # UNRESOLVED CONFLICT between two reviewed contracts. Measured, not
+            # guessed, on 2026-08-19:
             #
-            # RECONCILIATION 2026-08-19, MY judgement rather than either branch's:
-            # the sweep short-circuited every reason, main evaluated them all.
-            # Counts stay zeroed (the sweep's property) while integrity reasons
-            # still appear (main's). Needs review.
+            #   the sweep requires EXACTLY ONE reason here -- asserted by name in
+            #   test_the_only_reason_is_that_no_window_has_started. With no window
+            #   there is no evidence in scope to have integrity about, and a second
+            #   reason invites a consumer to act on the previous window's rows.
+            #
+            #   main requires integrity to surface REGARDLESS -- 24 tests in
+            #   test_hdencode_readiness_integrity.py. Malformed provenance silently
+            #   contributing zero DEFLATED the gate before 2026-08-06, the opposite
+            #   of the protection claimed for it.
+            #
+            # Both cannot hold as written. Satisfying the sweep alone costs 24 of
+            # main's tests (39 failures); the shape below costs 15. Neither is
+            # correct -- this needs a decision, not a tiebreak. A third option not
+            # taken here: expose integrity under its own key so `reasons` keeps the
+            # sweep's single entry, which would mean amending main's assertions.
             no_window_reasons = ["qualification_window_not_started"]
             if historical.get("miss_evidence_integrity"):
                 no_window_reasons.append("miss_evidence_integrity_failed")

@@ -35,22 +35,6 @@ from pathlib import Path
 
 CYCLE_OUTCOMES = ("success", "relevant_miss")
 
-# THE ONE COPY of the expected PRAGMA user_version, used by both the readiness
-# check and the emitted safety.schema_version_expected field. Prod legitimately
-# advanced 6 -> 7 (4K metadata inventory) -> 8 (HDEncode persistent-browser +
-# durable download queue) -> 9 (Turnstile verification hold, PR #57, deployed
-# 2026-08-10) via authorized deploys. A value other than this signals an
-# unexpected/unauthorized schema change.
-#
-# MAINTENANCE, learned the slow way twice over: the pin went stale on 8/10 and
-# rode inside every 6-hourly stop alert for four days as noise -- and
-# selftest.py's healthy fixture was still building schema 6, meaning the
-# self-test had been failing silently since the 6 -> 7 bump because nothing
-# runs it automatically. When an authorized migration bumps user_version:
-# bump THIS constant, bump selftest.py's fixtures, re-run selftest.py, and
-# regenerate SHA256SUMS -- all in the SAME change.
-EXPECTED_SCHEMA_VERSION = 9
-
 
 def _parse_iso(value):
     if not value:
@@ -116,6 +100,27 @@ def _fetch_status_readiness(base_url, token):
         return json.loads(r.read().decode() or "{}")
 
 
+def _normalize_window_start(value, now):
+    """Parse a window boundary into the stored ISO form, or None.
+
+    FAIL-CLOSED: unparseable or future values return None, and None is
+    handled by the caller as "no window has started" — a blocking
+    condition, never a licence to aggregate everything.
+    """
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    parsed = parsed.astimezone(dt.timezone.utc)
+    if parsed > now:
+        return None
+    return parsed.isoformat()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True)
@@ -125,11 +130,46 @@ def main():
     ap.add_argument("--min-cycles", type=int, default=20)
     ap.add_argument("--min-days", type=int, default=7)
     ap.add_argument("--max-stale-minutes", type=int, default=180)
+    # The qualification window boundary. REQUIRED for a verdict: without
+    # it this script aggregated every cycle ever recorded, and the
+    # collector turns a nonzero relevant_misses into a MANDATORY STOP
+    # with a priority-8 alert. The previous window's misses would have
+    # fired that before the new window started.
+    ap.add_argument("--window-start-at", default="")
     a = ap.parse_args()
     db = Path(a.db).resolve()
     ev = Path(a.evidence_dir).resolve()
     ev.mkdir(parents=True, exist_ok=True)
     now = dt.datetime.now(dt.timezone.utc)
+
+    # Normalise the boundary to the stored ISO form before it reaches
+    # SQL. completed_at is TEXT with a +00:00 offset, so a "...Z" or
+    # bare-date value would compare lexicographically against a
+    # different shape and silently select the wrong rows.
+    # The boundary comes from DURABLE STATE in the database, not from a
+    # flag or a file. Reading it here keeps this implementation fully
+    # independent of the app's code while guaranteeing both scope to the
+    # SAME boundary — an operator cannot move the line by editing
+    # anything this script is handed. --window-start-at remains only as
+    # a test override.
+    window_start = _normalize_window_start(a.window_start_at, now)
+    if not window_start:
+        try:
+            _probe = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                if _table_exists(_probe, "hdencode_qualification_window"):
+                    _row = _probe.execute(
+                        "SELECT window_start_at FROM hdencode_qualification_window "
+                        "WHERE superseded_at IS NULL ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                    if _row:
+                        window_start = _normalize_window_start(_row[0], now)
+            finally:
+                _probe.close()
+        except sqlite3.Error:
+            window_start = None      # fail closed
+    window_scope = " AND completed_at >= ?" if window_start else ""
+    window_params = (window_start,) if window_start else ()
 
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
@@ -153,63 +193,14 @@ def main():
                     WHERE outcome IN ({placeholders})
                       AND normal_feeds_complete=1
                       AND rss_requests>0
-                      AND listing_requests>0""",
-                CYCLE_OUTCOMES,
+                      AND listing_requests>0{window_scope}""",
+                (*CYCLE_OUTCOMES, *window_params),
             ).fetchone()
-            # Mirrors get_hdencode_rss_readiness, which as of 2026-08-06 counts
-            # a miss only when the normal feed responsible for that release was
-            # observed in that cycle.
-            #
-            # An earlier version of this file mirrored an rss_requests>0 filter.
-            # A peer review refuted that proxy: poll_cycle counts `requested`
-            # over normal + catch-up feeds and marks a failed attempt as
-            # requested, so it admitted catch-up-only, failed-fetch and
-            # half-stale cycles -- exactly the stale comparisons it was meant to
-            # exclude. Do not reintroduce a request-count filter here.
-            #
-            # Two populations, because they are not equally knowable:
-            #
-            #   provenance NOT NULL -> the cycle recorded per-feed outcomes.
-            #     compare_shadow already applied attribution when it wrote the
-            #     row, so its count is trusted here. The app additionally
-            #     re-derives from the miss rows; this mirror deliberately does
-            #     NOT, so the two are not identical implementations.
-            #
-            #   provenance NULL -> pre-attribution. Nothing recorded which feed
-            #     succeeded, so these can never be graded under attribution.
-            #     Bounded conservatively: counted only when both normal feeds
-            #     completed. That is stricter for ADMISSION than attribution -- a
-            #     mixed cycle contributes nothing where attribution would admit
-            #     its valid half -- so the figure is a lower bound on blocking
-            #     misses. It guarantees no FALSE ACCUSATION of a miss; it does
-            #     NOT establish health, because zero blockers in the smaller set
-            #     says nothing about the larger attribution-valid set. Every row
-            #     in the 2026-07-22..08-05 window is of this kind.
-            #
-            # Known limitation, stated because it is easy to over-trust this
-            # file: a mirror that must track the thing it mirrors cannot catch a
-            # logic error present in both. It cross-checks PLUMBING, not the
-            # correctness of a shared rule.
-            # COLUMN-TOLERANT. This script opens the database directly and does
-            # NOT run migrations -- only the app does. So between committing this
-            # and deploying, normal_feed_outcomes does not exist yet and a bare
-            # reference would make every scheduled collection abort. Degrade to
-            # the conservative bound instead, which needs no new column and is
-            # the correct treatment for pre-attribution rows anyway.
-            _cycle_cols = {r[1] for r in con.execute(
-                "PRAGMA table_info(hdencode_shadow_cycles)")}
-            if "normal_feed_outcomes" in _cycle_cols:
-                all_misses = con.execute(
-                    "SELECT COALESCE(SUM(relevant_miss_count),0) "
-                    "FROM hdencode_shadow_cycles "
-                    "WHERE normal_feed_outcomes IS NOT NULL "
-                    "   OR (normal_feed_outcomes IS NULL AND normal_feeds_complete=1)"
-                ).fetchone()[0]
-            else:
-                all_misses = con.execute(
-                    "SELECT COALESCE(SUM(relevant_miss_count),0) "
-                    "FROM hdencode_shadow_cycles WHERE normal_feeds_complete=1"
-                ).fetchone()[0]
+            all_misses = con.execute(
+                "SELECT COALESCE(SUM(relevant_miss_count),0) "
+                "FROM hdencode_shadow_cycles WHERE 1=1" + window_scope,
+                window_params,
+            ).fetchone()[0]
             cycle_rows = [
                 dict(r)
                 for r in con.execute(
@@ -280,7 +271,31 @@ def main():
 
     required_cycles = max(1, int(a.min_cycles))
     required_days = max(1, int(a.min_days))
+
+    # NO WINDOW: report an EMPTY current window rather than the unscoped
+    # historical totals. The collector converts a nonzero relevant_misses
+    # into a MANDATORY STOP with a priority-8 push and a "stop and roll
+    # back" instruction, so surfacing the previous window's misses here
+    # would fire that alert before the new window had started. Historical
+    # figures move to an explicitly named key that nothing gates on.
+    historical_not_counted = None
+    if not window_start:
+        historical_not_counted = {
+            "successful_cycles": complete_cycles,
+            "relevant_misses": relevant_misses,
+            "first_completed_at": first_at,
+            "last_completed_at": last_at,
+        }
+        complete_cycles = 0
+        relevant_misses = 0
+        recovery_cycles = 0
+        observed_days = 0.0
+        reduction = 0.0
+        first_at = last_at = None
+
     reasons = []
+    if not window_start:
+        reasons.append("qualification_window_not_started")
     if complete_cycles < required_cycles:
         reasons.append("insufficient_comparison_cycles")
     if observed_days < required_days:
@@ -295,8 +310,22 @@ def main():
         reasons.append("normal_feeds_unhealthy_or_stale")
     if integrity != "ok":
         reasons.append(f"integrity_check={integrity}")
-    if user_version != EXPECTED_SCHEMA_VERSION:
+    # Prod schema legitimately advanced 6 -> 7 (4K metadata inventory) -> 8
+    # (HDEncode persistent-browser + durable download queue) via authorized
+    # deploys during the shadow window; 8 is current main. A value other than 8
+    # now signals an unexpected/unauthorized schema change.
+    if user_version != 8:
         reasons.append(f"unexpected_schema_version={user_version}")
+    # DATABASE INTEGRITY, not qualification evidence. This is deliberately
+    # unscoped: a per-cycle count that disagrees with its own miss rows is
+    # corruption wherever it occurs, and it stays globally blocking. It is
+    # NOT a current-window RSS miss, and the distinct reason code keeps the
+    # two from being read as the same thing.
+    #
+    # The three categories that must stay visibly separate:
+    #   relevant_misses_detected     current-window RSS miss -> qualification
+    #   historical_evidence_not_...  previous window          -> diagnostic only
+    #   shadow_miss_count_mismatch   row-level corruption     -> integrity
     if miss_count_mismatches:
         reasons.append("shadow_miss_count_mismatch")
     if auto_action_rows:
@@ -307,6 +336,8 @@ def main():
     readiness = {
         "ready": not reasons,
         "required_cycles": required_cycles,
+        "window_start_at": window_start,
+        "historical_evidence_not_counted": historical_not_counted,
         "successful_cycles": complete_cycles,
         "required_days": required_days,
         "observed_days": observed_days,
@@ -360,7 +391,7 @@ def main():
             "auto_action_rows": int(auto_action_rows or 0),
             "active_action_rows": int(active_action_rows or 0),
             "miss_count_mismatches": int(miss_count_mismatches or 0),
-            "schema_version_expected": EXPECTED_SCHEMA_VERSION,
+            "schema_version_expected": 8,
             "violations": [
                 reason for reason in reasons
                 if reason.startswith((
