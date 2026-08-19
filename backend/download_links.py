@@ -133,6 +133,32 @@ def annotate_source_links(db, rows):
     if db is None:
         return rows
     try:
+        # FRESHNESS POLICY: the LAST PROOF stays authoritative until it is
+        # retracted, and BOTH transports must apply it. The poller's in-memory
+        # row carries provenance_url=None whenever it could not observe a
+        # package's links, while download_results deliberately keeps the
+        # previous proof in that case. Left alone, the WebSocket row resolves to
+        # `unknown` while a REST poll of the same package resolves to a full
+        # identity -- the two transports disagreeing about a fact that gates
+        # cancelling downloads, which is exactly what this module exists to
+        # prevent (peer review 2026-08-18, M2).
+        #
+        # Recovering the persisted value here is the same rule the database
+        # already implements, applied one layer up. Costs ONE batched query,
+        # and only when a row is in that state, which is normally none.
+        stale = [r for r in rows
+                 if not r.get("provenance_url")
+                 and r.get("provenance_observed") is False]
+        if stale:
+            persisted = db.get_persisted_provenance(
+                [(r.get("package_uuid"), r.get("name")) for r in stale]) or {}
+            for row in stale:
+                uuid, name = row.get("package_uuid"), row.get("name")
+                recovered = (persisted.get(("uuid", str(uuid))) if uuid
+                             else persisted.get(("name", str(name))))
+                if recovered:
+                    row["provenance_url"] = recovered
+
         proven = {}
         for row in rows:
             url = row.get("provenance_url")
@@ -175,7 +201,29 @@ def annotate_source_links(db, rows):
         # have been a confident `movie` whose guard had just been added to stop
         # exactly that.
         year = rec.get("year") or None
-        if season is None and year is None:
+        if season is None:
+            # NO RECORDED SEASON MEANS UNKNOWN, NOT MOVIE.
+            #
+            # This verdict has now failed three times, each for a reason the
+            # previous fix did not anticipate: placeholder titles, then 16 live
+            # TV rows whose season was never recorded, then year=0. The peer
+            # review named why that keeps happening -- the problem is
+            # CATEGORICAL, not a sentinel hunt. `("Notting Hill", 1999, None)`
+            # is structurally identical to a 1999 TV show with a missing season.
+            # `add_to_history()` takes no media-type argument and `downloads`
+            # stores no such column, so NOTHING in the data distinguishes them.
+            # A year identifies an edition; it does not prove a media kind.
+            #
+            # The old positive test asserted `Notting Hill` came back as a
+            # movie. That proved the convention, not the discriminator -- the
+            # test author knew it was a film; production never did.
+            #
+            # So a seasonless row stays unknown until a media kind is RECORDED
+            # AT INGEST. That costs movie identity entirely for now, which is
+            # the honest price: the destructive action this gates is already
+            # withheld from every movie today, and re-enabling it on an
+            # unprovable inference is how the previous three holes happened.
+            continue
             # NEITHER discriminator. "movie" here would be a guess, and a wrong
             # one: 16 live history rows are plainly TV -- their source url slug
             # says `-s02-` -- with no season recorded, and ALL 16 also lack a
@@ -188,6 +236,6 @@ def annotate_source_links(db, rows):
         row["identity_title"] = clean
         row["identity_year"] = year
         row["identity_season"] = season
-        row["identity_kind"] = "movie" if season is None else "tv_season"
+        row["identity_kind"] = "tv_season"
         row["identity_source"] = "provenance"
     return rows

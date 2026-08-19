@@ -188,18 +188,34 @@ class TestSemanticIdentity:
         assert rows[0]["identity_season"] == 2
         assert rows[0]["identity_source"] == "provenance"
 
-    def test_a_movie_grab_reports_no_season(self, db):
-        """The positive control for `movie`. Without it, a bug that reported
-        everything as unknown would pass every fail-closed test here."""
+    def test_a_SEASONLESS_grab_is_unknown_even_with_a_real_year(self, db):
+        """M1. This test used to assert `movie`, which was the blind spot: it
+        proved the CONVENTION, not the discriminator. The author knew Notting
+        Hill is a film; production never did. `("Notting Hill", 1999, None)` is
+        structurally identical to a 1999 TV show whose season was not recorded,
+        and `add_to_history` takes no media-type argument, so nothing in the
+        data separates them. A year identifies an edition, not a media kind."""
         db.add_to_history(A, "Notting Hill", year=1999,
                           package_name="Notting Hill (1999) [4K]")
         rows = [{"name": "whatever", "provenance_url": A}]
 
         annotate_source_links(db, rows)
 
-        assert rows[0]["identity_kind"] == "movie"
-        assert rows[0]["identity_season"] is None
-        assert rows[0]["identity_year"] == 1999
+        assert rows[0]["identity_kind"] == "unknown"
+        assert rows[0]["identity_source"] == "unknown"
+        assert rows[0]["identity_title"] is None
+
+    def test_no_row_is_EVER_labelled_a_movie(self, db):
+        """The rule, asserted directly rather than case by case, so restoring a
+        `movie` verdict cannot slip back in without this failing."""
+        db.add_to_history(A, "Notting Hill", year=1999)
+        b = "https://source.example/release-B"
+        db.add_to_history(b, "Some Show", season=3, year=2019)
+        rows = [{"name": "a", "provenance_url": A}, {"name": "b", "provenance_url": b}]
+
+        annotate_source_links(db, rows)
+
+        assert [r["identity_kind"] for r in rows] == ["unknown", "tv_season"]
 
     def test_THE_case_a_name_parser_can_never_get_right(self, db):
         """Two rows whose package names are character-for-character identical,
@@ -311,12 +327,12 @@ class TestSemanticIdentity:
     def test_a_real_title_that_merely_contains_a_placeholder_word_is_fine(self, db):
         """The guard matches the WHOLE title, not a substring -- `Untitled` must
         not disqualify a real film whose name happens to include the word."""
-        db.add_to_history(A, "The Untitled Star Wars Project", year=2020)
+        db.add_to_history(A, "The Untitled Star Wars Project", season=1, year=2020)
         rows = [{"name": "x", "provenance_url": A}]
 
         annotate_source_links(db, rows)
 
-        assert rows[0]["identity_kind"] == "movie"
+        assert rows[0]["identity_kind"] == "tv_season"
         assert rows[0]["identity_title"] == "The Untitled Star Wars Project"
 
     def test_the_RSS_path_url_shape_fails_CLOSED(self, db):
@@ -502,16 +518,18 @@ class TestIdentityGuardsThatNearlyWentUntested:
         assert rows[0]["identity_season"] == 2
         assert rows[0]["identity_year"] is None, "the 0 sentinel leaked onto the wire"
 
-    def test_a_movie_WITH_a_year_still_gets_its_identity(self, db):
-        """The positive control. Without it, "always return unknown" would pass
-        every fail-closed assertion in this class."""
-        db.add_to_history(A, "Notting Hill", year=1999)
+    def test_a_TV_row_still_gets_its_identity(self, db):
+        """THE positive control for this whole class. Without it, "always return
+        unknown" would satisfy every fail-closed assertion here and the feature
+        could be dead while the suite stayed green."""
+        db.add_to_history(A, "The Repair Shop", season=2, year=2017)
         rows = [{"name": "x", "provenance_url": A}]
 
         annotate_source_links(db, rows)
 
-        assert rows[0]["identity_kind"] == "movie"
-        assert rows[0]["identity_year"] == 1999
+        assert rows[0]["identity_kind"] == "tv_season"
+        assert rows[0]["identity_season"] == 2
+        assert rows[0]["identity_year"] == 2017
 
     def test_a_tv_row_with_a_season_but_no_year_is_still_tv(self, db):
         """The year requirement applies ONLY to the movie verdict. A recorded
@@ -528,10 +546,107 @@ class TestIdentityGuardsThatNearlyWentUntested:
 
     def test_a_placeholder_is_matched_WHOLE_not_by_prefix(self, db):
         """Loosening the guard to startswith would survive a mid-string test."""
-        db.add_to_history(A, "Untitled Horror Project", year=2020)
+        db.add_to_history(A, "Untitled Horror Project", season=2, year=2020)
         rows = [{"name": "x", "provenance_url": A}]
 
         annotate_source_links(db, rows)
 
-        assert rows[0]["identity_kind"] == "movie"
+        assert rows[0]["identity_kind"] == "tv_season"
         assert rows[0]["identity_title"] == "Untitled Horror Project"
+
+
+class TestFreshnessAgreesAcrossTransports:
+    """M2. The poller's in-memory row carries provenance_url=None whenever it
+    could not OBSERVE a package's links, while download_results deliberately
+    keeps the previous proof -- upsert_download_result writes the new value only
+    when provenance_observed is true, because "could not look" is not "no longer
+    ours".
+
+    Left alone, the WebSocket row resolves to unknown while a REST poll of the
+    same package resolves to a full identity. A blinking source link was an
+    accepted cosmetic gap; a blinking IDENTITY is not, because identity is meant
+    to authorise cancelling other downloads.
+
+    POLICY: the last proof stays authoritative until retracted, and BOTH
+    transports apply it.
+    """
+
+    UUID = "pkg-uuid-1"
+    NAME = "The Repair Shop (2017) S02 [1080p]"
+
+    def _seed(self, db):
+        db.add_to_history(A, "The Repair Shop", season=2, year=2017,
+                          package_name=self.NAME)
+        db.upsert_download_result(name=self.NAME, package_uuid=self.UUID,
+                                  title="The Repair Shop", state="downloading",
+                                  provenance_url=A, provenance_observed=True)
+
+    def _rest_row(self, db):
+        # Exactly what the REST route hands the annotator.
+        return [r for r in db.get_download_results(limit=200)
+                if r.get("package_uuid") == self.UUID]
+
+    def _ws_row_unobserved(self):
+        # Exactly what the poller emits when it could not observe the links.
+        return [{"id": None, "package_uuid": self.UUID, "name": self.NAME,
+                 "state": "downloading", "provenance_url": None,
+                 "provenance_observed": False}]
+
+    def test_the_two_transports_report_the_SAME_identity(self, db):
+        """The finding, stated as the property that matters. Before the fix the
+        WS row was unknown and the REST row was tv_season for the same package
+        in the same instant."""
+        self._seed(db)
+        rest = self._rest_row(db)
+        ws = self._ws_row_unobserved()
+
+        annotate_source_links(db, rest)
+        annotate_source_links(db, ws)
+
+        fields = ("identity_kind", "identity_title", "identity_year", "identity_season")
+        assert [rest[0][f] for f in fields] == [ws[0][f] for f in fields], (
+            f"transports disagree: REST={[rest[0][f] for f in fields]} "
+            f"WS={[ws[0][f] for f in fields]}")
+        # ...and specifically, the last proof is what both report.
+        assert ws[0]["identity_kind"] == "tv_season"
+        assert ws[0]["identity_season"] == 2
+
+    def test_an_unobserved_poll_does_not_silently_drop_the_source_link_either(self, db):
+        """Same recovery, checked on the pre-existing field, so the fix is not
+        quietly identity-only."""
+        self._seed(db)
+        ws = self._ws_row_unobserved()
+
+        annotate_source_links(db, ws)
+
+        assert ws[0]["source_url"] == A
+
+    def test_a_package_that_was_NEVER_proven_stays_unknown(self, db):
+        """The negative control. Recovery must resurrect a real prior proof, not
+        invent one -- otherwise every unobserved row would acquire an identity."""
+        db.add_to_history(A, "The Repair Shop", season=2, year=2017)
+        db.upsert_download_result(name="hand added", package_uuid="pkg-uuid-2",
+                                  state="downloading", provenance_url=None,
+                                  provenance_observed=True)
+        ws = [{"id": None, "package_uuid": "pkg-uuid-2", "name": "hand added",
+               "state": "downloading", "provenance_url": None,
+               "provenance_observed": False}]
+
+        annotate_source_links(db, ws)
+
+        assert ws[0]["identity_kind"] == "unknown"
+        assert ws[0]["source_url"] is None
+
+    def test_recovery_only_applies_to_rows_that_could_not_be_observed(self, db):
+        """An OBSERVED poll that found no links is a retraction, not a gap. It
+        must NOT be handed the old proof back, or a package that genuinely
+        stopped being ours would keep its identity forever."""
+        self._seed(db)
+        ws = [{"id": None, "package_uuid": self.UUID, "name": self.NAME,
+               "state": "downloading", "provenance_url": None,
+               "provenance_observed": True}]   # looked, and found nothing
+
+        annotate_source_links(db, ws)
+
+        assert ws[0]["identity_kind"] == "unknown"
+        assert ws[0]["source_url"] is None

@@ -4143,6 +4143,52 @@ class DatabaseManager:
                 }
         return out
 
+    def get_persisted_provenance(self, keys):
+        """Map a package's identity key -> its PERSISTED ``provenance_url``.
+
+        `keys` is an iterable of ``(package_uuid, name)`` pairs. Result keys are
+        ``("uuid", package_uuid)`` or ``("name", name)`` so a caller can look up
+        by whichever it has, with uuid preferred.
+
+        WHY THIS EXISTS. The poller's in-memory row carries
+        ``provenance_url=None`` whenever it could not observe a package's links,
+        while this table deliberately KEEPS the previous proof in that case --
+        ``upsert_download_result`` writes the new value only when
+        ``provenance_observed`` is true, because "could not look" is not
+        "no longer ours". So the WebSocket row and the persisted row disagree
+        for the length of an unobserved poll. That was accepted while the only
+        consequence was a source link blinking; it is not acceptable for
+        identity, which is meant to authorise cancelling other downloads
+        (peer review 2026-08-18, M2).
+
+        ONE batched query, and only for the rows that need it -- the caller
+        filters to unobserved-and-urlless rows first, which is normally none.
+        """
+        pairs = [(u, n) for u, n in (keys or []) if u or n]
+        if not pairs:
+            return {}
+        uuids = [str(u) for u, _ in pairs if u]
+        names = [str(n) for u, n in pairs if not u and n]
+        out = {}
+        for column, values in (("package_uuid", uuids), ("name", names)):
+            for start in range(0, len(values), 300):
+                chunk = values[start:start + 300]
+                if not chunk:
+                    continue
+                rows = self._query_dicts(
+                    "SELECT package_uuid, name, provenance_url FROM download_results "
+                    "WHERE %s IN (%s)" % (column, ",".join("?" * len(chunk))),
+                    tuple(chunk), default=[]) or []
+                for row in rows:
+                    if column == "package_uuid" and row.get("package_uuid"):
+                        out[("uuid", str(row["package_uuid"]))] = row.get("provenance_url")
+                    elif column == "name" and row.get("name"):
+                        # Legacy NULL-uuid rows only. A name can repeat, so this
+                        # is deliberately last-write-wins rather than a guess
+                        # between two rows -- the uuid path is the reliable one.
+                        out[("name", str(row["name"]))] = row.get("provenance_url")
+        return out
+
     def get_download_result_id(self, package_uuid, name):
         """Resolve a download_results row id for a package: by ``package_uuid``
         when present, else the most recent legacy NULL-uuid row with the same
