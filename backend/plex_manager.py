@@ -127,6 +127,11 @@ class PathMapping:
         return path
 
 
+#: Number of stripes guarding per-item Plex label mutation. Bounds the lock
+#: count while still letting unrelated titles write concurrently.
+_LABEL_LOCK_STRIPES = 64
+
+
 class PlexManager:
     """Manages Plex server connection and library operations."""
 
@@ -159,6 +164,20 @@ class PlexManager:
         self._cache_timestamp: Optional[datetime] = None
         self._cache_duration = timedelta(hours=1)
         self._lock = threading.Lock()
+        # STRIPED LOCKS FOR LABEL MUTATION. add_label/remove_label are
+        # read-modify-write on a fetched Plex item, and two independent workers
+        # can hold the same item: the scheduled DV sync and the version-badge
+        # sync run sequentially on the maintenance thread, but the MANUAL DV
+        # sync endpoint runs on its own daemon thread and can overlap either.
+        # Two edits built from the same stale read mean one silently drops the
+        # other's label (peer review 2026-08-19, M3).
+        #
+        # Striped rather than one lock per rating_key: a per-key dict would grow
+        # an entry for every one of ~15,000 movies and need reaping. Striping
+        # bounds that at a fixed cost while still letting unrelated titles write
+        # concurrently -- only same-stripe collisions serialise, which for label
+        # writes is far cheaper than the Plex round trip they guard.
+        self._label_locks = [threading.Lock() for _ in range(_LABEL_LOCK_STRIPES)]
         self._callbacks: List[Callable[[str, Any], None]] = []
 
     @property
@@ -433,13 +452,26 @@ class PlexManager:
             logger.error(f"Failed to get library section '{name}': {e}")
             return None
 
+    def _label_lock(self, rating_key):
+        """The stripe guarding label mutation for one item. Same key -> same
+        lock, so a read-modify-write on one movie cannot interleave."""
+        return self._label_locks[hash(str(rating_key)) % _LABEL_LOCK_STRIPES]
+
     def add_label(self, rating_key, label):
-        """Add a Plex label to the item with ``rating_key`` (TEXT-safe)."""
-        self._server.fetchItem(int(rating_key)).addLabel(label)
+        """Add a Plex label to the item with ``rating_key`` (TEXT-safe).
+
+        Serialised per item: `fetchItem().addLabel()` reads the item's current
+        labels and writes them back, so an overlapping writer on the same movie
+        can drop this label or have its own dropped."""
+        with self._label_lock(rating_key):
+            self._server.fetchItem(int(rating_key)).addLabel(label)
 
     def remove_label(self, rating_key, label):
-        """Remove a Plex label from the item with ``rating_key`` (TEXT-safe)."""
-        self._server.fetchItem(int(rating_key)).removeLabel(label)
+        """Remove a Plex label from the item with ``rating_key`` (TEXT-safe).
+
+        Serialised per item, for the same reason as `add_label`."""
+        with self._label_lock(rating_key):
+            self._server.fetchItem(int(rating_key)).removeLabel(label)
 
     # Path mapping methods
     def add_path_mapping(self, plex_path: str, local_path: str):

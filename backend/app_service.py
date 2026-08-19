@@ -754,11 +754,22 @@ class AppService:
         # refresh does not change what layer they are.
         try:
             if self.db is not None and self.config.get("plex_enabled", True):
-                latest = self.db.get_latest_plex_cache_at(content_type="Movies")
+                # NO BASELINE-ONLY FIRST PASS, unlike the DV block above. That
+                # pattern exists there so restarting never kicks off a full
+                # relabel; here it would mean the badges stay at zero until the
+                # Plex cache happens to be rewritten -- which is the exact
+                # "built but unreachable" failure this wiring exists to fix, just
+                # moved one step later (peer review 2026-08-19, M1).
+                #
+                # The existing cache generation IS pending work on first pass.
+                # Re-running it on restart is cheap and safe: reconciliation only
+                # writes where a label differs, so a repeat pass over an
+                # already-badged library issues reads and almost no writes.
                 if not hasattr(self, "_last_version_cache_at"):
-                    self._last_version_cache_at = latest  # baseline only
-                elif latest and (self._last_version_cache_at is None
-                                 or latest > self._last_version_cache_at):
+                    self._last_version_cache_at = None
+                latest = self.db.get_latest_plex_cache_at(content_type="Movies")
+                if latest and (self._last_version_cache_at is None
+                               or latest > self._last_version_cache_at):
                     from backend.api.dependencies import registry
                     from backend.rename import version_labeler
                     plex_service = getattr(registry, "_plex_service", None)
@@ -770,8 +781,22 @@ class AppService:
                     else:
                         result = version_labeler.sync_version_labels(
                             self.db, pm, self.config)
-                        # Success only, for the reason the DV block spells out.
-                        self._last_version_cache_at = latest
+                        # COMPLETE, not merely returned. The sync catches every
+                        # failure so one bad title cannot abandon the rest, which
+                        # means a normal return is compatible with a library that
+                        # would not enumerate or a hundred label writes Plex
+                        # rejected. Advancing on that marks the generation
+                        # reconciled and never retries it (peer review M2).
+                        if result.get("complete"):
+                            self._last_version_cache_at = latest
+                        else:
+                            logger.warning(
+                                "Version-badge sync INCOMPLETE — watermark NOT "
+                                "advanced, will retry next pass "
+                                "(%d library, %d title, %d write failure(s))",
+                                result.get("lib_failures", 0),
+                                result.get("title_failures", 0),
+                                result.get("write_failures", 0))
                         logger.info(
                             "Version-badge sync: %d title(s) seen, %d added, "
                             "%d removed, %d multi-version, %d uncached",

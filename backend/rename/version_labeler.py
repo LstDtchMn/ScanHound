@@ -14,11 +14,16 @@ and their own reconcile pass, sharing the DV labeler's discipline but not its
 vocabulary.
 """
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 #: Above this, the count collapses into the catch-all bucket.
 MAX_EXACT_VERSIONS = 4
+
+#: Inter-write pause, same value and same reason as dv_labeler's: a full
+#: backfill touches roughly a thousand titles and must not hammer Plex.
+_THROTTLE_S = 0.05
 
 #: The CLOSED set this module may remove. Nothing outside it is ever touched, so
 #: a label the owner applied by hand is safe — the same rule that stopped the DV
@@ -51,23 +56,44 @@ def version_label(count):
 
 def count_versions(rows):
     """``{rating_key: version_count}`` from plex_cache movie rows.
-
-    One row per version is the shape plex_cache stores. Rows with no rating_key
-    are dropped — they cannot be attributed to a title, and counting them into
-    someone else's total would be worse than ignoring them.
-
-    Returns COUNTS ONLY, deliberately: this is the half of the duplicate feature
-    that does not need to identify individual versions, so it does not depend on
-    media_id being unique (6 of 1,032 multi-version movies have repeated ones).
+    
+    COUNTS DISTINCT ``media_id``, NOT ROWS. plex_cache stores one row per
+    PART, not per version: `_extract_movie_data()` emits a row for each part and
+    gives multipart media separate cache keys while REUSING the media_id, with a
+    two-file DVD rip as its worked example. Counting rows therefore reports a
+    one-version two-part film as "2 Versions", and a two-version film where one
+    is multipart as "3 Versions".
+    
+    Not hypothetical: six live titles are in that shape, including
+    `Friday the 13th: The New Blood` (2 rows, 1 media_id -> should carry NO
+    badge) and `Lawrence of Arabia` (3 rows, 2 media_ids -> "2 Versions", not
+    three). An earlier version of this docstring cited those same six as a
+    reason NOT to depend on media_id. That was exactly backwards -- ignoring it
+    is what produced the wrong count (peer review 2026-08-19, H1).
+    
+    A row with no media_id makes its title UNKNOWN rather than guessed: parts
+    and versions become indistinguishable for that title, and the module's
+    standing rule is that an unknown count touches nothing. Zero live rows are
+    in that state; this is a guard against the shape, not a fix for existing
+    data.
+    
+    Rows with no rating_key are dropped -- they cannot be attributed to a title,
+    and counting them into someone else's total would be worse than ignoring
+    them.
     """
-    counts = {}
+    media_by_key = {}
+    unusable = set()
     for r in rows or ():
         key = r.get("rating_key")
         if key is None or key == "":
             continue
-        counts[str(key)] = counts.get(str(key), 0) + 1
-    return counts
-
+        key = str(key)
+        media = r.get("media_id")
+        if media is None or media == "":
+            unusable.add(key)
+            continue
+        media_by_key.setdefault(key, set()).add(str(media))
+    return {k: len(v) for k, v in media_by_key.items() if k not in unusable}
 
 def reconcile_movie_versions(movie, counts, pm, *, dry_run=False):
     """Reconcile one movie's version badge. Returns ``{added, removed}``.
@@ -77,6 +103,7 @@ def reconcile_movie_versions(movie, counts, pm, *, dry_run=False):
     rule the DV labeler enforces, and for the same reason: a cache gap must not
     be read as evidence and strip a correct badge.
     """
+    failed = 0
     rating_key = str(getattr(movie, "ratingKey", "") or "")
     existing = set()
     for lab in (getattr(movie, "labels", None) or []):
@@ -87,7 +114,7 @@ def reconcile_movie_versions(movie, counts, pm, *, dry_run=False):
 
     if rating_key not in counts:
         # No cached row for this title. Say nothing rather than guess.
-        return {"added": [], "removed": [], "count": None}
+        return {"added": [], "removed": [], "count": None, "failed": 0}
 
     count = counts[rating_key]
     wanted = version_label(count)
@@ -101,14 +128,26 @@ def reconcile_movie_versions(movie, counts, pm, *, dry_run=False):
             try:
                 pm.add_label(movie.ratingKey, lab)
             except Exception as e:  # noqa: BLE001
+                failed += 1
                 logger.warning("add_label %s on %s failed: %s", lab, rating_key, e)
         for lab in removed:
             try:
                 pm.remove_label(movie.ratingKey, lab)
             except Exception as e:  # noqa: BLE001
+                failed += 1
                 logger.warning("remove_label %s on %s failed: %s", lab, rating_key, e)
 
-    return {"added": added, "removed": removed, "count": count}
+        if (added or removed) and not dry_run:
+            # Pace the writes, exactly as dv_labeler does: the first backfill
+            # touches ~1,000 titles, and an unpaced burst is what makes Plex
+            # start rejecting them -- which, combined with a watermark that
+            # advanced anyway, would have marked the generation done with the
+            # badges missing.
+            time.sleep(_THROTTLE_S)
+    # `failed` is the number of label WRITES that did not land. Reported rather
+    # than only logged, because the caller decides whether the pass may be
+    # called complete, and "the function returned" is not "the work happened".
+    return {"added": added, "removed": removed, "count": count, "failed": failed}
 
 
 def sync_version_labels(db, pm, config, *, dry_run=False, progress_cb=None):
@@ -117,6 +156,18 @@ def sync_version_labels(db, pm, config, *, dry_run=False, progress_cb=None):
     Mirrors dv_labeler.sync_labels' shape: read the cache once, walk the
     libraries, reconcile per title. The counts come from plex_cache, so this
     makes no per-movie Plex call.
+
+    REPORTS `complete`, AND THE CALLER MUST HONOUR IT. Every failure in here is
+    caught and logged so one bad title cannot abandon the rest -- a library that
+    will not enumerate, a title that raises, a label write Plex rejects. That is
+    the right behaviour for the pass and the wrong signal for a watermark:
+    returning normally after a hundred rejected writes would let the scheduler
+    mark the cache generation reconciled and never retry it, leaving the badges
+    missing (peer review 2026-08-19, M2).
+
+    `complete` is False if ANY library failed to enumerate, ANY title raised, or
+    ANY label write failed. A library that could not be listed counts, because
+    its titles were never reconciled at all.
     """
     rows = db.list_plex_cache_movies() if hasattr(db, "list_plex_cache_movies") else []
     counts = count_versions(rows)
@@ -125,6 +176,7 @@ def sync_version_labels(db, pm, config, *, dry_run=False, progress_cb=None):
                 len(rows), len(counts), multi)
 
     libs = config.get("movie_libs") or config.get("known_movie_libraries") or []
+    lib_failures = 0
     seen = set()
     movies = []
     for name in libs:
@@ -138,19 +190,23 @@ def sync_version_labels(db, pm, config, *, dry_run=False, progress_cb=None):
                 seen.add(mv.ratingKey)
                 movies.append(mv)
         except Exception as e:  # noqa: BLE001
+            lib_failures += 1
             logger.warning("version labels: library %s failed: %s", name, e)
 
     added_n = removed_n = badged_n = unknown_n = 0
+    title_failures = write_failures = 0
     for i, mv in enumerate(movies):
         try:
             res = reconcile_movie_versions(mv, counts, pm, dry_run=dry_run)
             added_n += len(res["added"])
             removed_n += len(res["removed"])
+            write_failures += res.get("failed", 0)
             if res["count"] is None:
                 unknown_n += 1
             elif res["count"] > 1:
                 badged_n += 1
         except Exception as e:  # noqa: BLE001
+            title_failures += 1
             logger.warning("version labels: title %s failed: %s",
                            getattr(mv, "title", "?"), e)
         if progress_cb:
@@ -166,4 +222,9 @@ def sync_version_labels(db, pm, config, *, dry_run=False, progress_cb=None):
         # is a reason to look at the cache.
         "unknown": unknown_n,
         "dry_run": dry_run,
+        # The counters the caller's watermark decision rests on.
+        "lib_failures": lib_failures,
+        "title_failures": title_failures,
+        "write_failures": write_failures,
+        "complete": not (lib_failures or title_failures or write_failures),
     }
