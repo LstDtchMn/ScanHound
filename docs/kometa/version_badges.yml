@@ -1,0 +1,124 @@
+# ScanHound — version-count badges for Kometa.
+#
+# Badges a movie with HOW MANY versions it has. The owner keeps multiple
+# versions deliberately; this says so on the poster instead of requiring a click
+# into Plex to find out.
+#
+# A SEPARATE FILE from dv_badges.yml on purpose. These labels are managed by a
+# different ScanHound pass with its own closed set
+# (backend/rename/version_labeler.py, VERSION_LABELS) and must NOT be added to
+# the DV labeler's MANAGED set: the DV sync computes removals as
+# "managed labels this title should not have", so a version label inside MANAGED
+# would be stripped on every DV run.
+#
+# Drop into your Kometa config alongside the DV badges:
+#
+#   libraries:
+#     Movies:
+#       overlay_files:
+#         - file: config/dv_badges.yml
+#         - file: config/version_badges.yml
+#
+# Run AFTER ScanHound's version-label sync, the same ordering the DV badges need.
+
+# ---------------------------------------------------------------------------
+# DRAWN TOP-RIGHT, STACKED BELOW THE DOLBY VISION BADGE.
+#
+# Measured against the file Kometa ACTUALLY LOADS, which is /config/dv-layer.yml
+# in the running container -- not docs/kometa/dv_badges.yml in this repo. Those
+# two disagree, and trusting the repo copy is how this file first shipped with a
+# guaranteed collision: it draws the DV pill at
+#
+#     horizontal_align: right   vertical_align: top   offsets 15 / 15
+#     image 250 x 96, so it occupies y = 15..111
+#
+# while this file used the IDENTICAL position. Every movie carrying both would
+# have drawn one badge on top of the other -- and that is the common case, not
+# the edge case: 1,029 movies have multiple versions and most of them are also
+# DV or HDR10.
+#
+# vertical_offset 123 = 15 (DV top) + 96 (DV height) + 12 (gap), so the two
+# stack in a right-hand column. The other corners are taken: the ratings row is
+# top-left and the resolution badge is at the bottom, both per dv-layer.yml's
+# own comment.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# ONE BLOCK PER LABEL, because Kometa overlays are label-gated with fixed text —
+# there is no way to interpolate a count into a single overlay. The label set is
+# therefore closed, and "5+ Versions" is the catch-all that keeps it closed.
+#
+# Without that bucket, importing a fifth version produces a count with no label,
+# no overlay, and a poster that silently loses its badge — indistinguishable
+# from a movie that never had duplicates.
+#
+# Live distribution, re-measured 2026-08-19 after the counter was corrected to
+# count Plex VERSIONS rather than cache rows: 983 twos, 45 threes, 1 four,
+# 0 fives. The 4 and 5+ blocks badge one movie and none respectively; they exist
+# so the set cannot develop a hole.
+# ---------------------------------------------------------------------------
+
+overlays:
+  2 Versions:
+    overlay:
+      name: text(2 VERSIONS)
+      horizontal_offset: 15
+      horizontal_align: right
+      vertical_offset: 123
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 260
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: 2 Versions
+
+  3 Versions:
+    overlay:
+      name: text(3 VERSIONS)
+      horizontal_offset: 15
+      horizontal_align: right
+      vertical_offset: 123
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 260
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: 3 Versions
+
+  4 Versions:
+    overlay:
+      name: text(4 VERSIONS)
+      horizontal_offset: 15
+      horizontal_align: right
+      vertical_offset: 123
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 260
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: 4 Versions
+
+  5+ Versions:
+    overlay:
+      name: text(5+ VERSIONS)
+      horizontal_offset: 15
+      horizontal_align: right
+      vertical_offset: 123
+      vertical_align: top
+      font_color: "#FFFFFF"
+      back_color: "#00000099"
+      back_width: 260
+      back_height: 80
+      back_radius: 30
+    plex_search:
+      all:
+        label: 5+ Versions

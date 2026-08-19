@@ -740,6 +740,78 @@ class AppService:
         except Exception:
             logger.exception("DV auto label sync failed (non-fatal)")
 
+        # ── Version-count badges ──────────────────────────────────────────
+        # Same shape as the DV sync above, and deliberately so: the failure it
+        # is built to avoid is the one that block's comment documents at
+        # length -- advancing a watermark before the work succeeded, which
+        # silently consumes a generation and leaves the labels unapplied until
+        # something unrelated moves it again.
+        #
+        # TRIGGER: plex_cache.last_updated. The counts are derived from that
+        # cache, so a rewrite is exactly when a title's file count can change.
+        # A separate watermark from the DV one because they move independently:
+        # a DV scan does not change how many files a movie has, and a Plex
+        # refresh does not change what layer they are.
+        try:
+            if self.db is not None and self.config.get("plex_enabled", True):
+                # NO BASELINE-ONLY FIRST PASS, unlike the DV block above. That
+                # pattern exists there so restarting never kicks off a full
+                # relabel; here it would mean the badges stay at zero until the
+                # Plex cache happens to be rewritten -- which is the exact
+                # "built but unreachable" failure this wiring exists to fix, just
+                # moved one step later (peer review 2026-08-19, M1).
+                #
+                # The existing cache generation IS pending work on first pass.
+                # Re-running it on restart is cheap and safe: reconciliation only
+                # writes where a label differs, so a repeat pass over an
+                # already-badged library issues reads and almost no writes.
+                if not hasattr(self, "_last_version_cache_at"):
+                    self._last_version_cache_at = None
+                latest = self.db.get_latest_plex_cache_at(content_type="Movies")
+                if latest and (self._last_version_cache_at is None
+                               or latest > self._last_version_cache_at):
+                    from backend.api.dependencies import registry
+                    from backend.rename import version_labeler
+                    plex_service = getattr(registry, "_plex_service", None)
+                    pm = getattr(plex_service, "plex_manager", None) if plex_service else None
+                    if pm is None:
+                        logger.info("Version-badge sync: cache refreshed but Plex "
+                                    "not initialized — watermark NOT advanced, "
+                                    "will retry next pass")
+                    else:
+                        result = version_labeler.sync_version_labels(
+                            self.db, pm, self.config)
+                        # COMPLETE, not merely returned. The sync catches every
+                        # failure so one bad title cannot abandon the rest, which
+                        # means a normal return is compatible with a library that
+                        # would not enumerate or a hundred label writes Plex
+                        # rejected. Advancing on that marks the generation
+                        # reconciled and never retries it (peer review M2).
+                        if result.get("complete"):
+                            self._last_version_cache_at = latest
+                        else:
+                            logger.warning(
+                                "Version-badge sync INCOMPLETE — watermark NOT "
+                                "advanced, will retry next pass "
+                                "(%d cache, %d library, %d title, %d write "
+                                "failure(s))",
+                                result.get("cache_failures", 0),
+                                result.get("lib_failures", 0),
+                                result.get("title_failures", 0),
+                                result.get("write_failures", 0))
+                        logger.info(
+                            "Version-badge sync: %d title(s) seen, %d label "
+                            "add(s) and %d removal(s) ATTEMPTED (%d write "
+                            "failure(s)), %d multi-version, %d uncached",
+                            result.get("total", 0),
+                            result.get("added_attempted", 0),
+                            result.get("removed_attempted", 0),
+                            result.get("write_failures", 0),
+                            result.get("multi_version", 0),
+                            result.get("unknown", 0))
+        except Exception:
+            logger.exception("Version-badge sync failed (non-fatal)")
+
     def _alert_dv_layer_conflicts(self, result):
         """Alert ONCE per distinct set of self-contradicting DV files.
 
