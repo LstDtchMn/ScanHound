@@ -793,15 +793,21 @@ class AppService:
                             logger.warning(
                                 "Version-badge sync INCOMPLETE — watermark NOT "
                                 "advanced, will retry next pass "
-                                "(%d library, %d title, %d write failure(s))",
+                                "(%d cache, %d library, %d title, %d write "
+                                "failure(s))",
+                                result.get("cache_failures", 0),
                                 result.get("lib_failures", 0),
                                 result.get("title_failures", 0),
                                 result.get("write_failures", 0))
                         logger.info(
-                            "Version-badge sync: %d title(s) seen, %d added, "
-                            "%d removed, %d multi-version, %d uncached",
-                            result.get("total", 0), result.get("added", 0),
-                            result.get("removed", 0), result.get("multi_version", 0),
+                            "Version-badge sync: %d title(s) seen, %d label "
+                            "add(s) and %d removal(s) ATTEMPTED (%d write "
+                            "failure(s)), %d multi-version, %d uncached",
+                            result.get("total", 0),
+                            result.get("added_attempted", 0),
+                            result.get("removed_attempted", 0),
+                            result.get("write_failures", 0),
+                            result.get("multi_version", 0),
                             result.get("unknown", 0))
         except Exception:
             logger.exception("Version-badge sync failed (non-fatal)")

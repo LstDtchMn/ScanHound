@@ -131,6 +131,14 @@ class PathMapping:
 #: count while still letting unrelated titles write concurrently.
 _LABEL_LOCK_STRIPES = 64
 
+#: MODULE-LEVEL, not per-instance, for two reasons. The guard must hold across
+#: PlexManager INSTANCES -- two of them pointing at the same server would each
+#: take their own lock and serialise nothing, and the thing being protected is
+#: the Plex item, not the manager. And instance state built in __init__ is not
+#: there for objects created via __new__, which several tests and helpers do;
+#: an AttributeError inside a label write is a worse failure than the race.
+_LABEL_LOCKS = [threading.Lock() for _ in range(_LABEL_LOCK_STRIPES)]
+
 
 class PlexManager:
     """Manages Plex server connection and library operations."""
@@ -176,8 +184,8 @@ class PlexManager:
         # an entry for every one of ~15,000 movies and need reaping. Striping
         # bounds that at a fixed cost while still letting unrelated titles write
         # concurrently -- only same-stripe collisions serialise, which for label
-        # writes is far cheaper than the Plex round trip they guard.
-        self._label_locks = [threading.Lock() for _ in range(_LABEL_LOCK_STRIPES)]
+        # writes is far cheaper than the Plex round trip they guard. The stripes
+        # live at module scope; see _LABEL_LOCKS.
         self._callbacks: List[Callable[[str, Any], None]] = []
 
     @property
@@ -452,10 +460,13 @@ class PlexManager:
             logger.error(f"Failed to get library section '{name}': {e}")
             return None
 
-    def _label_lock(self, rating_key):
+    @staticmethod
+    def _label_lock(rating_key):
         """The stripe guarding label mutation for one item. Same key -> same
-        lock, so a read-modify-write on one movie cannot interleave."""
-        return self._label_locks[hash(str(rating_key)) % _LABEL_LOCK_STRIPES]
+        lock, so a read-modify-write on one movie cannot interleave -- and the
+        same lock across every PlexManager instance, which is what makes it a
+        guard on the Plex item rather than on one manager object."""
+        return _LABEL_LOCKS[hash(str(rating_key)) % _LABEL_LOCK_STRIPES]
 
     def add_label(self, rating_key, label):
         """Add a Plex label to the item with ``rating_key`` (TEXT-safe).

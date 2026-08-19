@@ -3519,6 +3519,33 @@ class DatabaseManager:
             "rating_key, media_id, is_tv, dovi, hdr, library_name, file_path "
             "FROM plex_cache WHERE content_type = 'Movies'", default=[])
 
+    def list_plex_cache_movies_strict(self):
+        """Same rows as ``list_plex_cache_movies``, but RAISES on a read
+        failure instead of returning ``[]``.
+
+        WHY A SECOND METHOD. `_query_dicts(default=[])` converts a database
+        error into an empty list, which is the right call for a display query
+        and the wrong one for evidence. The version-badge sync derives its
+        counts from these rows: an empty result makes every live movie
+        "unknown", the reconciler correctly touches nothing, no counter records
+        a failure, and the pass reports COMPLETE -- so the scheduler marks that
+        cache generation reconciled and never retries it. The badges are then
+        stale until an unrelated refresh (peer review 2026-08-19, M2/A).
+
+        An empty table is still a valid empty answer here; only a failed READ
+        raises. The caller must not try to tell those apart by inspecting the
+        result, which is exactly the inference this method exists to remove.
+        """
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError("plex_cache read failed: no database connection")
+            cur = conn.execute(
+                "SELECT key, title, original_title, year, res, size, imdb_id, "
+                "rating_key, media_id, is_tv, dovi, hdr, library_name, file_path "
+                "FROM plex_cache WHERE content_type = 'Movies'")
+            return [dict(r) for r in cur.fetchall()]
+
     def load_plex_cache(self, mode):
         """Load cached Plex items for the given content type.
 

@@ -1,6 +1,6 @@
 """Badge a Plex movie with HOW MANY versions it has.
 
-The owner keeps multiple versions deliberately — 1,032 movies in this library
+The owner keeps multiple versions deliberately — 1,029 movies in this library
 have more than one file — and wants the poster to say so. Kometa overlays are
 label-gated with fixed text, so a COUNT means one label per value rather than
 one label with a number in it.
@@ -169,7 +169,22 @@ def sync_version_labels(db, pm, config, *, dry_run=False, progress_cb=None):
     ANY label write failed. A library that could not be listed counts, because
     its titles were never reconciled at all.
     """
-    rows = db.list_plex_cache_movies() if hasattr(db, "list_plex_cache_movies") else []
+    # STRICT READ. `list_plex_cache_movies()` turns a database error into `[]`,
+    # which here is indistinguishable from an empty cache: every live movie
+    # becomes "unknown", the reconciler correctly touches nothing, NO counter
+    # records a failure, and the pass reports complete -- so the generation is
+    # consumed and the badges stay stale (peer review M2/B). An empty table is
+    # still a valid answer; only a failed read raises.
+    cache_failures = 0
+    try:
+        if hasattr(db, "list_plex_cache_movies_strict"):
+            rows = db.list_plex_cache_movies_strict()
+        else:
+            rows = db.list_plex_cache_movies() if hasattr(db, "list_plex_cache_movies") else []
+    except Exception as e:  # noqa: BLE001
+        cache_failures = 1
+        rows = []
+        logger.warning("version labels: plex_cache read failed: %s", e)
     counts = count_versions(rows)
     multi = sum(1 for c in counts.values() if c > 1)
     logger.info("version labels: %d cached movie rows -> %d titles, %d multi-version",
@@ -183,6 +198,13 @@ def sync_version_labels(db, pm, config, *, dry_run=False, progress_cb=None):
         try:
             lib = pm.get_library_section(name)
             if not lib:
+                # NOT a harmless skip. Production PlexManager catches its own
+                # connect/lookup errors and RETURNS None, so this is what a real
+                # failure looks like -- the mock that raises only proved the
+                # except branch. Its titles were never reconciled, so the pass
+                # is not complete (peer review M2/A).
+                lib_failures += 1
+                logger.warning("version labels: library %s did not resolve", name)
                 continue
             for mv in lib.all():
                 if mv.ratingKey in seen:
@@ -193,13 +215,13 @@ def sync_version_labels(db, pm, config, *, dry_run=False, progress_cb=None):
             lib_failures += 1
             logger.warning("version labels: library %s failed: %s", name, e)
 
-    added_n = removed_n = badged_n = unknown_n = 0
+    added_attempted = removed_attempted = badged_n = unknown_n = 0
     title_failures = write_failures = 0
     for i, mv in enumerate(movies):
         try:
             res = reconcile_movie_versions(mv, counts, pm, dry_run=dry_run)
-            added_n += len(res["added"])
-            removed_n += len(res["removed"])
+            added_attempted += len(res["added"])
+            removed_attempted += len(res["removed"])
             write_failures += res.get("failed", 0)
             if res["count"] is None:
                 unknown_n += 1
@@ -214,8 +236,12 @@ def sync_version_labels(db, pm, config, *, dry_run=False, progress_cb=None):
 
     return {
         "total": len(movies),
-        "added": added_n,
-        "removed": removed_n,
+        # ATTEMPTED, not confirmed. reconcile computes the diff, then tries the
+        # writes; a rejected write still counts here and is reported separately
+        # in write_failures. Named for what they are so the operational log
+        # cannot imply a badge landed when Plex refused it (peer review L2).
+        "added_attempted": added_attempted,
+        "removed_attempted": removed_attempted,
         "multi_version": badged_n,
         # Titles with no cached row. Reported rather than folded into "single
         # version", because the two mean different things and only one of them
@@ -223,8 +249,10 @@ def sync_version_labels(db, pm, config, *, dry_run=False, progress_cb=None):
         "unknown": unknown_n,
         "dry_run": dry_run,
         # The counters the caller's watermark decision rests on.
+        "cache_failures": cache_failures,
         "lib_failures": lib_failures,
         "title_failures": title_failures,
         "write_failures": write_failures,
-        "complete": not (lib_failures or title_failures or write_failures),
+        "complete": not (cache_failures or lib_failures or title_failures
+                         or write_failures),
     }

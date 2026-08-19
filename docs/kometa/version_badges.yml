@@ -26,7 +26,7 @@
 #
 # Every block in dv_badges.yml draws at horizontal_align: left / vertical_align:
 # top with the same offsets, and that file warns that adding another there
-# stacks overlapping labels. This is not a hypothetical collision: 1,032 movies
+# stacks overlapping labels. This is not a hypothetical collision: 1,029 movies
 # have multiple versions and most of them already carry a DV or HDR10 badge in
 # that corner, so top-left would overlap on the common case rather than the edge
 # case.
@@ -41,7 +41,8 @@
 # no overlay, and a poster that silently loses its badge — indistinguishable
 # from a movie that never had duplicates.
 #
-# Live distribution when written (2026-08-17): 983 twos, 48 threes, 1 four,
+# Live distribution, re-measured 2026-08-19 after the counter was corrected to
+# count Plex VERSIONS rather than cache rows: 983 twos, 45 threes, 1 four,
 # 0 fives. The 4 and 5+ blocks badge one movie and none respectively; they exist
 # so the set cannot develop a hole.
 # ---------------------------------------------------------------------------

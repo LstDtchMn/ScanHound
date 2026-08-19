@@ -13,7 +13,7 @@ a concurrent write can do it by accident, which is what these cover.
 import threading
 import time
 
-from backend.plex_manager import PlexManager, _LABEL_LOCK_STRIPES
+from backend.plex_manager import PlexManager
 
 
 class _RaceyItem:
@@ -36,7 +36,6 @@ class _RaceyItem:
 
 def _manager(item):
     pm = PlexManager.__new__(PlexManager)
-    pm._label_locks = [threading.Lock() for _ in range(_LABEL_LOCK_STRIPES)]
 
     class _Server:
         def fetchItem(self, _key):
@@ -111,7 +110,6 @@ def test_different_items_are_not_serialised_into_one_queue():
             self.labels.append(label)
 
     pm = PlexManager.__new__(PlexManager)
-    pm._label_locks = [threading.Lock() for _ in range(_LABEL_LOCK_STRIPES)]
 
     class _Server:
         def fetchItem(self, key):
@@ -151,6 +149,5 @@ def test_different_items_are_not_serialised_into_one_queue():
 
 def test_the_same_key_always_maps_to_the_same_stripe():
     pm = PlexManager.__new__(PlexManager)
-    pm._label_locks = [threading.Lock() for _ in range(_LABEL_LOCK_STRIPES)]
     assert pm._label_lock("123") is pm._label_lock("123")
     assert pm._label_lock(123) is pm._label_lock("123"), "int and str keys must agree"

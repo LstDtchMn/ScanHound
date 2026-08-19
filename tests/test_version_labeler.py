@@ -1,4 +1,5 @@
-"""Version-count badges: 1,032 movies in this library have more than one file.
+"""Version-count badges: 1,029 movies in this library have more than one
+PLEX VERSION -- which is not the same as more than one file.
 
 Two rules carry the weight, and both are the same rule the DV labeler learned:
 
@@ -30,12 +31,12 @@ def _movie(rating_key, labels=()):
 class TestTheLabelForACount:
     def test_a_single_version_gets_no_badge(self):
         """Badging all 15,250 movies would make the badge noise. It exists to
-        flag the 1,032 exceptions."""
+        flag the 1,029 exceptions."""
         assert version_label(1) is None
         assert version_label(0) is None
 
     def test_the_counts_that_actually_occur(self):
-        # Live data: 983 twos, 48 threes, 1 four.
+        # Live data: 983 twos, 45 threes, 1 four.
         assert version_label(2) == "2 Versions"
         assert version_label(3) == "3 Versions"
         assert version_label(4) == "4 Versions"
@@ -176,7 +177,7 @@ class TestSync:
 
     def test_it_reports_what_it_did(self):
         db = MagicMock()
-        db.list_plex_cache_movies.return_value = [
+        db.list_plex_cache_movies_strict.return_value = [
             {"rating_key": "1", "media_id": "a"},       # 2 distinct versions
             {"rating_key": "1", "media_id": "b"},
             {"rating_key": "2", "media_id": "c"},       # 1 version
@@ -184,7 +185,7 @@ class TestSync:
         pm = self._pm([_movie(1), _movie(2)])
         out = sync_version_labels(db, pm, {"movie_libs": ["Movies"]}, dry_run=False)
         assert out["total"] == 2
-        assert out["added"] == 1 and out["removed"] == 0
+        assert out["added_attempted"] == 1 and out["removed_attempted"] == 0
         assert out["multi_version"] == 1
         assert out["unknown"] == 0
 
@@ -192,14 +193,14 @@ class TestSync:
         """Folding them together would hide a broken cache behind a plausible
         number."""
         db = MagicMock()
-        db.list_plex_cache_movies.return_value = [{"rating_key": "1", "media_id": "a"}]
+        db.list_plex_cache_movies_strict.return_value = [{"rating_key": "1", "media_id": "a"}]
         pm = self._pm([_movie(1), _movie(404)])
         out = sync_version_labels(db, pm, {"movie_libs": ["Movies"]}, dry_run=True)
         assert out["unknown"] == 1
 
     def test_a_failing_library_does_not_abort_the_others(self):
         db = MagicMock()
-        db.list_plex_cache_movies.return_value = [{"rating_key": "1", "media_id": "a"},
+        db.list_plex_cache_movies_strict.return_value = [{"rating_key": "1", "media_id": "a"},
                                                   {"rating_key": "1", "media_id": "b"}]
         pm = MagicMock()
         good = MagicMock(); good.all.return_value = [_movie(1)]
@@ -236,7 +237,7 @@ class TestTheKometaConfigCoversEveryLabel:
 
     def test_the_badges_do_not_draw_over_the_DV_badges(self):
         """dv_badges.yml draws every block top-LEFT and warns that a second one
-        there stacks overlapping labels. Most of these 1,032 movies already
+        there stacks overlapping labels. Most of these 1,029 movies already
         carry a DV or HDR10 badge, so a collision would be the common case."""
         for name, block in self._overlays().items():
             o = block["overlay"]
@@ -257,7 +258,7 @@ class TestTheSyncIsActuallyREACHABLE:
 
     This suite's other tests build their own inputs, so every one of them would
     still pass if `sync_version_labels` were never invoked by anything -- which
-    was true for two days: 23 green tests, a live dry-run finding 1,032 movies,
+    was true for two days: 23 green tests, a live dry-run finding 1,029 movies,
     and zero badges on any poster.
     """
 
@@ -425,7 +426,7 @@ class TestCompletenessIsEarnedByTheWRITES:
 
     def _db(self):
         db = MagicMock()
-        db.list_plex_cache_movies.return_value = [
+        db.list_plex_cache_movies_strict.return_value = [
             {"rating_key": "1", "media_id": "a"},
             {"rating_key": "1", "media_id": "b"},   # 2 versions -> wants a badge
         ]
@@ -473,4 +474,80 @@ class TestCompletenessIsEarnedByTheWRITES:
         assert out["write_failures"] == 0 and out["lib_failures"] == 0
         assert out["title_failures"] == 0
         assert out["complete"] is True
-        assert out["added"] == 1
+        assert out["added_attempted"] == 1
+
+
+class TestAnEmptyReadIsNotASuccessfulRead:
+    """Round 2's finding, in one sentence: the code had learned that a returned
+    WRITE is not a successful write, but not the input rule — an empty or absent
+    READ is not a successful read.
+
+    Both paths below fail SOFT in production and so bypassed every counter:
+    `get_library_section()` catches its own errors and returns None, and
+    `list_plex_cache_movies()` turns a DB error into `[]`. Either one let the
+    sync report complete and consume the cache generation without reconciling it.
+    """
+
+    def _db_ok(self):
+        db = MagicMock()
+        db.list_plex_cache_movies_strict.return_value = [
+            {"rating_key": "1", "media_id": "a"},
+            {"rating_key": "1", "media_id": "b"},
+        ]
+        return db
+
+    def _pm(self, movies):
+        pm = MagicMock()
+        lib = MagicMock()
+        lib.all.return_value = movies
+        pm.get_library_section.return_value = lib
+        return pm
+
+    def test_a_library_that_RESOLVES_TO_NONE_is_incomplete(self):
+        """Mechanism A. The round-1 test made the mock RAISE, which only proved
+        the except branch. Production PlexManager catches its own connect and
+        lookup failures and returns None — so this is what a real outage looks
+        like, and `if not lib: continue` treated it as a harmless skip."""
+        pm = MagicMock()
+        pm.get_library_section.return_value = None
+        out = sync_version_labels(self._db_ok(), pm, {"movie_libs": ["Movies"]})
+        assert out["lib_failures"] == 1
+        assert out["complete"] is False, "an unreadable library still earned complete"
+
+    def test_a_FAILED_CACHE_READ_is_incomplete(self):
+        """Mechanism B. A DB error made every live movie 'unknown', which the
+        reconciler correctly leaves alone — so nothing raised, no counter moved,
+        and the pass called itself complete while the badges went stale."""
+        db = MagicMock()
+        db.list_plex_cache_movies_strict.side_effect = RuntimeError("db unavailable")
+        out = sync_version_labels(db, self._pm([_movie(1)]), {"movie_libs": ["Movies"]})
+        assert out["cache_failures"] == 1
+        assert out["complete"] is False
+        # ...and it must not have guessed: no label was touched.
+        assert out["added_attempted"] == 0 and out["removed_attempted"] == 0
+
+    def test_a_GENUINELY_empty_cache_is_still_complete(self):
+        """The distinction that matters. An empty table is a valid answer; only
+        a failed read is not. Without this, 'always incomplete' would satisfy
+        the test above and the watermark could never advance."""
+        db = MagicMock()
+        db.list_plex_cache_movies_strict.return_value = []
+        out = sync_version_labels(db, self._pm([_movie(1)]), {"movie_libs": ["Movies"]})
+        assert out["cache_failures"] == 0
+        assert out["complete"] is True
+        assert out["unknown"] == 1     # the movie is unknown, which is correct
+
+    def test_a_genuinely_empty_LIBRARY_is_still_complete(self):
+        """Same distinction on the other path: a library that resolves and
+        contains nothing is not a failure."""
+        out = sync_version_labels(self._db_ok(), self._pm([]), {"movie_libs": ["Movies"]})
+        assert out["lib_failures"] == 0
+        assert out["complete"] is True
+
+    def test_the_strict_reader_is_preferred_over_the_soft_one(self):
+        """A db exposing both must be read strictly, or the fix is inert."""
+        db = self._db_ok()
+        db.list_plex_cache_movies.return_value = []      # the soft path
+        sync_version_labels(db, self._pm([_movie(1)]), {"movie_libs": ["Movies"]})
+        db.list_plex_cache_movies_strict.assert_called_once()
+        db.list_plex_cache_movies.assert_not_called()
