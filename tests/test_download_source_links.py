@@ -205,9 +205,11 @@ class TestSemanticIdentity:
         assert rows[0]["identity_source"] == "unknown"
         assert rows[0]["identity_title"] is None
 
-    def test_no_row_is_EVER_labelled_a_movie(self, db):
-        """The rule, asserted directly rather than case by case, so restoring a
-        `movie` verdict cannot slip back in without this failing."""
+    def test_no_row_is_labelled_a_movie_WITHOUT_A_RECORDED_KIND(self, db):
+        """The rule, asserted directly. A movie verdict is now possible -- see
+        TestMovieIdentityFinallyExists -- but ONLY where the kind was recorded
+        at grab time. Inferring it from an absent season is what failed three
+        times, and this is what stops it coming back."""
         db.add_to_history(A, "Notting Hill", year=1999)
         b = "https://source.example/release-B"
         db.add_to_history(b, "Some Show", season=3, year=2019)
@@ -865,3 +867,111 @@ class TestFreshnessAgreesAcrossTransports:
         assert rest[0]["source_url"] == b
         assert rest[0]["identity_kind"] == "tv_season"
         assert rest[0]["identity_season"] == 5
+
+
+class TestMovieIdentityFinallyExists:
+    """Movies could never use the de-duplicate action, because nothing recorded
+    what KIND of thing a download was and the annotator refused to guess.
+
+    ScanHound knew all along -- its scan sources declare `type: movie` / `tv`
+    and MediaItem carries the resulting `category` right through to the UI --
+    but the download request dropped it, so it never reached `downloads`.
+    Recording it is what turns the refusal into an answer.
+    """
+
+    def test_a_recorded_MOVIE_gets_a_movie_identity(self, db):
+        db.add_to_history(A, "Notting Hill", year=1999, media_kind="movie")
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "movie"
+        assert rows[0]["identity_title"] == "Notting Hill"
+        assert rows[0]["identity_year"] == 1999
+        assert rows[0]["identity_season"] is None
+        assert rows[0]["identity_source"] == "provenance"
+
+    def test_an_UNRECORDED_kind_is_still_unknown_not_movie(self, db):
+        """The regression guard. Every row grabbed before the column existed has
+        no kind, and must stay unknown -- re-inferring it from `season is None`
+        is the exact mistake that failed three times."""
+        db.add_to_history(A, "Notting Hill", year=1999)   # no media_kind
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "unknown"
+        assert rows[0]["identity_title"] is None
+
+    def test_a_recorded_movie_with_NO_YEAR_is_not_actionable(self, db):
+        """A movie identity is title+year: normalizeTitle strips years
+        downstream, so without one two remakes collapse into one identity."""
+        db.add_to_history(A, "Some Film", media_kind="movie")
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "unknown"
+
+    def test_CONTRADICTORY_evidence_is_refused(self, db):
+        """Recorded as a film yet carrying a season. One of the two is wrong and
+        nothing here can tell which, so neither is trusted."""
+        db.add_to_history(A, "Confused Release", season=2, year=2019,
+                          media_kind="movie")
+        rows = [{"name": "x", "provenance_url": A}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "unknown"
+
+    def test_TV_identity_is_UNCHANGED_by_all_of_this(self, db):
+        """Strictly additive. A recorded season was always positive evidence of
+        TV and still is -- requiring media_kind there would have silently
+        dropped every existing TV identity to unknown."""
+        b = "https://source.example/release-B"
+        db.add_to_history(A, "The Repair Shop", season=2, year=2017)  # no kind
+        db.add_to_history(b, "Other Show", season=3, year=2001, media_kind="tv")
+        rows = [{"name": "a", "provenance_url": A}, {"name": "b", "provenance_url": b}]
+
+        annotate_source_links(db, rows)
+
+        assert rows[0]["identity_kind"] == "tv_season" and rows[0]["identity_season"] == 2
+        assert rows[1]["identity_kind"] == "tv_season" and rows[1]["identity_season"] == 3
+
+
+class TestTheCategoryToKindMapping:
+    """The ingest-side half of the fact. `media_kind_for_category` is what turns
+    the scan source's declaration into the value stored on the row, and nothing
+    covered it -- a mutant defaulting unknown categories to "movie" survived the
+    whole suite.
+    """
+
+    def _kind(self, category):
+        from backend.download_service import DownloadService
+        return DownloadService.media_kind_for_category(category)
+
+    def test_the_categories_the_scan_sources_actually_emit(self):
+        # scanner_service declares type movie/tv per source; these are the
+        # categories those sources carry.
+        assert self._kind("tv") == "tv"
+        assert self._kind("4k") == "movie"
+        assert self._kind("remux") == "movie"
+
+    def test_an_UNRECOGNISED_category_records_NOTHING(self):
+        """THE guard. A default of 'movie' would quietly hand a movie identity
+        to everything ScanHound cannot classify -- including the 'search'
+        category, which says nothing about media kind."""
+        for c in ("search", "", None, "unknown", "movies", "TV Packs", "4K "):
+            k = self._kind(c)
+            assert k in (None, "tv", "movie"), k
+        assert self._kind("search") is None, "'search' proves nothing about kind"
+        assert self._kind("") is None
+        assert self._kind(None) is None
+        assert self._kind("wat") is None
+
+    def test_it_is_case_and_whitespace_tolerant(self):
+        """The category arrives from the wire, so it may be spelled loosely --
+        but tolerance must not become guessing."""
+        assert self._kind(" TV ") == "tv"
+        assert self._kind("4K") == "movie"
+        assert self._kind("ReMux") == "movie"

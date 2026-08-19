@@ -337,10 +337,30 @@ class HDEncodeActionService:
                     hdr_formats = ", ".join(str(value) for value in parsed)
             except (TypeError, ValueError):
                 pass
-        for link in links:
+        # HISTORY IS KEYED BY THE RELEASE URL, NOT BY EACH FILE-HOST LINK.
+        #
+        # This used to write one `downloads` row per link. Nothing reads them:
+        # `is_downloaded()` -- the only consumer -- is called with the RELEASE
+        # url (download_service.py), so link rows can never match, and the links
+        # are already recorded by `record_submitted_links()` for provenance.
+        #
+        # Worse, it made a whole feature silently inert for this path.
+        # `download_results.provenance_url` resolves to the canonical url, and
+        # `annotate_source_links()` joins that against `downloads.url`. With
+        # history under the links, that join could never match, so every RSS
+        # grab was destined to show no source link, no first-seen date and no
+        # semantic identity -- and `first_seen_at` had been silently absent on
+        # this path since long before identity existed.
+        #
+        # Keyed on canonical_url now, exactly as `download_item()` does it.
+        # Latent rather than historical: hdencode_actions holds 0 rows and RSS
+        # auto-grab is off, so nothing was ever written the old way and there is
+        # no legacy data to reconcile.
+        canonical = action.get("canonical_url")
+        if canonical:
             try:
                 self.download.save_to_history(
-                    link,
+                    canonical,
                     candidate.get("clean_title")
                     or candidate.get("title")
                     or "RSS Candidate",
@@ -359,6 +379,11 @@ class HDEncodeActionService:
                 )
             except Exception:
                 logger.exception("Failed to persist RSS action download history")
+        else:
+            logger.warning(
+                "RSS action %s has no canonical_url; history not recorded, so "
+                "its source link and identity will stay unknown",
+                action.get("action_uuid"))
         return self.db.get_hdencode_action(action_uuid)
 
     def queue_approved_auto_actions(
