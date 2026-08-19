@@ -2,19 +2,35 @@
 
 **Repository:** `LstDtchMn/ScanHound`
 
-This is a **three-PR stack**, reviewed bottom-up. Each PR's base is the one below
+This is a **four-PR stack**, reviewed bottom-up. Each PR's base is the one below
 it, so each "Files changed" view shows only that PR's own delta.
 
 | PR | Branch | Head | Base |
 |----|--------|------|------|
 | #89 | `fix/rss-history-keyed-on-release-url` | `c0b874a` | `main @ 3013556` |
 | #90 | `feat/record-media-kind-at-ingest` | `81c6c68` | `fix/rss-history-keyed-on-release-url` |
-| #91 | `feat/consume-media-kind-in-ui` | `dae52f7` | `feat/record-media-kind-at-ingest` |
+| #91 | `feat/consume-media-kind-in-ui` | `fb3c073` | `feat/record-media-kind-at-ingest` |
+| #92 | `feat/queue-records-category` | `96a5505` | `feat/consume-media-kind-in-ui` |
 
-Merge order is forced: **#89, then #90, then #91.** (#90 originally declared
-`main` as its base, which made GitHub render #89's changes inside #90's diff and
-would have auto-closed #89 unreviewed if #90 merged first. Corrected before
-sending.)
+Merge order is forced: **#89, then #90, then #91, then #92.**
+
+## Three corrections since this document was first sent
+
+**#90's base was wrong.** It declared `main` while actually sitting on top of
+#89, so GitHub rendered #89's changes inside #90's diff and would have
+auto-closed #89 unreviewed if #90 merged first.
+
+**#91 was not really stacked.** It declared #90 as its base but was branched
+from `main` independently, so it could not build against the backend it
+consumes. I only found this when work on top of it raised `TypeError` against
+the real `DownloadService`. #90 has since been merged into #91 (`fb3c073`) and
+the stack is now genuinely linear.
+
+**#91's diff was 90% noise.** Its first commit rewrote every line of
+`DetailPanel.svelte` from LF to CRLF, rendering as 520 insertions / 519
+deletions for a **three-line** change. A follow-up commit restores LF; #91 is
+now 114 insertions / 18 deletions rather than 631. If you pulled before that,
+re-pull.
 
 ---
 
@@ -36,7 +52,7 @@ This stack moves the authorization evidence from *a guess about a filename* to
 
 ## #89 — RSS grabs: key history on the release url, not each file-host link
 
-**Smallest PR; independent of the other two.** It is in the stack only because
+**Smallest PR; independent of the other three.** It is in the stack only because
 #90 was branched from it.
 
 `hdencode_action_service` wrote one history row per **file-host link**. A release
@@ -141,26 +157,54 @@ which groups but does not authorize.
 
 ---
 
+## #92 — Record the media kind for batched grabs too
+
+This closes what the first send disclosed as an accepted gap. **I was wrong to
+accept it.**
+
+I said batched grabs losing their kind was a fair trade because it fails closed.
+Then I measured it: **398 items have completed through the queue**, and not one
+of them could ever be dupe-compared. That is not a corner case, it is most of
+the feature.
+
+The queue normalised every request through `_request_dict`, which dropped
+`category`, so `download_item()` was called without it. #92 carries it end to
+end: stored on the queue item, forwarded by the worker, and actually sent by the
+frontend. The migration is placed **after** the CREATE, not in the shared
+`_column_migrations` list — that list runs first, so an ALTER there fails with
+"no such table" and the guard leaves the column silently absent.
+
+Two things surfaced while building it that are worth your attention:
+
+- **Two of the three frontend batch callers already passed a `category`, and
+  `downloadBatch` dropped it on the way out.** The wire had a field nobody
+  filled. Same defect class as the whole stack, one layer up.
+- **I had the queue passing `category=` to a `DownloadService` that did not
+  accept it yet.** Every mocked test was green, because `MagicMock` accepts any
+  keyword. Production would have raised `TypeError` on the first queued grab.
+
+For the second, #92 adds a test that inspects the **real** signature of
+`download_item` and compares it against the kwargs the queue actually sends,
+read from source by AST rather than restated by hand.
+
+**Question 6:** please check whether that test is as strong as I think it is. It
+is the only thing standing between a mock and a runtime failure, and I wrote it
+immediately after being fooled by exactly that gap — which is not the state of
+mind that produces good adversarial tests.
+
+---
+
 ## Known gaps — disclosed, not hidden
-
-**Batch grabs record no media kind.** `download_queue_items` has no `category`
-column, so a batched grab reaches `save_to_history` with nothing to record. Those
-rows get `media_kind = NULL` → identity unknown → the UI groups them but will not
-authorize a destructive action on them.
-
-This is **fail-closed**: the failure mode is "the feature is unavailable for
-these rows", not "the feature destroys the wrong file." I chose to ship it that
-way rather than widen the schema inside this stack.
-
-**Question 6:** is fail-closed acceptable to merge, or should the `category`
-column land before #91 goes in? Batched grabs are a meaningful share of real
-usage, so shipping this way means the feature is partly dark on arrival.
 
 **Pre-existing, not in this stack:** `backend/scanner_service.py:1539` recomputes
 `'is_tv': item.season is not None` for the matcher, discarding the authoritative
 value computed at line 1138. It is the same class of bug this stack exists to
 fix — re-deriving a fact that was already known — but it is on a different code
 path and I did not want to widen the diff. Flagged for its own PR.
+
+**Unmeasured:** `media_kind` is recorded from the category at grab time and never
+re-validated against the file that actually arrives. If a source mislabels a
+release, the wrong kind is recorded permanently and authorizes on that basis.
 
 ---
 
