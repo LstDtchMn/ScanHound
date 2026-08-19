@@ -33,6 +33,24 @@ from __future__ import annotations
 import argparse, datetime as dt, json, sqlite3, urllib.error, urllib.request
 from pathlib import Path
 
+# THE ONE COPY of the expected PRAGMA user_version, used by both the readiness
+# check and the emitted safety.schema_version_expected field. Prod legitimately
+# advanced 6 -> 7 (4K metadata inventory) -> 8 (HDEncode persistent-browser +
+# durable download queue) -> 9 (Turnstile verification hold, PR #57, deployed
+# 2026-08-10) via authorized deploys. A value other than this signals an
+# unexpected/unauthorized schema change.
+#
+# RESTORED 2026-08-19. The hybrid-sweep merge took this file wholesale from the
+# sweep branch, which predates the 8 -> 9 bump and hardcoded 8 in two places.
+# On the live database (user_version 9) the mirror then appended
+# unexpected_schema_version=9 on every run and could never be ready, which
+# drives the collector's mandatory-stop branch every six hours.
+#
+# MAINTENANCE: when an authorized migration bumps user_version, bump THIS
+# constant, bump selftest.py's fixtures, re-run selftest.py, and regenerate
+# SHA256SUMS -- all in the SAME change.
+EXPECTED_SCHEMA_VERSION = 9
+
 CYCLE_OUTCOMES = ("success", "relevant_miss")
 
 
@@ -196,9 +214,30 @@ def main():
                       AND listing_requests>0{window_scope}""",
                 (*CYCLE_OUTCOMES, *window_params),
             ).fetchone()
+            # COLUMN-TOLERANT ATTRIBUTION FILTER, restored 2026-08-19. The merge
+            # replaced it with a bare WHERE 1=1, so the mirror counted misses from
+            # cycles whose normal feeds never completed while the app excluded them.
+            # The two must agree or the collector reports a disagreement and stops
+            # the window on an artifact of the merge.
+            #
+            # This script does NOT run migrations, so between commit and deploy
+            # normal_feed_outcomes may not exist; degrade to the conservative bound
+            # rather than aborting every scheduled collection.
+            #
+            # The OR is PARENTHESISED. window_scope appends " AND ...", and without
+            # the parens SQL binds it as A OR (B AND window), silently exempting
+            # every attributed row from the window.
+            _cycle_cols = {r[1] for r in con.execute(
+                "PRAGMA table_info(hdencode_shadow_cycles)")}
+            if "normal_feed_outcomes" in _cycle_cols:
+                _miss_where = ("WHERE (normal_feed_outcomes IS NOT NULL "
+                               "   OR (normal_feed_outcomes IS NULL "
+                               "       AND normal_feeds_complete=1))")
+            else:
+                _miss_where = "WHERE normal_feeds_complete=1"
             all_misses = con.execute(
                 "SELECT COALESCE(SUM(relevant_miss_count),0) "
-                "FROM hdencode_shadow_cycles WHERE 1=1" + window_scope,
+                "FROM hdencode_shadow_cycles " + _miss_where + window_scope,
                 window_params,
             ).fetchone()[0]
             cycle_rows = [
@@ -314,7 +353,7 @@ def main():
     # (HDEncode persistent-browser + durable download queue) via authorized
     # deploys during the shadow window; 8 is current main. A value other than 8
     # now signals an unexpected/unauthorized schema change.
-    if user_version != 8:
+    if user_version != EXPECTED_SCHEMA_VERSION:
         reasons.append(f"unexpected_schema_version={user_version}")
     # DATABASE INTEGRITY, not qualification evidence. This is deliberately
     # unscoped: a per-cycle count that disagrees with its own miss rows is
@@ -391,7 +430,7 @@ def main():
             "auto_action_rows": int(auto_action_rows or 0),
             "active_action_rows": int(active_action_rows or 0),
             "miss_count_mismatches": int(miss_count_mismatches or 0),
-            "schema_version_expected": 8,
+            "schema_version_expected": EXPECTED_SCHEMA_VERSION,
             "violations": [
                 reason for reason in reasons
                 if reason.startswith((
