@@ -1,6 +1,5 @@
 """Annotate live download rows with their source page, first-seen date, and the
-semantic identity (movie/TV, title, year, season) recorded when they were
-grabbed.
+semantic identity (TV season, title, year) recorded when they were grabbed.
 
 Both transports that carry download results to the UI must annotate, not just
 the REST one: the Downloads page replaces its whole list from the
@@ -69,30 +68,21 @@ def annotate_source_links(db, rows):
     them. Carrying what the grab actually recorded replaces a guess with a fact
     for the rows that have it.
 
-    `identity_kind` is `tv_season` when a season was recorded and `movie` when
-    one was not. That is the discriminator the backend already uses on itself
-    (`save_to_history` keys its lookup on `season is not None`), but it is a
-    CONVENTION rather than a schema constraint, and on its own it DOES NOT HOLD.
+    THE ONLY POSITIVE KIND EMITTED IS `tv_season`, and only when a season was
+    actually recorded. A seasonless row is `unknown` -- never `movie`.
 
-    An earlier version of this docstring defended it by noting that no
-    season-less history row carries a season token in its title or package name.
-    That was true and misleading: the season is in the SOURCE URL, which that
-    check never looked at. Measured properly, 16 season-less rows are plainly TV
-    (`...-s02-...` in the hdencode slug), and four title groups hold more than
-    one -- `Law & Order: Special Victims Unit` has three, which are seasons 1, 2
-    and 3.
+    That is not caution, it is the absence of a fact. `add_to_history()` takes
+    no media-type argument and `downloads` stores no such column, so
+    `("Notting Hill", 1999, None)` is structurally identical to a 1999 show
+    whose season was never captured. A year identifies an edition; it does not
+    prove a media kind.
 
-    So `movie` additionally requires a YEAR. All 16 of those rows also lack one,
-    which makes the year a clean discriminator rather than a patch aimed at
-    them, and it is the principled rule anyway: a movie identity IS title+year,
-    so a row with neither season nor year has nothing to identify with and stays
-    `unknown`. Cost: 179 year-less rows lose a movie identity, 273 keep one.
-    None of the 16 reaches the wire today (none carries provenance), so this
-    closes the mechanism before it can produce a wrong answer rather than after.
-
-    A row we cannot look up at all likewise stays `unknown` rather than
-    defaulting to `movie` -- guessing "movie" would authorise cancelling one
-    season against another.
+    Three narrower rules were tried and each failed for a reason the previous
+    one did not anticipate -- placeholder titles, then 16 live rows that are
+    plainly TV (`...-s02-...` in their source url) with no recorded season,
+    then year=0 as an ingest sentinel. Three misses in a row is the signature of
+    a wrong premise rather than a leaky guard, so the inference is gone until a
+    media kind is RECORDED AT INGEST (peer review 2026-08-18, M1).
 
     KNOWN COVERAGE GAP, and it predates this function. Identity resolves only
     when `provenance_url` matches a `downloads.url`. The RSS auto-grab path
@@ -109,16 +99,13 @@ def annotate_source_links(db, rows):
     and do join, so nothing is currently affected -- but a row from that path
     would be, and it would fail CLOSED (unknown), not wrong.
 
-    KNOWN LIMIT, stated rather than papered over. `movie` rests on that
-    convention holding at INGEST: `download_item()` receives `season` from the
-    scraped listing, so a TV grab whose listing yielded no season would be
-    recorded with `season=None` and read back here as a movie. Two seasons of
-    such a show would then share one title+year identity. Nothing in the current
-    data is in that state, and no heuristic here can detect it -- the season is
-    absent from every column, not merely from the display name. The durable fix
-    is a recorded media type at ingest; until then a consumer that treats
-    `movie` as permission to cancel is trusting the ingest path, and should say
-    so where it makes that decision.
+    KNOWN LIMIT, stated rather than papered over. Identity is the CURRENT
+    recorded metadata for a release url, not an immutable per-submission
+    snapshot: `downloads.url` is the primary key and `add_to_history()` updates
+    title and season on conflict. Two grabs of the same url therefore share one
+    identity by construction, which is correct for a re-grab and would be wrong
+    if one url were ever reused for two different releases. No production path
+    does that today.
 
     Never raises: enrichment is decoration on a live progress list, and the
     caller's real job (showing downloads, driving the poller loop) must not fail
@@ -146,16 +133,19 @@ def annotate_source_links(db, rows):
         # Recovering the persisted value here is the same rule the database
         # already implements, applied one layer up. Costs ONE batched query,
         # and only when a row is in that state, which is normally none.
+        # Keyed by the durable download_results.id, never by package name.
+        # poll_results() attaches that id to every row it emits and REST rows
+        # carry the same one; a row that somehow has none is left unrecovered,
+        # because recovering by name would let a different same-named row donate
+        # its provenance -- the exact collision identity exists to remove.
         stale = [r for r in rows
                  if not r.get("provenance_url")
-                 and r.get("provenance_observed") is False]
+                 and r.get("provenance_observed") is False
+                 and r.get("id") is not None]
         if stale:
-            persisted = db.get_persisted_provenance(
-                [(r.get("package_uuid"), r.get("name")) for r in stale]) or {}
+            persisted = db.get_persisted_provenance([r.get("id") for r in stale]) or {}
             for row in stale:
-                uuid, name = row.get("package_uuid"), row.get("name")
-                recovered = (persisted.get(("uuid", str(uuid))) if uuid
-                             else persisted.get(("name", str(name))))
+                recovered = persisted.get(row.get("id"))
                 if recovered:
                     row["provenance_url"] = recovered
 
@@ -223,15 +213,6 @@ def annotate_source_links(db, rows):
             # the honest price: the destructive action this gates is already
             # withheld from every movie today, and re-enabling it on an
             # unprovable inference is how the previous three holes happened.
-            continue
-            # NEITHER discriminator. "movie" here would be a guess, and a wrong
-            # one: 16 live history rows are plainly TV -- their source url slug
-            # says `-s02-` -- with no season recorded, and ALL 16 also lack a
-            # year. Three are Law & Order: Special Victims Unit seasons 1, 2
-            # and 3, which would have collapsed onto ONE identity: the exact
-            # collision this module exists to prevent, produced by the module
-            # itself. A movie identity IS title+year, so a row with neither
-            # season nor year has nothing to identify with.
             continue
         row["identity_title"] = clean
         row["identity_year"] = year

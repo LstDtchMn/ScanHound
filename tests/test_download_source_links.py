@@ -586,9 +586,17 @@ class TestFreshnessAgreesAcrossTransports:
         return [r for r in db.get_download_results(limit=200)
                 if r.get("package_uuid") == self.UUID]
 
-    def _ws_row_unobserved(self):
-        # Exactly what the poller emits when it could not observe the links.
-        return [{"id": None, "package_uuid": self.UUID, "name": self.NAME,
+    def _ws_row_unobserved(self, db):
+        """Exactly what the poller emits when it could not observe the links.
+
+        It carries the REAL persisted id: poll_results() attaches one from its
+        uuid->id cache, else via get_download_result_id(), writing the row first
+        if need be -- explicitly so it never emits an id-less row. An earlier
+        version of this fixture used id=None, which misrepresented production
+        and would have hidden the id-keyed recovery entirely."""
+        rid = db.get_download_result_id(self.UUID, self.NAME)
+        assert rid is not None, "fixture is not exercising a persisted row"
+        return [{"id": rid, "package_uuid": self.UUID, "name": self.NAME,
                  "state": "downloading", "provenance_url": None,
                  "provenance_observed": False}]
 
@@ -598,7 +606,7 @@ class TestFreshnessAgreesAcrossTransports:
         in the same instant."""
         self._seed(db)
         rest = self._rest_row(db)
-        ws = self._ws_row_unobserved()
+        ws = self._ws_row_unobserved(db)
 
         annotate_source_links(db, rest)
         annotate_source_links(db, ws)
@@ -615,7 +623,7 @@ class TestFreshnessAgreesAcrossTransports:
         """Same recovery, checked on the pre-existing field, so the fix is not
         quietly identity-only."""
         self._seed(db)
-        ws = self._ws_row_unobserved()
+        ws = self._ws_row_unobserved(db)
 
         annotate_source_links(db, ws)
 
@@ -650,3 +658,51 @@ class TestFreshnessAgreesAcrossTransports:
 
         assert ws[0]["identity_kind"] == "unknown"
         assert ws[0]["source_url"] is None
+
+    def test_a_SAME_NAMED_row_can_never_donate_its_provenance(self, db):
+        """THE round-2 finding. Recovery used to match on package name with no
+        `package_uuid IS NULL` predicate and no ORDER BY, so a different row
+        sharing the name -- including a uuid-backed one -- could supply the
+        recovered url, and the "last-write-wins" the comment claimed was really
+        whichever row SQLite returned last.
+
+        Identical package names across distinct releases are the entire reason
+        identity is being moved off names, so that reintroduced the collision
+        through the back door, for the source link as well as the identity.
+
+        Two persisted rows, same name, different provenance. The unobserved row
+        must recover its OWN url and can never acquire the other's."""
+        b = "https://source.example/release-B"
+        name = "Same Name (2019) S01 [1080p]"
+        db.add_to_history(A, "Show A", season=1, year=2019, package_name=name)
+        db.add_to_history(b, "Show B", season=7, year=2001, package_name=name)
+        db.upsert_download_result(name=name, package_uuid="uuid-A", state="downloading",
+                                  provenance_url=A, provenance_observed=True)
+        db.upsert_download_result(name=name, package_uuid="uuid-B", state="downloading",
+                                  provenance_url=b, provenance_observed=True)
+        id_a = db.get_download_result_id("uuid-A", name)
+        id_b = db.get_download_result_id("uuid-B", name)
+        assert id_a != id_b, "fixture did not create two distinct rows"
+
+        ws = [{"id": id_a, "package_uuid": "uuid-A", "name": name,
+               "state": "downloading", "provenance_url": None,
+               "provenance_observed": False}]
+        annotate_source_links(db, ws)
+
+        assert ws[0]["source_url"] == A, "recovered the wrong row's url"
+        assert ws[0]["identity_season"] == 1, "acquired the other row's identity"
+        assert ws[0]["identity_title"] == "Show A"
+
+    def test_a_row_with_no_id_is_left_unrecovered(self, db):
+        """Fail closed. If poll_results could not attach an id -- a DB write or
+        recovery failure -- there is no durable key, and guessing by name is
+        exactly what this fix removed."""
+        self._seed(db)
+        ws = [{"id": None, "package_uuid": self.UUID, "name": self.NAME,
+               "state": "downloading", "provenance_url": None,
+               "provenance_observed": False}]
+
+        annotate_source_links(db, ws)
+
+        assert ws[0]["source_url"] is None
+        assert ws[0]["identity_kind"] == "unknown"

@@ -4143,12 +4143,25 @@ class DatabaseManager:
                 }
         return out
 
-    def get_persisted_provenance(self, keys):
-        """Map a package's identity key -> its PERSISTED ``provenance_url``.
+    def get_persisted_provenance(self, ids):
+        """Map ``download_results.id`` -> its PERSISTED ``provenance_url``.
 
-        `keys` is an iterable of ``(package_uuid, name)`` pairs. Result keys are
-        ``("uuid", package_uuid)`` or ``("name", name)`` so a caller can look up
-        by whichever it has, with uuid preferred.
+        KEYED BY THE DURABLE ROW ID, not by package name. An earlier version
+        also matched on ``name`` for rows without a uuid, and that was wrong in
+        the one way this whole feature exists to prevent: the query carried no
+        ``package_uuid IS NULL`` predicate and no ``ORDER BY``, so a DIFFERENT
+        same-named row -- including a uuid-backed one -- could donate its
+        provenance, and the "last-write-wins" the comment claimed was really
+        whichever row SQLite happened to return last. Identical package names
+        across distinct seasons are precisely why identity is being moved off
+        names, so recovering by name reintroduced the collision through the back
+        door, for both `source_url` and identity (peer review round 2).
+
+        ``poll_results()`` attaches this id to every row it emits -- from its
+        uuid->id cache, else via ``get_download_result_id()``, writing the row
+        first if need be, explicitly so it never emits an id-less row -- and
+        REST rows carry the same persisted id. A row that still has no id is
+        left unrecovered, which is the safe direction.
 
         WHY THIS EXISTS. The poller's in-memory row carries
         ``provenance_url=None`` whenever it could not observe a package's links,
@@ -4164,29 +4177,26 @@ class DatabaseManager:
         ONE batched query, and only for the rows that need it -- the caller
         filters to unobserved-and-urlless rows first, which is normally none.
         """
-        pairs = [(u, n) for u, n in (keys or []) if u or n]
-        if not pairs:
+        wanted = []
+        for value in (ids or []):
+            try:
+                wanted.append(int(value))
+            except (TypeError, ValueError):
+                # No id, or not one. Skip rather than guess -- an unrecovered
+                # row stays unknown, which is the direction that cannot be wrong.
+                continue
+        wanted = list(dict.fromkeys(wanted))
+        if not wanted:
             return {}
-        uuids = [str(u) for u, _ in pairs if u]
-        names = [str(n) for u, n in pairs if not u and n]
         out = {}
-        for column, values in (("package_uuid", uuids), ("name", names)):
-            for start in range(0, len(values), 300):
-                chunk = values[start:start + 300]
-                if not chunk:
-                    continue
-                rows = self._query_dicts(
-                    "SELECT package_uuid, name, provenance_url FROM download_results "
-                    "WHERE %s IN (%s)" % (column, ",".join("?" * len(chunk))),
-                    tuple(chunk), default=[]) or []
-                for row in rows:
-                    if column == "package_uuid" and row.get("package_uuid"):
-                        out[("uuid", str(row["package_uuid"]))] = row.get("provenance_url")
-                    elif column == "name" and row.get("name"):
-                        # Legacy NULL-uuid rows only. A name can repeat, so this
-                        # is deliberately last-write-wins rather than a guess
-                        # between two rows -- the uuid path is the reliable one.
-                        out[("name", str(row["name"]))] = row.get("provenance_url")
+        for start in range(0, len(wanted), 300):
+            chunk = wanted[start:start + 300]
+            rows = self._query_dicts(
+                "SELECT id, provenance_url FROM download_results WHERE id IN (%s)"
+                % ",".join("?" * len(chunk)),
+                tuple(chunk), default=[]) or []
+            for row in rows:
+                out[row["id"]] = row.get("provenance_url")
         return out
 
     def get_download_result_id(self, package_uuid, name):
