@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  normalizeTitle, resRank, groupDownloads, isActive, seasonKey, semanticKey
+  normalizeTitle, resRank, groupDownloads, isActive, seasonKey, semanticKey, semanticGroupKey
 } from './dupes';
 import type { DownloadResult } from '$lib/api/types';
 
@@ -469,5 +469,101 @@ describe('semantic identity outranks the name', () => {
           name: `The Repair Shop (2017) ${s} [1080p]` })));
     expect(g).toHaveLength(3);
     expect(g.every((x) => !x.canKeepBest)).toBe(true);
+  });
+});
+
+describe('the semantic key is an identity, not a display normalization', () => {
+  const tv = (over: Partial<DownloadResult>): DownloadResult =>
+    r({ state: 'queued', identity_source: 'provenance', identity_kind: 'tv_season',
+        identity_title: 'Show', identity_year: 2020, identity_season: 1, ...over });
+
+  it('does NOT collapse two different non-ASCII titles', () => {
+    // THE round-8 finding. semanticKey used normalizeTitle(), which replaces
+    // everything outside [a-z0-9 whitespace] with spaces -- so both of these
+    // reduced to the EMPTY string and, sharing a year and season, produced one
+    // identity: two unrelated shows mutually cancellable, which is precisely
+    // what the wire was introduced to prevent.
+    const a = tv({ id: 1, identity_title: '進撃の巨人' });
+    const b = tv({ id: 2, identity_title: '鬼滅の刃' });
+    expect(semanticKey(a)).not.toBeNull();
+    expect(semanticKey(a)).not.toBe(semanticKey(b));
+    const g = groupDownloads([a, b]);
+    expect(g).toHaveLength(2);
+    expect(g.every((x) => !x.canKeepBest)).toBe(true);
+  });
+
+  it('does NOT collapse titles that differ only in punctuation or an inline year', () => {
+    // The same defect without any Unicode: the display normalizer strips
+    // punctuation and standalone years, so these pairs were equal.
+    for (const [x, y] of [['A+B', 'A B'], ['Room 2012', 'Room'], ['Se7en', 'Se en']]) {
+      expect(semanticKey(tv({ identity_title: x })), `${x} vs ${y}`)
+        .not.toBe(semanticKey(tv({ identity_title: y })));
+    }
+  });
+
+  it('is structured data that round-trips the exact recorded title', () => {
+    // The key is a TUPLE, not a joined string. A delimiter-joined key could not
+    // actually collide here -- the two trailing components are numbers, so a
+    // title containing the separator shifts the field count rather than forging
+    // a match -- but a joined key cannot be read back, and its safety would
+    // depend on that numeric-suffix accident continuing to hold. Asserting the
+    // round trip pins the property that makes the separator irrelevant.
+    const key = semanticKey(tv({ identity_title: 'A|B', identity_year: 2020,
+                                 identity_season: 1 }));
+    expect(JSON.parse(key as string)).toEqual(['sem', 'A|B', 2020, 1]);
+  });
+
+  it('treats case and surrounding whitespace as recorded, except for trimming', () => {
+    // Trimmed, deliberately not case-folded: no live pair differs only by case,
+    // and at a destructive boundary a false negative is the safe direction.
+    expect(semanticKey(tv({ identity_title: '  Show  ' }))).toBe(semanticKey(tv({})));
+    expect(semanticKey(tv({ identity_title: 'show' }))).not.toBe(semanticKey(tv({})));
+  });
+});
+
+describe('three intentional key classes', () => {
+  const tv = (over: Partial<DownloadResult>): DownloadResult =>
+    r({ state: 'queued', identity_source: 'provenance', identity_kind: 'tv_season',
+        identity_title: 'The Repair Shop', identity_year: 2017, identity_season: 2,
+        title: 'The Repair Shop [1080p]',
+        name: 'The Repair Shop (2017) S02 [1080p]', ...over });
+
+  it('a proven row with NO year groups semantically but is not actionable', () => {
+    // Round-8 LOW. Such a row used to fall all the way back to name parsing and
+    // could share a display card with a genuinely unproven row, which made the
+    // "proven and unproven never share a card" claim false. It now groups on
+    // what WAS recorded, and is still refused the action.
+    const proven = tv({ id: 1, identity_year: null });
+    const unproven = r({ id: 2, state: 'queued', title: 'The Repair Shop [1080p]',
+                          name: 'The Repair Shop (2017) S02 [1080p]' });
+    expect(semanticGroupKey(proven)).not.toBeNull();  // grouped semantically...
+    expect(semanticKey(proven)).toBeNull();           // ...but not authorised
+    const g = groupDownloads([proven, unproven]);
+    expect(g, 'proven-no-year must not share a card with an unproven row').toHaveLength(2);
+    expect(g.every((x) => !x.canKeepBest)).toBe(true);
+  });
+
+  it('keeps the three classes apart from each other', () => {
+    const full = tv({ id: 1 });
+    const noYear = tv({ id: 2, identity_year: null });
+    const unproven = r({ id: 3, state: 'queued', title: 'The Repair Shop [1080p]',
+                          name: 'The Repair Shop (2017) S02 [1080p]' });
+    const g = groupDownloads([full, noYear, unproven]);
+    expect(g).toHaveLength(3);
+    expect(g.filter((x) => x.identityKnown)).toHaveLength(1); // only the full one
+    expect(g.every((x) => !x.canKeepBest)).toBe(true);        // all singletons
+  });
+
+  it('two proven year-less rows of the SAME show still group, still refused', () => {
+    // The grouping half has to actually work, or the split above would be
+    // indistinguishable from leaving them in legacy.
+    const g = groupDownloads([
+      tv({ id: 1, identity_year: null, name: 'a.different.release.name' }),
+      tv({ id: 2, identity_year: null, name: 'another.one.entirely' })
+    ]);
+    expect(g).toHaveLength(1);
+    expect(g[0].items).toHaveLength(2);
+    expect(g[0].identityKnown).toBe(false);
+    expect(g[0].canKeepBest).toBe(false);
   });
 });

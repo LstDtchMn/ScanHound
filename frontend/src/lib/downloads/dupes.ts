@@ -131,48 +131,64 @@ export function seasonKey(name: string): string {
   return `S${one[1].padStart(2, '0')}`;
 }
 
-/** THE AUTHORITATIVE IDENTITY, or `null` when the backend did not prove one.
+/** THE RECORDED IDENTITY, shaped for GROUPING: proven TV rows with a title and
+ *  a season, carrying the year when it is known and an explicit `null` when it
+ *  is not.
  *
- *  This — not any reading of `name` — is what may authorise cancelling other
- *  downloads. `annotate_source_links()` fills these fields from what the grab
- *  RECORDED, joined on proven provenance, so they answer a question the package
- *  name cannot: one live name is recorded against 13 distinct seasons.
+ *  THE TITLE IS USED AS RECORDED, only trimmed. It is deliberately NOT passed
+ *  through `normalizeTitle()`, which exists for fuzzy DISPLAY grouping and
+ *  replaces everything outside `[a-z0-9\s]` with spaces. That is not injective:
+ *  `進撃の巨人` and `鬼滅の刃` both reduce to the empty string, so with the same
+ *  year and season they produced ONE identity and became mutually cancellable --
+ *  the exact false positive the semantic wire was introduced to remove,
+ *  reintroduced by borrowing a display normalizer for authority. `A+B` vs `A B`
+ *  and `Room 2012` vs `Room` collapse the same way (peer review round 8).
  *
- *  EVERY PART OF THE TUPLE IS REQUIRED, and each for its own reason:
+ *  Live data has no such collision today -- all 42 provenance-backed titles are
+ *  distinct trimmed, and none is non-ASCII -- so this costs nothing and closes
+ *  the mechanism before it can fire. Not case-folded either: no live pair
+ *  differs only by case, and for a destructive boundary a false negative is the
+ *  acceptable direction.
  *
- *    identity_source === 'provenance'  the row is provably ours. Anything else
- *                                      is a hand-added package.
- *    identity_kind === 'tv_season'     the only kind the backend emits
- *                                      positively. `movie` is declared on the
- *                                      wire but never sent, because nothing
- *                                      records a media type; seasonless rows
- *                                      are `unknown` and must stay unactionable.
- *    identity_title non-empty          a title-less row identifies nothing.
- *    identity_season an integer        the discriminator itself.
- *    identity_year an integer          NOT optional. `normalizeTitle` strips
- *                                      years, so without it
- *                                      `Battlestar Galactica (1978) S01` and
- *                                      `(2004) S01` collapse to one identity
- *                                      and become mutually cancellable. That
- *                                      remake hole was a documented limit of
- *                                      the parser; the wire carries the year,
- *                                      so there is no reason to keep it.
- *
- *  A `tv_season` row with no recorded year therefore gets NO semantic identity
- *  and falls back to display grouping. That is deliberate: it is exactly the
- *  case where two remakes would be indistinguishable. */
-export function semanticKey(r: DownloadResult): string | null {
+ *  JSON-encoded rather than delimiter-joined, so a title containing the
+ *  separator cannot forge a different tuple. */
+export function semanticGroupKey(r: DownloadResult): string | null {
   if (r.identity_source !== 'provenance') return null;
   if (r.identity_kind !== 'tv_season') return null;
   const title = (r.identity_title || '').trim();
   if (!title) return null;
   const season = r.identity_season;
-  const year = r.identity_year;
   if (typeof season !== 'number' || !Number.isInteger(season)) return null;
-  if (typeof year !== 'number' || !Number.isInteger(year)) return null;
-  // `sem|` prefixed and four-part, so it can never collide with the two-part
-  // `legacy|` key below — normalizeTitle cannot emit a `|` of its own.
-  return `sem|${normalizeTitle(title)}|${year}|S${String(season).padStart(2, '0')}`;
+  const year =
+    typeof r.identity_year === 'number' && Number.isInteger(r.identity_year)
+      ? r.identity_year
+      : null;
+  return JSON.stringify(['sem', title, year, season]);
+}
+
+/** THE AUTHORITATIVE IDENTITY — what may authorise cancelling other downloads.
+ *
+ *  The grouping identity PLUS a recorded year, which grouping tolerates as null
+ *  and authorization does not. Without it `Battlestar Galactica (1978) S01` and
+ *  `(2004) S01` are one identity, and the backend really does emit `tv_season`
+ *  with no year -- one live row, `Frankie vs the Internet S01`, is in exactly
+ *  that state.
+ *
+ *  SPLIT FROM GROUPING deliberately. Demoting a proven-but-year-less row all the
+ *  way to name parsing let it share a display card with a genuinely unproven
+ *  row, which made the claim "proven and unproven rows never share a card"
+ *  false. It now groups on what the backend did record and is still refused the
+ *  action (peer review round 8). Three intentional key classes result:
+ *
+ *      ["sem", title, 2017, 2]   proven, actionable
+ *      ["sem", title, null, 2]   proven, grouped, NOT actionable
+ *      legacy|...                unproven, display only
+ *
+ *  When the year is present this returns exactly the grouping key, so the two
+ *  can never disagree about which rows belong together. */
+export function semanticKey(r: DownloadResult): string | null {
+  if (typeof r.identity_year !== 'number' || !Number.isInteger(r.identity_year)) return null;
+  return semanticGroupKey(r);
 }
 
 /** States that count as "in flight" — not yet a finished/historical row. */
@@ -256,7 +272,7 @@ export function groupDownloads(results: DownloadResult[]): DownloadGroup[] {
     // a separator that normalizeTitle cannot produce, so "show" + "S02" can
     // never collide with a differently-split pair.
     const key =
-      semanticKey(r) ?? `legacy|${normalizeTitle(r.title || r.name)}|${seasonKey(r.name)}`;
+      semanticGroupKey(r) ?? `legacy|${normalizeTitle(r.title || r.name)}|${seasonKey(r.name)}`;
     const arr = byKey.get(key);
     if (arr) arr.push(r);
     else byKey.set(key, [r]);
@@ -274,7 +290,7 @@ export function groupDownloads(results: DownloadResult[]): DownloadGroup[] {
     const base = items[0].identity_title || items[0].title || items[0].name;
     // Every item in a group shares the key, so it shares the season too. Prefer
     // the RECORDED season over the parsed one for the same reason the key does.
-    const semantic = semanticKey(items[0]);
+    const semantic = semanticGroupKey(items[0]);
     const season = semantic
       ? `S${String(items[0].identity_season).padStart(2, '0')}`
       : seasonKey(items[0].name);
