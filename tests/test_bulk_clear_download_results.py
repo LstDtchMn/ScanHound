@@ -396,19 +396,51 @@ class TestTheCheckAndTheWriteAreATOMIC:
                 "a poll holding a pre-removal snapshot would have persisted it")
 
     def test_the_epoch_advance_is_inside_the_same_section_as_the_deletes(self):
-        """Reading the source, because the ordering is what matters and a unit
-        test cannot see it. The deletes, the cache eviction and the bump must be
-        in ONE `with self._results_state():` -- if the bump drifts outside it
-        again, a poll can slip between the deletes and the advance and write the
-        rows straight back."""
-        import inspect, re
-        src = inspect.getsource(DownloadService.remove_packages)
-        after = src.split("with self._results_state():", 1)
-        assert len(after) == 2, "remove_packages no longer uses the shared section"
-        body = after[1]
-        assert "delete_download_result" in body, "deletes moved outside the lock"
-        assert "_results_cache.pop" in body, "cache eviction moved outside the lock"
-        assert "_results_epoch" in body, "the epoch advance moved outside the lock"
+        """The deletes, the cache eviction and the epoch advance must be in ONE
+        `with self._results_state():` -- if the bump drifts outside it, a poll
+        can slip between the deletes and the advance and write the rows back.
+
+        PARSED WITH `ast`, not by splitting the source text. The previous version
+        split on the `with` line and searched the ENTIRE REMAINDER of the
+        function, so this mutation still passed it:
+
+            with self._results_state():
+                delete...
+                evict...
+            if removed:                 # <-- lock released, race reopened
+                self._bump_epoch_locked()
+
+        It could not see the thing its own name claims (peer review round 2).
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        src = textwrap.dedent(inspect.getsource(DownloadService.remove_packages))
+        fn = ast.parse(src).body[0]
+        sections = [n for n in ast.walk(fn)
+                    if isinstance(n, ast.With)
+                    and "_results_state" in ast.dump(n.items[0].context_expr)]
+        assert len(sections) == 1, (
+            "remove_packages no longer uses exactly one _results_state section")
+
+        # The LEXICAL body of the with, so "after the block" is not "inside" it.
+        inside = "\n".join(ast.unparse(stmt) for stmt in sections[0].body)
+
+        assert "delete_download_result" in inside, "deletes moved outside the lock"
+        assert "_results_cache.pop" in inside, "cache eviction moved outside the lock"
+        # Either spelling of the advance counts: the literal assignment, or the
+        # _bump_epoch_locked() helper. Asserting only on "_results_epoch" made
+        # this fail the moment identical behaviour moved behind a well-named
+        # helper -- pinning the WORDING rather than the property.
+        assert ("_results_epoch" in inside) or ("_bump_epoch_locked" in inside), (
+            "the epoch advance moved outside the lock")
+        # And it must not be the LOCKING variant: _epoch_lock() is a plain Lock
+        # and _results_state() already holds it, so self._bump_epoch() here
+        # would deadlock rather than merely be redundant.
+        assert "self._bump_epoch()" not in inside, (
+            "_bump_epoch() inside _results_state() deadlocks on the "
+            "non-reentrant lock; use _bump_epoch_locked()")
 
     def test_the_JD_call_stays_OUTSIDE_the_lock(self):
         """A wedged JDownloader must never block the API route -- that was the
