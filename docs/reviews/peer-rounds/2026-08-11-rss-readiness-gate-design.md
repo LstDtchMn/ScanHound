@@ -106,3 +106,84 @@ signal.
 - ChatGPT go/no-go: "D" (the hybrid), NO-GO today, canary-interval-< -visibility-window, auto-demote,
   document (not relabel) the 8; redirect PR #61 off per-URL-ack toward retained observability.
 - Both peers converged on the hybrid; this record is that convergence.
+
+---
+
+# Gate restated — 2026-08-19 (re-measured at 585 cycles)
+
+The original go/no-go was written against 287 cycles / 17 days. The shadow has
+now run **585 cycles over 28 days** (2026-07-22 → 2026-08-19). Re-measuring
+changed the decision, and corrected a mistake in how the first pass counted.
+
+## The counting mistake
+
+The headline "misses" figure conflates two different things. Separating them:
+
+| | count |
+|---|---|
+| Total recorded misses | **201** |
+| RSS caught up on a later cycle — **lag, not a gap** | **189** |
+| **Never acquired by RSS at all** | **12** |
+
+Lag distribution for the 189: **median 1.1h, p90 2.1h, max 15.2h.** Cycles run
+~67 min apart, so the typical "miss" is one cycle of delay.
+
+A rate quoted from the 201 describes how often RSS is *briefly behind the
+listing*, not how often it *loses something*. Those want opposite responses:
+lag is what the reduced-frequency canary is for, whereas a permanent gap is the
+thing that must block promotion.
+
+## What the 12 actually are
+
+```text
+2026-07-30   pallichattambi-2026-2160p-sonyliv-web-dl
+2026-08-07   gun-stories-s04 … s14   (8 releases, the documented cohort)
+2026-08-10   a-man-on-the-beach-1956-2160p-uhd-bluray   (x2, two release groups)
+2026-08-10   x-the-unknown-1956-ar-1-66-2160p-uhd-bluray
+```
+
+Two things stand out.
+
+**Nothing has been permanently missed since 2026-08-10 — nine days clean.**
+
+**Eleven of the twelve are back catalogue.** The Gun Stories cohort is marked
+`archived`; the 2026-08-10 group are 1956 films posted as UHD Blu-ray rips. Only
+Pallichattambi is a current release. The feed carries what is newly posted; a
+bulk archive upload does not reliably reach it.
+
+That is a *shaped* gap, not a random one, and it is the strongest argument the
+shadow has produced for the hybrid: the canary is not insurance against RSS
+being unreliable in general, it covers a specific and explicable blind spot.
+
+## The gate, restated
+
+The original condition — *"GO once the only remaining blockers are the 8 Gun
+Stories historical unknowns"* — cannot be evaluated as written, because it names
+a fixed cohort while the population keeps growing. Four more have appeared since
+it was written, and by its own terms that is a permanent NO-GO even though all
+four are nine or more days old.
+
+Replace it with a condition that stays meaningful as evidence accumulates:
+
+**GO when all three hold:**
+
+1. **No new `never_acquired` release for 14 consecutive days.** Measured as it
+   is here: a missed URL that appears in no later cycle's `feed_only` or
+   `duplicate_urls`. Today this stands at **9 days**.
+2. **Canary interval < the listing's real visibility window.** Unchanged from
+   the original design, and still the load-bearing constraint.
+3. **The hybrid is built and reviewed.** Also unchanged. Nothing here promotes
+   anything on its own.
+
+**Automatic reversion to `rss_shadow`** on any single proven `never_acquired`,
+which is the original design's reversion trigger and is not weakened by this.
+
+The known 12 are grandfathered as an accepted historical cohort — the same
+treatment the original gave the 8 — and are never relabelled acquired or safe.
+
+## Efficiency, re-measured
+
+The original quoted ~84% fewer discovery requests. Measured across the 499
+cycles that completed normally: **64.3%** (1,034 RSS requests against 5,073
+listing requests). Still a large saving, but the smaller number is the one to
+decide on.
