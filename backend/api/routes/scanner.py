@@ -418,8 +418,11 @@ def rescan_item(
     details['source'] = post_source
     details['category'] = existing.get("source_category") or ""
 
+    post_source_is_tv = (existing.get("source_category") or "") == 'tv'
     item = scanner._create_media_item({
-        'details': details, 'is_tv': details.get('is_tv', False), 'url': req.url,
+        'details': details,
+        'is_tv': details.get('is_tv', False) or post_source_is_tv,
+        'url': req.url,
     })
     if not item:
         raise HTTPException(status_code=502, detail="Could not parse the refreshed page")

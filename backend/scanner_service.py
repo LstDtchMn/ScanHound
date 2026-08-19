@@ -91,6 +91,10 @@ class MediaItem:
     # Crawl category this item came from: '4k' | 'remux' | 'tv' | '' (unknown).
     # Drives the instant 4K/Remux/TV display filter in the UI.
     category: str = ""
+    # Whether this release is television, decided ONCE in _process_post
+    # and carried, rather than re-derived per consumer. `season is not
+    # None` is not a synonym: a complete-series pack is TV with no season.
+    is_tv: bool = False
 
 
 @dataclass
@@ -1295,6 +1299,7 @@ class ScannerService:
                 imdb_id=details.get('imdb_id'),
                 description=details.get('description', ''),
                 posted_date=details.get('posted_date'),
+                is_tv=bool(result.get('is_tv', False)),
                 category=details.get('category', ''),
             )
         except Exception as e:
@@ -1339,6 +1344,8 @@ class ScannerService:
                 web_data=d.get('web_data', {}) or {},
                 group_key=d.get('group_key', '') or '',
                 prior_grab=d.get('prior_grab'),
+                is_tv=(bool(d['is_tv']) if 'is_tv' in d
+                       else d.get('season') is not None),
                 category=d.get('category', '') or '',
             )
         except Exception:
@@ -1536,7 +1543,13 @@ class ScannerService:
                 'hdr': item.hdr,
                 'url': item.url,
                 'imdb_id': item.web_data.get('imdb_id'),
-                'is_tv': item.season is not None,
+                # The authoritative value, decided in _process_post from the
+                # scraper's own answer OR the source's declared type. Re-deriving
+                # it from `season is not None` here discarded that and sent any TV
+                # release whose season did not parse -- a complete-series pack, a
+                # title the regex missed -- into find_movie_matches below, to be
+                # matched against the film library.
+                'is_tv': item.is_tv,
                 'season': item.season,
                 'episodes': item.episodes,
                 'search_key': normalize_title(item.title),
