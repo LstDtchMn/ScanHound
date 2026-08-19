@@ -3563,12 +3563,167 @@ class DatabaseManager:
             return {}
         return {str(k):str(v) for k,v in parsed.items()}
 
-    def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180):
-        required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days)); summary=self.get_hdencode_shadow_summary()
+    def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180,
+                                   window_start_at=None):
+        required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days))
+        # The PERSISTED boundary is the authority; `window_start_at` is what
+        # configuration currently claims. They must agree exactly. Without this
+        # the zero-miss requirement could be defeated by editing a file to slide
+        # the boundary past an observed miss.
+        active = self.get_active_qualification_window()
+        configured = self.normalize_window_start(window_start_at)
+        boundary_changed = False
+        if active:
+            if configured and configured != active["window_start_at"]:
+                boundary_changed = True
+            elif not configured:
+                # Configuration cleared while a window is live — treat as a
+                # change, not as "fall back to the persisted value".
+                boundary_changed = True
+        window_start_at = active["window_start_at"] if active else None
+        if window_start_at and boundary_changed:
+            summary = self.get_hdencode_shadow_summary(window_start_at=window_start_at)
+            return {
+                "ready": False, "window_start_at": window_start_at,
+                "required_cycles": required_cycles,
+                "successful_cycles": summary["successful_cycles"],
+                "required_days": required_days, "observed_days": 0.0,
+                "normal_feeds_healthy": False,
+                "relevant_misses": summary["relevant_misses"],
+                "request_reduction_pct": summary["request_reduction_pct"],
+                "recovery_cycles": summary["recovery_cycles"],
+                "first_completed_at": summary["first_completed_at"],
+                "last_completed_at": summary["last_completed_at"],
+                "reasons": ["qualification_window_boundary_changed"],
+                "configured_window_start_at": configured,
+            }
+        if not window_start_at:
+            # NO WINDOW: return an EMPTY current-window summary.
+            #
+            # Returning the unscoped historical totals here — even alongside a
+            # blocking reason — is not merely untidy, it is actively dangerous.
+            # The qualification collector reads `relevant_misses` on its own and
+            # converts any nonzero value into a MANDATORY STOP with a priority-8
+            # push alert and a "stop and roll back" instruction. With 102 void
+            # misses in the table, that alert would fire from the previous
+            # window's evidence before the new one had even started.
+            #
+            # Historical totals are still available, but under an explicitly
+            # named diagnostic key that no gate consumes. Caught in review.
+            historical = self.get_hdencode_shadow_summary()
+            # INTEGRITY STILL SURFACES WITH NO WINDOW. The early return exists so
+            # the collector cannot read a PREVIOUS window's misses and fire a
+            # priority-8 mandatory stop before this window has started. That is
+            # about counts leaking, not about silencing every check. Malformed
+            # provenance, or a stored count disagreeing with the rows on disk,
+            # means the evidence contradicts itself -- true whether or not a
+            # window is open, and swallowing it here would reintroduce the
+            # deflation that check was added to stop.
+            #
+            # RECONCILIATION 2026-08-19, MY judgement rather than either branch's:
+            # the sweep short-circuited every reason, main evaluated them all.
+            # Counts stay zeroed (the sweep's property) while integrity reasons
+            # still appear (main's). Needs review.
+            no_window_reasons = ["qualification_window_not_started"]
+            if historical.get("miss_evidence_integrity"):
+                no_window_reasons.append("miss_evidence_integrity_failed")
+            return {
+                "ready": False,
+                "window_start_at": None,
+                "required_cycles": required_cycles, "successful_cycles": 0,
+                "required_days": required_days, "observed_days": 0.0,
+                "normal_feeds_healthy": False,
+                "relevant_misses": 0, "request_reduction_pct": 0.0,
+                "recovery_cycles": 0,
+                "first_completed_at": None, "last_completed_at": None,
+                "reasons": no_window_reasons,
+                "historical_evidence_not_counted": {
+                    "successful_cycles": historical["successful_cycles"],
+                    "relevant_misses": historical["relevant_misses"],
+                    "first_completed_at": historical["first_completed_at"],
+                    "last_completed_at": historical["last_completed_at"],
+                },
+            }
+        required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days)); summary=self.get_hdencode_shadow_summary(window_start_at=window_start_at)
+        first=summary.get("first_completed_at"); last=summary.get("last_completed_at"); observed_days=0.0
+        try:
+            first_dt=datetime.datetime.fromisoformat(first); last_dt=datetime.datetime.fromisoformat(last)
+            if first_dt.tzinfo is None: first_dt=first_dt.replace(tzinfo=datetime.timezone.utc)
+            if last_dt.tzinfo is None: last_dt=last_dt.replace(tzinfo=datetime.timezone.utc)
+            observed_days=max(0.0,(last_dt-first_dt).total_seconds()/86400.0)
+        except (TypeError,ValueError): pass
+        feed_rows=self._query_dicts(
+            "SELECT feed_key,last_status,consecutive_failures,last_checked_at FROM hdencode_feed_state "
+            "WHERE feed_key IN ('movies_all','tv_all')",default=[])
+        by_key={row["feed_key"]:row for row in feed_rows}; now=datetime.datetime.now(datetime.timezone.utc)
+        def fresh(row):
+            try:
+                value=datetime.datetime.fromisoformat(row.get("last_checked_at"))
+                if value.tzinfo is None: value=value.replace(tzinfo=datetime.timezone.utc)
+                return (now-value.astimezone(datetime.timezone.utc)).total_seconds() <= max(15,int(max_stale_minutes))*60
+            except (TypeError,ValueError): return False
+        feeds_healthy=all(key in by_key and by_key[key].get("last_status") in (200,304) and int(by_key[key].get("consecutive_failures") or 0)==0 and fresh(by_key[key]) for key in ("movies_all","tv_all"))
+        reasons=[]
+        if summary["successful_cycles"]<required_cycles: reasons.append("insufficient_comparison_cycles")
+        if observed_days<required_days: reasons.append("insufficient_observation_days")
+        # THE MISS RULE, changed 2026-08-07 on Jesse's decision. This used to be
+        # `if summary["relevant_misses"] > 0`, which blocked on ANY listing-only
+        # observation ever recorded. That could never pass: 99 of 100 such
+        # releases were acquired anyway, median about an hour, all via the normal
+        # feeds, so the gate treated ordinary polling latency as permanent
+        # coverage loss and RSS would have stayed in shadow mode indefinitely.
+        #
+        # Now only a release that was NEVER acquired counts, with no deadline.
+        # UNDETERMINED rows -- ones that left the listing without ever appearing
+        # in the feed -- still block, because "cannot be proven either way" is not
+        # evidence of health, and calling it health is the fail-open shape that
+        # produced two HIGH findings in this same subsystem.
+        resolution=self.get_hdencode_miss_resolution()
+        if int(resolution.get("never_acquired") or 0)>0:
+            reasons.append("unacquired_misses_detected")
+        if int(resolution.get("undetermined") or 0)>0:
+            reasons.append("miss_resolution_undetermined")
+        # PENDING BLOCKS, reversed 2026-08-07 on peer review. I had excluded
+        # not_yet_assessable so the gate could pass. The review showed why that is
+        # unsafe rather than merely optimistic: the shadow comparison is recorded
+        # only while discovery_mode == "rss_shadow", so promoting to rss_primary
+        # stops producing the very observations a pending row needs. The gate
+        # would open on evidence its own promoted mode destroys.
+        if int(resolution.get("not_yet_assessable") or 0)>0:
+            reasons.append("miss_resolution_pending")
+        # Unreadable evidence is not the same as clean evidence. Skipping a
+        # malformed cycle can remove the only observation after a miss, so it is
+        # reported rather than absorbed.
+        if resolution.get("evidence_problems"):
+            reasons.append("miss_resolution_evidence_unreadable")
+        # UNATTRIBUTED IN-SCOPE CANDIDATES BLOCK. Round 6: a listing-only release
+        # whose detail scrape failed is not booked as a miss (it has no media type,
+        # so it cannot be attributed to a feed) -- and it was therefore vanishing
+        # from readiness entirely. A false-health under-count. It must block the
+        # claim that no unacquired misses exist, without invalidating the cycle's
+        # membership evidence for resolving OTHER misses.
+        # Counted STRUCTURALLY by the loader, which already parses details_json.
+        # My first attempt here used `details_json LIKE '%detail_failed%'` -- string
+        # matching against JSON, which is the exact anti-pattern the RSS
+        # round-6 work removed from this same file. A schema change or a key
+        # appearing inside a URL would break it silently.
+        if int(resolution.get("unattributed_candidates") or 0) > 0:
+            reasons.append("unattributed_listing_candidates")
+        # An integrity failure is not "zero misses". Malformed provenance, a
+        # count that disagrees with the rows on disk, a nonzero count with no
+        # rows, or a miss row filed against supplied-empty provenance all mean
+        # the evidence contradicts itself. Before 2026-08-06 each of these
+        # silently contributed zero, which DEFLATED the gate -- the opposite of
+        # the protection claimed for it. They must block instead.
+        if summary.get("miss_evidence_integrity"):
+            reasons.append("miss_evidence_integrity_failed")
+        if summary["request_reduction_pct"]<=0: reasons.append("request_reduction_not_proven")
+        if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
+        if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")
+        return {"ready":not reasons,"window_start_at":summary.get("window_start_at"),"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"misses_acquired":int(resolution.get("acquired") or 0),"misses_never_acquired":int(resolution.get("never_acquired") or 0),"misses_undetermined":int(resolution.get("undetermined") or 0),"misses_not_yet_assessable":int(resolution.get("not_yet_assessable") or 0),"miss_evidence_problems":list(resolution.get("evidence_problems") or []),"worst_acquisition_lag_hours":resolution.get("worst_acquisition_lag_hours"),"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
 
-    # -- durable qualification window (carried from the hybrid sweep) ----
-    # The persisted boundary, NOT configuration, is the authority. Absent
-    # from main entirely; it is what contract row R-13 measures against.
+    # ── HDEncode candidate actions ─────────────────────────────────────
+
     def get_active_qualification_window(self):
         """The persisted boundary, or None if no window has been started.
 
