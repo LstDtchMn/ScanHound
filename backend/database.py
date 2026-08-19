@@ -3514,7 +3514,10 @@ class DatabaseManager:
     #: ONE projection, two error contracts. Shared so the strict reader's claim
     #: to return "the same rows" cannot quietly stop being true: `media_id`
     #: became load-bearing for the version badges, and a column added to one
-    #: SELECT but not the other is precisely the drift that produced H1.
+    #: SELECT but not the other is the kind of schema/consumer drift that
+    #: could RECREATE H1's failure class. It is not what caused H1 -- that was
+    #: count_versions() counting rows instead of distinct media_id, with the
+    #: column already present in both readers.
     _PLEX_CACHE_MOVIES_SQL = (
         "SELECT key, title, original_title, year, res, size, imdb_id, "
         "rating_key, media_id, is_tv, dovi, hdr, library_name, file_path "
@@ -3541,7 +3544,8 @@ class DatabaseManager:
         "unknown", the reconciler correctly touches nothing, no counter records
         a failure, and the pass reports COMPLETE -- so the scheduler marks that
         cache generation reconciled and never retries it. The badges are then
-        stale until an unrelated refresh (peer review 2026-08-19, M2/A).
+        stale until an unrelated refresh (peer review 2026-08-19, M2/B --
+        M2/A was the separate library-returns-None path).
 
         An empty table is still a valid empty answer here; only a failed READ
         raises. The caller must not try to tell those apart by inspecting the
