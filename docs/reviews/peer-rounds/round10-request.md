@@ -214,3 +214,63 @@ The premise. This stack asserts that **provenance beats parsing** for
 authorization. If there is a case where the recorded kind is wrong and the
 filename is right, the whole design authorizes on the worse evidence, and I would
 rather hear that now than after something gets overwritten.
+
+---
+
+# Added after the first send: #93
+
+**#93 `fix/carry-is-tv-not-rederive`** — head `25d7f43`, base `main @ 3013556`.
+**Independent of the stack above**, so review it in any order.
+
+Same defect class, different code path — a fact that was already known, then
+re-derived worse downstream.
+
+`_process_post` settles whether a release is television properly:
+
+```python
+is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'
+```
+
+The matcher then asked a different question:
+
+```python
+'is_tv': item.season is not None,
+```
+
+**A complete-series pack is television with no season number**, and so is any TV
+release whose season the title regex failed to parse. Each one answered `False`
+and was routed to `find_movie_matches` — compared against the film library.
+`rematch_cache` runs that loop over every cached row; there are 4,068 live.
+
+The authoritative value was already in scope: `_create_media_item` receives it
+and both callers set it. It was never read onto the item.
+
+**Cached rows fall back to the old derivation, not to `False`.** Every row on
+the live instance predates the field; defaulting them `False` would route every
+cached TV item to the movie matcher, which is worse than the bug.
+
+## Questions
+
+7. Is `MediaItem.is_tv` the right home, versus deriving from the existing
+   `category` field (`'tv'` / `'4k'` / `'remux'`)? Category is already carried
+   and is what #90 uses for `media_kind`, so there are now two adjacent
+   answers to "is this a show" and I am not certain they cannot diverge.
+8. The back-compat fallback keys on `'is_tv' in d` rather than truthiness, so a
+   row that recorded `False` stays `False` even with a season present. Is that
+   the right call, or should a stored `False` with a season be treated as
+   suspect rather than authoritative?
+
+## Verification
+
+Seven tests on the axis the bug is on — TV with no season. Mutation-tested:
+restoring `item.season is not None` fails exactly 2; defaulting old cache rows
+to `False` fails 1; unmutated passes 7. The three "this already worked" cases
+keep passing under the first mutation, which confirms they carry no proof.
+
+Full suite **35 failed / 5217 passed** — identical to the `main` baseline.
+
+One note worth your scrutiny: the first suite run showed a 36th failure,
+`test_all_expected_field_names`. That is a deliberate field-inventory tripwire
+and adding a field is supposed to trip it. I updated the inventory rather than
+weakening the test — but that is exactly the move that would also hide a real
+regression, so it is worth checking I did not.
