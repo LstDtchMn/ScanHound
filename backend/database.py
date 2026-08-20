@@ -4219,6 +4219,14 @@ class DatabaseManager:
             # either. None here means the caller records nothing.
             logger.warning("scan cache row for %s has undecodable data", url)
             return None
+        if payload.get("category_conflict"):
+            # Two listings classified this release differently and the crawl
+            # recorded that rather than picking the one it happened to see
+            # first. There is no server-owned answer here, so there is no
+            # answer -- returning the first-seen category would be exactly the
+            # silent movie-wins outcome M1 is about.
+            logger.info("no media kind for %s: listings disagree about its type", url)
+            return None
         category = str(payload.get("category") or "").strip().lower()
         return category or None
 

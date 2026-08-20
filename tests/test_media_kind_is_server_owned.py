@@ -148,3 +148,149 @@ class TestTheResolutionHappensOnce:
             "every history-writing path must consume the resolved value")
         assert not re.search(r"media_kind=self\.media_kind_for_category\(category\)", source), (
             "a history path is still mapping the raw client category")
+
+
+# ── the other half of M1: the crawl's own classification ──────────────────
+#
+# Fixing the client round trip is not enough on its own. The server's category
+# was ALSO first-source-wins: one `seen_post_urls` set spans every source, and
+# the movie listings are crawled before TV Packs (4K -> Remux -> TV Packs), so a
+# release visible in both was recorded as a movie and the TV listing was skipped
+# entirely, its evidence discarded with no trace.
+#
+# The post is still processed ONCE. What changes is that a disagreeing second
+# listing is recorded instead of dropped.
+
+import asyncio
+import threading
+
+from backend.scanner_service import ScannerService
+
+
+def _page(entries):
+    rows = "".join(
+        '<div class="data"><h5><a href="%s">%s</a></h5></div>' % (u, t)
+        for u, t in entries)
+    return ("<html><body>%s</body></html>" % rows).encode()
+
+
+class _Resp:
+    def __init__(self, body):
+        self.status_code = 200
+        self.content = body
+
+
+class _Scraper:
+    def __init__(self, pages):
+        self._pages = list(pages)
+        self.calls = 0
+
+    def get(self, *_a, **_kw):
+        body = self._pages[min(self.calls, len(self._pages) - 1)]
+        self.calls += 1
+        return _Resp(body)
+
+
+def _shell():
+    s = ScannerService.__new__(ScannerService)
+    s._stop_event = threading.Event()
+    s._last_crawl_seen_urls = set()
+    s._last_crawl_early_stopped = False
+    s._last_crawl_request_count = 0
+    s._last_crawl_policy_excluded_new = []
+    s._last_crawl_policy_excluded_count = 0
+    s._log = MagicMock()
+    s._progress = MagicMock()
+    s.config = {}
+    s.db = None
+    return s
+
+
+def _source(name, kind, category):
+    return {"name": name, "base": f"https://hdencode.org/{category}/",
+            "suffix": "", "type": kind, "source": "hdencode",
+            "category": category}
+
+
+def _crawl(sources, scraper, monkeypatch):
+    async def no_sleep(_s):
+        return None
+    monkeypatch.setattr("backend.scanner_service.asyncio.sleep", no_sleep)
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        return await _shell()._crawl_pages(
+            sources, pages=1, base_url="https://hdencode.org",
+            scraper=scraper, loop=loop, previously_scanned=set(),
+            early_stop=False, policy_excluded=None, skip_full_disc=False)
+    return asyncio.run(run())
+
+
+SHARED = "https://hdencode.org/some-show-s02-2160p/"
+
+
+class TestTwoListingsThatDisagree:
+    def test_a_release_in_both_a_movie_and_a_tv_listing_is_marked_conflicted(
+            self, monkeypatch):
+        """The case that silently became a movie."""
+        scraper = _Scraper([_page([(SHARED, "Some Show S02 2160p")])])
+        posts = _crawl([_source("4K Movies", "movie", "4k"),
+                        _source("TV Packs", "tv", "tv")], scraper, monkeypatch)
+        assert len(posts) == 1, "the post must still be processed exactly once"
+        assert posts[0]["category_conflict"] is True
+
+    def test_the_first_listing_still_supplies_the_category(self, monkeypatch):
+        """The conflict is recorded ALONGSIDE the original value, not instead
+        of it -- downstream needs to know what was seen, only not to trust it."""
+        scraper = _Scraper([_page([(SHARED, "Some Show S02 2160p")])])
+        posts = _crawl([_source("4K Movies", "movie", "4k"),
+                        _source("TV Packs", "tv", "tv")], scraper, monkeypatch)
+        assert posts[0]["category"] == "4k"
+        assert posts[0]["type"] == "movie"
+
+    def test_two_movie_listings_are_NOT_a_conflict(self, monkeypatch):
+        """'4k' and 'remux' both mean movie. A collision between them says
+        nothing contradictory about the KIND, and marking it would make the
+        conflict signal fire constantly and mean nothing."""
+        scraper = _Scraper([_page([(SHARED, "A Film 2026 2160p")])])
+        posts = _crawl([_source("4K Movies", "movie", "4k"),
+                        _source("Remux Movies", "movie", "remux")],
+                       scraper, monkeypatch)
+        assert len(posts) == 1
+        assert posts[0]["category_conflict"] is False
+
+    def test_an_uncontested_release_is_not_marked(self, monkeypatch):
+        scraper = _Scraper([_page([(SHARED, "A Film 2026 2160p")])])
+        posts = _crawl([_source("4K Movies", "movie", "4k")], scraper, monkeypatch)
+        assert posts[0]["category_conflict"] is False
+
+
+class TestAConflictedReleaseHasNoRecordedKind:
+    def _cache(self, db, *, category, conflict):
+        db.upsert_background_cache([{
+            "url": URL, "title": "Some Show", "year": 2026, "status": "missing",
+            "source_category": "HDEncode",
+            "data": json.dumps({"url": URL, "category": category,
+                                "category_conflict": conflict}),
+        }])
+
+    def test_a_conflicted_row_answers_nothing(self, svc):
+        self._cache(svc.db, category="4k", conflict=True)
+        assert svc.db.get_scan_category(URL) is None
+        assert svc.verified_media_kind(URL, "4k") is None
+
+    def test_the_same_row_without_the_conflict_answers_normally(self, svc):
+        """Positive control. Without it the test above would pass even if the
+        lookup were broken for every row."""
+        self._cache(svc.db, category="4k", conflict=False)
+        assert svc.db.get_scan_category(URL) == "4k"
+        assert svc.verified_media_kind(URL, "4k") == "movie"
+
+    def test_agreeing_with_the_first_listing_does_not_rescue_it(self, svc):
+        """A client echoing the movie category cannot resolve a conflict the
+        server recorded -- that is the first-source-wins outcome coming back in
+        through the other door."""
+        self._cache(svc.db, category="4k", conflict=True)
+        assert svc.verified_media_kind(URL, "4k") is None
+        assert svc.verified_media_kind(URL, "tv") is None
+        assert svc.verified_media_kind(URL, "") is None
