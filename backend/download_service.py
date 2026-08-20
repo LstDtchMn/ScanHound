@@ -581,6 +581,52 @@ class DownloadService:
     #: we do not recognise is not evidence of either kind.
     _CATEGORY_MEDIA_KIND = {"tv": "tv", "4k": "movie", "remux": "movie"}
 
+    def verified_media_kind(self, url, client_category):
+        """The media kind this SERVER can vouch for, or None.
+
+        Peer review round 10, M1. The kind used to come straight from
+        `DownloadRequest.category` -- unvalidated, and echoed back by the client
+        from a scan result. That is a round trip through the least trustworthy
+        layer for preserving semantic identity, and the value goes on to
+        authorize a DESTRUCTIVE overwrite in the UI.
+
+        The server scanned the release itself, so it answers the question:
+
+            server records a category  ->  that is the answer
+            client disagrees with it   ->  answer NOTHING, and log it
+            server has no record       ->  answer NOTHING
+
+        The client's value is only ever used to CONTRADICT, never to supply.
+        A disagreement means a stale UI object, a mismatched row, or a call-site
+        bug -- and a wrong recognized value is worse than a missing one, because
+        missing fails closed while wrong may authorize.
+
+        NOT CLOSED BY THIS: the server's own category is still first-source-wins.
+        One `seen_post_urls` set spans every source and the movie listings are
+        crawled before TV Packs, so a release visible in both is recorded as a
+        movie and the TV listing is skipped entirely. That is the other half of
+        M1 and it lives in the crawler, not here.
+        """
+        server_category = None
+        if self.db is not None:
+            try:
+                server_category = self.db.get_scan_category(url)
+            except Exception:
+                # An unreadable evidence source is not a licence to trust the
+                # client instead.
+                logger.exception("scan-category lookup failed for %s", url)
+                return None
+        if not server_category:
+            return None
+        client = (client_category or "").strip().lower()
+        if client and client != server_category:
+            logger.warning(
+                "media kind NOT recorded for %s: client said category=%r, this "
+                "server scanned it as %r. Recording nothing rather than picking "
+                "a winner.", url, client, server_category)
+            return None
+        return self.media_kind_for_category(server_category)
+
     @classmethod
     def media_kind_for_category(cls, category):
         """The media kind a scan category proves, or None if it proves nothing."""
@@ -3622,6 +3668,10 @@ class DownloadService:
 
         Returns dict with 'success', 'method', 'link_count', 'message'.
         """
+        # Resolved ONCE, here, and consumed by every history-writing path
+        # below. Four separate calls to the resolver would be four chances
+        # for one of them to keep using the raw client value.
+        _verified_kind = self.verified_media_kind(url, category)
         result = {
             "success": False,
             "method": "",
@@ -3816,7 +3866,7 @@ class DownloadService:
                     url, title, season, resolution, size, status="completed",
                     hdr=hdr, dovi=dovi, year=year,
                     package_name=package_name, service_type=service_type,
-                    media_kind=self.media_kind_for_category(category)
+                    media_kind=_verified_kind
                 )
                 self._log(
                     f"[Download] {title}: delivered to JDownloader "
@@ -3839,7 +3889,7 @@ class DownloadService:
                 url, title, season, resolution, size, status="clipboard",
                 hdr=hdr, dovi=dovi, year=year,
                 package_name=package_name, service_type=service_type,
-                media_kind=self.media_kind_for_category(category)
+                media_kind=_verified_kind
             )
             self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
             return result
@@ -3856,7 +3906,7 @@ class DownloadService:
                 url, title, season, resolution, size, status="browser",
                 hdr=hdr, dovi=dovi, year=year,
                 package_name=package_name, service_type=service_type,
-                media_kind=self.media_kind_for_category(category)
+                media_kind=_verified_kind
             )
             self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
             return result
@@ -3871,7 +3921,7 @@ class DownloadService:
             self.save_to_history(url, title, season, resolution, size,
                                  status="failed", hdr=hdr, dovi=dovi, year=year,
                                  package_name=package_name, service_type=service_type,
-                                 media_kind=self.media_kind_for_category(category))
+                                 media_kind=_verified_kind)
         except Exception:
             pass
         self._progress("download:failed", {"title": title, "url": url, "message": result["message"]}, _cb=_cb)
