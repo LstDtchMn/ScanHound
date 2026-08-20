@@ -86,7 +86,11 @@ class TestFailsClosed:
 
 class TestAgreementOpensTheGate:
     def test_an_agreeing_cross_check_produces_no_blockers(self, collector):
-        assert blockers(collector, {"ready_matches": True}) == []
+        # Deltas included: agreement now means the two implementations
+        # reported the SAME NUMBERS, not merely the same verdict.
+        assert blockers(collector, {"ready_matches": True,
+                                    "successful_cycles_delta": 0,
+                                    "relevant_misses_delta": 0}) == []
 
 
 class TestNetworking:
@@ -101,3 +105,44 @@ class TestNetworking:
         have worked — publishing one would not have fixed it either."""
         assert "127.0.0.1" not in collector.BASE_URL
         assert collector.BASE_URL == "http://scanhound:9721"
+
+
+class TestGateFieldsMustAgreeNotJustTheVerdict:
+    """Peer review round 11 (Q2).
+
+    The deltas were computed and logged and never enforced, so this passed:
+
+        app.relevant_misses    = 0
+        mirror.relevant_misses = 3
+        both ready             = False
+        -> ready_matches True, relevant_misses_delta -3, no blocker
+
+    Two views reporting different numbers while agreeing on the verdict is not
+    corroboration, it is both happening to say no.
+    """
+
+    def test_a_numeric_disagreement_blocks_even_when_the_verdict_matches(self, collector):
+        out = blockers(collector, {"ready_matches": True,
+                                   "successful_cycles_delta": 0,
+                                   "relevant_misses_delta": -3})
+        assert out and "relevant_misses" in out[0]
+
+    def test_a_cycle_count_disagreement_blocks_too(self, collector):
+        out = blockers(collector, {"ready_matches": True,
+                                   "successful_cycles_delta": 2,
+                                   "relevant_misses_delta": 0})
+        assert out and "successful_cycles" in out[0]
+
+    def test_a_missing_delta_is_not_agreement(self, collector):
+        """An older evidence script that never emitted a delta must not
+        silently satisfy a check it did not run."""
+        out = blockers(collector, {"ready_matches": True,
+                                   "successful_cycles_delta": 0})
+        assert out and "relevant_misses_delta" in out[0]
+
+    def test_full_agreement_still_opens_the_gate(self, collector):
+        """POSITIVE CONTROL. Without it, 'always block' would satisfy all three
+        assertions above."""
+        assert blockers(collector, {"ready_matches": True,
+                                    "successful_cycles_delta": 0,
+                                    "relevant_misses_delta": 0}) == []

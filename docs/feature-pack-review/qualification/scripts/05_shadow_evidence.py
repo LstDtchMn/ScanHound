@@ -235,11 +235,49 @@ def main():
                                "       AND normal_feeds_complete=1))")
             else:
                 _miss_where = "WHERE normal_feeds_complete=1"
-            all_misses = con.execute(
-                "SELECT COALESCE(SUM(relevant_miss_count),0) "
-                "FROM hdencode_shadow_cycles " + _miss_where + window_scope,
-                window_params,
-            ).fetchone()[0]
+            # ROW-VALIDATED, INDEPENDENTLY. Peer review round 11 (Q2).
+            #
+            # This used to be SUM(relevant_miss_count) -- what the cycle CLAIMED --
+            # while the app re-derives the count from the miss ROWS and treats a
+            # count with no rows as corrupt evidence contributing zero. The two
+            # therefore agreed on consistent data and disagreed exactly on
+            # contradictory data, which is precisely where corroboration is worth
+            # having. Independence should mean a different code path, not a
+            # different question.
+            #
+            # Implemented here as its own SQL rather than by importing the app's
+            # helper -- sharing the implementation would end the independence this
+            # script exists for.
+            #
+            # Provenance-aware cycles: count the ROWS. Pre-provenance legacy rows
+            # keep the conservative stored-count rule, since they carry no rows to
+            # count and the accepted completeness condition is all there is.
+            if _table_exists(con, "hdencode_shadow_misses") and \
+                    "normal_feed_outcomes" in _cycle_cols:
+                _attributed = con.execute(
+                    "SELECT COUNT(*) FROM hdencode_shadow_misses m "
+                    "JOIN hdencode_shadow_cycles c ON c.cycle_uuid = m.cycle_uuid "
+                    "WHERE c.normal_feed_outcomes IS NOT NULL "
+                    "  AND m.media_type IN ('movie','tv','unknown')"
+                    + window_scope.replace("completed_at", "c.completed_at"),
+                    window_params,
+                ).fetchone()[0]
+                _legacy = con.execute(
+                    "SELECT COALESCE(SUM(relevant_miss_count),0) "
+                    "FROM hdencode_shadow_cycles "
+                    "WHERE normal_feed_outcomes IS NULL AND normal_feeds_complete=1"
+                    + window_scope,
+                    window_params,
+                ).fetchone()[0]
+                all_misses = int(_attributed or 0) + int(_legacy or 0)
+            else:
+                # No miss table, or a schema predating provenance: the stored count
+                # is the only evidence there is.
+                all_misses = con.execute(
+                    "SELECT COALESCE(SUM(relevant_miss_count),0) "
+                    "FROM hdencode_shadow_cycles " + _miss_where + window_scope,
+                    window_params,
+                ).fetchone()[0]
             cycle_rows = [
                 dict(r)
                 for r in con.execute(
