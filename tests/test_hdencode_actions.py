@@ -231,3 +231,50 @@ class TestConstructionIsSideEffectFree:
             # the real DatabaseManager records the call by having run it;
             # assert the method exists and the table is reachable
             assert hasattr(db, "recover_hdencode_actions")
+
+
+def test_history_is_keyed_on_the_RELEASE_url_not_each_file_host_link():
+    """The RSS path used to write one `downloads` row per file-host link.
+
+    Nothing reads those: `is_downloaded()` -- the only consumer -- is called
+    with the RELEASE url, so a link row can never match, and the links are
+    already recorded by `record_submitted_links()` for provenance.
+
+    Worse, it made a whole feature inert on this path. `provenance_url` resolves
+    to the canonical url and `annotate_source_links()` joins it against
+    `downloads.url`, so with history under the links that join could never
+    match: no source link, no first-seen date, no identity. The old test
+    asserted only `assert download.history` -- that something was written --
+    which is exactly why the wrong key survived.
+    """
+    action, db, download = service()
+    download.scrape_links = lambda *_a: ["https://rapidgator.net/file/1",
+                                         "https://rapidgator.net/file/2"]
+    queued = action.queue_action(
+        db.candidate["canonical_url"], action_kind="grab",
+        requested_by="explicit", idempotency_key="grab-key",
+    )
+    action.run_action(queued["action_uuid"], owns_lifespan=lambda: True)
+
+    assert len(download.history) == 1, (
+        f"expected ONE history row for the release, got {len(download.history)} "
+        "— one per link is the old behaviour")
+    url = download.history[0][0][0]
+    assert url == db.candidate["canonical_url"], (
+        f"history keyed on {url!r}, not the release url")
+    assert "rapidgator" not in url
+
+
+def test_a_missing_canonical_url_records_nothing_rather_than_guessing():
+    """Without it there is no key that provenance could ever join, so writing a
+    row under some other url would create history that can never be resolved."""
+    action, db, download = service()
+    queued = action.queue_action(
+        db.candidate["canonical_url"], action_kind="grab",
+        requested_by="explicit", idempotency_key="grab-nocanon",
+    )
+    # Strip the canonical url the way a malformed candidate would.
+    stored = db.actions[queued["action_uuid"]]
+    stored["canonical_url"] = None
+    action.run_action(queued["action_uuid"], owns_lifespan=lambda: True)
+    assert download.history == [], "wrote history under an unjoinable key"
