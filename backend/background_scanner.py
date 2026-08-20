@@ -546,6 +546,45 @@ class BackgroundScanner:
                     total += len(rows)
                 source_results.append({"source": source, "new": len(rows), "error": err})
 
+                # CLASSIFICATION CONFLICTS, persisted and then RETRACTED.
+                #
+                # Peer review round 11. Two listings disagreeing about a release is
+                # evidence that the recorded media kind is unsafe, and it has to reach
+                # two places the crawl does not otherwise touch:
+                #
+                #   M1b  the CACHED row, which is never rewritten for a release this
+                #        crawl skipped -- i.e. the entire deployed corpus
+                #   M1a  the PERSISTED downloads row, because the destructive identity
+                #        reads downloads.media_kind and not the cache, so refusing to
+                #        record a NEW kind leaves an old one authoritative
+                #
+                # Retraction is deliberately a separate named operation. Routing it
+                # through add_to_history(media_kind=None) would do nothing: that path
+                # COALESCEs, because there None means "no observation this time".
+                _conflicted = getattr(scanner, "_last_crawl_conflicted_urls", None) or set()
+                # BACKFILL THE ATTESTATION for everything this crawl observed cleanly.
+                # A cached row written before conflict detection has no attestation, and
+                # get_scan_category refuses to answer for it -- correctly, since nothing
+                # had ever checked it. Observing it now IS the check. Written only where
+                # the key is absent, so this is a one-time backfill per release rather
+                # than a write on every crawl.
+                _seen = getattr(scanner, "_last_crawl_seen_urls", None) or set()
+                _clean = _seen - (getattr(scanner, "_last_crawl_conflicted_urls", None) or set())
+                if _clean:
+                    try:
+                        db.attest_scan_categories(_clean)
+                    except Exception:
+                        logger.exception("failed to attest scan categories")
+                if _conflicted:
+                    try:
+                        db.mark_scan_category_conflict(_conflicted)
+                        db.retract_download_media_kind(
+                            _conflicted, reason="classification_conflict")
+                    except Exception:
+                        # Never let bookkeeping abort a scan. An unrecorded conflict
+                        # leaves the PREVIOUS state, which was already the status quo.
+                        logger.exception("failed to record classification conflicts")
+
             if not self._owns_lifespan():
                 logger.info("Background scan abandoned before cache re-match: stale app lifespan")
                 return {

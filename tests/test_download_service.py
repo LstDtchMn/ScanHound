@@ -391,6 +391,9 @@ class TestSaveToHistory:
             normalized_title="test movie", season=None,
             resolution="4K", size="50 GB", status="completed",
             hdr=None, dovi=False, year=None,
+            # No category passed, so nothing recorded the kind -- and an
+            # unrecorded kind must stay unrecorded rather than be inferred.
+            media_kind=None,
         )
         assert "http://a.com" in svc.download_history
         assert "test movie" in svc._downloaded_titles_lookup
