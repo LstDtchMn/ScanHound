@@ -191,7 +191,7 @@
     downloading = true;
     try {
       await api.downloadBatch(
-        selectedItems.map((i) => ({ url: i.url, title: i.title, year: i.year, season: i.season, resolution: i.resolution, size: i.size, hdr: i.hdr, dovi: i.dovi })),
+        selectedItems.map((i) => ({ url: i.url, title: i.title, year: i.year, season: i.season, resolution: i.resolution, size: i.size, hdr: i.hdr, dovi: i.dovi, category: i.category })),
         $downloadHost
       );
       addToast('Download', `Sending ${selectedItems.length} item(s) to JDownloader…`);

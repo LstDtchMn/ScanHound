@@ -12,7 +12,7 @@ export function downloadResult(item: ScanResult, host: string): void {
   // that row powers duplicate protection and the read-time overlay.
   api.download(item.url, item.title, host, item.year,
                item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false,
-               item.season)
+               item.season, item.category || '')
     .catch(() => addToast('Error', 'Download failed', 'error'));
 }
 

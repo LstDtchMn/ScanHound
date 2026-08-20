@@ -74,7 +74,7 @@
       // Include release specs so a later "already grabbed" chip isn't blank.
       api.download(item.url, item.title, $downloadHost, item.year,
                    item.resolution || '', item.size || '', item.hdr || '', item.dovi ?? false,
-                   item.season)
+                   item.season, item.category || '')
         .catch(() => addToast('Error', 'Download failed', 'error'));
     }
   }

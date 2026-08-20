@@ -510,7 +510,7 @@ describe('the semantic key is an identity, not a display normalization', () => {
     // round trip pins the property that makes the separator irrelevant.
     const key = semanticKey(tv({ identity_title: 'A|B', identity_year: 2020,
                                  identity_season: 1 }));
-    expect(JSON.parse(key as string)).toEqual(['sem', 'A|B', 2020, 1]);
+    expect(JSON.parse(key as string)).toEqual(['sem', 'tv_season', 'A|B', 2020, 1]);
   });
 
   it('treats case and surrounding whitespace as recorded, except for trimming', () => {
@@ -576,7 +576,7 @@ describe('an absent year and a malformed one are different things', () => {
   it('null year is a real answer and keeps the partial semantic class', () => {
     const k = semanticGroupKey(tv({ identity_year: null }));
     expect(k).not.toBeNull();
-    expect(JSON.parse(k as string)).toEqual(['sem', 'Show', null, 1]);
+    expect(JSON.parse(k as string)).toEqual(['sem', 'tv_season', 'Show', null, 1]);
     expect(semanticKey(tv({ identity_year: null }))).toBeNull();  // still refused
   });
 
@@ -599,5 +599,72 @@ describe('an absent year and a malformed one are different things', () => {
     const g = groupDownloads([yearless, malformed]);
     expect(g).toHaveLength(2);
     expect(g.every((x) => !x.canKeepBest)).toBe(true);
+  });
+});
+
+describe('a recorded MOVIE can finally carry an identity', () => {
+  // The de-duplicate action was withheld from every film, because nothing
+  // recorded whether a download was a movie or a show and the backend refused
+  // to guess. It records it now, so a proven movie gets an identity.
+  const film = (over: Partial<DownloadResult>): DownloadResult =>
+    r({
+      state: 'queued',
+      identity_source: 'provenance',
+      identity_kind: 'movie',
+      identity_title: 'Notting Hill',
+      identity_year: 1999,
+      identity_season: null,
+      ...over
+    });
+
+  it('two releases of the same film ARE actionable', () => {
+    const g = groupDownloads([
+      film({ id: 1, name: 'Notting.Hill.1999.1080p.BluRay-ABC' }),
+      film({ id: 2, name: 'notting hill (1999) [4K] other releaser', bytes_total: 999 })
+    ]);
+    expect(g).toHaveLength(1);
+    expect(g[0].identityKnown).toBe(true);
+    expect(g[0].canKeepBest).toBe(true);
+    expect(g[0].best.id).toBe(2);
+  });
+
+  it('two REMAKES stay apart', () => {
+    // The hole the year requirement exists to close, now on the movie side.
+    const g = groupDownloads([
+      film({ id: 1, identity_title: 'The Thing', identity_year: 1982 }),
+      film({ id: 2, identity_title: 'The Thing', identity_year: 2011 })
+    ]);
+    expect(g).toHaveLength(2);
+    expect(g.every((x) => !x.canKeepBest)).toBe(true);
+  });
+
+  it('a film and a SHOW of the same name never share an identity', () => {
+    // The kind is part of the tuple precisely so this cannot happen.
+    const a = film({ id: 1, identity_title: 'Fargo', identity_year: 1996 });
+    const b = r({
+      id: 2, state: 'queued', identity_source: 'provenance',
+      identity_kind: 'tv_season', identity_title: 'Fargo',
+      identity_year: 1996, identity_season: 1
+    });
+    expect(semanticKey(a)).not.toBe(semanticKey(b));
+    expect(groupDownloads([a, b])).toHaveLength(2);
+  });
+
+  it('a movie with NO recorded year is not actionable', () => {
+    const g = groupDownloads([
+      film({ id: 1, identity_year: null }),
+      film({ id: 2, identity_year: null })
+    ]);
+    expect(g[0].identityKnown).toBe(false);
+    expect(g[0].canKeepBest).toBe(false);
+  });
+
+  it('a movie carrying a SEASON is refused as contradictory', () => {
+    expect(semanticKey(film({ identity_season: 2 }))).toBeNull();
+  });
+
+  it('an UNRECORDED kind is still not a movie', () => {
+    // Every row grabbed before media_kind existed. Unknown, not inferred.
+    expect(semanticKey(film({ identity_kind: 'unknown' }))).toBeNull();
   });
 });
