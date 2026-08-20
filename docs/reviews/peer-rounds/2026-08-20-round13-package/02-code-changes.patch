@@ -1,0 +1,743 @@
+diff --git a/backend/api/routes/scanner.py b/backend/api/routes/scanner.py
+index af7bd09..d012239 100644
+--- a/backend/api/routes/scanner.py
++++ b/backend/api/routes/scanner.py
+@@ -7,7 +7,7 @@ import logging
+ import threading
+ import time
+ from enum import Enum
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, List, NamedTuple, Optional
+ from urllib.parse import urlparse
+ 
+ from fastapi import APIRouter, Depends, HTTPException
+@@ -19,6 +19,14 @@ from backend.config import source_enabled
+ from backend.scanner_service import ScanStatus, STATUS_COLORS, STATUS_TEXTS
+ 
+ logger = logging.getLogger(__name__)
++class CarriedClassification(NamedTuple):
++    """Classification evidence a detail rescan carries forward, never invents."""
++    category: str
++    is_tv: bool
++    category_conflict: bool
++    category_attested: bool
++
++
+ def rescan_classification(existing):
+     """The classification a rescan must CARRY FORWARD, from the cached row.
+ 
+@@ -48,7 +56,17 @@ def rescan_classification(existing):
+     listing the release came from, so it carries that evidence rather than
+     inventing it.
+ 
+-    Returns ``(category, is_tv_from_cache, category_conflict)``.
++    Returns a :class:`CarriedClassification`. Round 12 (M12-3) added
++    ``category_attested`` and made this a named structure rather than a
++    positional tuple: the merge that produced the three-value version wired all
++    three correctly and silently dropped the fourth, which a positional unpack
++    cannot make visible at the call site.
++
++    A detail rescan must never CREATE attestation -- it observes no listing
++    membership at all -- but it must not destroy one either. Writing a falsey
++    value was not harmless: `attest_scan_categories` skipped rows that merely
++    HAD the key, so one rescan permanently disabled the media kind for that
++    release. That guard now tests truth, and this carries the value forward.
+     """
+     try:
+         cached = json.loads(existing.get("data") or "{}")
+@@ -64,7 +82,10 @@ def rescan_classification(existing):
+     # A conflict recorded against this release survives a rescan: re-reading
+     # the detail page is not evidence about which listings carried it.
+     conflict = bool(cached.get("category_conflict"))
+-    return category, is_tv, conflict
++    # Likewise the attestation. A rescan fetches the DETAIL page; attestation is
++    # a statement about LISTING coverage, which this route observes nothing of.
++    attested = bool(cached.get("category_attested"))
++    return CarriedClassification(category, is_tv, conflict, attested)
+ 
+ 
+ router = APIRouter(prefix="/scan", tags=["scanner"])
+@@ -467,10 +488,16 @@ def rescan_item(
+     # BOTH sides of this conflict added something, and neither is redundant:
+     #   #93   the extracted helper, and the TV signal it recovers
+     #   main  preservation of a recorded classification conflict
+-    # The helper carries all three rather than one side being dropped.
+-    (details['category'],
+-     post_source_is_tv,
+-     details['category_conflict']) = rescan_classification(existing)
++    # The helper carries all FOUR rather than one side being dropped. Round 12
++    # (M12-3) found the fourth: the merge wired three values coherently and
++    # silently dropped category_attested, which a positional unpack hides.
++    _carried = rescan_classification(existing)
++    details['category'] = _carried.category
++    details['category_conflict'] = _carried.category_conflict
++    # Carried, never invented: a rescan observes no listing membership, so it may
++    # neither create nor destroy an attestation (round 12, M12-3).
++    details['category_attested'] = _carried.category_attested
++    post_source_is_tv = _carried.is_tv
+     item = scanner._create_media_item({
+         'details': details,
+         'is_tv': details.get('is_tv', False) or post_source_is_tv,
+diff --git a/backend/background_scanner.py b/backend/background_scanner.py
+index a314d35..54a1916 100644
+--- a/backend/background_scanner.py
++++ b/backend/background_scanner.py
+@@ -31,11 +31,59 @@ _ALL_CATEGORY_FLAGS = {
+ }
+ 
+ 
++#: The listing types whose disagreement attestation exists to rule out. A crawl
++#: that fetched only movie arms cannot have observed a movie-vs-TV contradiction,
++#: so its silence about one is not evidence of absence.
++_CONTRADICTING_TYPES = ("movie", "tv")
++
++
++def crawl_attestation_verdict(scanner):
++    """Whether a finished crawl may certify releases as classification-clean.
++
++    Peer review round 12 (M12-1). Attestation is a NEGATIVE claim -- "no listing
++    contradicts this one" -- and the old code derived it from `_seen - _conflicted`,
++    i.e. purely from the absence of an observation. Absence of an observation is
++    only evidence of absence when you looked everywhere it could have been.
++
++    The scheduled background crawl never looks everywhere. It is bounded by
++    `background_scan_pages` (default 3), it runs with `early_stop=True` so it halts
++    at the cached frontier, and its category arms are individually switchable via
++    `background_scan_categories` -- with `["4k"]`, the TV listing is never fetched
++    at all and no contradiction is observable even in principle.
++
++    So this deliberately returns False for the normal cycle. Conflict DISCOVERY
++    still runs on every crawl, because that half is a positive observation and is
++    always valid; only certification requires coverage.
++
++    Returns (may_attest, reason). Fail-closed: anything unrecognised is a no.
++    """
++    if not getattr(scanner, "_last_crawl_attests_coverage", False):
++        return (False, "crawl was not run as an attesting crawl")
++    if getattr(scanner, "_last_crawl_early_stopped", False):
++        return (False, "crawl stopped early; deeper pages were never fetched")
++    if int(getattr(scanner, "_last_crawl_page_errors", 0) or 0) > 0:
++        return (False, "crawl hit page errors; part of the listing was never read")
++    termination = str(getattr(scanner, "_last_crawl_termination", "") or "")
++    if termination != "complete":
++        return (False, "crawl terminated as %s" % (termination or "unknown"))
++    covered = {str(t).strip().lower()
++               for t in (getattr(scanner, "_last_crawl_types_covered", None) or ())}
++    missing = [t for t in _CONTRADICTING_TYPES if t not in covered]
++    if missing:
++        return (False, "crawl never fetched the %s arm(s)" % "/".join(missing))
++    return (True, "every contradicting listing type covered by a complete crawl")
++
++
+ class BackgroundScanner:
+     """Runs periodic pre-cache scans on a daemon thread."""
+ 
+     def __init__(self, registry):
+         self._reg = registry
++        #: Releases whose media-kind revocation could not be committed. The
++        #: transaction rolls back as a unit, so on failure the OLD kind is still
++        #: authoritative while we already know it is unsafe. Held here and retried
++        #: on the next cycle rather than dropped (round 12, M12-2).
++        self._pending_revocations = set()
+         self._lifespan_generation = registry.lifespan_generation
+         self._thread: Optional[threading.Thread] = None
+         self._stop = threading.Event()
+@@ -562,28 +610,65 @@ class BackgroundScanner:
+                 # through add_to_history(media_kind=None) would do nothing: that path
+                 # COALESCEs, because there None means "no observation this time".
+                 _conflicted = getattr(scanner, "_last_crawl_conflicted_urls", None) or set()
+-                # BACKFILL THE ATTESTATION for everything this crawl observed cleanly.
+-                # A cached row written before conflict detection has no attestation, and
+-                # get_scan_category refuses to answer for it -- correctly, since nothing
+-                # had ever checked it. Observing it now IS the check. Written only where
+-                # the key is absent, so this is a one-time backfill per release rather
+-                # than a write on every crawl.
+-                _seen = getattr(scanner, "_last_crawl_seen_urls", None) or set()
+-                _clean = _seen - (getattr(scanner, "_last_crawl_conflicted_urls", None) or set())
+-                if _clean:
+-                    try:
+-                        db.attest_scan_categories(_clean)
+-                    except Exception:
+-                        logger.exception("failed to attest scan categories")
+-                if _conflicted:
++                # CONFLICT DISCOVERY FIRST, AND IT IS ALWAYS VALID EVIDENCE.
++                #
++                # Round 12 (M12-2): recording the conflict and withdrawing the
++                # authority it invalidates are ONE transaction now. They used to be
++                # two independent commits under a broad try/except, so a failure
++                # between them left the cache saying "unsafe" while
++                # downloads.media_kind still said "movie" -- and the destructive
++                # identity reads the latter. Fail-open on an authorization boundary.
++                #
++                # Note the asymmetry with attestation below. OBSERVING a
++                # contradiction is a positive fact that any crawl can establish,
++                # however partial it was. Certifying the ABSENCE of one is not.
++                _pending = set(self._pending_revocations)
++                _to_revoke = set(_conflicted) | _pending
++                if _to_revoke:
+                     try:
+-                        db.mark_scan_category_conflict(_conflicted)
+-                        db.retract_download_media_kind(
+-                            _conflicted, reason="classification_conflict")
++                        db.record_classification_conflicts_and_retract_kinds(
++                            _to_revoke, reason="classification_conflict")
++                        self._pending_revocations -= _to_revoke
+                     except Exception:
+-                        # Never let bookkeeping abort a scan. An unrecorded conflict
+-                        # leaves the PREVIOUS state, which was already the status quo.
+-                        logger.exception("failed to record classification conflicts")
++                        # NOT bookkeeping. The transaction rolled back, so the old
++                        # media kind is still authoritative on these releases. Hold
++                        # them and retry next cycle rather than dropping the fact
++                        # that we already know they are unsafe.
++                        self._pending_revocations |= _to_revoke
++                        logger.error(
++                            "REVOCATION FAILED for %d release(s): their recorded "
++                            "media kind is still live despite a known classification "
++                            "conflict. Retrying next cycle.", len(_to_revoke))
++                        source_results[-1]["revocation_failed"] = len(_to_revoke)
++
++                # ATTESTATION: only a crawl whose coverage could actually rule out a
++                # contradiction may turn unknown into checked-clean.
++                #
++                # Round 12 (M12-1). This used to be `_seen - _conflicted`, which
++                # answers "did THIS crawl notice a contradiction" and was then read
++                # as "is this release clean". Those coincide only under full
++                # coverage. The scheduled crawl is bounded by background_scan_pages
++                # (default 3), runs early_stop=True, and its category arms are
++                # individually switchable -- so the TV arm can be absent entirely
++                # while every 4K row still looked "clean". The same partiality was
++                # already trusted a few lines above to block a PURGE; it simply was
++                # not read here.
++                _may_attest, _why = crawl_attestation_verdict(scanner)
++                if err:
++                    # The block sits outside the `if not err:` guard, so a source
++                    # that RAISED could still attest whatever partial seen-set the
++                    # crawl had accumulated before it died.
++                    _may_attest, _why = False, "source errored: %s" % (err,)
++                if not _may_attest:
++                    logger.debug("not attesting from this crawl: %s", _why)
++                else:
++                    _seen = getattr(scanner, "_last_crawl_seen_urls", None) or set()
++                    _clean = _seen - set(_conflicted)
++                    if _clean:
++                        try:
++                            db.attest_scan_categories(_clean)
++                        except Exception:
++                            logger.exception("failed to attest scan categories")
+ 
+             if not self._owns_lifespan():
+                 logger.info("Background scan abandoned before cache re-match: stale app lifespan")
+diff --git a/backend/database.py b/backend/database.py
+index 496e622..a946f47 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -4274,7 +4274,14 @@ class DatabaseManager:
+                 payload = json.loads(dict(row).get("data") or "{}")
+             except (TypeError, ValueError):
+                 continue
+-            if "category_attested" in payload or payload.get("category_conflict"):
++            # TRUTH, not PRESENCE. Round 12: the guard used to be
++            # `"category_attested" in payload`, so any row carrying the key with
++            # a FALSE value could never be attested again by any later crawl --
++            # permanently disabling the media kind for that release. A manual
++            # rescan writes exactly such a row (M12-3), and so does every fresh
++            # crawl now that the producer no longer stamps a bare True.
++            # Idempotence should key on having the ANSWER, not on having asked.
++            if payload.get("category_attested") or payload.get("category_conflict"):
+                 continue
+             payload["category_attested"] = True
+             with self.transaction() as conn:
+@@ -4324,6 +4331,79 @@ class DatabaseManager:
+                 "identity built on those rows is withdrawn.", retracted, reason)
+         return retracted
+ 
++    def record_classification_conflicts_and_retract_kinds(self, urls, *, reason):
++        """Record a classification conflict AND withdraw the authority it
++        invalidates, as ONE transaction.
++
++        Peer review round 12 (M12-2). These used to be two independently
++        committed mutations under a broad try/except: mark_scan_category_conflict()
++        committed the cache flag, then retract_download_media_kind() opened a
++        separate transaction over `downloads`. A crash or failure between them
++        left exactly the worst pair of states:
++
++            background_scan_cache.category_conflict = 1        # we KNOW it is unsafe
++            downloads.media_kind                    = 'movie'  # ...and still allow it
++
++        That is fail-OPEN on an authorization boundary. The destructive identity
++        reads downloads.media_kind through get_release_identity() and never
++        consults the cache, so the withdrawn permission stayed live while the
++        evidence withdrawing it was already durably recorded.
++
++        Ordering inside the transaction is deliberate. The RETRACTION goes first
++        because it is the safety-critical half: an unreadable or missing cache row
++        must never be able to prevent it. The cache flag only records WHY.
++
++        Raises on failure. A failed revocation is NOT bookkeeping noise -- the old
++        permission is still authoritative -- so the caller has to treat it as a
++        failure and leave the release in a degraded/unknown state.
++
++        Returns (retracted, marked).
++        """
++        targets = {str(u) for u in (urls or ()) if u}
++        if not targets:
++            return (0, 0)
++        retracted = 0
++        marked = 0
++        with self.transaction() as conn:
++            if not conn:
++                raise RuntimeError(
++                    "no database connection: the classification conflict for "
++                    f"{len(targets)} release(s) could not be recorded, and the "
++                    "media kind it invalidates is still authoritative")
++            # 1. WITHDRAW THE AUTHORITY FIRST.
++            for url in targets:
++                cur = conn.execute(
++                    "UPDATE downloads SET media_kind = NULL "
++                    "WHERE url = ? AND media_kind IS NOT NULL", (url,))
++                retracted += max(0, int(cur.rowcount or 0))
++            # 2. Then the diagnostic cache flag.
++            for url in targets:
++                row = conn.execute(
++                    "SELECT data FROM background_scan_cache WHERE url = ?",
++                    (url,)).fetchone()
++                if not row:
++                    continue
++                try:
++                    payload = json.loads(dict(row).get("data") or "{}")
++                except (TypeError, ValueError):
++                    logger.warning("cannot mark conflict on %s: undecodable data", url)
++                    continue
++                if payload.get("category_conflict"):
++                    continue
++                payload["category_conflict"] = True
++                conn.execute(
++                    "UPDATE background_scan_cache SET data = ? WHERE url = ?",
++                    (json.dumps(payload, default=str), url))
++                marked += 1
++        if retracted:
++            logger.warning(
++                "retracted media_kind on %d download row(s): %s. Any semantic "
++                "identity built on those rows is withdrawn.", retracted, reason)
++        if marked:
++            logger.info(
++                "marked %d cached release(s) as classification-conflicted", marked)
++        return (retracted, marked)
++
+     def get_scan_category(self, url):
+         """The crawl category THIS SERVER recorded for a release URL.
+ 
+diff --git a/backend/scanner_service.py b/backend/scanner_service.py
+index 42b8d77..e6b08ac 100644
+--- a/backend/scanner_service.py
++++ b/backend/scanner_service.py
+@@ -264,6 +264,20 @@ class ScannerService:
+         # So every exit now says why it stopped, and only "complete" grants
+         # membership authority.
+         self._last_crawl_termination: str = "not_run"
++        # CONTRADICTION COVERAGE, owned by the crawler. Round 12 (M12-1).
++        #
++        # Attestation is a NEGATIVE claim -- "no listing contradicts this one" --
++        # and a negative claim needs COVERAGE, not merely an absence of sightings.
++        # The set below records which listing types this crawl actually fetched
++        # ('movie', 'tv', ...). A crawl that never fetched the TV arm cannot have
++        # observed a movie-vs-TV disagreement, so its silence proves nothing.
++        self._last_crawl_types_covered: Set[str] = set()
++        # Whether this crawl was RUN as an attesting crawl at all. The scheduled
++        # background crawl is bounded by background_scan_pages and runs with
++        # early_stop=True, so it deliberately never claims this. It may still
++        # DISCOVER a conflict -- that is a positive observation and always valid
++        # evidence -- but it may not certify anything as clean.
++        self._last_crawl_attests_coverage: bool = False
+         # THE DETAIL PIPELINE, tracked separately from membership. Cached skips and
+         # policy exclusions never reach all_posts, so scheduled-minus-completed is
+         # ONLY genuine attribution failures -- unlike the earlier
+@@ -371,6 +385,7 @@ class ScannerService:
+         track_urls: bool = True,
+         skip_urls: Optional[Set[str]] = None,
+         early_stop: bool = False,
++        attest_coverage: bool = False,
+     ) -> List[MediaItem]:
+         """Run a full scan synchronously (call from background thread).
+ 
+@@ -403,6 +418,12 @@ class ScannerService:
+             self.items.clear()
+             self._item_counter = 0
+         self._last_crawl_seen_urls = set()
++        # A crawl may only certify releases as clean when it was RUN to do so.
++        # early_stop truncates the traversal at the cached frontier, so an
++        # early-stopping crawl can never support the negative claim no matter
++        # what else it reports. Both conditions, not either.
++        self._last_crawl_attests_coverage = bool(attest_coverage) and not early_stop
++        self._last_crawl_types_covered = set()
+         self._last_crawl_request_count = 0
+         # RESET THE WHOLE CRAWL-AUTHORITY STATE HERE, at run entry, beside the
+         # resets above. Round 7 found the consequence of my having put this reset
+@@ -833,6 +854,8 @@ class ScannerService:
+         seen_exclusion_canonical: Set[str] = set()
+         policy_excluded_known = 0
+         early_stopped = False
++        #: Listing types this crawl actually fetched (round 12, M12-1).
++        types_covered: Set[str] = set()
+         total_pages = len(sources) * pages
+         current_page = 0
+ 
+@@ -849,6 +872,12 @@ class ScannerService:
+             source_base = source["base"]
+             source_suffix = source["suffix"]
+             source_type_hint = source["type"]
++            # This arm is being fetched, so its listing type is covered by this
++            # crawl. Round 12 (M12-1): attestation claims that no OTHER listing
++            # disagrees, which is only checkable for types actually visited. The
++            # crawl-wide early_stop / page_errors / cancelled verdicts decide
++            # separately whether the visit was thorough enough to certify.
++            types_covered.add(str(source_type_hint or "").strip().lower())
+             source_id = source.get("source", "hdencode")
+             source_category = source.get("category", "")
+ 
+@@ -1046,7 +1075,13 @@ class ScannerService:
+                         _post = {'url': post_url, 'type': source_type_hint,
+                                  'source': source_id, 'category': source_category,
+                                  'category_conflict': False,
+-                                  'category_attested': True}
++                                 # NOT attested here. Round 12 (M12-1): coming
++                                 # through this crawler proves the sightings it
++                                 # SAW were checked, not that the listings it
++                                 # never fetched agree. Attestation is decided
++                                 # once, after the crawl, by whether its coverage
++                                 # could actually rule a contradiction out.
++                                 'category_attested': False}
+                         all_posts.append(_post)
+                         # Indexed so a LATER listing that classifies this same release
+                         # differently can mark it, instead of being dropped by the dedup
+@@ -1123,6 +1158,7 @@ class ScannerService:
+         # A crawl that stopped early never visited deeper pages, so its seen-set
+         # is partial — the caller must not age out items it simply didn't revisit.
+         self._last_crawl_early_stopped = early_stopped
++        self._last_crawl_types_covered = types_covered
+         # The crawl's own verdict on itself, in precedence order: a stop that cut
+         # it short, then pages that failed, then a suspicious empty result.
+         # A recorded cancellation WINS over everything below it. Previously the
+@@ -1207,10 +1243,12 @@ class ScannerService:
+                 # differently. Carried so the recorded kind can decline to
+                 # answer rather than silently reporting whichever listing
+                 # happened to be crawled first.
+-                # This crawler checks every sighting for a conflict, so anything it
+-                # produces has been checked -- which is what distinguishes it from a
+-                # row written before conflict detection existed.
+-                details['category_attested'] = True
++                # NOT attested here -- see M12-1. A crawl checks every sighting
++                # it OBSERVES, which is a different claim from "no contradicting
++                # listing exists". The bounded, early-stopping production crawl
++                # cannot support the second claim, so the decision is deferred to
++                # the post-crawl authority gate.
++                details['category_attested'] = False
+                 details['category_conflict'] = bool(
+                     post_info.get('category_conflict'))
+                 return {'details': details, 'is_tv': is_tv, 'url': url}
+diff --git a/tests/test_media_kind_is_server_owned.py b/tests/test_media_kind_is_server_owned.py
+index 73f3db6..105e977 100644
+--- a/tests/test_media_kind_is_server_owned.py
++++ b/tests/test_media_kind_is_server_owned.py
+@@ -477,10 +477,23 @@ class TestAConflictIsSeenEvenWhenTheReleaseIsSkipped:
+         assert posts[0]["category_conflict"] is True
+         assert SHARED in shell._last_crawl_conflicted_urls
+ 
+-    def test_a_fresh_post_is_marked_attested(self, monkeypatch):
+-        """Anything this crawler produces HAS been conflict-checked, which is
+-        what separates it from a row written before the check existed."""
++    def test_a_fresh_post_is_NOT_marked_attested_by_the_crawler(self, monkeypatch):
++        """DELIBERATELY FLIPPED in round 12 (M12-1). This test used to assert
++        True, on the reasoning quoted in its old docstring: "anything this
++        crawler produces HAS been conflict-checked".
++
++        That reasoning conflates two different claims. The crawler does check
++        every sighting it MAKES -- but a crawl of the 4K arm alone, as set up
++        here, never fetched the TV listing, so there was no opportunity for a
++        contradiction to appear. Stamping "attested" on its output turned "we
++        did not look" into "we looked and it is clean", and that flag is what
++        later authorises a destructive Keep-best.
++
++        Attestation is now decided once, after the crawl, by whether its
++        coverage could actually rule a contradiction out. See
++        tests/test_round12_attestation_authority.py for that gate, including the
++        positive controls proving a qualified crawl still attests."""
+         scraper = _Scraper([_page([(SHARED, "A Film 2026 2160p")])])
+         posts, _shell = self._crawl_with_skip(
+             [_source("4K Movies", "movie", "4k")], scraper, monkeypatch, skipped=set())
+-        assert posts[0]["category_attested"] is True
++        assert posts[0]["category_attested"] is False
+diff --git a/tests/test_rescan_preserves_classification.py b/tests/test_rescan_preserves_classification.py
+index a0b8082..e595074 100644
+--- a/tests/test_rescan_preserves_classification.py
++++ b/tests/test_rescan_preserves_classification.py
+@@ -57,7 +57,9 @@ def _rebuild(existing, details):
+ 
+     # Three values since the round-11 merge: main's branch of that conflict
+     # added conflict preservation, so the helper carries it too.
+-    category, is_tv_from_cache, conflict = rescan_classification(existing)
++    carried = rescan_classification(existing)
++    category, is_tv_from_cache, conflict = (
++        carried.category, carried.is_tv, carried.category_conflict)
+     details = dict(details)
+     details["category"] = category
+     details["category_conflict"] = conflict
+diff --git a/tests/test_round12_attestation_authority.py b/tests/test_round12_attestation_authority.py
+new file mode 100644
+index 0000000..4e9ad94
+--- /dev/null
++++ b/tests/test_round12_attestation_authority.py
+@@ -0,0 +1,252 @@
++"""Round 12, M12-1: who is ENTITLED to attest a classification as clean.
++
++The round-11 fix made `category_attested` a real three-state gate, and that part
++is right. What it did not do is establish who may write the middle state. The
++background scanner computed:
++
++    _clean = _last_crawl_seen_urls - _last_crawl_conflicted_urls
++    db.attest_scan_categories(_clean)
++
++which promotes "this crawl observed no contradiction" into "this release was
++checked and is clean". Those are only the same claim when the crawl actually
++covered every listing that could have contradicted it.
++
++The real background crawl covers nothing of the sort. It is bounded
++(`background_scan_pages`, default 3), it runs with `early_stop=True`, and its
++category arms are individually switchable via `background_scan_categories` --
++so the TV arm can be absent from the crawl entirely.
++
++The existing tests could not see this: they call `attest_scan_categories()`
++directly, which presupposes the entitlement instead of testing it.
++
++These tests drive the REAL `BackgroundScanner.scan_once()` authority decision.
++"""
++import json
++import pytest
++
++from backend.database import DatabaseManager
++from backend.background_scanner import BackgroundScanner
++from tests.test_background_scanner import _FakeScanner, _FakeRegistry
++
++URL = "https://hdencode.example/the-release-2026-2160p/"
++
++
++@pytest.fixture(autouse=True)
++def _reset_cache():
++    def _clear():
++        try:
++            dm = DatabaseManager()
++            dm.clear_background_cache()
++            dm.close()
++        except Exception:
++            pass
++    _clear()
++    yield
++    _clear()
++
++
++@pytest.fixture
++def db():
++    dm = DatabaseManager()
++    yield dm
++    dm.close()
++
++
++def _legacy_row(db, url=URL, category="4k"):
++    """A row exactly as the pre-conflict-detection crawler wrote it: a recorded
++    category, and no attestation of any kind."""
++    db.upsert_background_cache([{
++        "url": url, "title": "The Release", "year": 2026,
++        "status": "missing", "source_category": "HDEncode",
++        "data": json.dumps({"url": url, "category": category}),
++    }])
++
++
++def _run(db, scanner, **cfg):
++    base = {"background_scan_sources": ["HDEncode"], "background_scan_pages": 3}
++    base.update(cfg)
++    BackgroundScanner(_FakeRegistry(base, scanner, db)).scan_once()
++
++
++def _saw(url=URL, conflicted=(), *, early_stopped=False, termination="complete",
++         attests=False, types=("movie", "tv"), page_errors=0):
++    """A finished crawl, described by the verdict fields the gate reads.
++
++    Defaults describe the PRODUCTION cycle: it does not claim attesting coverage,
++    because it is bounded and early-stopping. `attests=True` with full type
++    coverage describes the dedicated conflict-aware crawl that may certify.
++    """
++    s = _FakeScanner()
++    s._last_crawl_seen_urls = {url}
++    s._last_crawl_conflicted_urls = set(conflicted)
++    s._last_crawl_early_stopped = early_stopped
++    s._last_crawl_termination = termination
++    s._last_crawl_attests_coverage = attests
++    s._last_crawl_types_covered = set(types)
++    s._last_crawl_page_errors = page_errors
++    return s
++
++
++class TestAttestationRequiresCoverageThatRulesOutContradiction:
++
++    def test_a_crawl_with_the_tv_arm_switched_off_must_not_attest(self, db):
++        """THE CONFIG-REACHABLE FALSE POSITIVE.
++
++        `background_scan_categories=['4k']` makes `_build_sources` emit only the
++        4K movie arm. No TV listing is ever fetched, so a contradiction cannot
++        be observed even in principle. Attesting here converts "we did not look"
++        into "we looked and it is clean", and that is what later authorizes a
++        destructive Keep-best."""
++        _legacy_row(db)
++        _run(db, _saw(), background_scan_categories=["4k"])
++        assert db.get_scan_category(URL) is None
++
++    def test_an_early_stopped_crawl_must_not_attest(self, db):
++        """early_stop=True is hard-coded in the production path, so the crawl
++        stops at the cached frontier. It never reached the pages where a
++        contradicting listing would live."""
++        _legacy_row(db)
++        _run(db, _saw(early_stopped=True, termination="early_stopped"))
++        assert db.get_scan_category(URL) is None
++
++    def test_a_crawl_with_page_errors_must_not_attest(self, db):
++        _legacy_row(db)
++        _run(db, _saw(termination="page_errors"))
++        assert db.get_scan_category(URL) is None
++
++    def test_a_cancelled_crawl_must_not_attest(self, db):
++        _legacy_row(db)
++        _run(db, _saw(termination="cancelled"))
++        assert db.get_scan_category(URL) is None
++
++    def test_a_conflict_is_still_recorded_by_a_partial_crawl(self, db):
++        """The asymmetry that makes this safe rather than merely strict:
++        DISCOVERING a contradiction is valid evidence from any crawl, because it
++        is a positive observation. Only the negative assertion needs coverage."""
++        _legacy_row(db)
++        _run(db, _saw(conflicted=[URL], early_stopped=True,
++                      termination="early_stopped"))
++        assert db.get_scan_category(URL) is None
++        row = db.get_background_cache()[0]
++        assert json.loads(row["data"]).get("category_conflict") is True
++
++
++class TestTheGateStillLetsAQualifiedCrawlThrough:
++    """POSITIVE CONTROLS.
++
++    Without these the suite cannot tell "correctly stricter" from "permanently
++    broken": deleting the attestation call outright, or any gate that never fires,
++    would satisfy every negative test above. Each of these must FAIL if the gate
++    is made unconditionally closed.
++    """
++
++    def test_a_full_coverage_attesting_crawl_does_attest(self, db):
++        _legacy_row(db)
++        _run(db, _saw(attests=True))
++        assert db.get_scan_category(URL) == "4k"
++
++    def test_and_that_attestation_reaches_the_media_kind_resolver(self, db):
++        """The consumer, not just the component: attestation only matters because
++        it is what lets the server answer with a media kind at all."""
++        from backend.download_service import DownloadService
++        _legacy_row(db)
++        _run(db, _saw(attests=True))
++        service = DownloadService.__new__(DownloadService)
++        service.db = db
++        assert service.verified_media_kind(URL, "4k") == "movie"
++
++    def test_coverage_of_only_the_movie_arms_is_not_enough(self, db):
++        """Discriminates the TYPE-coverage rule specifically: everything else about
++        this crawl qualifies, and it still must not attest."""
++        _legacy_row(db)
++        _run(db, _saw(attests=True, types=("movie",)))
++        assert db.get_scan_category(URL) is None
++
++
++
++class TestARescanNeverDestroysAttestability:
++    """Round 12 M12-3, and the sharper half the mapping pass surfaced.
++
++    `attest_scan_categories` used to skip any row that merely HAD the
++    `category_attested` key, truth or not. A rescan wrote it falsey, so one
++    rescan permanently disabled the media kind for that release -- no later crawl,
++    however thorough, could ever restore it."""
++
++    def test_a_row_carrying_a_false_attestation_can_still_be_attested(self, db):
++        db.upsert_background_cache([{
++            "url": URL, "title": "The Release", "year": 2026,
++            "status": "missing", "source_category": "HDEncode",
++            "data": json.dumps({"url": URL, "category": "4k",
++                                "category_attested": False}),
++        }])
++        assert db.attest_scan_categories([URL]) == 1
++        assert db.get_scan_category(URL) == "4k"
++
++    def test_a_rescan_carries_the_attestation_instead_of_dropping_it(self):
++        from backend.api.routes.scanner import rescan_classification
++        carried = rescan_classification({"data": json.dumps({
++            "category": "4k", "category_attested": True})})
++        assert carried.category_attested is True
++
++    def test_a_rescan_never_invents_an_attestation(self):
++        from backend.api.routes.scanner import rescan_classification
++        carried = rescan_classification({"data": json.dumps({"category": "4k"})})
++        assert carried.category_attested is False
++
++
++def _kind_of(db, url=URL):
++    row = db._query("SELECT media_kind FROM downloads WHERE url = ?",
++                    (url,), one=True, default=None)
++    return dict(row).get("media_kind") if row else None
++
++
++class TestARevocationFailureIsNotSwallowed:
++    """Round 12 M12-2, driven through the REAL scan_once sequence.
++
++    The old code caught any exception here and logged it as bookkeeping. After
++    M1a it is not bookkeeping: a failed revocation means the withdrawn permission
++    is still authoritative on downloads.media_kind, which is what the destructive
++    identity actually reads. Losing that fact is fail-OPEN."""
++
++    def _seed(self, db):
++        db.add_to_history(URL, "The Release", None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++        _legacy_row(db)
++
++    def test_a_failed_revocation_is_held_and_retried_next_cycle(self, db, monkeypatch):
++        self._seed(db)
++        assert _kind_of(db) == "movie", "seed did not take"
++        scanner = _saw(conflicted=[URL])
++        bs = BackgroundScanner(_FakeRegistry(
++            {"background_scan_sources": ["HDEncode"], "background_scan_pages": 3},
++            scanner, db))
++
++        def boom(*a, **k):
++            raise RuntimeError("injected: database is locked")
++        monkeypatch.setattr(
++            db, "record_classification_conflicts_and_retract_kinds", boom)
++        bs.scan_once()
++
++        # The transaction rolled back, so the stale kind IS still there -- that is
++        # exactly why the fact must not be dropped.
++        assert _kind_of(db) == "movie"
++        assert URL in bs._pending_revocations, (
++            "a failed revocation was swallowed; the conflict is now forgotten "
++            "while the permission it invalidates stays live")
++
++        monkeypatch.undo()
++        bs.scan_once()
++        assert _kind_of(db) is None, "retry did not withdraw the stale authority"
++        assert URL not in bs._pending_revocations
++
++    def test_the_retraction_precedes_the_cache_mark_in_one_transaction(self, db):
++        """Ordering is the safety property: if only ONE half could survive, it
++        must be the erase. A missing or unreadable cache row must never block it."""
++        db.add_to_history(URL, "The Release", None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++        # NO cache row at all for this URL.
++        retracted, marked = db.record_classification_conflicts_and_retract_kinds(
++            [URL], reason="test")
++        assert retracted == 1, "the erase must not depend on a readable cache row"
++        assert marked == 0
++        assert _kind_of(db) is None
