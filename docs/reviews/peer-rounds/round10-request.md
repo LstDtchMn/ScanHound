@@ -102,9 +102,12 @@ answer into a different one:
   bare title is not enough to authorize destroying a file.
 - **kind not recorded → unknown.** No inference from the title.
 
-Also in this PR: `list_plex_cache_movies_strict()` — a read that **raises**
-rather than returning `[]`, because *an empty read is not a successful read*, and
-the caller was about to use emptiness as evidence.
+**CORRECTION (round 10, Q3).** I originally described
+`list_plex_cache_movies_strict()` as part of this PR. It is not — it already
+exists on base `3013556` and predates this delta. The reviewer caught the
+misattribution. The seam is still worth reviewing (shared SQL constant, two
+deliberately different error contracts, because *an empty read is not a
+successful read*), but it is not #90's to claim.
 
 ### Questions
 
