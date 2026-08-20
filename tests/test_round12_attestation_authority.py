@@ -192,3 +192,61 @@ class TestARescanNeverDestroysAttestability:
         from backend.api.routes.scanner import rescan_classification
         carried = rescan_classification({"data": json.dumps({"category": "4k"})})
         assert carried.category_attested is False
+
+
+def _kind_of(db, url=URL):
+    row = db._query("SELECT media_kind FROM downloads WHERE url = ?",
+                    (url,), one=True, default=None)
+    return dict(row).get("media_kind") if row else None
+
+
+class TestARevocationFailureIsNotSwallowed:
+    """Round 12 M12-2, driven through the REAL scan_once sequence.
+
+    The old code caught any exception here and logged it as bookkeeping. After
+    M1a it is not bookkeeping: a failed revocation means the withdrawn permission
+    is still authoritative on downloads.media_kind, which is what the destructive
+    identity actually reads. Losing that fact is fail-OPEN."""
+
+    def _seed(self, db):
+        db.add_to_history(URL, "The Release", None, "2160p", "20 GB",
+                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
+        _legacy_row(db)
+
+    def test_a_failed_revocation_is_held_and_retried_next_cycle(self, db, monkeypatch):
+        self._seed(db)
+        assert _kind_of(db) == "movie", "seed did not take"
+        scanner = _saw(conflicted=[URL])
+        bs = BackgroundScanner(_FakeRegistry(
+            {"background_scan_sources": ["HDEncode"], "background_scan_pages": 3},
+            scanner, db))
+
+        def boom(*a, **k):
+            raise RuntimeError("injected: database is locked")
+        monkeypatch.setattr(
+            db, "record_classification_conflicts_and_retract_kinds", boom)
+        bs.scan_once()
+
+        # The transaction rolled back, so the stale kind IS still there -- that is
+        # exactly why the fact must not be dropped.
+        assert _kind_of(db) == "movie"
+        assert URL in bs._pending_revocations, (
+            "a failed revocation was swallowed; the conflict is now forgotten "
+            "while the permission it invalidates stays live")
+
+        monkeypatch.undo()
+        bs.scan_once()
+        assert _kind_of(db) is None, "retry did not withdraw the stale authority"
+        assert URL not in bs._pending_revocations
+
+    def test_the_retraction_precedes_the_cache_mark_in_one_transaction(self, db):
+        """Ordering is the safety property: if only ONE half could survive, it
+        must be the erase. A missing or unreadable cache row must never block it."""
+        db.add_to_history(URL, "The Release", None, "2160p", "20 GB",
+                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
+        # NO cache row at all for this URL.
+        retracted, marked = db.record_classification_conflicts_and_retract_kinds(
+            [URL], reason="test")
+        assert retracted == 1, "the erase must not depend on a readable cache row"
+        assert marked == 0
+        assert _kind_of(db) is None
