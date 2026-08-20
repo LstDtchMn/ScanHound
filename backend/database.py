@@ -3500,7 +3500,16 @@ class DatabaseManager:
                            "duplicate_urls":duplicates,
                            "outcomes":outcomes,
                            "listing_complete":listing_ok,
-                           "cycle_complete":bool(row.get("normal_feeds_complete"))})
+                           "cycle_complete":bool(row.get("normal_feeds_complete")),
+                           # THE OUTCOME TRAVELS WITH THE CYCLE. Peer review round 11 (I2):
+                           # admitting the three inconclusive outcomes into this resolver let
+                           # them become ORDINARY observations, because the validity predicate
+                           # checks listing_complete and per-feed outcomes and never looks at
+                           # `outcome`. So a guard cycle could CLEAR a candidate and resolve a
+                           # prior miss -- the exact opposite of the comment I wrote claiming
+                           # they "can only continue to BLOCK". They could not block if they
+                           # were excluded, and they could do far more than block once admitted.
+                           "outcome":str(row.get("outcome") or "")})
 
         misses=[]
         for row in self._query_dicts(
@@ -3652,15 +3661,24 @@ class DatabaseManager:
             # priority-8 push. With 102 void misses live that fired before the new
             # window existed.
             #
-            # RESOLVED 2026-08-19. I briefly added integrity reasons here too,
-            # reasoning that corrupt evidence is corrupt with or without a window.
-            # main's 24 integrity tests want exactly that -- but they predate the
-            # window entirely (zero references to it), so they were written for a
-            # world where readiness always evaluated. Their own rationale is that
-            # malformed provenance silently counting zero DEFLATED the gate; with no
-            # window the gate counts nothing and blocks regardless, so there is no
-            # deflation to cause. Integrity is meaningful INSIDE a window. Those
-            # tests now declare one rather than this contract being widened.
+            # NARROWED on peer review round 11 (T1). My first wording here was
+            # "integrity is meaningful INSIDE a window", and that is too broad: the
+            # independent mirror deliberately leaves shadow_miss_count_mismatch
+            # UNSCOPED, because count-vs-row corruption is database integrity and
+            # does not stop being true outside a window.
+            #
+            # The real distinction is about EFFECT, not meaning:
+            #
+            #   qualification-readiness effects  -> scoped to the active window
+            #   historical evidence corruption   -> still true at all times, but
+            #                                       must not masquerade as a
+            #                                       current-window miss
+            #
+            # So the no-window response carries exactly one READINESS REASON while
+            # global integrity stays available diagnostically -- it simply does not
+            # gate, and does not fire the mandatory-stop path that reads counts.
+            # main's integrity tests declare a window because they assert readiness
+            # EFFECTS, not because integrity stops existing without one.
             no_window_reasons = ["qualification_window_not_started"]
             return {
                 "ready": False,

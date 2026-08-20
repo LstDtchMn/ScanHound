@@ -236,6 +236,17 @@ def _status_value(row: Mapping[str,Any]) -> str:
 #: NOT successes and NOT ordinary misses — they say the evidence was unusable.
 #: A reconciliation that reports success because it had nothing to compare is
 #: fail-OPEN, and §10 requires this reconciliation to be fail-closed.
+#: Below this many identities on EITHER side, zero overlap carries no
+#: information -- a short feed and a short listing page routinely share
+#: nothing. Above it, zero overlap is the signature of an identity
+#: mismatch rather than genuine divergence.
+#:
+#: Chosen, not derived. The incident that motivated the guard was
+#: 100-vs-100; this sits far below that so a smaller break is still
+#: caught, while leaving ordinary small cycles alone. Worth revisiting
+#: against real cycle sizes.
+_DISJOINT_MIN_IDENTITIES = 5
+
 INCONCLUSIVE_OUTCOMES = frozenset({
     "no_listing_baseline",
     "no_rss_observations",
@@ -461,17 +472,56 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
     # spans catch-up feeds and counts attempted-but-failed requests, so it
     # admitted exactly the stale comparisons it was meant to exclude.
     if misses and normal_feeds_complete: outcome='relevant_miss'
-    # FAIL-CLOSED GUARDS, and they apply ONLY to a would-be SUCCESS.
+    # FAIL-CLOSED GUARDS, at TWO different precedences.
     #
-    # Their own rationale names the case: "each of these previously produced
-    # 'success' -- a verdict reached with no usable evidence". Applying them
-    # unconditionally (which is what the merge first did) also overrode
-    # 'relevant_miss' and 'incomplete_feeds', and both are real answers:
-    # a relevant_miss is an OBSERVATION, and incomplete_feeds is already the
-    # invalidity label. Overwriting them replaced information with a
-    # different, less specific kind of doubt -- and silently changed the
-    # vocabulary every downstream consumer switches on.
-    if outcome == 'success':
+    # Peer review round 11 (I1). I first applied all three only when the
+    # outcome would otherwise be 'success', on the grounds that their own
+    # rationale names that case. That is right for two of them and wrong
+    # for the third, because they answer different questions:
+    #
+    #   no_listing_baseline / no_rss_observations
+    #     'this cycle saw nothing to compare' -- guards a false CLEAN.
+    #     A relevant_miss is a real observation and outranks them.
+    #
+    #   disjoint_identity_sets
+    #     'the JOIN between the two sides is unusable'. That invalidates
+    #     the comparison itself -- including any miss DERIVED from it.
+    #     A broken join manufactures listing_only rows; if one happens to
+    #     carry a relevant state, `misses` is built first, the outcome
+    #     becomes relevant_miss, and gating on 'success' skipped the guard
+    #     entirely -- persisting a broken join as real miss evidence.
+    #
+    # The zero-overlap test could not catch that: its listing rows are all
+    # in_library, so misses stayed empty and the outcome stayed 'success'.
+    # Requires normal_feeds_complete for the same reason relevant_miss does:
+    # if the feeds never ran there is no usable comparison to CALL disjoint,
+    # and 'incomplete_feeds' already says the cycle cannot be judged. Without
+    # this the guard overwrote that label too, replacing a precise reason
+    # with a claim about a join that was never actually performed.
+    # ZERO OVERLAP ONLY MEANS SOMETHING WHEN OVERLAP WAS EXPECTED.
+    #
+    # My first version of this fired whenever the two sets did not
+    # intersect, and that reclassified an ordinary small cycle as a broken
+    # join: a one-item feed and a two-item listing that share nothing is
+    # just RSS not having those two releases yet, which is the ORDINARY
+    # miss this whole subsystem exists to record.
+    #
+    # The guard's own origin is about scale -- two divergent canonicalisers
+    # turning a healthy 99-of-100 pipeline into 0 of 100. At that size zero
+    # overlap is implausible; at two-vs-one it is unremarkable.
+    #
+    # THE THRESHOLD IS A JUDGEMENT CALL and is flagged as such. It is set
+    # where zero overlap stops being ordinary rather than at the observed
+    # incident size, because waiting for 100 would miss a smaller break.
+    # A cycle below it is left to the ordinary outcomes, which fail closed
+    # on their own terms.
+    if (normal_feeds_complete and not duplicate
+            and len(rss) >= _DISJOINT_MIN_IDENTITIES
+            and len(listing_urls) >= _DISJOINT_MIN_IDENTITIES):
+        # Outranks relevant_miss BY CONSTRUCTION: the miss was derived from
+        # the same join this says cannot be trusted.
+        outcome='disjoint_identity_sets'
+    elif outcome == 'success':
         if not listing_urls:
             # No baseline to detect misses against. Zero misses here means
             # zero comparisons were possible, not zero problems.
@@ -480,13 +530,6 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
             # RSS returned nothing at all, and nothing in the listing
             # contradicted it -- a clean success scored on an empty feed.
             outcome='no_rss_observations'
-        elif not duplicate:
-            # Both sides have identities and NONE match. Two views of one
-            # source overlapping in nothing is the signature of an identity
-            # mismatch, not genuine agreement -- exactly what ScanHound's two
-            # trailing-slash-divergent canonicalisers produced when a healthy
-            # 99-of-100 pipeline was reported as "0 of 100 never acquired".
-            outcome='disjoint_identity_sets'
     return ShadowComparison(len(rss),len(listing_urls),len(duplicate),len(feed_only),len(listing_only),len(misses),int(rss_requests),int(listing_requests),round(reduction,2),bool(normal_feeds_complete),outcome,tuple(sorted(feed_only)),tuple(sorted(listing_only)),tuple(misses),dict(recorded),tuple(unattributable),
         # A CONTRADICTION WITHHOLDS THE AUTHORITY CLAIM, it does not merely get
         # logged. Recording a problem and then still asserting listing authority
@@ -565,6 +608,30 @@ def cycle_is_valid_evidence_for(media_type, cycle):
     observed", which is NOT the same as "no per-feed data was recorded". Collapsing
     those two was a separate review finding.
     """
+    # AN INCONCLUSIVE CYCLE IS NOT AN OBSERVATION. Peer review round 11 (I2).
+    #
+    # The three fail-closed outcomes were admitted into the miss resolver so
+    # their unattributed candidates would keep BLOCKING. But this predicate
+    # never looked at `outcome`, so once admitted a guard cycle became an
+    # ordinary observation: able to CLEAR a candidate via feed carriage, and
+    # to resolve a prior miss to acquired OR never_acquired.
+    #
+    # The worst shape is disjoint_identity_sets, which says the identity join
+    # between the two sides is unusable -- and then that same cycle's
+    # listing_only could be read as proof a release is still missing.
+    #
+    # Placed HERE, in the shared predicate, so both consumers inherit it. The
+    # miss resolver and the candidate state machine have twice now been given
+    # new evidence rules one at a time, leaving the other blind.
+    #
+    # Deliberately conservative: a guard cycle contributes NEITHER positive
+    # nor negative resolution. Positive RSS carriage from such a cycle may
+    # well be salvageable, but that needs two predicates rather than one
+    # reusable-authority bit, and inventing that split here would be the same
+    # conflation in a new place.
+    if str(cycle.get("outcome") or "") in INCONCLUSIVE_OUTCOMES:
+        return False
+
     listing_ok = cycle.get("listing_complete")
     outcomes = cycle.get("outcomes")
 
