@@ -61,10 +61,60 @@ classification claim BEFORE any skip decision, so an already-cached release
 `category_conflict` no longer reads as "checked and clean": three states now,
 with legacy rows attested the next time a conflict-aware crawl observes them.
 
-**What I want challenged:** the attestation backfill means all 4,145 live
-cached rows answer *unknown* until a crawl observes them. I believe that is
-correct fail-closed behaviour, but it is a fleet-wide capability blackout on
-deploy and I chose it without measuring how long the backfill takes.
+### MEASURED AFTER WRITING THIS, AND IT IS WORSE THAN I SAID
+
+I originally flagged the attestation change as "a blackout for an interval I
+have not measured". I measured it. **It is not an interval — it is permanent for
+most of the library.**
+
+```text
+cached rows                        4178
+all of which have a usable category today
+a crawl observes per cycle        ~150   (early-stop fires at page 1-2)
+
+re-observed within 1 day            276   (6.6%)
+re-observed within 7 days           744   (17.8%)
+NOT re-observed in 7 days          3434   (82.2%)
+```
+
+The crawl early-stops the moment it reaches cached content, so it sees roughly
+the same ~150 most-recent releases every cycle and never goes deeper. My
+backfill attests only what the crawl OBSERVES. Therefore **~82% of the corpus
+would never be attested, and would answer `unknown` forever.**
+
+Every one of those 4,178 rows has a working category right now.
+
+So the change as built trades a real, working classification for permanent
+unknown across most of the library, in order to close a risk whose size I have
+not measured: how often a legacy row's release actually appeared in two
+listings. The old crawler discarded that evidence, so I cannot measure it
+retrospectively.
+
+**I do not think this should deploy as-is, and I would rather you told me which
+way to resolve it than have me pick.** The options I see:
+
+```text
+A. attest the existing corpus once, at deploy
+   -> restores capability immediately
+   -> but that IS "absence means attested clean", which you rejected
+
+B. deep-crawl to observe every cached URL
+   -> principled, uses listing evidence as you suggested
+   -> but releases that have paged off the listing are unreachable, so it
+      cannot cover the older tail at all
+
+C. ship it and accept the loss
+   -> fail-closed and honest, and 82% of the feature goes dark permanently
+
+D. attest existing rows but mark them a WEAKER grade -- usable for grouping,
+   never for a destructive action -- and let observation upgrade them
+   -> keeps display behaviour, keeps the destructive gate closed
+   -> more machinery, and a third state to reason about
+```
+
+D is where I would lean, because it separates "good enough to show" from "good
+enough to destroy on". But it is a design decision on a safety boundary you
+raised, so I would rather have your ruling than my instinct.
 
 ### 2. `6a458d7` — the rescan fix
 
@@ -108,8 +158,11 @@ would like checked, because it is a claim about code you have not read.
 ## Verification
 
 ```text
-main @ 6ac5cd2   full suite: see the PR comment for the current figure
+main @ 6ac5cd2   35 failed / 5286 passed / 4 skipped
 ```
+
+Identical failure set to the clean-`main` baseline, so the four merges
+introduced no interaction failures.
 
 Baseline for comparison is 35 failed (32 network-dependent, plus
 `test_source_hdencode`, `test_notifications`, `test_hdencode_off_switch`).
@@ -142,5 +195,6 @@ Is `main @ 6ac5cd2` safe to deploy? Specifically:
    only appear to?
 2. Is the merge resolution in `67de532` correct — does the route consume all
    three values coherently?
-3. Is the attestation blackout acceptable on deploy, or does the backfill need
-   to run before the feature can be trusted?
+3. **The attestation question, restated after measuring it:** the change makes
+   ~82% of the cached corpus permanently unknown, not temporarily. Which of
+   A/B/C/D above, or something I have not thought of?
