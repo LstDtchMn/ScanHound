@@ -84,6 +84,20 @@ class DatabaseManager:
         self.db_path = db_path
         self.conn = None
         self._lock = threading.RLock()  # Reentrant lock for thread-safe DB access
+        # RUNTIME AUTHORITY HOLD. Peer review round 13 (M13-1).
+        #
+        # Round 12 made conflict-recording and media-kind retraction atomic, which
+        # removed the split-commit state. It did NOT make the FAILURE path safe: if
+        # the transaction could not commit, downloads.media_kind still held the old
+        # value, get_release_identity() still returned it, and the destructive
+        # Keep-best it authorises stayed available -- while we already knew the
+        # evidence for it had been withdrawn.
+        #
+        # Consistency was not the property needed there. This set is the safety
+        # half, and it is deliberately NOT durable-write-dependent: a URL is held
+        # BEFORE the retraction is attempted, so the permission disappears at the
+        # instant the conflict is known rather than at the instant SQLite agrees.
+        self._media_kind_holds = set()
         self._init_depth = 0  # Guard against infinite recursion during recovery
         # Monotonic in-process revision, bumped on every background-cache write.
         # Folded into get_background_cache_version() so the parse-cache token
@@ -4331,70 +4345,113 @@ class DatabaseManager:
                 "identity built on those rows is withdrawn.", retracted, reason)
         return retracted
 
+    def hold_media_kind(self, urls, *, reason):
+        """Withhold semantic authority for these releases IMMEDIATELY.
+
+        Round 13 (M13-1). The hold is taken BEFORE any durable write is attempted,
+        and it is honoured by get_release_identity() regardless of what the
+        downloads row still says. That ordering is the whole point: the moment we
+        know the evidence is withdrawn, the permission it justified must stop being
+        offered -- even if the database cannot be written to at all.
+
+        In-process only, and deliberately so. A durable marker written to the same
+        SQLite file cannot be the safety mechanism for the case where writing to
+        that file is what failed. Restart behaviour is handled separately, by
+        reconcile_unrevoked_conflicts().
+        """
+        targets = {str(u) for u in (urls or ()) if u}
+        if not targets:
+            return 0
+        with self._lock:
+            new = targets - self._media_kind_holds
+            self._media_kind_holds |= targets
+        if new:
+            logger.warning(
+                "semantic authority HELD for %d release(s) (%s); any recorded media "
+                "kind is withheld from consumers until revocation succeeds",
+                len(new), reason)
+        return len(new)
+
+    def release_media_kind_hold(self, urls):
+        """Drop the hold once the durable retraction has actually committed."""
+        targets = {str(u) for u in (urls or ()) if u}
+        if not targets:
+            return 0
+        with self._lock:
+            dropped = targets & self._media_kind_holds
+            self._media_kind_holds -= targets
+        return len(dropped)
+
+    def is_media_kind_held(self, url):
+        with self._lock:
+            return str(url) in self._media_kind_holds
+
+    def held_media_kinds(self):
+        """Snapshot of the current holds, for reporting."""
+        with self._lock:
+            return frozenset(self._media_kind_holds)
+
     def record_classification_conflicts_and_retract_kinds(self, urls, *, reason):
-        """Record a classification conflict AND withdraw the authority it
-        invalidates, as ONE transaction.
+        """Withdraw the authority a classification conflict invalidates, durably.
 
-        Peer review round 12 (M12-2). These used to be two independently
-        committed mutations under a broad try/except: mark_scan_category_conflict()
-        committed the cache flag, then retract_download_media_kind() opened a
-        separate transaction over `downloads`. A crash or failure between them
-        left exactly the worst pair of states:
+        ORDERING IS THE SAFETY PROPERTY (round 13, M13-1). Round 12 made this one
+        all-or-nothing transaction, which removed the split-commit state but left
+        the FAILURE path fail-open: when the transaction could not commit, the old
+        media kind stayed committed AND stayed authoritative, so the destructive
+        action it permits remained on offer while we already knew better.
 
-            background_scan_cache.category_conflict = 1        # we KNOW it is unsafe
-            downloads.media_kind                    = 'movie'  # ...and still allow it
+        Consistency was not the property needed. The sequence is now:
 
-        That is fail-OPEN on an authorization boundary. The destructive identity
-        reads downloads.media_kind through get_release_identity() and never
-        consults the cache, so the withdrawn permission stayed live while the
-        evidence withdrawing it was already durably recorded.
+            1. HOLD      in-process, before any write. Authority stops being
+                         offered here, not when SQLite agrees.
+            2. ERASE     downloads.media_kind, in its own transaction.
+            3. MARK      the cache conflict, in its own transaction.
+            4. RELEASE   the hold only if the erase actually committed.
 
-        Ordering inside the transaction is deliberate. The RETRACTION goes first
-        because it is the safety-critical half: an unreadable or missing cache row
-        must never be able to prevent it. The cache flag only records WHY.
+        Step 3 is deliberately NOT tied to step 2. A diagnostic that is briefly
+        missing beats a permission that stays live -- and here it is more than a
+        diagnostic: a committed conflict mark whose downloads row still carries a
+        kind is exactly what reconcile_unrevoked_conflicts() looks for after a
+        restart, so writing it is what makes the failure recoverable at all.
 
-        Raises on failure. A failed revocation is NOT bookkeeping noise -- the old
-        permission is still authoritative -- so the caller has to treat it as a
-        failure and leave the release in a degraded/unknown state.
+        Raises if the erase could not be committed. The caller must keep retrying
+        and must not treat it as bookkeeping; the hold stays in force meanwhile.
 
         Returns (retracted, marked).
         """
         targets = {str(u) for u in (urls or ()) if u}
         if not targets:
             return (0, 0)
+
+        # 1. HOLD FIRST, unconditionally.
+        self.hold_media_kind(targets, reason=reason)
+
+        # 2. ERASE -- the safety-critical half, in its own transaction so that an
+        #    unreadable or missing cache row can never prevent it.
         retracted = 0
-        marked = 0
-        with self.transaction() as conn:
-            if not conn:
-                raise RuntimeError(
-                    "no database connection: the classification conflict for "
-                    f"{len(targets)} release(s) could not be recorded, and the "
-                    "media kind it invalidates is still authoritative")
-            # 1. WITHDRAW THE AUTHORITY FIRST.
-            for url in targets:
-                cur = conn.execute(
-                    "UPDATE downloads SET media_kind = NULL "
-                    "WHERE url = ? AND media_kind IS NOT NULL", (url,))
-                retracted += max(0, int(cur.rowcount or 0))
-            # 2. Then the diagnostic cache flag.
-            for url in targets:
-                row = conn.execute(
-                    "SELECT data FROM background_scan_cache WHERE url = ?",
-                    (url,)).fetchone()
-                if not row:
-                    continue
-                try:
-                    payload = json.loads(dict(row).get("data") or "{}")
-                except (TypeError, ValueError):
-                    logger.warning("cannot mark conflict on %s: undecodable data", url)
-                    continue
-                if payload.get("category_conflict"):
-                    continue
-                payload["category_conflict"] = True
-                conn.execute(
-                    "UPDATE background_scan_cache SET data = ? WHERE url = ?",
-                    (json.dumps(payload, default=str), url))
-                marked += 1
+        try:
+            with self.transaction() as conn:
+                if not conn:
+                    raise RuntimeError("no database connection")
+                for url in targets:
+                    cur = conn.execute(
+                        "UPDATE downloads SET media_kind = NULL "
+                        "WHERE url = ? AND media_kind IS NOT NULL", (url,))
+                    retracted += max(0, int(cur.rowcount or 0))
+        except Exception:
+            marked = self._mark_category_conflicts(targets)
+            logger.error(
+                "REVOCATION FAILED for %d release(s) (%s). The hold stays in force, "
+                "so no semantic identity is served for them, and %d cache row(s) "
+                "were marked so a restart can finish the job.",
+                len(targets), reason, marked)
+            raise
+
+        marked = self._mark_category_conflicts(targets)
+
+        # 4. RELEASE only now -- the durable row itself is safe.
+        self.release_media_kind_hold(targets)
+
         if retracted:
             logger.warning(
                 "retracted media_kind on %d download row(s): %s. Any semantic "
@@ -4403,6 +4460,100 @@ class DatabaseManager:
             logger.info(
                 "marked %d cached release(s) as classification-conflicted", marked)
         return (retracted, marked)
+
+    def reconcile_unrevoked_conflicts(self):
+        """Finish revocations a previous process started and could not commit.
+
+        Round 13 (M13-1). The in-process hold cannot survive a restart, and it
+        deliberately is not durable -- a marker written to the same SQLite file
+        cannot protect the case where writing to that file is what failed.
+
+        What IS durable is the conflict mark on the cached row, which is written
+        on both the success and failure paths. So the recoverable signature of an
+        interrupted revocation is exactly:
+
+            background_scan_cache says category_conflict = true
+            downloads.media_kind   is still set
+
+        That pair cannot occur in a completed revocation, because the erase
+        commits before the hold is released. Finding it means a previous process
+        knew the release was unsafe and died before finishing.
+
+        Call once at startup, BEFORE serving identity. Returns the number of
+        releases whose authority was withdrawn.
+        """
+        rows = self._query_dicts(
+            "SELECT d.url AS url, c.data AS data "
+            "FROM downloads d "
+            "JOIN background_scan_cache c ON c.url = d.url "
+            "WHERE d.media_kind IS NOT NULL",
+            (), default=[]) or []
+        stale = []
+        for row in rows:
+            try:
+                payload = json.loads(row.get("data") or "{}")
+            except (TypeError, ValueError):
+                # Unreadable evidence is not absent evidence. We cannot prove this
+                # row is safe, and it currently carries a live permission.
+                stale.append(row["url"])
+                continue
+            if payload.get("category_conflict"):
+                stale.append(row["url"])
+        if not stale:
+            return 0
+        logger.warning(
+            "startup reconciliation: %d release(s) carry a recorded classification "
+            "conflict AND a live media kind -- a previous process did not finish "
+            "revoking them. Withdrawing now.", len(stale))
+        try:
+            self.record_classification_conflicts_and_retract_kinds(
+                stale, reason="startup_reconciliation")
+        except Exception:
+            # The hold was taken before the attempt and is still in force, so no
+            # semantic identity is served for these releases in this process even
+            # though the durable erase failed again.
+            logger.exception(
+                "startup reconciliation could not commit; %d release(s) remain "
+                "HELD in memory for this process lifetime", len(stale))
+        return len(stale)
+
+    def _mark_category_conflicts(self, targets):
+        """Record the conflict on the cached rows. Never raises.
+
+        Split out of the revocation so it can run on BOTH paths: the diagnostic
+        must survive a failed erase, because it is the only durable evidence a
+        restart has that the release is unsafe.
+        """
+        marked = 0
+        try:
+            with self.transaction() as conn:
+                if not conn:
+                    return 0
+                for url in targets:
+                    row = conn.execute(
+                        "SELECT data FROM background_scan_cache WHERE url = ?",
+                        (url,)).fetchone()
+                    if not row:
+                        continue
+                    try:
+                        payload = json.loads(dict(row).get("data") or "{}")
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "cannot mark conflict on %s: undecodable data", url)
+                        continue
+                    if payload.get("category_conflict"):
+                        continue
+                    payload["category_conflict"] = True
+                    conn.execute(
+                        "UPDATE background_scan_cache SET data = ? WHERE url = ?",
+                        (json.dumps(payload, default=str), url))
+                    marked += 1
+        except Exception:
+            logger.exception(
+                "could not record the classification conflict for %d release(s); "
+                "the authority hold is unaffected", len(targets))
+            return 0
+        return marked
 
     def get_scan_category(self, url):
         """The crawl category THIS SERVER recorded for a release URL.
@@ -4482,6 +4633,11 @@ class DatabaseManager:
         if not wanted:
             return {}
         out = {}
+        # ROUND 13 (M13-1): a held release reports NO media kind, whatever the row
+        # says. The hold is entered before the retraction is attempted, so this is
+        # what actually withdraws the destructive permission -- the UPDATE merely
+        # makes it durable. Snapshotted once so every chunk sees one consistent view.
+        held = self.held_media_kinds()
         for start in range(0, len(wanted), 300):
             chunk = wanted[start:start + 300]
             rows = self._query_dicts(
@@ -4494,7 +4650,8 @@ class DatabaseManager:
                     "title": row.get("title"),
                     "year": row.get("year"),
                     "season": row.get("season"),
-                    "media_kind": row.get("media_kind"),
+                    "media_kind": (None if row["url"] in held
+                                   else row.get("media_kind")),
                 }
         return out
 

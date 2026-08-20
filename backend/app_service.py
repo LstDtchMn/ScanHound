@@ -470,6 +470,20 @@ class AppService:
         if self.db is not None:
             try:
                 self._migrate_legacy_persistence()
+                # FINISH ANY INTERRUPTED REVOCATION before serving identity.
+                # Round 13 (M13-1): the in-process authority hold cannot survive a
+                # restart and deliberately is not durable. What IS durable is the
+                # conflict mark, so a cached row flagged conflicted whose downloads
+                # row still carries a media kind means a previous process knew a
+                # release was unsafe and died before erasing it.
+                try:
+                    _n = self.db.reconcile_unrevoked_conflicts()
+                    if _n:
+                        logger.warning(
+                            "startup reconciliation withdrew authority for %d "
+                            "release(s) left unrevoked by a previous process", _n)
+                except Exception:
+                    logger.exception("startup revocation reconciliation failed")
                 logger.info(
                     "Recovered %d download history entries from database.",
                     self.db.get_history_count(),

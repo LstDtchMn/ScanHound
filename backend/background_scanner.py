@@ -630,15 +630,18 @@ class BackgroundScanner:
                             _to_revoke, reason="classification_conflict")
                         self._pending_revocations -= _to_revoke
                     except Exception:
-                        # NOT bookkeeping. The transaction rolled back, so the old
-                        # media kind is still authoritative on these releases. Hold
-                        # them and retry next cycle rather than dropping the fact
-                        # that we already know they are unsafe.
+                        # NOT bookkeeping. Round 13 (M13-1): the durable erase failed,
+                        # but the release is already HELD inside
+                        # record_classification_conflicts_and_retract_kinds(), which
+                        # takes the hold BEFORE attempting any write. So no semantic
+                        # identity is served for these releases for the rest of this
+                        # process, and the retry below is about making that DURABLE
+                        # rather than about restoring safety.
                         self._pending_revocations |= _to_revoke
                         logger.error(
-                            "REVOCATION FAILED for %d release(s): their recorded "
-                            "media kind is still live despite a known classification "
-                            "conflict. Retrying next cycle.", len(_to_revoke))
+                            "REVOCATION FAILED for %d release(s): held in memory so no "
+                            "semantic identity is served, but NOT yet erased on disk. "
+                            "Retrying next cycle.", len(_to_revoke))
                         source_results[-1]["revocation_failed"] = len(_to_revoke)
 
                 # ATTESTATION: only a crawl whose coverage could actually rule out a
