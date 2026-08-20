@@ -872,12 +872,21 @@ class ScannerService:
             source_base = source["base"]
             source_suffix = source["suffix"]
             source_type_hint = source["type"]
-            # This arm is being fetched, so its listing type is covered by this
-            # crawl. Round 12 (M12-1): attestation claims that no OTHER listing
-            # disagrees, which is only checkable for types actually visited. The
-            # crawl-wide early_stop / page_errors / cancelled verdicts decide
-            # separately whether the visit was thorough enough to certify.
-            types_covered.add(str(source_type_hint or "").strip().lower())
+            # PARSER HEALTH IS PART OF COVERAGE. Round 13 (L13-1).
+            #
+            # This used to claim the arm as covered HERE, at the moment the crawl
+            # committed to fetching it. That counts an arm that returned HTTP 200
+            # with markup the selector no longer recognises: zero posts parsed,
+            # yet 'tv' recorded as covered, so a movie-vs-TV contradiction that
+            # was sitting in plain sight could never be observed while the crawl
+            # still looked complete.
+            #
+            # An arm now earns coverage only by yielding recognisable posts, at
+            # the end of its page loop. A genuinely empty listing therefore does
+            # NOT count as covered -- that direction is deliberate: an empty page
+            # and an unparseable one are indistinguishable here, so the safe
+            # reading is that neither proves anything.
+            source_posts = 0
             source_id = source.get("source", "hdencode")
             source_category = source.get("category", "")
 
@@ -1004,6 +1013,7 @@ class ScannerService:
                         if not post_url:
                             continue
                         page_posts += 1
+                        source_posts += 1
                         # CLASSIFICATION CLAIM FIRST, for EVERY sighting.
                         #
                         # Peer review round 11 (M1b): the conflict check used to consult
@@ -1113,6 +1123,14 @@ class ScannerService:
                     # to be recorded as trustworthy resolution evidence.
                     self._last_crawl_page_errors += 1
 
+            if source_posts > 0:
+                # The arm parsed. Only now can its silence about a release mean
+                # anything (round 13, L13-1).
+                types_covered.add(str(source_type_hint or "").strip().lower())
+            else:
+                self._log(
+                    f"{source_name}: no recognisable posts parsed; NOT "
+                    f"counting this arm as classification coverage", "warning")
             if blocked_total:
                 # A blocked source's crawl is INCOMPLETE — treat it like an
                 # early-stop so the caller does NOT purge still-listed items it

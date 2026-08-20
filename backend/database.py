@@ -4645,13 +4645,32 @@ class DatabaseManager:
                 "FROM downloads WHERE url IN (%s)" % ",".join("?" * len(chunk)),
                 tuple(chunk), default=[]) or []
             for row in rows:
+                _held = row["url"] in held
                 out[row["url"]] = {
                     "date_added": row.get("date_added"),
                     "title": row.get("title"),
                     "year": row.get("year"),
-                    "season": row.get("season"),
-                    "media_kind": (None if row["url"] in held
-                                   else row.get("media_kind")),
+                    # SEASON IS WITHDRAWN TOO, and that is the whole point.
+                    #
+                    # Masking media_kind ALONE was worse than useless here. Two
+                    # shapes made it so, both in download_links.annotate_source_links:
+                    #
+                    #   movie + season  the contradiction guard is
+                    #                   `kind == "movie" and season is not None`.
+                    #                   Nulling kind stops it firing, so the row
+                    #                   FELL THROUGH to the tv_season branch: a hold
+                    #                   turned fail-CLOSED into fail-OPEN and GRANTED
+                    #                   the permission it exists to withdraw.
+                    #
+                    #   any + season    the tv_season branch reads `season` alone and
+                    #                   never consults media_kind, so masking the kind
+                    #                   withdrew only the movie half of the authority.
+                    #
+                    # A classification conflict is two listings disagreeing about
+                    # movie-vs-TV. That invalidates the TV reading exactly as much as
+                    # the movie one, so a hold withdraws the whole semantic identity.
+                    "season": None if _held else row.get("season"),
+                    "media_kind": None if _held else row.get("media_kind"),
                 }
         return out
 
