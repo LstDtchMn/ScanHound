@@ -150,6 +150,39 @@ coverage model is a design decision I would rather you ruled on than guessed at:
 a full unbounded crawl of every arm is expensive, and for releases that have
 aged off the listing entirely there is no listing evidence to be had at all.
 
+There are exactly two `run_scan` callers, and neither sets the flag:
+
+```text
+api/routes/scanner.py:258   manual scan   early_stop defaults False, flags are user-chosen
+background_scanner.py:759   scheduled     early_stop=True, so permanently ineligible
+```
+
+**The manual route is the candidate I would suggest**, and I want to argue
+against myself about it. It already traverses without early stop, and when the
+user selects every category the type-coverage condition is genuinely satisfied —
+my gate would refuse a single-arm manual scan on its own. What it does *not*
+settle is your bounded-coverage objection: `req.pages` is still a page budget,
+so a release on page 40 of TV Packs is invisible to a 5-page manual scan of
+every arm, and the crawl would nonetheless satisfy every condition I wrote.
+
+So I think the type-coverage half is sound and the depth half is still unearned,
+which is precisely the part I did not want to decide alone.
+
+**And there is a concrete reason it cannot be closed with what exists.** The page
+loop is `for page_num in range(1, pages + 1)`, and its only early exit is the
+cached-frontier `early_stop` break. There is **no end-of-listing detection at
+all** — nothing distinguishes *"I ran out of page budget"* from *"I reached the
+end of the listing"*. `_last_crawl_termination == "complete"` means only that
+every REQUESTED page was fetched, which is exactly the objection you raised, and
+I can now confirm no other signal in the crawler carries it either.
+
+Closing it properly means detecting an exhausted listing (a page yielding zero
+posts, distinguished from a page that failed to parse — `_last_crawl_page_errors`
+gives one half of that, and I do not think it gives the other). That is the
+dedicated coverage model you deferred rather than something I should bolt on,
+and I would rather build it to your ruling than guess and be wrong twice in the
+same area.
+
 Still open from earlier rounds, unchanged: the **I1 ruling** on #94, the
 **reason-code enum**, and the **grab-time resolver measurement**.
 
@@ -166,10 +199,27 @@ Still open from earlier rounds, unchanged: the **I1 ruling** on #94, the
 ## Verification
 
 ```text
-head under review    SUITE_HEAD_PLACEHOLDER
-targeted             13 passed  (tests/test_round12_attestation_authority.py)
-full suite           SUITE_FIGURE_PLACEHOLDER
+code head    64815c5          branch head adds this document only
+targeted     13 passed        tests/test_round12_attestation_authority.py
+
+                        failed   passed   skipped
+main control (origin/main)   1     5320         4
+this branch                  1     5333         4
 ```
+
+The single failure is identical on both sides and pre-existing:
+`test_dv_settings.py::test_all_frontend_editable_settings_keys_are_in_model`.
+**+13 passing, zero net new failures** — the 13 are the new file.
+
+**On how that figure was obtained, because I got it wrong first.** My initial run
+reported *74 failed*. That was my instrument, not the code: the throwaway
+container had no `docs/` or `scripts/`, and `test_version_labeler` reads
+`docs/kometa/version_badges.yml` while `test_verification_hold` reaches into
+`scripts/`. I ran `origin/main` through the identical method in its own
+container and it also reported 74, which is what identified the artifact rather
+than a regression. Both figures above are from containers provisioned the same
+way, in the same session, with the code trees differing only as intended
+(md5 `b9e5184a` vs `49f09c81` on `background_scanner.py`).
 
 ## The question for this round
 
