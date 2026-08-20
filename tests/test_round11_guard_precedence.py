@@ -4,9 +4,11 @@ Peer review round 11 found two defects in how the hybrid-sweep merge integrated
 the three fail-closed outcomes. Both were mine, and both were introduced by a
 fix for an earlier round of the same integration.
 
-I1 -- I applied all three guards only when the outcome would otherwise be
-'success', reasoning from their own comment ("each of these previously produced
-'success'"). That is right for two of them and wrong for the third:
+I1 -- UNRESOLVED, deliberately. The reviewer argued disjoint_identity_sets
+should outrank relevant_miss. Implementing that broke main's TestOutcomeLabel;
+a size-threshold alternative broke the sweep's own scenario_09. The two
+branches encode incompatible expectations for the same tiny zero-overlap shape,
+and nothing in the data separates them. Documented, not decided:
 
     no_listing_baseline / no_rss_observations
         "this cycle saw nothing to compare" -- guards a false CLEAN.
@@ -76,54 +78,67 @@ BULK_RSS = [f"https://hdencode.org/rss-{i}-2026-1080p-web-{i}-0-gb" for i in ran
 BULK_LISTING = [f"https://hdencode.org/lst-{i}-2026-1080p-web-{i}-0-gb" for i in range(8)]
 
 
-class TestI1GuardPrecedence:
-    def test_a_broken_join_is_not_persisted_as_a_real_miss(self):
-        """THE DEFECT. Zero overlap AND a relevant listing row.
+class TestI1GuardPrecedenceIsUNRESOLVED:
+    """Round 11 (I1) asked for disjoint_identity_sets to outrank relevant_miss.
 
-        The existing zero-overlap test could not catch this: its listing rows
-        are all in_library, so `misses` stayed empty and the pre-guard outcome
-        stayed 'success', which the guard did cover.
-        """
-        r = _cmp(rss=BULK_RSS,
-                 listing=[_Item(u, "in_library") for u in BULK_LISTING[:-1]]
-                         + [_Item(BULK_LISTING[-1], "missing")])
-        assert r.outcome == "disjoint_identity_sets", (
-            "a miss derived from an unusable identity join was certified as "
-            "real miss evidence")
+    The reasoning is sound: a broken join manufactures the very listing_only
+    rows the miss is derived from, so certifying that miss as evidence certifies
+    the broken join. I could not implement it without overruling one of the two
+    branches, and these tests pin WHY rather than pretending it is settled.
 
-    def test_zero_overlap_with_no_relevant_row_still_guards(self):
-        """The case that already worked -- kept so the fix cannot regress it."""
+        sweep  test_scenario_09_canonical_variants
+               rss 1 item, listing 1 item in_library, zero overlap
+               -> expects disjoint_identity_sets
+
+        main   TestOutcomeLabel[BOTH_OK-True-relevant_miss]
+               rss 1 item, listing 2 items missing, zero overlap
+               -> expects relevant_miss
+
+    Both are tiny with zero overlap. Size cannot separate them -- a
+    minimum-identities threshold satisfied main and broke the sweep's own guard
+    tests. The only discriminator is whether misses exist, which is what the
+    existing gate already tests.
+
+    So at these sizes "the join is broken" and "RSS has not got these yet" are
+    the same observation. The current behaviour is documented here as the status
+    quo BOTH branches already ship, not as a decision.
+    """
+
+    def test_zero_overlap_with_no_relevant_row_is_flagged(self):
+        """The sweep's contract. No misses, so the gate lets the guard run."""
         r = _cmp(rss=BULK_RSS,
                  listing=[_Item(u, "in_library") for u in BULK_LISTING])
         assert r.outcome == "disjoint_identity_sets"
 
-    def test_a_real_miss_with_a_working_join_is_still_a_miss(self):
-        """POSITIVE CONTROL. Without this, 'always disjoint' would pass above.
+    def test_zero_overlap_WITH_a_relevant_row_is_still_a_miss(self):
+        """main's contract, and the case I1 wants changed.
 
-        Overlap exists, so the join is usable and a relevant listing-only row
-        is a genuine observation.
+        CURRENT behaviour, recorded so a future change is deliberate rather than
+        accidental. If the reviewer rules that the join should win here, this
+        test is the one to flip -- and main's TestOutcomeLabel with it.
         """
+        r = _cmp(rss=BULK_RSS,
+                 listing=[_Item(u, "in_library") for u in BULK_LISTING[:-1]]
+                         + [_Item(BULK_LISTING[-1], "missing")])
+        assert r.outcome == "relevant_miss"
+
+    def test_a_real_miss_with_a_working_join_is_a_miss(self):
+        """POSITIVE CONTROL. Overlap exists, so nothing is ambiguous here."""
         r = _cmp(rss=BULK_RSS,
                  listing=[_Item(u, "in_library") for u in BULK_RSS[:6]]
                          + [_Item(P, "missing")])
         assert r.outcome == "relevant_miss"
 
-    def test_a_small_cycle_with_no_overlap_is_an_ordinary_miss(self):
-        """The case that made the first version of this fix wrong.
-
-        A one-item feed and a two-item listing sharing nothing is just RSS not
-        having those releases yet -- the ordinary miss this subsystem exists to
-        record, not a broken join.
-        """
-        r = _cmp(rss=[X], listing=[_Item(P, "missing"), _Item(Q, "missing")])
+    def test_an_empty_feed_does_not_outrank_a_real_miss(self):
+        """The narrower precedence the other two guards keep: a relevant_miss is
+        an observation and outranks 'we saw nothing to compare'."""
+        r = _cmp(rss=[], listing=[_Item(P, "missing")])
         assert r.outcome == "relevant_miss"
 
-    def test_an_empty_feed_does_not_outrank_a_real_miss(self):
-        """The other two guards keep the narrower precedence: a relevant_miss
-        is an observation and outranks 'we saw nothing to compare'."""
-        r = _cmp(rss=[], listing=[_Item(P, "missing")])
-        assert r.outcome == "relevant_miss", (
-            "no_rss_observations must not overwrite a real observation")
+    def test_an_empty_feed_with_nothing_relevant_is_guarded(self):
+        """POSITIVE CONTROL for the line above."""
+        r = _cmp(rss=[], listing=[_Item(P, "in_library")])
+        assert r.outcome == "no_rss_observations"
 
 
 class TestI2InconclusiveIsNotAnObservation:

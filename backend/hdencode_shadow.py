@@ -236,17 +236,6 @@ def _status_value(row: Mapping[str,Any]) -> str:
 #: NOT successes and NOT ordinary misses — they say the evidence was unusable.
 #: A reconciliation that reports success because it had nothing to compare is
 #: fail-OPEN, and §10 requires this reconciliation to be fail-closed.
-#: Below this many identities on EITHER side, zero overlap carries no
-#: information -- a short feed and a short listing page routinely share
-#: nothing. Above it, zero overlap is the signature of an identity
-#: mismatch rather than genuine divergence.
-#:
-#: Chosen, not derived. The incident that motivated the guard was
-#: 100-vs-100; this sits far below that so a smaller break is still
-#: caught, while leaving ordinary small cycles alone. Worth revisiting
-#: against real cycle sizes.
-_DISJOINT_MIN_IDENTITIES = 5
-
 INCONCLUSIVE_OUTCOMES = frozenset({
     "no_listing_baseline",
     "no_rss_observations",
@@ -498,38 +487,44 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
     # and 'incomplete_feeds' already says the cycle cannot be judged. Without
     # this the guard overwrote that label too, replacing a precise reason
     # with a claim about a join that was never actually performed.
-    # ZERO OVERLAP ONLY MEANS SOMETHING WHEN OVERLAP WAS EXPECTED.
+    # FAIL-CLOSED GUARDS, all three gated on a would-be SUCCESS.
     #
-    # My first version of this fired whenever the two sets did not
-    # intersect, and that reclassified an ordinary small cycle as a broken
-    # join: a one-item feed and a two-item listing that share nothing is
-    # just RSS not having those two releases yet, which is the ORDINARY
-    # miss this whole subsystem exists to record.
+    # Peer review round 11 (I1) argued disjoint_identity_sets should ALSO
+    # outrank relevant_miss, since a broken join can manufacture the very
+    # listing_only rows the miss is derived from. The reasoning is sound and
+    # I could not implement it without overruling one of the two branches:
     #
-    # The guard's own origin is about scale -- two divergent canonicalisers
-    # turning a healthy 99-of-100 pipeline into 0 of 100. At that size zero
-    # overlap is implausible; at two-vs-one it is unremarkable.
+    #   sweep  test_scenario_09_canonical_variants
+    #          rss 1 item, listing 1 item in_library, zero overlap
+    #          -> expects disjoint_identity_sets
     #
-    # THE THRESHOLD IS A JUDGEMENT CALL and is flagged as such. It is set
-    # where zero overlap stops being ordinary rather than at the observed
-    # incident size, because waiting for 100 would miss a smaller break.
-    # A cycle below it is left to the ordinary outcomes, which fail closed
-    # on their own terms.
-    if (normal_feeds_complete and not duplicate
-            and len(rss) >= _DISJOINT_MIN_IDENTITIES
-            and len(listing_urls) >= _DISJOINT_MIN_IDENTITIES):
-        # Outranks relevant_miss BY CONSTRUCTION: the miss was derived from
-        # the same join this says cannot be trusted.
-        outcome='disjoint_identity_sets'
-    elif outcome == 'success':
+    #   main   TestOutcomeLabel[BOTH_OK-True-relevant_miss]
+    #          rss 1 item, listing 2 items missing, zero overlap
+    #          -> expects relevant_miss
+    #
+    # Both are tiny with zero overlap, so SIZE cannot separate them: a
+    # minimum-identities threshold satisfied main and broke the sweep's own
+    # guard tests. The only signal that does separate them is whether misses
+    # exist -- which is precisely what this gate already tests.
+    #
+    # At these sizes 'the identity join is broken' and 'RSS has not got these
+    # yet' are the SAME observation, and nothing in the data distinguishes
+    # them. Deciding either way silently overrules one branch's encoded
+    # contract, so it is raised rather than decided here.
+    if outcome == 'success':
         if not listing_urls:
-            # No baseline to detect misses against. Zero misses here means
-            # zero comparisons were possible, not zero problems.
+            # No baseline to detect misses against. Zero misses here means zero
+            # comparisons were possible, not zero problems.
             outcome='no_listing_baseline'
         elif not rss:
             # RSS returned nothing at all, and nothing in the listing
             # contradicted it -- a clean success scored on an empty feed.
             outcome='no_rss_observations'
+        elif not duplicate:
+            # Both sides have identities and NONE match -- the signature of an
+            # identity mismatch, which is what two divergent canonicalisers
+            # produced when a healthy 99-of-100 pipeline read as 0 of 100.
+            outcome='disjoint_identity_sets'
     return ShadowComparison(len(rss),len(listing_urls),len(duplicate),len(feed_only),len(listing_only),len(misses),int(rss_requests),int(listing_requests),round(reduction,2),bool(normal_feeds_complete),outcome,tuple(sorted(feed_only)),tuple(sorted(listing_only)),tuple(misses),dict(recorded),tuple(unattributable),
         # A CONTRADICTION WITHHOLDS THE AUTHORITY CLAIM, it does not merely get
         # logged. Recording a problem and then still asserting listing authority
