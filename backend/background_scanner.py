@@ -31,11 +31,59 @@ _ALL_CATEGORY_FLAGS = {
 }
 
 
+#: The listing types whose disagreement attestation exists to rule out. A crawl
+#: that fetched only movie arms cannot have observed a movie-vs-TV contradiction,
+#: so its silence about one is not evidence of absence.
+_CONTRADICTING_TYPES = ("movie", "tv")
+
+
+def crawl_attestation_verdict(scanner):
+    """Whether a finished crawl may certify releases as classification-clean.
+
+    Peer review round 12 (M12-1). Attestation is a NEGATIVE claim -- "no listing
+    contradicts this one" -- and the old code derived it from `_seen - _conflicted`,
+    i.e. purely from the absence of an observation. Absence of an observation is
+    only evidence of absence when you looked everywhere it could have been.
+
+    The scheduled background crawl never looks everywhere. It is bounded by
+    `background_scan_pages` (default 3), it runs with `early_stop=True` so it halts
+    at the cached frontier, and its category arms are individually switchable via
+    `background_scan_categories` -- with `["4k"]`, the TV listing is never fetched
+    at all and no contradiction is observable even in principle.
+
+    So this deliberately returns False for the normal cycle. Conflict DISCOVERY
+    still runs on every crawl, because that half is a positive observation and is
+    always valid; only certification requires coverage.
+
+    Returns (may_attest, reason). Fail-closed: anything unrecognised is a no.
+    """
+    if not getattr(scanner, "_last_crawl_attests_coverage", False):
+        return (False, "crawl was not run as an attesting crawl")
+    if getattr(scanner, "_last_crawl_early_stopped", False):
+        return (False, "crawl stopped early; deeper pages were never fetched")
+    if int(getattr(scanner, "_last_crawl_page_errors", 0) or 0) > 0:
+        return (False, "crawl hit page errors; part of the listing was never read")
+    termination = str(getattr(scanner, "_last_crawl_termination", "") or "")
+    if termination != "complete":
+        return (False, "crawl terminated as %s" % (termination or "unknown"))
+    covered = {str(t).strip().lower()
+               for t in (getattr(scanner, "_last_crawl_types_covered", None) or ())}
+    missing = [t for t in _CONTRADICTING_TYPES if t not in covered]
+    if missing:
+        return (False, "crawl never fetched the %s arm(s)" % "/".join(missing))
+    return (True, "every contradicting listing type covered by a complete crawl")
+
+
 class BackgroundScanner:
     """Runs periodic pre-cache scans on a daemon thread."""
 
     def __init__(self, registry):
         self._reg = registry
+        #: Releases whose media-kind revocation could not be committed. The
+        #: transaction rolls back as a unit, so on failure the OLD kind is still
+        #: authoritative while we already know it is unsafe. Held here and retried
+        #: on the next cycle rather than dropped (round 12, M12-2).
+        self._pending_revocations = set()
         self._lifespan_generation = registry.lifespan_generation
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -562,28 +610,65 @@ class BackgroundScanner:
                 # through add_to_history(media_kind=None) would do nothing: that path
                 # COALESCEs, because there None means "no observation this time".
                 _conflicted = getattr(scanner, "_last_crawl_conflicted_urls", None) or set()
-                # BACKFILL THE ATTESTATION for everything this crawl observed cleanly.
-                # A cached row written before conflict detection has no attestation, and
-                # get_scan_category refuses to answer for it -- correctly, since nothing
-                # had ever checked it. Observing it now IS the check. Written only where
-                # the key is absent, so this is a one-time backfill per release rather
-                # than a write on every crawl.
-                _seen = getattr(scanner, "_last_crawl_seen_urls", None) or set()
-                _clean = _seen - (getattr(scanner, "_last_crawl_conflicted_urls", None) or set())
-                if _clean:
+                # CONFLICT DISCOVERY FIRST, AND IT IS ALWAYS VALID EVIDENCE.
+                #
+                # Round 12 (M12-2): recording the conflict and withdrawing the
+                # authority it invalidates are ONE transaction now. They used to be
+                # two independent commits under a broad try/except, so a failure
+                # between them left the cache saying "unsafe" while
+                # downloads.media_kind still said "movie" -- and the destructive
+                # identity reads the latter. Fail-open on an authorization boundary.
+                #
+                # Note the asymmetry with attestation below. OBSERVING a
+                # contradiction is a positive fact that any crawl can establish,
+                # however partial it was. Certifying the ABSENCE of one is not.
+                _pending = set(self._pending_revocations)
+                _to_revoke = set(_conflicted) | _pending
+                if _to_revoke:
                     try:
-                        db.attest_scan_categories(_clean)
+                        db.record_classification_conflicts_and_retract_kinds(
+                            _to_revoke, reason="classification_conflict")
+                        self._pending_revocations -= _to_revoke
                     except Exception:
-                        logger.exception("failed to attest scan categories")
-                if _conflicted:
-                    try:
-                        db.mark_scan_category_conflict(_conflicted)
-                        db.retract_download_media_kind(
-                            _conflicted, reason="classification_conflict")
-                    except Exception:
-                        # Never let bookkeeping abort a scan. An unrecorded conflict
-                        # leaves the PREVIOUS state, which was already the status quo.
-                        logger.exception("failed to record classification conflicts")
+                        # NOT bookkeeping. The transaction rolled back, so the old
+                        # media kind is still authoritative on these releases. Hold
+                        # them and retry next cycle rather than dropping the fact
+                        # that we already know they are unsafe.
+                        self._pending_revocations |= _to_revoke
+                        logger.error(
+                            "REVOCATION FAILED for %d release(s): their recorded "
+                            "media kind is still live despite a known classification "
+                            "conflict. Retrying next cycle.", len(_to_revoke))
+                        source_results[-1]["revocation_failed"] = len(_to_revoke)
+
+                # ATTESTATION: only a crawl whose coverage could actually rule out a
+                # contradiction may turn unknown into checked-clean.
+                #
+                # Round 12 (M12-1). This used to be `_seen - _conflicted`, which
+                # answers "did THIS crawl notice a contradiction" and was then read
+                # as "is this release clean". Those coincide only under full
+                # coverage. The scheduled crawl is bounded by background_scan_pages
+                # (default 3), runs early_stop=True, and its category arms are
+                # individually switchable -- so the TV arm can be absent entirely
+                # while every 4K row still looked "clean". The same partiality was
+                # already trusted a few lines above to block a PURGE; it simply was
+                # not read here.
+                _may_attest, _why = crawl_attestation_verdict(scanner)
+                if err:
+                    # The block sits outside the `if not err:` guard, so a source
+                    # that RAISED could still attest whatever partial seen-set the
+                    # crawl had accumulated before it died.
+                    _may_attest, _why = False, "source errored: %s" % (err,)
+                if not _may_attest:
+                    logger.debug("not attesting from this crawl: %s", _why)
+                else:
+                    _seen = getattr(scanner, "_last_crawl_seen_urls", None) or set()
+                    _clean = _seen - set(_conflicted)
+                    if _clean:
+                        try:
+                            db.attest_scan_categories(_clean)
+                        except Exception:
+                            logger.exception("failed to attest scan categories")
 
             if not self._owns_lifespan():
                 logger.info("Background scan abandoned before cache re-match: stale app lifespan")

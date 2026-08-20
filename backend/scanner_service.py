@@ -264,6 +264,20 @@ class ScannerService:
         # So every exit now says why it stopped, and only "complete" grants
         # membership authority.
         self._last_crawl_termination: str = "not_run"
+        # CONTRADICTION COVERAGE, owned by the crawler. Round 12 (M12-1).
+        #
+        # Attestation is a NEGATIVE claim -- "no listing contradicts this one" --
+        # and a negative claim needs COVERAGE, not merely an absence of sightings.
+        # The set below records which listing types this crawl actually fetched
+        # ('movie', 'tv', ...). A crawl that never fetched the TV arm cannot have
+        # observed a movie-vs-TV disagreement, so its silence proves nothing.
+        self._last_crawl_types_covered: Set[str] = set()
+        # Whether this crawl was RUN as an attesting crawl at all. The scheduled
+        # background crawl is bounded by background_scan_pages and runs with
+        # early_stop=True, so it deliberately never claims this. It may still
+        # DISCOVER a conflict -- that is a positive observation and always valid
+        # evidence -- but it may not certify anything as clean.
+        self._last_crawl_attests_coverage: bool = False
         # THE DETAIL PIPELINE, tracked separately from membership. Cached skips and
         # policy exclusions never reach all_posts, so scheduled-minus-completed is
         # ONLY genuine attribution failures -- unlike the earlier
@@ -371,6 +385,7 @@ class ScannerService:
         track_urls: bool = True,
         skip_urls: Optional[Set[str]] = None,
         early_stop: bool = False,
+        attest_coverage: bool = False,
     ) -> List[MediaItem]:
         """Run a full scan synchronously (call from background thread).
 
@@ -403,6 +418,12 @@ class ScannerService:
             self.items.clear()
             self._item_counter = 0
         self._last_crawl_seen_urls = set()
+        # A crawl may only certify releases as clean when it was RUN to do so.
+        # early_stop truncates the traversal at the cached frontier, so an
+        # early-stopping crawl can never support the negative claim no matter
+        # what else it reports. Both conditions, not either.
+        self._last_crawl_attests_coverage = bool(attest_coverage) and not early_stop
+        self._last_crawl_types_covered = set()
         self._last_crawl_request_count = 0
         # RESET THE WHOLE CRAWL-AUTHORITY STATE HERE, at run entry, beside the
         # resets above. Round 7 found the consequence of my having put this reset
@@ -833,6 +854,8 @@ class ScannerService:
         seen_exclusion_canonical: Set[str] = set()
         policy_excluded_known = 0
         early_stopped = False
+        #: Listing types this crawl actually fetched (round 12, M12-1).
+        types_covered: Set[str] = set()
         total_pages = len(sources) * pages
         current_page = 0
 
@@ -849,6 +872,12 @@ class ScannerService:
             source_base = source["base"]
             source_suffix = source["suffix"]
             source_type_hint = source["type"]
+            # This arm is being fetched, so its listing type is covered by this
+            # crawl. Round 12 (M12-1): attestation claims that no OTHER listing
+            # disagrees, which is only checkable for types actually visited. The
+            # crawl-wide early_stop / page_errors / cancelled verdicts decide
+            # separately whether the visit was thorough enough to certify.
+            types_covered.add(str(source_type_hint or "").strip().lower())
             source_id = source.get("source", "hdencode")
             source_category = source.get("category", "")
 
@@ -1046,7 +1075,13 @@ class ScannerService:
                         _post = {'url': post_url, 'type': source_type_hint,
                                  'source': source_id, 'category': source_category,
                                  'category_conflict': False,
-                                  'category_attested': True}
+                                 # NOT attested here. Round 12 (M12-1): coming
+                                 # through this crawler proves the sightings it
+                                 # SAW were checked, not that the listings it
+                                 # never fetched agree. Attestation is decided
+                                 # once, after the crawl, by whether its coverage
+                                 # could actually rule a contradiction out.
+                                 'category_attested': False}
                         all_posts.append(_post)
                         # Indexed so a LATER listing that classifies this same release
                         # differently can mark it, instead of being dropped by the dedup
@@ -1123,6 +1158,7 @@ class ScannerService:
         # A crawl that stopped early never visited deeper pages, so its seen-set
         # is partial — the caller must not age out items it simply didn't revisit.
         self._last_crawl_early_stopped = early_stopped
+        self._last_crawl_types_covered = types_covered
         # The crawl's own verdict on itself, in precedence order: a stop that cut
         # it short, then pages that failed, then a suspicious empty result.
         # A recorded cancellation WINS over everything below it. Previously the
@@ -1207,10 +1243,12 @@ class ScannerService:
                 # differently. Carried so the recorded kind can decline to
                 # answer rather than silently reporting whichever listing
                 # happened to be crawled first.
-                # This crawler checks every sighting for a conflict, so anything it
-                # produces has been checked -- which is what distinguishes it from a
-                # row written before conflict detection existed.
-                details['category_attested'] = True
+                # NOT attested here -- see M12-1. A crawl checks every sighting
+                # it OBSERVES, which is a different claim from "no contradicting
+                # listing exists". The bounded, early-stopping production crawl
+                # cannot support the second claim, so the decision is deferred to
+                # the post-crawl authority gate.
+                details['category_attested'] = False
                 details['category_conflict'] = bool(
                     post_info.get('category_conflict'))
                 return {'details': details, 'is_tv': is_tv, 'url': url}

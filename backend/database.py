@@ -4274,7 +4274,14 @@ class DatabaseManager:
                 payload = json.loads(dict(row).get("data") or "{}")
             except (TypeError, ValueError):
                 continue
-            if "category_attested" in payload or payload.get("category_conflict"):
+            # TRUTH, not PRESENCE. Round 12: the guard used to be
+            # `"category_attested" in payload`, so any row carrying the key with
+            # a FALSE value could never be attested again by any later crawl --
+            # permanently disabling the media kind for that release. A manual
+            # rescan writes exactly such a row (M12-3), and so does every fresh
+            # crawl now that the producer no longer stamps a bare True.
+            # Idempotence should key on having the ANSWER, not on having asked.
+            if payload.get("category_attested") or payload.get("category_conflict"):
                 continue
             payload["category_attested"] = True
             with self.transaction() as conn:
@@ -4323,6 +4330,79 @@ class DatabaseManager:
                 "retracted media_kind on %d download row(s): %s. Any semantic "
                 "identity built on those rows is withdrawn.", retracted, reason)
         return retracted
+
+    def record_classification_conflicts_and_retract_kinds(self, urls, *, reason):
+        """Record a classification conflict AND withdraw the authority it
+        invalidates, as ONE transaction.
+
+        Peer review round 12 (M12-2). These used to be two independently
+        committed mutations under a broad try/except: mark_scan_category_conflict()
+        committed the cache flag, then retract_download_media_kind() opened a
+        separate transaction over `downloads`. A crash or failure between them
+        left exactly the worst pair of states:
+
+            background_scan_cache.category_conflict = 1        # we KNOW it is unsafe
+            downloads.media_kind                    = 'movie'  # ...and still allow it
+
+        That is fail-OPEN on an authorization boundary. The destructive identity
+        reads downloads.media_kind through get_release_identity() and never
+        consults the cache, so the withdrawn permission stayed live while the
+        evidence withdrawing it was already durably recorded.
+
+        Ordering inside the transaction is deliberate. The RETRACTION goes first
+        because it is the safety-critical half: an unreadable or missing cache row
+        must never be able to prevent it. The cache flag only records WHY.
+
+        Raises on failure. A failed revocation is NOT bookkeeping noise -- the old
+        permission is still authoritative -- so the caller has to treat it as a
+        failure and leave the release in a degraded/unknown state.
+
+        Returns (retracted, marked).
+        """
+        targets = {str(u) for u in (urls or ()) if u}
+        if not targets:
+            return (0, 0)
+        retracted = 0
+        marked = 0
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError(
+                    "no database connection: the classification conflict for "
+                    f"{len(targets)} release(s) could not be recorded, and the "
+                    "media kind it invalidates is still authoritative")
+            # 1. WITHDRAW THE AUTHORITY FIRST.
+            for url in targets:
+                cur = conn.execute(
+                    "UPDATE downloads SET media_kind = NULL "
+                    "WHERE url = ? AND media_kind IS NOT NULL", (url,))
+                retracted += max(0, int(cur.rowcount or 0))
+            # 2. Then the diagnostic cache flag.
+            for url in targets:
+                row = conn.execute(
+                    "SELECT data FROM background_scan_cache WHERE url = ?",
+                    (url,)).fetchone()
+                if not row:
+                    continue
+                try:
+                    payload = json.loads(dict(row).get("data") or "{}")
+                except (TypeError, ValueError):
+                    logger.warning("cannot mark conflict on %s: undecodable data", url)
+                    continue
+                if payload.get("category_conflict"):
+                    continue
+                payload["category_conflict"] = True
+                conn.execute(
+                    "UPDATE background_scan_cache SET data = ? WHERE url = ?",
+                    (json.dumps(payload, default=str), url))
+                marked += 1
+        if retracted:
+            logger.warning(
+                "retracted media_kind on %d download row(s): %s. Any semantic "
+                "identity built on those rows is withdrawn.", retracted, reason)
+        if marked:
+            logger.info(
+                "marked %d cached release(s) as classification-conflicted", marked)
+        return (retracted, marked)
 
     def get_scan_category(self, url):
         """The crawl category THIS SERVER recorded for a release URL.

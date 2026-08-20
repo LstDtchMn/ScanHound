@@ -57,7 +57,9 @@ def _rebuild(existing, details):
 
     # Three values since the round-11 merge: main's branch of that conflict
     # added conflict preservation, so the helper carries it too.
-    category, is_tv_from_cache, conflict = rescan_classification(existing)
+    carried = rescan_classification(existing)
+    category, is_tv_from_cache, conflict = (
+        carried.category, carried.is_tv, carried.category_conflict)
     details = dict(details)
     details["category"] = category
     details["category_conflict"] = conflict

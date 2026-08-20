@@ -477,10 +477,23 @@ class TestAConflictIsSeenEvenWhenTheReleaseIsSkipped:
         assert posts[0]["category_conflict"] is True
         assert SHARED in shell._last_crawl_conflicted_urls
 
-    def test_a_fresh_post_is_marked_attested(self, monkeypatch):
-        """Anything this crawler produces HAS been conflict-checked, which is
-        what separates it from a row written before the check existed."""
+    def test_a_fresh_post_is_NOT_marked_attested_by_the_crawler(self, monkeypatch):
+        """DELIBERATELY FLIPPED in round 12 (M12-1). This test used to assert
+        True, on the reasoning quoted in its old docstring: "anything this
+        crawler produces HAS been conflict-checked".
+
+        That reasoning conflates two different claims. The crawler does check
+        every sighting it MAKES -- but a crawl of the 4K arm alone, as set up
+        here, never fetched the TV listing, so there was no opportunity for a
+        contradiction to appear. Stamping "attested" on its output turned "we
+        did not look" into "we looked and it is clean", and that flag is what
+        later authorises a destructive Keep-best.
+
+        Attestation is now decided once, after the crawl, by whether its
+        coverage could actually rule a contradiction out. See
+        tests/test_round12_attestation_authority.py for that gate, including the
+        positive controls proving a qualified crawl still attests."""
         scraper = _Scraper([_page([(SHARED, "A Film 2026 2160p")])])
         posts, _shell = self._crawl_with_skip(
             [_source("4K Movies", "movie", "4k")], scraper, monkeypatch, skipped=set())
-        assert posts[0]["category_attested"] is True
+        assert posts[0]["category_attested"] is False

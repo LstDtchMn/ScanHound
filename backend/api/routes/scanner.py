@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -19,6 +19,14 @@ from backend.config import source_enabled
 from backend.scanner_service import ScanStatus, STATUS_COLORS, STATUS_TEXTS
 
 logger = logging.getLogger(__name__)
+class CarriedClassification(NamedTuple):
+    """Classification evidence a detail rescan carries forward, never invents."""
+    category: str
+    is_tv: bool
+    category_conflict: bool
+    category_attested: bool
+
+
 def rescan_classification(existing):
     """The classification a rescan must CARRY FORWARD, from the cached row.
 
@@ -48,7 +56,17 @@ def rescan_classification(existing):
     listing the release came from, so it carries that evidence rather than
     inventing it.
 
-    Returns ``(category, is_tv_from_cache, category_conflict)``.
+    Returns a :class:`CarriedClassification`. Round 12 (M12-3) added
+    ``category_attested`` and made this a named structure rather than a
+    positional tuple: the merge that produced the three-value version wired all
+    three correctly and silently dropped the fourth, which a positional unpack
+    cannot make visible at the call site.
+
+    A detail rescan must never CREATE attestation -- it observes no listing
+    membership at all -- but it must not destroy one either. Writing a falsey
+    value was not harmless: `attest_scan_categories` skipped rows that merely
+    HAD the key, so one rescan permanently disabled the media kind for that
+    release. That guard now tests truth, and this carries the value forward.
     """
     try:
         cached = json.loads(existing.get("data") or "{}")
@@ -64,7 +82,10 @@ def rescan_classification(existing):
     # A conflict recorded against this release survives a rescan: re-reading
     # the detail page is not evidence about which listings carried it.
     conflict = bool(cached.get("category_conflict"))
-    return category, is_tv, conflict
+    # Likewise the attestation. A rescan fetches the DETAIL page; attestation is
+    # a statement about LISTING coverage, which this route observes nothing of.
+    attested = bool(cached.get("category_attested"))
+    return CarriedClassification(category, is_tv, conflict, attested)
 
 
 router = APIRouter(prefix="/scan", tags=["scanner"])
@@ -467,10 +488,16 @@ def rescan_item(
     # BOTH sides of this conflict added something, and neither is redundant:
     #   #93   the extracted helper, and the TV signal it recovers
     #   main  preservation of a recorded classification conflict
-    # The helper carries all three rather than one side being dropped.
-    (details['category'],
-     post_source_is_tv,
-     details['category_conflict']) = rescan_classification(existing)
+    # The helper carries all FOUR rather than one side being dropped. Round 12
+    # (M12-3) found the fourth: the merge wired three values coherently and
+    # silently dropped category_attested, which a positional unpack hides.
+    _carried = rescan_classification(existing)
+    details['category'] = _carried.category
+    details['category_conflict'] = _carried.category_conflict
+    # Carried, never invented: a rescan observes no listing membership, so it may
+    # neither create nor destroy an attestation (round 12, M12-3).
+    details['category_attested'] = _carried.category_attested
+    post_source_is_tv = _carried.is_tv
     item = scanner._create_media_item({
         'details': details,
         'is_tv': details.get('is_tv', False) or post_source_is_tv,
