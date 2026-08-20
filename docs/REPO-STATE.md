@@ -62,6 +62,53 @@ diagnosis — downstream cannot tell conflict from unscanned from disagreement.
 
 ---
 
+## #94 — the hybrid sweep, exactly where it stands
+
+**Integrated and largely repaired.** Head `fc7760c`.
+
+| | failures |
+|---|---:|
+| clean `main` baseline | 35 |
+| at the merge (`77db9f2`) | **115** (80 net new) |
+| after the readiness/window work | **52** (17 net new) |
+| after the shadow/miss cluster | *see the PR* |
+
+### The pattern behind every regression
+
+**The sweep's 118 commits and 16 review rounds never ran against main's tests,
+because those tests do not exist on that branch.** Every regression found here
+was a main-side test the sweep had never seen — `test_rematch_cache_stop_flag`,
+`test_hdencode_readiness_integrity`, `test_round7/8_discrimination`,
+`test_miss_resolution_rule`, `test_shadow_miss_validity`,
+`test_shadow_provenance_paths`.
+
+Sixteen rounds of review cannot catch what is not there to run. That is an
+argument for merging sooner, not for reviewing harder.
+
+### Three traps for anyone touching this branch
+
+1. **`05_shadow_evidence.py` is a second PRODUCTION implementation** of
+   readiness that the collector reads, kept independent so the two corroborate.
+   Updating one side without the other breaks the corroboration silently — its
+   own header warns about exactly that, and it caught me anyway.
+2. **A signature can accept a parameter its body ignores.** The window was
+   grafted onto main's summary and only **one query in six** carried the scope.
+   Grep for the parameter, then check every query.
+3. **Consumers switch on outcome STRINGS.** Adding three new outcomes without
+   teaching `get_hdencode_miss_resolution` about them made guarded cycles stop
+   blocking — the same "right and unreachable" failure its own comment already
+   records from 2026-08-07.
+
+### Still open
+
+- The contract's 🔨 rows are attested against **pre-merge SHAs** and are stale.
+  Re-attestation has not been done.
+- The app validates the miss count against rows; the mirror sums the stored
+  count. They agree on consistent cycles and diverge exactly when the evidence
+  contradicts itself. Unsettled; recorded in the parity fixture.
+
+---
+
 ## Live in the running container
 
 - **Version-count badges** — backfill completed 2026-08-19 16:51: 15,250 titles
