@@ -154,7 +154,7 @@ class TestMediaItem:
             "plex_info", "plex_versions", "plex_rating_key", "selected",
             "host_pref", "poster_path", "imdb_id",
             "tile_state", "description", "posted_date", "web_data", "group_key",
-            "is_duplicate_group", "prior_grab", "category", "category_conflict",
+            "is_duplicate_group", "prior_grab", "category", "category_conflict", "category_attested",
         }
         actual = {f.name for f in fields(MediaItem)}
         assert actual == expected

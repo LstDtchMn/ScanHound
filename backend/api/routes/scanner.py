@@ -416,7 +416,34 @@ def rescan_item(
 
     post_source = existing.get("source_category") or "hdencode"
     details['source'] = post_source
-    details['category'] = existing.get("source_category") or ""
+    # PRESERVE THE CRAWL CATEGORY, do not rebuild it from source_category.
+    #
+    # Peer review round 11 (LOW): source_category is the SOURCE NAME --
+    # "HDEncode" on all 4,145 live rows -- not the crawl category
+    # ('4k' | 'remux' | 'tv'). Writing it here replaced a good category
+    # with a value that maps to no media kind, and this route writes the
+    # rebuilt row straight back into background_scan_cache. So rescanning
+    # an item silently destroyed the server-owned classification that
+    # authorises a destructive action for that release.
+    #
+    # It failed CLOSED -- the kind became unknown, never wrong -- which is
+    # why this is LOW. But it is a live path, and it proves the cached
+    # category can be lost without anything noticing.
+    #
+    # The real category lives in the cached row's `data` JSON. A rescan
+    # re-fetches the DETAIL page; it does not re-observe which listing the
+    # release came from, so it has no new classification evidence and must
+    # carry the existing one forward rather than invent one.
+    _cached = {}
+    try:
+        _cached = json.loads(existing.get("data") or "{}")
+    except (TypeError, ValueError):
+        _cached = {}
+    details["category"] = str(_cached.get("category") or "").strip().lower()
+    # A conflict already recorded against this release survives a rescan
+    # too: re-reading the detail page is not evidence about which listings
+    # carried it.
+    details["category_conflict"] = bool(_cached.get("category_conflict"))
 
     item = scanner._create_media_item({
         'details': details, 'is_tv': details.get('is_tv', False), 'url': req.url,
