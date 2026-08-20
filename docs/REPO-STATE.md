@@ -20,45 +20,29 @@ verify a row, delete the row rather than leave it guessed.
 
 ## Open PRs
 
-| PR | Branch | Base | State | What it does |
-|---|---|---|---|---|
-| **#94** | `agent/hybrid-sweep-rebased` | `main` | **DRAFT** | Hybrid listing sweep. 118 commits, 16 review rounds, stalled 08-05 at contract row R-7. Integrated 08-19 (`b92ad92`) — **suite NOT clean, see below.** Evidence not re-attested either; every 🔨 row cites pre-merge SHAs. |
-| **#93** | `fix/carry-is-tv-not-rederive` | `main` | **APPROVED** (round 10) | Carry `is_tv` instead of re-deriving it from `season is not None`. Q8 closed: a recorded season now outranks an `is_tv=False`. Head `ac10d02`. |
-| **#92** | `feat/queue-records-category` | #91 | round 10 L1+L2 **closed** | Records media kind for batched grabs. Signature test now binds per call; migration test builds a real old schema. Head `2a953cc`. |
-| **#91** | `feat/consume-media-kind-in-ui` | #90 | consumer OK, was blocked by M1 | Deletes `isCanonicalSeasonName`; authorizes from the wire. Head `08b0e75`. |
-| **#90** | `feat/record-media-kind-at-ingest` | #89 | round 10 M1 **closed both halves** | The SERVER now answers what kind a release is; the client may only contradict. Crawl records classification conflicts instead of first-source-wins. Head `3e94f34`. |
-| **#89** | `fix/rss-history-keyed-on-release-url` | `main` | ready | One history row per release, not per file-host mirror. |
-| **#61** | `design/rss-readiness-gate` | `main` | ready | **Evidence record, not a design.** Its hybrid already exists in #94's `sweep/gate.py`. Carries the 28-day shadow measurements. |
-| **#59** | `docs/dv-detector-enable-runbook` | `main` | ready | Runbook for enabling the DV host detector. Blocked on gates 1 and 4 — both Jesse-only. |
+**Last verified:** 2026-08-20, after peer-review round 11.
 
-**Merge order for the media-kind stack is forced:** #89 → #90 → #91 → #92.
+| PR | Branch | Head | State |
+|---|---|---|---|
+| **#95** | `fix/rss-history-keyed-on-release-url` | `1407ea4` | **Re-delivers #90 to main.** #90 was merged into #89's *branch* 14s after #89 merged to main, so its content never arrived. M1a/M1b/LOW all fixed here. |
+| **#94** | `agent/hybrid-sweep-rebased` | `7a50443` | DRAFT. Hybrid sweep, 0 behind main. R-3 harness run. I1 unresolved. |
+| **#93** | `fix/carry-is-tv-not-rederive` | `6a458d7` | Q8 closed + rescan fixed. Reviewer APPROVED at the earlier head. |
+| **#92** | `feat/queue-records-category` | `2a953cc` | L1/L2 closed. Retargeted to `main`. |
+| **#91** | `feat/consume-media-kind-in-ui` | `08b0e75` | Consumer sound. Retargeted to `main`. |
+| **#61** | `design/rss-readiness-gate` | — | Evidence record; its design lives in #94. |
+| **#59** | `docs/dv-detector-enable-runbook` | — | Blocked on two Jesse-only gates. |
 
----
+**Every PR now targets `main` directly.** They previously targeted each other,
+which is how #90 stranded — merging a PR whose base is a branch puts the content
+in that branch, and GitHub only auto-retargets when the base is **deleted**.
 
-## Round 10 peer review — the finding worth remembering
+**How to check a merge actually landed** (ancestry lies after a squash):
 
-> **package provenance != media-kind provenance**
+```bash
+git grep -l "<a symbol the PR added>" origin/main -- backend/
+```
 
-Knowing which release a package came from does not certify what KIND of thing it
-is. The stack had been treating `identity_source = provenance` as if it did.
-
-Two mechanisms that were wrong, both verified before being fixed:
-
-1. **The kind came from the client.** `DownloadRequest.category` is unvalidated
-   and filled by the frontend from `ScanResult.category`, so a value that
-   authorizes a DESTRUCTIVE overwrite made a round trip through the client.
-2. **The server's own category was first-source-wins.** One `seen_post_urls` set
-   spans every source and the movie listings crawl before TV Packs, so a release
-   in both was silently recorded as a movie.
-
-**Trap for anyone touching this:** `background_scan_cache.source_category` is the
-source NAME (`"HDEncode"` on all 4,084 rows), not the crawl category. The
-category lives in the row's `data` JSON.
-
-**Open question back to the reviewer:** the conflict is recorded at the crawl and
-the lookup declines, rather than adding `media_kind_source` /
-`media_kind_conflict` to the wire as proposed. Equivalent for safety, not for
-diagnosis — downstream cannot tell conflict from unscanned from disagreement.
+Zero files means it stranded. That is what caught #90.
 
 ---
 
