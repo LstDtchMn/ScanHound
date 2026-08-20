@@ -7,6 +7,7 @@ md5 parity was asserted before each run.
 ## 1. Targeted suites
 
 ```text
+tests/test_round14_listing_claim_ledger.py        15 passed
 tests/test_round13_hold_withdraws_identity.py      7 passed
 tests/test_round13_revocation_failclosed.py        7 passed
 tests/test_round13_parser_health_coverage.py       4 passed
@@ -15,7 +16,7 @@ tests/test_media_kind_is_server_owned.py          30 passed
 tests/test_rescan_preserves_classification.py     12 passed
 tests/test_background_scanner.py                  25 passed
                                                   -----------
-                                                  98 passed
+                                                 113 passed
 ```
 
 Plus the identity suites, which the broader `season` mask could have disturbed:
@@ -42,7 +43,22 @@ hold taken AFTER the erase                           2   ordering, not just outc
 reconciliation made a no-op                          2   restart recovery is real
 mask applied to EVERY row                            4   over-strict is detected
 award arm coverage on entry again                    3   parser health is enforced
+
+round 14 -- the claim ledger and the coverage report
+first_seen_at overwritten on re-sighting             1   age info is preserved
+sightings never increments                           1
+order_key overwritten instead of preserved           1   see the note below
+claims recorded only by an attesting crawl           1   the ledger is NOT gated
+conflict branch never fires in the summary           2   class precedence
 ```
+
+**One mutant initially SURVIVED, and it was the useful one.** Removing the
+`COALESCE` in `record_listing_claims()` changed nothing: every existing test went
+through `backfill_listing_claim_order_keys()`, whose `WHERE order_key IS NULL`
+already prevents an overwrite, so the `ON CONFLICT` clause was never reached. The
+line was real but unexercised. Two tests were added for it and the mutant now
+dies. Recorded because a surviving mutant that is quietly fixed afterwards looks
+identical to one that never survived.
 
 The last two are the anti-vacuity controls. Every negative assertion in this work
 says "no identity" or "not covered", so withdrawing everything — or never
@@ -53,7 +69,7 @@ recording coverage — would satisfy them all while destroying the feature.
 ```text
                               failed   passed   skipped   duration
 main control (origin/main)         1     5320         4   804s
-this branch                        1     5351         4   801s
+this branch (0c0f5d1)              1     5366         4   828s
 ```
 
 Identical single pre-existing failure on both sides:
@@ -62,7 +78,7 @@ Identical single pre-existing failure on both sides:
 FAILED tests/test_dv_settings.py::test_all_frontend_editable_settings_keys_are_in_model
 ```
 
-**+31 passing, zero net new failures.** `main` has not moved since the round-13
+**+46 passing, zero net new failures.** `main` has not moved since the round-13
 control was measured, and the same container pair was used.
 
 ## 4. The corpus measurement behind the watermark discussion
@@ -95,7 +111,37 @@ So the order key exists and is durable for the whole corpus, but the listing sid
 carries none — which is the awkward half, because the releases that most need
 attesting are the ones the crawl skips and therefore never detail-fetches.
 
-## 5. Deployment state
+## 5. The population a conflict could exist in, and why it is unmeasured
+
+Live database, read-only:
+
+```text
+cached rows              4195
+  category 4k            2101     movie arm
+  category tv            1816     tv arm
+  category remux          278     movie arm
+rows flagged conflicted     0
+```
+
+Two things worth drawing out.
+
+**The conflict-eligible population is large.** 2,379 rows came from a movie arm
+and 1,816 from the TV arm, so movie-vs-TV disagreement is not a corner case by
+volume — it is the shape of the corpus.
+
+**Zero conflicts have ever been recorded**, because the deployed code has no
+conflict detection; it predates all of this work. So the obvious question — *how
+often do two listings actually disagree?* — has never been answerable here, and I
+could not answer it for round 12 either when I wanted to size the risk.
+
+**And it cannot be answered retrospectively.** Each cached row stores exactly ONE
+category. Whether that release ALSO appeared under another arm was never written
+down: `url_type_claim` held it for the duration of a single crawl and then the
+dict went out of scope. That is precisely the evidence `listing_claims` now
+captures, and precisely why capturing it could not wait for the coverage-model
+ruling — every crawl that ran without it destroyed another cycle's worth.
+
+## 6. Deployment state
 
 ```bash
 docker exec scanhound sh -c "grep -c 'media_kind' /app/backend/database.py"

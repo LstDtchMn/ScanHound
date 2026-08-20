@@ -104,7 +104,7 @@ index ab7da4b..a2ae215 100644
                      "Recovered %d download history entries from database.",
                      self.db.get_history_count(),
 diff --git a/backend/background_scanner.py b/backend/background_scanner.py
-index a314d35..618f4a9 100644
+index a314d35..ddcdf3d 100644
 --- a/backend/background_scanner.py
 +++ b/backend/background_scanner.py
 @@ -31,11 +31,59 @@ _ALL_CATEGORY_FLAGS = {
@@ -167,7 +167,7 @@ index a314d35..618f4a9 100644
          self._lifespan_generation = registry.lifespan_generation
          self._thread: Optional[threading.Thread] = None
          self._stop = threading.Event()
-@@ -562,28 +610,68 @@ class BackgroundScanner:
+@@ -562,28 +610,90 @@ class BackgroundScanner:
                  # through add_to_history(media_kind=None) would do nothing: that path
                  # COALESCEs, because there None means "no observation this time".
                  _conflicted = getattr(scanner, "_last_crawl_conflicted_urls", None) or set()
@@ -180,11 +180,6 @@ index a314d35..618f4a9 100644
 -                _seen = getattr(scanner, "_last_crawl_seen_urls", None) or set()
 -                _clean = _seen - (getattr(scanner, "_last_crawl_conflicted_urls", None) or set())
 -                if _clean:
--                    try:
--                        db.attest_scan_categories(_clean)
--                    except Exception:
--                        logger.exception("failed to attest scan categories")
--                if _conflicted:
 +                # CONFLICT DISCOVERY FIRST, AND IT IS ALWAYS VALID EVIDENCE.
 +                #
 +                # Round 12 (M12-2): recording the conflict and withdrawing the
@@ -201,16 +196,13 @@ index a314d35..618f4a9 100644
 +                _to_revoke = set(_conflicted) | _pending
 +                if _to_revoke:
                      try:
--                        db.mark_scan_category_conflict(_conflicted)
--                        db.retract_download_media_kind(
--                            _conflicted, reason="classification_conflict")
+-                        db.attest_scan_categories(_clean)
 +                        db.record_classification_conflicts_and_retract_kinds(
 +                            _to_revoke, reason="classification_conflict")
 +                        self._pending_revocations -= _to_revoke
                      except Exception:
--                        # Never let bookkeeping abort a scan. An unrecorded conflict
--                        # leaves the PREVIOUS state, which was already the status quo.
--                        logger.exception("failed to record classification conflicts")
+-                        logger.exception("failed to attest scan categories")
+-                if _conflicted:
 +                        # NOT bookkeeping. Round 13 (M13-1): the durable erase failed,
 +                        # but the release is already HELD inside
 +                        # record_classification_conflicts_and_retract_kinds(), which
@@ -224,6 +216,34 @@ index a314d35..618f4a9 100644
 +                            "semantic identity is served, but NOT yet erased on disk. "
 +                            "Retrying next cycle.", len(_to_revoke))
 +                        source_results[-1]["revocation_failed"] = len(_to_revoke)
++
++                # THE LISTING-CLAIM LEDGER (round 14).
++                #
++                # What each arm SAID about each release, kept. Until now this was
++                # a function-local dict rebuilt every crawl, so only conflicts
++                # survived and the sightings themselves were discarded -- while
++                # releases age off the listing continuously and a claim not
++                # captured cannot be reconstructed afterwards.
++                #
++                # Recorded regardless of the crawl verdict, and deliberately so:
++                # unlike attestation, writing down WHAT WAS SEEN needs no coverage
++                # proof. It is an observation, not a certification, and nothing
++                # reads this table to grant a media kind.
++                _claims = getattr(scanner, "_last_crawl_listing_claims", None) or []
++                if _claims:
+                     try:
+-                        db.mark_scan_category_conflict(_conflicted)
+-                        db.retract_download_media_kind(
+-                            _conflicted, reason="classification_conflict")
++                        db.record_listing_claims(_claims)
++                        db.backfill_listing_claim_order_keys()
+                     except Exception:
+-                        # Never let bookkeeping abort a scan. An unrecorded conflict
+-                        # leaves the PREVIOUS state, which was already the status quo.
+-                        logger.exception("failed to record classification conflicts")
++                        # A ledger failure must never affect the scan or the
++                        # safety paths above; it only costs future evidence.
++                        logger.exception("failed to record listing claims")
 +
 +                # ATTESTATION: only a crawl whose coverage could actually rule out a
 +                # contradiction may turn unknown into checked-clean.
@@ -257,7 +277,7 @@ index a314d35..618f4a9 100644
              if not self._owns_lifespan():
                  logger.info("Background scan abandoned before cache re-match: stale app lifespan")
 diff --git a/backend/database.py b/backend/database.py
-index 496e622..6415305 100644
+index 496e622..9c890a5 100644
 --- a/backend/database.py
 +++ b/backend/database.py
 @@ -84,6 +84,20 @@ class DatabaseManager:
@@ -281,7 +301,55 @@ index 496e622..6415305 100644
          self._init_depth = 0  # Guard against infinite recursion during recovery
          # Monotonic in-process revision, bumped on every background-cache write.
          # Folded into get_background_cache_version() so the parse-cache token
-@@ -4274,7 +4288,14 @@ class DatabaseManager:
+@@ -1214,6 +1228,47 @@ class DatabaseManager:
+                     CREATE INDEX IF NOT EXISTS idx_listing_policy_excl_source
+                     ON listing_policy_exclusions(source, policy_reason)
+                 """)
++
++                # LISTING CLAIMS -- what each arm said about a release, kept.
++                #
++                # Peer review round 13/14. `url_type_claim` was a function-local
++                # dict rebuilt on every crawl, so the observation "this release
++                # appeared under 4K Movies in this run" was DISCARDED every
++                # cycle; only conflicts survived, as a flag. That is exactly the
++                # evidence a coverage proof needs, and it was being destroyed
++                # continuously while releases aged off the listing.
++                #
++                # Recording it is deliberately independent of whichever coverage
++                # model is chosen: this table AUTHORIZES NOTHING. Nothing reads it
++                # to grant a media kind. It exists so the claims are still there
++                # when a proof model is agreed, because a claim not captured today
++                # cannot be reconstructed once the release leaves the listing.
++                #
++                # Additive DDL only, and NO schema-version bump: the base tables
++                # above are created unconditionally on every init, and
++                # docs/feature-pack-review/qualification/scripts/05_shadow_evidence.py
++                # BLOCKS on user_version != 9.
++                cursor.execute("""
++                    CREATE TABLE IF NOT EXISTS listing_claims (
++                        url TEXT NOT NULL,
++                        source TEXT NOT NULL,
++                        listing_type TEXT NOT NULL,
++                        listing_category TEXT NOT NULL DEFAULT '',
++                        order_key TEXT,
++                        first_seen_at TEXT NOT NULL,
++                        last_seen_at TEXT NOT NULL,
++                        sightings INTEGER NOT NULL DEFAULT 1,
++                        PRIMARY KEY (url, source, listing_type, listing_category)
++                    )
++                """)
++                cursor.execute("""
++                    CREATE INDEX IF NOT EXISTS idx_listing_claims_arm
++                    ON listing_claims(source, listing_type, listing_category)
++                """)
++                cursor.execute("""
++                    CREATE INDEX IF NOT EXISTS idx_listing_claims_url
++                    ON listing_claims(url)
++                """)
+                 for _column, _declaration in (
+                     ("imdb_id", "TEXT"),
+                     ("tmdb_id", "TEXT"),
+@@ -4274,7 +4329,14 @@ class DatabaseManager:
                  payload = json.loads(dict(row).get("data") or "{}")
              except (TypeError, ValueError):
                  continue
@@ -297,10 +365,202 @@ index 496e622..6415305 100644
                  continue
              payload["category_attested"] = True
              with self.transaction() as conn:
-@@ -4324,6 +4345,216 @@ class DatabaseManager:
+@@ -4324,6 +4386,408 @@ class DatabaseManager:
                  "identity built on those rows is withdrawn.", retracted, reason)
          return retracted
  
++    def record_listing_claims(self, claims):
++        """Persist what each listing arm SAID about a release. Authorizes nothing.
++
++        Round 14. Until now the per-crawl `url_type_claim` map was a function
++        local, rebuilt and discarded every cycle, so only CONFLICTS survived --
++        as a boolean. The observation itself (this release appeared under this
++        arm, at this time, with this order key) was thrown away.
++
++        That observation is the raw material of any coverage proof, and it is
++        perishable: once a release ages off every listing, no future crawl of any
++        depth can reconstruct which arms carried it. So it is captured now, while
++        the coverage model itself is still undecided.
++
++        DELIBERATELY INERT. Nothing reads this table to grant a media kind, and
++        it is not consulted by get_scan_category(), verified_media_kind(), or the
++        identity path. It is a ledger, not an authority -- adding evidence must
++        not be able to widen permission by itself.
++
++        `claims` is an iterable of dicts with keys: url, source, listing_type,
++        listing_category, and optionally order_key.
++
++        Returns the number of claim rows written or refreshed.
++        """
++        rows = []
++        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
++        for c in (claims or ()):
++            try:
++                url = str(c.get("url") or "").strip()
++                ltype = str(c.get("listing_type") or "").strip().lower()
++            except AttributeError:
++                continue
++            if not url or not ltype:
++                # A claim with no arm is not a claim.
++                continue
++            rows.append((
++                url,
++                str(c.get("source") or "").strip().lower(),
++                ltype,
++                str(c.get("listing_category") or "").strip().lower(),
++                (str(c.get("order_key")).strip() if c.get("order_key") else None),
++                now, now,
++            ))
++        if not rows:
++            return 0
++        with self.transaction() as conn:
++            if not conn:
++                return 0
++            conn.executemany(
++                "INSERT INTO listing_claims "
++                "(url, source, listing_type, listing_category, order_key, "
++                " first_seen_at, last_seen_at, sightings) "
++                "VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
++                "ON CONFLICT(url, source, listing_type, listing_category) "
++                "DO UPDATE SET "
++                "  last_seen_at = excluded.last_seen_at, "
++                "  sightings = listing_claims.sightings + 1, "
++                "  order_key = COALESCE(listing_claims.order_key, excluded.order_key)",
++                rows)
++        return len(rows)
++
++    def backfill_listing_claim_order_keys(self, limit=2000):
++        """Fill in `order_key` on claims from the cached `posted_date`.
++
++        Round 14. A claim is recorded at LISTING time, where no date is
++        available: `_select_posts()` returns anchor elements only -- href and
++        link text -- so the crawl genuinely cannot know when a release was
++        published at the moment it sees it in a listing. The date is parsed from
++        the DETAIL page (detail_scraper.py) and lands in the scan cache, where it
++        is present on 100% of live rows.
++
++        So this is an enrichment pass, kept separate from recording on purpose:
++        a claim must be captured whether or not a date can be attached, since the
++        claim is the perishable part and the date can be filled in later.
++
++        The value is the site's own string (e.g. "June 29, 2026 at 11:38 PM").
++        It is stored verbatim, NOT normalised here -- whether it is precise enough
++        to order coverage by is a question for the coverage model, and silently
++        reformatting it would hide the ambiguity rather than surface it.
++
++        Returns the number of claims enriched.
++        """
++        pending = self._query_dicts(
++            "SELECT DISTINCT url FROM listing_claims "
++            "WHERE order_key IS NULL LIMIT ?",
++            (int(limit),), default=[]) or []
++        if not pending:
++            return 0
++        urls = [r["url"] for r in pending]
++        found = {}
++        for start in range(0, len(urls), 300):
++            chunk = urls[start:start + 300]
++            rows = self._query_dicts(
++                "SELECT url, data FROM background_scan_cache WHERE url IN (%s)"
++                % ",".join("?" * len(chunk)),
++                tuple(chunk), default=[]) or []
++            for row in rows:
++                try:
++                    payload = json.loads(row.get("data") or "{}")
++                except (TypeError, ValueError):
++                    continue
++                pd = payload.get("posted_date")
++                if pd:
++                    found[row["url"]] = str(pd)
++        if not found:
++            return 0
++        with self.transaction() as conn:
++            if not conn:
++                return 0
++            conn.executemany(
++                "UPDATE listing_claims SET order_key = ? "
++                "WHERE url = ? AND order_key IS NULL",
++                [(v, k) for k, v in found.items()])
++        return len(found)
++
++    def get_listing_claims(self, url):
++        """Every arm that has ever claimed this release. Reporting/diagnostics."""
++        return self._query_dicts(
++            "SELECT source, listing_type, listing_category, order_key, "
++            "first_seen_at, last_seen_at, sightings "
++            "FROM listing_claims WHERE url = ? "
++            "ORDER BY first_seen_at",
++            (str(url),), default=[]) or []
++
++    def media_kind_coverage_summary(self):
++        """Why each release can or cannot be given a media kind, as counts.
++
++        Round 13/14: the reviewer asked that permanently-unknown releases be a
++        MEASURED CLASS rather than something that merely looks like a failed
++        backfill. Without this the blackout is indistinguishable from a bug --
++        which is exactly how I misread it going into round 12, when I reported
++        82% of the corpus going dark as a regression rather than as the
++        fail-closed answer it was.
++
++        Read-only, and it grants nothing.
++
++        Classes:
++            conflicted          two listings disagreed; never answerable
++            attested            checked clean; the category is usable
++            unknown_claimed     not attested, but at least one listing claim
++                                exists, so a future coverage proof COULD reach it
++            unknown_unclaimed   not attested and no claim on record. If the
++                                release has also aged off the listings, this is
++                                the permanently-unprovable class
++        """
++        rows = self._query_dicts(
++            "SELECT url, data FROM background_scan_cache", (), default=[]) or []
++        claimed = set()
++        for r in (self._query_dicts(
++                "SELECT DISTINCT url FROM listing_claims", (), default=[]) or []):
++            claimed.add(r["url"])
++        out = {
++            "total": 0, "conflicted": 0, "attested": 0,
++            "unknown_claimed": 0, "unknown_unclaimed": 0, "unreadable": 0,
++        }
++        for row in rows:
++            out["total"] += 1
++            try:
++                payload = json.loads(row.get("data") or "{}")
++            except (TypeError, ValueError):
++                # Unreadable evidence is its own class, not silently 'unknown'.
++                out["unreadable"] += 1
++                continue
++            if payload.get("category_conflict"):
++                out["conflicted"] += 1
++            elif payload.get("category_attested"):
++                out["attested"] += 1
++            elif row["url"] in claimed:
++                out["unknown_claimed"] += 1
++            else:
++                out["unknown_unclaimed"] += 1
++        return out
++
++    def listing_claim_summary(self):
++        """Counts per arm, and how many releases have claims from BOTH a movie
++        and a TV arm -- the population a conflict could ever be found in.
++        """
++        per_arm = self._query_dicts(
++            "SELECT source, listing_type, listing_category, COUNT(*) AS n "
++            "FROM listing_claims "
++            "GROUP BY source, listing_type, listing_category "
++            "ORDER BY n DESC",
++            (), default=[]) or []
++        both = self._query(
++            "SELECT COUNT(*) AS n FROM ("
++            "  SELECT url FROM listing_claims GROUP BY url "
++            "  HAVING COUNT(DISTINCT listing_type) > 1)",
++            (), one=True, default=None)
++        return {
++            "per_arm": [dict(r) for r in per_arm],
++            "claimed_by_multiple_types": (dict(both).get("n") if both else 0),
++        }
++
 +    def hold_media_kind(self, urls, *, reason):
 +        """Withhold semantic authority for these releases IMMEDIATELY.
 +
@@ -514,7 +774,7 @@ index 496e622..6415305 100644
      def get_scan_category(self, url):
          """The crawl category THIS SERVER recorded for a release URL.
  
-@@ -4402,6 +4633,11 @@ class DatabaseManager:
+@@ -4402,6 +4866,11 @@ class DatabaseManager:
          if not wanted:
              return {}
          out = {}
@@ -526,7 +786,7 @@ index 496e622..6415305 100644
          for start in range(0, len(wanted), 300):
              chunk = wanted[start:start + 300]
              rows = self._query_dicts(
-@@ -4409,12 +4645,32 @@ class DatabaseManager:
+@@ -4409,12 +4878,32 @@ class DatabaseManager:
                  "FROM downloads WHERE url IN (%s)" % ",".join("?" * len(chunk)),
                  tuple(chunk), default=[]) or []
              for row in rows:
@@ -562,10 +822,10 @@ index 496e622..6415305 100644
          return out
  
 diff --git a/backend/scanner_service.py b/backend/scanner_service.py
-index 42b8d77..b9f113b 100644
+index 42b8d77..355bb82 100644
 --- a/backend/scanner_service.py
 +++ b/backend/scanner_service.py
-@@ -264,6 +264,20 @@ class ScannerService:
+@@ -264,6 +264,23 @@ class ScannerService:
          # So every exit now says why it stopped, and only "complete" grants
          # membership authority.
          self._last_crawl_termination: str = "not_run"
@@ -577,6 +837,9 @@ index 42b8d77..b9f113b 100644
 +        # ('movie', 'tv', ...). A crawl that never fetched the TV arm cannot have
 +        # observed a movie-vs-TV disagreement, so its silence proves nothing.
 +        self._last_crawl_types_covered: Set[str] = set()
++        #: Round 14: one record per (release, arm) seen by the last crawl. A
++        #: ledger of observations; it authorises nothing on its own.
++        self._last_crawl_listing_claims: List[Dict] = []
 +        # Whether this crawl was RUN as an attesting crawl at all. The scheduled
 +        # background crawl is bounded by background_scan_pages and runs with
 +        # early_stop=True, so it deliberately never claims this. It may still
@@ -586,7 +849,7 @@ index 42b8d77..b9f113b 100644
          # THE DETAIL PIPELINE, tracked separately from membership. Cached skips and
          # policy exclusions never reach all_posts, so scheduled-minus-completed is
          # ONLY genuine attribution failures -- unlike the earlier
-@@ -371,6 +385,7 @@ class ScannerService:
+@@ -371,6 +388,7 @@ class ScannerService:
          track_urls: bool = True,
          skip_urls: Optional[Set[str]] = None,
          early_stop: bool = False,
@@ -594,7 +857,7 @@ index 42b8d77..b9f113b 100644
      ) -> List[MediaItem]:
          """Run a full scan synchronously (call from background thread).
  
-@@ -403,6 +418,12 @@ class ScannerService:
+@@ -403,6 +421,13 @@ class ScannerService:
              self.items.clear()
              self._item_counter = 0
          self._last_crawl_seen_urls = set()
@@ -604,10 +867,21 @@ index 42b8d77..b9f113b 100644
 +        # what else it reports. Both conditions, not either.
 +        self._last_crawl_attests_coverage = bool(attest_coverage) and not early_stop
 +        self._last_crawl_types_covered = set()
++        self._last_crawl_listing_claims = []
          self._last_crawl_request_count = 0
          # RESET THE WHOLE CRAWL-AUTHORITY STATE HERE, at run entry, beside the
          # resets above. Round 7 found the consequence of my having put this reset
-@@ -833,6 +854,8 @@ class ScannerService:
+@@ -818,6 +843,9 @@ class ScannerService:
+         #: cached, because a disagreement between two listings is evidence
+         #: about the release regardless of whether we re-fetch its detail page.
+         url_type_claim: Dict[str, str] = {}
++        #: Round 14 ledger: one record per (release, arm) observed this crawl.
++        listing_claims: List[Dict] = []
++        listing_claim_seen: Set[tuple] = set()
+         #: urls two listings disagreed about. Exposed after the crawl so the
+         #: caller can mark the CACHED rows, which are otherwise never rewritten.
+         conflicted_urls: Set[str] = set()
+@@ -833,6 +861,8 @@ class ScannerService:
          seen_exclusion_canonical: Set[str] = set()
          policy_excluded_known = 0
          early_stopped = False
@@ -616,7 +890,7 @@ index 42b8d77..b9f113b 100644
          total_pages = len(sources) * pages
          current_page = 0
  
-@@ -849,6 +872,21 @@ class ScannerService:
+@@ -849,6 +879,21 @@ class ScannerService:
              source_base = source["base"]
              source_suffix = source["suffix"]
              source_type_hint = source["type"]
@@ -638,7 +912,7 @@ index 42b8d77..b9f113b 100644
              source_id = source.get("source", "hdencode")
              source_category = source.get("category", "")
  
-@@ -975,6 +1013,7 @@ class ScannerService:
+@@ -975,6 +1020,7 @@ class ScannerService:
                          if not post_url:
                              continue
                          page_posts += 1
@@ -646,7 +920,29 @@ index 42b8d77..b9f113b 100644
                          # CLASSIFICATION CLAIM FIRST, for EVERY sighting.
                          #
                          # Peer review round 11 (M1b): the conflict check used to consult
-@@ -1046,7 +1085,13 @@ class ScannerService:
+@@ -987,6 +1033,21 @@ class ScannerService:
+                         #
+                         # A conflict is LISTING MEMBERSHIP evidence. Observing it needs no
+                         # detail fetch, so it is recorded before any skip decision.
++                        # THE LEDGER, round 14. Every arm's claim is kept, not
++                        # just the first: url_type_claim below records only the
++                        # winner-so-far because it exists to DETECT disagreement,
++                        # whereas a coverage proof needs the sightings themselves.
++                        # Deduped per (url, arm) so a release seen on two pages of
++                        # the same arm is one claim.
++                        _arm = (post_url, source_type_hint, source_category)
++                        if _arm not in listing_claim_seen:
++                            listing_claim_seen.add(_arm)
++                            listing_claims.append({
++                                "url": post_url,
++                                "source": source_id,
++                                "listing_type": source_type_hint,
++                                "listing_category": source_category,
++                            })
+                         _claim = url_type_claim.get(post_url)
+                         if _claim is None:
+                             url_type_claim[post_url] = source_type_hint
+@@ -1046,7 +1107,13 @@ class ScannerService:
                          _post = {'url': post_url, 'type': source_type_hint,
                                   'source': source_id, 'category': source_category,
                                   'category_conflict': False,
@@ -661,7 +957,7 @@ index 42b8d77..b9f113b 100644
                          all_posts.append(_post)
                          # Indexed so a LATER listing that classifies this same release
                          # differently can mark it, instead of being dropped by the dedup
-@@ -1078,6 +1123,14 @@ class ScannerService:
+@@ -1078,6 +1145,14 @@ class ScannerService:
                      # to be recorded as trustworthy resolution evidence.
                      self._last_crawl_page_errors += 1
  
@@ -676,15 +972,16 @@ index 42b8d77..b9f113b 100644
              if blocked_total:
                  # A blocked source's crawl is INCOMPLETE — treat it like an
                  # early-stop so the caller does NOT purge still-listed items it
-@@ -1123,6 +1176,7 @@ class ScannerService:
+@@ -1123,6 +1198,8 @@ class ScannerService:
          # A crawl that stopped early never visited deeper pages, so its seen-set
          # is partial — the caller must not age out items it simply didn't revisit.
          self._last_crawl_early_stopped = early_stopped
 +        self._last_crawl_types_covered = types_covered
++        self._last_crawl_listing_claims = listing_claims
          # The crawl's own verdict on itself, in precedence order: a stop that cut
          # it short, then pages that failed, then a suspicious empty result.
          # A recorded cancellation WINS over everything below it. Previously the
-@@ -1207,10 +1261,12 @@ class ScannerService:
+@@ -1207,10 +1284,12 @@ class ScannerService:
                  # differently. Carried so the recorded kind can decline to
                  # answer rather than silently reporting whichever listing
                  # happened to be crawled first.
@@ -1444,3 +1741,261 @@ index 0000000..f9dd7de
 +        }])
 +        assert db.reconcile_unrevoked_conflicts() == 1
 +        assert _served_kind(db) is None
+diff --git a/tests/test_round14_listing_claim_ledger.py b/tests/test_round14_listing_claim_ledger.py
+new file mode 100644
+index 0000000..9034820
+--- /dev/null
++++ b/tests/test_round14_listing_claim_ledger.py
+@@ -0,0 +1,252 @@
++"""Round 14: keep what each listing arm SAID, before the releases age off.
++
++The reviewer's coverage model needs per-release listing claims. Until now
++`url_type_claim` was a function-local dict rebuilt on every crawl: only CONFLICTS
++survived, as a boolean, and the sightings themselves were discarded. Releases age
++off the listings continuously, and a claim not captured cannot be reconstructed
++by any later crawl of any depth -- so the recording half is built now, while the
++coverage model itself is still undecided.
++
++THE PROPERTY THAT MATTERS MOST is that the ledger is INERT. Adding evidence must
++not be able to widen permission on its own; if recording a claim could make a
++release answerable, this would be the attestation bug again wearing a new hat.
++`test_the_ledger_authorises_nothing` is that control.
++"""
++import json
++import pytest
++
++from backend.database import DatabaseManager
++from backend.background_scanner import BackgroundScanner
++from tests.test_background_scanner import _FakeScanner, _FakeRegistry
++
++URL = "https://hdencode.example/the-release-2026-2160p/"
++OTHER = "https://hdencode.example/another-2026-2160p/"
++
++
++@pytest.fixture
++def db(tmp_path):
++    dm = DatabaseManager(str(tmp_path / "r14.db"))
++    yield dm
++    dm.close()
++
++
++def _claim(url, ltype, category, source="hdencode"):
++    return {"url": url, "source": source,
++            "listing_type": ltype, "listing_category": category}
++
++
++class TestClaimsArePersisted:
++
++    def test_every_arm_is_recorded_not_only_the_first(self, db):
++        """The whole point. `url_type_claim` kept only the winner-so-far because
++        it exists to DETECT disagreement; a coverage proof needs the sightings."""
++        assert db.record_listing_claims([
++            _claim(URL, "movie", "4k"),
++            _claim(URL, "tv", "tv"),
++        ]) == 2
++        arms = {(c["listing_type"], c["listing_category"])
++                for c in db.get_listing_claims(URL)}
++        assert arms == {("movie", "4k"), ("tv", "tv")}
++
++    def test_re_observation_counts_and_keeps_the_first_sighting(self, db):
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        first = db.get_listing_claims(URL)[0]["first_seen_at"]
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        row = db.get_listing_claims(URL)[0]
++        assert row["sightings"] == 2
++        assert row["first_seen_at"] == first, (
++            "first_seen_at is when the claim was first observed; overwriting it "
++            "would destroy the age information the coverage model needs")
++
++    def test_a_claim_without_an_arm_is_not_a_claim(self, db):
++        assert db.record_listing_claims([{"url": URL, "source": "hdencode"}]) == 0
++        assert db.get_listing_claims(URL) == []
++
++    def test_the_summary_counts_releases_claimed_by_both_types(self, db):
++        """The population a movie-vs-TV conflict could ever be found in."""
++        db.record_listing_claims([
++            _claim(URL, "movie", "4k"), _claim(URL, "tv", "tv"),
++            _claim(OTHER, "movie", "4k"),
++        ])
++        s = db.listing_claim_summary()
++        assert s["claimed_by_multiple_types"] == 1
++
++
++class TestTheLedgerIsInert:
++    """THE SAFETY CONTROL.
++
++    Evidence accumulating must never widen permission by itself. The attestation
++    bug was exactly this shape -- an observation being read as a certification."""
++
++    def test_the_ledger_authorises_nothing(self, db):
++        db.upsert_background_cache([{
++            "url": URL, "title": "The Release", "year": 2026,
++            "status": "missing", "source_category": "HDEncode",
++            "data": json.dumps({"url": URL, "category": "4k"}),
++        }])
++        assert db.get_scan_category(URL) is None, "precondition: unattested"
++
++        db.record_listing_claims([
++            _claim(URL, "movie", "4k"), _claim(URL, "movie", "remux"),
++        ])
++        db.backfill_listing_claim_order_keys()
++
++        assert db.get_scan_category(URL) is None, (
++            "recording claims made an unattested release answerable -- the "
++            "ledger has become an authority, which is the bug it exists to "
++            "provide evidence against")
++
++    def test_claims_do_not_mark_a_conflict_on_their_own(self, db):
++        """Two disagreeing claims are the RAW MATERIAL of a conflict, not a
++        conflict. The crawl decides that, with its own logic."""
++        db.upsert_background_cache([{
++            "url": URL, "title": "x", "year": 2026, "status": "missing",
++            "source_category": "HDEncode",
++            "data": json.dumps({"url": URL, "category": "4k",
++                                "category_attested": True}),
++        }])
++        assert db.get_scan_category(URL) == "4k", "precondition: attested clean"
++        db.record_listing_claims([
++            _claim(URL, "movie", "4k"), _claim(URL, "tv", "tv"),
++        ])
++        assert db.get_scan_category(URL) == "4k", (
++            "the ledger must not mutate classification state; only the crawl's "
++            "own conflict path may do that")
++
++
++class TestOrderKeyBackfill:
++
++    def _cached_with_date(self, db, url=URL, date="June 29, 2026 at 11:38 PM"):
++        db.upsert_background_cache([{
++            "url": url, "title": "The Release", "year": 2026,
++            "status": "missing", "source_category": "HDEncode",
++            "data": json.dumps({"url": url, "category": "4k",
++                                "posted_date": date}),
++        }])
++
++    def test_it_fills_the_order_key_from_the_cached_posted_date(self, db):
++        """The claim is recorded at LISTING time, where no date exists: the
++        selector returns anchors only. The date comes from the detail page."""
++        self._cached_with_date(db)
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        assert db.get_listing_claims(URL)[0]["order_key"] is None
++        assert db.backfill_listing_claim_order_keys() == 1
++        assert db.get_listing_claims(URL)[0]["order_key"] == \
++            "June 29, 2026 at 11:38 PM"
++
++    def test_a_claim_with_no_cached_date_simply_stays_unenriched(self, db):
++        """POSITIVE CONTROL for the failure direction: the claim must still be
++        RECORDED. The claim is the perishable part; the date can arrive later."""
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        assert db.backfill_listing_claim_order_keys() == 0
++        assert len(db.get_listing_claims(URL)) == 1
++
++    def test_it_does_not_overwrite_a_key_it_already_has(self, db):
++        self._cached_with_date(db, date="January 1, 2020 at 1:00 AM")
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        db.backfill_listing_claim_order_keys()
++        self._cached_with_date(db, date="December 31, 2026 at 9:00 PM")
++        db.backfill_listing_claim_order_keys()
++        assert db.get_listing_claims(URL)[0]["order_key"] == \
++            "January 1, 2020 at 1:00 AM"
++
++
++class TestTheCrawlRecordsClaims:
++
++    def test_a_partial_crawl_still_records_what_it_saw(self, db):
++        """Unlike attestation, writing down what was OBSERVED needs no coverage
++        proof -- so an early-stopped crawl must still contribute to the ledger."""
++        scanner = _FakeScanner()
++        scanner._last_crawl_seen_urls = {URL}
++        scanner._last_crawl_conflicted_urls = set()
++        scanner._last_crawl_early_stopped = True
++        scanner._last_crawl_termination = "early_stopped"
++        scanner._last_crawl_attests_coverage = False
++        scanner._last_crawl_types_covered = set()
++        scanner._last_crawl_listing_claims = [_claim(URL, "movie", "4k")]
++
++        BackgroundScanner(_FakeRegistry(
++            {"background_scan_sources": ["HDEncode"], "background_scan_pages": 3},
++            scanner, db)).scan_once()
++
++        assert len(db.get_listing_claims(URL)) == 1
++        assert db.get_scan_category(URL) is None, (
++            "and it still must not have attested anything")
++
++
++class TestAnExplicitlySuppliedOrderKeyIsAlsoPreserved:
++    """Found by mutation, not by design.
++
++    Removing the COALESCE in record_listing_claims() left every test passing:
++    the tests above go through backfill_listing_claim_order_keys(), whose
++    `WHERE order_key IS NULL` already prevents an overwrite, so the ON CONFLICT
++    clause was never reached. The line was real but unexercised."""
++
++    def test_a_second_sighting_does_not_replace_the_recorded_key(self, db):
++        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
++                                       order_key="June 1, 2026 at 1:00 AM")])
++        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
++                                       order_key="June 2, 2026 at 2:00 AM")])
++        row = db.get_listing_claims(URL)[0]
++        assert row["order_key"] == "June 1, 2026 at 1:00 AM"
++        assert row["sightings"] == 2
++
++    def test_but_a_missing_key_is_still_filled_in_later(self, db):
++        """The other direction: COALESCE must not freeze a NULL."""
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        assert db.get_listing_claims(URL)[0]["order_key"] is None
++        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
++                                       order_key="June 3, 2026 at 3:00 AM")])
++        assert db.get_listing_claims(URL)[0]["order_key"] ==             "June 3, 2026 at 3:00 AM"
++
++
++class TestCoverageSummaryMakesTheUnknownsAMeasuredClass:
++    """The reviewer asked that permanently-unknown releases be a reported class
++    rather than something that merely looks like a failed backfill.
++
++    That distinction is not academic: going into round 12 I read 82% of the
++    corpus going dark as a regression, and it was the fail-closed answer working
++    correctly. A number nobody prints is a number everybody misreads."""
++
++    def _row(self, db, url, **payload):
++        data = {"url": url, "category": "4k"}
++        data.update(payload)
++        db.upsert_background_cache([{
++            "url": url, "title": "t", "year": 2026, "status": "missing",
++            "source_category": "HDEncode", "data": json.dumps(data),
++        }])
++
++    def test_each_release_lands_in_exactly_one_class(self, db):
++        self._row(db, "u/conflicted", category_conflict=True)
++        self._row(db, "u/attested", category_attested=True)
++        self._row(db, "u/claimed")
++        self._row(db, "u/unclaimed")
++        db.record_listing_claims([_claim("u/claimed", "movie", "4k")])
++
++        s = db.media_kind_coverage_summary()
++        assert s["total"] == 4
++        assert s["conflicted"] == 1
++        assert s["attested"] == 1
++        assert s["unknown_claimed"] == 1
++        assert s["unknown_unclaimed"] == 1
++        assert (s["conflicted"] + s["attested"] + s["unknown_claimed"]
++                + s["unknown_unclaimed"] + s["unreadable"]) == s["total"], (
++            "the classes must partition the corpus, or the report invites the "
++            "same misreading it exists to prevent")
++
++    def test_a_conflict_outranks_an_attestation(self, db):
++        """Both keys present is not a tie: a recorded conflict wins."""
++        self._row(db, "u/both", category_attested=True, category_conflict=True)
++        s = db.media_kind_coverage_summary()
++        assert s["conflicted"] == 1 and s["attested"] == 0
++
++    def test_unreadable_rows_are_their_own_class(self, db):
++        """Not silently folded into unknown. Unreadable evidence is a different
++        problem from absent evidence and needs to be visible as one."""
++        db.upsert_background_cache([{
++            "url": "u/bad", "title": "t", "year": 2026, "status": "missing",
++            "source_category": "HDEncode", "data": "{not json",
++        }])
++        s = db.media_kind_coverage_summary()
++        assert s["unreadable"] == 1
++        assert s["unknown_unclaimed"] == 0

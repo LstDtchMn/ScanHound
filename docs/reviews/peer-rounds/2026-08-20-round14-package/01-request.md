@@ -150,6 +150,49 @@ parser health: an arm that parsed nothing has no watermark to advance.
    policy-excluded full disc, for instance — contributes no date. Should its arm's
    watermark refuse to advance past it, or is skipping it sound?
 
+### What I DID build, because it is ruling-independent and perishable
+
+One line of yours changed what I did with the waiting time:
+
+> Persist claims before releases age off.
+
+That does not depend on which coverage model you choose — every variant needs the
+claims — and it is time-sensitive in a way the rest of the design is not. So I
+built the recording half only.
+
+The state it replaces is worse than "not built". `url_type_claim` was a
+**function-local dict, rebuilt on every crawl**. Only conflicts survived, as a
+boolean; the sightings themselves were discarded every cycle. Meanwhile releases
+age off continuously, and a claim not captured cannot be reconstructed by any
+later crawl of any depth.
+
+```text
+listing_claims(url, source, listing_type, listing_category,
+               order_key, first_seen_at, last_seen_at, sightings)
+```
+
+**The ledger authorizes nothing, and there is a test asserting exactly that.**
+`get_scan_category()`, `verified_media_kind()` and the identity path do not
+consult it. Accumulating evidence must not be able to widen permission by itself
+— the attestation bug was precisely that shape, an observation being read as a
+certification, and I would rather over-state this constraint than repeat it.
+
+Claims are recorded **regardless of the crawl verdict**, deliberately: unlike
+attestation, writing down what was seen needs no coverage proof. A mutation that
+gates recording on a qualifying crawl kills a test.
+
+`order_key` is filled by a separate backfill from the cached `posted_date`,
+kept apart from recording so a claim is captured whether or not a date can be
+attached.
+
+**No schema-version bump**, checked before writing rather than after: the base
+tables are created unconditionally on every init so additive DDL needs none, and
+`qualification/scripts/05_shadow_evidence.py` **blocks** on `user_version != 9`.
+A bump would have broken the RSS qualification gate.
+
+If you want a different claim shape, this is cheap to change — the point was to
+stop destroying the evidence while we decide.
+
 ### On aged-off rows
 
 Accepted without reservation: no historical coverage proof and no independent
@@ -160,16 +203,16 @@ historical absence, and I will not substitute title parsing for it.
 ## Verification
 
 ```text
-code head    75c6b0c
+code head    0c0f5d1
 
                               failed   passed   skipped
 main control (origin/main)         1     5320         4
-this branch                        1     5351         4
+this branch                        1     5366         4
 ```
 
 Same single pre-existing failure both sides
 (`test_dv_settings::test_all_frontend_editable_settings_keys_are_in_model`).
-**+31 passing, zero net new failures.**
+**+46 passing, zero net new failures.**
 
 Both containers were provisioned identically in the same session, and are the
 same pair used for round 13 — `main` has not moved, so the control figure is the
@@ -177,7 +220,7 @@ one measured then.
 
 ## The question for this round
 
-Two:
+Three:
 
 1. Does withdrawing `season` as well as `media_kind` over-withdraw anywhere I
    have not looked? It is the right call for a movie-vs-TV conflict, but it is a
@@ -185,3 +228,9 @@ Two:
 2. The three watermark questions above — particularly (1), since deriving
    coverage from previously stored dates is the step where I could be relocating
    the trust problem again rather than solving it.
+3. Is the `listing_claims` shape right, and is recording it while the model is
+   undecided the correct call? My reasoning was that the claims are perishable
+   and the model is not, so capturing them cannot be premature — but that is an
+   argument for acting before a ruling, which is the kind of reasoning that has
+   gone wrong twice in this work already. If the shape is wrong, it is cheap to
+   change now and expensive once months of claims exist.

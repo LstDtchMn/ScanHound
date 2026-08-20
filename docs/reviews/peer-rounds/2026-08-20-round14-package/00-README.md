@@ -8,7 +8,7 @@ to fetch code from the branch.
 ```text
 repository    LstDtchMn/ScanHound
 branch        fix/round12-attestation-authority
-code head     75c6b0c1d9a6ed6bd26f7ca2cd00df6413025115
+code head     0c0f5d12b48535991ec1b31ee58e7d3834210e44
 base          6ac5cd2aefb81bb7d85354577a69af269b8e05e5   (main, 0 behind)
 working tree  clean
 deployed      NOTHING. The running container predates all media-kind work.
@@ -41,6 +41,12 @@ deployed      NOTHING. The running container predates all media-kind work.
    previously stored dates is exactly the kind of step where I could relocate the
    trust problem instead of solving it, which is what round 13 caught me doing.
 
+4. **What IS built: the listing-claim ledger.** Your line "persist claims before
+   releases age off" is ruling-independent and perishable, so I built the
+   recording half only. `url_type_claim` was a function-local dict rebuilt every
+   crawl — the sightings were being destroyed continuously. The new table
+   **authorizes nothing**, and a test asserts that.
+
 ## Round-13 dispositions
 
 ```text
@@ -50,5 +56,6 @@ M13-1   fail-closed revocation      FIXED    hold -> erase -> mark -> release
 L13-1   parser health as coverage   FIXED    an arm earns coverage by parsing
         real-producer tests         FIXED    tests drive _crawl_pages() itself
         coverage proof / watermark  NOT BUILT -- evidence gathered, questions asked
+        persist claims before ageing BUILT     -- ruling-independent, inert ledger
         legacy aged-off policy      ACCEPTED  permanently unknown, reported as a class
 ```
