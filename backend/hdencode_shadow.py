@@ -461,27 +461,32 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
     # spans catch-up feeds and counts attempted-but-failed requests, so it
     # admitted exactly the stale comparisons it was meant to exclude.
     if misses and normal_feeds_complete: outcome='relevant_miss'
-    # -- fail-closed guards, sweep branch section 10 ---------------------
-    # Checked AFTER the ordinary outcomes and overriding them, because
-    # "we could not conclude" outranks any conclusion. Each of these
-    # previously produced 'success': a verdict reached with no usable
-    # evidence.
-    if not listing_urls:
-        # No baseline to detect misses against. Zero misses here means zero
-        # comparisons were possible, not zero problems.
-        outcome='no_listing_baseline'
-    elif not rss:
-        # RSS returned nothing at all. Without any relevant-state listing
-        # item this would otherwise have scored a clean success on an
-        # empty feed.
-        outcome='no_rss_observations'
-    elif not duplicate:
-        # Both sides have identities and NONE match. Two views of one
-        # source overlapping in nothing is the signature of an identity
-        # mismatch, not genuine divergence -- exactly what ScanHound's two
-        # trailing-slash-divergent canonicalisers produced when a healthy
-        # 99-of-100 pipeline was reported as "0 of 100 never acquired".
-        outcome='disjoint_identity_sets'
+    # FAIL-CLOSED GUARDS, and they apply ONLY to a would-be SUCCESS.
+    #
+    # Their own rationale names the case: "each of these previously produced
+    # 'success' -- a verdict reached with no usable evidence". Applying them
+    # unconditionally (which is what the merge first did) also overrode
+    # 'relevant_miss' and 'incomplete_feeds', and both are real answers:
+    # a relevant_miss is an OBSERVATION, and incomplete_feeds is already the
+    # invalidity label. Overwriting them replaced information with a
+    # different, less specific kind of doubt -- and silently changed the
+    # vocabulary every downstream consumer switches on.
+    if outcome == 'success':
+        if not listing_urls:
+            # No baseline to detect misses against. Zero misses here means
+            # zero comparisons were possible, not zero problems.
+            outcome='no_listing_baseline'
+        elif not rss:
+            # RSS returned nothing at all, and nothing in the listing
+            # contradicted it -- a clean success scored on an empty feed.
+            outcome='no_rss_observations'
+        elif not duplicate:
+            # Both sides have identities and NONE match. Two views of one
+            # source overlapping in nothing is the signature of an identity
+            # mismatch, not genuine agreement -- exactly what ScanHound's two
+            # trailing-slash-divergent canonicalisers produced when a healthy
+            # 99-of-100 pipeline was reported as "0 of 100 never acquired".
+            outcome='disjoint_identity_sets'
     return ShadowComparison(len(rss),len(listing_urls),len(duplicate),len(feed_only),len(listing_only),len(misses),int(rss_requests),int(listing_requests),round(reduction,2),bool(normal_feeds_complete),outcome,tuple(sorted(feed_only)),tuple(sorted(listing_only)),tuple(misses),dict(recorded),tuple(unattributable),
         # A CONTRADICTION WITHHOLDS THE AUTHORITY CLAIM, it does not merely get
         # logged. Recording a problem and then still asserting listing authority

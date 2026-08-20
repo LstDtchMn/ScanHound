@@ -3377,8 +3377,25 @@ class DatabaseManager:
             # separate authority: cycle_is_valid_evidence_for() requires the
             # listing arm AND the relevant feed, so an "incomplete_feeds" cycle
             # whose LISTING failed still cannot resolve anything.
+            # ADMIT THE INCONCLUSIVE OUTCOMES TOO, 2026-08-19. The hybrid-sweep
+            # merge added three fail-closed guards to compare_shadow -- 
+            # no_listing_baseline, no_rss_observations, disjoint_identity_sets --
+            # which OVERRIDE the ordinary outcome. None was in this filter, so a
+            # guarded cycle was discarded here and its unattributed candidates
+            # stopped blocking: readiness could go clean on a cycle the guard had
+            # just declared unusable. That is the exact failure the note above
+            # records for incomplete_feeds -- "the helper was right and
+            # unreachable" -- reintroduced by a different route.
+            #
+            # Admitting them is safe for the same reason admitting incomplete_feeds
+            # was: cycle_is_valid_evidence_for() requires the listing arm AND the
+            # relevant feed, so an inconclusive cycle still cannot RESOLVE anything.
+            # It can only continue to BLOCK, which is what a guard should do.
             if not (row.get("outcome") in ("success","relevant_miss",
-                                           "incomplete_feeds")
+                                           "incomplete_feeds",
+                                           "no_listing_baseline",
+                                           "no_rss_observations",
+                                           "disjoint_identity_sets")
                     and int(row.get("rss_requests") or 0)>0
                     and int(row.get("listing_requests") or 0)>0):
                 continue

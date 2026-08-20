@@ -27,9 +27,28 @@ def collector():
     return _load()
 
 
-def blockers(collector, app, *, missing_credentials=False):
+def blockers(collector, app, *, missing_credentials=False, reconciliation=None):
+    """Drive the real signature, which takes the VERDICT separately.
+
+    UPDATED 2026-08-19. This helper passed the verdict as `app_readiness`,
+    because when it was written the comparison lived in that payload. It no
+    longer does, and the reason is in the production code:
+
+        "The COMPARISON lives in `reconciliation`, not in `app_readiness`.
+         Reading it from the payload being compared is what broke this."
+
+    A test that keeps handing the verdict to the old parameter cannot see that
+    split, and would go on passing while the collector read the wrong field --
+    which is the exact defect the split fixed.
+
+    A bare `ready_matches` dict is therefore routed to `reconciliation`, so the
+    old call sites keep testing what they were written to test.
+    """
+    if reconciliation is None and isinstance(app, dict) and "ready_matches" in app:
+        app, reconciliation = {}, app
     return collector.reconciliation_blockers(
-        app, missing_credentials=missing_credentials)
+        app, missing_credentials=missing_credentials,
+        reconciliation=reconciliation)
 
 
 class TestFailsClosed:

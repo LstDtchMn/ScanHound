@@ -37,9 +37,23 @@ from datetime import datetime, timedelta, timezone
 from backend import database as database_module
 from backend.database import DatabaseManager
 from backend.hdencode_shadow import (
+
     classify_miss_resolution,
     summarise_miss_resolutions,
 )
+
+#: These tests predate the qualification window. With none started,
+#: readiness returns exactly one reason ("qualification_window_not_started")
+#: and zeroes every gate field, so the blockers they assert can never
+#: appear -- not because the blocking stopped working, but because
+#: nothing is in scope to block on. The boundary precedes every fixture
+#: cycle in this file.
+_WINDOW_BOUNDARY = "2026-01-01T00:00:00+00:00"
+
+
+def _with_window(db):
+    return db.start_qualification_window(_WINDOW_BOUNDARY)["window_start_at"]
+
 
 T0 = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
 URL = "https://hdencode.org/some-release-2160p/"
@@ -192,7 +206,7 @@ class TestTheProductionPathActuallyUsesIt:
                               "undetermined": 3, "not_yet_assessable": 4,
                               "blocking": 9, "worst_acquisition_lag_hours": 41.5,
                               "rows": [], "evidence_problems": ["bad:c1"]})
-            out = db.get_hdencode_rss_readiness()
+            out = db.get_hdencode_rss_readiness(window_start_at=_with_window(db))
             assert "unacquired_misses_detected" in out["reasons"]
             assert "miss_resolution_undetermined" in out["reasons"]
             assert "miss_resolution_pending" in out["reasons"], (
@@ -216,7 +230,7 @@ class TestTheProductionPathActuallyUsesIt:
                               "undetermined": 0, "not_yet_assessable": 0,
                               "blocking": 0, "worst_acquisition_lag_hours": 3.2,
                               "rows": [], "evidence_problems": []})
-            out = db.get_hdencode_rss_readiness()
+            out = db.get_hdencode_rss_readiness(window_start_at=_with_window(db))
             for reason in ("unacquired_misses_detected",
                            "miss_resolution_undetermined",
                            "miss_resolution_pending",

@@ -31,6 +31,19 @@ from backend.download_outcome import _FAILURE_TITLES
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, _MESSAGES
 from backend.source_identity import SOURCE_KINDS
 
+#: These tests predate the qualification window. With none started, readiness
+#: returns exactly one reason ("qualification_window_not_started") and zeroes
+#: every gate field, so the blockers they assert can never appear -- not
+#: because the blocking stopped working, but because nothing is in scope to
+#: block on. The boundary below precedes every fixture cycle in this file.
+_WINDOW_BOUNDARY = "2026-01-01T00:00:00+00:00"
+
+
+def _with_window(db):
+    return db.start_qualification_window(_WINDOW_BOUNDARY)["window_start_at"]
+
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Pre-crawl exit must not inherit the previous run's crawl authority
@@ -525,6 +538,6 @@ def test_candidate_blocking_still_reaches_readiness(db):
     _cycle(db, listing_complete=1, at="2026-08-01T00:00:00+00:00",
            details={"detail_failed": [ONLY], "listing_only": [ONLY],
                     "feed_only": []})
-    readiness = db.get_hdencode_rss_readiness()
+    readiness = db.get_hdencode_rss_readiness(window_start_at=_with_window(db))
     assert "unattributed_listing_candidates" in readiness["reasons"]
     assert readiness["ready"] is False
