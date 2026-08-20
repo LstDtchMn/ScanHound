@@ -92,6 +92,13 @@ class MediaItem:
     # Drives the instant 4K/Remux/TV display filter in the UI.
     category: str = ""
 
+    #: True when this release appeared in two listings that disagree
+    #: about its type -- a movie listing and TV Packs, say. The crawl
+    #: used to drop the second sighting entirely, so `category` was
+    #: whichever source ran first. A conflict is recorded instead of
+    #: resolved, because there is no evidence here for picking one.
+    category_conflict: bool = False
+
 
 @dataclass
 class WatchlistItem:
@@ -794,6 +801,9 @@ class ScannerService:
             canonicalize_listing_url(u) for u in (policy_excluded or set())
         }
         seen_post_urls: Set[str] = set()  # O(1) dedup instead of O(n) list scan
+        #: url -> the appended post dict, so a later source that disagrees
+        #: about the media type can mark it rather than be dropped.
+        post_index: Dict[str, dict] = {}
         skipped_count = 0
         # Full-disc releases the operator excludes by policy. Split by whether
         # this crawl is seeing them for the first time — the two cases differ
@@ -949,6 +959,25 @@ class ScannerService:
                             continue
                         page_posts += 1
                         if post_url in seen_post_urls:
+                            # FIRST-SOURCE-WINS WAS SILENT. Peer review round 10, M1:
+                            # one seen_post_urls set spans every source, and the movie
+                            # listings are crawled before TV Packs, so a release visible
+                            # in both was recorded as a movie and the TV listing was
+                            # skipped entirely -- its evidence discarded with no trace.
+                            #
+                            # The post is still processed ONCE; what changes is that a
+                            # disagreeing second listing is now RECORDED. Only the type
+                            # axis matters here: '4k' and 'remux' both mean movie, so a
+                            # collision between those two is not a conflict about KIND.
+                            _prior = post_index.get(post_url)
+                            if _prior is not None and _prior.get('type') != source_type_hint:
+                                if not _prior.get('category_conflict'):
+                                    logger.info(
+                                        "classification conflict: %s listed as %s (%s) and "
+                                        "%s (%s); recording the conflict, not a winner",
+                                        post_url, _prior.get('type'), _prior.get('category'),
+                                        source_type_hint, source_category)
+                                _prior['category_conflict'] = True
                             continue
                         seen_post_urls.add(post_url)
                         page_unique += 1
@@ -990,7 +1019,14 @@ class ScannerService:
                                 policy_excluded_new.append(row)
                             continue
                         page_new += 1
-                        all_posts.append({'url': post_url, 'type': source_type_hint, 'source': source_id, 'category': source_category})
+                        _post = {'url': post_url, 'type': source_type_hint,
+                                 'source': source_id, 'category': source_category,
+                                 'category_conflict': False}
+                        all_posts.append(_post)
+                        # Indexed so a LATER listing that classifies this same release
+                        # differently can mark it, instead of being dropped by the dedup
+                        # below and silently losing its evidence.
+                        post_index[post_url] = _post
 
                     # Early-stop: a populated page that yields no new posts means
                     # we've reached content already cached/seen — deeper pages are
@@ -1138,6 +1174,12 @@ class ScannerService:
                 is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'
                 details['source'] = post_source
                 details['category'] = post_info.get('category', '')
+                # Set when a second listing classified this same release
+                # differently. Carried so the recorded kind can decline to
+                # answer rather than silently reporting whichever listing
+                # happened to be crawled first.
+                details['category_conflict'] = bool(
+                    post_info.get('category_conflict'))
                 return {'details': details, 'is_tv': is_tv, 'url': url}
             except Exception as e:
                 logger.debug("Error processing post %s: %s", url, e)
@@ -1296,6 +1338,7 @@ class ScannerService:
                 description=details.get('description', ''),
                 posted_date=details.get('posted_date'),
                 category=details.get('category', ''),
+                category_conflict=bool(details.get('category_conflict')),
             )
         except Exception as e:
             self._log(f"Error creating media item: {e}", "warning")
@@ -1340,6 +1383,7 @@ class ScannerService:
                 group_key=d.get('group_key', '') or '',
                 prior_grab=d.get('prior_grab'),
                 category=d.get('category', '') or '',
+                category_conflict=bool(d.get('category_conflict')),
             )
         except Exception:
             return None

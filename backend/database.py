@@ -4204,6 +4204,49 @@ class DatabaseManager:
                 return None   # ambiguous; no honest answer
         return next(iter(found)) if len(found) == 1 else None
 
+    def get_scan_category(self, url):
+        """The crawl category THIS SERVER recorded for a release URL.
+
+        Peer review round 10, M1: the media kind was being taken from
+        `DownloadRequest.category`, which is unvalidated and arrives from the
+        client. The server scanned the release itself and already knows which
+        listing it came from, so it should answer this question rather than
+        accept an answer back.
+
+        Read from the cached scan row's JSON, not from `source_category` --
+        that column holds the SOURCE NAME ('HDEncode' on every one of the
+        4,084 live rows), while the crawl category ('4k' | 'remux' | 'tv') is
+        inside `data`. Verified before relying on it.
+
+        Returns None when the URL was never scanned by this server, which is
+        NOT the same as a category of ''. The caller must treat it as
+        "cannot verify" and record nothing.
+        """
+        if not url:
+            return None
+        row = self._query(
+            "SELECT data FROM background_scan_cache WHERE url = ?",
+            (str(url),), one=True, default=None)
+        if not row:
+            return None
+        try:
+            payload = json.loads(dict(row).get("data") or "{}")
+        except (TypeError, ValueError):
+            # Unreadable evidence is not absent evidence, but it is not usable
+            # either. None here means the caller records nothing.
+            logger.warning("scan cache row for %s has undecodable data", url)
+            return None
+        if payload.get("category_conflict"):
+            # Two listings classified this release differently and the crawl
+            # recorded that rather than picking the one it happened to see
+            # first. There is no server-owned answer here, so there is no
+            # answer -- returning the first-seen category would be exactly the
+            # silent movie-wins outcome M1 is about.
+            logger.info("no media kind for %s: listings disagree about its type", url)
+            return None
+        category = str(payload.get("category") or "").strip().lower()
+        return category or None
+
     def get_release_identity(self, urls):
         """Map release url -> the SEMANTIC identity recorded when it was grabbed:
         ``{"date_added", "title", "year", "season"}``.
