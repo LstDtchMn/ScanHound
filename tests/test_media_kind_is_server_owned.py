@@ -54,8 +54,12 @@ def _scanned_as(db, category, url=URL):
         "year": 2026,
         "status": "missing",
         "source_category": "HDEncode",
+        # category_attested: a conflict-aware crawl checked this release.
+        # Without it the lookup refuses, because a row written before
+        # conflict detection cannot prove it was ever checked.
         "data": json.dumps({"url": url, "title": "Some Release",
-                            "category": category, "season": None}),
+                            "category": category, "season": None,
+                            "category_attested": True}),
     }])
 
 
@@ -271,6 +275,7 @@ class TestAConflictedReleaseHasNoRecordedKind:
             "url": URL, "title": "Some Show", "year": 2026, "status": "missing",
             "source_category": "HDEncode",
             "data": json.dumps({"url": URL, "category": category,
+                                "category_attested": True,
                                 "category_conflict": conflict}),
         }])
 
@@ -294,3 +299,188 @@ class TestAConflictedReleaseHasNoRecordedKind:
         assert svc.verified_media_kind(URL, "4k") is None
         assert svc.verified_media_kind(URL, "tv") is None
         assert svc.verified_media_kind(URL, "") is None
+
+
+# ── M1a: a conflict must RETRACT an already-persisted kind ────────────────
+#
+# Peer review round 11. verified_media_kind() refuses to RECORD a kind once a
+# conflict appears -- but the destructive identity does not read the cache. It
+# reads the already-persisted downloads.media_kind through
+# get_release_identity(). So a kind written BEFORE the conflict was discovered
+# stayed authoritative and Keep-best stayed available on it.
+#
+# Reproduced before fixing: T0 record movie -> T1 conflict appears ->
+# verified_media_kind returns None (correct) -> persisted media_kind is STILL
+# "movie". A later status-only write with media_kind=None preserved it too,
+# because add_to_history COALESCEs.
+#
+# Why one value cannot carry both meanings:
+#     None = "this write carries no media-kind observation, keep what you had"
+#     None = "the evidence that justified the old value has been withdrawn"
+# Hence a named operation that only ever erases.
+
+
+class TestAConflictRetractsAPersistedKind:
+    def _persist(self, db, kind):
+        db.add_to_history(URL, "Some Release", None, "2160p", "20 GB",
+                          hdr="HDR", dovi=False, year=2026, media_kind=kind)
+
+    def test_the_durable_row_is_retracted(self, svc):
+        _scanned_as(svc.db, "4k")
+        self._persist(svc.db, svc.verified_media_kind(URL, "4k"))
+        assert svc.db.get_release_identity([URL])[URL]["media_kind"] == "movie"
+
+        n = svc.db.retract_download_media_kind([URL], reason="classification_conflict")
+        assert n == 1
+        assert svc.db.get_release_identity([URL])[URL]["media_kind"] is None
+
+    def test_retraction_is_not_reachable_through_add_to_history(self, svc):
+        """The reason this needed its own operation.
+
+        add_to_history(media_kind=None) COALESCEs on purpose -- there None means
+        "no observation this time". Routing a retraction through it would
+        silently do nothing, which is worse than not trying.
+        """
+        _scanned_as(svc.db, "4k")
+        self._persist(svc.db, "movie")
+        self._persist(svc.db, None)          # a status-only update
+        assert svc.db.get_release_identity([URL])[URL]["media_kind"] == "movie", (
+            "add_to_history must still PRESERVE on a no-observation write")
+
+        svc.db.retract_download_media_kind([URL], reason="classification_conflict")
+        assert svc.db.get_release_identity([URL])[URL]["media_kind"] is None
+
+    def test_retracting_an_unrecorded_kind_is_a_no_op(self, svc):
+        _scanned_as(svc.db, "4k")
+        self._persist(svc.db, None)
+        assert svc.db.retract_download_media_kind([URL], reason="x") == 0
+
+    def test_a_retracted_row_yields_no_semantic_identity(self, svc):
+        """The consumer end. An unknown kind must not authorise anything."""
+        _scanned_as(svc.db, "4k")
+        self._persist(svc.db, "movie")
+        svc.db.retract_download_media_kind([URL], reason="classification_conflict")
+        ident = svc.db.get_release_identity([URL])[URL]
+        assert ident["media_kind"] is None
+        # title+year survive; only the KIND is withdrawn, so the row still
+        # groups for display and simply cannot authorise.
+        assert ident["year"] == 2026
+
+
+# ── M1b: absence of a conflict flag is not proof of no conflict ───────────
+
+
+class TestLegacyRowsAreNotTreatedAsAttested:
+    def _legacy(self, db):
+        """A row exactly as the old first-source-wins crawler wrote it."""
+        db.upsert_background_cache([{
+            "url": URL, "title": "Some Release", "year": 2026,
+            "status": "missing", "source_category": "HDEncode",
+            "data": json.dumps({"url": URL, "category": "4k"}),
+        }])
+
+    def test_a_row_that_was_never_conflict_checked_answers_nothing(self, svc):
+        """The state Round 10 identified could otherwise survive the fix: a
+        release that appeared in BOTH listings before conflict detection existed
+        still looks unconflicted, because the key is simply absent."""
+        self._legacy(svc.db)
+        assert svc.db.get_scan_category(URL) is None
+        assert svc.verified_media_kind(URL, "4k") is None
+
+    def test_observing_it_cleanly_attests_it(self, svc):
+        """A conflict-aware crawl seeing the release IS the check."""
+        self._legacy(svc.db)
+        assert svc.db.attest_scan_categories([URL]) == 1
+        assert svc.db.get_scan_category(URL) == "4k"
+        assert svc.verified_media_kind(URL, "4k") == "movie"
+
+    def test_attestation_never_overrides_a_recorded_conflict(self, svc):
+        svc.db.upsert_background_cache([{
+            "url": URL, "title": "x", "year": 2026, "status": "missing",
+            "source_category": "HDEncode",
+            "data": json.dumps({"url": URL, "category": "4k",
+                                "category_conflict": True}),
+        }])
+        assert svc.db.attest_scan_categories([URL]) == 0
+        assert svc.db.get_scan_category(URL) is None
+
+    def test_attesting_twice_writes_once(self, svc):
+        self._legacy(svc.db)
+        assert svc.db.attest_scan_categories([URL]) == 1
+        assert svc.db.attest_scan_categories([URL]) == 0
+
+
+class TestAConflictIsSeenEvenWhenTheReleaseIsSkipped:
+    """The half M1b was really about: the DEPLOYED corpus.
+
+    The conflict check used to consult `post_index`, which is populated only for
+    posts that survive the cached-skip. So an already-cached release -- every
+    row on the live instance -- was added to `seen_post_urls`, skipped, and
+    never indexed. A later listing that classified it differently found nothing
+    to mark and discarded the conflict.
+
+    The original conflict tests all passed `previously_scanned=set()`, so they
+    exercised only the fresh-row path and could never have caught this.
+    """
+
+    def _crawl_with_skip(self, sources, scraper, monkeypatch, skipped):
+        async def no_sleep(_s):
+            return None
+        monkeypatch.setattr("backend.scanner_service.asyncio.sleep", no_sleep)
+        shell = _shell()
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            posts = await shell._crawl_pages(
+                sources, pages=1, base_url="https://hdencode.org",
+                scraper=scraper, loop=loop, previously_scanned=set(skipped),
+                early_stop=False, policy_excluded=None, skip_full_disc=False)
+            return posts, shell
+
+        return asyncio.run(run())
+
+    def test_an_already_cached_release_still_records_a_conflict(self, monkeypatch):
+        """The exact case: URL is in previously_scanned, so no detail fetch is
+        scheduled -- but two listings still disagree about what it is, and that
+        is listing-membership evidence which needs no detail page."""
+        scraper = _Scraper([_page([(SHARED, "Some Show S02 2160p")])])
+        posts, shell = self._crawl_with_skip(
+            [_source("4K Movies", "movie", "4k"),
+             _source("TV Packs", "tv", "tv")],
+            scraper, monkeypatch, skipped={SHARED})
+
+        assert posts == [], "a cached release must still be skipped for detail"
+        assert SHARED in shell._last_crawl_conflicted_urls, (
+            "the conflict was observed and then discarded because the release "
+            "was skipped -- which is every row on the deployed instance")
+
+    def test_a_skipped_release_with_no_disagreement_is_not_flagged(self, monkeypatch):
+        """Positive control. Without it the assertion above would pass even if
+        every skipped release were marked conflicted."""
+        scraper = _Scraper([_page([(SHARED, "A Film 2026 2160p")])])
+        posts, shell = self._crawl_with_skip(
+            [_source("4K Movies", "movie", "4k"),
+             _source("Remux Movies", "movie", "remux")],
+            scraper, monkeypatch, skipped={SHARED})
+        assert posts == []
+        assert SHARED not in shell._last_crawl_conflicted_urls
+
+    def test_a_fresh_release_still_works(self, monkeypatch):
+        """The path the original tests covered, kept so the restructure cannot
+        regress it."""
+        scraper = _Scraper([_page([(SHARED, "Some Show S02 2160p")])])
+        posts, shell = self._crawl_with_skip(
+            [_source("4K Movies", "movie", "4k"),
+             _source("TV Packs", "tv", "tv")],
+            scraper, monkeypatch, skipped=set())
+        assert len(posts) == 1
+        assert posts[0]["category_conflict"] is True
+        assert SHARED in shell._last_crawl_conflicted_urls
+
+    def test_a_fresh_post_is_marked_attested(self, monkeypatch):
+        """Anything this crawler produces HAS been conflict-checked, which is
+        what separates it from a row written before the check existed."""
+        scraper = _Scraper([_page([(SHARED, "A Film 2026 2160p")])])
+        posts, _shell = self._crawl_with_skip(
+            [_source("4K Movies", "movie", "4k")], scraper, monkeypatch, skipped=set())
+        assert posts[0]["category_attested"] is True
