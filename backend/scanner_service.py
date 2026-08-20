@@ -91,6 +91,10 @@ class MediaItem:
     # Crawl category this item came from: '4k' | 'remux' | 'tv' | '' (unknown).
     # Drives the instant 4K/Remux/TV display filter in the UI.
     category: str = ""
+    # Whether this release is television, decided ONCE in _process_post
+    # and carried, rather than re-derived per consumer. `season is not
+    # None` is not a synonym: a complete-series pack is TV with no season.
+    is_tv: bool = False
 
     #: True when this release appeared in two listings that disagree
     #: about its type -- a movie listing and TV Packs, say. The crawl
@@ -1366,6 +1370,7 @@ class ScannerService:
                 imdb_id=details.get('imdb_id'),
                 description=details.get('description', ''),
                 posted_date=details.get('posted_date'),
+                is_tv=bool(result.get('is_tv', False)),
                 category=details.get('category', ''),
                 category_conflict=bool(details.get('category_conflict')),
                 category_attested=bool(details.get('category_attested')),
@@ -1412,6 +1417,8 @@ class ScannerService:
                 web_data=d.get('web_data', {}) or {},
                 group_key=d.get('group_key', '') or '',
                 prior_grab=d.get('prior_grab'),
+                is_tv=(bool(d['is_tv']) if 'is_tv' in d
+                       else d.get('season') is not None),
                 category=d.get('category', '') or '',
                 category_conflict=bool(d.get('category_conflict')),
                 category_attested=bool(d.get('category_attested')),
@@ -1611,7 +1618,28 @@ class ScannerService:
                 'hdr': item.hdr,
                 'url': item.url,
                 'imdb_id': item.web_data.get('imdb_id'),
-                'is_tv': item.season is not None,
+                # The authoritative value, decided in _process_post from the
+                # scraper's own answer OR the source's declared type. Re-deriving
+                # it from `season is not None` here discarded that and sent any TV
+                # release whose season did not parse -- a complete-series pack, a
+                # title the regex missed -- into find_movie_matches below, to be
+                # matched against the film library.
+                # An OR OF POSITIVE SIGNALS, the same shape _process_post uses when it
+                # decides the value in the first place:
+                #     is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'
+                #
+                # `season is not None` was the ORIGINAL bug when it REPLACED the recorded
+                # value -- that is what lost every TV release with no parsed season. As an
+                # ADDITIONAL positive signal it cannot cause that loss: it only ever turns
+                # unknown into TV, never TV into film.
+                #
+                # It also settles `is_tv=False` alongside a recorded season, which peer
+                # review (round 10, Q8) flagged. False here is usually the ABSENCE of
+                # positive TV evidence -- the detail scraper initialises it False and only
+                # raises it on an Sxx match -- not an affirmative statement that this is a
+                # film. A recorded season IS affirmative. Pinning 'False wins' would have
+                # let an absence outrank an observation.
+                'is_tv': item.is_tv or item.season is not None,
                 'season': item.season,
                 'episodes': item.episodes,
                 'search_key': normalize_title(item.title),

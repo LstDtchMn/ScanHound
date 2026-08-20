@@ -140,6 +140,11 @@ class TestMediaItem:
         item = MediaItem(id="x", title="X", year=2024)
         assert item.host_pref == "RG"
 
+    def test_is_tv_defaults_false(self):
+        """Defaults False so an item built without it is treated as a film,
+        which is what every caller did before the field existed."""
+        item = MediaItem(id="x", title="X", year=2024)
+        assert item.is_tv is False
     def test_category_conflict_defaults_false(self):
         """Defaults False so an item built without one is treated as
         unconflicted -- the behaviour every caller had before the field."""
@@ -154,7 +159,7 @@ class TestMediaItem:
             "plex_info", "plex_versions", "plex_rating_key", "selected",
             "host_pref", "poster_path", "imdb_id",
             "tile_state", "description", "posted_date", "web_data", "group_key",
-            "is_duplicate_group", "prior_grab", "category", "category_conflict", "category_attested",
+            "category", "category_attested", "category_conflict", "is_duplicate_group", "is_tv", "prior_grab",
         }
         actual = {f.name for f in fields(MediaItem)}
         assert actual == expected

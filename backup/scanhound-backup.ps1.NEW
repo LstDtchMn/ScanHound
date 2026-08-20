@@ -1,0 +1,123 @@
+# scanhound-backup.ps1 - nightly ScanHound backup: SQLite-safe copy of crawler.db.
+# STAGED FILE - NOT SCHEDULED, NOT YET RUN. Created 2026-08-05 by the recovery audit.
+# ASCII-only (PS 5.1 safe). Modelled on vaultwarden-backup.ps1.
+#
+# WHY THIS EXISTS:
+#   The live ScanHound database is /dbvol/crawler.db, which is the Docker NAMED VOLUME
+#   scanhound_scanhound_db (52.5 MB total; crawler.db itself 34,271,232 bytes plus a
+#   3.7 MB -wal). Named volumes are inside the Docker Desktop WSL2 VHDX and are
+#   invisible to Backblaze - verified 2026-08-05, zero cloud file-ids exist for any
+#   /var/lib/docker/volumes path. X:\Docker Apps\ScanHound\data IS covered (34,930
+#   file-ids) but the database is NOT in there. So ScanHound has no backup today.
+#
+#   What is at risk (row counts read 2026-08-05 from a read-only copy):
+#     plex_cache 21,510 | dv_scan 4,195 | dv_seed_baseline 3,729
+#     hdencode_candidates 3,408 | dismissed_items 1,057 | download_results 504
+#     downloads 455 | scanned_urls 352 | rename_jobs 158 | hdencode_shadow_misses 149
+#     media_inventory 27 | media_probe 27 | auth_sessions 8 | auth_credentials 1
+#   dv_scan + dv_seed_baseline are a full Dolby Vision pass over the 4K libraries -
+#   expensive to regenerate given the known bind-mount syscall latency on 4K scans.
+#   dismissed_items are Jesse's own reject decisions and cannot be regenerated at all.
+#
+# NOTE ON THE OTHER FILE IN THAT VOLUME:
+#   /dbvol/scanhound.db is 0 bytes and is a known stray - it is NOT the database.
+#   This script deliberately backs up crawler.db only.
+#
+# WHAT IT DOES:
+#   1. SQLite online-backup (".backup") of crawler.db with the volume mounted READ-ONLY.
+#   2. Verifies the ARTIFACT: integrity_check must be "ok", table count sane, and
+#      dv_scan must have rows (a database that opens is not the same as one with data).
+#   3. Prunes to $KeepCopies.
+#   4. Gotify push on failure; Uptime-Kuma push heartbeat as a dead-man's switch.
+#
+# DESTINATION: C:\DockerData\scanhound-backup  (C: is Backblaze-watched and actively
+#   uploading; also a different physical device from the X: mirror with the failing disk)
+
+$ErrorActionPreference = 'Continue'
+
+# ---------------- config ----------------
+$DbVol       = 'scanhound_scanhound_db'
+$BackupRoot  = 'C:\DockerData\scanhound-backup'
+$DbDir       = "$BackupRoot\db"
+$GotifyToken = 'AJLoyMaHFNQLTzi'
+$PushToken   = 'REPLACE_ME_SCANHOUND_PUSH'   # <-- Jesse: create Uptime-Kuma push monitor "ScanHound Backup", paste token here
+$KeepCopies  = 14
+$MinDbBytes  = 5000000                        # 5 MB; live file is ~34 MB
+$Log         = "$BackupRoot\backup.log"
+$SqliteImage = 'keinos/sqlite3:latest'
+
+function Log($m){ $l=(Get-Date -Format 's')+'  '+$m; Add-Content -LiteralPath $Log -Value $l; Write-Output $l }
+function Notify($title,$msg,$priority){
+  try { docker run --rm --network proxy curlimages/curl:latest -s -o /dev/null "http://gotify/message?token=$GotifyToken" -F "title=$title" -F "message=$msg" -F "priority=$priority" | Out-Null }
+  catch { Log ('gotify notify failed: ' + $_.Exception.Message) }
+}
+function Heartbeat($status,$msg){
+  if($PushToken -like 'REPLACE_ME*'){ Log 'uptime-kuma heartbeat SKIPPED - push token not configured yet'; return }
+  try {
+    $enc = [uri]::EscapeDataString($msg)
+    docker run --rm --network proxy curlimages/curl:latest -s -o /dev/null "http://uptime-kuma:3001/api/push/${PushToken}?status=$status&msg=$enc&ping=" | Out-Null
+  } catch { Log ('uptime-kuma heartbeat failed: ' + $_.Exception.Message) }
+}
+
+New-Item -ItemType Directory -Force -Path $DbDir | Out-Null
+$stamp  = Get-Date -Format 'yyyy-MM-dd_HHmm'
+$errors = @()
+Log "===== backup start $stamp ====="
+
+# ---------------- 1. SQLite-safe DB backup out of the named volume ----------------
+$outName = "crawler-$stamp.db"
+$outPath = "$DbDir\$outName"
+Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue
+
+docker run --rm --user root -v "${DbVol}:/src:ro" -v "${DbDir}:/dst" $SqliteImage sqlite3 /src/crawler.db ".backup /dst/$outName" | Out-Null
+
+if(-not (Test-Path -LiteralPath $outPath)){
+  $errors += 'DB backup produced no file'
+  Log 'DB backup FAILED - no output file'
+} elseif((Get-Item -LiteralPath $outPath).Length -lt $MinDbBytes){
+  $errors += 'DB backup file too small'
+  Log ('DB backup FAILED - only ' + (Get-Item -LiteralPath $outPath).Length + ' bytes')
+  Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue
+} else {
+  $integrity = docker run --rm --user root -v "${DbDir}:/dst" $SqliteImage sqlite3 "/dst/$outName" 'PRAGMA integrity_check;'
+  $integrity = ($integrity | Select-Object -First 1).ToString().Trim()
+  $tables    = docker run --rm --user root -v "${DbDir}:/dst" $SqliteImage sqlite3 "/dst/$outName" "select count(*) from sqlite_master where type='table';"
+  $tables    = ($tables | Select-Object -First 1).ToString().Trim()
+  $dv        = docker run --rm --user root -v "${DbDir}:/dst" $SqliteImage sqlite3 "/dst/$outName" 'select count(*) from dv_scan;'
+  $dv        = ($dv | Select-Object -First 1).ToString().Trim()
+  $dis       = docker run --rm --user root -v "${DbDir}:/dst" $SqliteImage sqlite3 "/dst/$outName" 'select count(*) from dismissed_items;'
+  $dis       = ($dis | Select-Object -First 1).ToString().Trim()
+
+  Log "verify: integrity_check=$integrity tables=$tables dv_scan=$dv dismissed_items=$dis"
+
+  $tablesN = 0; [void][int]::TryParse($tables,[ref]$tablesN)
+  $dvN     = 0; [void][int]::TryParse($dv    ,[ref]$dvN)
+
+  if($integrity -ne 'ok'){
+    $errors += "integrity_check returned '$integrity'"
+    Log 'DB backup FAILED integrity_check'
+    Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue
+  } elseif($tablesN -lt 20){
+    $errors += "only $tablesN tables in backup"
+    Log 'DB backup FAILED - implausible table count (expected 30+)'
+    Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue
+  } elseif($dvN -lt 1){
+    $errors += 'dv_scan is empty in backup'
+    Log 'DB backup FAILED - dv_scan empty'
+    Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue
+  } else {
+    Log ('DB backup OK: ' + $outName + ' (' + [int]((Get-Item -LiteralPath $outPath).Length/1MB) + ' MB, dv_scan=' + $dvN + ')')
+  }
+}
+Get-ChildItem -LiteralPath $DbDir -Filter 'crawler-*.db' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip $KeepCopies | Remove-Item -Force -ErrorAction SilentlyContinue
+
+# ---------------- 2. notify ----------------
+if($errors.Count -eq 0){
+  Notify 'ScanHound backup OK' "crawler.db SQLite-safe backup completed ($stamp)" 3
+  Heartbeat 'up' "OK $stamp"
+  Log '===== backup OK ====='
+} else {
+  Notify 'ScanHound backup FAILED' (($errors -join '; ') + " - see $Log") 8
+  Heartbeat 'down' (($errors -join '; ') -replace '[^a-zA-Z0-9 ;_-]','')
+  Log ('===== backup FAILED: ' + ($errors -join '; ') + ' =====')
+}
