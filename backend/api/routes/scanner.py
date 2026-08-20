@@ -48,7 +48,7 @@ def rescan_classification(existing):
     listing the release came from, so it carries that evidence rather than
     inventing it.
 
-    Returns ``(category, is_tv_from_cache)``.
+    Returns ``(category, is_tv_from_cache, category_conflict)``.
     """
     try:
         cached = json.loads(existing.get("data") or "{}")
@@ -61,7 +61,10 @@ def rescan_classification(existing):
     is_tv = (category == "tv"
              or bool(cached.get("is_tv"))
              or cached.get("season") is not None)
-    return category, is_tv
+    # A conflict recorded against this release survives a rescan: re-reading
+    # the detail page is not evidence about which listings carried it.
+    conflict = bool(cached.get("category_conflict"))
+    return category, is_tv, conflict
 
 
 router = APIRouter(prefix="/scan", tags=["scanner"])
@@ -461,7 +464,13 @@ def rescan_item(
 
     post_source = existing.get("source_category") or "hdencode"
     details['source'] = post_source
-    details['category'], post_source_is_tv = rescan_classification(existing)
+    # BOTH sides of this conflict added something, and neither is redundant:
+    #   #93   the extracted helper, and the TV signal it recovers
+    #   main  preservation of a recorded classification conflict
+    # The helper carries all three rather than one side being dropped.
+    (details['category'],
+     post_source_is_tv,
+     details['category_conflict']) = rescan_classification(existing)
     item = scanner._create_media_item({
         'details': details,
         'is_tv': details.get('is_tv', False) or post_source_is_tv,

@@ -55,9 +55,12 @@ def _rebuild(existing, details):
     """
     from backend.api.routes.scanner import rescan_classification
 
-    category, is_tv_from_cache = rescan_classification(existing)
+    # Three values since the round-11 merge: main's branch of that conflict
+    # added conflict preservation, so the helper carries it too.
+    category, is_tv_from_cache, conflict = rescan_classification(existing)
     details = dict(details)
     details["category"] = category
+    details["category_conflict"] = conflict
     return details, (details.get("is_tv", False) or is_tv_from_cache)
 
 
@@ -113,3 +116,23 @@ class TestTheTVSignalSurvivesARescan:
         """The detail page remains able to contribute positive evidence."""
         _d, is_tv = _rebuild(_cached("4k"), {"is_tv": True})
         assert is_tv is True
+
+
+class TestARecordedConflictSurvivesARescan:
+    """main's half of the merge conflict, kept rather than dropped.
+
+    Re-reading a detail page is not evidence about which LISTINGS carried the
+    release, so a conflict recorded by the crawl must not be cleared by a
+    rescan.
+    """
+
+    def test_a_conflicted_row_stays_conflicted(self):
+        row = {"source_category": "HDEncode",
+               "data": json.dumps({"category": "4k", "category_conflict": True})}
+        details, _ = _rebuild(row, {"is_tv": False})
+        assert details["category_conflict"] is True
+
+    def test_an_unconflicted_row_stays_unconflicted(self):
+        """POSITIVE CONTROL."""
+        details, _ = _rebuild(_cached("4k"), {"is_tv": False})
+        assert details["category_conflict"] is False

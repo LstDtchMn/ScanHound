@@ -199,32 +199,51 @@ def annotate_source_links(db, rows):
         # have been a confident `movie` whose guard had just been added to stop
         # exactly that.
         year = rec.get("year") or None
-        if season is None:
-            # NO RECORDED SEASON MEANS UNKNOWN, NOT MOVIE.
-            #
-            # This verdict has now failed three times, each for a reason the
-            # previous fix did not anticipate: placeholder titles, then 16 live
-            # TV rows whose season was never recorded, then year=0. The peer
-            # review named why that keeps happening -- the problem is
-            # CATEGORICAL, not a sentinel hunt. `("Notting Hill", 1999, None)`
-            # is structurally identical to a 1999 TV show with a missing season.
-            # `add_to_history()` takes no media-type argument and `downloads`
-            # stores no such column, so NOTHING in the data distinguishes them.
-            # A year identifies an edition; it does not prove a media kind.
-            #
-            # The old positive test asserted `Notting Hill` came back as a
-            # movie. That proved the convention, not the discriminator -- the
-            # test author knew it was a film; production never did.
-            #
-            # So a seasonless row stays unknown until a media kind is RECORDED
-            # AT INGEST. That costs movie identity entirely for now, which is
-            # the honest price: the destructive action this gates is already
-            # withheld from every movie today, and re-enabling it on an
-            # unprovable inference is how the previous three holes happened.
+        # THE RECORDED KIND, where there is one. `downloads.media_kind` is
+        # written at grab time from what the scan source declared (its sources
+        # carry type movie/tv, which MediaItem carries as `category`). NULL
+        # means NOT RECORDED -- which is every row grabbed before the column
+        # existed -- and is never re-inferred.
+        kind = (rec.get("media_kind") or "").strip().lower() or None
+
+        # STRICTLY ADDITIVE, and deliberately so. A RECORDED SEASON is positive
+        # evidence of TV and always was; the reviewer accepted that direction.
+        # What was unsound was the other one -- reading an ABSENT season as
+        # proof of a movie. So TV identity is unchanged, and `movie` is a new
+        # capability that appears only where the kind was actually recorded.
+        #
+        # Requiring media_kind for TV as well would have been a regression:
+        # nothing recorded it until now, so all 42 rows that carry a TV
+        # identity today would have silently dropped to unknown.
+        if kind == "movie" and season is not None:
+            # CONTRADICTORY EVIDENCE: recorded as a film, yet carrying a season.
+            # One of the two is wrong and there is no way to tell which, so
+            # neither is trusted.
+            continue
+        if season is not None:
+            row["identity_title"] = clean
+            row["identity_year"] = year
+            row["identity_season"] = season
+            row["identity_kind"] = "tv_season"
+            row["identity_source"] = "provenance"
+            continue
+        if kind != "movie":
+            # No season and no recorded movie kind. This is exactly where
+            # `season is None -> movie` used to live, and it failed three times
+            # for reasons each previous fix did not anticipate. The season was
+            # never the question: add_to_history took no media type, so
+            # ("Notting Hill", 1999, None) was structurally identical to a 1999
+            # show whose season was never captured. Now that the kind can be
+            # recorded, an absent one is simply absent.
+            continue
+        if year is None:
+            # Recorded as a film, but a movie identity is title+year:
+            # normalizeTitle strips years downstream, so without one two
+            # remakes collapse into a single identity. Same rule TV lives by.
             continue
         row["identity_title"] = clean
         row["identity_year"] = year
-        row["identity_season"] = season
-        row["identity_kind"] = "tv_season"
+        row["identity_season"] = None
+        row["identity_kind"] = "movie"
         row["identity_source"] = "provenance"
     return rows
