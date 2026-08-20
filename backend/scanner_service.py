@@ -1421,7 +1421,28 @@ class ScannerService:
             cached_type = str(d.get('media_type') or '').strip().lower()
             cached_provisional = d.get('media_type_provisional')
             if cached_type not in ('tv', 'movie', 'ambiguous'):
+                _cached_category = ('' if d.get('category_conflict')
+                                    else str(d.get('category') or '').strip().lower())
                 verdict = grammar.resolve_media_type([
+                    # THE CRAWL ROUTE, recovered from the cache. Without this a cached
+                    # film is unresolvable: the grammar can PROVE tv (a season token)
+                    # but nothing proves MOVIE from a title, because the absence of TV
+                    # evidence is not evidence of a film. Every one of the 4,073 live
+                    # cached rows would have rendered 'Type unresolved -- review' on
+                    # deploy until a full re-scrape, even though the row records the
+                    # category it was crawled from.
+                    #
+                    # ROUTE authority, matching resolve_listing_media_type exactly: which
+                    # category page a release was found on is routing, not identity, so
+                    # any title or detail evidence still outranks it.
+                    #
+                    # Skipped when the crawl recorded a classification conflict -- two
+                    # listings disagreeing is not a route to trust.
+                    grammar.TypeEvidence(
+                        grammar.MediaType.TV if _cached_category == 'tv'
+                        else grammar.MediaType.MOVIE,
+                        grammar.Authority.ROUTE, 'cached-category')
+                    if _cached_category in ('tv', '4k', 'remux') else None,
                     grammar.title_type_evidence(d.get('title') or '',
                                                 source='cached-title'),
                     grammar.TypeEvidence(grammar.MediaType.TV,
