@@ -360,15 +360,16 @@ class TestScrapeDetailsSize:
         assert "500" in result["size"]
         assert "MB" in result["size"]
 
-    def test_size_tb_not_matched_by_regex(self, scraper):
-        """The size regex only handles GiB/GB/MiB/MB/KB, not TB.
-        A size like '1.2 TB' will not be captured."""
+    def test_size_tb_is_matched_via_the_shared_grammar(self, scraper):
+        """Divergence (e), CLOSED 2026-08-03. This test previously pinned the
+        DEFECT ('TB is not in the regex alternation, so size defaults to ?').
+        Sizes now go through release_grammar.find_all_sizes, whose unit
+        grammar includes TB/TiB, so a terabyte release keeps its size."""
         html = _build_detail_html(
             "Movie.2020.2160p.mkv", size_label="Total Size: 1.2 TB"
         )
         result = _scrape(scraper, html)
-        # TB is not in the regex alternation, so size defaults to "?"
-        assert result["size"] == "?"
+        assert result["size"] == "1.2 TB"
 
     def test_size_large_gb_equivalent_of_tb(self, scraper):
         """When the page lists a TB-equivalent in GB, it should parse correctly."""
@@ -884,3 +885,88 @@ class TestRTSlugIntegration:
         import re
         slug = scraper._title_to_rt_slug("Fast & Furious: Hobbs! and? Shaw#")
         assert re.match(r'^[\w]+$', slug), f"Slug contains invalid URL chars: {slug}"
+
+
+class TestRound10ReworkRegressions:
+    """Behavioural pins for the internal round-10 review's executed findings —
+    deliberately NOT source-grep assertions; that proxy shape is how the
+    leftover override block survived the first R-3 patch."""
+
+    def test_page_resolution_wins_when_filename_has_no_token(self, scraper):
+        # The leftover substring block used to let filename fragments override
+        # an explicit page line. (1080i became a REAL token on 2026-08-04, so
+        # this case now uses a genuinely token-less filename; a 1080i filename
+        # legitimately wins the filename-preference rule.)
+        html = _build_detail_html("Show.S01E01.HDTV.mkv",
+                                  resolution="Resolution: 2160p")
+        assert _scrape(scraper, html)["res"] == "4K"
+
+    def test_1080i_filename_is_now_a_real_token(self, scraper):
+        html = _build_detail_html("Show.S01E01.1080i.mkv",
+                                  resolution="Resolution: 2160p")
+        assert _scrape(scraper, html)["res"] == "1080p"
+
+    def test_title_year_form_keeps_a_clean_title(self, scraper):
+        html = _build_detail_html("Movie Title (2020) 1080p.mkv")
+        result = _scrape(scraper, html)
+        assert result["display_title"].rstrip() == "Movie Title"
+        assert result["year"] == 2020
+
+    def test_opening_year_title_retries_the_next_year_token(self, scraper):
+        html = _build_detail_html("2001.A.Space.Odyssey.1968.1080p.mkv")
+        result = _scrape(scraper, html)
+        assert result["display_title"] == "2001 A Space Odyssey"
+        assert result["year"] == 1968
+
+    def test_group_name_starting_with_s_digit_is_not_tv(self, scraper):
+        html = _build_detail_html("Movie.2020.1080p.x264-S0MEGRP.mkv")
+        result = _scrape(scraper, html)
+        assert result["is_tv"] is False
+        assert result["year"] == 2020
+
+    def test_oversized_prose_is_not_a_labelled_size(self, scraper):
+        html = _build_detail_html(
+            "Movie.2020.1080p.mkv", size_label="Size: 2.0 GB",
+            extra_text="the oversized bonus disc adds 9 GB")
+        assert _scrape(scraper, html)["size"] == "2.0 GB"
+
+    def test_dimension_only_filename_gets_a_clean_title(self, scraper):
+        html = _build_detail_html("Concert.Film.1920x1080.mkv")
+        result = _scrape(scraper, html)
+        assert result["display_title"] == "Concert Film"
+        assert result["year"] == 0
+
+
+class TestRound10SequenceItem3:
+    """Round-10 required-sequence item 3: size-label right boundary, full
+    episode counting, blank-Filename rejection — behavioural, via the facade."""
+
+    def test_sized_prose_is_not_a_labelled_size(self, scraper):
+        html = _build_detail_html(
+            "Movie.2020.1080p.mkv", size_label="Size: 2.0 GB",
+            extra_text="the sized bonus disc adds 9 GB")
+        assert _scrape(scraper, html)["size"] == "2.0 GB"
+
+    def test_glued_episode_lists_count_every_episode(self, scraper):
+        html = _build_detail_html(
+            "Show.S01E01E02.720p.mkv",
+            extra_filenames=["Show.S01E03E04.720p.mkv"])
+        assert _scrape(scraper, html)["episodes"] == 4
+
+    def test_blank_filename_value_yields_no_result(self, scraper):
+        html = _build_detail_html("")
+        assert _scrape(scraper, html) is None
+
+
+class TestYearAuthorityDelegation:
+    """Round-11 Finding 4: DetailScraper must FOLLOW select_release_year,
+    not re-implement it -- perturbation-proven like the RSS/SourceBase tests."""
+
+    def test_detail_scraper_follows_the_selector(self, scraper, monkeypatch):
+        from backend import release_grammar
+        monkeypatch.setattr(
+            release_grammar, "select_release_year",
+            lambda text: release_grammar.YearMatch(1234, len("Movie Title ")))
+        html = _build_detail_html("Movie Title 2020 1080p.mkv")
+        result = _scrape(scraper, html)
+        assert result["year"] == 1234

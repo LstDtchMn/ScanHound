@@ -11,7 +11,13 @@ import time
 import threading
 import requests
 from bs4 import BeautifulSoup
+from backend import release_grammar as grammar
 from backend.url_identity import canonicalize_listing_url
+from backend.release_policy import (  # noqa: F401  (re-exported for callers)
+    REASON_LISTING_FULL_DISC,
+    is_full_disc_title,
+)
+from backend.sweep.structure import select_with_tier
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -50,6 +56,11 @@ class ScanStatus(Enum):
     IN_LIBRARY = "in_library"
     UPGRADE = "upgrade"
     DV_UPGRADE = "dv_upgrade"
+    # The media type could not be resolved, so NEITHER typed library may be
+    # queried. A visible terminal state, deliberately not a silent default:
+    # an unresolved item used to take the movie matcher and be reported as
+    # an ordinary result, which is indistinguishable from a confident one.
+    MEDIA_TYPE_UNRESOLVED = "media_type_unresolved"
 
 
 @dataclass
@@ -60,6 +71,18 @@ class MediaItem:
     year: int
     season: Optional[int] = None
     episodes: Optional[int] = None
+    #: Resolved media type — "tv", "movie" or "ambiguous". Carried explicitly
+    #: because downstream USED to rebuild it as `season is not None`, and
+    #: season-presence is not TV-ness: a season pack, a complete series and a
+    #: mini-series are all TV and none carries an SxxExx token. That
+    #: reconstruction silently matched "Great Show Complete Series" against the
+    #: movie library after the resolver had already decided it was TV.
+    #: Defaults to "ambiguous" so an item built without one is never mistaken
+    #: for a film.
+    media_type: str = "ambiguous"
+    #: True when nothing above the crawl route contributed to `media_type`.
+    #: Weak evidence must remain distinguishable from confirmed identity.
+    media_type_provisional: bool = True
     rating: float = 0.0
     votes: int = 0
     votes_source: str = ""
@@ -93,6 +116,42 @@ class MediaItem:
     category: str = ""
 
 
+def web_item_facts(item: "MediaItem") -> Dict[str, Any]:
+    """The identity facts Plex matching decides from, as a plain dict.
+
+    Extracted as a seam so the media-type decision is reachable by a test. It
+    previously lived inline inside ``_match_against_plex``, an async method
+    reading instance state, so the only way to "test" it was to restate its
+    logic in the test — which is not a test of anything. A mutation reverting
+    the rule below passed a suite that asserted the restatement.
+
+    THE RULE: ``is_tv`` comes from the CARRIED verdict, never from
+    ``season is not None``. Season-presence and TV-ness are different facts —
+    a season pack, a complete series and a mini-series are all TV and none
+    carries a numeric season, so the old reconstruction sent every one of them
+    to the movie library after the resolver had already decided otherwise.
+
+    AMBIGUOUS yields ``is_tv=False`` because it must not select the TV library,
+    but it is preserved distinctly in ``media_type`` so the library query can
+    refuse to guess rather than defaulting to Movies.
+    """
+    return {
+        'display_title': item.title,
+        'year': item.year,
+        'res': item.resolution,
+        'size': item.size,
+        'dovi': item.dovi,
+        'hdr': item.hdr,
+        'url': item.url,
+        'imdb_id': item.imdb_id,
+        'is_tv': item.media_type == 'tv',
+        'media_type': item.media_type,
+        'media_type_provisional': item.media_type_provisional,
+        'season': item.season,
+        'episodes': item.episodes,
+    }
+
+
 @dataclass
 class WatchlistItem:
     """Represents an item in the watchlist."""
@@ -124,6 +183,7 @@ STATUS_COLORS = {
     ScanStatus.IN_LIBRARY: "#27ae60",
     ScanStatus.UPGRADE: "#f39c12",
     ScanStatus.DV_UPGRADE: "#9b59b6",
+    ScanStatus.MEDIA_TYPE_UNRESOLVED: "#7f8c8d",
 }
 
 STATUS_TEXTS = {
@@ -134,6 +194,7 @@ STATUS_TEXTS = {
     ScanStatus.IN_LIBRARY: "\u2713 In Library",
     ScanStatus.UPGRADE: "UPGRADE",
     ScanStatus.DV_UPGRADE: "UPGRADE (DV)",
+    ScanStatus.MEDIA_TYPE_UNRESOLVED: "Type unresolved — review",
 }
 
 # Resolution ranking for the "is this sibling an upgrade over what I grabbed?"
@@ -159,23 +220,12 @@ def _res_rank(res) -> int:
 # The operator does not want 45-91 GB disc images, so they are excluded by
 # policy BEFORE any page is downloaded — recognised from the listing title,
 # which already carries the marker.
-
-#: Anchored, case-insensitive, and tolerant of whitespace inside the brackets.
-#: Deliberately NOT applied to the URL slug: the slug for "[BD]Sorority..." is
-#: "bdsorority...", so a substring test there would also match a genuine release
-#: whose title merely begins with those letters.
-_FULL_DISC_TITLE_RE = re.compile(r"^\s*\[\s*BD\s*\]", re.IGNORECASE)
-
-
-def is_full_disc_title(title: Optional[str]) -> bool:
-    """True when a listing title marks a full-disc release.
-
-    Matches only the bracketed ``[BD]`` prefix. ``BD Movie Title`` and
-    ``Some BDRip Movie`` are ordinary releases and must not match.
-    """
-    if not title:
-        return False
-    return bool(_FULL_DISC_TITLE_RE.match(title))
+#
+# The predicate itself lives in backend/release_policy.py because the RSS path
+# must apply the IDENTICAL rule. Two independently-written copies of one rule is
+# precisely how this codebase's two URL canonicalisers drifted (one stripped the
+# trailing slash, one appended it) and silently broke every join between them.
+# Re-exported here so existing callers keep working.
 
 
 # ── ScannerService ────────────────────────────────────────────────────
@@ -990,7 +1040,16 @@ class ScannerService:
                                 policy_excluded_new.append(row)
                             continue
                         page_new += 1
-                        all_posts.append({'url': post_url, 'type': source_type_hint, 'source': source_id, 'category': source_category})
+                        # `title` is retained deliberately. It used to be read,
+                        # used for the full-disc check, and then dropped — so
+                        # the shared title grammar could not participate in the
+                        # media-type decision downstream, and the RSS path and
+                        # this one disagreed about releases named
+                        # "Complete Series", "Mini Series", "TV Series" and
+                        # "Season 4". Carrying it costs one string per post.
+                        all_posts.append({'url': post_url, 'title': post_title,
+                                          'type': source_type_hint,
+                                          'source': source_id, 'category': source_category})
 
                     # Early-stop: a populated page that yields no new posts means
                     # we've reached content already cached/seen — deeper pages are
@@ -1084,26 +1143,44 @@ class ScannerService:
 
         return all_posts
 
-    @staticmethod
-    def _select_posts(soup, source_id: str):
-        """Select post link elements from a listing page based on source.
+    #: Ordered per source: index 0 is the primary selector, the rest are
+    #: fallbacks. Kept as data rather than an ``a or b or c`` chain so the
+    #: matching TIER is observable — see _select_posts_with_tier.
+    POST_SELECTORS = {
+        "ddlbase": [
+            'div.movie_title_list > a[href*="/post/"]',
+            'a[href*="/post/"]',
+        ],
+        "adithd": [
+            '.structItem-title a[href*="threads/"]',
+            '.contentRow-title a',
+            'a[href*="threads/"]',
+        ],
+        "hdencode": [
+            'div.data h5 a',
+            'div.data a',
+            'h2.entry-title a',
+            '.post-title a',
+            'article a[rel="bookmark"]',
+        ],
+    }
 
-        Each source uses different HTML structures; this method provides
-        multiple CSS selector fallbacks per source for resilience.
+    @classmethod
+    def _select_posts_with_tier(cls, soup, source_id: str):
+        """Select post links AND report which fallback tier matched.
+
+        The tier is the early-warning signal. An ``a or b or c`` chain silently
+        falls through when site markup drifts, so a breakage that has already
+        consumed two of three fallbacks looks identical to a healthy page — and
+        the eventual total failure arrives with no warning history at all.
         """
-        if source_id == "ddlbase":
-            return (soup.select('div.movie_title_list > a[href*="/post/"]') or
-                    soup.select('a[href*="/post/"]'))
-        elif source_id == "adithd":
-            return (soup.select('.structItem-title a[href*="threads/"]') or
-                    soup.select('.contentRow-title a') or
-                    soup.select('a[href*="threads/"]'))
-        else:
-            return (soup.select('div.data h5 a') or
-                    soup.select('div.data a') or
-                    soup.select('h2.entry-title a') or
-                    soup.select('.post-title a') or
-                    soup.select('article a[rel="bookmark"]'))
+        selectors = cls.POST_SELECTORS.get(source_id, cls.POST_SELECTORS["hdencode"])
+        return select_with_tier(soup, selectors)
+
+    @classmethod
+    def _select_posts(cls, soup, source_id: str):
+        """Select post link elements from a listing page based on source."""
+        return cls._select_posts_with_tier(soup, source_id)[0]
 
     # ── Post processing ───────────────────────────────────────────────
 
@@ -1115,6 +1192,10 @@ class ScannerService:
         scrape succeeded AND a MediaItem was created. Callers record only
         these in ``scanned_urls``; a URL left out is retried on the next scan
         instead of being skipped forever.
+
+        Media-type resolution lives in resolve_listing_media_type (module
+        level, below this class) -- THE one listing composition, executed
+        directly by the R-5 cross-path suite. Do not inline a copy here.
         """
         processed = 0
         total_posts = len(all_posts)
@@ -1135,9 +1216,18 @@ class ScannerService:
                 )
                 if not details:
                     return None
-                is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'
+
+                verdict = resolve_listing_media_type(post_info, details)
+                # AMBIGUOUS is preserved as a distinct downstream signal rather
+                # than collapsed here; `is_tv` stays boolean for the existing
+                # consumers, and a genuine clash resolves to NOT-tv so nothing
+                # is filed into a library on contested evidence.
+                is_tv = verdict.media_type is grammar.MediaType.TV
                 details['source'] = post_source
                 details['category'] = post_info.get('category', '')
+                details['media_type_verdict'] = verdict.media_type.value
+                details['media_type_provisional'] = verdict.provisional
+                details['media_type_because'] = list(verdict.because)
                 return {'details': details, 'is_tv': is_tv, 'url': url}
             except Exception as e:
                 logger.debug("Error processing post %s: %s", url, e)
@@ -1277,6 +1367,13 @@ class ScannerService:
                 year=details.get('year', 0),
                 season=season,
                 episodes=episodes,
+                # The resolver's verdict, carried rather than recomputed. It
+                # was previously dropped here and rebuilt downstream from
+                # `season is not None`, which silently sent every TV release
+                # without an SxxExx token to the movie library.
+                media_type=details.get('media_type_verdict', 'ambiguous'),
+                media_type_provisional=bool(
+                    details.get('media_type_provisional', True)),
                 rating=self._parse_rating(details.get('rating')),
                 status=status,
                 status_text=STATUS_TEXTS[status],
@@ -1311,12 +1408,59 @@ class ScannerService:
                 status = ScanStatus(d.get('status', 'missing'))
             except ValueError:
                 status = ScanStatus.MISSING
+            # A cached dict written before media_type existed carries none, and
+            # MediaItem defaults to 'ambiguous' — which the matcher now
+            # (correctly) refuses to route. Left unhandled that would have made
+            # every pre-existing cached item unmatchable, so resolve it from the
+            # evidence the cache does carry.
+            #
+            # Marked PROVISIONAL: the cache has the title and season but not the
+            # detail-scraper evidence the live path had, so this is a weaker
+            # verdict than a fresh scan produces and must not authorise anything
+            # autonomous on its own.
+            cached_type = str(d.get('media_type') or '').strip().lower()
+            cached_provisional = d.get('media_type_provisional')
+            if cached_type not in ('tv', 'movie', 'ambiguous'):
+                _cached_category = ('' if d.get('category_conflict')
+                                    else str(d.get('category') or '').strip().lower())
+                verdict = grammar.resolve_media_type([
+                    # THE CRAWL ROUTE, recovered from the cache. Without this a cached
+                    # film is unresolvable: the grammar can PROVE tv (a season token)
+                    # but nothing proves MOVIE from a title, because the absence of TV
+                    # evidence is not evidence of a film. Every one of the 4,073 live
+                    # cached rows would have rendered 'Type unresolved -- review' on
+                    # deploy until a full re-scrape, even though the row records the
+                    # category it was crawled from.
+                    #
+                    # ROUTE authority, matching resolve_listing_media_type exactly: which
+                    # category page a release was found on is routing, not identity, so
+                    # any title or detail evidence still outranks it.
+                    #
+                    # Skipped when the crawl recorded a classification conflict -- two
+                    # listings disagreeing is not a route to trust.
+                    grammar.TypeEvidence(
+                        grammar.MediaType.TV if _cached_category == 'tv'
+                        else grammar.MediaType.MOVIE,
+                        grammar.Authority.ROUTE, 'cached-category')
+                    if _cached_category in ('tv', '4k', 'remux') else None,
+                    grammar.title_type_evidence(d.get('title') or '',
+                                                source='cached-title'),
+                    grammar.TypeEvidence(grammar.MediaType.TV,
+                                         grammar.Authority.TITLE, 'cached-season')
+                    if d.get('season') is not None else None,
+                ])
+                cached_type = verdict.media_type.value
+                cached_provisional = True
+
             return MediaItem(
                 id=str(d.get('id', '') or ''),
                 title=d.get('title', '') or '',
                 year=d.get('year', 0) or 0,
                 season=d.get('season'),
                 episodes=d.get('episodes'),
+                media_type=cached_type,
+                media_type_provisional=(
+                    True if cached_provisional is None else bool(cached_provisional)),
                 rating=d.get('rating', 0.0) or 0.0,
                 rt_score=d.get('rt_score'),
                 status=status,
@@ -1528,23 +1672,31 @@ class ScannerService:
                 continue
 
             web_item = {
-                'display_title': item.title,
-                'year': item.year,
-                'res': item.resolution,
+                **web_item_facts(item),
                 'size': item.web_data.get('size', item.size),
-                'dovi': item.dovi,
-                'hdr': item.hdr,
-                'url': item.url,
                 'imdb_id': item.web_data.get('imdb_id'),
-                'is_tv': item.season is not None,
-                'season': item.season,
                 'episodes': item.episodes,
                 'search_key': normalize_title(item.title),
                 'episode_number': item.web_data.get('episode_number'),
             }
 
             try:
-                if web_item['is_tv']:
+                # TRI-STATE SELECTION, not a boolean branch.
+                #
+                # This was `if web_item['is_tv']: tv else: movie`, so an
+                # AMBIGUOUS item fell into the else and was matched against the
+                # MOVIE library. A boolean cannot express "neither", which is
+                # exactly the case the resolver exists to report, so the
+                # selector reads media_type directly and `is_tv` is left for
+                # legacy display only.
+                if web_item['media_type'] not in ('tv', 'movie'):
+                    item.status = ScanStatus.MEDIA_TYPE_UNRESOLVED
+                    item.status_text = STATUS_TEXTS[ScanStatus.MEDIA_TYPE_UNRESOLVED]
+                    item.color = STATUS_COLORS[ScanStatus.MEDIA_TYPE_UNRESOLVED]
+                    item.plex_info = "Media type unresolved"
+                    continue
+
+                if web_item['media_type'] == 'tv':
                     matches, is_uncertain = self.matching.find_tv_season_matches(web_item, plex_index)
                 else:
                     matches, is_uncertain = self.matching.find_movie_matches(web_item, plex_index)
@@ -1881,3 +2033,37 @@ class ScannerService:
         except Exception as e:
             logger.error("Failed to load download history: %s", e)
             return set()
+
+
+def resolve_listing_media_type(post_info, details):
+    """THE listing-path media-type composition (round-13 R-5 extraction).
+
+    Media type is resolved by AUTHORITY, not by boolean OR. The old rule was
+    ``details['is_tv'] or post_info['type'] == 'tv'``, which could not
+    represent a contradiction and so resolved every one of them to TV -- and
+    it never consulted the listing title at all, which is how this path and
+    the RSS path came to disagree about "Complete Series" and friends.
+
+    Inputs: ``post_info['type']`` (crawl route, 'tv'/'movie'/other),
+    ``post_info['title']`` (listing title), ``details['is_tv']`` (the detail
+    filename's positive TV signal). Called by ``_process_posts``'s worker and
+    the rescan route; executed DIRECTLY by the R-5 cross-path suite, so any
+    drift here fails tests rather than silently diverging from the RSS path.
+    """
+    return grammar.resolve_media_type([
+        # The crawl route is the WEAKEST signal: which category page
+        # a release was found on is routing, not identity.
+        grammar.TypeEvidence(
+            grammar.MediaType.TV if post_info['type'] == 'tv'
+            else grammar.MediaType.MOVIE,
+            grammar.Authority.ROUTE, 'listing-route')
+        if post_info.get('type') in ('tv', 'movie') else None,
+        grammar.title_type_evidence(post_info.get('title') or '',
+                                    source='listing-title'),
+        # The detail filename outranks the title. Only a positive
+        # is_tv is evidence: False means "no season token in the
+        # filename", which is not a claim that this is a film.
+        grammar.TypeEvidence(grammar.MediaType.TV,
+                             grammar.Authority.DETAIL, 'detail-filename')
+        if details.get('is_tv') else None,
+    ])

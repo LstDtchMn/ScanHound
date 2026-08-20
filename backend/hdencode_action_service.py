@@ -393,11 +393,18 @@ class HDEncodeActionService:
         lifespan_generation: Optional[int] = None,
         stop_requested: Optional[Callable[[], bool]] = None,
     ) -> list[dict]:
+        from backend.capability_gate import capability_blockers
+        if capability_blockers(self.config):
+            # R-6 boundary 2: no autonomous side effect without a recorded
+            # evidence pass. Checked once per scan at the queue entry (the
+            # per-candidate validator keeps candidate-level semantics).
+            return []
         if self.config.get("hdencode_rss_auto_grab_enabled") is not True:
             return []
         readiness = self.db.get_hdencode_rss_readiness(
             min_cycles=self.config.get("hdencode_rss_shadow_min_cycles", 20),
             min_days=self.config.get("hdencode_rss_shadow_min_days", 7),
+            window_start_at=self.config.get("hdencode_rss_window_start_at") or None,
         )
         if not readiness.get("ready"):
             return []
@@ -439,6 +446,18 @@ class HDEncodeActionService:
                 "auto_action_invalid",
                 "Automatic actions may only submit approved grabs.",
             )
+        if (candidate.get("derived_state") or "current") != "current":
+            # R-4: facts derived under an older grammar version never
+            # authorise an AUTONOMOUS action -- queue-time evidence is frozen
+            # into authorized_evidence_json as if current, so stale rows are
+            # excluded outright rather than re-scored. Raise, never return:
+            # this validator's contract is exception-based, and an early
+            # return would silently PASS the stale row (caught red by the
+            # commit-2 test before this fix).
+            raise HDEncodeActionError(
+                "stale_derived",
+                "Derived facts predate the current grammar version.",
+            )
         if candidate.get("relevance_state") not in {
             "relevant_missing",
             "relevant_upgrade",
@@ -455,6 +474,38 @@ class HDEncodeActionService:
             raise HDEncodeActionError(
                 "auto_identity_unknown",
                 "The candidate identity is not confirmed.",
+            )
+        # The media TYPE must be resolved, independently of identity.
+        #
+        # A confirmed external id resolves WHICH title this is; it does not
+        # resolve whether the title is a film or a series, and those are the
+        # two different libraries an action would target. A candidate could
+        # previously reach here typed 'ambiguous' with identity_state='exact',
+        # because _identity_is_confirmed fell through to the movie rule for any
+        # unrecognised type.
+        #
+        # This is a CANDIDATE-level gate and is deliberately not satisfied by
+        # the programme-level promotion gate: qualification says the pipeline
+        # may act at all, this says *this release* is understood well enough to
+        # act on. Both are required.
+        media_type = str(candidate.get("media_type") or "").strip().lower()
+        if media_type not in {"tv", "movie"}:
+            raise HDEncodeActionError(
+                "auto_media_type_unresolved",
+                "The candidate's media type is unresolved; it cannot be "
+                "targeted at a library automatically.",
+            )
+        # A type resting only on the feed category is routing metadata, not
+        # identity. It may inform display and manual review; it must not by
+        # itself authorise an autonomous action.
+        # Round-12 R-5 suite finding: DB rows carry the INTEGER 1, and
+        # `is True` is False for 1 -- the strict-bool idiom made this gate
+        # inert against every real row (only bool-passing test fixtures ever
+        # fired it). Truthiness is the correct read for an int-typed column.
+        if bool(candidate.get("media_type_provisional")):
+            raise HDEncodeActionError(
+                "auto_media_type_provisional",
+                "The candidate's media type rests only on route evidence.",
             )
         if candidate.get("hydration_state") != "completed":
             raise HDEncodeActionError(

@@ -7,6 +7,8 @@ import re
 from typing import Any, Dict, Iterable, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from backend.url_canonical import canonicalize_listing_url
+
 _RELEVANT_STATES={"missing","missing_season","upgrade","dv_upgrade"}
 
 # ── Per-feed observation validity ─────────────────────────────────────────
@@ -177,10 +179,14 @@ def normal_feed_outcomes_from_results(results: Iterable[Mapping[str, Any]]) -> D
     return out
 
 def canonical_url(value: str) -> str:
-    parsed=urlsplit(str(value or '').strip())
-    if not parsed.scheme or not parsed.netloc: return str(value or '').strip().rstrip('/')
-    path=(parsed.path or '/').rstrip('/') or '/'
-    return urlunsplit((parsed.scheme.lower(),parsed.netloc.lower(),path,'',''))
+    """Delegates to the shared Form-B identity (url_canonical). One edge kept
+    from the old local copy: a scheme-less string still gets its trailing
+    slash stripped rather than passing through the urlsplit path, preserving
+    this module's historical behaviour for degenerate inputs."""
+    parsed = urlsplit(str(value or '').strip())
+    if not parsed.scheme or not parsed.netloc:
+        return str(value or '').strip().rstrip('/')
+    return canonicalize_listing_url(value)
 
 def jittered_interval_seconds(minutes: int, *, jitter_minutes: int=10, rng=None) -> int:
     base=max(15,min(int(minutes),360))*60
@@ -225,6 +231,16 @@ def _status_value(row: Mapping[str,Any]) -> str:
     value=row.get('status')
     if hasattr(value,'value'): value=value.value
     return str(value or row.get('status_text') or '').strip().lower().replace(' ','_')
+
+#: Outcomes meaning "this comparison could not reach a conclusion". They are
+#: NOT successes and NOT ordinary misses — they say the evidence was unusable.
+#: A reconciliation that reports success because it had nothing to compare is
+#: fail-OPEN, and §10 requires this reconciliation to be fail-closed.
+INCONCLUSIVE_OUTCOMES = frozenset({
+    "no_listing_baseline",
+    "no_rss_observations",
+    "disjoint_identity_sets",
+})
 
 @dataclass(frozen=True)
 class ShadowComparison:
@@ -291,6 +307,15 @@ class ShadowComparison:
     #: every later argument and broke 47 tests.
     duplicate_urls:tuple[str,...]=()
     def as_dict(self): return asdict(self)
+
+    @property
+    def is_conclusive(self) -> bool:
+        return self.outcome not in INCONCLUSIVE_OUTCOMES
+
+    @property
+    def qualifies(self) -> bool:
+        """True only for a clean, conclusive cycle. Anything else blocks."""
+        return self.outcome == "success"
 
 def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss_requests:int, listing_requests:int, normal_feeds_complete:bool, normal_feed_outcomes: Optional[Mapping[str,str]]=None, listing_complete: Optional[bool]=None, raw_listing_urls: Optional[Iterable[str]]=None, detail_failed_urls: Optional[Iterable[str]]=None) -> ShadowComparison:
     rss={canonical_url(u) for u in rss_urls if u}
@@ -436,6 +461,70 @@ def compare_shadow(*, rss_urls: Iterable[str], listing_items: Iterable[Any], rss
     # spans catch-up feeds and counts attempted-but-failed requests, so it
     # admitted exactly the stale comparisons it was meant to exclude.
     if misses and normal_feeds_complete: outcome='relevant_miss'
+    # FAIL-CLOSED GUARDS, at TWO different precedences.
+    #
+    # Peer review round 11 (I1). I first applied all three only when the
+    # outcome would otherwise be 'success', on the grounds that their own
+    # rationale names that case. That is right for two of them and wrong
+    # for the third, because they answer different questions:
+    #
+    #   no_listing_baseline / no_rss_observations
+    #     'this cycle saw nothing to compare' -- guards a false CLEAN.
+    #     A relevant_miss is a real observation and outranks them.
+    #
+    #   disjoint_identity_sets
+    #     'the JOIN between the two sides is unusable'. That invalidates
+    #     the comparison itself -- including any miss DERIVED from it.
+    #     A broken join manufactures listing_only rows; if one happens to
+    #     carry a relevant state, `misses` is built first, the outcome
+    #     becomes relevant_miss, and gating on 'success' skipped the guard
+    #     entirely -- persisting a broken join as real miss evidence.
+    #
+    # The zero-overlap test could not catch that: its listing rows are all
+    # in_library, so misses stayed empty and the outcome stayed 'success'.
+    # Requires normal_feeds_complete for the same reason relevant_miss does:
+    # if the feeds never ran there is no usable comparison to CALL disjoint,
+    # and 'incomplete_feeds' already says the cycle cannot be judged. Without
+    # this the guard overwrote that label too, replacing a precise reason
+    # with a claim about a join that was never actually performed.
+    # FAIL-CLOSED GUARDS, all three gated on a would-be SUCCESS.
+    #
+    # Peer review round 11 (I1) argued disjoint_identity_sets should ALSO
+    # outrank relevant_miss, since a broken join can manufacture the very
+    # listing_only rows the miss is derived from. The reasoning is sound and
+    # I could not implement it without overruling one of the two branches:
+    #
+    #   sweep  test_scenario_09_canonical_variants
+    #          rss 1 item, listing 1 item in_library, zero overlap
+    #          -> expects disjoint_identity_sets
+    #
+    #   main   TestOutcomeLabel[BOTH_OK-True-relevant_miss]
+    #          rss 1 item, listing 2 items missing, zero overlap
+    #          -> expects relevant_miss
+    #
+    # Both are tiny with zero overlap, so SIZE cannot separate them: a
+    # minimum-identities threshold satisfied main and broke the sweep's own
+    # guard tests. The only signal that does separate them is whether misses
+    # exist -- which is precisely what this gate already tests.
+    #
+    # At these sizes 'the identity join is broken' and 'RSS has not got these
+    # yet' are the SAME observation, and nothing in the data distinguishes
+    # them. Deciding either way silently overrules one branch's encoded
+    # contract, so it is raised rather than decided here.
+    if outcome == 'success':
+        if not listing_urls:
+            # No baseline to detect misses against. Zero misses here means zero
+            # comparisons were possible, not zero problems.
+            outcome='no_listing_baseline'
+        elif not rss:
+            # RSS returned nothing at all, and nothing in the listing
+            # contradicted it -- a clean success scored on an empty feed.
+            outcome='no_rss_observations'
+        elif not duplicate:
+            # Both sides have identities and NONE match -- the signature of an
+            # identity mismatch, which is what two divergent canonicalisers
+            # produced when a healthy 99-of-100 pipeline read as 0 of 100.
+            outcome='disjoint_identity_sets'
     return ShadowComparison(len(rss),len(listing_urls),len(duplicate),len(feed_only),len(listing_only),len(misses),int(rss_requests),int(listing_requests),round(reduction,2),bool(normal_feeds_complete),outcome,tuple(sorted(feed_only)),tuple(sorted(listing_only)),tuple(misses),dict(recorded),tuple(unattributable),
         # A CONTRADICTION WITHHOLDS THE AUTHORITY CLAIM, it does not merely get
         # logged. Recording a problem and then still asserting listing authority
@@ -514,6 +603,30 @@ def cycle_is_valid_evidence_for(media_type, cycle):
     observed", which is NOT the same as "no per-feed data was recorded". Collapsing
     those two was a separate review finding.
     """
+    # AN INCONCLUSIVE CYCLE IS NOT AN OBSERVATION. Peer review round 11 (I2).
+    #
+    # The three fail-closed outcomes were admitted into the miss resolver so
+    # their unattributed candidates would keep BLOCKING. But this predicate
+    # never looked at `outcome`, so once admitted a guard cycle became an
+    # ordinary observation: able to CLEAR a candidate via feed carriage, and
+    # to resolve a prior miss to acquired OR never_acquired.
+    #
+    # The worst shape is disjoint_identity_sets, which says the identity join
+    # between the two sides is unusable -- and then that same cycle's
+    # listing_only could be read as proof a release is still missing.
+    #
+    # Placed HERE, in the shared predicate, so both consumers inherit it. The
+    # miss resolver and the candidate state machine have twice now been given
+    # new evidence rules one at a time, leaving the other blind.
+    #
+    # Deliberately conservative: a guard cycle contributes NEITHER positive
+    # nor negative resolution. Positive RSS carriage from such a cycle may
+    # well be salvageable, but that needs two predicates rather than one
+    # reusable-authority bit, and inventing that split here would be the same
+    # conflation in a new place.
+    if str(cycle.get("outcome") or "") in INCONCLUSIVE_OUTCOMES:
+        return False
+
     listing_ok = cycle.get("listing_complete")
     outcomes = cycle.get("outcomes")
 

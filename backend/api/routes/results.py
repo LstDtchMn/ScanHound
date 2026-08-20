@@ -33,15 +33,47 @@ CATEGORY_NONE_SENTINEL = "__none__"
 
 
 def _effective_category(item: Dict[str, Any]) -> str:
-    """Determine the effective category for an item.
+    """Effective facet category, in INTENTIONAL precedence order (round-11):
 
-    If category is set, use it. Otherwise, use 'tv' if season is not None,
-    else '4k'.
+    1. an explicit category (the crawl route) always wins;
+    2. the CARRIED media-type verdict -- season presence is one grammar
+       field, not an identity, and reconstructing type from it is the
+       documented bug that sent tokenless TV to the movie facet;
+    3. DECLARED LIMITATION: the facet space is binary (tv/4k), so an
+       ambiguous/absent verdict falls back to the legacy season heuristic
+       for DISPLAY ONLY. A third facet is a UI change, recorded for a
+       future round, not smuggled in here.
     """
     cat = item.get("category")
     if cat:
         return cat
+    media_type = item.get("media_type")
+    if media_type == "tv":
+        return "tv"
+    if media_type == "movie":
+        return "4k"
     return "tv" if item.get("season") is not None else "4k"
+
+
+def _bookmark_key_for_item(i: Dict[str, Any]):
+    """Bookmark identity: imdb id when present; otherwise title/year plus the
+    CARRIED media-type verdict (round-11 -- season-derived typing gave a
+    tokenless TV result and its saved TV bookmark different keys). An
+    unresolved/absent verdict keys as its own 'ambiguous' discriminator
+    (round-12 F5); season is NEVER part of bookmark identity.
+    NOTE: bookmarks saved under the old mis-derived keys will no longer
+    match; they were keyed wrongly and are re-savable in one click."""
+    imdb = i.get("imdb_id")
+    if imdb:
+        return ("imdb", imdb)
+    media_type = i.get("media_type")
+    if media_type not in ("tv", "movie"):
+        # Round-12 F5: bookmark identity is PERSISTENT, so uncertainty is
+        # preserved in the key -- an unresolved type gets its own
+        # discriminator and can never collide with a confident tv or movie
+        # bookmark. Season presence is one grammar field, not an identity.
+        media_type = "ambiguous"
+    return ("title", normalize_title(str(i.get("title", ""))), i.get("year"), media_type)
 
 
 # UHD is spelled BOTH ways in the live catalogue and the two spellings never
@@ -583,15 +615,8 @@ def _shape_results(
     # filter on and stats/facets see the flag too.
     bookmark_keys = reg.db.list_bookmark_keys() if reg.db is not None else set()
 
-    def _item_bookmark_key(i):
-        imdb = i.get("imdb_id")
-        if imdb:
-            return ("imdb", imdb)
-        media_type = "tv" if i.get("season") is not None else "movie"
-        return ("title", normalize_title(str(i.get("title", ""))), i.get("year"), media_type)
-
     for i in items:
-        i["bookmarked"] = _item_bookmark_key(i) in bookmark_keys
+        i["bookmarked"] = _bookmark_key_for_item(i) in bookmark_keys
 
     # Snapshot of all visible (non-dismissed) items for the overall stats,
     # before status/search/category/genre/language/quick filtering narrows

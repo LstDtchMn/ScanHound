@@ -11,6 +11,7 @@ from backend.hdencode_coordinator import (
     HDEncodeTrafficDenied,
     configure_hdencode_coordinator,
 )
+from backend.release_policy import REASON_RSS_FULL_DISC, is_full_disc_title
 from backend.sources.hdencode_feed_client import HDEncodeFeedClient
 from backend.sources.hdencode_feed_parser import parse_feed
 from backend.sources.hdencode_feeds import catchup_feeds, normal_feeds
@@ -100,7 +101,25 @@ class HDEncodeRSSService:
             min_days=self.config.get(
                 "hdencode_rss_shadow_min_days", 7
             ),
+            window_start_at=self.config.get(
+                "hdencode_rss_window_start_at"
+            ) or None,
         )
+        gate_blockers = ()
+        if mode == "rss_primary":
+            # R-6: a gate that WAS valid at promotion can go invalid (binding
+            # drift, version bump). The safe direction is DEMOTION: keep
+            # polling (evidence must flow), restore shadow behaviour, record
+            # why. Silent skipping here would be a discovery outage.
+            from backend.capability_gate import capability_blockers
+            gate_blockers = capability_blockers(self.config)
+            if gate_blockers:
+                if gate_blockers != getattr(self, "_last_gate_blockers", ()):
+                    logger.warning(
+                        "rss_primary demoted to shadow behaviour: %s",
+                        list(gate_blockers))
+                    self._last_gate_blockers = gate_blockers
+                mode = "rss_shadow"
         if mode == "rss_primary" and not readiness["ready"]:
             cycle = {
                 "mode": mode,
@@ -176,6 +195,12 @@ class HDEncodeRSSService:
         candidate_urls = self.db.list_hdencode_current_feed_urls()
         cycle = {
             "mode": mode,
+            # Round-11 Finding 1: demotion must be DURABLE and operator-
+            # visible, not a log line -- callers and status readers get the
+            # prior mode and the exact blockers.
+            **({"demoted_from": "rss_primary",
+                "promotion_gate_blockers": list(gate_blockers)}
+               if gate_blockers else {}),
             "at": time.time(),
             "feeds": results,
             "changed": sum(r.get("changed", 0) for r in results),
@@ -319,6 +344,26 @@ class HDEncodeRSSService:
                 "requested": True,
             }
 
+        # Full-disc policy symmetry (#191). The listing path excludes [BD]
+        # releases before fetching a detail page; RSS must exclude the same
+        # releases or the two paths disagree about what "discovered" means, and
+        # every listing-vs-RSS comparison inherits a fixed, invisible offset.
+        ingestable, excluded = self._split_full_disc(parsed.entries)
+        if excluded:
+            try:
+                self.db.record_policy_exclusions([
+                    {"url": entry.canonical_url, "source": "hdencode",
+                     "category": feed.key, "title": entry.title,
+                     "reason": REASON_RSS_FULL_DISC}
+                    for entry in excluded
+                ])
+            except Exception:
+                # Recording is observability, not correctness: the entries are
+                # excluded either way. Failing the whole poll here would turn a
+                # bookkeeping problem into lost coverage.
+                logger.warning("Failed to record RSS full-disc exclusions for %s",
+                               feed.key, exc_info=True)
+
         count = self.db.ingest_hdencode_feed(
             feed_key=feed.key,
             feed_url=feed.url,
@@ -326,10 +371,15 @@ class HDEncodeRSSService:
             http_status=response.status,
             body_sha256=parsed.body_sha256,
             channel_last_build_date=parsed.channel_last_build_date,
-            entries=[entry.as_database_row() for entry in parsed.entries],
+            entries=[entry.as_database_row() for entry in ingestable],
             started_at=started,
             completed_at=checked,
         )
+        # Depth is measured over ALL parsed entries, INCLUDING the excluded
+        # ones. Depth describes the FEED's publication window — a property of
+        # hdencode.org, not of our policy. Narrowing it to what we chose to keep
+        # would understate the window and corrupt the coverage-margin figures
+        # that the promotion gate depends on.
         depth = _observed_depth_seconds(parsed.entries)
         try:
             self.db.update_hdencode_feed_depth(feed.key, depth)
@@ -346,9 +396,23 @@ class HDEncodeRSSService:
             "requested": True,
             "changed": 1,
             "candidate_count": count,
+            "policy_excluded_full_disc": len(excluded),
             "observed_depth_seconds": depth,
             "body_sha256": parsed.body_sha256,
         }
+
+    def _split_full_disc(self, entries):
+        """Partition parsed entries into (ingestable, policy-excluded).
+
+        Gated by the same ``hdencode_skip_full_disc`` setting as the listing
+        path, read per-poll so a settings change takes effect without a restart.
+        """
+        if not self.config.get("hdencode_skip_full_disc", True):
+            return list(entries), []
+        ingestable, excluded = [], []
+        for entry in entries:
+            (excluded if is_full_disc_title(entry.title) else ingestable).append(entry)
+        return ingestable, excluded
 
     def status(self) -> dict:
         return {
@@ -363,6 +427,9 @@ class HDEncodeRSSService:
                 min_days=self.config.get(
                     "hdencode_rss_shadow_min_days", 7
                 ),
+                window_start_at=self.config.get(
+                    "hdencode_rss_window_start_at"
+                ) or None,
             ),
         }
 

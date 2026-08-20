@@ -13,9 +13,11 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from backend import release_grammar as grammar
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.ws import ws_manager
 from backend.config import source_enabled
+from backend.scanner_service import resolve_listing_media_type
 from backend.scanner_service import ScanStatus, STATUS_COLORS, STATUS_TEXTS
 
 logger = logging.getLogger(__name__)
@@ -418,8 +420,26 @@ def rescan_item(
     details['source'] = post_source
     details['category'] = existing.get("source_category") or ""
 
+    # Run THE listing media-type composition (round-13: this route never
+    # resolved a verdict, so _create_media_item silently defaulted every
+    # rescanned item's media_type to 'ambiguous'). Route evidence comes from
+    # the cached row's crawl category; the fresh scrape supplies the detail
+    # filename signal, exactly as _process_posts' worker composes it.
+    try:
+        cached_category = json.loads(existing.get("data") or "{}").get("category")
+    except (TypeError, ValueError):
+        cached_category = None
+    route_type = {"4k": "movie", "remux": "movie", "tv": "tv"}.get(cached_category)
+    verdict = resolve_listing_media_type(
+        {"type": route_type, "title": existing.get("title") or ""}, details)
+    details['media_type_verdict'] = verdict.media_type.value
+    details['media_type_provisional'] = verdict.provisional
+    details['media_type_because'] = list(verdict.because)
+
     item = scanner._create_media_item({
-        'details': details, 'is_tv': details.get('is_tv', False), 'url': req.url,
+        'details': details,
+        'is_tv': verdict.media_type is grammar.MediaType.TV,
+        'url': req.url,
     })
     if not item:
         raise HTTPException(status_code=502, detail="Could not parse the refreshed page")

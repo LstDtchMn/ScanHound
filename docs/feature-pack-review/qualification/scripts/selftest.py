@@ -197,6 +197,21 @@ def _make_db(path, *, cycles, misses, recovery, feeds_ok, span_days, schema=9):
     con.execute("""CREATE TABLE hdencode_feed_state (
         feed_key TEXT PRIMARY KEY, last_status INTEGER, consecutive_failures INTEGER,
         last_checked_at TEXT)""")
+
+    # QUALIFICATION WINDOW. Added 2026-08-19: the mirror is now window-scoped,
+    # and with no window row it correctly reports successful_cycles=0 and
+    # qualification_window_not_started -- so the healthy fixture must declare
+    # a window or it is testing the empty case, not the healthy one.
+    # The boundary is set BEFORE the oldest cycle so every cycle is in scope.
+    con.execute("""CREATE TABLE hdencode_qualification_window (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        window_start_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        build_ref TEXT,
+        operator_note TEXT,
+        previous_window_start_at TEXT,
+        superseded_at TEXT
+    )""")
     base = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=span_days)
     step = dt.timedelta(days=span_days / max(1, cycles))
     for i in range(cycles):
@@ -214,6 +229,16 @@ def _make_db(path, *, cycles, misses, recovery, feeds_ok, span_days, schema=9):
         if is_miss:
             con.execute("INSERT INTO hdencode_shadow_misses VALUES (?,?,?,?)",
                         (f"cy-{i}", f"http://x/{i}", "T", "missing"))
+    # The window boundary sits one second BEFORE the oldest cycle, so every
+    # cycle above is inside it. Placing it at `base` exactly would make the
+    # first cycle's inclusion depend on whether the comparison is >= or >.
+    _boundary = (base - dt.timedelta(seconds=1)).isoformat()
+    con.execute(
+        "INSERT INTO hdencode_qualification_window "
+        "(window_start_at, created_at, build_ref, operator_note) "
+        "VALUES (?,?,?,?)",
+        (_boundary, _boundary, "selftest", "selftest fixture"),
+    )
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     stale = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
     for key in ("movies_all", "tv_all"):

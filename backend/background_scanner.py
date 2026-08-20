@@ -308,6 +308,14 @@ class BackgroundScanner:
                 rss_cycle = HDEncodeRSSService(cfg, db).poll_cycle(
                     stop_requested=stop_requested,
                 )
+                # Round-11 Finding 1: the service may have DEMOTED an
+                # invalid-gate primary to shadow behaviour. Every downstream
+                # branch must follow the EFFECTIVE mode the cycle actually
+                # ran in, or the listing safety net stays down while config
+                # still says primary -- RSS-only discovery under an invalid
+                # gate, the exact state demotion exists to prevent.
+                if rss_cycle and rss_cycle.get("mode"):
+                    discovery_mode = rss_cycle["mode"]
                 if stop_requested():
                     return {
                         "scanned": 0,

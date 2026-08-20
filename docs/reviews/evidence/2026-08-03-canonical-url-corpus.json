@@ -1,0 +1,182 @@
+{
+ "controls": {
+  "negative_different_slugs": true,
+  "negative_slash_detector": true,
+  "positive_slash_bridge": true,
+  "positive_slash_detector": true
+ },
+ "cross_form_joins": {
+  "hdencode_shadow_misses_vs_candidates": {
+   "bridged_match": 111,
+   "denominator": 112,
+   "exact_match": 0,
+   "unmatched": [
+    "https://hdencode.org/pallichattambi-2026-2160p-sonyliv-web-dl-dd5-1-atmos-h-265-cptn5dw-8-7-gb"
+   ],
+   "unmatched_count": 1
+  },
+  "listing_policy_exclusions_vs_candidates": {
+   "bridged_match": 114,
+   "denominator": 149,
+   "exact_match": 0,
+   "unmatched": [
+    "https://hdencode.org/bd20th-century-women-2016-2160p-usa-uhd-blu-ray-dv-hdr-hevc-dts-hd-ma-5-1-tmt-87-0-gb",
+    "https://hdencode.org/bd36-hours-1953-2160p-complete-uhd-bluray-lwrtd-76-1-gb",
+    "https://hdencode.org/bdalice-doesnt-live-here-anymore-1974-2160p-usa-uhd-blu-ray-dv-hdr-hevc-lpcm-1-0-tmt-82-3-gb",
+    "https://hdencode.org/bdanyone-but-you-2023-2160p-usa-uhd-blu-ray-dv-hdr-hevc-truehd-7-1-atmos-tmt-73-3-gb",
+    "https://hdencode.org/bdbeginners-2010-2160p-usa-uhd-blu-ray-dv-hdr-hevc-dts-hd-ma-5-1-tmt-73-0-gb",
+    "https://hdencode.org/bdcity-of-the-living-dead-1980-2in1-2160p-gbr-uhd-blu-ray-dv-hdr-hevc-dts-hd-ma-5-1-91-2-gb",
+    "https://hdencode.org/bdcmon-cmon-2021-2160p-usa-uhd-blu-ray-dv-hdr-hevc-truehd-7-1-atmos-tmt-77-5-gb",
+    "https://hdencode.org/bdcruel-story-of-youth-1960-2160p-usa-uhd-blu-ray-sdr-hevc-lpcm-1-0-tmt-59-5-gb",
+    "https://hdencode.org/bddanger-diabolik-aka-diabolik-1968-2160p-gbr-uhd-blu-ray-dv-hdr-hevc-dts-hd-ma-1-0-86-2-gb",
+    "https://hdencode.org/bddark-shadows-2012-2160p-complete-uhd-bluray-b0mbardiers-80-4-gb",
+    "https://hdencode.org/bddeathstalker-2025-2160p-complete-uhd-bluray-b0mbardiers-68-9-gb",
+    "https://hdencode.org/bdfull-contact-1992-uhd-bluray-2160p-hevc-dts-hd-ma2-0-mteam-68-4-gb",
+    "https://hdencode.org/bdhalloween-4-the-return-of-michael-myers-1988-fr-complete-uhd-bluray-skallan-54-7-gb",
+    "https://hdencode.org/bdhalloween-5-the-revenge-of-michael-myers-1989-fr-complete-uhd-bluray-skallan-61-2-gb",
+    "https://hdencode.org/bdhow-to-make-a-killing-2026-2160p-multi-complete-uhd-bluray-fullbrutality-73-7-gb",
+    "https://hdencode.org/bdknock-off-1998-2160p-multi-complete-uhd-bluray-sharphd-81-2-gb",
+    "https://hdencode.org/bdla-cite-des-enfants-perdus-1995-2160p-usa-uhd-blu-ray-hevc-dts-hd-ma-2-0-mixer-59-3-gb-2",
+    "https://hdencode.org/bdlee-cronins-the-mummy-2026-uhd-bluray-2160p-hevc-atmos-truehd7-1-mteam-87-7-gb",
+    "https://hdencode.org/bdleprechaun-1992-rerip-complete-uhd-bluray-b0mbardiers-73-8-gb",
+    "https://hdencode.org/bdmaurice-1987-2160p-complete-uhd-bluray-baked-90-4-gb",
+    "https://hdencode.org/bdmichael-2026-uhd-bluray-2160p-hevc-atmos-truehd7-1-mteam-92-9-gb",
+    "https://hdencode.org/bdmr-nice-guy-1997-international-cut-2160p-gbr-uhd-blu-ray-dv-hdr-hevc-lpcm-2-0-62-8-gb",
+    "https://hdencode.org/bdmr-nice-guy-1997-japanese-and-hong-kong-cuts-2160p-gbr-uhd-blu-ray-dv-hdr-hevc-lpcm-2-0-71-8-gb",
+    "https://hdencode.org/bdnormal-2025-uhd-bluray-2160p-hevc-atmos-truehd7-1-mteam-60-0-gb",
+    "https://hdencode.org/bdobsession-2025-2160p-usa-uhd-blu-ray-dv-hdr-hevc-truehd-7-1-atmos-tmt-61-1-gb",
+    "https://hdencode.org/bdpsycho-1960-2in1-proper-2160p-uhd-blu-ray-hevc-dtsx-taipak-90-5-gb",
+    "https://hdencode.org/bdthe-black-phone-2021-2160p-gbr-uhd-blu-ray-hdr-hevc-truehd-7-1-atmos-blochead-49-9-gb",
+    "https://hdencode.org/bdthe-crying-game-1992-2160p-usa-uhd-blu-ray-dv-hdr-hevc-dts-hd-ma-2-0-tmt-81-8-gb",
+    "https://hdencode.org/bdthe-descent-2005-2160p-gbr-uhd-blu-ray-dv-hdr-hevc-dts-hd-ma-5-1-blochead-78-1-gb",
+    "https://hdencode.org/bdthe-descent-2005-2160p-multi-complete-uhd-bluray-monument-71-0-gb",
+    "https://hdencode.org/bdthe-evil-dead-1981-2160p-gbr-uhd-blu-ray-dv-hdr-hevc-dts-hd-ma-5-1-blochead-52-7-gb",
+    "https://hdencode.org/bdthe-magic-faraway-tree-2026-2160p-complete-uhd-bluray-4kdvs-54-6-gb",
+    "https://hdencode.org/bdthe-resurrection-of-the-golden-wolf-1979-2160p-jpn-uhd-blu-ray-hevc-atmos-truehd-7-1-taipak-88-6-gb",
+    "https://hdencode.org/bdused-cars-1980-2160p-complete-uhd-bluray-b0mbardiers-91-1-gb-2",
+    "https://hdencode.org/bdvampire-circus-1972-2160p-aus-uhd-blu-ray-dv-hdr-hevc-lpcm-2-0-tux-54-0-gb"
+   ],
+   "unmatched_count": 35
+  }
+ },
+ "definitions": {
+  "bridged_match": "Form-B key || '/' equals a candidates (Form-A) key \u2014 the named post_to_listing_identity bridge, inverted",
+  "denominator": "COUNT(DISTINCT canonical_url) of the Form-B table; unmatched rows are LISTED, never dropped"
+ },
+ "provenance": "backup-API snapshot of /dbvol/crawler.db (sqlite3 Connection.backup into the container's /tmp, docker cp out); record the capture time next to the file",
+ "snapshot_sha256": "69fb7c2cbbcfd904233b043fd3b7e2897046d74996260556ec813015d89d7c06",
+ "tables": {
+  "background_scan_cache.url": {
+   "distinct": 2918,
+   "expected_form": "raw",
+   "http_scheme": 0,
+   "rows": 2918,
+   "trailing_slash": 2918,
+   "with_query": 0
+  },
+  "dismissed_items.url": {
+   "distinct": 1018,
+   "expected_form": "raw",
+   "http_scheme": 0,
+   "rows": 1018,
+   "trailing_slash": 1018,
+   "with_query": 0
+  },
+  "download_queue_items.canonical_url": {
+   "distinct": 198,
+   "expected_form": "raw",
+   "http_scheme": 0,
+   "rows": 213,
+   "trailing_slash": 213,
+   "with_query": 0
+  },
+  "downloads.url": {
+   "distinct": 417,
+   "expected_form": "raw",
+   "http_scheme": 0,
+   "rows": 417,
+   "trailing_slash": 417,
+   "with_query": 0
+  },
+  "hdencode_candidate_details.canonical_url": {
+   "distinct": 2033,
+   "expected_form": "A",
+   "http_scheme": 0,
+   "rows": 2033,
+   "trailing_slash": 2033,
+   "with_query": 0
+  },
+  "hdencode_candidate_feeds.canonical_url": {
+   "distinct": 2969,
+   "expected_form": "A",
+   "http_scheme": 0,
+   "rows": 4568,
+   "trailing_slash": 4568,
+   "with_query": 0
+  },
+  "hdencode_candidates.canonical_url": {
+   "distinct": 2969,
+   "expected_form": "A",
+   "http_scheme": 0,
+   "rows": 2969,
+   "trailing_slash": 2969,
+   "with_query": 0
+  },
+  "hdencode_feed_state.feed_url": {
+   "distinct": 12,
+   "expected_form": "feed",
+   "http_scheme": 0,
+   "rows": 12,
+   "trailing_slash": 2,
+   "with_query": 10
+  },
+  "hdencode_hydration_queue.canonical_url": {
+   "distinct": 2888,
+   "expected_form": "A",
+   "http_scheme": 0,
+   "rows": 2888,
+   "trailing_slash": 2888,
+   "with_query": 0
+  },
+  "hdencode_shadow_misses.canonical_url": {
+   "distinct": 112,
+   "expected_form": "B",
+   "http_scheme": 0,
+   "rows": 112,
+   "trailing_slash": 0,
+   "with_query": 0
+  },
+  "listing_policy_exclusions.canonical_url": {
+   "distinct": 149,
+   "expected_form": "B",
+   "http_scheme": 0,
+   "rows": 149,
+   "trailing_slash": 0,
+   "with_query": 0
+  },
+  "pipeline_verdicts.url": {
+   "distinct": 203,
+   "expected_form": "raw",
+   "http_scheme": 0,
+   "rows": 203,
+   "trailing_slash": 203,
+   "with_query": 0
+  },
+  "scanned_urls.url": {
+   "distinct": 300,
+   "expected_form": "raw",
+   "http_scheme": 0,
+   "rows": 300,
+   "trailing_slash": 300,
+   "with_query": 0
+  },
+  "scraped_link_map.source_url": {
+   "distinct": 417,
+   "expected_form": "raw",
+   "http_scheme": 0,
+   "rows": 1599,
+   "trailing_slash": 1599,
+   "with_query": 0
+  }
+ }
+}

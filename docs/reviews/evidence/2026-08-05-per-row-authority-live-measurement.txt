@@ -1,0 +1,61 @@
+Per-row detail authority — measured against the LIVE database
+=============================================================
+Read-only reconstruction. No writes to production.
+Source : scanhound container, /dbvol/crawler.db (mode=ro)
+Method : re-ran the SAME backend.hdencode_candidate_service._candidate_updates
+         over each row's RETAINED hydration payload, intersected with the 16
+         COALESCE-protected columns.
+Date   : 2026-08-05
+
+  hdencode_candidates rows            3431
+  hydration_state = 'completed'       2466
+  completed rows WITH a payload       2466   (100% — backfill can be exact)
+  reconstructed successfully          2466
+  payloads that would remain NULL        0
+
+Protected fields each row's detail ACTUALLY supplied (of 16):
+
+   8 fields : 1292 rows
+   9 fields :  482 rows
+  10 fields :  692 rows
+
+So NO live row is fully detail-authoritative. Every one carries 6–8
+protected fields that are still FEED-owned, which is exactly the mixed
+authority round-15 identified.
+
+Per-field claim rate (how often DETAIL is authoritative):
+
+  clean_title              2466  100.0%
+  description_year         2466  100.0%
+  dv_evidence              2466  100.0%
+  hdr_evidence             2466  100.0%
+  hdr_formats              2466  100.0%
+  resolution               2466  100.0%
+  size_gb                  2466  100.0%
+  size_text                2466  100.0%
+  season                   1174   47.6%
+  episode                   692   28.1%
+  ----------------------------------------  never claimed by detail:
+  title_year                  0    0.0%
+  media_type                  0    0.0%
+  media_type_provisional      0    0.0%
+  media_type_because          0    0.0%
+  hevc_evidence               0    0.0%
+  episode_end                 0    0.0%
+
+WHAT THIS MEASURES ABOUT THE ROUND-14 DEFECT
+
+_FEED_ONLY_ON_COMPLETED = ("title_year",) repaired ONE field. The table
+shows 6 fields that are feed-owned on 100% of rows and 2 more that are
+feed-owned on a majority. So on every one of 2466 completed rows, 5 to 7
+protected fields were frozen at the old grammar's parse while the row was
+stamped feed-current.
+
+The media-type triple is among them, at 100%. The stale-forever set therefore
+included the media-type verdict itself on every completed row — the same
+authority R-1 exists to protect.
+
+hevc_evidence at 0% is worth a second look on its own terms: round-13 recorded
+that a detail producer now exists for it, and across 2466 live payloads it has
+never once fired. That is consistent with its positive-only exact-token rule,
+but it means the column is feed-owned in practice, not merely in principle.

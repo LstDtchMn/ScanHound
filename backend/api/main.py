@@ -154,6 +154,10 @@ def _init_services(
     reg._plex_service = plex_svc
 
     # Scanner
+    reconciled = backend.db.reconcile_derived_versions()
+    if any(reconciled.values()):
+        logging.getLogger(__name__).info(
+            "derived-state reconciliation: %s", reconciled)
     scrapers = WebScrapers(bridge)
     matching = MatchingEngine(bridge)
     scanner_svc = ScannerService(
@@ -435,7 +439,9 @@ def _start_results_poller(reg: ServiceRegistry, interval: float = 8.0) -> None:
                     # folder to the rename service (it self-gates on the setting
                     # and dedups by package). Runs off-thread so the poller never
                     # blocks on filesystem walks / TMDB lookups.
-                    if cfg.get("auto_rename_enabled") and reg._rename_service:
+                    if (cfg.get("auto_rename_enabled") and reg._rename_service
+                            and not __import__("backend.capability_gate",
+                                fromlist=["capability_blockers"]).capability_blockers(cfg)):
                         for r in results:
                             key = _rename_dedup_key(r)
                             if (r.get("state") == "extracted" and r.get("save_to")
