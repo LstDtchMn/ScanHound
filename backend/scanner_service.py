@@ -272,6 +272,9 @@ class ScannerService:
         # ('movie', 'tv', ...). A crawl that never fetched the TV arm cannot have
         # observed a movie-vs-TV disagreement, so its silence proves nothing.
         self._last_crawl_types_covered: Set[str] = set()
+        #: Round 14: one record per (release, arm) seen by the last crawl. A
+        #: ledger of observations; it authorises nothing on its own.
+        self._last_crawl_listing_claims: List[Dict] = []
         # Whether this crawl was RUN as an attesting crawl at all. The scheduled
         # background crawl is bounded by background_scan_pages and runs with
         # early_stop=True, so it deliberately never claims this. It may still
@@ -424,6 +427,7 @@ class ScannerService:
         # what else it reports. Both conditions, not either.
         self._last_crawl_attests_coverage = bool(attest_coverage) and not early_stop
         self._last_crawl_types_covered = set()
+        self._last_crawl_listing_claims = []
         self._last_crawl_request_count = 0
         # RESET THE WHOLE CRAWL-AUTHORITY STATE HERE, at run entry, beside the
         # resets above. Round 7 found the consequence of my having put this reset
@@ -839,6 +843,9 @@ class ScannerService:
         #: cached, because a disagreement between two listings is evidence
         #: about the release regardless of whether we re-fetch its detail page.
         url_type_claim: Dict[str, str] = {}
+        #: Round 14 ledger: one record per (release, arm) observed this crawl.
+        listing_claims: List[Dict] = []
+        listing_claim_seen: Set[tuple] = set()
         #: urls two listings disagreed about. Exposed after the crawl so the
         #: caller can mark the CACHED rows, which are otherwise never rewritten.
         conflicted_urls: Set[str] = set()
@@ -1026,6 +1033,21 @@ class ScannerService:
                         #
                         # A conflict is LISTING MEMBERSHIP evidence. Observing it needs no
                         # detail fetch, so it is recorded before any skip decision.
+                        # THE LEDGER, round 14. Every arm's claim is kept, not
+                        # just the first: url_type_claim below records only the
+                        # winner-so-far because it exists to DETECT disagreement,
+                        # whereas a coverage proof needs the sightings themselves.
+                        # Deduped per (url, arm) so a release seen on two pages of
+                        # the same arm is one claim.
+                        _arm = (post_url, source_type_hint, source_category)
+                        if _arm not in listing_claim_seen:
+                            listing_claim_seen.add(_arm)
+                            listing_claims.append({
+                                "url": post_url,
+                                "source": source_id,
+                                "listing_type": source_type_hint,
+                                "listing_category": source_category,
+                            })
                         _claim = url_type_claim.get(post_url)
                         if _claim is None:
                             url_type_claim[post_url] = source_type_hint
@@ -1177,6 +1199,7 @@ class ScannerService:
         # is partial — the caller must not age out items it simply didn't revisit.
         self._last_crawl_early_stopped = early_stopped
         self._last_crawl_types_covered = types_covered
+        self._last_crawl_listing_claims = listing_claims
         # The crawl's own verdict on itself, in precedence order: a stop that cut
         # it short, then pages that failed, then a suspicious empty result.
         # A recorded cancellation WINS over everything below it. Previously the

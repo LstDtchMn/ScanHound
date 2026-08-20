@@ -644,6 +644,28 @@ class BackgroundScanner:
                             "Retrying next cycle.", len(_to_revoke))
                         source_results[-1]["revocation_failed"] = len(_to_revoke)
 
+                # THE LISTING-CLAIM LEDGER (round 14).
+                #
+                # What each arm SAID about each release, kept. Until now this was
+                # a function-local dict rebuilt every crawl, so only conflicts
+                # survived and the sightings themselves were discarded -- while
+                # releases age off the listing continuously and a claim not
+                # captured cannot be reconstructed afterwards.
+                #
+                # Recorded regardless of the crawl verdict, and deliberately so:
+                # unlike attestation, writing down WHAT WAS SEEN needs no coverage
+                # proof. It is an observation, not a certification, and nothing
+                # reads this table to grant a media kind.
+                _claims = getattr(scanner, "_last_crawl_listing_claims", None) or []
+                if _claims:
+                    try:
+                        db.record_listing_claims(_claims)
+                        db.backfill_listing_claim_order_keys()
+                    except Exception:
+                        # A ledger failure must never affect the scan or the
+                        # safety paths above; it only costs future evidence.
+                        logger.exception("failed to record listing claims")
+
                 # ATTESTATION: only a crawl whose coverage could actually rule out a
                 # contradiction may turn unknown into checked-clean.
                 #

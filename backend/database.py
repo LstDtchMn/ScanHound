@@ -1228,6 +1228,47 @@ class DatabaseManager:
                     CREATE INDEX IF NOT EXISTS idx_listing_policy_excl_source
                     ON listing_policy_exclusions(source, policy_reason)
                 """)
+
+                # LISTING CLAIMS -- what each arm said about a release, kept.
+                #
+                # Peer review round 13/14. `url_type_claim` was a function-local
+                # dict rebuilt on every crawl, so the observation "this release
+                # appeared under 4K Movies in this run" was DISCARDED every
+                # cycle; only conflicts survived, as a flag. That is exactly the
+                # evidence a coverage proof needs, and it was being destroyed
+                # continuously while releases aged off the listing.
+                #
+                # Recording it is deliberately independent of whichever coverage
+                # model is chosen: this table AUTHORIZES NOTHING. Nothing reads it
+                # to grant a media kind. It exists so the claims are still there
+                # when a proof model is agreed, because a claim not captured today
+                # cannot be reconstructed once the release leaves the listing.
+                #
+                # Additive DDL only, and NO schema-version bump: the base tables
+                # above are created unconditionally on every init, and
+                # docs/feature-pack-review/qualification/scripts/05_shadow_evidence.py
+                # BLOCKS on user_version != 9.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS listing_claims (
+                        url TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        listing_type TEXT NOT NULL,
+                        listing_category TEXT NOT NULL DEFAULT '',
+                        order_key TEXT,
+                        first_seen_at TEXT NOT NULL,
+                        last_seen_at TEXT NOT NULL,
+                        sightings INTEGER NOT NULL DEFAULT 1,
+                        PRIMARY KEY (url, source, listing_type, listing_category)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_listing_claims_arm
+                    ON listing_claims(source, listing_type, listing_category)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_listing_claims_url
+                    ON listing_claims(url)
+                """)
                 for _column, _declaration in (
                     ("imdb_id", "TEXT"),
                     ("tmdb_id", "TEXT"),
@@ -4344,6 +4385,149 @@ class DatabaseManager:
                 "retracted media_kind on %d download row(s): %s. Any semantic "
                 "identity built on those rows is withdrawn.", retracted, reason)
         return retracted
+
+    def record_listing_claims(self, claims):
+        """Persist what each listing arm SAID about a release. Authorizes nothing.
+
+        Round 14. Until now the per-crawl `url_type_claim` map was a function
+        local, rebuilt and discarded every cycle, so only CONFLICTS survived --
+        as a boolean. The observation itself (this release appeared under this
+        arm, at this time, with this order key) was thrown away.
+
+        That observation is the raw material of any coverage proof, and it is
+        perishable: once a release ages off every listing, no future crawl of any
+        depth can reconstruct which arms carried it. So it is captured now, while
+        the coverage model itself is still undecided.
+
+        DELIBERATELY INERT. Nothing reads this table to grant a media kind, and
+        it is not consulted by get_scan_category(), verified_media_kind(), or the
+        identity path. It is a ledger, not an authority -- adding evidence must
+        not be able to widen permission by itself.
+
+        `claims` is an iterable of dicts with keys: url, source, listing_type,
+        listing_category, and optionally order_key.
+
+        Returns the number of claim rows written or refreshed.
+        """
+        rows = []
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        for c in (claims or ()):
+            try:
+                url = str(c.get("url") or "").strip()
+                ltype = str(c.get("listing_type") or "").strip().lower()
+            except AttributeError:
+                continue
+            if not url or not ltype:
+                # A claim with no arm is not a claim.
+                continue
+            rows.append((
+                url,
+                str(c.get("source") or "").strip().lower(),
+                ltype,
+                str(c.get("listing_category") or "").strip().lower(),
+                (str(c.get("order_key")).strip() if c.get("order_key") else None),
+                now, now,
+            ))
+        if not rows:
+            return 0
+        with self.transaction() as conn:
+            if not conn:
+                return 0
+            conn.executemany(
+                "INSERT INTO listing_claims "
+                "(url, source, listing_type, listing_category, order_key, "
+                " first_seen_at, last_seen_at, sightings) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
+                "ON CONFLICT(url, source, listing_type, listing_category) "
+                "DO UPDATE SET "
+                "  last_seen_at = excluded.last_seen_at, "
+                "  sightings = listing_claims.sightings + 1, "
+                "  order_key = COALESCE(listing_claims.order_key, excluded.order_key)",
+                rows)
+        return len(rows)
+
+    def backfill_listing_claim_order_keys(self, limit=2000):
+        """Fill in `order_key` on claims from the cached `posted_date`.
+
+        Round 14. A claim is recorded at LISTING time, where no date is
+        available: `_select_posts()` returns anchor elements only -- href and
+        link text -- so the crawl genuinely cannot know when a release was
+        published at the moment it sees it in a listing. The date is parsed from
+        the DETAIL page (detail_scraper.py) and lands in the scan cache, where it
+        is present on 100% of live rows.
+
+        So this is an enrichment pass, kept separate from recording on purpose:
+        a claim must be captured whether or not a date can be attached, since the
+        claim is the perishable part and the date can be filled in later.
+
+        The value is the site's own string (e.g. "June 29, 2026 at 11:38 PM").
+        It is stored verbatim, NOT normalised here -- whether it is precise enough
+        to order coverage by is a question for the coverage model, and silently
+        reformatting it would hide the ambiguity rather than surface it.
+
+        Returns the number of claims enriched.
+        """
+        pending = self._query_dicts(
+            "SELECT DISTINCT url FROM listing_claims "
+            "WHERE order_key IS NULL LIMIT ?",
+            (int(limit),), default=[]) or []
+        if not pending:
+            return 0
+        urls = [r["url"] for r in pending]
+        found = {}
+        for start in range(0, len(urls), 300):
+            chunk = urls[start:start + 300]
+            rows = self._query_dicts(
+                "SELECT url, data FROM background_scan_cache WHERE url IN (%s)"
+                % ",".join("?" * len(chunk)),
+                tuple(chunk), default=[]) or []
+            for row in rows:
+                try:
+                    payload = json.loads(row.get("data") or "{}")
+                except (TypeError, ValueError):
+                    continue
+                pd = payload.get("posted_date")
+                if pd:
+                    found[row["url"]] = str(pd)
+        if not found:
+            return 0
+        with self.transaction() as conn:
+            if not conn:
+                return 0
+            conn.executemany(
+                "UPDATE listing_claims SET order_key = ? "
+                "WHERE url = ? AND order_key IS NULL",
+                [(v, k) for k, v in found.items()])
+        return len(found)
+
+    def get_listing_claims(self, url):
+        """Every arm that has ever claimed this release. Reporting/diagnostics."""
+        return self._query_dicts(
+            "SELECT source, listing_type, listing_category, order_key, "
+            "first_seen_at, last_seen_at, sightings "
+            "FROM listing_claims WHERE url = ? "
+            "ORDER BY first_seen_at",
+            (str(url),), default=[]) or []
+
+    def listing_claim_summary(self):
+        """Counts per arm, and how many releases have claims from BOTH a movie
+        and a TV arm -- the population a conflict could ever be found in.
+        """
+        per_arm = self._query_dicts(
+            "SELECT source, listing_type, listing_category, COUNT(*) AS n "
+            "FROM listing_claims "
+            "GROUP BY source, listing_type, listing_category "
+            "ORDER BY n DESC",
+            (), default=[]) or []
+        both = self._query(
+            "SELECT COUNT(*) AS n FROM ("
+            "  SELECT url FROM listing_claims GROUP BY url "
+            "  HAVING COUNT(DISTINCT listing_type) > 1)",
+            (), one=True, default=None)
+        return {
+            "per_arm": [dict(r) for r in per_arm],
+            "claimed_by_multiple_types": (dict(both).get("n") if both else 0),
+        }
 
     def hold_media_kind(self, urls, *, reason):
         """Withhold semantic authority for these releases IMMEDIATELY.
