@@ -127,6 +127,15 @@ services:
     environment:
       - TZ=America/New_York
       - SCANHOUND_DB_DIR=/dbvol
+      # Scoped DV ingest key: the SHA-256 of the detector's secret (the raw
+      # secret lives only on the host in C:\DockerData\scanhound\dv_ingest_key.secret).
+      # Authorizes ONLY POST /rename/dv-host-rows. Not sensitive (one-way hash).
+      - SCANHOUND_DV_INGEST_KEY_SHA256=b898d4bbade6e30f66ce8419c694724b35929833f9d46a60a68bd4edf500c6c4
+    ports:
+      # Host-loopback ONLY: lets the host-side DV detector reach the app at
+      # http://127.0.0.1:9721. Bound to 127.0.0.1 so it is NOT exposed to the
+      # LAN; external access stays via the proxy network / NPM / Cloudflare.
+      - "127.0.0.1:9721:9721"
     labels:
       # scanhound is a locally-built image (no registry) — tell Whats-Up-Docker
       # not to try checking Docker Hub for it (was logging 401 UNAUTHORIZED).

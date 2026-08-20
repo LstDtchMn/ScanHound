@@ -19,6 +19,54 @@ from backend.config import source_enabled
 from backend.scanner_service import ScanStatus, STATUS_COLORS, STATUS_TEXTS
 
 logger = logging.getLogger(__name__)
+def rescan_classification(existing):
+    """The classification a rescan must CARRY FORWARD, from the cached row.
+
+    Extracted so it can be tested against production code rather than a test
+    reimplementation. The first version of its test rebuilt this logic locally
+    and therefore could not fail when the production line was wrong -- a
+    mutation restoring the bug killed nothing.
+
+    Peer review round 11. `source_category` is the SOURCE NAME -- "HDEncode" on
+    all 4,145 live rows -- not the crawl category ('4k' | 'remux' | 'tv'). Two
+    uses read it as though it were:
+
+        details['category'] = source_category
+            persisted "HDEncode" back into background_scan_cache, destroying
+            the server-owned classification that authorises a destructive
+            action for that release.
+
+        post_source_is_tv = (source_category == 'tv')
+            ALWAYS False, so rescanning a TV row whose season does not parse
+            produced is_tv=False with season=None -- recreating on a live route
+            the exact defect #93 exists to fix. That line was added BY the #93
+            fix, which is the part worth noticing: a fix for "re-derived a fact
+            that was already known" re-derived it again, one route over, from a
+            field that never held it.
+
+    A rescan re-fetches the DETAIL page. It observes nothing about which
+    listing the release came from, so it carries that evidence rather than
+    inventing it.
+
+    Returns ``(category, is_tv_from_cache, category_conflict)``.
+    """
+    try:
+        cached = json.loads(existing.get("data") or "{}")
+    except (TypeError, ValueError):
+        cached = {}
+    category = str(cached.get("category") or "").strip().lower()
+    # The item's own recorded verdict outranks a re-derivation: it was decided
+    # at crawl time with evidence this route does not have. An OR of positive
+    # signals, matching the matcher.
+    is_tv = (category == "tv"
+             or bool(cached.get("is_tv"))
+             or cached.get("season") is not None)
+    # A conflict recorded against this release survives a rescan: re-reading
+    # the detail page is not evidence about which listings carried it.
+    conflict = bool(cached.get("category_conflict"))
+    return category, is_tv, conflict
+
+
 router = APIRouter(prefix="/scan", tags=["scanner"])
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 
@@ -416,10 +464,17 @@ def rescan_item(
 
     post_source = existing.get("source_category") or "hdencode"
     details['source'] = post_source
-    details['category'] = existing.get("source_category") or ""
-
+    # BOTH sides of this conflict added something, and neither is redundant:
+    #   #93   the extracted helper, and the TV signal it recovers
+    #   main  preservation of a recorded classification conflict
+    # The helper carries all three rather than one side being dropped.
+    (details['category'],
+     post_source_is_tv,
+     details['category_conflict']) = rescan_classification(existing)
     item = scanner._create_media_item({
-        'details': details, 'is_tv': details.get('is_tv', False), 'url': req.url,
+        'details': details,
+        'is_tv': details.get('is_tv', False) or post_source_is_tv,
+        'url': req.url,
     })
     if not item:
         raise HTTPException(status_code=502, detail="Could not parse the refreshed page")
