@@ -2970,6 +2970,14 @@ class DatabaseManager:
         the previous window stays available for forensics; it simply stops
         counting toward the current one.
         """
+        # EVERY aggregate below must carry this. The merge grafted the window
+        # parameter onto main's richer body, and three of the four queries
+        # kept main's unscoped WHERE -- so successful_cycles, observed_days,
+        # request_reduction_pct, recovery_cycles and relevant_misses were all
+        # still computed over EVERY row ever recorded. A window that scopes
+        # one query out of four is not a window.
+        # Orphan miss rows are deliberately NOT scoped: an orphan has no cycle
+        # to take a date from, which is precisely what makes it an orphan.
         scope, params = "", []
         if window_start_at:
             scope = " AND completed_at >= ?"
@@ -3005,8 +3013,8 @@ class DatabaseManager:
                  AND normal_feeds_complete=1
                  AND (listing_complete IS NULL OR listing_complete=1)
                  AND rss_requests>0
-                 AND listing_requests>0""",
-            one=True,default=None)
+                 AND listing_requests>0""" + scope,
+            tuple(params),one=True,default=None)
         # MISS ACCOUNTING. The 2026-07-21 adversarial audit (f5e3c6e) established
         # that a degraded cycle must not be able to HIDE a real gap. That rule is
         # preserved by ATTRIBUTION rather than any cycle-level proxy: a real movie
@@ -3077,7 +3085,14 @@ class DatabaseManager:
             "       c.relevant_miss_count AS stored_count "
             "FROM hdencode_shadow_misses m "
             "JOIN hdencode_shadow_cycles c ON c.cycle_uuid=m.cycle_uuid "
-            "WHERE c.normal_feed_outcomes IS NOT NULL",default=[])
+            # Aliased scope: the join makes a bare `completed_at` ambiguous to a
+            # reader even though only c has it. THIS is the query that produces
+            # `attributed`, so an unscoped version here silently carried every
+            # historical miss into a fresh window -- the exact permanent block
+            # the window exists to clear.
+            "WHERE c.normal_feed_outcomes IS NOT NULL"
+            + scope.replace("completed_at", "c.completed_at"),
+            tuple(params),default=[])
         for row in rows:
             cycle=str(row.get("cycle_uuid") or "")
             slot=per_cycle.setdefault(cycle,{"total":0,"supported":0,
@@ -3187,7 +3202,8 @@ class DatabaseManager:
         for claim in self._query_dicts(
                 "SELECT cycle_uuid, relevant_miss_count AS n "
                 "FROM hdencode_shadow_cycles "
-                "WHERE normal_feed_outcomes IS NOT NULL",default=[]):
+                "WHERE normal_feed_outcomes IS NOT NULL" + scope,
+                tuple(params),default=[]):
             cycle=str(claim.get("cycle_uuid") or "")
             stored=int(claim.get("n") or 0)
             slot=per_cycle.get(cycle)
@@ -3232,8 +3248,9 @@ class DatabaseManager:
         legacy=self._query(
             "SELECT SUM(relevant_miss_count) AS n "
             "FROM hdencode_shadow_cycles "
-            "WHERE normal_feed_outcomes IS NULL AND normal_feeds_complete=1",
-            one=True,default=None)
+            "WHERE normal_feed_outcomes IS NULL AND normal_feeds_complete=1"
+            + scope,
+            tuple(params),one=True,default=None)
         # Categorised so an operator can tell "coverage miss" from "evidence
         # store corrupt" without the gate ever reporting ready.
         findings=sorted(set(integrity))
@@ -3611,27 +3628,23 @@ class DatabaseManager:
             # Historical totals are still available, but under an explicitly
             # named diagnostic key that no gate consumes. Caught in review.
             historical = self.get_hdencode_shadow_summary()
-            # UNRESOLVED CONFLICT between two reviewed contracts. Measured, not
-            # guessed, on 2026-08-19:
+            # EXACTLY ONE REASON HERE. Asserted by name in
+            # test_the_only_reason_is_that_no_window_has_started, and the rationale
+            # is about what the COLLECTOR consumes: it reads relevant_misses
+            # independently and turns any nonzero value into a mandatory stop with a
+            # priority-8 push. With 102 void misses live that fired before the new
+            # window existed.
             #
-            #   the sweep requires EXACTLY ONE reason here -- asserted by name in
-            #   test_the_only_reason_is_that_no_window_has_started. With no window
-            #   there is no evidence in scope to have integrity about, and a second
-            #   reason invites a consumer to act on the previous window's rows.
-            #
-            #   main requires integrity to surface REGARDLESS -- 24 tests in
-            #   test_hdencode_readiness_integrity.py. Malformed provenance silently
-            #   contributing zero DEFLATED the gate before 2026-08-06, the opposite
-            #   of the protection claimed for it.
-            #
-            # Both cannot hold as written. Satisfying the sweep alone costs 24 of
-            # main's tests (39 failures); the shape below costs 15. Neither is
-            # correct -- this needs a decision, not a tiebreak. A third option not
-            # taken here: expose integrity under its own key so `reasons` keeps the
-            # sweep's single entry, which would mean amending main's assertions.
+            # RESOLVED 2026-08-19. I briefly added integrity reasons here too,
+            # reasoning that corrupt evidence is corrupt with or without a window.
+            # main's 24 integrity tests want exactly that -- but they predate the
+            # window entirely (zero references to it), so they were written for a
+            # world where readiness always evaluated. Their own rationale is that
+            # malformed provenance silently counting zero DEFLATED the gate; with no
+            # window the gate counts nothing and blocks regardless, so there is no
+            # deflation to cause. Integrity is meaningful INSIDE a window. Those
+            # tests now declare one rather than this contract being widened.
             no_window_reasons = ["qualification_window_not_started"]
-            if historical.get("miss_evidence_integrity"):
-                no_window_reasons.append("miss_evidence_integrity_failed")
             return {
                 "ready": False,
                 "window_start_at": None,

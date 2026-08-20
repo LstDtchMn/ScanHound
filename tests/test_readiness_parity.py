@@ -41,16 +41,47 @@ GATE_FIELDS = ("successful_cycles", "relevant_misses", "recovery_cycles",
 
 def cycle(db, *, completed_at, misses=0, outcome="success", rss=2, listing=10,
           recovery=False):
+    """Record a cycle, and the miss ROWS backing any count it claims.
+
+    UPDATED 2026-08-19, same reason as the helper in
+    test_rss_qualification_window.py. The app-side gate re-derives misses from
+    the rows and treats a count with no rows as `count_without_rows`, counting
+    nothing. A fixture that sets `relevant_miss_count` and stops is therefore
+    not "a cycle with N misses" -- it is a cycle with corrupt evidence.
+
+    RESIDUAL DIVERGENCE, stated rather than hidden: the app validates the count
+    against the rows; the mirror sums the stored count. They agree whenever a
+    cycle's count matches its rows, which is every consistent cycle. They
+    disagree exactly when the evidence contradicts itself -- and there the app
+    also raises an integrity finding and blocks, so the gate is closed either
+    way, but the two views report different NUMBERS. This fixture no longer
+    exercises that case; whether the mirror should adopt the row-validated
+    accounting is a real question and is not settled here.
+    """
+    cycle_uuid = str(uuid.uuid4())
     db.record_hdencode_shadow_comparison(
-        cycle_uuid=str(uuid.uuid4()),
+        cycle_uuid=cycle_uuid,
         started_at=completed_at, completed_at=completed_at,
         metrics={"normal_feeds_complete": True, "rss_requests": rss,
                  "listing_requests": listing, "rss_count": 10,
                  "listing_count": 10, "duplicate_count": 10,
                  "feed_only_count": 0, "listing_only_count": 0,
                  "relevant_miss_count": misses,
+                 "normal_feed_outcomes": {"movies_all": "changed",
+                                          "tv_all": "changed"},
                  "request_reduction_pct": 80.0, "outcome": outcome},
         catchup_used=recovery, restart_recovery=False)
+    if misses:
+        conn = db.get_connection()
+        for i in range(misses):
+            conn.execute(
+                "INSERT OR REPLACE INTO hdencode_shadow_misses "
+                "(cycle_uuid, canonical_url, title, status, media_type) "
+                "VALUES (?,?,?,?,?)",
+                (cycle_uuid, "https://hdencode.org/%s-%d" % (cycle_uuid[:8], i),
+                 "T", "missing", "movie"))
+        conn.commit()
+    return cycle_uuid
 
 
 def feeds_healthy(db, when):

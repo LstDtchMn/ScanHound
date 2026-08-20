@@ -50,16 +50,52 @@ def db(tmp_path):
 
 def cycle(db, *, completed_at, misses=0, outcome="success", rss=2, listing=10,
           recovery=0):
+    """Record a cycle, and the miss ROWS backing any count it claims.
+
+    UPDATED 2026-08-19. This helper used to set `relevant_miss_count` and stop
+    there. That was consistent with the older accounting, which simply summed
+    the stored count -- but the gate now RE-DERIVES misses from the rows, and
+    the helper in test_hdencode_readiness_integrity.py says why:
+
+        "The gate re-derives attribution from these, not from the cycle's
+         aggregate count, so a test that only sets relevant_miss_count proves
+         nothing about attribution."
+
+    A cycle claiming N misses with zero rows is not a cycle with N misses; the
+    summary reports `count_without_rows:<uuid>:N` and counts nothing. Verified
+    empirically before changing this: claim-only gives misses=0 with that
+    integrity finding, claim + rows + a non-empty feed-outcome map gives the
+    real count and no findings.
+
+    `normal_feed_outcomes` is required for the same reason. An empty map is
+    stored as '{}', which is not NULL, so the row takes the attribution path
+    and every miss row is flagged `miss_row_with_empty_provenance` -- there is
+    no feed to attribute it to.
+    """
+    cycle_uuid = str(uuid.uuid4())
     db.record_hdencode_shadow_comparison(
-        cycle_uuid=str(uuid.uuid4()),
+        cycle_uuid=cycle_uuid,
         started_at=completed_at, completed_at=completed_at,
         metrics={"normal_feeds_complete": True, "rss_requests": rss,
                  "listing_requests": listing, "rss_count": 10,
                  "listing_count": 10, "duplicate_count": 10,
                  "feed_only_count": 0, "listing_only_count": 0,
                  "relevant_miss_count": misses,
+                 "normal_feed_outcomes": {"movies_all": "changed",
+                                          "tv_all": "changed"},
                  "request_reduction_pct": 80.0, "outcome": outcome},
         catchup_used=bool(recovery), restart_recovery=False)
+    if misses:
+        conn = db.get_connection()
+        for i in range(misses):
+            conn.execute(
+                "INSERT OR REPLACE INTO hdencode_shadow_misses "
+                "(cycle_uuid, canonical_url, title, status, media_type) "
+                "VALUES (?,?,?,?,?)",
+                (cycle_uuid, "https://hdencode.org/%s-%d" % (cycle_uuid[:8], i),
+                 "T", "missing", "movie"))
+        conn.commit()
+    return cycle_uuid
 
 
 def started(db, boundary=NEW):
