@@ -198,3 +198,55 @@ class TestAnExplicitlySuppliedOrderKeyIsAlsoPreserved:
         db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
                                        order_key="June 3, 2026 at 3:00 AM")])
         assert db.get_listing_claims(URL)[0]["order_key"] ==             "June 3, 2026 at 3:00 AM"
+
+
+class TestCoverageSummaryMakesTheUnknownsAMeasuredClass:
+    """The reviewer asked that permanently-unknown releases be a reported class
+    rather than something that merely looks like a failed backfill.
+
+    That distinction is not academic: going into round 12 I read 82% of the
+    corpus going dark as a regression, and it was the fail-closed answer working
+    correctly. A number nobody prints is a number everybody misreads."""
+
+    def _row(self, db, url, **payload):
+        data = {"url": url, "category": "4k"}
+        data.update(payload)
+        db.upsert_background_cache([{
+            "url": url, "title": "t", "year": 2026, "status": "missing",
+            "source_category": "HDEncode", "data": json.dumps(data),
+        }])
+
+    def test_each_release_lands_in_exactly_one_class(self, db):
+        self._row(db, "u/conflicted", category_conflict=True)
+        self._row(db, "u/attested", category_attested=True)
+        self._row(db, "u/claimed")
+        self._row(db, "u/unclaimed")
+        db.record_listing_claims([_claim("u/claimed", "movie", "4k")])
+
+        s = db.media_kind_coverage_summary()
+        assert s["total"] == 4
+        assert s["conflicted"] == 1
+        assert s["attested"] == 1
+        assert s["unknown_claimed"] == 1
+        assert s["unknown_unclaimed"] == 1
+        assert (s["conflicted"] + s["attested"] + s["unknown_claimed"]
+                + s["unknown_unclaimed"] + s["unreadable"]) == s["total"], (
+            "the classes must partition the corpus, or the report invites the "
+            "same misreading it exists to prevent")
+
+    def test_a_conflict_outranks_an_attestation(self, db):
+        """Both keys present is not a tie: a recorded conflict wins."""
+        self._row(db, "u/both", category_attested=True, category_conflict=True)
+        s = db.media_kind_coverage_summary()
+        assert s["conflicted"] == 1 and s["attested"] == 0
+
+    def test_unreadable_rows_are_their_own_class(self, db):
+        """Not silently folded into unknown. Unreadable evidence is a different
+        problem from absent evidence and needs to be visible as one."""
+        db.upsert_background_cache([{
+            "url": "u/bad", "title": "t", "year": 2026, "status": "missing",
+            "source_category": "HDEncode", "data": "{not json",
+        }])
+        s = db.media_kind_coverage_summary()
+        assert s["unreadable"] == 1
+        assert s["unknown_unclaimed"] == 0

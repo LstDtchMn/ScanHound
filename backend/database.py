@@ -4509,6 +4509,55 @@ class DatabaseManager:
             "ORDER BY first_seen_at",
             (str(url),), default=[]) or []
 
+    def media_kind_coverage_summary(self):
+        """Why each release can or cannot be given a media kind, as counts.
+
+        Round 13/14: the reviewer asked that permanently-unknown releases be a
+        MEASURED CLASS rather than something that merely looks like a failed
+        backfill. Without this the blackout is indistinguishable from a bug --
+        which is exactly how I misread it going into round 12, when I reported
+        82% of the corpus going dark as a regression rather than as the
+        fail-closed answer it was.
+
+        Read-only, and it grants nothing.
+
+        Classes:
+            conflicted          two listings disagreed; never answerable
+            attested            checked clean; the category is usable
+            unknown_claimed     not attested, but at least one listing claim
+                                exists, so a future coverage proof COULD reach it
+            unknown_unclaimed   not attested and no claim on record. If the
+                                release has also aged off the listings, this is
+                                the permanently-unprovable class
+        """
+        rows = self._query_dicts(
+            "SELECT url, data FROM background_scan_cache", (), default=[]) or []
+        claimed = set()
+        for r in (self._query_dicts(
+                "SELECT DISTINCT url FROM listing_claims", (), default=[]) or []):
+            claimed.add(r["url"])
+        out = {
+            "total": 0, "conflicted": 0, "attested": 0,
+            "unknown_claimed": 0, "unknown_unclaimed": 0, "unreadable": 0,
+        }
+        for row in rows:
+            out["total"] += 1
+            try:
+                payload = json.loads(row.get("data") or "{}")
+            except (TypeError, ValueError):
+                # Unreadable evidence is its own class, not silently 'unknown'.
+                out["unreadable"] += 1
+                continue
+            if payload.get("category_conflict"):
+                out["conflicted"] += 1
+            elif payload.get("category_attested"):
+                out["attested"] += 1
+            elif row["url"] in claimed:
+                out["unknown_claimed"] += 1
+            else:
+                out["unknown_unclaimed"] += 1
+        return out
+
     def listing_claim_summary(self):
         """Counts per arm, and how many releases have claims from BOTH a movie
         and a TV arm -- the population a conflict could ever be found in.
