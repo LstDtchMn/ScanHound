@@ -12,6 +12,14 @@ import threading
 import requests
 from bs4 import BeautifulSoup
 from backend.url_identity import canonicalize_listing_url
+from backend.coverage import (
+    Arm as _CovArm, Page as _CovPage, Sighting as _CovSighting,
+    TraversalReport as _CovReport, PAGE_OK as _COV_PAGE_OK,
+    PARSER_RECOGNISED as _COV_RECOGNISED)
+
+#: Bumped when _select_posts changes shape. Part of any coverage proof: a
+#: frontier derived by one parser version is not evidence for another.
+_COV_PARSER_VERSION = "select_posts/1"
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -863,6 +871,12 @@ class ScannerService:
         early_stopped = False
         #: Listing types this crawl actually fetched (round 12, M12-1).
         types_covered: Set[str] = set()
+        #: RAW TRAVERSAL OBSERVATIONS (round 15, S7). What was seen and in what
+        #: order -- never a conclusion about coverage. A separate evaluator
+        #: decides what these facts justify; the crawler is not allowed to
+        #: decide that about itself.
+        traversal_arms: Dict[str, object] = {}
+        _cov_run_id = "%s-%x" % (time.strftime("%Y%m%d%H%M%S"), id(sources))
         total_pages = len(sources) * pages
         current_page = 0
 
@@ -879,6 +893,13 @@ class ScannerService:
             source_base = source["base"]
             source_suffix = source["suffix"]
             source_type_hint = source["type"]
+            _cov_arm = _CovArm(
+                arm_key="%s:%s" % (source.get("source", "hdencode"),
+                                   source.get("category", "")),
+                listing_type=str(source_type_hint or "").strip().lower(),
+                parser_version=_COV_PARSER_VERSION)
+            traversal_arms.setdefault(_cov_arm.arm_key, _cov_arm)
+            _cov_arm = traversal_arms[_cov_arm.arm_key]
             # PARSER HEALTH IS PART OF COVERAGE. Round 13 (L13-1).
             #
             # This used to claim the arm as covered HERE, at the moment the crawl
@@ -986,6 +1007,11 @@ class ScannerService:
                             # itself as trustworthy resolution evidence. A page we
                             # did not read is a page we cannot vouch for.
                             self._last_crawl_page_errors += 1
+                            _cov_arm.pages.append(_CovPage(
+                                page_number=page_num,
+                                request_outcome="http_%s" % resp.status_code,
+                                http_status=int(resp.status_code or 0),
+                                page_error="HTTP %s" % resp.status_code))
                             self._log(
                                 f"{source_name}: page returned "
                                 f"{resp.status_code}; listing is incomplete",
@@ -996,6 +1022,13 @@ class ScannerService:
 
                     soup = BeautifulSoup(resp.content, 'html.parser')
                     posts = self._select_posts(soup, source_id)
+                    # Recognition, not merely a status code: a layout change
+                    # or an interstitial answers 200 and parses to nothing.
+                    _cov_page = _CovPage(
+                        page_number=page_num, request_outcome=_COV_PAGE_OK,
+                        http_status=int(getattr(resp, 'status_code', 200) or 200),
+                        parser_state=(_COV_RECOGNISED if posts else "unrecognised"))
+                    _cov_arm.pages.append(_cov_page)
 
                     page_posts = 0   # non-empty post URLs found on this page
                     # Unique URLs FIRST SEEN on this page. Deliberately excludes
@@ -1039,6 +1072,19 @@ class ScannerService:
                         # whereas a coverage proof needs the sightings themselves.
                         # Deduped per (url, arm) so a release seen on two pages of
                         # the same arm is one claim.
+                        # THE OBSERVATION, recorded before any skip decision
+                        # so listing ORDER survives intact. Duplicates and
+                        # policy exclusions are flagged, not dropped: the
+                        # evaluator needs to know they were there and why they
+                        # cannot anchor a frontier.
+                        _cov_page.sightings.append(_CovSighting(
+                            position=len(_cov_page.sightings) + 1,
+                            canonical_url=canonicalize_listing_url(post_url),
+                            raw_url=post_url,
+                            duplicate_in_run=(post_url in seen_post_urls),
+                            policy_excluded=bool(
+                                skip_full_disc and source_id == "hdencode"
+                                and is_full_disc_title(post_title))))
                         _arm = (post_url, source_type_hint, source_category)
                         if _arm not in listing_claim_seen:
                             listing_claim_seen.add(_arm)
@@ -1199,6 +1245,12 @@ class ScannerService:
         # is partial — the caller must not age out items it simply didn't revisit.
         self._last_crawl_early_stopped = early_stopped
         self._last_crawl_types_covered = types_covered
+        self._last_crawl_traversal = _CovReport(
+            run_id=_cov_run_id,
+            source=str((sources[0].get("source") if sources else "") or ""),
+            early_stop_enabled=bool(early_stop),
+            termination=self._last_crawl_termination,
+            arms=list(traversal_arms.values()))
         self._last_crawl_listing_claims = listing_claims
         # The crawl's own verdict on itself, in precedence order: a stop that cut
         # it short, then pages that failed, then a suspicious empty result.
