@@ -13,6 +13,7 @@ import uuid
 import requests
 from bs4 import BeautifulSoup
 from backend.url_identity import canonicalize_listing_url
+from backend.arms import arm_key_from_descriptor
 from backend.coverage import (
     Arm as _CovArm, Page as _CovPage, Sighting as _CovSighting,
     TraversalReport as _CovReport, PAGE_OK as _COV_PAGE_OK,
@@ -22,21 +23,6 @@ from backend.coverage import (
 #: frontier derived by one parser version is not evidence for another.
 _COV_PARSER_VERSION = "select_posts/1"
 
-
-def _endpoint_slug(base_url):
-    """A stable, readable identity for ONE listing endpoint.
-
-    Round 17 (M17-4). Two DDLBase endpoints share the category "remux", so an
-    arm key of source:category merged them into a single arm carrying two
-    unrelated listing orders and duplicate page numbers -- a sequence no
-    frontier argument can mean anything over. The endpoint URL is the thing
-    that is actually distinct.
-    """
-    try:
-        parts = [x for x in str(base_url or "").split("/") if x]
-        return parts[-1] if parts else "root"
-    except Exception:
-        return "root"
 
 
 from collections import defaultdict
@@ -924,9 +910,7 @@ class ScannerService:
             source_type_hint = source["type"]
             _cov_arm = _CovArm(
                 # ENDPOINT identity, not the UI category (round 17, M17-4).
-                arm_key="%s:%s:%s" % (source.get("source", "hdencode"),
-                                      source.get("category", ""),
-                                      _endpoint_slug(source.get("base", ""))),
+                arm_key=arm_key_from_descriptor(source),
                 listing_type=str(source_type_hint or "").strip().lower(),
                 parser_version=_COV_PARSER_VERSION)
             traversal_arms.setdefault(_cov_arm.arm_key, _cov_arm)
@@ -1142,7 +1126,14 @@ class ScannerService:
                                 skip_full_disc and source_id == "hdencode"
                                 and is_full_disc_title(post_title))))
                         _cov_arm_seen.add(canonicalize_listing_url(post_url))
-                        _arm = (post_url, source_type_hint, source_category)
+                        # Round 19 (M18-1): keyed and stamped with the SAME
+                        # arm key the traversal reports, not with the category.
+                        # Two feeds of one category -- DDLBase remux 2160p and
+                        # remux 1080p -- were one arm here, so the second one to
+                        # list a release had its claim dropped as a repeat of
+                        # the first, and no policy could join a claim to a
+                        # coverage proof because the two named different things.
+                        _arm = (post_url, source_type_hint, _cov_arm.arm_key)
                         if _arm not in listing_claim_seen:
                             listing_claim_seen.add(_arm)
                             listing_claims.append({
@@ -1150,6 +1141,7 @@ class ScannerService:
                                 "source": source_id,
                                 "listing_type": source_type_hint,
                                 "listing_category": source_category,
+                                "arm_key": _cov_arm.arm_key,
                             })
                         _claim = url_type_claim.get(post_url)
                         if _claim is None:

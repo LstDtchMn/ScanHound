@@ -4454,6 +4454,124 @@ class DatabaseManager:
                 "identity built on those rows is withdrawn.", retracted, reason)
         return retracted
 
+    def migrate_listing_claim_arm_keys(self, registry):
+        """Rewrite pre-round-19 two-part arm keys to their three-part form.
+
+        Takes the ArmRegistry rather than a ready-made mapping, and derives the
+        plan from the keys actually present in the table. The registry MUST be
+        complete -- `backend.arms.default_registry()` -- because a partial one
+        resolves an ambiguous legacy key to whichever half it happens to know,
+        which fabricates an attribution instead of declining to guess.
+
+        A key the registry cannot resolve is LOGGED and its rows are left
+        exactly as they are: a legacy row is still a true record of a sighting,
+        and what it must never do is acquire an attribution it never carried.
+        Logged rather than skipped quietly -- a silent skip is indistinguishable
+        from a migration that had nothing to do.
+
+        Idempotent. Rows already in the modern shape are not in `rewrites`, and
+        re-running finds no legacy rows left to move.
+
+        MERGES rather than clobbers. If a release is present under BOTH shapes
+        -- possible after a deploy, a rollback and a redeploy -- the two rows
+        describe the same sightings of the same release by the same feed, so
+        the union is the truth: earliest first_seen, latest last_seen, summed
+        sightings, and posted_date_changed set if EITHER saw a change. An
+        UPDATE OR REPLACE here would silently discard one of them.
+
+        Returns {"claims_moved", "claims_merged", "aliases_moved", "skipped"}.
+        """
+        moved = merged = alias_moved = 0
+        if registry is None:
+            raise ValueError(
+                "a migration needs the complete arm registry; refusing to run "
+                "without one rather than resolving keys against nothing")
+
+        with self.transaction() as conn:
+            present = [r[0] for r in conn.execute(
+                "SELECT DISTINCT arm_key FROM listing_claims").fetchall()]
+        plan, unresolved = registry.legacy_migration_plan(present)
+        if unresolved:
+            logger.warning(
+                "listing-claim arm keys left in the legacy shape because no "
+                "single feed claims them: %s", unresolved)
+        if not plan:
+            return {"claims_moved": 0, "claims_merged": 0,
+                    "aliases_moved": 0, "skipped": unresolved}
+
+        with self.transaction() as conn:
+            cur = conn.cursor()
+            for legacy, modern in sorted(plan.items()):
+
+                # -- claims: merge where the modern row already exists --------
+                cur.execute(
+                    "SELECT canonical_url FROM listing_claims WHERE arm_key = ?",
+                    (legacy,))
+                legacy_urls = [r[0] for r in cur.fetchall()]
+                if not legacy_urls:
+                    continue
+
+                cur.execute(
+                    "SELECT canonical_url FROM listing_claims WHERE arm_key = ?",
+                    (modern,))
+                already = {r[0] for r in cur.fetchall()}
+                collisions = [u for u in legacy_urls if u in already]
+
+                for url in collisions:
+                    cur.execute(
+                        "UPDATE listing_claims SET "
+                        "  first_seen_at = MIN(first_seen_at, "
+                        "    (SELECT first_seen_at FROM listing_claims "
+                        "     WHERE canonical_url = ? AND arm_key = ?)), "
+                        "  last_seen_at = MAX(last_seen_at, "
+                        "    (SELECT last_seen_at FROM listing_claims "
+                        "     WHERE canonical_url = ? AND arm_key = ?)), "
+                        "  sightings = sightings + "
+                        "    (SELECT sightings FROM listing_claims "
+                        "     WHERE canonical_url = ? AND arm_key = ?), "
+                        "  posted_date_changed = MAX(posted_date_changed, "
+                        "    (SELECT posted_date_changed FROM listing_claims "
+                        "     WHERE canonical_url = ? AND arm_key = ?)) "
+                        "WHERE canonical_url = ? AND arm_key = ?",
+                        (url, legacy, url, legacy, url, legacy, url, legacy,
+                         url, modern))
+                    cur.execute(
+                        "DELETE FROM listing_claims "
+                        "WHERE canonical_url = ? AND arm_key = ?",
+                        (url, legacy))
+                    merged += 1
+
+                cur.execute(
+                    "UPDATE listing_claims SET arm_key = ? WHERE arm_key = ?",
+                    (modern, legacy))
+                moved += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+                # -- aliases: identity history moves with the claim -----------
+                # OR IGNORE, then delete: an alias already recorded under the
+                # modern key is the same (release, feed, raw href) triple, and
+                # its counters are not summed because an alias row records that
+                # a variant WAS seen, not how often it beat the other row.
+                cur.execute(
+                    "INSERT OR IGNORE INTO listing_claim_aliases "
+                    "  (canonical_url, arm_key, raw_url, first_seen_at, "
+                    "   last_seen_at, sightings) "
+                    "SELECT canonical_url, ?, raw_url, first_seen_at, "
+                    "       last_seen_at, sightings "
+                    "FROM listing_claim_aliases WHERE arm_key = ?",
+                    (modern, legacy))
+                cur.execute(
+                    "DELETE FROM listing_claim_aliases WHERE arm_key = ?",
+                    (legacy,))
+                alias_moved += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        if moved or merged or alias_moved:
+            logger.info(
+                "listing-claim arm keys migrated: %d claim(s) moved, %d merged, "
+                "%d alias row(s) moved, plan=%s",
+                moved, merged, alias_moved, plan)
+        return {"claims_moved": moved, "claims_merged": merged,
+                "aliases_moved": alias_moved, "skipped": unresolved}
+
     def record_listing_claims(self, claims):
         """Persist what each listing arm SAID about a release. Authorizes nothing.
 
@@ -4506,9 +4624,16 @@ class DatabaseManager:
                 continue
             source = str(c.get("source") or "").strip().lower()
             category = str(c.get("listing_category") or "").strip().lower()
+            # Round 19 (M18-1): the producer stamps the arm key, computed
+            # by backend.arms -- the SAME function the traversal uses. The
+            # fallback below is the pre-round-19 shape, kept only so a claim
+            # from an older producer is still recorded rather than dropped; it
+            # merges two feeds of one category and must never be the path a
+            # new deployment takes.
+            stamped = str(c.get("arm_key") or "").strip().lower()
             rows.append((
                 canonical,
-                "%s:%s" % (source, category) if category else source,
+                stamped or ("%s:%s" % (source, category) if category else source),
                 ltype,
                 raw,
                 (str(c.get("posted_date_raw")).strip()

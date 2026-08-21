@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from backend.arms import default_registry
 from backend.config import source_enabled
 
 logger = logging.getLogger(__name__)
@@ -658,6 +659,34 @@ class BackgroundScanner:
                 # reads this table to grant a media kind.
                 _claims = getattr(scanner, "_last_crawl_listing_claims", None) or []
                 if _claims:
+                    # Round 19 (M18-1): before the first claim in the new
+                    # three-part shape is written, move the rows the deployed
+                    # container left in the two-part shape. Without this the
+                    # ledger carries BOTH keys for the same feed -- the same
+                    # release appearing twice, and coverage summaries reporting
+                    # six arms where there are three.
+                    #
+                    # Once per process, and idempotent besides. The registry is
+                    # the COMPLETE one, never the sources selected for this
+                    # scan: a partial view resolves an ambiguous legacy key to
+                    # whichever half it knows about.
+                    if not getattr(self, "_arm_keys_migrated", False):
+                        self._arm_keys_migrated = True
+                        try:
+                            _mig = db.migrate_listing_claim_arm_keys(
+                                default_registry())
+                            if _mig.get("claims_moved") or _mig.get("claims_merged"):
+                                logger.info("arm-key migration: %s", _mig)
+                        except Exception:
+                            # The claims below are still worth recording. They
+                            # land in the new shape alongside the old rows,
+                            # which is untidy but loses nothing; the next
+                            # process start retries.
+                            self._arm_keys_migrated = False
+                            logger.exception(
+                                "arm-key migration failed; claims will be "
+                                "recorded in the new shape alongside the "
+                                "un-migrated legacy rows")
                     try:
                         db.record_listing_claims(_claims)
                     except Exception:
