@@ -304,7 +304,7 @@ index a314d35..4b68306 100644
              if not self._owns_lifespan():
                  logger.info("Background scan abandoned before cache re-match: stale app lifespan")
 diff --git a/backend/database.py b/backend/database.py
-index 496e622..3d8bcca 100644
+index 496e622..2313959 100644
 --- a/backend/database.py
 +++ b/backend/database.py
 @@ -84,6 +84,26 @@ class DatabaseManager:
@@ -477,7 +477,7 @@ index 496e622..3d8bcca 100644
                  continue
              payload["category_attested"] = True
              with self.transaction() as conn:
-@@ -4324,6 +4454,712 @@ class DatabaseManager:
+@@ -4324,6 +4454,786 @@ class DatabaseManager:
                  "identity built on those rows is withdrawn.", retracted, reason)
          return retracted
  
@@ -585,46 +585,57 @@ index 496e622..3d8bcca 100644
 +        return len(rows)
 +
 +    def backfill_listing_claim_posted_dates(self, limit=2000):
-+        """Attach the site's published date to claims, from the cached detail row.
++        """Attach the site's published date, and NOTICE when it changes.
 +
-+        Round 14. A claim is recorded at LISTING time, where no date exists:
-+        `_select_posts()` returns anchor elements only. The date is parsed from the
-+        DETAIL page and lands in the scan cache.
++        Round 14 built the attach half. Round 15 (L15-1) found that the notice
++        half never ran in production: the query selected only rows where
++        `posted_date_raw IS NULL`, so once a date was attached nothing ever
++        compared a later one against it. The live `posted_date_changed = 0`
++        therefore meant only "no change was detected by this write path" -- not
++        "the site's publication timestamp has been shown to be stable". The unit
++        tests passed a date straight into record_listing_claims(), which the real
++        listing crawler never does, so nothing exercised the real route.
 +
-+        Kept separate from recording on purpose -- a claim must be captured whether
-+        or not a date can be attached, because the claim is the perishable half.
++        That distinction matters because the coverage model is about to depend on
++        those timestamps being immutable enough to order by. A flag that can only
++        ever read zero is worse than no flag.
 +
-+        THE JOIN USES `raw_url`, not `canonical_url`. `background_scan_cache` keys
-+        on the raw href (see url_identity.canonicalize_listing_url's scope note),
-+        so joining canonical-to-raw would silently match nothing.
++        So this now walks EVERY claim that has an alias, not only the empty ones,
++        and:
 +
-+        The value is stored verbatim and is NOT an approved order key. Whether it
-+        can order coverage -- and how ties and timezone-less local times behave --
-+        is the coverage model's question; normalising here would hide that.
++            stored is NULL              -> fill it
++            stored == cached detail     -> nothing
++            stored != cached detail     -> raise posted_date_changed
 +
-+        Returns the number of claims enriched.
++        A claim is compared across ALL of its aliases, since two raw variants of
++        one release can each carry their own cached detail row.
++
++        The value stays verbatim and is NOT normalised. Whether it can order
++        coverage -- ties, missing timezone, local-time inversions -- is the
++        coverage model's question, and normalising here would hide it.
++
++        Returns the number of claims filled or flagged.
 +        """
-+        # Join through the aliases: a claim whose current raw_url has no cached
-+        # detail row may still have an earlier variant that does.
-+        pending = self._query_dicts(
++        rows = self._query_dicts(
 +            "SELECT c.canonical_url AS canonical_url, c.arm_key AS arm_key, "
-+            "       a.raw_url AS raw_url "
++            "       c.posted_date_raw AS stored, a.raw_url AS raw_url "
 +            "FROM listing_claims c "
 +            "JOIN listing_claim_aliases a "
 +            "  ON a.canonical_url = c.canonical_url AND a.arm_key = c.arm_key "
-+            "WHERE c.posted_date_raw IS NULL LIMIT ?",
++            "WHERE c.posted_date_changed = 0 LIMIT ?",
 +            (int(limit),), default=[]) or []
-+        if not pending:
++        if not rows:
 +            return 0
-+        raws = list({r["raw_url"] for r in pending})
++
++        raws = list({r["raw_url"] for r in rows})
 +        dates = {}
-+        for start_i in range(0, len(raws), 300):
-+            chunk = raws[start_i:start_i + 300]
-+            rows = self._query_dicts(
++        for start in range(0, len(raws), 300):
++            chunk = raws[start:start + 300]
++            cached = self._query_dicts(
 +                "SELECT url, data FROM background_scan_cache WHERE url IN (%s)"
 +                % ",".join("?" * len(chunk)),
 +                tuple(chunk), default=[]) or []
-+            for row in rows:
++            for row in cached:
 +                try:
 +                    payload = json.loads(row.get("data") or "{}")
 +                except (TypeError, ValueError):
@@ -632,19 +643,45 @@ index 496e622..3d8bcca 100644
 +                pd = payload.get("posted_date")
 +                if pd:
 +                    dates[row["url"]] = str(pd)
-+        updates = [(dates[r["raw_url"]], r["canonical_url"], r["arm_key"])
-+                   for r in pending if r["raw_url"] in dates]
-+        if not updates:
++
++        fills = []
++        flags = []
++        for r in rows:
++            observed = dates.get(r["raw_url"])
++            if not observed:
++                continue
++            stored = r["stored"]
++            key = (r["canonical_url"], r["arm_key"])
++            if stored is None:
++                fills.append((observed, key[0], key[1]))
++            elif str(stored) != observed:
++                # The site's own date for this release moved. Do NOT pick a
++                # winner: record that it is not immutable and let the coverage
++                # model refuse to order by it.
++                flags.append(key)
++
++        if not fills and not flags:
 +            return 0
 +        with self.transaction() as conn:
 +            if not conn:
 +                return 0
-+            conn.executemany(
-+                "UPDATE listing_claims SET posted_date_raw = ? "
-+                "WHERE canonical_url = ? AND arm_key = ? "
-+                "AND posted_date_raw IS NULL",
-+                updates)
-+        return len(updates)
++            if fills:
++                conn.executemany(
++                    "UPDATE listing_claims SET posted_date_raw = ? "
++                    "WHERE canonical_url = ? AND arm_key = ? "
++                    "AND posted_date_raw IS NULL",
++                    fills)
++            if flags:
++                conn.executemany(
++                    "UPDATE listing_claims SET posted_date_changed = 1 "
++                    "WHERE canonical_url = ? AND arm_key = ?",
++                    flags)
++        if flags:
++            logger.warning(
++                "%d claim(s) saw a DIFFERENT site publication date than the one "
++                "first recorded. The timestamp is not immutable for these, and a "
++                "coverage proof must not order by them.", len(flags))
++        return len(fills) + len(flags)
 +
 +    def get_listing_claims(self, url):
 +        """Every arm that has ever claimed this release. Reporting/diagnostics."""
@@ -733,10 +770,47 @@ index 496e622..3d8bcca 100644
 +            raw.extend(r["raw_url"] for r in rows)
 +        if not raw:
 +            return 0
-+        self.record_classification_conflicts_and_retract_kinds(raw, reason=reason)
++
++        # IDEMPOTENCE. Round 15 (L15-2). This reselected every contradiction on
++        # every cycle and re-issued the revocation whether or not anything was
++        # left to do -- safe, but it wrote a journal op each time. That matters
++        # more now than it looks: journal I/O failure trips the global interlock,
++        # so pointless journal traffic is pointless risk.
++        #
++        # Narrow to the raw urls that still have something to withdraw: a live
++        # media kind, or a cache row not yet marked. Note this filters the WORK,
++        # not the detection -- a contradiction that is already fully consumed
++        # stays contradicted, it simply needs nothing done to it again.
++        outstanding = set()
++        for start in range(0, len(raw), 300):
++            chunk = raw[start:start + 300]
++            marks = ",".join("?" * len(chunk))
++            live = self._query_dicts(
++                "SELECT url FROM downloads "
++                "WHERE media_kind IS NOT NULL AND url IN (%s)" % marks,
++                tuple(chunk), default=[]) or []
++            outstanding |= {r["url"] for r in live}
++            cached = self._query_dicts(
++                "SELECT url, data FROM background_scan_cache WHERE url IN (%s)"
++                % marks, tuple(chunk), default=[]) or []
++            for row in cached:
++                try:
++                    payload = json.loads(row.get("data") or "{}")
++                except (TypeError, ValueError):
++                    # Unreadable evidence is not proof it was already handled.
++                    outstanding.add(row["url"])
++                    continue
++                if not payload.get("category_conflict"):
++                    outstanding.add(row["url"])
++        if not outstanding:
++            return 0
++
++        self.record_classification_conflicts_and_retract_kinds(
++            sorted(outstanding), reason=reason)
 +        logger.warning(
 +            "cross-crawl classification conflict: %d release(s) carry claims "
-+            "from both a movie and a TV arm; authority withdrawn", len(canon))
++            "from both a movie and a TV arm; authority withdrawn on %d url(s)",
++            len(canon), len(outstanding))
 +        return len(canon)
 +
 +    def media_kind_coverage_summary(self):
@@ -1190,7 +1264,7 @@ index 496e622..3d8bcca 100644
      def get_scan_category(self, url):
          """The crawl category THIS SERVER recorded for a release URL.
  
-@@ -4402,6 +5238,14 @@ class DatabaseManager:
+@@ -4402,6 +5312,14 @@ class DatabaseManager:
          if not wanted:
              return {}
          out = {}
@@ -1205,7 +1279,7 @@ index 496e622..3d8bcca 100644
          for start in range(0, len(wanted), 300):
              chunk = wanted[start:start + 300]
              rows = self._query_dicts(
-@@ -4409,12 +5253,32 @@ class DatabaseManager:
+@@ -4409,12 +5327,32 @@ class DatabaseManager:
                  "FROM downloads WHERE url IN (%s)" % ",".join("?" * len(chunk)),
                  tuple(chunk), default=[]) or []
              for row in rows:
@@ -3041,3 +3115,166 @@ index 0000000..55aacd3
 +            assert _identity(second) == "unknown"
 +        finally:
 +            second.close()
+diff --git a/tests/test_round16_low_findings.py b/tests/test_round16_low_findings.py
+new file mode 100644
+index 0000000..6b1ea0d
+--- /dev/null
++++ b/tests/test_round16_low_findings.py
+@@ -0,0 +1,157 @@
++"""Round 15 L15-1 and L15-2.
++
++L15-1  posted_date_changed could only ever read zero in production. The backfill
++       selected `WHERE posted_date_raw IS NULL`, so once a date was attached
++       nothing compared a later one against it. My unit tests passed a date
++       straight into record_listing_claims(), which the real listing crawler
++       never does -- so the decisive path was never exercised. A flag that cannot
++       fire is worse than no flag, because the coverage model was about to treat
++       its zero as evidence of timestamp stability.
++
++       These tests go through backfill_listing_claim_posted_dates(), the route
++       production actually uses.
++
++L15-2  the consumer reselected every contradiction each cycle and re-issued the
++       revocation whether or not anything remained to do. Safe but noisy, and
++       journal I/O failure trips the global interlock -- so pointless journal
++       traffic is pointless risk.
++"""
++import io
++import json
++import pytest
++
++from backend.database import DatabaseManager
++
++URL = "https://hdencode.example/the-release-2026-2160p/"
++OTHER = "https://hdencode.example/another-2026-2160p/"
++
++
++@pytest.fixture
++def db(tmp_path):
++    dm = DatabaseManager(str(tmp_path / "r16low.db"))
++    yield dm
++    dm.close()
++
++
++def _claim(url, ltype, category, source="hdencode"):
++    return {"url": url, "source": source,
++            "listing_type": ltype, "listing_category": category}
++
++
++def _cache(db, url, date=None):
++    payload = {"url": url, "category": "4k"}
++    if date:
++        payload["posted_date"] = date
++    db.upsert_background_cache([{
++        "url": url, "title": "The Release", "year": 2026, "status": "missing",
++        "source_category": "HDEncode", "data": json.dumps(payload)}])
++
++
++def _claim_row(db, url=URL):
++    return db.get_listing_claims(url)[0]
++
++
++class TestAChangedSiteDateIsNoticedByTheRealRoute:
++
++    def test_a_later_different_date_raises_the_flag(self, db):
++        """THE GAP. Everything here goes through the production enrichment path;
++        nothing injects a date into record_listing_claims()."""
++        _cache(db, URL, "June 1, 2026 at 1:00 AM")
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        db.backfill_listing_claim_posted_dates()
++        assert _claim_row(db)["posted_date_raw"] == "June 1, 2026 at 1:00 AM"
++        assert _claim_row(db)["posted_date_changed"] == 0
++
++        # The site now reports a different publication date for the same release.
++        _cache(db, URL, "June 2, 2026 at 2:00 AM")
++        db.backfill_listing_claim_posted_dates()
++
++        row = _claim_row(db)
++        assert row["posted_date_changed"] == 1, (
++            "the enrichment route never re-compared, so the flag could only ever "
++            "read zero and its zero would have been mistaken for stability")
++        assert row["posted_date_raw"] == "June 1, 2026 at 1:00 AM", (
++            "the first value is kept; the point is to record that it MOVED, "
++            "not to pick a winner")
++
++    def test_an_unchanged_date_is_not_flagged(self, db):
++        """POSITIVE CONTROL. Flagging every re-check would make the signal
++        useless, which is the same as not having it."""
++        _cache(db, URL, "June 1, 2026 at 1:00 AM")
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        for _ in range(3):
++            db.backfill_listing_claim_posted_dates()
++        assert _claim_row(db)["posted_date_changed"] == 0
++
++    def test_a_claim_with_no_cached_date_is_untouched(self, db):
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        db.backfill_listing_claim_posted_dates()
++        row = _claim_row(db)
++        assert row["posted_date_raw"] is None
++        assert row["posted_date_changed"] == 0
++
++    def test_the_summary_surfaces_it(self, db):
++        _cache(db, URL, "June 1, 2026 at 1:00 AM")
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        db.backfill_listing_claim_posted_dates()
++        _cache(db, URL, "June 9, 2026 at 9:00 PM")
++        db.backfill_listing_claim_posted_dates()
++        assert db.listing_claim_summary()["posted_date_changed"] == 1
++
++
++def _journal_ops(db):
++    """How many revocation operations the journal has recorded."""
++    path = db._revocation_journal_path()
++    try:
++        with io.open(path, encoding="utf-8") as fh:
++            return sum(1 for line in fh
++                       if line.strip() and '"kind": "PENDING"' in line)
++    except OSError:
++        return 0
++
++
++class TestTheConsumerDoesNoWorkTwice:
++
++    def _contradicted(self, db):
++        db.add_to_history(URL, "The Release", None, None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++        _cache(db, URL)
++        db.record_listing_claims([_claim(URL, "movie", "4k"),
++                                  _claim(URL, "tv", "tv")])
++
++    def test_a_second_pass_does_nothing(self, db):
++        self._contradicted(db)
++        assert db.consume_cross_crawl_conflicts() == 1
++        after_first = _journal_ops(db)
++
++        assert db.consume_cross_crawl_conflicts() == 0, (
++            "an already-consumed contradiction was processed again")
++        assert _journal_ops(db) == after_first, (
++            "a second pass wrote another journal operation; journal I/O failure "
++            "trips the global interlock, so this is risk for no benefit")
++
++    def test_it_still_acts_when_work_remains(self, db):
++        """POSITIVE CONTROL. Skipping on the mere PRESENCE of a contradiction
++        would make the consumer a no-op after the first cycle forever."""
++        self._contradicted(db)
++        db.consume_cross_crawl_conflicts()
++
++        # A later grab re-records a kind under the same release.
++        db.add_to_history(URL, "The Release", None, None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++        assert db.consume_cross_crawl_conflicts() == 1, (
++            "authority came back and the consumer ignored it")
++        row = db._query("SELECT media_kind FROM downloads WHERE url = ?",
++                        (URL,), one=True, default=None)
++        assert dict(row).get("media_kind") is None
++
++    def test_an_unreadable_cache_row_counts_as_outstanding(self, db):
++        """Unreadable evidence is not proof the work was already done."""
++        db.add_to_history(URL, "The Release", None, None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++        db.upsert_background_cache([{
++            "url": URL, "title": "x", "year": 2026, "status": "missing",
++            "source_category": "HDEncode", "data": "{not json"}])
++        db.record_listing_claims([_claim(URL, "movie", "4k"),
++                                  _claim(URL, "tv", "tv")])
++        assert db.consume_cross_crawl_conflicts() == 1

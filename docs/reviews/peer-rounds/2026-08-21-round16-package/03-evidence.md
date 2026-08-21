@@ -16,12 +16,13 @@ tests/test_round13_hold_withdraws_identity.py      7 passed
 tests/test_round13_revocation_failclosed.py        7 passed
 tests/test_round12_attestation_authority.py       13 passed
 tests/test_media_kind_is_server_owned.py          30 passed
+tests/test_round16_low_findings.py                 7 passed
 tests/test_background_scanner.py                  25 passed
                                                   -----------
-                                                 123 passed
+                                                 130 passed
 ```
 
-## 2. Mutation results — nine applied, nine killed
+## 2. Mutation results — twelve applied, twelve killed
 
 ```text
 mutation                                        killed   finding
@@ -38,13 +39,17 @@ M15-3, ordering
 consume gated on _claims again                       1   quiet-cycle case
 enrichment moved ahead of the consumer in one try    1   your case
 
+L15-1 / L15-2, the LOWs
+backfill only fills NULLs again                      2   the flag could not fire
+consumer always re-issues                            1   journal noise
+
 earlier rounds, re-run and still killed
 mask media_kind only (the fail-open inversion)       3
 hold taken AFTER the erase                           2
 award arm coverage on entry again                    3
 ```
 
-Each of the six new mutants is killed by **exactly one** test, which is the
+Each of the nine new mutants is killed by **exactly one** test, which is the
 result I wanted: a mutant killed by many tests usually means the tests overlap
 rather than that they discriminate.
 
@@ -63,7 +68,7 @@ an unconditional consumer must NOT revoke an uncontradicted release
 ```text
                               failed   passed   skipped   duration
 main control (origin/main)         1     5320         4   804s
-this branch (6869886)              1     5392         4   808s
+this branch (039a06e)              1     5399         4   821s
 ```
 
 Identical single pre-existing failure both sides:
@@ -72,7 +77,7 @@ Identical single pre-existing failure both sides:
 FAILED tests/test_dv_settings.py::test_all_frontend_editable_settings_keys_are_in_model
 ```
 
-**+72 passing, zero net new failures.** `main` has not moved since the round-13
+**+79 passing, zero net new failures.** `main` has not moved since the round-13
 control was measured, and the same container pair was used throughout.
 
 ## 4. Live data from the running deployment

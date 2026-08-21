@@ -7,7 +7,7 @@
 ```text
 repository    LstDtchMn/ScanHound
 branch        fix/round12-attestation-authority
-code head     6869886173e1d027ea237901baeb6bc8022b1aa8
+code head     039a06e (all round-15 findings closed)
 base          6ac5cd2aefb81bb7d85354577a69af269b8e05e5   (main, 0 behind)
 working tree  clean
 
@@ -21,13 +21,13 @@ two different heads in play and they are not the same:
 
 ```text
 running in production   the image built at deploy time this morning
-under review here       6869886, which contains today's remediation
+under review here       039a06e, which contains today's remediation
 ```
 
 Live state as of this package (read-only, from the running container):
 
 ```text
-listing_claims        188 claims / 181 releases
+listing_claims        188 claims / 181 releases (3h stable)
 movie-vs-tv conflicts   0
 category_attested       0
 downloads.media_kind    NULL on all 684 rows
@@ -49,8 +49,8 @@ errors                  0
 M15-1  journal fails closed        CLOSED  session markers; residual named in 01
 M15-2  raw aliases                 CLOSED  listing_claim_aliases, seeded from live
 M15-3  safety before enrichment    CLOSED  plus a second cause you did not name
-L15-1  posted_date_changed         OPEN    not observed through production
-L15-2  consumer idempotence        OPEN    safe but noisy
+L15-1  posted_date_changed         CLOSED  now compared through the real route
+L15-2  consumer idempotence        CLOSED  narrows to outstanding work only
 D15-1  rollback tags wrong image   CLOSED
 D15-2  no fresh before-snapshot    CLOSED
 D15-3  dark checks not enforced    CLOSED

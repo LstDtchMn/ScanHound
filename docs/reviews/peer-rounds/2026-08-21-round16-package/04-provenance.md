@@ -6,17 +6,17 @@
 repository   LstDtchMn/ScanHound
 branch       fix/round12-attestation-authority
 
-code head    6869886173e1d027ea237901baeb6bc8022b1aa8
+code head    039a06e
 base         6ac5cd2aefb81bb7d85354577a69af269b8e05e5   (main, 0 behind)
 ```
 
-`6869886` is the last commit touching `backend/` or `tests/`.
+`039a06e` is the last commit touching `backend/` or `tests/`.
 
 **The branch is NOT documentation-only above the code head.** Round 15's S11
 caught me stating that when it was no longer true. The branch also carries
 `scripts/morning-deploy.ps1`, an operational script that has been changed several
 times since round 14 and which round 15 reviewed separately. Any commit after
-`6869886` is documentation or that script — never backend or test code.
+`039a06e` is documentation or that script — never backend or test code.
 
 ## Commits since main, oldest first
 
@@ -34,6 +34,7 @@ d951d67   ops  fix: the image has no wget, so the health gate never passed
 7663729   ops  fix D15-1/D15-2/D15-3 from the round-15 review
 7d7dfd2   R16  raw aliases (M15-2) and safety before enrichment (M15-3)
 6869886   R16  the journal fails closed when it cannot be trusted (M15-1)
+039a06e   R16  close L15-1 (flag could not fire) and L15-2 (idempotence)
           ---- backend/tests code ends here ----
 ```
 
@@ -50,7 +51,7 @@ ef2fb18  removes a duplicate listing_claim_summary created while reshaping
 d951d67  fixes a readiness gate introduced by a8f6116
 ```
 
-Seven of thirteen commits repair earlier work on this branch. Four of those seven
+Seven of fourteen commits repair earlier work on this branch. Four of those seven
 repair something introduced by a rewrite made **after** a review had passed over
 the previous version.
 
@@ -62,6 +63,7 @@ backend/background_scanner.py                  4b6830618b2c
 scripts/morning-deploy.ps1                     50fb161edcda
 tests/test_round16_journal_durability.py       55aacd333e65
 tests/test_round16_alias_and_ordering.py       29bcd2efb79e
+tests/test_round16_low_findings.py             (added at 039a06e)
 ```
 
 ## Deployment
@@ -86,7 +88,7 @@ diagnosed in round 13 by reproducing the same 74 on the `main` control.
 
 - **No CI attestation.** Builder-side runs, described so they can be re-run.
 - **The coverage evaluator is not started.** Architecture ruling accepted.
-- **L15-1 and L15-2 are not addressed.**
+- L15-1 and L15-2 are now closed.
 - **The M15-1 residual**: a journal unwritable from process start leaves no
   trace. Named in `01-request.md` and is the question for this round.
 - **The revocation journal has not been exercised against a real disk failure**,

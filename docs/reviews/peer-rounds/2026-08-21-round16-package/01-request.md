@@ -2,8 +2,10 @@
 
 ## Verdict accepted
 
-Round 15 accepted in full. Nothing contested. Three MEDIUMs closed, three
-deploy-script findings closed, two LOWs still open and named below.
+Round 15 accepted in full. Nothing contested. **Every finding is closed** —
+three MEDIUMs, two LOWs, three deploy-script findings and the package-consistency
+note. What remains is the coverage evaluator, which round 15 ruled the
+architecture for.
 
 ## M15-2 — raw aliases
 
@@ -90,17 +92,35 @@ Fixed at the source rather than patched: this package states the deployment
 state once, in `00-README.md`, and `04-provenance.md` describes the branch as it
 actually is — including that it carries the deploy script, not documentation only.
 
-## Still open, and not started
+## L15-1 and L15-2 — also closed
 
-- **L15-1** — `posted_date_changed` is not observed through the production path.
+**L15-1 was worse than LOW, and that is the part worth reading.** The flag was
+about to become load-bearing: the coverage model would have read its live `0` as
+evidence that the site's timestamps are stable enough to order by. But the
+enrichment pass selected `WHERE posted_date_raw IS NULL`, so once a date was
+attached nothing ever compared a later one. The flag was structurally incapable
+of firing, and my unit tests injected a date straight into
+`record_listing_claims()` — which the real crawler never does — so the decisive
+route had no coverage at all.
+
+It now walks every claim with an alias and fills / ignores / flags, comparing
+across all aliases. When a date moves the FIRST value is kept: the point is to
+record that it moved, not to pick a winner, since picking one is exactly what
+would bury the evidence.
+
+**L15-2** now narrows to the raw urls that still have something to withdraw. It
+filters the WORK, not the detection — an already-consumed contradiction stays
+contradicted — and an unreadable cache row counts as outstanding, since
+unreadable evidence is not proof the work was done.
+
+## Not started
+
+- ~~**L15-1** — `posted_date_changed` is not observed through the production path.
   The backfill only selects `WHERE posted_date_raw IS NULL`, so once a date is
   attached nothing ever compares a later one. You are right that the live `0`
   currently means only "no change detected by this write path". Before any
   coverage proof leans on timestamp stability this has to compare a current
-  detail date against the stored value, across all aliases.
-- **L15-2** — the consumer reselects every contradiction each cycle. Safe but
-  noisy, and it grows journal traffic, which now matters more because journal I/O
-  can trip the global interlock.
+  detail date against the stored value, across all aliases.~~ **CLOSED above.**
 - **The coverage evaluator.** Not started. Your architecture ruling is accepted:
   the crawler emits raw ordered traversal facts, a separate versioned evaluator
   derives the frontier, and `attest_coverage=True` means "attempt a proof", never
@@ -109,17 +129,17 @@ actually is — including that it carries the deploy script, not documentation o
 ## Verification
 
 ```text
-code head    6869886
+code head    039a06e
 
                               failed   passed   skipped
 main control (origin/main)         1     5320         4
-this branch                        1     5392         4
+this branch                        1     5399         4
 ```
 
-Same single pre-existing failure both sides. **+72 passing, zero net new
+Same single pre-existing failure both sides. **+79 passing, zero net new
 failures.** Host/container md5 parity asserted for the run.
 
-Mutation, nine applied and nine killed, each by exactly one test — listed in
+Mutation, twelve applied and twelve killed, each by exactly one test — listed in
 `03-evidence.md`.
 
 ## The question for this round
