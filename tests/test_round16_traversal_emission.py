@@ -181,3 +181,110 @@ class TestTheEvaluatorCanConsumeWhatTheCrawlerProduced:
             assert not hasattr(report, name), (
                 "the traversal report carries a %r conclusion; deriving that is "
                 "the evaluator's job, not the crawler's" % name)
+
+
+class TestAnAttemptedPageIsAlwaysObserved:
+    """M17-2, required change 1. The generic exception handler used to leave NO
+    page record, so an exception on page 2 produced a report of pages [1, 3] and
+    the absence was invisible. A page we attempted and failed is a FACT about the
+    traversal; the evidence should carry it rather than rely on something
+    downstream noticing a hole."""
+
+    class _Exploding:
+        """Succeeds, raises, succeeds -- the reviewer's exact sequence."""
+        def __init__(self, bodies):
+            self._bodies = list(bodies)
+            self.calls = 0
+
+        def get(self, *_a, **_kw):
+            i = self.calls
+            self.calls += 1
+            if self._bodies[i] is None:
+                raise RuntimeError("injected: connection reset")
+            return _Resp(self._bodies[i])
+
+    def test_the_failed_page_appears_in_the_report(self, monkeypatch):
+        shell = _crawl(
+            [_source("4K Movies", "movie", "4k")],
+            self._Exploding([
+                _listing([(A, "A Film 2026 2160p")]),
+                None,
+                _listing([(B, "B Film 2026 2160p")]),
+            ]), monkeypatch, pages=3)
+
+        arm = shell._last_crawl_traversal.arms[0]
+        numbers = sorted(p.page_number for p in arm.pages)
+        assert numbers == [1, 2, 3], (
+            "the failed page vanished from the report, so the gap was invisible: "
+            "got %s" % numbers)
+        failed = [p for p in arm.pages if p.page_number == 2][0]
+        assert not failed.usable
+        assert failed.page_error
+
+    def test_and_the_evaluator_refuses_that_traversal(self, monkeypatch):
+        """The safety net behind the evidence: even recorded, a failed page
+        before the frontier means the walk was not contiguous."""
+        shell = _crawl(
+            [_source("4K Movies", "movie", "4k")],
+            self._Exploding([
+                _listing([(A, "A Film 2026 2160p")]),
+                None,
+                _listing([(B, "B Film 2026 2160p")]),
+            ]), monkeypatch, pages=3)
+
+        report = shell._last_crawl_traversal
+        v = CoverageEvaluator(DATES).evaluate_arm(report, report.arms[0])
+        assert not v.proven
+        assert "unusable" in v.reason or "gap" in v.reason
+
+
+class TestTheCrawlerFlagsAliasesByCanonicalIdentity:
+    """M17-1, at the PRODUCER.
+
+    `TestOneCanonicalPostUnderTwoRawAliases` in the evaluator suite builds its
+    Sightings by hand with duplicate_in_run=True -- so it proves the evaluator
+    HONOURS the flag, and proves nothing about whether the crawler ever SETS it.
+    Reverting the crawler to raw-href keying left that suite entirely green.
+
+    This drives the real crawl with one canonical release under two cosmetic raw
+    hrefs, which is the shape that let one terminal post corroborate itself.
+    """
+
+    def test_a_cosmetic_variant_is_flagged_as_a_duplicate(self, monkeypatch):
+        shell = _crawl(
+            [_source("4K Movies", "movie", "4k")],
+            _Scraper([_listing([
+                (A, "A Film 2026 2160p"),
+                (A.rstrip("/") + "/?utm_source=listing", "A Film 2026 2160p"),
+            ])]), monkeypatch)
+
+        page = shell._last_crawl_traversal.arms[0].pages[0]
+        assert len(page.sightings) == 2, "both raw variants must be OBSERVED"
+        assert page.sightings[0].duplicate_in_run is False
+        assert page.sightings[1].duplicate_in_run is True, (
+            "the second raw variant of the same canonical release was not "
+            "flagged, so it can corroborate the first as an independent anchor")
+        assert (page.sightings[0].canonical_url
+                == page.sightings[1].canonical_url), "same release, by identity"
+
+    def test_and_the_evaluator_will_not_let_it_corroborate(self, monkeypatch):
+        """End to end: the alias cannot extend the frontier."""
+        old = "https://hdencode.example/old-film-2019-2160p/"
+        shell = _crawl(
+            [_source("4K Movies", "movie", "4k")],
+            _Scraper([_listing([
+                (A, "A Film 2026 2160p"),
+                (B, "B Film 2026 2160p"),
+                (old, "Old Film 2019 2160p"),
+                (old.rstrip("/") + "/?utm=x", "Old Film 2019 2160p"),
+            ])]), monkeypatch)
+
+        dates = dict(DATES)
+        dates["https://hdencode.example/old-film-2019-2160p"] = \
+            "January 4, 2019 at 1:00 AM"
+        report = shell._last_crawl_traversal
+        v = CoverageEvaluator(dates).evaluate_arm(report, report.arms[0])
+        assert v.proven, v.reason
+        assert "old-film" not in v.proof.frontier_url, (
+            "the aliased repeat corroborated the old terminal post, "
+            "manufacturing years of coverage from one page")

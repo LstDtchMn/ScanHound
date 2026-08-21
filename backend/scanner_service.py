@@ -1227,6 +1227,25 @@ class ScannerService:
                     # crawl from a clean one -- which is how a broken listing came
                     # to be recorded as trustworthy resolution evidence.
                     self._last_crawl_page_errors += 1
+                    # AND OBSERVED. Round 17 (M17-2): this handler used to leave
+                    # NO page record at all, so an exception on page 2 produced a
+                    # report of pages [1, 3] and the absence was invisible. The
+                    # evaluator now refuses on a gap, but a page we attempted and
+                    # failed is a FACT about the traversal, and the evidence
+                    # should say so rather than rely on something downstream
+                    # noticing a hole.
+                    #
+                    # Guarded, because the exception can also fire after the page
+                    # was already recorded -- during post processing rather than
+                    # the fetch.
+                    if not any(pg.page_number == page_num
+                               for pg in _cov_arm.pages):
+                        _cov_arm.pages.append(_CovPage(
+                            page_number=page_num,
+                            request_outcome="exception",
+                            http_status=0,
+                            parser_state="unrecognised",
+                            page_error=str(e)[:200]))
 
             if source_posts > 0:
                 # The arm parsed. Only now can its silence about a release mean
