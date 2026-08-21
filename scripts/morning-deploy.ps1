@@ -207,13 +207,16 @@ if ($composeExit -ne 0) {
 
 # ------------------------------------------------- wait for it to be READY --
 Head "Waiting for the app to finish starting"
-# Measured startup on this container is ~65s, and the entrypoint's browser-lock
+# The image has NO wget (proven: 'sh: 1: wget: not found'). Using it here
+# made the poll unsatisfiable, so a GOOD deploy timed out and reported
+# failure. python is present and is what the app itself runs on.
+# Measured startup on this container
 # cleanup has been seen taking 4 minutes. A fixed sleep prints tracebacks from
 # post-checks that ran too early and still exits green.
 $deadline = (Get-Date).AddSeconds(300)
 $ready = $false
 while ((Get-Date) -lt $deadline) {
-    $h = (docker exec $Container wget -qO- $HealthUrl 2>$null)
+    $h = (docker exec $Container python -c "import urllib.request,sys;sys.stdout.write(urllib.request.urlopen('$HealthUrl',timeout=5).read(20).decode())" 2>$null)
     if (-not [string]::IsNullOrWhiteSpace($h)) { $ready = $true; break }
     Start-Sleep -Seconds 5
 }
