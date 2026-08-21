@@ -111,7 +111,13 @@ class DatabaseManager:
         # (a same-second in-place upsert would otherwise serve stale blobs).
         self._bg_cache_rev = 0
         self._dismissed_cache = None  # lazily-populated set[str], kept in sync by mutators
+        self._session_id = None
         self.init_db()
+        # Claim responsibility for revocations before anything can be served.
+        # Round 15 (M15-1): a process that cannot write this marker cannot
+        # promise a restart will finish its work, so it disables authority now
+        # rather than discovering the problem when it is too late to record.
+        self.open_revocation_session()
 
     # ── Core helpers ──────────────────────────────────────────────────
 
@@ -141,7 +147,16 @@ class DatabaseManager:
                 raise
 
     def close(self):
-        """Close the database connection and release resources."""
+        """Close the database connection and release resources.
+
+        Also closes the revocation session -- but only if nothing is
+        outstanding. An unclosed session is the signal the next process reads to
+        fail closed, so it must survive an unclean exit.
+        """
+        try:
+            self.close_revocation_session()
+        except Exception:
+            logger.exception("could not close the revocation session")
         with self._lock:
             if self.conn:
                 try:
@@ -4758,19 +4773,7 @@ class DatabaseManager:
             "revocation_journal.jsonl")
 
     def _journal_append(self, record):
-        """Append one record and force it to disk. Returns True if durable.
-
-        Round 14 (M14-1). Restart recovery previously depended on writing a
-        conflict mark to the SAME SQLite database whose write had just failed.
-        If SQLite cannot commit, that mark does not land either -- so the
-        journal did not exist in precisely the case it was needed for, and
-        startup saw no interrupted-revocation signature at all.
-
-        A plain append + fsync to a separate file has failure semantics that
-        are genuinely independent of the database transaction. It is not
-        independent of the DISK, and nothing can be, which is what the
-        _authority_disabled interlock is for.
-        """
+        """Append one record and force it to disk. Returns True if durable."""
         try:
             path = self._revocation_journal_path()
             with open(path, "a", encoding="utf-8") as fh:
@@ -4784,13 +4787,67 @@ class DatabaseManager:
                 self._revocation_journal_path())
             return False
 
-    def read_pending_revocations(self):
-        """URLs the journal says were being revoked and never confirmed done."""
+    def open_revocation_session(self):
+        """Record that this process is now responsible for revocations.
+
+        Round 15 (M15-1). The previous design could not detect the case that
+        mattered most. If the journal write ITSELF failed, the interlock lived
+        only in this process's memory; the next process started with no holds, an
+        empty journal and no cache mark, and the stale authority simply came back.
+
+        A session marker fixes that by inverting the question. Instead of asking
+        "is there a pending revocation?" -- which a failed write cannot answer --
+        the next startup asks "did the previous session prove it shut down
+        cleanly?" A process whose storage stopped accepting writes cannot write
+        its own close record, so its silence is itself the signal.
+        """
+        self._session_id = uuid.uuid4().hex
+        if not self._journal_append({"kind": "SESSION_OPEN",
+                                     "session": self._session_id}):
+            self._authority_disabled = True
+            logger.error(
+                "cannot open the revocation journal; semantic authority is "
+                "disabled for this process")
+            return False
+        return True
+
+    def close_revocation_session(self):
+        """Prove a clean shutdown -- ONLY when nothing is unresolved.
+
+        Deliberately refuses to write the close record while authority is
+        disabled or a hold is outstanding. An unclosed session is how the next
+        process learns to fail closed, so closing it with something unresolved
+        would erase the very warning we mean to leave behind.
+        """
+        if getattr(self, "_session_id", None) is None:
+            return False
+        if self._authority_disabled or self._media_kind_holds:
+            logger.warning(
+                "NOT closing the revocation session: %d hold(s) outstanding, "
+                "authority_disabled=%s. The next start will fail closed.",
+                len(self._media_kind_holds), self._authority_disabled)
+            return False
+        return self._journal_append({"kind": "SESSION_CLOSED",
+                                     "session": self._session_id})
+
+    def scan_revocation_journal(self):
+        """Read the journal and report what it can actually prove.
+
+        Returns (pending_urls, healthy, reason). `healthy` is False whenever the
+        journal cannot be trusted, and every such case must fail CLOSED:
+
+            unreadable        we cannot know what was outstanding
+            malformed line    a torn PENDING and a torn DONE look identical, and
+                              skipping a torn PENDING resurrects authority
+            unclosed session  the previous process never proved a clean exit,
+                              which is exactly what a storage failure looks like
+        """
         path = self._revocation_journal_path()
-        pending = set()
+        pending = {}
+        open_sessions = set()
         try:
             if not os.path.exists(path):
-                return pending
+                return (set(), True, "no journal")
             with open(path, "r", encoding="utf-8") as fh:
                 for line in fh:
                     line = line.strip()
@@ -4799,31 +4856,49 @@ class DatabaseManager:
                     try:
                         rec = json.loads(line)
                     except ValueError:
-                        # A torn final line is exactly what a crash mid-append
-                        # looks like. Ignore the fragment, keep the rest.
-                        continue
-                    urls = rec.get("urls") or []
-                    if rec.get("done"):
-                        pending -= {str(u) for u in urls}
-                    else:
-                        pending |= {str(u) for u in urls}
+                        # A torn line is NOT harmless. It may be a PENDING that
+                        # never completed, and skipping it silently restores the
+                        # permission it was written to withdraw.
+                        partial = set()
+                        for _u in pending.values():
+                            partial |= _u
+                        return (partial, False, "malformed journal line")
+                    kind = rec.get("kind")
+                    if kind == "SESSION_OPEN":
+                        open_sessions.add(rec.get("session"))
+                    elif kind == "SESSION_CLOSED":
+                        open_sessions.discard(rec.get("session"))
+                    elif kind == "PENDING":
+                        pending[rec.get("op")] = {
+                            str(u) for u in (rec.get("urls") or [])}
+                    elif kind == "DONE":
+                        # Keyed on op id, not URL-set subtraction, so two
+                        # overlapping revocations cannot cancel each other.
+                        pending.pop(rec.get("op"), None)
         except Exception:
             logger.exception("could not read the revocation journal")
-        return pending
+            return (set(), False, "unreadable journal")
 
-    def _journal_compact(self, still_pending):
-        """Rewrite the journal to just what is still outstanding."""
+        urls = set()
+        for u in pending.values():
+            urls |= u
+        # Our OWN session is open by definition while we are running.
+        stale = open_sessions - {getattr(self, "_session_id", None)}
+        if stale:
+            return (urls, False,
+                    "%d previous session(s) never closed" % len(stale))
+        return (urls, True, "clean")
+
+    def _journal_compact(self):
+        """Rewrite the journal down to just our own open session."""
         path = self._revocation_journal_path()
         try:
-            if not still_pending:
-                if os.path.exists(path):
-                    os.remove(path)
-                return
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(
-                    {"urls": sorted(still_pending), "reason": "compacted"},
-                    default=str) + "\n")
+                if getattr(self, "_session_id", None):
+                    fh.write(json.dumps(
+                        {"kind": "SESSION_OPEN",
+                         "session": self._session_id}) + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
@@ -4916,7 +4991,9 @@ class DatabaseManager:
         #     a conflict mark to the same SQLite database whose write had just
         #     failed, so in exactly the case it mattered the journal did not
         #     exist and startup saw nothing to recover.
-        if not self._journal_append({"urls": sorted(targets), "reason": reason}):
+        _op = uuid.uuid4().hex
+        if not self._journal_append({"kind": "PENDING", "op": _op,
+                                     "urls": sorted(targets), "reason": reason}):
             # The durability mechanism itself failed. This process can no longer
             # promise that a restart will finish the job, so it stops promising
             # anything: no semantic identity is served until an operator or a
@@ -4952,8 +5029,7 @@ class DatabaseManager:
         # 4. CONFIRM in the journal, then RELEASE. Order matters: releasing the
         #    hold before recording completion would leave a window where neither
         #    the runtime hold nor the journal protects the release.
-        self._journal_append({"urls": sorted(targets), "reason": reason,
-                              "done": True})
+        self._journal_append({"kind": "DONE", "op": _op, "reason": reason})
         self.release_media_kind_hold(targets)
 
         if retracted:
@@ -4989,7 +5065,18 @@ class DatabaseManager:
         # SOURCE 1: the independent journal. This is the one that survives the
         # failure that prevented the revocation, because it is not in the
         # database that refused the write.
-        stale = list(self.read_pending_revocations())
+        journal_urls, healthy, why = self.scan_revocation_journal()
+        if not healthy:
+            # Round 15 (M15-1). A journal we cannot trust is not the same as an
+            # empty one. Torn line, unreadable file, or a previous session that
+            # never proved a clean exit -- in every case we cannot know what was
+            # outstanding, so nothing is vouched for until an operator resolves it.
+            self._authority_disabled = True
+            logger.error(
+                "REVOCATION JOURNAL NOT TRUSTWORTHY (%s). Semantic authority is "
+                "disabled process-wide; no release will be served an identity.",
+                why)
+        stale = list(journal_urls)
         if stale:
             logger.warning(
                 "revocation journal holds %d unfinished revocation(s) from a "
@@ -5025,7 +5112,7 @@ class DatabaseManager:
         try:
             self.record_classification_conflicts_and_retract_kinds(
                 stale, reason="startup_reconciliation")
-            self._journal_compact(set())
+            self._journal_compact()
         except Exception:
             # The hold was taken before the attempt and is still in force, so no
             # semantic identity is served for these releases in this process even
