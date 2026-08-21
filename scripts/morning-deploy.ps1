@@ -156,7 +156,7 @@ src = sqlite3.connect('file:/dbvol/crawler.db?mode=ro', uri=True, timeout=30)
 dst = sqlite3.connect('$tmpInContainer')
 src.backup(dst)
 dst.close()
-chk = sqlite3.connect('file:$tmpInContainer?mode=ro', uri=True)
+chk = sqlite3.connect('file:${tmpInContainer}?mode=ro', uri=True)
 ok = chk.execute('PRAGMA integrity_check').fetchone()[0]
 counts = {}
 for t in ('downloads', 'background_scan_cache'):
