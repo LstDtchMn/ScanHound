@@ -34,6 +34,8 @@ $ComposeFile = 'C:\ProgramData\ScanHound\deploy\docker-compose.yml'
 $Project     = 'scanhound'
 $Container   = 'scanhound'
 $Branch      = 'fix/round12-attestation-authority'
+# The exact code head peer review bound itself to.
+$ReviewedCodeHead = 'ef2fb188342350507eeb649f533f3b197fc031e2'
 $BackupDir   = 'C:\DockerData\scanhound-backups'
 $HealthUrl   = 'http://127.0.0.1:9721/health'
 
@@ -81,6 +83,18 @@ if (-not [string]::IsNullOrWhiteSpace($dirty)) {
     exit 2
 }
 Good "on $Branch, tree clean"
+
+# Refuse to ship backend/test code that no review has seen. Later commits for
+# docs or this script are fine; unreviewed backend changes are not.
+git diff --quiet $ReviewedCodeHead HEAD -- backend tests
+if ($LASTEXITCODE -ne 0) {
+    Bad "backend/ or tests/ differ from the reviewed head $ReviewedCodeHead."
+    Bad "This script only ships code that has been through review. Changed:"
+    (git diff --name-only $ReviewedCodeHead HEAD -- backend tests) |
+        ForEach-Object { Say "    $_" }
+    exit 2
+}
+Good "backend/ and tests/ match the reviewed head $ReviewedCodeHead"
 
 if (-not (Test-Path -LiteralPath $ComposeFile)) {
     Bad "Pinned compose missing: $ComposeFile"
@@ -134,10 +148,19 @@ Head "Tagging the current image so rollback stays possible"
 # today's known-good image is gone and a routine `docker image prune` deletes
 # it permanently.
 $rollbackTag = "scanhound:rollback-$stamp"
-docker tag scanhound:latest $rollbackTag
+# D15-1: tag the image the CONTAINER is actually running, not whatever
+# scanhound:latest happens to point at. This repo has already had a state
+# where the tag and the running container diverged, and rolling back to the
+# wrong image is worse than not rolling back.
+docker tag $currentImage $rollbackTag
 $check = (docker image inspect $rollbackTag --format '{{.Id}}' 2>$null)
 if ([string]::IsNullOrWhiteSpace($check)) {
     Bad "Could not tag the current image. Refusing to deploy without a rollback."
+    exit 1
+}
+if ($check -ne $currentImage) {
+    Bad "Rollback tag points at $check but the container runs $currentImage."
+    Bad "Refusing to deploy with a rollback that would restore the wrong image."
     exit 1
 }
 Good "rollback image tagged: $rollbackTag"
@@ -197,6 +220,15 @@ Head "Building and recreating (10+ minutes -- do not interrupt)"
 # --force-recreate: without it, a rebuild that produces an identical image
 # leaves the container untouched, and verify-deploy.py correctly reports
 # "same image -- nothing was deployed", which reads as a failure on a re-run.
+# D15-2: verify-deploy.py "after" compares against a snapshot that "before"
+#        writes. Only "after" was ever called, so the comparison could run
+#        against a stale state file. Always take a fresh one, here, so it
+#        describes the container we are about to replace.
+$LASTEXITCODE = 0
+python "$Repo\scriptserify-deploy.py" before
+if ($LASTEXITCODE -ne 0) { Bad "verify-deploy.py before failed. Not deploying."; exit 1 }
+Good "fresh pre-deploy snapshot recorded"
+
 docker compose -f $ComposeFile --project-directory $Repo -p $Project up -d --build --force-recreate
 $composeExit = $LASTEXITCODE
 if ($composeExit -ne 0) {
@@ -261,8 +293,21 @@ docker exec $Container python -c "import sqlite3;c=sqlite3.connect('file:/dbvol/
 Say "-- media kinds recorded (expect none or only pre-existing) --"
     docker exec $Container python -c "import sqlite3;c=sqlite3.connect('file:/dbvol/crawler.db?mode=ro',uri=True);print(c.execute('SELECT media_kind, COUNT(*) FROM downloads GROUP BY media_kind').fetchall());c.close()"
 
-Say "-- attestation is DARK (must print 0) --"
-docker exec $Container sh -c "grep -r 'attest_coverage=True' /app/backend/ 2>/dev/null | wc -l"
+Say "-- HARD INVARIANTS: the feature must be dark --"
+# D15-3: these were printed and never checked, so the script could announce
+#        "deployed dark" after the dark check had failed.
+$darkCallers = (docker exec $Container sh -c "grep -r 'attest_coverage=True' /app/backend/ 2>/dev/null | wc -l")
+$liveState = (docker exec $Container python -c "import sqlite3,json;c=sqlite3.connect('file:/dbvol/crawler.db?mode=ro',uri=True);a=sum(1 for (d,) in c.execute('SELECT data FROM background_scan_cache') if (json.loads(d).get('category_attested') if d and d.strip().startswith(chr(123)) else False));k=c.execute('SELECT COUNT(*) FROM downloads WHERE media_kind IS NOT NULL').fetchone()[0];print('%d %d' % (a,k));c.close()")
+$parts = "$liveState".Trim() -split "\s+"
+Say "attestation callers : $($darkCallers.Trim())"
+Say "rows attested       : $($parts[0])"
+Say "non-NULL media_kind : $($parts[1])"
+if (("$darkCallers".Trim() -ne "0") -or ($parts[0] -ne "0") -or ($parts[1] -ne "0")) {
+    Bad "DARK INVARIANT VIOLATED. The feature is not dark after this deploy."
+    Bad "Roll back: docker tag $rollbackTag scanhound:latest ; then up -d --force-recreate"
+    exit 1
+}
+Good "dark invariants hold: 0 callers, 0 attested, 0 recorded media kinds"
 
 Head "Done -- deployed dark"
 Say "Nothing can certify a media kind, so no new destructive authority exists."
