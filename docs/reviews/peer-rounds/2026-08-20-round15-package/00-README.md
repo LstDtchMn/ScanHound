@@ -10,7 +10,8 @@ branch        fix/round12-attestation-authority
 code head     ef2fb188342350507eeb649f533f3b197fc031e2
 base          6ac5cd2aefb81bb7d85354577a69af269b8e05e5   (main, 0 behind)
 working tree  clean
-deployed      NOTHING. The running container predates all media-kind work.
+deployed      YES -- DARK, on 2026-08-21. First cycle complete, 0 attested,
+              media_kind NULL on all 684 rows, 0 errors. See 03-evidence.md S5.
 ```
 
 ## Contents
@@ -54,6 +55,13 @@ coverage proof / frontier  NOT BUILT -- min(posted_date) accepted as rejected;
                            one design question in 01-request.md
 legacy aged-off policy     ACCEPTED, unchanged
 ```
+
+## New since you last saw this
+
+**It is deployed dark and there is live data.** First cycle: 180 claims, 0
+movie-vs-TV conflicts. And a measurement that matters more than that one --
+**three pages of the TV arm reach back less than a day**, so the aged-off corpus
+is unreachable in practice, not just in principle. `03-evidence.md` S5.
 
 ## Open question in one line
 

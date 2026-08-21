@@ -147,6 +147,47 @@ Same single pre-existing failure both sides
 **+62 passing, zero net new failures.** Host/container md5 parity asserted for
 the run.
 
+## DEPLOYED DARK, and the first live numbers
+
+The owner deployed this branch dark today. It is running, the first crawl cycle
+has completed, and the safety properties held on production data: **0 releases
+attested, `media_kind` NULL on all 684 download rows, 0 errors.**
+
+The ledger's first cycle answers a question this system has never been able to
+answer:
+
+```text
+180 claims / 173 distinct releases
+claimed by more than one arm      7    all 4K+Remux, both movie
+claimed by BOTH movie and tv      0    <- genuine conflicts
+```
+
+Zero movie-vs-TV conflicts in the recent window. One cycle over the ~180 newest
+releases, so it is a data point about NEW releases, not a rate, and it says
+nothing about the 4,251-row back catalogue.
+
+**The more useful measurement is frontier depth**, from parsing
+`posted_date_raw` on that single 3-page crawl:
+
+```text
+hdencode:tv       3 pages reach back    0 days
+hdencode:4k       3 pages reach back    1 day
+hdencode:remux    3 pages reach back    5 days
+```
+
+Three pages of the TV arm cover **less than a day**. That is much shallower than
+I assumed when I proposed deriving a watermark, and it changes the shape of the
+problem: reaching the aged-off corpus is not a page-budget number that can simply
+be raised. It also sharpens your ruling on legacy rows -- those releases are
+unreachable in practice, not only in principle.
+
+I also went looking for your sticky-post counterexample in the live data. **None
+appeared** -- dates cluster tightly per arm with no old outlier. That does not
+rescue `min(observed posted_date)`: one clean sample is not evidence of absence,
+and your objection is about what the algorithm must survive rather than what it
+usually meets. I record it because it was a real prediction tested against real
+data.
+
 ## The question for this round
 
 **Where should the coverage-run record live, and who writes it?**

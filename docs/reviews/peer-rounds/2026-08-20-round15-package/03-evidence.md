@@ -116,7 +116,76 @@ backend/scanner_service.py    _select_posts() returns ANCHOR ELEMENTS only.
                               a listing page.
 ```
 
-## 5. Deployment state
+## 5. DEPLOYED DARK -- live data from the first cycle
+
+The owner deployed this branch dark on 2026-08-21. It is running now, and the
+first crawl cycle has completed, so the numbers below are production rather than
+fixtures.
+
+### The safety properties held on live data
+
+```text
+releases certified (attested)      0     attestation is dark, confirmed live
+downloads.media_kind               NULL on all 684 rows
+false conflicts recorded           0
+errors / tracebacks                0
+```
+
+### What the ledger captured on one cycle
+
+```text
+hdencode:4k      movie    60
+hdencode:remux   movie    60
+hdencode:tv      tv       60
+                        ----
+                        180 claims / 173 distinct releases
+
+claimed by MORE THAN ONE arm        7
+claimed by BOTH movie and tv        0     <- genuine conflicts
+posted_date attached              172 / 180
+posted_date_changed (anomaly)       0
+```
+
+All 7 multi-arm releases are **4K + Remux, both `movie`** -- the same UHD title
+listed in two movie categories. That is expected and is not a contradiction.
+
+**So: zero movie-vs-TV conflicts in the recent window.** This is the first time
+this system has been able to answer that question at all. It is one cycle over
+the ~180 newest releases, so it measures NEW releases and says nothing about the
+4,251-row back catalogue -- a data point, not a rate.
+
+### FRONTIER DEPTH, measured -- this is the useful one for the coverage model
+
+Parsing `posted_date_raw` from that single 3-page crawl:
+
+```text
+arm               dated   newest       oldest       span
+hdencode:tv         60    2026-08-21   2026-08-20    0 days
+hdencode:4k         52    2026-08-21   2026-08-19    1 day
+hdencode:remux      60    2026-08-21   2026-08-16    5 days
+```
+
+**Three pages of the TV arm reach back less than one day.** That is the concrete
+answer to how deep a bounded crawl actually goes, and it is much shallower than I
+would have guessed. It also explains why the aged-off corpus is unreachable in
+practice rather than merely in principle: at roughly a day per three pages,
+traversing back through months of releases is not a page-budget problem that a
+larger number fixes.
+
+### Your sticky-post objection, tested against live data
+
+I looked for the counterexample you used to reject `min(observed posted_date)`:
+a lone entry far older than the rest of its page. **None appeared in this
+sample** -- the dates are tightly clustered per arm with no outlier.
+
+That does NOT rescue the rejected approach. One clean sample is not evidence of
+absence, the objection is about what the algorithm must be robust to rather than
+what it usually meets, and a single pinned post appearing later would silently
+manufacture a deep frontier. I mention it only because it is a real measurement
+against a real prediction, and it is the kind of thing worth recording before it
+turns up.
+
+## 6. Deployment state
 
 ```bash
 docker exec scanhound sh -c "grep -c 'media_kind' /app/backend/database.py"
