@@ -28,7 +28,9 @@ currently authorise anything -- by construction, not by convention.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from types import MappingProxyType
+from typing import (Any, Dict, FrozenSet, List, Mapping, Optional,
+                    Sequence, Set, Tuple)
 
 #: Bumped whenever the proof RULES change. Part of the proof, per §8.8: a proof
 #: is only meaningful alongside the version of the logic that produced it.
@@ -55,7 +57,13 @@ PARSER_RECOGNISED = "recognised"
 #: limitation lived in a docstring, and the docstring was wrong.
 #:
 #: Adding an entry is a reviewed decision, not a configuration change.
-ORDERING_CONTRACTS: Dict[str, str] = {}
+#: Keyed on (arm_key, parser_version) -- round 18, M18-1. This was keyed on
+#: `source`, so a contract established for one HDEncode endpoint would have
+#: marked 4K, Remux and TV Packs authoritative together, and would have
+#: survived a parser rewrite that changed what the listing order MEANS. A
+#: contract is a claim about a specific feed read by a specific parser; it
+#: transfers to neither a sibling arm nor a different parser version.
+ORDERING_CONTRACTS: Dict[Tuple[str, str], str] = {}
 
 _DATE_FORMATS = ("%B %d, %Y at %I:%M %p", "%B %d, %Y")
 
@@ -161,24 +169,66 @@ class ArmVerdict:
         return self.proof is not None
 
 
+@dataclass(frozen=True)
+class CoverageEvidenceSnapshot:
+    """The date evidence a proof was derived from, sealed at capture time.
+
+    Round 18 (M18-4). A proof is an argument about a moment. If the evidence it
+    cites can change afterwards, the proof stops meaning what it said, and no
+    reader can tell -- the proof looks identical either way.
+
+    `capture()` COPIES. A read-only view over the caller's dictionary would not
+    be enough: the caller still holds the original and can still write to it,
+    and every mutation would be visible through the view.
+    """
+
+    dates: Mapping[str, str]
+    unstable: FrozenSet[str]
+
+    @classmethod
+    def capture(cls, dates: Optional[Dict[str, str]],
+                unstable: Optional[Set[str]] = None
+                ) -> "CoverageEvidenceSnapshot":
+        return cls(dates=MappingProxyType(dict(dates or {})),
+                   unstable=frozenset(unstable or ()))
+
+
 class CoverageEvaluator:
     """Derives a frontier from traversal observations. Grants nothing."""
 
     version = EVALUATOR_VERSION
 
-    def __init__(self, dates: Dict[str, str], unstable: Optional[Set[str]] = None):
-        """`dates` maps canonical_url -> the site's raw publication string.
+    def __init__(self, dates: Any, unstable: Optional[Set[str]] = None):
+        """`dates` maps canonical_url -> the site's raw publication string, or
+        is an already-captured CoverageEvidenceSnapshot.
         `unstable` is the set whose recorded date has been seen to CHANGE
         (`posted_date_changed`); per §8.7 those cannot support timestamp
         coverage until resolved, so they are never anchors.
+
+        Round 18 (M18-4): the inputs are CAPTURED, not retained. This used to
+        hold the caller's dictionary by reference, so a proof could name a
+        frontier date that no longer matched what the map said -- an enrichment
+        pass writing a corrected date would silently rewrite the evidence that a
+        past decision rested on.
         """
-        self._dates = dates or {}
-        self._unstable = set(unstable or ())
+        if isinstance(dates, CoverageEvidenceSnapshot):
+            if unstable is not None:
+                raise ValueError(
+                    "pass either a snapshot or raw inputs, not both: a second "
+                    "unstable set would contradict the one already sealed")
+            self._evidence = dates
+        else:
+            self._evidence = CoverageEvidenceSnapshot.capture(dates, unstable)
 
     # -- anchors ----------------------------------------------------------
 
-    def _anchor_date(self, s: Sighting) -> Optional[datetime]:
-        """Whether this sighting can anchor a frontier, and at what time.
+    def _anchor(self, s: Sighting) -> Optional[Tuple[datetime, str]]:
+        """Whether this sighting can anchor a frontier, at what time, and from
+        which raw string.
+
+        Returns BOTH, from a SINGLE read, so a proof's `frontier_date` and
+        `frontier_date_raw` cannot describe two different observations
+        (round 18, M18-4).
 
         Excluded, each for its own reason:
           duplicate_in_run  a repeat proves nothing about NEW depth (§8.4)
@@ -188,9 +238,11 @@ class CoverageEvaluator:
         """
         if s.duplicate_in_run or s.policy_excluded:
             return None
-        if s.canonical_url in self._unstable:
+        if s.canonical_url in self._evidence.unstable:
             return None
-        return parse_site_date(self._dates.get(s.canonical_url))
+        raw = self._evidence.dates.get(s.canonical_url)
+        when = parse_site_date(raw)
+        return None if when is None else (when, str(raw or ""))
 
     # -- one arm ----------------------------------------------------------
 
@@ -262,10 +314,17 @@ class CoverageEvaluator:
 
         for page in sorted(arm.pages, key=lambda p: p.page_number):
             positions = [s.position for s in page.sightings]
-            if len(set(positions)) != len(positions):
+            # Round 18 (M18-3): uniqueness alone accepted [1, 3] -- a page that
+            # LOST a sighting -- and [2, 1], a page whose emitted order did not
+            # match its claimed order. Sorting afterwards hid both. A complete
+            # page numbers its sightings 1..N in the order they were read, so
+            # require exactly that and refuse anything else.
+            if positions != list(range(1, len(positions) + 1)):
                 return ArmVerdict(
                     arm.arm_key, None,
-                    "duplicate positions on page %d" % page.page_number)
+                    "page %d sighting positions are not a complete 1..%d "
+                    "sequence in emitted order: %s" % (
+                        page.page_number, len(positions), positions))
             if not page.usable:
                 return ArmVerdict(
                     arm.arm_key, None,
@@ -274,20 +333,22 @@ class CoverageEvaluator:
                         ", " + page.page_error if page.page_error else ""))
             pages_done += 1
 
-            for s in sorted(page.sightings, key=lambda x: x.position):
-                when = self._anchor_date(s)
-                if when is None:
+            # Emitted order IS position order -- asserted immediately above.
+            for s in page.sightings:
+                found = self._anchor(s)
+                if found is None:
                     # Not an anchor, but traversal continues past it (S8.6).
                     continue
+                when, raw = found
                 anchors += 1
                 if pending is None:
-                    pending = (when, s)
+                    pending = (when, raw, s)
                     continue
                 if when <= pending[0]:
                     # The previous anchor is corroborated: something at least as
                     # old came after it, so it really was part of the sequence.
                     confirmed = pending
-                    pending = (when, s)
+                    pending = (when, raw, s)
                 else:
                     # A newer item BELOW an older one. Either a pinned post or an
                     # ordering we do not understand; a frontier argument depends
@@ -303,16 +364,18 @@ class CoverageEvaluator:
                 arm.arm_key, None,
                 "no corroborated anchor: %d anchor(s) seen, none confirmed by a "
                 "later one" % anchors)
-        when, s = confirmed
+        when, raw, s = confirmed
+        # (arm, parser) -- never the source, and never across a parser change.
+        _contract = ORDERING_CONTRACTS.get((arm.arm_key, arm.parser_version))
         return ArmVerdict(arm.arm_key, CoverageProof(
             run_id=report.run_id, source=report.source, arm_key=arm.arm_key,
             listing_type=arm.listing_type, parser_version=arm.parser_version,
             evaluator_version=self.version,
             frontier_url=s.canonical_url,
-            frontier_date_raw=str(self._dates.get(s.canonical_url) or ""),
+            frontier_date_raw=raw,
             frontier_date=when, pages_traversed=pages_done, anchors_used=anchors,
-            authoritative=bool(ORDERING_CONTRACTS.get(report.source)),
-            ordering_contract=str(ORDERING_CONTRACTS.get(report.source) or ""),
+            authoritative=bool(_contract),
+            ordering_contract=str(_contract or ""),
         ), "frontier reached")
 
     # -- the question that matters ---------------------------------------
@@ -367,9 +430,10 @@ class CoverageEvaluator:
                 # known to be a chronological stream, and depth in an unordered
                 # sequence is not depth in time.
                 return (False, verdicts,
-                        "required arm %s has no ordering contract for source "
-                        "%r, so its frontier is telemetry and cannot support a "
-                        "negative proof" % (key, report.source))
+                        "required arm %s (parser %s) has no ordering contract, "
+                        "so its frontier is telemetry and cannot support a "
+                        "negative proof"
+                        % (key, v.proof.parser_version))
             if not (v.proof.frontier_date < target):
                 return (False, verdicts,
                         "required arm %s reached only %s, which is not strictly "

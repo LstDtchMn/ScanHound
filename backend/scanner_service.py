@@ -895,9 +895,16 @@ class ScannerService:
         #: decides what these facts justify; the crawler is not allowed to
         #: decide that about itself.
         traversal_arms: Dict[str, object] = {}
-        #: Canonical identities seen this run, for duplicate_in_run. Separate
+        #: Canonical identities seen PER ARM, for duplicate_in_run. Separate
         #: from seen_post_urls, which is raw and drives the crawl's own dedup.
-        _cov_seen_canonical: Set[str] = set()
+        #:
+        #: Round 18 (M18-2): this was ONE set for the whole crawl, so a release
+        #: first seen in the 4K arm was marked a duplicate on its FIRST sighting
+        #: in Remux. duplicate_in_run means "proves no new depth in THIS arm",
+        #: and a first sighting always does. Worse, the evaluator then SKIPS it
+        #: -- so an out-of-order date that should have triggered an inversion
+        #: was silently removed and a frontier returned instead of a refusal.
+        _cov_seen_by_arm: Dict[str, Set[str]] = {}
         _cov_run_id = uuid.uuid4().hex
         total_pages = len(sources) * pages
         current_page = 0
@@ -924,6 +931,7 @@ class ScannerService:
                 parser_version=_COV_PARSER_VERSION)
             traversal_arms.setdefault(_cov_arm.arm_key, _cov_arm)
             _cov_arm = traversal_arms[_cov_arm.arm_key]
+            _cov_arm_seen = _cov_seen_by_arm.setdefault(_cov_arm.arm_key, set())
             # PARSER HEALTH IS PART OF COVERAGE. Round 13 (L13-1).
             #
             # This used to claim the arm as covered HERE, at the moment the crawl
@@ -971,6 +979,11 @@ class ScannerService:
                     else:
                         url = f"{source_base}page/{page_num}/{source_suffix}"
 
+                #: The page under construction, NOT yet sealed into the arm.
+                #: Reset per iteration: the HTTP-error branch seals its own page
+                #: and continues, so without this a later exception could seal
+                #: the PREVIOUS page's object under this page's number.
+                _cov_page = None
                 try:
                     def _fetch_page(u=url):
                         self._last_crawl_request_count += 1
@@ -1052,7 +1065,15 @@ class ScannerService:
                         page_number=page_num, request_outcome=_COV_PAGE_OK,
                         http_status=int(getattr(resp, 'status_code', 200) or 200),
                         parser_state=(_COV_RECOGNISED if posts else "unrecognised"))
-                    _cov_arm.pages.append(_cov_page)
+                    # Round 18 (M18-3): NOT sealed here. This used to append the
+                    # page before enumerating a single post, so an exception
+                    # partway through left a page whose request_outcome said "ok"
+                    # and whose parser_state said "recognised", carrying only the
+                    # sightings that happened to be read before the failure. The
+                    # evaluator would accept it as a complete page and walk a
+                    # truncated list, which is exactly the silent shortfall the
+                    # continuity check exists to prevent. A page is sealed only
+                    # once every post on it has been enumerated -- see below.
 
                     page_posts = 0   # non-empty post URLs found on this page
                     # Unique URLs FIRST SEEN on this page. Deliberately excludes
@@ -1116,12 +1137,11 @@ class ScannerService:
                             # the same identity or it is not the same question.
                             duplicate_in_run=(
                                 canonicalize_listing_url(post_url)
-                                in _cov_seen_canonical),
+                                in _cov_arm_seen),
                             policy_excluded=bool(
                                 skip_full_disc and source_id == "hdencode"
                                 and is_full_disc_title(post_title))))
-                        _cov_seen_canonical.add(
-                            canonicalize_listing_url(post_url))
+                        _cov_arm_seen.add(canonicalize_listing_url(post_url))
                         _arm = (post_url, source_type_hint, source_category)
                         if _arm not in listing_claim_seen:
                             listing_claim_seen.add(_arm)
@@ -1203,6 +1223,13 @@ class ScannerService:
                         # below and silently losing its evidence.
                         post_index[post_url] = _post
 
+                    # Every post on this page was enumerated without raising, so
+                    # the page is now a complete observation and can be sealed.
+                    # Reached on the early-stop path too: that break happens
+                    # AFTER this point.
+                    _cov_arm.pages.append(_cov_page)
+                    _cov_page = None
+
                     # Early-stop: a populated page that yields no new posts means
                     # we've reached content already cached/seen — deeper pages are
                     # older still, so stop crawling this source. Only with a skip
@@ -1240,12 +1267,23 @@ class ScannerService:
                     # the fetch.
                     if not any(pg.page_number == page_num
                                for pg in _cov_arm.pages):
-                        _cov_arm.pages.append(_CovPage(
-                            page_number=page_num,
-                            request_outcome="exception",
-                            http_status=0,
-                            parser_state="unrecognised",
-                            page_error=str(e)[:200]))
+                        if _cov_page is not None:
+                            # Round 18 (M18-3): the failure landed partway through
+                            # enumeration. Keep the partial sightings -- they are a
+                            # true record of what was read -- but overwrite the
+                            # outcome so nothing downstream can mistake a truncated
+                            # page for a complete one.
+                            _cov_page.request_outcome = "exception"
+                            _cov_page.parser_state = "unrecognised"
+                            _cov_page.page_error = str(e)[:200]
+                            _cov_arm.pages.append(_cov_page)
+                        else:
+                            _cov_arm.pages.append(_CovPage(
+                                page_number=page_num,
+                                request_outcome="exception",
+                                http_status=0,
+                                parser_state="unrecognised",
+                                page_error=str(e)[:200]))
 
             if source_posts > 0:
                 # The arm parsed. Only now can its silence about a release mean

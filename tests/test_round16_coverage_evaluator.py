@@ -240,13 +240,25 @@ class TestCrossingRequiresEVERYNamedArm:
     REQUIRED = ["hdencode:4k:2160p", "hdencode:remux:remux",
                 "hdencode:tv:tv-packs"]
 
+    #: (arm_key, parser_version), round 18 M18-1. A contract is per arm per
+    #: parser, so granting one here means granting three.
+    CONTRACT_KEYS = [(k, "p1") for k in
+                     ["hdencode:4k:2160p", "hdencode:remux:remux",
+                      "hdencode:tv:tv-packs"]]
+
     def _ev_contracted(self):
-        """Grant hdencode a contract so this class can test the ARM logic rather
+        """Grant each arm a contract so this class tests the ARM logic rather
         than re-testing the telemetry gate."""
         import backend.coverage as cov
         ev = _ev()
-        cov.ORDERING_CONTRACTS["hdencode"] = "test-contract/1"
+        for ck in self.CONTRACT_KEYS:
+            cov.ORDERING_CONTRACTS[ck] = "test-contract/1"
         return ev, cov
+
+    @staticmethod
+    def _clear(cov):
+        for ck in list(cov.ORDERING_CONTRACTS):
+            cov.ORDERING_CONTRACTS.pop(ck, None)
 
     def test_a_shallow_same_type_arm_refuses(self, monkeypatch):
         ev, cov = self._ev_contracted()
@@ -261,7 +273,7 @@ class TestCrossingRequiresEVERYNamedArm:
             assert not ok, "a shallow Remux arm was accepted because 4K crossed"
             assert "remux" in why
         finally:
-            cov.ORDERING_CONTRACTS.pop("hdencode", None)
+            self._clear(cov)
 
     def test_an_unusable_same_type_arm_refuses(self):
         ev, cov = self._ev_contracted()
@@ -271,7 +283,7 @@ class TestCrossingRequiresEVERYNamedArm:
                 rep, "August 20, 2026 at 11:30 PM", self.REQUIRED)
             assert not ok
         finally:
-            cov.ORDERING_CONTRACTS.pop("hdencode", None)
+            self._clear(cov)
 
     def test_a_required_arm_absent_entirely_refuses(self):
         ev, cov = self._ev_contracted()
@@ -284,7 +296,7 @@ class TestCrossingRequiresEVERYNamedArm:
             assert not ok
             assert "not traversed at all" in why
         finally:
-            cov.ORDERING_CONTRACTS.pop("hdencode", None)
+            self._clear(cov)
 
     def test_all_required_arms_crossing_passes(self):
         """POSITIVE CONTROL. Without it, a universally-refusing implementation
@@ -297,7 +309,7 @@ class TestCrossingRequiresEVERYNamedArm:
                 rep, "August 20, 2026 at 11:30 PM", self.REQUIRED)
             assert ok, why
         finally:
-            cov.ORDERING_CONTRACTS.pop("hdencode", None)
+            self._clear(cov)
 
     def test_an_empty_required_set_is_not_vacuously_true(self):
         ev, cov = self._ev_contracted()
@@ -308,7 +320,7 @@ class TestCrossingRequiresEVERYNamedArm:
             assert not ok
             assert "no required arms" in why
         finally:
-            cov.ORDERING_CONTRACTS.pop("hdencode", None)
+            self._clear(cov)
 
 
 class TestPageContinuity:
@@ -345,7 +357,8 @@ class TestPageContinuity:
                                       Sighting(1, "u/aug19")]))
         v = _ev().evaluate_arm(_report(arm), arm)
         assert not v.proven
-        assert "duplicate positions" in v.reason
+        assert "not a complete 1..2 sequence" in v.reason
+        assert "[1, 1]" in v.reason
 
 
 class TestTheValidCase:
