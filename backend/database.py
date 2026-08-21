@@ -98,6 +98,12 @@ class DatabaseManager:
         # BEFORE the retraction is attempted, so the permission disappears at the
         # instant the conflict is known rather than at the instant SQLite agrees.
         self._media_kind_holds = set()
+        # LAST-RESORT INTERLOCK. Set when the revocation journal itself could
+        # not be written, which means this process cannot promise a restart
+        # will recover. While true, NO release is served a semantic identity.
+        # Expensive and deliberately so -- it is the honest answer when the
+        # durability mechanism has failed (round 14, M14-1 option B fallback).
+        self._authority_disabled = False
         self._init_depth = 0  # Guard against infinite recursion during recovery
         # Monotonic in-process revision, bumped on every background-cache write.
         # Folded into get_background_cache_version() so the parse-cache token
@@ -1248,26 +1254,35 @@ class DatabaseManager:
                 # above are created unconditionally on every init, and
                 # docs/feature-pack-review/qualification/scripts/05_shadow_evidence.py
                 # BLOCKS on user_version != 9.
+                # The earlier shape of this table was introduced in this same
+                # unmerged branch and has NEVER been deployed, so there is no
+                # production data to migrate. If a developer ran the earlier
+                # shape, replace it rather than carrying two identities forward.
+                cursor.execute("PRAGMA table_info(listing_claims)")
+                _lc_cols = {r[1] for r in cursor.fetchall()}
+                if _lc_cols and "order_key" in _lc_cols:
+                    cursor.execute("DROP TABLE listing_claims")
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS listing_claims (
-                        url TEXT NOT NULL,
-                        source TEXT NOT NULL,
+                        canonical_url TEXT NOT NULL,
+                        arm_key TEXT NOT NULL,
                         listing_type TEXT NOT NULL,
-                        listing_category TEXT NOT NULL DEFAULT '',
-                        order_key TEXT,
+                        raw_url TEXT,
+                        posted_date_raw TEXT,
+                        posted_date_changed INTEGER NOT NULL DEFAULT 0,
                         first_seen_at TEXT NOT NULL,
                         last_seen_at TEXT NOT NULL,
                         sightings INTEGER NOT NULL DEFAULT 1,
-                        PRIMARY KEY (url, source, listing_type, listing_category)
+                        PRIMARY KEY (canonical_url, arm_key)
                     )
                 """)
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_listing_claims_arm
-                    ON listing_claims(source, listing_type, listing_category)
+                    ON listing_claims(arm_key)
                 """)
                 cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_listing_claims_url
-                    ON listing_claims(url)
+                    CREATE INDEX IF NOT EXISTS idx_listing_claims_type
+                    ON listing_claims(canonical_url, listing_type)
                 """)
                 for _column, _declaration in (
                     ("imdb_id", "TEXT"),
@@ -4389,43 +4404,62 @@ class DatabaseManager:
     def record_listing_claims(self, claims):
         """Persist what each listing arm SAID about a release. Authorizes nothing.
 
-        Round 14. Until now the per-crawl `url_type_claim` map was a function
-        local, rebuilt and discarded every cycle, so only CONFLICTS survived --
-        as a boolean. The observation itself (this release appeared under this
-        arm, at this time, with this order key) was thrown away.
+        Round 14. The per-crawl `url_type_claim` map was a function local, rebuilt
+        and discarded every cycle, so only CONFLICTS survived -- as a boolean. The
+        observation itself was thrown away, and it is perishable: once a release
+        ages off every listing, no future crawl of any depth can reconstruct which
+        arms carried it.
 
-        That observation is the raw material of any coverage proof, and it is
-        perishable: once a release ages off every listing, no future crawl of any
-        depth can reconstruct which arms carried it. So it is captured now, while
-        the coverage model itself is still undecided.
+        DELIBERATELY INERT as a writer. Nothing here grants a media kind, and
+        get_scan_category() / verified_media_kind() / the identity path do not read
+        this table. Evidence accumulating must not widen permission by itself.
 
-        DELIBERATELY INERT. Nothing reads this table to grant a media kind, and
-        it is not consulted by get_scan_category(), verified_media_kind(), or the
-        identity path. It is a ledger, not an authority -- adding evidence must
-        not be able to widen permission by itself.
+        (Round 14 review, M14-2: *narrowing* is different. Opposite-type claims
+        across crawls ARE contradictory positive evidence and are consumed
+        separately by consume_cross_crawl_conflicts(), which revokes. Positive
+        evidence may narrow authority immediately; only a coverage proof may
+        widen it.)
+
+        Identity is CANONICAL. A cosmetic URL variant must not split one release
+        into two historical identities, which would hide a contradiction by
+        filing the two claims under different keys.
+
+        `arm_key` is the stable raw identity of the listing arm ("hdencode:tv").
+        `listing_type` is kept alongside it as a code-derived snapshot, because
+        the mapping from arm to movie/tv is our interpretation and may be
+        versioned later.
+
+        `posted_date_raw` is the site's verbatim string. It is NOT an approved
+        order key -- whether it can order coverage is the coverage model's
+        question -- so it is stored unnormalised and named for what it is.
 
         `claims` is an iterable of dicts with keys: url, source, listing_type,
-        listing_category, and optionally order_key.
+        listing_category, and optionally posted_date_raw.
 
         Returns the number of claim rows written or refreshed.
         """
+        from backend.url_identity import canonicalize_listing_url
         rows = []
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         for c in (claims or ()):
             try:
-                url = str(c.get("url") or "").strip()
+                raw = str(c.get("url") or "").strip()
                 ltype = str(c.get("listing_type") or "").strip().lower()
             except AttributeError:
                 continue
-            if not url or not ltype:
-                # A claim with no arm is not a claim.
+            canonical = canonicalize_listing_url(raw)
+            if not canonical or not ltype:
+                # A claim with no release or no arm is not a claim.
                 continue
+            source = str(c.get("source") or "").strip().lower()
+            category = str(c.get("listing_category") or "").strip().lower()
             rows.append((
-                url,
-                str(c.get("source") or "").strip().lower(),
+                canonical,
+                "%s:%s" % (source, category) if category else source,
                 ltype,
-                str(c.get("listing_category") or "").strip().lower(),
-                (str(c.get("order_key")).strip() if c.get("order_key") else None),
+                raw,
+                (str(c.get("posted_date_raw")).strip()
+                 if c.get("posted_date_raw") else None),
                 now, now,
             ))
         if not rows:
@@ -4435,48 +4469,58 @@ class DatabaseManager:
                 return 0
             conn.executemany(
                 "INSERT INTO listing_claims "
-                "(url, source, listing_type, listing_category, order_key, "
+                "(canonical_url, arm_key, listing_type, raw_url, posted_date_raw, "
                 " first_seen_at, last_seen_at, sightings) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
-                "ON CONFLICT(url, source, listing_type, listing_category) "
-                "DO UPDATE SET "
+                "ON CONFLICT(canonical_url, arm_key) DO UPDATE SET "
                 "  last_seen_at = excluded.last_seen_at, "
                 "  sightings = listing_claims.sightings + 1, "
-                "  order_key = COALESCE(listing_claims.order_key, excluded.order_key)",
+                "  listing_type = excluded.listing_type, "
+                # A DIFFERENT site date on a later sighting is an ANOMALY, not a
+                # tie to break silently. The first value is kept and the row is
+                # flagged, because quietly choosing one would bury evidence that
+                # the site's own ordering key is not immutable -- which the
+                # coverage model depends on.
+                "  posted_date_changed = CASE "
+                "    WHEN excluded.posted_date_raw IS NOT NULL "
+                "     AND listing_claims.posted_date_raw IS NOT NULL "
+                "     AND excluded.posted_date_raw <> listing_claims.posted_date_raw "
+                "    THEN 1 ELSE listing_claims.posted_date_changed END, "
+                "  posted_date_raw = COALESCE(listing_claims.posted_date_raw, "
+                "                             excluded.posted_date_raw)",
                 rows)
         return len(rows)
 
-    def backfill_listing_claim_order_keys(self, limit=2000):
-        """Fill in `order_key` on claims from the cached `posted_date`.
+    def backfill_listing_claim_posted_dates(self, limit=2000):
+        """Attach the site's published date to claims, from the cached detail row.
 
-        Round 14. A claim is recorded at LISTING time, where no date is
-        available: `_select_posts()` returns anchor elements only -- href and
-        link text -- so the crawl genuinely cannot know when a release was
-        published at the moment it sees it in a listing. The date is parsed from
-        the DETAIL page (detail_scraper.py) and lands in the scan cache, where it
-        is present on 100% of live rows.
+        Round 14. A claim is recorded at LISTING time, where no date exists:
+        `_select_posts()` returns anchor elements only. The date is parsed from the
+        DETAIL page and lands in the scan cache.
 
-        So this is an enrichment pass, kept separate from recording on purpose:
-        a claim must be captured whether or not a date can be attached, since the
-        claim is the perishable part and the date can be filled in later.
+        Kept separate from recording on purpose -- a claim must be captured whether
+        or not a date can be attached, because the claim is the perishable half.
 
-        The value is the site's own string (e.g. "June 29, 2026 at 11:38 PM").
-        It is stored verbatim, NOT normalised here -- whether it is precise enough
-        to order coverage by is a question for the coverage model, and silently
-        reformatting it would hide the ambiguity rather than surface it.
+        THE JOIN USES `raw_url`, not `canonical_url`. `background_scan_cache` keys
+        on the raw href (see url_identity.canonicalize_listing_url's scope note),
+        so joining canonical-to-raw would silently match nothing.
+
+        The value is stored verbatim and is NOT an approved order key. Whether it
+        can order coverage -- and how ties and timezone-less local times behave --
+        is the coverage model's question; normalising here would hide that.
 
         Returns the number of claims enriched.
         """
         pending = self._query_dicts(
-            "SELECT DISTINCT url FROM listing_claims "
-            "WHERE order_key IS NULL LIMIT ?",
+            "SELECT canonical_url, arm_key, raw_url FROM listing_claims "
+            "WHERE posted_date_raw IS NULL AND raw_url IS NOT NULL LIMIT ?",
             (int(limit),), default=[]) or []
         if not pending:
             return 0
-        urls = [r["url"] for r in pending]
-        found = {}
-        for start in range(0, len(urls), 300):
-            chunk = urls[start:start + 300]
+        raws = list({r["raw_url"] for r in pending})
+        dates = {}
+        for start_i in range(0, len(raws), 300):
+            chunk = raws[start_i:start_i + 300]
             rows = self._query_dicts(
                 "SELECT url, data FROM background_scan_cache WHERE url IN (%s)"
                 % ",".join("?" * len(chunk)),
@@ -4488,26 +4532,109 @@ class DatabaseManager:
                     continue
                 pd = payload.get("posted_date")
                 if pd:
-                    found[row["url"]] = str(pd)
-        if not found:
+                    dates[row["url"]] = str(pd)
+        updates = [(dates[r["raw_url"]], r["canonical_url"], r["arm_key"])
+                   for r in pending if r["raw_url"] in dates]
+        if not updates:
             return 0
         with self.transaction() as conn:
             if not conn:
                 return 0
             conn.executemany(
-                "UPDATE listing_claims SET order_key = ? "
-                "WHERE url = ? AND order_key IS NULL",
-                [(v, k) for k, v in found.items()])
-        return len(found)
+                "UPDATE listing_claims SET posted_date_raw = ? "
+                "WHERE canonical_url = ? AND arm_key = ? "
+                "AND posted_date_raw IS NULL",
+                updates)
+        return len(updates)
 
     def get_listing_claims(self, url):
         """Every arm that has ever claimed this release. Reporting/diagnostics."""
+        from backend.url_identity import canonicalize_listing_url
         return self._query_dicts(
-            "SELECT source, listing_type, listing_category, order_key, "
-            "first_seen_at, last_seen_at, sightings "
-            "FROM listing_claims WHERE url = ? "
+            "SELECT arm_key, listing_type, raw_url, posted_date_raw, "
+            "posted_date_changed, first_seen_at, last_seen_at, sightings "
+            "FROM listing_claims WHERE canonical_url = ? "
             "ORDER BY first_seen_at",
-            (str(url),), default=[]) or []
+            (canonicalize_listing_url(url),), default=[]) or []
+
+    def listing_claim_summary(self):
+        """Counts per arm, and how many releases carry claims from BOTH a movie
+        and a TV arm -- the population a conflict can be found in.
+        """
+        per_arm = self._query_dicts(
+            "SELECT arm_key, listing_type, COUNT(*) AS n "
+            "FROM listing_claims GROUP BY arm_key, listing_type "
+            "ORDER BY n DESC",
+            (), default=[]) or []
+        both = self._query(
+            "SELECT COUNT(*) AS n FROM ("
+            "  SELECT canonical_url FROM listing_claims GROUP BY canonical_url "
+            "  HAVING COUNT(DISTINCT listing_type) > 1)",
+            (), one=True, default=None)
+        changed = self._query(
+            "SELECT COUNT(*) AS n FROM listing_claims "
+            "WHERE posted_date_changed = 1",
+            (), one=True, default=None)
+        return {
+            "per_arm": [dict(r) for r in per_arm],
+            "claimed_by_multiple_types": (dict(both).get("n") if both else 0),
+            "posted_date_changed": (dict(changed).get("n") if changed else 0),
+        }
+
+    def consume_cross_crawl_conflicts(
+            self, *, reason="cross_crawl_classification_conflict"):
+        """Revoke authority where durable claims disagree ACROSS crawls.
+
+        Round 14 review (M14-2), and the asymmetry it rests on:
+
+            positive evidence may NARROW authority immediately
+            authority may WIDEN only through a coverage proof
+
+        The crawl's own conflict path only sees disagreement WITHIN a single
+        _crawl_pages() invocation, because url_type_claim lived and died there.
+        But two sightings that disagree are contradictory positive evidence
+        whether they happened in one crawl or a week apart:
+
+            movie yesterday
+            tv today
+
+        No coverage proof is needed to narrow on that. Refusing to act until a
+        proof exists would be treating a POSITIVE observation as if it needed
+        the same warrant as a negative one, which is the mistake in reverse.
+
+        record_listing_claims() stays an inert writer; this is the separate
+        consumer, and it revokes through the existing HOLD -> ERASE -> MARK path
+        rather than inventing a second revocation route.
+
+        Returns the number of releases whose authority was withdrawn.
+        """
+        contradicted = self._query_dicts(
+            "SELECT canonical_url FROM listing_claims "
+            "GROUP BY canonical_url "
+            "HAVING COUNT(DISTINCT listing_type) > 1",
+            (), default=[]) or []
+        if not contradicted:
+            return 0
+        canon = [r["canonical_url"] for r in contradicted]
+        # downloads and background_scan_cache key on the RAW href, so the
+        # revocation has to be issued against every raw variant this release
+        # was ever seen under -- not the canonical form the ledger groups by.
+        raw = []
+        for start in range(0, len(canon), 300):
+            chunk = canon[start:start + 300]
+            rows = self._query_dicts(
+                "SELECT DISTINCT raw_url FROM listing_claims "
+                "WHERE raw_url IS NOT NULL AND canonical_url IN (%s)"
+                % ",".join("?" * len(chunk)),
+                tuple(chunk), default=[]) or []
+            raw.extend(r["raw_url"] for r in rows)
+        if not raw:
+            return 0
+        self.record_classification_conflicts_and_retract_kinds(raw, reason=reason)
+        logger.warning(
+            "cross-crawl classification conflict: %d release(s) carry claims "
+            "from both a movie and a TV arm; authority withdrawn", len(canon))
+        return len(canon)
 
     def media_kind_coverage_summary(self):
         """Why each release can or cannot be given a media kind, as counts.
@@ -4532,10 +4659,15 @@ class DatabaseManager:
         """
         rows = self._query_dicts(
             "SELECT url, data FROM background_scan_cache", (), default=[]) or []
+        # The cache keys on the RAW href while the ledger keys on the canonical
+        # one, so the membership test must canonicalise the cache side. Comparing
+        # them directly would report every claimed release as unclaimed.
+        from backend.url_identity import canonicalize_listing_url
         claimed = set()
         for r in (self._query_dicts(
-                "SELECT DISTINCT url FROM listing_claims", (), default=[]) or []):
-            claimed.add(r["url"])
+                "SELECT DISTINCT canonical_url FROM listing_claims",
+                (), default=[]) or []):
+            claimed.add(r["canonical_url"])
         out = {
             "total": 0, "conflicted": 0, "attested": 0,
             "unknown_claimed": 0, "unknown_unclaimed": 0, "unreadable": 0,
@@ -4552,31 +4684,90 @@ class DatabaseManager:
                 out["conflicted"] += 1
             elif payload.get("category_attested"):
                 out["attested"] += 1
-            elif row["url"] in claimed:
+            elif canonicalize_listing_url(row["url"]) in claimed:
                 out["unknown_claimed"] += 1
             else:
                 out["unknown_unclaimed"] += 1
         return out
 
-    def listing_claim_summary(self):
-        """Counts per arm, and how many releases have claims from BOTH a movie
-        and a TV arm -- the population a conflict could ever be found in.
+    def _revocation_journal_path(self):
+        """Beside the database, but NOT inside it."""
+        return os.path.join(
+            os.path.dirname(os.path.abspath(self.db_path)) or ".",
+            "revocation_journal.jsonl")
+
+    def _journal_append(self, record):
+        """Append one record and force it to disk. Returns True if durable.
+
+        Round 14 (M14-1). Restart recovery previously depended on writing a
+        conflict mark to the SAME SQLite database whose write had just failed.
+        If SQLite cannot commit, that mark does not land either -- so the
+        journal did not exist in precisely the case it was needed for, and
+        startup saw no interrupted-revocation signature at all.
+
+        A plain append + fsync to a separate file has failure semantics that
+        are genuinely independent of the database transaction. It is not
+        independent of the DISK, and nothing can be, which is what the
+        _authority_disabled interlock is for.
         """
-        per_arm = self._query_dicts(
-            "SELECT source, listing_type, listing_category, COUNT(*) AS n "
-            "FROM listing_claims "
-            "GROUP BY source, listing_type, listing_category "
-            "ORDER BY n DESC",
-            (), default=[]) or []
-        both = self._query(
-            "SELECT COUNT(*) AS n FROM ("
-            "  SELECT url FROM listing_claims GROUP BY url "
-            "  HAVING COUNT(DISTINCT listing_type) > 1)",
-            (), one=True, default=None)
-        return {
-            "per_arm": [dict(r) for r in per_arm],
-            "claimed_by_multiple_types": (dict(both).get("n") if both else 0),
-        }
+        try:
+            path = self._revocation_journal_path()
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, default=str) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            return True
+        except Exception:
+            logger.exception(
+                "could not write the revocation journal at %s",
+                self._revocation_journal_path())
+            return False
+
+    def read_pending_revocations(self):
+        """URLs the journal says were being revoked and never confirmed done."""
+        path = self._revocation_journal_path()
+        pending = set()
+        try:
+            if not os.path.exists(path):
+                return pending
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        # A torn final line is exactly what a crash mid-append
+                        # looks like. Ignore the fragment, keep the rest.
+                        continue
+                    urls = rec.get("urls") or []
+                    if rec.get("done"):
+                        pending -= {str(u) for u in urls}
+                    else:
+                        pending |= {str(u) for u in urls}
+        except Exception:
+            logger.exception("could not read the revocation journal")
+        return pending
+
+    def _journal_compact(self, still_pending):
+        """Rewrite the journal to just what is still outstanding."""
+        path = self._revocation_journal_path()
+        try:
+            if not still_pending:
+                if os.path.exists(path):
+                    os.remove(path)
+                return
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(
+                    {"urls": sorted(still_pending), "reason": "compacted"},
+                    default=str) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            logger.exception("could not compact the revocation journal")
 
     def hold_media_kind(self, urls, *, reason):
         """Withhold semantic authority for these releases IMMEDIATELY.
@@ -4659,6 +4850,21 @@ class DatabaseManager:
         # 1. HOLD FIRST, unconditionally.
         self.hold_media_kind(targets, reason=reason)
 
+        # 1b. JOURNAL, before any database write is attempted, to a file OUTSIDE
+        #     the database. Round 14 (M14-1): recovery used to depend on writing
+        #     a conflict mark to the same SQLite database whose write had just
+        #     failed, so in exactly the case it mattered the journal did not
+        #     exist and startup saw nothing to recover.
+        if not self._journal_append({"urls": sorted(targets), "reason": reason}):
+            # The durability mechanism itself failed. This process can no longer
+            # promise that a restart will finish the job, so it stops promising
+            # anything: no semantic identity is served until an operator or a
+            # clean restart resolves it.
+            self._authority_disabled = True
+            logger.error(
+                "REVOCATION JOURNAL UNWRITABLE -- semantic authority is now "
+                "disabled process-wide; no release will be served an identity")
+
         # 2. ERASE -- the safety-critical half, in its own transaction so that an
         #    unreadable or missing cache row can never prevent it.
         retracted = 0
@@ -4682,7 +4888,11 @@ class DatabaseManager:
 
         marked = self._mark_category_conflicts(targets)
 
-        # 4. RELEASE only now -- the durable row itself is safe.
+        # 4. CONFIRM in the journal, then RELEASE. Order matters: releasing the
+        #    hold before recording completion would leave a window where neither
+        #    the runtime hold nor the journal protects the release.
+        self._journal_append({"urls": sorted(targets), "reason": reason,
+                              "done": True})
         self.release_media_kind_hold(targets)
 
         if retracted:
@@ -4715,13 +4925,26 @@ class DatabaseManager:
         Call once at startup, BEFORE serving identity. Returns the number of
         releases whose authority was withdrawn.
         """
+        # SOURCE 1: the independent journal. This is the one that survives the
+        # failure that prevented the revocation, because it is not in the
+        # database that refused the write.
+        stale = list(self.read_pending_revocations())
+        if stale:
+            logger.warning(
+                "revocation journal holds %d unfinished revocation(s) from a "
+                "previous process", len(stale))
+            self.hold_media_kind(stale, reason="startup_journal_recovery")
+
+        # SOURCE 2: the in-database signature, kept as a second net. It catches a
+        # revocation that committed its cache mark but not its erase -- a case
+        # the journal also covers, but which is cheap to detect and costs nothing
+        # to re-check.
         rows = self._query_dicts(
             "SELECT d.url AS url, c.data AS data "
             "FROM downloads d "
             "JOIN background_scan_cache c ON c.url = d.url "
             "WHERE d.media_kind IS NOT NULL",
             (), default=[]) or []
-        stale = []
         for row in rows:
             try:
                 payload = json.loads(row.get("data") or "{}")
@@ -4732,15 +4955,16 @@ class DatabaseManager:
                 continue
             if payload.get("category_conflict"):
                 stale.append(row["url"])
+        stale = sorted(set(stale))
         if not stale:
             return 0
         logger.warning(
-            "startup reconciliation: %d release(s) carry a recorded classification "
-            "conflict AND a live media kind -- a previous process did not finish "
-            "revoking them. Withdrawing now.", len(stale))
+            "startup reconciliation: %d release(s) were left mid-revocation by a "
+            "previous process. Withdrawing now.", len(stale))
         try:
             self.record_classification_conflicts_and_retract_kinds(
                 stale, reason="startup_reconciliation")
+            self._journal_compact(set())
         except Exception:
             # The hold was taken before the attempt and is still in force, so no
             # semantic identity is served for these releases in this process even
@@ -4871,6 +5095,9 @@ class DatabaseManager:
         # what actually withdraws the destructive permission -- the UPDATE merely
         # makes it durable. Snapshotted once so every chunk sees one consistent view.
         held = self.held_media_kinds()
+        # THE INTERLOCK. When the journal could not be written we cannot promise
+        # a restart finishes any pending revocation, so nothing is served.
+        disabled = self._authority_disabled
         for start in range(0, len(wanted), 300):
             chunk = wanted[start:start + 300]
             rows = self._query_dicts(
@@ -4878,7 +5105,7 @@ class DatabaseManager:
                 "FROM downloads WHERE url IN (%s)" % ",".join("?" * len(chunk)),
                 tuple(chunk), default=[]) or []
             for row in rows:
-                _held = row["url"] in held
+                _held = disabled or row["url"] in held
                 out[row["url"]] = {
                     "date_added": row.get("date_added"),
                     "title": row.get("title"),

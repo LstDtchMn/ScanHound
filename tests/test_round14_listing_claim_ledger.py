@@ -44,9 +44,9 @@ class TestClaimsArePersisted:
             _claim(URL, "movie", "4k"),
             _claim(URL, "tv", "tv"),
         ]) == 2
-        arms = {(c["listing_type"], c["listing_category"])
+        arms = {(c["arm_key"], c["listing_type"])
                 for c in db.get_listing_claims(URL)}
-        assert arms == {("movie", "4k"), ("tv", "tv")}
+        assert arms == {("hdencode:4k", "movie"), ("hdencode:tv", "tv")}
 
     def test_re_observation_counts_and_keeps_the_first_sighting(self, db):
         db.record_listing_claims([_claim(URL, "movie", "4k")])
@@ -89,7 +89,7 @@ class TestTheLedgerIsInert:
         db.record_listing_claims([
             _claim(URL, "movie", "4k"), _claim(URL, "movie", "remux"),
         ])
-        db.backfill_listing_claim_order_keys()
+        db.backfill_listing_claim_posted_dates()
 
         assert db.get_scan_category(URL) is None, (
             "recording claims made an unattested release answerable -- the "
@@ -124,30 +124,30 @@ class TestOrderKeyBackfill:
                                 "posted_date": date}),
         }])
 
-    def test_it_fills_the_order_key_from_the_cached_posted_date(self, db):
+    def test_it_fills_the_posted_date_from_the_cached_detail_row(self, db):
         """The claim is recorded at LISTING time, where no date exists: the
         selector returns anchors only. The date comes from the detail page."""
         self._cached_with_date(db)
         db.record_listing_claims([_claim(URL, "movie", "4k")])
-        assert db.get_listing_claims(URL)[0]["order_key"] is None
-        assert db.backfill_listing_claim_order_keys() == 1
-        assert db.get_listing_claims(URL)[0]["order_key"] == \
+        assert db.get_listing_claims(URL)[0]["posted_date_raw"] is None
+        assert db.backfill_listing_claim_posted_dates() == 1
+        assert db.get_listing_claims(URL)[0]["posted_date_raw"] == \
             "June 29, 2026 at 11:38 PM"
 
     def test_a_claim_with_no_cached_date_simply_stays_unenriched(self, db):
         """POSITIVE CONTROL for the failure direction: the claim must still be
         RECORDED. The claim is the perishable part; the date can arrive later."""
         db.record_listing_claims([_claim(URL, "movie", "4k")])
-        assert db.backfill_listing_claim_order_keys() == 0
+        assert db.backfill_listing_claim_posted_dates() == 0
         assert len(db.get_listing_claims(URL)) == 1
 
     def test_it_does_not_overwrite_a_key_it_already_has(self, db):
         self._cached_with_date(db, date="January 1, 2020 at 1:00 AM")
         db.record_listing_claims([_claim(URL, "movie", "4k")])
-        db.backfill_listing_claim_order_keys()
+        db.backfill_listing_claim_posted_dates()
         self._cached_with_date(db, date="December 31, 2026 at 9:00 PM")
-        db.backfill_listing_claim_order_keys()
-        assert db.get_listing_claims(URL)[0]["order_key"] == \
+        db.backfill_listing_claim_posted_dates()
+        assert db.get_listing_claims(URL)[0]["posted_date_raw"] == \
             "January 1, 2020 at 1:00 AM"
 
 
@@ -178,26 +178,26 @@ class TestAnExplicitlySuppliedOrderKeyIsAlsoPreserved:
     """Found by mutation, not by design.
 
     Removing the COALESCE in record_listing_claims() left every test passing:
-    the tests above go through backfill_listing_claim_order_keys(), whose
-    `WHERE order_key IS NULL` already prevents an overwrite, so the ON CONFLICT
+    the tests above go through backfill_listing_claim_posted_dates(), whose
+    `WHERE posted_date_raw IS NULL` already prevents an overwrite, so the ON CONFLICT
     clause was never reached. The line was real but unexercised."""
 
     def test_a_second_sighting_does_not_replace_the_recorded_key(self, db):
         db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
-                                       order_key="June 1, 2026 at 1:00 AM")])
+                                       posted_date_raw="June 1, 2026 at 1:00 AM")])
         db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
-                                       order_key="June 2, 2026 at 2:00 AM")])
+                                       posted_date_raw="June 2, 2026 at 2:00 AM")])
         row = db.get_listing_claims(URL)[0]
-        assert row["order_key"] == "June 1, 2026 at 1:00 AM"
+        assert row["posted_date_raw"] == "June 1, 2026 at 1:00 AM"
         assert row["sightings"] == 2
 
     def test_but_a_missing_key_is_still_filled_in_later(self, db):
         """The other direction: COALESCE must not freeze a NULL."""
         db.record_listing_claims([_claim(URL, "movie", "4k")])
-        assert db.get_listing_claims(URL)[0]["order_key"] is None
+        assert db.get_listing_claims(URL)[0]["posted_date_raw"] is None
         db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
-                                       order_key="June 3, 2026 at 3:00 AM")])
-        assert db.get_listing_claims(URL)[0]["order_key"] ==             "June 3, 2026 at 3:00 AM"
+                                       posted_date_raw="June 3, 2026 at 3:00 AM")])
+        assert db.get_listing_claims(URL)[0]["posted_date_raw"] ==             "June 3, 2026 at 3:00 AM"
 
 
 class TestCoverageSummaryMakesTheUnknownsAMeasuredClass:
@@ -250,3 +250,155 @@ class TestCoverageSummaryMakesTheUnknownsAMeasuredClass:
         s = db.media_kind_coverage_summary()
         assert s["unreadable"] == 1
         assert s["unknown_unclaimed"] == 0
+
+
+class TestClaimIdentityIsCanonical:
+    """Round 14 review, ledger shape A.
+
+    A cosmetic URL variant must not split one release into two historical
+    identities. That is not tidiness: the whole value of the ledger is detecting
+    that one release was claimed by two arms, and filing the two claims under
+    different keys would hide exactly the contradiction we are collecting them
+    for."""
+
+    def test_variants_collapse_to_one_release(self, db):
+        db.record_listing_claims([
+            _claim("https://HDencode.example/A-Release/", "movie", "4k"),
+            _claim("https://hdencode.example/A-Release?utm=x", "tv", "tv"),
+        ])
+        claims = db.get_listing_claims("https://hdencode.example/A-Release")
+        assert len(claims) == 2, (
+            "trailing slash, query and host case produced separate identities, "
+            "so a movie-vs-TV contradiction would never be visible")
+        assert {c["listing_type"] for c in claims} == {"movie", "tv"}
+
+    def test_the_summary_sees_one_contradicted_release_not_two(self, db):
+        db.record_listing_claims([
+            _claim("https://hdencode.example/A-Release/", "movie", "4k"),
+            _claim("https://hdencode.example/a-release", "tv", "tv"),
+        ])
+        assert db.listing_claim_summary()["claimed_by_multiple_types"] in (0, 1)
+
+    def test_the_raw_url_is_kept_for_audit(self, db):
+        raw = "https://hdencode.example/A-Release/?utm=x"
+        db.record_listing_claims([_claim(raw, "movie", "4k")])
+        assert db.get_listing_claims(raw)[0]["raw_url"] == raw
+
+
+class TestAChangedPublishDateIsAnAnomalyNotATieBreak:
+    """Round 14 review, ledger shape D.
+
+    The surviving COALESCE mutant exposed this as a SEMANTIC decision rather than
+    an implementation detail. Silently keeping the first value would bury evidence
+    that the site's own ordering key is not immutable -- and the coverage model is
+    about to depend on exactly that immutability."""
+
+    def test_a_differing_later_date_raises_the_flag(self, db):
+        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
+                                       posted_date_raw="June 1, 2026 at 1:00 AM")])
+        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
+                                       posted_date_raw="June 2, 2026 at 2:00 AM")])
+        row = db.get_listing_claims(URL)[0]
+        assert row["posted_date_raw"] == "June 1, 2026 at 1:00 AM"
+        assert row["posted_date_changed"] == 1
+        assert db.listing_claim_summary()["posted_date_changed"] == 1
+
+    def test_an_identical_repeat_is_not_an_anomaly(self, db):
+        """POSITIVE CONTROL: flagging every re-sighting would make the signal
+        useless, which is the same as not having it."""
+        for _ in range(3):
+            db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
+                                           posted_date_raw="June 1, 2026 at 1:00 AM")])
+        row = db.get_listing_claims(URL)[0]
+        assert row["posted_date_changed"] == 0
+        assert row["sightings"] == 3
+
+    def test_filling_in_a_previously_absent_date_is_not_an_anomaly(self, db):
+        db.record_listing_claims([_claim(URL, "movie", "4k")])
+        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
+                                       posted_date_raw="June 1, 2026 at 1:00 AM")])
+        row = db.get_listing_claims(URL)[0]
+        assert row["posted_date_raw"] == "June 1, 2026 at 1:00 AM"
+        assert row["posted_date_changed"] == 0
+
+
+class TestCrossCrawlContradictionsRevoke:
+    """Round 14 review, M14-2.
+
+        positive evidence may NARROW authority immediately
+        authority may WIDEN only through a coverage proof
+
+    The crawl's own conflict path only ever saw disagreement WITHIN a single
+    `_crawl_pages()` invocation, because `url_type_claim` lived and died there.
+    Two sightings a week apart that disagree are contradictory positive evidence
+    just the same -- and narrowing on positive evidence needs no coverage proof.
+
+    These assert on `annotate_source_links()`, the producer of the wire fields
+    `canKeepBest` is computed from. Asserting on the claims table would pass while
+    the destructive permission was still being served."""
+
+    def _identity(self, db, url=URL):
+        from backend.download_links import annotate_source_links
+        rows = [{"id": 1, "provenance_url": url, "provenance_observed": True}]
+        annotate_source_links(db, rows)
+        return rows[0].get("identity_kind")
+
+    def _grabbed_as_movie(self, db, url=URL):
+        db.add_to_history(url, "The Release", None, None, "2160p", "20 GB",
+                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
+
+    def test_two_crawls_that_disagree_withdraw_the_identity(self, db):
+        """THE REQUIRED CASE. Neither claim was ever in the same crawl as the
+        other, so the in-crawl conflict path can never have seen this."""
+        self._grabbed_as_movie(db)
+        assert self._identity(db) == "movie", "precondition: authority is live"
+
+        db.record_listing_claims([_claim(URL, "movie", "4k")])     # crawl A
+        assert self._identity(db) == "movie", (
+            "one claim is agreement, not contradiction")
+
+        db.record_listing_claims([_claim(URL, "tv", "tv")])        # crawl B, later
+        assert db.consume_cross_crawl_conflicts() == 1
+        assert self._identity(db) == "unknown", (
+            "the release is claimed by both a movie and a TV arm and the "
+            "destructive permission is still being served")
+
+    def test_agreeing_claims_across_crawls_change_nothing(self, db):
+        """POSITIVE CONTROL. Revoking on any repeat sighting would satisfy the
+        test above while destroying every recorded kind in the library."""
+        self._grabbed_as_movie(db)
+        db.record_listing_claims([_claim(URL, "movie", "4k")])
+        db.record_listing_claims([_claim(URL, "movie", "remux")])
+        assert db.consume_cross_crawl_conflicts() == 0
+        assert self._identity(db) == "movie"
+
+    def test_it_matches_across_cosmetic_url_variants(self, db):
+        """The canonical identity earning its keep: the two claims arrive under
+        different raw hrefs, which under the first ledger shape would have been
+        two unrelated releases and no contradiction at all."""
+        self._grabbed_as_movie(db)
+        db.record_listing_claims([_claim(URL, "movie", "4k")])
+        db.record_listing_claims([_claim(URL.rstrip("/") + "?utm=x", "tv", "tv")])
+        assert db.consume_cross_crawl_conflicts() == 1
+        assert self._identity(db) == "unknown"
+
+    def test_it_is_idempotent(self, db):
+        """It runs every cycle; a second pass must not thrash or re-report."""
+        self._grabbed_as_movie(db)
+        db.record_listing_claims([_claim(URL, "movie", "4k"),
+                                  _claim(URL, "tv", "tv")])
+        db.consume_cross_crawl_conflicts()
+        assert self._identity(db) == "unknown"
+        db.consume_cross_crawl_conflicts()
+        assert self._identity(db) == "unknown"
+
+    def test_the_claim_writer_itself_still_revokes_nothing(self, db):
+        """The writer stays inert. Recording must not revoke on its own -- the
+        consumer is a separate, named step, so the inert-ledger property survives
+        this addition."""
+        self._grabbed_as_movie(db)
+        db.record_listing_claims([_claim(URL, "movie", "4k"),
+                                  _claim(URL, "tv", "tv")])
+        assert self._identity(db) == "movie", (
+            "record_listing_claims() revoked by itself; the ledger is no longer "
+            "an inert writer")

@@ -660,7 +660,13 @@ class BackgroundScanner:
                 if _claims:
                     try:
                         db.record_listing_claims(_claims)
-                        db.backfill_listing_claim_order_keys()
+                        db.backfill_listing_claim_posted_dates()
+                        # NARROWING on positive evidence, round 14 (M14-2).
+                        # The crawl only sees disagreement WITHIN one crawl;
+                        # claims that disagree across crawls are contradictory
+                        # positive evidence just the same, and narrowing needs
+                        # no coverage proof. Widening still does.
+                        db.consume_cross_crawl_conflicts()
                     except Exception:
                         # A ledger failure must never affect the scan or the
                         # safety paths above; it only costs future evidence.
