@@ -110,7 +110,7 @@ class TestTheCrawlerEmitsAReport:
         assert report is not None, "the crawl produced no traversal report at all"
         assert report.arms, "no arms recorded"
         arm = report.arms[0]
-        assert arm.arm_key == "hdencode:4k"
+        assert arm.arm_key == "hdencode:4k:4k"
         assert arm.listing_type == "movie"
         assert arm.parser_version, "a proof needs the parser version"
 

@@ -9,6 +9,7 @@ import logging
 import re
 import time
 import threading
+import uuid
 import requests
 from bs4 import BeautifulSoup
 from backend.url_identity import canonicalize_listing_url
@@ -20,6 +21,24 @@ from backend.coverage import (
 #: Bumped when _select_posts changes shape. Part of any coverage proof: a
 #: frontier derived by one parser version is not evidence for another.
 _COV_PARSER_VERSION = "select_posts/1"
+
+
+def _endpoint_slug(base_url):
+    """A stable, readable identity for ONE listing endpoint.
+
+    Round 17 (M17-4). Two DDLBase endpoints share the category "remux", so an
+    arm key of source:category merged them into a single arm carrying two
+    unrelated listing orders and duplicate page numbers -- a sequence no
+    frontier argument can mean anything over. The endpoint URL is the thing
+    that is actually distinct.
+    """
+    try:
+        parts = [x for x in str(base_url or "").split("/") if x]
+        return parts[-1] if parts else "root"
+    except Exception:
+        return "root"
+
+
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -876,7 +895,10 @@ class ScannerService:
         #: decides what these facts justify; the crawler is not allowed to
         #: decide that about itself.
         traversal_arms: Dict[str, object] = {}
-        _cov_run_id = "%s-%x" % (time.strftime("%Y%m%d%H%M%S"), id(sources))
+        #: Canonical identities seen this run, for duplicate_in_run. Separate
+        #: from seen_post_urls, which is raw and drives the crawl's own dedup.
+        _cov_seen_canonical: Set[str] = set()
+        _cov_run_id = uuid.uuid4().hex
         total_pages = len(sources) * pages
         current_page = 0
 
@@ -894,8 +916,10 @@ class ScannerService:
             source_suffix = source["suffix"]
             source_type_hint = source["type"]
             _cov_arm = _CovArm(
-                arm_key="%s:%s" % (source.get("source", "hdencode"),
-                                   source.get("category", "")),
+                # ENDPOINT identity, not the UI category (round 17, M17-4).
+                arm_key="%s:%s:%s" % (source.get("source", "hdencode"),
+                                      source.get("category", ""),
+                                      _endpoint_slug(source.get("base", ""))),
                 listing_type=str(source_type_hint or "").strip().lower(),
                 parser_version=_COV_PARSER_VERSION)
             traversal_arms.setdefault(_cov_arm.arm_key, _cov_arm)
@@ -1081,10 +1105,23 @@ class ScannerService:
                             position=len(_cov_page.sightings) + 1,
                             canonical_url=canonicalize_listing_url(post_url),
                             raw_url=post_url,
-                            duplicate_in_run=(post_url in seen_post_urls),
+                            # CANONICAL, not raw. Round 17 (M17-1): the
+                            # sighting's identity and its date lookup are both
+                            # canonical, so keying duplicate detection on the
+                            # RAW href let ONE terminal post appear as two
+                            # eligible anchors under cosmetic variants -- and
+                            # the second then corroborated the first. This
+                            # branch already needed an alias table because
+                            # those variants are real here; coverage has to use
+                            # the same identity or it is not the same question.
+                            duplicate_in_run=(
+                                canonicalize_listing_url(post_url)
+                                in _cov_seen_canonical),
                             policy_excluded=bool(
                                 skip_full_disc and source_id == "hdencode"
                                 and is_full_disc_title(post_title))))
+                        _cov_seen_canonical.add(
+                            canonicalize_listing_url(post_url))
                         _arm = (post_url, source_type_hint, source_category)
                         if _arm not in listing_claim_seen:
                             listing_claim_seen.add(_arm)
@@ -1245,12 +1282,6 @@ class ScannerService:
         # is partial — the caller must not age out items it simply didn't revisit.
         self._last_crawl_early_stopped = early_stopped
         self._last_crawl_types_covered = types_covered
-        self._last_crawl_traversal = _CovReport(
-            run_id=_cov_run_id,
-            source=str((sources[0].get("source") if sources else "") or ""),
-            early_stop_enabled=bool(early_stop),
-            termination=self._last_crawl_termination,
-            arms=list(traversal_arms.values()))
         self._last_crawl_listing_claims = listing_claims
         # The crawl's own verdict on itself, in precedence order: a stop that cut
         # it short, then pages that failed, then a suspicious empty result.
@@ -1271,6 +1302,17 @@ class ScannerService:
         else:
             self._last_crawl_termination = "complete"
             self._last_crawl_status = "complete"
+        # PUBLISHED LAST, and the ordering is the point. Round 17 (M17-2): the
+        # report used to be built BEFORE the termination chain ran, so every
+        # ordinary report carried termination="not_run" -- the crawl's own
+        # verdict on itself was missing from the very evidence a coverage proof
+        # is supposed to rest on.
+        self._last_crawl_traversal = _CovReport(
+            run_id=_cov_run_id,
+            source=str((sources[0].get("source") if sources else "") or ""),
+            early_stop_enabled=bool(early_stop),
+            termination=self._last_crawl_termination,
+            arms=list(traversal_arms.values()))
         # Everything the crawl intended to detail-process. Cached skips and policy
         # exclusions are already absent: they `continue` before all_posts.append.
         self._last_crawl_detail_scheduled = {

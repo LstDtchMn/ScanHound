@@ -15,11 +15,16 @@ database. It is pure over its inputs so the proof rules can be tested without
 crawling anything.
 
 THE RULE THAT MOTIVATES THE DESIGN. A frontier is a claim about how deep in TIME
-a contiguous traversal reached. It is NOT `min(observed posted_date)`: a single
-pinned "sticky" post near the top of page one carries an old date and would
-manufacture a deep frontier out of a shallow crawl. So the frontier is derived
-from LISTING ORDER, and a date that appears out of order is treated as a reason
-to refuse rather than as evidence.
+a contiguous traversal reached. It is NOT `min(observed posted_date)`: a pinned
+"sticky" post carries an old date and would manufacture a deep frontier out of a
+shallow crawl. So the frontier is derived from LISTING ORDER, and a date that
+appears out of order is a reason to refuse rather than evidence.
+
+AND THE FRONTIER IS STILL ONLY TELEMETRY. Round 17 showed that ordering checks
+defeat one terminal anomaly and no fixed count defeats k+1 of them, so a
+timestamp frontier is a negative proof only where the SOURCE guarantees a
+chronological stream. `ORDERING_CONTRACTS` is empty, so nothing here can
+currently authorise anything -- by construction, not by convention.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -34,6 +39,23 @@ EVALUATOR_VERSION = 1
 #: or an interstitial returns 200 and parses to nothing.
 PAGE_OK = "ok"
 PARSER_RECOGNISED = "recognised"
+
+#: SOURCES WITH A DECLARED ORDERING CONTRACT. Deliberately EMPTY.
+#:
+#: Round 17 (M17-1). A timestamp frontier is only a negative proof if the source
+#: guarantees the listing is a chronological stream. Corroboration defeats one
+#: terminal anomaly and no fixed number defeats k+1 of them, so counting is not
+#: the missing ingredient -- a source-observable invariant is: a pin/sticky
+#: marker the crawler can see and exclude, a documented chronological feed
+#: contract, or an API cursor with explicit ordering semantics.
+#:
+#: Until a source appears here with such a contract, every frontier this module
+#: derives is INSPECTABLE TELEMETRY and cannot mint anything. Keeping the gate in
+#: code rather than in a comment is deliberate: the previous version of this
+#: limitation lived in a docstring, and the docstring was wrong.
+#:
+#: Adding an entry is a reviewed decision, not a configuration change.
+ORDERING_CONTRACTS: Dict[str, str] = {}
 
 _DATE_FORMATS = ("%B %d, %Y at %I:%M %p", "%B %d, %Y")
 
@@ -121,6 +143,11 @@ class CoverageProof:
     frontier_date: datetime
     pages_traversed: int
     anchors_used: int
+    #: False unless the SOURCE has a declared ordering contract. A frontier
+    #: without one is telemetry: inspectable, comparable over time, and unable
+    #: to mint attestation. See ORDERING_CONTRACTS.
+    authoritative: bool = False
+    ordering_contract: str = ""
 
 
 @dataclass
@@ -170,40 +197,75 @@ class CoverageEvaluator:
     def evaluate_arm(self, report: TraversalReport, arm: Arm) -> ArmVerdict:
         """Walk the arm in listing order and find the deepest CORROBORATED anchor.
 
-        Fails closed on the first unusable page: a gap BEFORE the frontier means
-        the traversal was not contiguous, and a frontier claim on a broken walk
-        is exactly the unearned negative this design exists to refuse.
+        WHAT THIS PRODUCES IS TELEMETRY, NOT AUTHORITY, and round 17 (M17-1) is
+        why. I previously wrote here that being one anchor shallow "can only ever
+        refuse a proof we might have been entitled to, never grant one we were
+        not." That is FALSE, and the counterexample is two terminal outliers:
 
-        TWO DEFENCES AGAINST A STICKY POST, because one is not enough.
+            Aug 20, Aug 19, Jan 2024 (sticky A), Dec 2023 (sticky B)
 
-        The reviewer's counterexample is a pinned old entry at the BOTTOM of
-        page one:
+        The dates never ascend, so no inversion fires; sticky B corroborates
+        sticky A, and the frontier becomes January 2024 -- years of coverage
+        manufactured from one page. Corroboration defeats exactly ONE terminal
+        anomaly, and my claim silently assumed the source has at most one.
 
-            Aug 20, Aug 20, Aug 19, Jan 2024   <- sticky
+        No fixed number of confirmations fixes this: any k is defeated by k+1.
+        The missing ingredient is not more counting, it is a SOURCE-OBSERVABLE
+        invariant -- a pin/sticky marker the crawler can see and exclude, a
+        documented chronological feed contract, or an API cursor with explicit
+        ordering. Without one, exhausting the entire contradictory listing is the
+        only general negative proof for an unordered source.
 
-        Those dates descend, so an order check alone never fires and a naive
-        walk adopts Jan 2024 -- manufacturing months of coverage from one page.
-        `min(observed posted_date)` fails the same way, which is why it was
-        rejected.
+        So a proof is marked `authoritative` only when the source has a declared
+        ordering contract, and `ORDERING_CONTRACTS` is deliberately EMPTY. Every
+        frontier this returns today is inspectable telemetry that cannot mint
+        anything. That is a structural refusal rather than a comment, because a
+        comment is what failed last time.
 
-        So an anchor only becomes the frontier once a LATER anchor corroborates
-        it by being no newer. Concretely:
-
-          * sticky in the MIDDLE   the next anchor is newer -> inversion -> refuse
-          * sticky at the END      nothing corroborates it -> it is held back,
-                                   and the frontier stays at the last real anchor
-
-        The cost is that the deepest anchor of any traversal is never claimed --
-        the frontier is always one anchor short. That is the conservative
-        direction, and being one release shallow can only ever refuse a proof we
-        might have been entitled to, never grant one we were not.
+        The walk still refuses on the things it CAN see:
+          * a gap or unusable page before the frontier (S8.1 / S8.2)
+          * an inversion, which catches a sticky in the MIDDLE of a run
+          * an uncorroborated terminal anchor, which catches a single sticky
+            at the END
         """
+        # CONTINUITY IS VALIDATED, NOT ASSUMED. Round 17 (M17-2).
+        #
+        # This used to sort the pages it was handed and check only whether each
+        # PRESENT page was usable -- so an ABSENT page was invisible. The
+        # crawler's generic exception path increments the error counter and
+        # emits no page observation at all, which makes [1, 3] a reachable
+        # report: the walk then carried page-1 depth straight into page 3 and
+        # corroborated across a gap nobody observed.
+        #
+        # Validate rather than normalise. Sorting a broken sequence produces a
+        # tidy sequence, which is exactly the wrong response.
+        numbers = [p.page_number for p in arm.pages]
+        if not numbers:
+            return ArmVerdict(arm.arm_key, None, "no pages were observed")
+        if len(set(numbers)) != len(numbers):
+            return ArmVerdict(arm.arm_key, None,
+                              "duplicate page numbers: %s" % sorted(numbers))
+        ordered = sorted(numbers)
+        if ordered[0] != 1:
+            return ArmVerdict(arm.arm_key, None,
+                              "traversal does not start at page 1 (starts at %d)"
+                              % ordered[0])
+        if ordered != list(range(1, len(ordered) + 1)):
+            missing = sorted(set(range(1, ordered[-1] + 1)) - set(ordered))
+            return ArmVerdict(arm.arm_key, None,
+                              "page gap: %s never observed" % missing)
+
         confirmed: Optional[Tuple[datetime, Sighting]] = None
         pending: Optional[Tuple[datetime, Sighting]] = None
         anchors = 0
         pages_done = 0
 
         for page in sorted(arm.pages, key=lambda p: p.page_number):
+            positions = [s.position for s in page.sightings]
+            if len(set(positions)) != len(positions):
+                return ArmVerdict(
+                    arm.arm_key, None,
+                    "duplicate positions on page %d" % page.page_number)
             if not page.usable:
                 return ArmVerdict(
                     arm.arm_key, None,
@@ -249,49 +311,70 @@ class CoverageEvaluator:
             frontier_url=s.canonical_url,
             frontier_date_raw=str(self._dates.get(s.canonical_url) or ""),
             frontier_date=when, pages_traversed=pages_done, anchors_used=anchors,
+            authoritative=bool(ORDERING_CONTRACTS.get(report.source)),
+            ordering_contract=str(ORDERING_CONTRACTS.get(report.source) or ""),
         ), "frontier reached")
 
     # -- the question that matters ---------------------------------------
 
     def covers_release(self, report: TraversalReport, target_date_raw: str,
-                       required_types: Sequence[str] = ("movie", "tv"),
+                       required_arm_keys: Sequence[str],
                        ) -> Tuple[bool, List[ArmVerdict], str]:
-        """Was every contradictory arm traversed PAST this release?
+        """Was EVERY required arm traversed past this release?
 
-        Target-relative, per §9: a fixed page budget is never evidence by
-        itself. The question is always "did we get older than R", never "did we
-        read N pages".
+        Round 17 (M17-3). This used to group verdicts by `listing_type` and
+        accept a type as soon as ANY arm of that type crossed -- existential
+        where the contract is universal. HDEncode has two movie arms, 4K and
+        Remux, so a deep 4K traversal satisfied "movie" while a contradicting
+        movie classification could sit untraversed in Remux. The tests could not
+        see it because they used one arm per type, where `any` and `all` agree.
 
-        STRICTLY older. Equal timestamps do not prove crossing (§8.5): the site's
+        The required set is now passed in EXPLICITLY, by stable arm key. Types
+        are not a substitute: what has to be ruled out is a contradiction in a
+        specific listing, and only the listing identity names it.
+
+        Target-relative per S9: the question is always "did we get older than R",
+        never "did we read N pages". A fixed page budget is never evidence.
+
+        STRICTLY older. Equal timestamps do not prove crossing (S8.5): the site's
         strings are minute-resolution, so two releases in the same minute are
-        unordered with respect to each other and one cannot vouch for the other.
+        unordered with respect to each other and neither can vouch for the other.
         """
         target = parse_site_date(target_date_raw)
         if target is None:
             return (False, [], "the target release has no readable date")
+        required = [str(k) for k in (required_arm_keys or ())]
+        if not required:
+            # An empty requirement would make this vacuously true, which is the
+            # most dangerous possible default for a negative proof.
+            return (False, [], "no required arms were specified")
 
-        verdicts: List[ArmVerdict] = []
-        by_type: Dict[str, List[ArmVerdict]] = {}
-        for arm in report.arms:
-            v = self.evaluate_arm(report, arm)
-            verdicts.append(v)
-            by_type.setdefault(arm.listing_type, []).append(v)
+        verdicts = [self.evaluate_arm(report, a) for a in report.arms]
+        by_key = {v.arm_key: v for v in verdicts}
 
-        for want in required_types:
-            arms = by_type.get(want) or []
-            if not arms:
+        for key in required:
+            v = by_key.get(key)
+            if v is None:
                 return (False, verdicts,
-                        "no %s arm was traversed at all" % want)
-            crossed = [v for v in arms
-                       if v.proven and v.proof.frontier_date < target]
-            if not crossed:
-                why = "; ".join(
-                    v.reason if not v.proven
-                    else "%s frontier %s is not strictly older" % (
-                        v.arm_key, v.proof.frontier_date_raw)
-                    for v in arms)
+                        "required arm %s was not traversed at all" % key)
+            if not v.proven:
                 return (False, verdicts,
-                        "the %s side was not traversed past the target: %s"
-                        % (want, why))
+                        "required arm %s has no usable frontier: %s"
+                        % (key, v.reason))
+            if not v.proof.authoritative:
+                # The frontier may be perfectly measured and still prove
+                # nothing: without an ordering contract the listing is not
+                # known to be a chronological stream, and depth in an unordered
+                # sequence is not depth in time.
+                return (False, verdicts,
+                        "required arm %s has no ordering contract for source "
+                        "%r, so its frontier is telemetry and cannot support a "
+                        "negative proof" % (key, report.source))
+            if not (v.proof.frontier_date < target):
+                return (False, verdicts,
+                        "required arm %s reached only %s, which is not strictly "
+                        "older than the target"
+                        % (key, v.proof.frontier_date_raw))
 
-        return (True, verdicts, "every contradictory arm crossed the target")
+        return (True, verdicts,
+                "all %d required arm(s) crossed the target" % len(required))
