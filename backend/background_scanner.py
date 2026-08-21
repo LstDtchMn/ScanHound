@@ -660,17 +660,38 @@ class BackgroundScanner:
                 if _claims:
                     try:
                         db.record_listing_claims(_claims)
-                        db.backfill_listing_claim_posted_dates()
-                        # NARROWING on positive evidence, round 14 (M14-2).
-                        # The crawl only sees disagreement WITHIN one crawl;
-                        # claims that disagree across crawls are contradictory
-                        # positive evidence just the same, and narrowing needs
-                        # no coverage proof. Widening still does.
-                        db.consume_cross_crawl_conflicts()
                     except Exception:
-                        # A ledger failure must never affect the scan or the
-                        # safety paths above; it only costs future evidence.
+                        # Losing a claim costs future evidence, nothing live.
                         logger.exception("failed to record listing claims")
+
+                # SAFETY, IN ITS OWN TRY AND UNCONDITIONAL. Round 15 (M15-3).
+                #
+                # This used to share a try with the claim write and the date
+                # enrichment, so an enrichment failure -- which is optional work
+                # for a coverage model that does not exist yet -- skipped the
+                # revocation entirely and left contradicted authority live.
+                #
+                # It also sat under `if _claims:`, so a cycle that recorded
+                # nothing new never retried an OLDER unconsumed contradiction.
+                # The evidence is durable; the consumer must not depend on this
+                # particular crawl having produced any.
+                #
+                # Narrowing on positive evidence needs no coverage proof.
+                # Widening still does.
+                try:
+                    db.consume_cross_crawl_conflicts()
+                except Exception:
+                    logger.exception(
+                        "CROSS-CRAWL REVOCATION FAILED: a durable contradiction "
+                        "was not consumed this cycle and contradicted authority "
+                        "may still be served")
+
+                # ENRICHMENT LAST, and lowest priority: it feeds a future
+                # coverage model and protects nothing today.
+                try:
+                    db.backfill_listing_claim_posted_dates()
+                except Exception:
+                    logger.exception("posted-date enrichment failed")
 
                 # ATTESTATION: only a crawl whose coverage could actually rule out a
                 # contradiction may turn unknown into checked-clean.

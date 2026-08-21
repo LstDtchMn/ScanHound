@@ -1284,6 +1284,44 @@ class DatabaseManager:
                     CREATE INDEX IF NOT EXISTS idx_listing_claims_type
                     ON listing_claims(canonical_url, listing_type)
                 """)
+
+                # RAW URL ALIASES. Round 15 (M15-2).
+                #
+                # listing_claims is keyed (canonical_url, arm_key), so a SECOND
+                # raw href for the same release in the SAME arm hits the same row
+                # and the earlier raw_url is simply overwritten. But downloads and
+                # background_scan_cache key on the RAW href, so revocation has to
+                # enumerate every variant ever seen -- and a variant the ledger
+                # forgot is a download row that silently keeps its media kind
+                # after the release has been contradicted.
+                #
+                # The claim row stays the aggregate; identity history lives here.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS listing_claim_aliases (
+                        canonical_url TEXT NOT NULL,
+                        arm_key TEXT NOT NULL,
+                        raw_url TEXT NOT NULL,
+                        first_seen_at TEXT NOT NULL,
+                        last_seen_at TEXT NOT NULL,
+                        sightings INTEGER NOT NULL DEFAULT 1,
+                        PRIMARY KEY (canonical_url, arm_key, raw_url)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_listing_claim_aliases_canon
+                    ON listing_claim_aliases(canonical_url)
+                """)
+                # Seed from claims already recorded before this table existed --
+                # the deployment has live rows, and their raw_url is the only
+                # copy of that identity.
+                cursor.execute("""
+                    INSERT OR IGNORE INTO listing_claim_aliases
+                        (canonical_url, arm_key, raw_url,
+                         first_seen_at, last_seen_at, sightings)
+                    SELECT canonical_url, arm_key, raw_url,
+                           first_seen_at, last_seen_at, sightings
+                    FROM listing_claims WHERE raw_url IS NOT NULL
+                """)
                 for _column, _declaration in (
                     ("imdb_id", "TEXT"),
                     ("tmdb_id", "TEXT"),
@@ -4489,6 +4527,19 @@ class DatabaseManager:
                 "  posted_date_raw = COALESCE(listing_claims.posted_date_raw, "
                 "                             excluded.posted_date_raw)",
                 rows)
+            # EVERY raw href, kept. Round 15 (M15-2): the claim row above is keyed
+            # (canonical_url, arm_key), so a second variant in the same arm
+            # overwrites the first -- and revocation keys on the RAW href, so a
+            # forgotten variant is a download row that keeps its media kind after
+            # the release has been contradicted.
+            conn.executemany(
+                "INSERT INTO listing_claim_aliases "
+                "(canonical_url, arm_key, raw_url, first_seen_at, last_seen_at, "
+                " sightings) VALUES (?, ?, ?, ?, ?, 1) "
+                "ON CONFLICT(canonical_url, arm_key, raw_url) DO UPDATE SET "
+                "  last_seen_at = excluded.last_seen_at, "
+                "  sightings = listing_claim_aliases.sightings + 1",
+                [(r[0], r[1], r[3], r[5], r[6]) for r in rows if r[3]])
         return len(rows)
 
     def backfill_listing_claim_posted_dates(self, limit=2000):
@@ -4511,9 +4562,15 @@ class DatabaseManager:
 
         Returns the number of claims enriched.
         """
+        # Join through the aliases: a claim whose current raw_url has no cached
+        # detail row may still have an earlier variant that does.
         pending = self._query_dicts(
-            "SELECT canonical_url, arm_key, raw_url FROM listing_claims "
-            "WHERE posted_date_raw IS NULL AND raw_url IS NOT NULL LIMIT ?",
+            "SELECT c.canonical_url AS canonical_url, c.arm_key AS arm_key, "
+            "       a.raw_url AS raw_url "
+            "FROM listing_claims c "
+            "JOIN listing_claim_aliases a "
+            "  ON a.canonical_url = c.canonical_url AND a.arm_key = c.arm_key "
+            "WHERE c.posted_date_raw IS NULL LIMIT ?",
             (int(limit),), default=[]) or []
         if not pending:
             return 0
@@ -4622,9 +4679,13 @@ class DatabaseManager:
         raw = []
         for start in range(0, len(canon), 300):
             chunk = canon[start:start + 300]
+            # From the ALIAS table (round 15, M15-2). listing_claims keeps only
+            # the most recent raw href per arm, so selecting from it would revoke
+            # some variants and silently miss others -- exactly the download rows
+            # that would keep a contradicted media kind.
             rows = self._query_dicts(
-                "SELECT DISTINCT raw_url FROM listing_claims "
-                "WHERE raw_url IS NOT NULL AND canonical_url IN (%s)"
+                "SELECT DISTINCT raw_url FROM listing_claim_aliases "
+                "WHERE canonical_url IN (%s)"
                 % ",".join("?" * len(chunk)),
                 tuple(chunk), default=[]) or []
             raw.extend(r["raw_url"] for r in rows)
